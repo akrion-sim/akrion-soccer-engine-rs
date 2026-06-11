@@ -1,0 +1,3070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soccer Simulation</title>
+<style>
+  :root {
+    --bg: #eef1f4;
+    --ink: #172026;
+    --muted: #64717b;
+    --line: #cad2d8;
+    --panel: #ffffff;
+    --home: #1f6feb;
+    --away: #d64545;
+    --official: #111827;
+    --field: #238547;
+    --field2: #2f9b57;
+    --gold: #c58a13;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  .app {
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--line);
+    background: #f8fafb;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.2;
+    letter-spacing: 0;
+  }
+  .score {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+  }
+  .score span {
+    display: inline-flex;
+    align-items: center;
+    min-width: 34px;
+    justify-content: center;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+  }
+  .main {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+  }
+  .stage {
+    min-height: 0;
+    padding: 16px;
+    position: relative;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    min-height: 520px;
+    display: block;
+    background: var(--field);
+    border: 1px solid #126233;
+    border-radius: 6px;
+  }
+  aside {
+    border-left: 1px solid var(--line);
+    background: var(--panel);
+    padding: 14px;
+    overflow: auto;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  button, select {
+    min-height: 32px;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  button {
+    min-width: 38px;
+    padding: 0 10px;
+    cursor: pointer;
+  }
+  button:hover { background: #f0f4f7; }
+  select { padding: 0 8px; }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--home);
+  }
+  .metric {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    padding: 7px 0;
+    border-bottom: 1px solid #eef1f4;
+    font-size: 13px;
+  }
+  .metric b {
+    max-width: 190px;
+    overflow: hidden;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .section {
+    margin: 14px 0 6px;
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  .events {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: 12px;
+  }
+  .events li {
+    padding: 6px 0;
+    border-bottom: 1px solid #eef1f4;
+  }
+  .slot {
+    display: grid;
+    grid-template-columns: 52px 1fr;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .slot label { color: var(--muted); }
+  .slot.active select {
+    outline: 2px solid rgba(246,201,68,.75);
+    outline-offset: 1px;
+  }
+  .slot .keymap {
+    grid-column: 2;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.25;
+  }
+  .slot .input-status {
+    grid-column: 2;
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.25;
+  }
+  .slot .input-status.warn { color: #a66b13; }
+  .slot .input-status.bad { color: var(--away); }
+  .legend {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 4px;
+  }
+  .loading-overlay {
+    position: absolute;
+    inset: 16px;
+    display: grid;
+    place-items: center;
+    background: rgba(238, 241, 244, .86);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    z-index: 2;
+  }
+  .loading-overlay.hidden { display: none; }
+  .loading-overlay.playable {
+    align-items: end;
+    background: transparent;
+    border: 0;
+    pointer-events: none;
+  }
+  .loading-overlay.playable .loading-card {
+    margin-bottom: 12px;
+    opacity: .92;
+  }
+  .loading-card {
+    width: min(420px, calc(100% - 28px));
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 18px;
+    box-shadow: 0 14px 40px rgba(23, 32, 38, .16);
+  }
+  .loading-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+  }
+  .loading-title.failed .spinner {
+    animation: none;
+    border-color: #e7b8b8;
+    border-top-color: var(--away);
+  }
+  .spinner {
+    width: 22px;
+    height: 22px;
+    border: 3px solid #d7e0e6;
+    border-top-color: var(--home);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress {
+    height: 10px;
+    margin: 14px 0 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e7edf2;
+  }
+  .progress-fill {
+    width: 0%;
+    height: 100%;
+    background: linear-gradient(90deg, var(--home), #13a66b);
+    transition: width .16s ease;
+  }
+  .loading-status,
+  .loading-bytes {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .auth-panel {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .loading-overlay.auth-required .auth-panel {
+    display: flex;
+  }
+  .auth-panel input {
+    min-width: 0;
+    flex: 1;
+    min-height: 32px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0 8px;
+    font-size: 13px;
+  }
+  button:disabled,
+  select:disabled,
+  input:disabled {
+    opacity: .55;
+    cursor: wait;
+  }
+  @media (max-width: 860px) {
+    header { grid-template-columns: 1fr; }
+    .main { grid-template-columns: 1fr; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+    canvas { min-height: 460px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Soccer Simulation</h1>
+    <div class="score">
+      <span id="homeScore">0</span>
+      <strong id="clock">0:00.0</strong>
+      <span id="awayScore">0</span>
+    </div>
+  </header>
+  <div class="main">
+    <div class="stage">
+      <canvas id="pitch" width="1280" height="720"></canvas>
+      <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-card">
+          <div id="loadingTitle" class="loading-title"><span class="spinner"></span><span id="loadingTitleText">Loading match data</span></div>
+          <div id="loadingProgress" class="progress" role="progressbar" aria-label="Match data loading progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="Starting download"><div id="loadingBar" class="progress-fill"></div></div>
+          <div id="loadingStatus" class="loading-status">Starting download</div>
+          <div id="loadingBytes" class="loading-bytes">0 B</div>
+          <form id="authForm" class="auth-panel">
+            <input id="authToken" type="password" placeholder="Auth header" autocomplete="off">
+            <button id="authRetry" type="submit">Retry</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    <aside>
+      <div class="row">
+        <button id="play">Play</button>
+        <button id="prev">-1</button>
+        <button id="next">+1</button>
+        <button id="runNewSim">Run New Sim</button>
+        <select id="speed">
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+        </select>
+        <select id="gridOverlayLevel" aria-label="Grid overlay">
+          <option value="off" selected>Grid off</option>
+          <option value="fine">Fine grid</option>
+          <option value="tactical">Tactical grid</option>
+          <option value="macro">Macro grid</option>
+        </select>
+      </div>
+      <input id="scrub" type="range" min="0" max="0" value="0">
+      <div class="section">Match</div>
+      <div class="metric"><span>Phase</span><b id="phase">Kickoff</b></div>
+      <div class="metric"><span>Central Brain</span><b id="centralBrain">22p 3o Loose</b></div>
+      <div class="metric"><span>Agent Order</span><b id="agentOrder">shuffle pending</b></div>
+      <div class="metric"><span>Home Brain</span><b id="homeBrain">P0.00 R0.00</b></div>
+      <div class="metric"><span>Away Brain</span><b id="awayBrain">P0.00 R0.00</b></div>
+      <div class="metric"><span>Ball</span><b id="ballPhysics">0.0y/s 0.0y/s2</b></div>
+      <div class="metric"><span>Ball Hist</span><b id="ballKinematics">H0 V0.0 A0.0 J0.0</b></div>
+      <div class="metric"><span>Ball Agent</span><b id="ballAgent">waiting</b></div>
+      <div class="metric"><span>Refs</span><b id="officialAgents">waiting</b></div>
+      <div class="metric"><span>Intent</span><b id="actionIntent">Idle</b></div>
+      <div class="metric"><span>Shots</span><b id="shots">0 - 0</b></div>
+      <div class="metric"><span>On Target</span><b id="onTarget">0 - 0</b></div>
+      <div class="metric"><span>Saves</span><b id="saves">0 - 0</b></div>
+      <div class="metric"><span>GK Physics</span><b id="gkPhysics">save/parry</b></div>
+      <div class="metric"><span>Passes</span><b id="passes">0 / 0</b></div>
+      <div class="metric"><span>Tactical Live</span><b id="tacticalLiveness">P0/0 S0</b></div>
+      <div class="metric"><span>Dribble Beats</span><b id="dribbleBeats">0 - 0</b></div>
+      <div class="metric"><span>Clearances</span><b id="clearances">0 - 0</b></div>
+      <div class="metric"><span>Route 1</span><b id="routeOne">0 - 0</b></div>
+      <div class="metric"><span>Tackles</span><b id="tackles">0 - 0</b></div>
+      <div class="metric"><span>Interceptions</span><b id="interceptions">0 - 0</b></div>
+      <div class="metric"><span>Shot Blocks</span><b id="shotBlocks">0 - 0</b></div>
+      <div class="metric"><span>Recoveries</span><b id="recoveries">0 - 0</b></div>
+      <div class="metric"><span>Offside</span><b id="offsides">0 - 0</b></div>
+      <div class="metric"><span>Restarts</span><b id="restarts">0 - 0</b></div>
+      <div class="metric"><span>Fouls</span><b id="fouls">0 - 0</b></div>
+      <div class="metric"><span>Ticks</span><b id="ticks">0</b></div>
+      <div class="metric"><span>Cadence</span><b id="cadence">0.1s x 6001</b></div>
+      <div class="metric"><span>Step Budget</span><b id="stepBudget">100ms ok</b></div>
+      <div class="metric"><span>Seed</span><b id="seed">-</b></div>
+      <div class="metric"><span>Run ID</span><b id="runId">-</b></div>
+      <div class="section">Controller Slots</div>
+      <div class="metric"><span>Input Runtime</span><b id="controllerRuntime">4 slots notify</b></div>
+      <div id="slots"></div>
+      <div class="metric"><span>Selected</span><b id="agentSelected">Autonomous</b></div>
+      <div class="metric"><span>Kinematics</span><b id="agentKinematics">-</b></div>
+      <div class="metric"><span>Shot Lane</span><b id="agentShotLane">-</b></div>
+      <div class="metric"><span>Tactical</span><b id="agentTactical">-</b></div>
+      <div class="metric"><span>MDP/POMDP</span><b id="agentPomdp">-</b></div>
+      <div class="row">
+        <select id="passTarget"></select>
+        <select id="passFlight" aria-label="Pass flight">
+          <option value="floor">Floor pass</option>
+          <option value="aerial">Aerial pass</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="capture">Capture</button>
+        <button id="pass">Pass</button>
+        <button id="shoot">Shoot</button>
+        <button id="carryAction">Carry</button>
+        <button id="protectAction">Protect</button>
+        <button id="killerPassAction">Thread T</button>
+        <button id="clearanceAction">Clear C</button>
+        <button id="routeOneAction">Route R</button>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--home)"></i>Home</span>
+        <span><i class="swatch" style="background:var(--away)"></i>Away</span>
+        <span><i class="swatch" style="background:var(--official)"></i>Official</span>
+        <span><i class="swatch" style="background:var(--gold)"></i>Ball</span>
+      </div>
+      <div class="section">Events</div>
+      <ul class="events" id="events"></ul>
+    </aside>
+  </div>
+</div>
+<script>
+const TRACE_META_URL = "__SOCCER_TRACE_META_URL__";
+const TRACE_FRAMES_URL = "__SOCCER_TRACE_FRAMES_URL__";
+const RUN_NEW_SIM_URL = "../simulations/main_soccer/run?exact=1&fresh=1";
+const AUTH_HEADER_NAME = "Auth";
+const AUTH_STORAGE_KEY = "desRsAuth";
+const FALLBACK_CONFIG = {
+  fieldWidthYards: 80,
+  fieldLengthYards: 120,
+  goalWidthYards: 8,
+  maxHumanPlayers: 4,
+  dtSeconds: 0.1
+};
+const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
+const LIVE_INPUT_RETRY_MIN_MS = 120;
+const LIVE_INPUT_RETRY_MAX_MS = 1000;
+const LIVE_INPUT_CLIENT_QUEUE_LIMIT = 4;
+function emptyStats() {
+  return {
+    shotsHome: 0,
+    shotsAway: 0,
+    shotsOnTargetHome: 0,
+    shotsOnTargetAway: 0,
+    savesHome: 0,
+    savesAway: 0,
+    passesCompletedHome: 0,
+    passesCompletedAway: 0,
+    passesAttemptedHome: 0,
+    passesAttemptedAway: 0,
+    clearancesHome: 0,
+    clearancesAway: 0,
+    routeOneBallsHome: 0,
+    routeOneBallsAway: 0,
+    dribbleBeatsHome: 0,
+    dribbleBeatsAway: 0,
+    tacklesHome: 0,
+    tacklesAway: 0,
+    tackles: 0,
+    interceptionsHome: 0,
+    interceptionsAway: 0,
+    shotBlocksHome: 0,
+    shotBlocksAway: 0,
+    looseBallRecoveriesHome: 0,
+    looseBallRecoveriesAway: 0,
+    offsidesHome: 0,
+    offsidesAway: 0,
+    throwInsHome: 0,
+    throwInsAway: 0,
+    goalKicksHome: 0,
+    goalKicksAway: 0,
+    cornerKicksHome: 0,
+    cornerKicksAway: 0,
+    freeKicksHome: 0,
+    freeKicksAway: 0,
+    foulsHome: 0,
+    foulsAway: 0
+  };
+}
+const trace = {
+  config: {...FALLBACK_CONFIG},
+  summary: {ticks: 0, stats: emptyStats()},
+  cadence: null,
+  agentContract: null,
+  decisionModel: null,
+  controllerContract: null,
+  uiContract: null,
+  physicsContract: null,
+  learningContract: null,
+  stepTiming: null,
+  controllerYield: null,
+  tacticalLiveness: null,
+  frames: [],
+  events: [],
+  runId: null,
+  generatedAtUnixMs: null
+};
+const canvas = document.getElementById("pitch");
+const ctx = canvas.getContext("2d");
+const homeScore = document.getElementById("homeScore");
+const awayScore = document.getElementById("awayScore");
+const clock = document.getElementById("clock");
+const phase = document.getElementById("phase");
+const centralBrain = document.getElementById("centralBrain");
+const agentOrder = document.getElementById("agentOrder");
+const homeBrain = document.getElementById("homeBrain");
+const awayBrain = document.getElementById("awayBrain");
+const ballPhysics = document.getElementById("ballPhysics");
+const ballKinematics = document.getElementById("ballKinematics");
+const ballAgent = document.getElementById("ballAgent");
+const officialAgents = document.getElementById("officialAgents");
+const actionIntent = document.getElementById("actionIntent");
+const shots = document.getElementById("shots");
+const onTarget = document.getElementById("onTarget");
+const saves = document.getElementById("saves");
+const gkPhysics = document.getElementById("gkPhysics");
+const passes = document.getElementById("passes");
+const tacticalLiveness = document.getElementById("tacticalLiveness");
+const dribbleBeats = document.getElementById("dribbleBeats");
+const clearances = document.getElementById("clearances");
+const routeOne = document.getElementById("routeOne");
+const tackles = document.getElementById("tackles");
+const interceptions = document.getElementById("interceptions");
+const shotBlocks = document.getElementById("shotBlocks");
+const recoveries = document.getElementById("recoveries");
+const offsides = document.getElementById("offsides");
+const restarts = document.getElementById("restarts");
+const fouls = document.getElementById("fouls");
+const ticks = document.getElementById("ticks");
+const cadence = document.getElementById("cadence");
+const stepBudget = document.getElementById("stepBudget");
+const seed = document.getElementById("seed");
+const runId = document.getElementById("runId");
+const scrub = document.getElementById("scrub");
+const play = document.getElementById("play");
+const runNewSimButton = document.getElementById("runNewSim");
+const speed = document.getElementById("speed");
+const gridOverlayLevel = document.getElementById("gridOverlayLevel");
+const events = document.getElementById("events");
+const slots = document.getElementById("slots");
+const controllerRuntime = document.getElementById("controllerRuntime");
+const agentSelected = document.getElementById("agentSelected");
+const agentKinematics = document.getElementById("agentKinematics");
+const agentShotLane = document.getElementById("agentShotLane");
+const agentTactical = document.getElementById("agentTactical");
+const agentPomdp = document.getElementById("agentPomdp");
+const passTarget = document.getElementById("passTarget");
+const passFlight = document.getElementById("passFlight");
+const carryActionButton = document.getElementById("carryAction");
+const protectActionButton = document.getElementById("protectAction");
+const killerPassActionButton = document.getElementById("killerPassAction");
+const clearanceActionButton = document.getElementById("clearanceAction");
+const routeOneActionButton = document.getElementById("routeOneAction");
+const loadingOverlay = document.getElementById("loadingOverlay");
+const loadingTitle = document.getElementById("loadingTitle");
+const loadingTitleText = document.getElementById("loadingTitleText");
+const loadingProgress = document.getElementById("loadingProgress");
+const loadingBar = document.getElementById("loadingBar");
+const loadingStatus = document.getElementById("loadingStatus");
+const loadingBytes = document.getElementById("loadingBytes");
+const authForm = document.getElementById("authForm");
+const authToken = document.getElementById("authToken");
+const keys = new Set();
+const MOVE_KEY_CODES = new Set(["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","KeyW","KeyA","KeyS","KeyD"]);
+const SPRINT_KEY_CODES = new Set(["ShiftLeft","ShiftRight"]);
+const HUMAN_ACTION_KEY_CODES = new Set(["Enter","Space","KeyT","KeyC","KeyR"]);
+const CONTROLLER_KEYMAPS = [
+  {left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", sprint: "ShiftLeft", pass: "Enter", shoot: "Space"},
+  {left: "KeyA", right: "KeyD", up: "KeyW", down: "KeyS", sprint: "ShiftRight", pass: "KeyF", shoot: "KeyG"},
+  {left: "KeyJ", right: "KeyL", up: "KeyI", down: "KeyK", sprint: "KeyU", pass: "KeyO", shoot: "KeyP"},
+  {left: "Numpad4", right: "Numpad6", up: "Numpad8", down: "Numpad5", sprint: "Numpad0", pass: "Numpad7", shoot: "Numpad9"}
+];
+const GAMEPAD_BUTTONS = {
+  action: 0,
+  pass: 1,
+  carry: 2,
+  protect: 3,
+  clearance: 4,
+  sprint: 5,
+  routeOne: 6,
+  killerPass: 7,
+  dpadUp: 12,
+  dpadDown: 13,
+  dpadLeft: 14,
+  dpadRight: 15,
+};
+const GAMEPAD_STICK_DEADZONE = 0.18;
+const gamepadButtonLatch = new Map();
+let frameIndex = 0;
+let playing = false;
+let lastTs = 0;
+let inputSeq = 0;
+let activeSlot = 0;
+let traceFramesComplete = false;
+let uiReady = false;
+let loadStartedAt = performance.now();
+let recentLoadSamples = [];
+let lastFrameLoadSampleAt = performance.now();
+let lastFrameLoadSampleCount = 0;
+let traceLoadController = null;
+let runningNewSimulation = false;
+let controllerAssignmentSyncSeq = 0;
+let inputFlushTimer = null;
+let inputFlushInFlight = false;
+let inputFlushRetryAttempt = 0;
+let lastInputAck = {acceptedInputs: 0, queuedHumanInputs: 0, error: "", at: 0};
+window.__humanInputQueue = [];
+window.dispatchHumanInput = (frame) => {
+  if (!soccerLivePostApiEnabled("input")) {
+    window.__humanInputQueue = [];
+    updateInputStatusLabels();
+    return;
+  }
+  window.__humanInputQueue.push(frame);
+  compactQueuedInputsForBrowser();
+  updateInputStatusLabels();
+  scheduleInputFlush(0);
+};
+function inputHasCommand(input) {
+  return !!(input?.pass || input?.shoot || input?.action);
+}
+function mergeControllerInputFrames(previous, next) {
+  const merged = {...next};
+  if (inputHasCommand(previous) && !inputHasCommand(next)) {
+    merged.pass = previous.pass;
+    merged.shoot = previous.shoot;
+    merged.passFlight = previous.passFlight;
+    merged.action = previous.action;
+    merged.targetPlayer = previous.targetPlayer;
+  }
+  return merged;
+}
+function coalesceQueuedInputsBySlot(inputs) {
+  const latestBySlot = new Map();
+  for (const input of inputs) {
+    const slot = Number(input?.controllerSlot ?? 0);
+    const current = latestBySlot.get(slot);
+    if (!current || Number(input.seq || 0) >= Number(current.seq || 0)) {
+      latestBySlot.set(slot, current ? mergeControllerInputFrames(current, input) : input);
+    } else if (inputHasCommand(input) && !inputHasCommand(current)) {
+      latestBySlot.set(slot, mergeControllerInputFrames(input, current));
+    }
+  }
+  return Array.from(latestBySlot.values())
+    .sort((a, b) => Number(a.controllerSlot ?? 0) - Number(b.controllerSlot ?? 0))
+    .slice(0, LIVE_INPUT_CLIENT_QUEUE_LIMIT);
+}
+function compactQueuedInputsForBrowser() {
+  if (window.__humanInputQueue.length > LIVE_INPUT_CLIENT_QUEUE_LIMIT) {
+    window.__humanInputQueue = coalesceQueuedInputsBySlot(window.__humanInputQueue);
+  }
+}
+function drainQueuedInputsForDispatch() {
+  window.__humanInputQueue = coalesceQueuedInputsBySlot(window.__humanInputQueue);
+  const inputs = window.__humanInputQueue.slice();
+  window.__humanInputQueue = [];
+  return inputs;
+}
+function requeueInputFrames(inputs) {
+  window.__humanInputQueue = coalesceQueuedInputsBySlot(inputs.concat(window.__humanInputQueue));
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value.toFixed(0)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+function textByteLength(text) {
+  if (typeof Blob !== "undefined") return new Blob([text]).size;
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).byteLength;
+  return String(text || "").length;
+}
+function cacheBustUrl(url) {
+  const absolute = new URL(url, window.location.href);
+  absolute.searchParams.set("v", String(Date.now()));
+  return absolute.toString();
+}
+function sessionAuthToken() {
+  try {
+    return window.sessionStorage?.getItem(AUTH_STORAGE_KEY) || "";
+  } catch (_) {
+    return "";
+  }
+}
+function storeSessionAuthToken(value) {
+  try {
+    if (value) window.sessionStorage?.setItem(AUTH_STORAGE_KEY, value);
+  } catch (_) {
+    // Session storage can be unavailable for local file previews.
+  }
+}
+function initializeAuthTokenFromLocation() {
+  const names = ["auth", "Auth", "desRsAuth", "DES_RS_AUTH"];
+  let token = "";
+  const url = new URL(window.location.href);
+  for (const name of names) {
+    token = url.searchParams.get(name) || token;
+    if (token) url.searchParams.delete(name);
+  }
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  if (!token && hash.includes("=")) {
+    const hashParams = new URLSearchParams(hash);
+    for (const name of names) {
+      token = hashParams.get(name) || token;
+      if (token) hashParams.delete(name);
+    }
+    const nextHash = hashParams.toString();
+    url.hash = nextHash ? `#${nextHash}` : "";
+  }
+  if (token) {
+    storeSessionAuthToken(token.trim());
+    window.history.replaceState(null, "", url.toString());
+  }
+}
+function fetchOptions(accept, signal) {
+  const headers = {"Accept": accept};
+  const token = sessionAuthToken();
+  if (token) headers[AUTH_HEADER_NAME] = token;
+  return {headers, cache: "no-store", signal};
+}
+function soccerApiUrl(path) {
+  const current = new URL(window.location.href);
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const liveIdx = current.pathname.indexOf("/soccer/live");
+  const outIdx = current.pathname.indexOf("/out/");
+  const desIdx = current.pathname.indexOf("/des-rs");
+  let prefix = "";
+  if (outIdx >= 0) {
+    prefix = current.pathname.slice(0, outIdx);
+  } else if (liveIdx >= 0) {
+    prefix = current.pathname.slice(0, liveIdx);
+  } else if (desIdx >= 0) {
+    prefix = current.pathname.slice(0, desIdx + "/des-rs".length);
+  }
+  return new URL(`${prefix}${normalizedPath}`, current.href).toString();
+}
+function soccerPlaybackAssetMode(pathname = window.location.pathname) {
+  return pathname.includes("/out/") || !pathname.includes("/soccer/live");
+}
+function soccerLivePostApiEnabled(resource = "api") {
+  const current = new URL(window.location.href);
+  const ui = trace.uiContract || trace.playback?.uiContract || {};
+  if (soccerPlaybackAssetMode(current.pathname) || ui.liveSimulationPostApiEnabled === false) {
+    return false;
+  }
+  if (resource === "step") return ui.liveStepPostEnabled !== false;
+  if (resource === "input" || resource === "assign") return ui.liveInputPostEnabled !== false;
+  return true;
+}
+async function postSoccerJson(path, payload, resource = "api") {
+  if (!soccerLivePostApiEnabled(resource)) {
+    throw new Error("playback mode uses GET-only assets");
+  }
+  const options = fetchOptions("application/json");
+  options.method = "POST";
+  options.headers = {...options.headers, "Content-Type": "application/json"};
+  options.body = JSON.stringify(payload);
+  const response = await fetch(cacheBustUrl(soccerApiUrl(path)), options);
+  if (response.status === 401 || response.status === 403) {
+    let detail = "";
+    try {
+      detail = (await response.text()).trim().replace(/\s+/g, " ").slice(0, 180);
+    } catch (_) {
+      detail = "";
+    }
+    throw new AuthRequiredError(resource, response.status, detail);
+  }
+  if (!response.ok) throw new Error(`${resource} ${response.status}`);
+  return response.json();
+}
+class AuthRequiredError extends Error {
+  constructor(resource, status, detail) {
+    const suffix = detail ? `: ${detail}` : "";
+    super(`${resource} ${status}${suffix}`);
+    this.name = "AuthRequiredError";
+  }
+}
+async function fetchRequiredResource(url, accept, signal, resource) {
+  const response = await fetch(cacheBustUrl(url), fetchOptions(accept, signal));
+  if (response.status === 401 || response.status === 403) {
+    let detail = "";
+    try {
+      detail = (await response.text()).trim().replace(/\s+/g, " ").slice(0, 180);
+    } catch (_) {
+      detail = "";
+    }
+    throw new AuthRequiredError(resource, response.status, detail);
+  }
+  if (!response.ok) throw new Error(`${resource} ${response.status}`);
+  return response;
+}
+function setLoadingTitle(text, state = "loading") {
+  loadingTitleText.textContent = text;
+  loadingTitle.classList.toggle("failed", state === "failed" || state === "auth");
+  loadingOverlay.classList.toggle("auth-required", state === "auth");
+}
+function currentFrame() {
+  if (!trace.frames.length) return null;
+  return trace.frames[Math.min(frameIndex, trace.frames.length - 1)];
+}
+function loadedFrameRate() {
+  const seconds = Math.max(.25, (performance.now() - loadStartedAt) / 1000);
+  return trace.frames.length / seconds;
+}
+function resetRecentLoadRate() {
+  recentLoadSamples = [];
+  lastFrameLoadSampleAt = performance.now();
+  lastFrameLoadSampleCount = trace.frames.length;
+}
+function recordRecentLoadRateSample() {
+  const now = performance.now();
+  const frameDelta = trace.frames.length - lastFrameLoadSampleCount;
+  const msDelta = now - lastFrameLoadSampleAt;
+  if (frameDelta > 0 && msDelta >= 120) {
+    recentLoadSamples.push({frames: frameDelta, ms: msDelta, at: now});
+    const cutoff = now - 3500;
+    recentLoadSamples = recentLoadSamples.filter(sample => sample.at >= cutoff);
+    lastFrameLoadSampleAt = now;
+    lastFrameLoadSampleCount = trace.frames.length;
+  }
+}
+function recentLoadedFrameRate() {
+  const frames = recentLoadSamples.reduce((sum, sample) => sum + sample.frames, 0);
+  const ms = recentLoadSamples.reduce((sum, sample) => sum + sample.ms, 0);
+  if (frames <= 0 || ms <= 0) return loadedFrameRate();
+  return frames / Math.max(.25, ms / 1000);
+}
+function expectedFrameCount() {
+  const cadenceFrames = Number(trace.cadence?.expectedFrameCount || 0);
+  if (cadenceFrames > 0) return cadenceFrames;
+  const ticks = Number(trace.summary?.ticks || 0);
+  return Math.max(ticks + 1, trace.frames.length, 0);
+}
+function cadenceDtSeconds() {
+  return Number(trace.cadence?.dtSeconds || trace.physicsContract?.dtSeconds || trace.config?.dtSeconds || FALLBACK_CONFIG.dtSeconds);
+}
+function stepTimingTelemetry() {
+  return trace.stepTiming || trace.summary?.stepTiming || trace.cadence?.stepTiming || null;
+}
+function timingNumber(timing, ...keys) {
+  for (const key of keys) {
+    const value = Number(timing?.[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+function stepBudgetStatus() {
+  const timing = stepTimingTelemetry();
+  const cadenceBudget = cadenceDtSeconds() * 1000;
+  if (!timing) {
+    return {
+      total: 0,
+      learning: 0,
+      budget: cadenceBudget,
+      learningBudget: cadenceBudget * 0.35,
+      over: false,
+      learningOver: false,
+      overTicks: 0,
+      learningOverTicks: 0,
+      ticks: 0,
+      maxOver: 0,
+      maxLearningOver: 0,
+      maxStep: 0,
+      maxField: 0,
+      maxPlayerDecision: 0,
+      maxLearning: 0
+    };
+  }
+  const budget = timingNumber(timing, "tickBudgetMs", "tick_budget_ms") || cadenceBudget;
+  const learningBudget = timingNumber(timing, "learningBudgetMs", "learning_budget_ms") || budget * 0.35;
+  const learning = timingNumber(timing, "learningMs", "learning_ms")
+    || timingNumber(timing, "learningDefenseMs") + timingNumber(timing, "learningTransitionsMs")
+    + timingNumber(timing, "recentLearningMs") + timingNumber(timing, "neuralSamplesMs")
+    + timingNumber(timing, "policyTrainMs") + timingNumber(timing, "learningLogMs")
+    + timingNumber(timing, "fullGameLearningMs");
+  const total = timingNumber(timing, "totalMs", "total_ms");
+  const overTicks = timingNumber(timing, "overBudgetTicks", "over_budget_ticks");
+  const learningOverTicks = timingNumber(timing, "learningOverBudgetTicks", "learning_over_budget_ticks");
+  return {
+    total,
+    learning,
+    budget,
+    learningBudget,
+    over: Boolean(timing.overBudget ?? timing.over_budget ?? (budget > 0 && total > budget)),
+    learningOver: Boolean(timing.learningOverBudget ?? timing.learning_over_budget ?? (learningBudget > 0 && learning > learningBudget)),
+    overTicks,
+    learningOverTicks,
+    ticks: timingNumber(timing, "ticks"),
+    maxOver: timingNumber(timing, "maxBudgetOverrunMs", "max_budget_overrun_ms"),
+    maxLearningOver: timingNumber(timing, "maxLearningBudgetOverrunMs", "max_learning_budget_overrun_ms"),
+    maxStep: timingNumber(timing, "maxStepMs", "max_step_ms"),
+    maxField: timingNumber(timing, "maxFieldLoopMs", "max_field_loop_ms"),
+    maxPlayerDecision: timingNumber(timing, "maxFieldPlayerDecisionMs", "max_field_player_decision_ms"),
+    maxLearning: timingNumber(timing, "maxLearningMs", "max_learning_ms")
+  };
+}
+function stepBudgetLabel() {
+  const status = stepBudgetStatus();
+  const label = status.over ? "over" : status.learningOver ? "learn" : "ok";
+  const total = status.ticks > 0 ? status.total.toFixed(1) : status.budget.toFixed(0);
+  const learning = status.ticks > 0 ? status.learning.toFixed(1) : "0.0";
+  return `${total}/${status.budget.toFixed(0)}ms ${learning}/${status.learningBudget.toFixed(0)}L ${label}`;
+}
+function stepBudgetTitle() {
+  const status = stepBudgetStatus();
+  if (status.ticks <= 0) return `tick budget ${status.budget.toFixed(0)}ms; learning ${status.learningBudget.toFixed(0)}ms`;
+  return `${status.ticks} ticks; over ${status.overTicks}; learning over ${status.learningOverTicks}; max step ${status.maxStep.toFixed(1)}ms; max field ${status.maxField.toFixed(1)}ms; max player ${status.maxPlayerDecision.toFixed(1)}ms; max learning ${status.maxLearning.toFixed(1)}ms; budget over ${status.maxOver.toFixed(1)}ms; learning over ${status.maxLearningOver.toFixed(1)}ms`;
+}
+function tacticalLivenessState() {
+  const s = trace.summary?.stats || emptyStats();
+  const meta = trace.tacticalLiveness || {};
+  const passAttempts = Number(meta.passAttempts ?? ((s.passesAttemptedHome ?? 0) + (s.passesAttemptedAway ?? 0)));
+  const completedPasses = Number(meta.completedPasses ?? ((s.passesCompletedHome ?? 0) + (s.passesCompletedAway ?? 0)));
+  const shotAttempts = Number(meta.shotAttempts ?? ((s.shotsHome ?? 0) + (s.shotsAway ?? 0)));
+  const frameLivenessKnown = Boolean(meta.frameLivenessKnown);
+  const offBallOpenSpaceSupportKnown = Boolean(meta.offBallOpenSpaceSupportKnown);
+  const offBallOpenSpaceMoves = Number(meta.offBallOpenSpaceMoves ?? 0);
+  const offBallOpenSpaceGain = Number(meta.offBallOpenSpaceGain ?? 0);
+  const ballMovementYards = Number(meta.ballMovementYards ?? 0);
+  const ballGoalwardProgressYards = Number(meta.ballGoalwardProgressYards ?? 0);
+  const ballActiveFrames = Number(meta.ballActiveFrames ?? 0);
+  const centralBrainOperationOrderSamples = Number(meta.centralBrainOperationOrderSamples ?? 0);
+  const centralBrainOperationOrderUniqueFirstOps = Number(meta.centralBrainOperationOrderUniqueFirstOps ?? 0);
+  const centralBrainOperationOrderUniqueFullOrders = Number(meta.centralBrainOperationOrderUniqueFullOrders ?? 0);
+  const playerOperationOrderSamples = Number(meta.playerOperationOrderSamples ?? 0);
+  const playerOperationOrderUniqueFirstOps = Number(meta.playerOperationOrderUniqueFirstOps ?? 0);
+  const playerOperationOrderUniqueFullOrders = Number(meta.playerOperationOrderUniqueFullOrders ?? 0);
+  const ballOperationOrderSamples = Number(meta.ballOperationOrderSamples ?? 0);
+  const ballOperationOrderUniqueFirstOps = Number(meta.ballOperationOrderUniqueFirstOps ?? 0);
+  const ballOperationOrderUniqueFullOrders = Number(meta.ballOperationOrderUniqueFullOrders ?? 0);
+  const officialOperationOrderSamples = Number(meta.officialOperationOrderSamples ?? 0);
+  const officialOperationOrderUniqueFirstOps = Number(meta.officialOperationOrderUniqueFirstOps ?? 0);
+  const officialOperationOrderUniqueFullOrders = Number(meta.officialOperationOrderUniqueFullOrders ?? 0);
+  const playerDecisionModelSamples = Number(meta.playerDecisionModelSamples ?? 0);
+  const playerMdpGridSamples = Number(meta.playerMdpGridSamples ?? 0);
+  const playerPomdpGridSamples = Number(meta.playerPomdpGridSamples ?? 0);
+  const playerActionFacingSamples = Number(meta.playerActionFacingSamples ?? 0);
+  const playerReceiveFacingSamples = Number(meta.playerReceiveFacingSamples ?? 0);
+  const playerGaitSamples = Number(meta.playerGaitSamples ?? 0);
+  const playerUniqueGaits = Number(meta.playerUniqueGaits ?? 0);
+  const playerHighIntensityGaitSamples = Number(meta.playerHighIntensityGaitSamples ?? 0);
+  const playerBackwardGaitSamples = Number(meta.playerBackwardGaitSamples ?? 0);
+  const playerLateralGaitSamples = Number(meta.playerLateralGaitSamples ?? 0);
+  const agentAccountingFrames = Number(meta.agentAccountingFrames ?? 0);
+  const agentAccountingOkFrames = Number(meta.agentAccountingOkFrames ?? 0);
+  const fullRosterFrames = Number(meta.fullRosterFrames ?? 0);
+  const completeScheduleFrames = Number(meta.completeScheduleFrames ?? 0);
+  const centralBrainDecisionFrames = Number(meta.centralBrainDecisionFrames ?? 0);
+  const ballDecisionFrames = Number(meta.ballDecisionFrames ?? 0);
+  const humanControlledPlayerDecisions = Number(meta.humanControlledPlayerDecisions ?? 0);
+  const humanInputPresentDecisions = Number(meta.humanInputPresentDecisions ?? 0);
+  const humanInputConsumedDecisions = Number(meta.humanInputConsumedDecisions ?? 0);
+  const humanInputUniqueControllerSlots = Number(meta.humanInputUniqueControllerSlots ?? 0);
+  const humanInputMaxQueueAgeMs = Number(meta.humanInputMaxQueueAgeMs ?? 0);
+  const finalThirdPossessionFrames = Number(meta.finalThirdPossessionFrames ?? 0);
+  const insideTwentyPossessionFrames = Number(meta.insideTwentyPossessionFrames ?? 0);
+  const shotOptionLegalFrames = Number(meta.shotOptionLegalFrames ?? 0);
+  const clearShotWindowFrames = Number(meta.clearShotWindowFrames ?? 0);
+  const clearShotWindowDecisiveActions = Number(meta.clearShotWindowDecisiveActions ?? 0);
+  const clearShotWindowShots = Number(meta.clearShotWindowShots ?? 0);
+  const clearShotWindowRecycles = Number(meta.clearShotWindowRecycles ?? 0);
+  const killerPassWindowFrames = Number(meta.killerPassWindowFrames ?? 0);
+  const killerPassWindowPasses = Number(meta.killerPassWindowPasses ?? 0);
+  const killerPassWindowRecycles = Number(meta.killerPassWindowRecycles ?? 0);
+  const sustainedPassWindow = Boolean(meta.sustainedPassWindow);
+  const sustainedShotWindow = Boolean(meta.sustainedShotWindow);
+  const passOk = meta.passActivityOk == null ? (!sustainedPassWindow || passAttempts > 0) : Boolean(meta.passActivityOk);
+  const completedOk = meta.completedPassActivityOk == null ? (!sustainedPassWindow || completedPasses > 0) : Boolean(meta.completedPassActivityOk);
+  const shotOk = meta.shotActivityOk == null ? (!sustainedShotWindow || shotAttempts > 0) : Boolean(meta.shotActivityOk);
+  const openSpaceOk = meta.openSpaceSupportOk == null ? true : Boolean(meta.openSpaceSupportOk);
+  const goalwardOk = meta.goalwardProgressOk == null ? true : Boolean(meta.goalwardProgressOk);
+  const centralBrainOperationOrderOk = meta.centralBrainOperationOrderRandomizedOk == null ? true : Boolean(meta.centralBrainOperationOrderRandomizedOk);
+  const operationOrderOk = meta.playerOperationOrderRandomizedOk == null ? true : Boolean(meta.playerOperationOrderRandomizedOk);
+  const ballOperationOrderOk = meta.ballOperationOrderRandomizedOk == null ? true : Boolean(meta.ballOperationOrderRandomizedOk);
+  const officialOperationOrderOk = meta.officialOperationOrderRandomizedOk == null ? true : Boolean(meta.officialOperationOrderRandomizedOk);
+  const decisionModelOk = meta.playerDecisionModelTraceOk == null ? true : Boolean(meta.playerDecisionModelTraceOk);
+  const movementGaitOk = meta.movementGaitVarietyOk == null ? true : Boolean(meta.movementGaitVarietyOk);
+  const agentAccountingOk = meta.agentAccountingOk == null ? true : Boolean(meta.agentAccountingOk);
+  const humanInputOk = meta.humanInputConsumedOk == null ? true : Boolean(meta.humanInputConsumedOk);
+  const clearShotOk = meta.clearShotWindowOk == null ? true : Boolean(meta.clearShotWindowOk);
+  const clearShotShotOk = meta.clearShotWindowShotOk == null ? true : Boolean(meta.clearShotWindowShotOk);
+  const killerPassOk = meta.killerPassWindowOk == null ? true : Boolean(meta.killerPassWindowOk);
+  return {passAttempts, completedPasses, shotAttempts, frameLivenessKnown, offBallOpenSpaceSupportKnown, offBallOpenSpaceMoves, offBallOpenSpaceGain, ballMovementYards, ballGoalwardProgressYards, ballActiveFrames, centralBrainOperationOrderSamples, centralBrainOperationOrderUniqueFirstOps, centralBrainOperationOrderUniqueFullOrders, playerOperationOrderSamples, playerOperationOrderUniqueFirstOps, playerOperationOrderUniqueFullOrders, ballOperationOrderSamples, ballOperationOrderUniqueFirstOps, ballOperationOrderUniqueFullOrders, officialOperationOrderSamples, officialOperationOrderUniqueFirstOps, officialOperationOrderUniqueFullOrders, playerDecisionModelSamples, playerMdpGridSamples, playerPomdpGridSamples, playerActionFacingSamples, playerReceiveFacingSamples, playerGaitSamples, playerUniqueGaits, playerHighIntensityGaitSamples, playerBackwardGaitSamples, playerLateralGaitSamples, agentAccountingFrames, agentAccountingOkFrames, fullRosterFrames, completeScheduleFrames, centralBrainDecisionFrames, ballDecisionFrames, humanControlledPlayerDecisions, humanInputPresentDecisions, humanInputConsumedDecisions, humanInputUniqueControllerSlots, humanInputMaxQueueAgeMs, finalThirdPossessionFrames, insideTwentyPossessionFrames, shotOptionLegalFrames, clearShotWindowFrames, clearShotWindowDecisiveActions, clearShotWindowShots, clearShotWindowRecycles, killerPassWindowFrames, killerPassWindowPasses, killerPassWindowRecycles, sustainedPassWindow, sustainedShotWindow, passOk, completedOk, shotOk, openSpaceOk, goalwardOk, centralBrainOperationOrderOk, operationOrderOk, ballOperationOrderOk, officialOperationOrderOk, decisionModelOk, movementGaitOk, agentAccountingOk, humanInputOk, clearShotOk, clearShotShotOk, killerPassOk};
+}
+function tacticalLivenessLabel() {
+  const live = tacticalLivenessState();
+  const ok = live.passOk && live.completedOk && live.shotOk && live.openSpaceOk && live.goalwardOk && live.centralBrainOperationOrderOk && live.operationOrderOk && live.ballOperationOrderOk && live.officialOperationOrderOk && live.decisionModelOk && live.movementGaitOk && live.agentAccountingOk && live.humanInputOk && live.clearShotOk && live.clearShotShotOk && live.killerPassOk;
+  const support = live.offBallOpenSpaceSupportKnown ? live.offBallOpenSpaceMoves : "?";
+  const goalward = live.frameLivenessKnown ? live.ballGoalwardProgressYards.toFixed(0) : "?";
+  const ops = live.frameLivenessKnown ? `${live.playerOperationOrderUniqueFirstOps}/${live.playerOperationOrderSamples}` : "?";
+  const model = live.frameLivenessKnown ? `${live.playerMdpGridSamples}/${live.playerDecisionModelSamples}` : "?";
+  const agents = live.frameLivenessKnown ? `${live.agentAccountingOkFrames}/${live.agentAccountingFrames}` : "?";
+  const human = live.frameLivenessKnown ? `${live.humanInputConsumedDecisions}/${live.humanInputPresentDecisions}` : "?";
+  const clear = live.frameLivenessKnown ? `${live.clearShotWindowDecisiveActions}/${live.clearShotWindowFrames}` : "?";
+  const killer = live.frameLivenessKnown ? `${live.killerPassWindowPasses}/${live.killerPassWindowFrames}` : "?";
+  const gait = live.frameLivenessKnown ? `${live.playerUniqueGaits}/${live.playerGaitSamples}` : "?";
+  return `P${live.completedPasses}/${live.passAttempts} S${live.shotAttempts} M${model} A${agents} R${ops} V${gait} H${human} C${clear} K${killer} O${support} G${goalward}${ok ? "" : " !"}`;
+}
+function tacticalLivenessTitle() {
+  const live = tacticalLivenessState();
+  const parts = [
+    `pass attempts=${live.passAttempts}`,
+    `completed passes=${live.completedPasses}`,
+    `shots=${live.shotAttempts}`,
+    live.offBallOpenSpaceSupportKnown
+      ? `off-ball open-space moves=${live.offBallOpenSpaceMoves}; gain=${live.offBallOpenSpaceGain.toFixed(2)}`
+      : "off-ball open-space support not measured",
+    live.frameLivenessKnown
+      ? `ball goalward progress=${live.ballGoalwardProgressYards.toFixed(2)}yd; movement=${live.ballMovementYards.toFixed(2)}yd; active frames=${live.ballActiveFrames}`
+      : "ball goalward progress not measured",
+    live.frameLivenessKnown
+      ? `central brain operation-order samples=${live.centralBrainOperationOrderSamples}; first-op diversity=${live.centralBrainOperationOrderUniqueFirstOps}; full-order diversity=${live.centralBrainOperationOrderUniqueFullOrders}`
+      : "central brain operation-order diversity not measured",
+    live.frameLivenessKnown
+      ? `player operation-order samples=${live.playerOperationOrderSamples}; first-op diversity=${live.playerOperationOrderUniqueFirstOps}; full-order diversity=${live.playerOperationOrderUniqueFullOrders}`
+      : "player operation-order diversity not measured",
+    live.frameLivenessKnown
+      ? `ball operation-order samples=${live.ballOperationOrderSamples}; first-op diversity=${live.ballOperationOrderUniqueFirstOps}; full-order diversity=${live.ballOperationOrderUniqueFullOrders}`
+      : "ball operation-order diversity not measured",
+    live.frameLivenessKnown
+      ? `official operation-order samples=${live.officialOperationOrderSamples}; first-op diversity=${live.officialOperationOrderUniqueFirstOps}; full-order diversity=${live.officialOperationOrderUniqueFullOrders}`
+      : "official operation-order diversity not measured",
+    live.frameLivenessKnown
+      ? `decision-model samples=${live.playerDecisionModelSamples}; mdp grid=${live.playerMdpGridSamples}; pomdp grid=${live.playerPomdpGridSamples}; action facing=${live.playerActionFacingSamples}; receive facing=${live.playerReceiveFacingSamples}`
+      : "decision-model liveness not measured",
+    live.frameLivenessKnown
+      ? `movement gaits unique=${live.playerUniqueGaits}; samples=${live.playerGaitSamples}; high-intensity=${live.playerHighIntensityGaitSamples}; backward=${live.playerBackwardGaitSamples}; lateral=${live.playerLateralGaitSamples}`
+      : "movement gait liveness not measured",
+    live.frameLivenessKnown
+      ? `agent accounting frames=${live.agentAccountingOkFrames}/${live.agentAccountingFrames}; full roster=${live.fullRosterFrames}; complete schedule=${live.completeScheduleFrames}; central brain decisions=${live.centralBrainDecisionFrames}; ball decisions=${live.ballDecisionFrames}`
+      : "agent accounting liveness not measured",
+    live.frameLivenessKnown
+      ? `human input decisions=${live.humanInputConsumedDecisions}/${live.humanInputPresentDecisions}; controlled decisions=${live.humanControlledPlayerDecisions}; controller slots=${live.humanInputUniqueControllerSlots}; max queue age=${live.humanInputMaxQueueAgeMs}ms`
+      : "human input liveness not measured",
+    live.frameLivenessKnown
+      ? `clear shot windows=${live.clearShotWindowFrames}; shots=${live.clearShotWindowShots}; decisive=${live.clearShotWindowDecisiveActions}; recycled=${live.clearShotWindowRecycles}; finalThirdPossessionFrames=${live.finalThirdPossessionFrames}; insideTwentyPossessionFrames=${live.insideTwentyPossessionFrames}; shotOptionLegalFrames=${live.shotOptionLegalFrames}`
+      : "clear shot windows not measured",
+    live.frameLivenessKnown
+      ? `killer-pass windows=${live.killerPassWindowFrames}; passes=${live.killerPassWindowPasses}; recycled=${live.killerPassWindowRecycles}`
+      : "killer-pass windows not measured",
+  ];
+  if (!live.passOk) parts.push("20s+ run has no pass attempts");
+  if (!live.completedOk) parts.push("20s+ run has no completed passes");
+  if (!live.shotOk) parts.push("45s+ run has no shots");
+  if (!live.openSpaceOk) parts.push("20s+ run has no off-ball open-space support");
+  if (!live.goalwardOk) parts.push("multi-frame run has no goalward ball progress");
+  if (!live.centralBrainOperationOrderOk) parts.push("central brain internal operation order did not vary");
+  if (!live.operationOrderOk) parts.push("player internal operation order did not vary");
+  if (!live.ballOperationOrderOk) parts.push("ball internal operation order did not vary");
+  if (!live.officialOperationOrderOk) parts.push("official internal operation order did not vary");
+  if (!live.decisionModelOk) parts.push("player MDP/POMDP decision traces are incomplete");
+  if (!live.movementGaitOk) parts.push("player movement stayed in too few gait bands");
+  if (!live.agentAccountingOk) parts.push("agent roster/schedule accounting is incomplete");
+  if (!live.humanInputOk) parts.push("human controller input was observed but not consumed");
+  if (!live.clearShotOk) parts.push("clear 20-yard shot window was recycled");
+  if (!live.killerPassOk) parts.push("threaded goal-pass window was recycled");
+  return parts.join("; ");
+}
+function totalLoadedSeconds() {
+  return Math.max(0, trace.frames.length - 1) * cadenceDtSeconds();
+}
+function bufferedFrameCountAhead() {
+  return Math.max(0, trace.frames.length - 1 - frameIndex);
+}
+function bufferedSeconds() {
+  return bufferedFrameCountAhead() * cadenceDtSeconds();
+}
+function canStartPlayback() {
+  if (trace.frames.length < 2) return false;
+  if (traceFramesComplete) return true;
+  const fps = 10 * Number(speed.value || 1);
+  return bufferedSeconds() >= 3 && recentLoadedFrameRate() > fps * 1.25;
+}
+function setControlsEnabled(enabled) {
+  play.disabled = !enabled;
+  document.getElementById("prev").disabled = !enabled;
+  document.getElementById("next").disabled = !enabled;
+  document.getElementById("capture").disabled = !enabled;
+  document.getElementById("pass").disabled = !enabled;
+  document.getElementById("shoot").disabled = !enabled;
+  carryActionButton.disabled = !enabled;
+  protectActionButton.disabled = !enabled;
+  killerPassActionButton.disabled = !enabled;
+  clearanceActionButton.disabled = !enabled;
+  routeOneActionButton.disabled = !enabled;
+  scrub.disabled = !enabled;
+  passTarget.disabled = !enabled;
+  passFlight.disabled = !enabled;
+}
+function resetTraceState() {
+  playing = false;
+  frameIndex = 0;
+  lastTs = 0;
+  activeSlot = 0;
+  traceFramesComplete = false;
+  uiReady = false;
+  trace.config = {...FALLBACK_CONFIG};
+  trace.summary = {ticks: 0, stats: emptyStats()};
+  trace.cadence = null;
+  trace.agentContract = null;
+  trace.decisionModel = null;
+  trace.controllerContract = null;
+  trace.physicsContract = null;
+  trace.learningContract = null;
+  trace.stepTiming = null;
+  trace.controllerYield = null;
+  trace.tacticalLiveness = null;
+  trace.frames = [];
+  trace.events = [];
+  trace.runId = null;
+  trace.generatedAtUnixMs = null;
+  resetRecentLoadRate();
+  slots.innerHTML = "";
+  passTarget.innerHTML = "";
+  scrub.value = 0;
+  scrub.max = 0;
+  keys.clear();
+  updateMetrics();
+}
+function runIdLabel() {
+  const id = trace.runId == null ? "" : String(trace.runId);
+  if (!id) return "-";
+  const generated = Number(trace.generatedAtUnixMs || 0);
+  const at = generated > 0 ? new Date(generated).toLocaleTimeString() : "";
+  const shortId = id.length > 18 ? id.slice(-18) : id;
+  return at ? `${shortId} ${at}` : shortId;
+}
+function traceRunKey() {
+  const id = trace.runId == null ? "" : String(trace.runId);
+  const generated = trace.generatedAtUnixMs == null ? "" : String(trace.generatedAtUnixMs);
+  const seed = trace.config?.seed == null ? "" : String(trace.config.seed);
+  if (!id && !generated && !seed) return "";
+  return `${id}|${generated}|${seed}`;
+}
+function assertFreshRunLoaded(previousRunKey) {
+  if (!previousRunKey) return;
+  const nextRunKey = traceRunKey();
+  if (nextRunKey && nextRunKey === previousRunKey) {
+    throw new Error("fresh run returned the previous split trace");
+  }
+}
+function updatePlaybackAvailability() {
+  const enabled = canStartPlayback();
+  setControlsEnabled(enabled);
+  runNewSimButton.disabled = runningNewSimulation;
+  if (enabled && !traceFramesComplete) {
+    loadingOverlay.classList.add("playable");
+  } else {
+    loadingOverlay.classList.remove("playable");
+  }
+  if (!enabled) {
+    play.textContent = "Loading";
+  } else if (!playing) {
+    play.textContent = "Play";
+  }
+}
+function updateLoadingProgress(loadedBytes = 0, totalBytes = 0, message = "Loading match data") {
+  const expectedFrames = expectedFrameCount();
+  const framePercent = expectedFrames > 0 ? Math.min(100, trace.frames.length / expectedFrames * 100) : 0;
+  const bytePercent = totalBytes > 0 ? Math.min(100, loadedBytes / totalBytes * 100) : 0;
+  const percent = totalBytes > 0 ? bytePercent : framePercent;
+  loadingBar.style.width = `${Math.max(percent, trace.frames.length ? 4 : 1).toFixed(1)}%`;
+  const ready = canStartPlayback() && !traceFramesComplete ? "Playback ready" : message;
+  setLoadingTitle(ready);
+  const rate = recentLoadedFrameRate();
+  loadingStatus.textContent = `${ready}; ${trace.frames.length}/${expectedFrames || "?"} frames; ${bufferedSeconds().toFixed(1)}s ahead; ${totalLoadedSeconds().toFixed(1)}s loaded; ${rate.toFixed(1)} fps recent`;
+  const frameProgress = expectedFrames > 0 ? `${trace.frames.length} / ${expectedFrames} frames` : `${trace.frames.length} frames`;
+  loadingBytes.textContent = totalBytes > 0
+    ? `${formatBytes(loadedBytes)} / ${formatBytes(totalBytes)}; ${frameProgress}`
+    : `${formatBytes(loadedBytes)} streamed; ${frameProgress}`;
+  loadingProgress.setAttribute("aria-valuenow", percent.toFixed(1));
+  loadingProgress.setAttribute(
+    "aria-valuetext",
+    totalBytes > 0
+      ? `${percent.toFixed(1)} percent; ${loadingBytes.textContent}; ${loadingStatus.textContent}`
+      : `Streaming; ${loadingBytes.textContent}; ${loadingStatus.textContent}`
+  );
+  updatePlaybackAvailability();
+}
+function hideLoadingOverlay() {
+  loadingOverlay.classList.add("hidden");
+}
+function initializeUiWhenReady() {
+  if (uiReady || !trace.frames.length) return;
+  uiReady = true;
+  scrub.max = Math.max(0, trace.frames.length - 1);
+  buildSlots();
+  updateMetrics();
+  render();
+}
+
+function phaseLabel(v) {
+  return String(v || "").replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+function flankPolicyLabel(d) {
+  const policy = String(d?.flankAttackPolicy || "none");
+  if (!policy || policy === "none") return "";
+  const overlap = Number(d?.flankOverlapRunProbability ?? 0);
+  const overlapText = overlap > 0 ? ` O${Math.round(overlap * 100)}%` : "";
+  if (policy === "playDownFlankLowCross") return ` LowX${overlapText}`;
+  if (policy === "playDownFlankHighCross") return ` HighX${overlapText}`;
+  return ` ${phaseLabel(policy)}${overlapText}`;
+}
+function directiveLabel(d) {
+  if (!d) return "P0.00 R0.00";
+  return `P${Number(d.pressIntensity ?? 0).toFixed(2)} R${Number(d.riskTolerance ?? 0).toFixed(2)}${flankPolicyLabel(d)}`;
+}
+function teamBrainModeLabel(mode) {
+  const v = String(mode || "").toLowerCase();
+  if (v === "attack") return "Atk";
+  if (v === "buildup" || v === "build-up") return "Build";
+  if (v === "defend") return "Def";
+  if (v === "kickoff") return "KO";
+  return "Tran";
+}
+function teamBrainLabel(brain, fallbackDirective) {
+  if (!brain) return directiveLabel(fallbackDirective);
+  const d = brain.directive || fallbackDirective || {};
+  const target = Number(brain.defensiveCoverTarget ?? d.defensiveCoverTarget ?? 0);
+  const actual = Number(brain.defensiveCoverActual ?? d.defensiveCoverActual ?? 0);
+  const cover = target > 0 ? ` C${actual}/${target >= 4 ? "4+" : target}` : "";
+  const actions = Number(brain.policyActionEntries ?? 0);
+  const targets = Number(brain.policyTargetEntries ?? 0);
+  const flank = flankPolicyLabel(d);
+  const centroid = brain.teamCentroid;
+  const shape = centroid
+    ? ` T${Number(centroid.x ?? 0).toFixed(0)},${Number(centroid.y ?? 0).toFixed(0)} W${Number(brain.teamSpreadYards ?? 0).toFixed(0)} NB${Number(brain.playersNearBall ?? 0)}`
+    : "";
+  return `${teamBrainModeLabel(brain.mode)} P${Number(brain.pressIntensity ?? d.pressIntensity ?? 0).toFixed(2)} R${Number(brain.riskTolerance ?? d.riskTolerance ?? 0).toFixed(2)}${cover} Q${actions}/${targets}${flank}${shape}`;
+}
+function centralBrainControllerAssignmentLabel(b) {
+  const assignments = Array.isArray(b?.controllerAssignments) ? b.controllerAssignments : [];
+  const humans = Number(b?.controlledHumanPlayers ?? assignments.length);
+  if (!humans && assignments.length === 0) return "";
+  const slots = assignments
+    .slice(0, 4)
+    .map(a => `S${Number(a.controllerSlot ?? 0) + 1}#${Number(a.playerId ?? 0)}`)
+    .join(",");
+  return slots ? ` H${humans} ${slots}` : ` H${humans}`;
+}
+function centralBrainShapeLabel(b) {
+  const shapeText = (prefix, shape) => {
+    if (!shape) return "";
+    const dist = Number(shape.centroidToBallYards ?? 0).toFixed(0);
+    const spread = Number(shape.spreadYards ?? 0).toFixed(0);
+    const near = Number(shape.playersNearBall ?? 0);
+    const forward = Number(shape.forwardVelocityYps ?? 0).toFixed(1);
+    return ` ${prefix}${dist} W${spread} NB${near} V${forward}`;
+  };
+  return `${shapeText("H", b?.homeShape)}${shapeText("A", b?.awayShape)}`;
+}
+function centralBrainBallKinematics(b) {
+  return Array.isArray(b?.ballKinematics) ? b.ballKinematics : null;
+}
+function centralBrainBallVec(b, key, offset) {
+  if (b?.[key]) return b[key];
+  const compact = centralBrainBallKinematics(b);
+  return {x: Number(compact?.[offset] ?? 0), y: Number(compact?.[offset + 1] ?? 0)};
+}
+function centralBrainLabel(b) {
+  if (!b) return "22p 3o Loose";
+  const players = Array.isArray(b.trackedPlayers) ? b.trackedPlayers.length : 0;
+  const officials = Number(b.trackedOfficials ?? 0);
+  const schedule = playbackScheduleSlotLabel(b.scheduledIndex);
+  const possession = b.possessionTeam || "Loose";
+  const holder = b.ballHolder == null ? "" : ` #${b.ballHolder}`;
+  const center = b.centerOfPlay;
+  const centerText = center ? ` C${Number(center.x ?? 0).toFixed(0)},${Number(center.y ?? 0).toFixed(0)}` : "";
+  const compactBall = centralBrainBallKinematics(b);
+  const ballSpeed = vecLen(centralBrainBallVec(b, "ballVelocity", 2));
+  const ballAccel = vecLen(centralBrainBallVec(b, "ballAcceleration", 4));
+  const ballJerk = vecLen(centralBrainBallVec(b, "ballJerk", 6));
+  const ballZ = Number(b.ballAltitudeYards ?? compactBall?.[8] ?? 0);
+  const ballSchedule = playbackScheduleSlotLabel(b.ballScheduledIndex);
+  const ballAction = b.ballLastAction ? ` ${b.ballLastAction}` : "";
+  const ballText = ` B${ballSpeed.toFixed(0)}/${ballAccel.toFixed(0)}/${ballJerk.toFixed(0)} z${ballZ.toFixed(1)}${ballSchedule}${ballAction}`;
+  const controllerText = centralBrainControllerAssignmentLabel(b);
+  const shapeText = centralBrainShapeLabel(b);
+  return `${players}p ${officials}o${schedule} ${possession}${holder}${controllerText}${centerText}${shapeText}${ballText}`;
+}
+function agentScheduleGlyph(entry) {
+  if (!entry) return "?";
+  if (entry.kind === "centralBrain") return "C";
+  if (entry.kind === "player") return `P${entry.id}`;
+  if (entry.kind === "official") return `O${entry.id}`;
+  if (entry.kind === "ball") return "B";
+  return String(entry.id ?? "?");
+}
+function agentScheduleEntriesForFrame(f) {
+  if (Array.isArray(f?.agentSchedule) && f.agentSchedule.length) return f.agentSchedule;
+  const entries = [];
+  for (const p of f?.players || []) {
+    if (Number.isInteger(p.scheduledIndex)) {
+      entries.push({kind: "player", id: p.id, scheduledIndex: p.scheduledIndex});
+    }
+  }
+  for (const o of f?.officials || []) {
+    if (Number.isInteger(o.scheduledIndex)) {
+      entries.push({kind: "official", id: o.id, scheduledIndex: o.scheduledIndex});
+    }
+  }
+  if (Number.isInteger(f?.ball?.scheduledIndex)) {
+    entries.push({kind: "ball", id: 0, scheduledIndex: f.ball.scheduledIndex});
+  }
+  entries.sort((a, b) => Number(a.scheduledIndex ?? 0) - Number(b.scheduledIndex ?? 0));
+  return entries;
+}
+function agentScheduleSummaryForFrame(f) {
+  const summary = f?.agentScheduleSummary;
+  if (summary && Number.isFinite(Number(summary.totalAgents))) return summary;
+  const schedule = agentScheduleEntriesForFrame(f);
+  const contract = trace.agentContract || trace.playback?.agentContract || null;
+  const players = schedule.filter(entry => entry.kind === "player").length;
+  const officials = schedule.filter(entry => entry.kind === "official").length;
+  const hasBall = schedule.some(entry => entry.kind === "ball");
+  const hasCentral = schedule.some(entry => entry.kind === "centralBrain");
+  const expectedPlayers = Number(contract?.expectedPlayerCount ?? players);
+  const expectedOfficials = Number(contract?.expectedOfficialCount ?? officials);
+  const expectedTotal = Number(contract?.expectedTotalAgents ?? schedule.length);
+  const expectedFieldShuffle = Number(contract?.expectedFieldShuffleAgents ?? Math.max(0, expectedTotal - 1));
+  const fieldShuffleAgents = schedule.filter(entry => entry.kind !== "centralBrain").length;
+  return {
+    totalAgents: schedule.length,
+    expectedTotalAgents: expectedTotal,
+    fieldShuffleAgents,
+    expectedFieldShuffleAgents: expectedFieldShuffle,
+    playerCount: players,
+    expectedPlayerCount: expectedPlayers,
+    officialCount: officials,
+    expectedOfficialCount: expectedOfficials,
+    ballCount: hasBall ? 1 : 0,
+    expectedBallCount: Number(contract?.expectedBallAgents ?? 1),
+    centralBrainCount: hasCentral ? 1 : 0,
+    duplicateAgents: 0,
+    centralBrainFirst: schedule[0]?.kind === "centralBrain",
+    complete: schedule.length === expectedTotal
+      && fieldShuffleAgents === expectedFieldShuffle
+      && players === expectedPlayers
+      && officials === expectedOfficials
+      && hasBall
+      && hasCentral
+  };
+}
+function agentScheduleCoverageLabel(schedule) {
+  const players = schedule.filter(entry => entry.kind === "player").length;
+  const officials = schedule.filter(entry => entry.kind === "official").length;
+  const hasBall = schedule.some(entry => entry.kind === "ball");
+  const hasCentral = schedule.some(entry => entry.kind === "centralBrain");
+  return `${hasCentral ? "C+" : ""}${players}p/${officials}o${hasBall ? "/B" : ""}`;
+}
+function agentScheduleSummaryLabel(f) {
+  const s = agentScheduleSummaryForFrame(f);
+  if (!s || Number(s.totalAgents || 0) <= 0) return "shuffle pending";
+  const central = Number(s.centralBrainCount || 0) > 0 ? "C+" : "";
+  const ball = Number(s.ballCount || 0) > 0 ? "/B" : "";
+  const expected = Number(s.expectedTotalAgents || 0);
+  const total = Number(s.totalAgents || 0);
+  const field = Number(s.fieldShuffleAgents || 0);
+  const expectedField = Number(s.expectedFieldShuffleAgents || 0);
+  const fieldText = expectedField > 0 ? ` F${field}/${expectedField}` : "";
+  const complete = s.complete ? " ok" : ` ${total}/${expected || "?"}`;
+  return `${central}${Number(s.playerCount || 0)}p/${Number(s.officialCount || 0)}o${ball}${fieldText}${complete}`;
+}
+function agentScheduleFullLabel(f) {
+  const schedule = agentScheduleEntriesForFrame(f);
+  if (!Array.isArray(schedule) || schedule.length === 0) return agentScheduleSummaryLabel(f);
+  return `${agentScheduleSummaryLabel(f)} ${schedule.map(agentScheduleGlyph).join(" ")}`;
+}
+function agentScheduleLabel(f) {
+  const schedule = agentScheduleEntriesForFrame(f);
+  if (!Array.isArray(schedule) || schedule.length === 0) return agentScheduleSummaryLabel(f);
+  const prefix = schedule.slice(0, 6).map(agentScheduleGlyph).join(" ");
+  const ball = schedule.find(entry => entry.kind === "ball");
+  const suffix = ball ? ` ... ${agentScheduleGlyph(ball)}` : "";
+  return `${agentScheduleSummaryLabel(f)} ${prefix}${suffix}`;
+}
+function playbackScheduleSlotLabel(value) {
+  return Number.isInteger(value) ? ` S${value}` : "";
+}
+function operationOrderLabel(order, limit = 3) {
+  if (!Array.isArray(order) || order.length === 0) return "";
+  const head = order.slice(0, limit).map(item => String(item).replace(/-/g, " ")).join(" > ");
+  return order.length > limit ? `${head} +${order.length - limit}` : head;
+}
+function playbackBallAgentLabel(ball) {
+  const action = String(ball?.lastAction || "waiting");
+  const schedule = playbackScheduleSlotLabel(ball?.scheduledIndex);
+  const holder = ball?.holder == null ? "" : ` #${ball.holder}`;
+  const decisionSpeed = Number(ball?.decisionSpeedYps ?? vecLen(ball?.velocity || {x: 0, y: 0}));
+  const decisionAltitude = Number(ball?.decisionAltitudeYards ?? ball?.altitudeYards ?? 0);
+  const decisionCurl = Number(ball?.decisionCurlYps2 ?? 0);
+  const physics = ` v${decisionSpeed.toFixed(1)} z${decisionAltitude.toFixed(1)} c${decisionCurl.toFixed(1)}`;
+  const ops = operationOrderLabel(ball?.operationOrder, 2);
+  return `${action}${schedule}${holder}${physics}${ops ? ` ${ops}` : ""}`;
+}
+function officialKindShortLabel(kind) {
+  if (kind === "centerReferee") return "CR";
+  if (kind === "assistantRefereeNear") return "AR-N";
+  if (kind === "assistantRefereeFar") return "AR-F";
+  return String(kind || "Ref");
+}
+function officialAgentsLabel(f) {
+  const officials = Array.isArray(f?.officials) ? f.officials : [];
+  if (!officials.length) return "waiting";
+  return officials.map(o => {
+    const action = String(o.lastAction || "track");
+    return `${officialKindShortLabel(o.kind)} ${action}${playbackScheduleSlotLabel(o.scheduledIndex)}`;
+  }).join(" | ");
+}
+function officialAgentsTitle(f) {
+  const officials = Array.isArray(f?.officials) ? f.officials : [];
+  if (!officials.length) return "No official agent traces";
+  return officials.map(o => {
+    const ops = Array.isArray(o.operationOrder) && o.operationOrder.length
+      ? o.operationOrder.join(" > ")
+      : "no operation order";
+    const kinematics = officialHistoryKinematicsLabel(o, trace.config?.dtSeconds, playbackOfficialHistoryForFrame(o.id));
+    return `${officialKindShortLabel(o.kind)}: ${String(o.lastAction || "track")} ${kinematics} ${ops}`;
+  }).join("\n");
+}
+function primaryIntent(f) {
+  const intents = Array.isArray(f?.intents) ? f.intents : [];
+  if (!intents.length) return null;
+  return intents.find(i => i.playerId === f.ball?.holder) || intents[0];
+}
+function intentLabel(i) {
+  if (!i) return "Idle";
+  const action = String(i.action || "move").replace(/-/g, " ");
+  const flight = i.flight === "aerial" ? " A" : "";
+  const actionProbability = Number(i.actionProbability ?? 0);
+  const tickProbability = Number(i.actionTickProbability ?? actionProbability);
+  const considered = Number(i.consideredActions ?? 0);
+  const probabilityLabel = considered > 0
+    ? ` P${actionProbability.toFixed(2)} T${tickProbability.toFixed(2)}`
+    : "";
+  return `${i.playerId} ${action}${flight} U${Number(i.urgency ?? 0).toFixed(2)}${probabilityLabel}${intentTargetGridLabel(i)}`;
+}
+function liveIntentTitle(decision) {
+  if (!decision) return "";
+  const pressure = Number(decision.decisiveGoalActionPressure ?? 0);
+  const killer = Number(decision.killerPassGoalPressure ?? 0);
+  const single = Number(decision.singleThreadGoalPressure ?? 0);
+  const outlets = Number(decision.openSupportOutlets ?? 0);
+  const space = Number(decision.targetOpenSpaceScore ?? 0);
+  const teammatePressure = Number(decision.targetTeammateOccupiedSpacePressure ?? 0);
+  const parts = [
+    `action=${String(decision.action || "move")}`,
+    `player=${Number(decision.playerId ?? 0)}`,
+    `D${pressure.toFixed(2)} K${killer.toFixed(2)} 1P${single.toFixed(2)}`,
+    `O${outlets.toFixed(0)} S${space.toFixed(1)} TP${teammatePressure.toFixed(2)}`,
+    `openSupportOutlets=${outlets.toFixed(0)}`,
+    `targetOpenSpaceScore=${space.toFixed(2)}`,
+    `targetTeammateOccupiedSpacePressure=${teammatePressure.toFixed(2)}`,
+    `singleThreadLearn=${decision.singleThreadGoalPressureLearningFeatureEnabled}`,
+    `supportTargetSpace=${decision.supportTargetOpenSpaceMetricsEnabled}`,
+    `shotKillerFloor=${decision.shotKillerPassFamilyProbabilityFloorEnabled}`,
+  ];
+  if (decision.actionTarget) {
+    parts.push(`target=${JSON.stringify(decision.actionTarget)}`);
+  }
+  return parts.join("; ");
+}
+function selectedPlayerDecisionProbabilityLabel(p) {
+  const compactConsidered = Number(p?.consideredActions ?? 0);
+  if (compactConsidered > 0) {
+    const actionProbability = Number(p?.actionProbability ?? 0);
+    const tickProbability = Number(p?.actionTickProbability ?? actionProbability);
+    return ` P${actionProbability.toFixed(2)} T${tickProbability.toFixed(2)} C${compactConsidered}`;
+  }
+  const decision = p?.lastDecision;
+  const options = Array.isArray(decision?.actionOptions) ? decision.actionOptions : [];
+  const legal = options.filter(option => option?.legal !== false);
+  if (!legal.length) return "";
+  const action = String(decision?.action || "").toLowerCase();
+  const selected = legal.find(option => String(option?.label || "").toLowerCase() === action) || legal[0];
+  const actionProbability = Number(selected?.probability ?? 0);
+  const tickProbability = Number(selected?.tickProbability ?? actionProbability);
+  return ` P${actionProbability.toFixed(2)} T${tickProbability.toFixed(2)} C${legal.length}`;
+}
+function selectedPlayerSkillBandLabel(p) {
+  const skills = p?.skillBands || {};
+  const compactBand = index => parseInt(String(skills || "").charAt(index) || "0", 36) || 0;
+  const band = (name, index) => Number(typeof skills === "string" ? compactBand(index) : Array.isArray(skills) ? skills[index] : skills[name] ?? 0);
+  const speed = band("speed", 0);
+  const acceleration = band("acceleration", 1);
+  const shooting = band("shooting", 3);
+  const passing = band("passing", 4);
+  const dribbling = band("dribbling", 5);
+  const defending = band("defending", 6);
+  if (![speed, acceleration, shooting, passing, dribbling, defending].some(v => v > 0)) return "";
+  return `Sk Sp${speed}/Ac${acceleration}/Sh${shooting}/Pa${passing}/Dr${dribbling}/Df${defending}`;
+}
+function pitchGridAddressFromPosition(position) {
+  const config = trace.config || FALLBACK_CONFIG;
+  const fieldWidth = Math.max(1, Number(config.fieldWidthYards || 80));
+  const fieldLength = Math.max(1, Number(config.fieldLengthYards || 120));
+  const cell = (level, columns, rows, parentId) => {
+    const x = Math.max(0, Math.min(columns - 1, Math.floor(Number(position?.x ?? 0) / fieldWidth * columns)));
+    const y = Math.max(0, Math.min(rows - 1, Math.floor(Number(position?.y ?? 0) / fieldLength * rows)));
+    const id = y * columns + x;
+    return {level, columns, rows, x, y, id, parentId};
+  };
+  const macroZone = cell("Macro", 3, 4, 0);
+  const tactical = cell("Tactical", 6, 8, macroZone.id);
+  const fine = cell("Fine", 12, 16, tactical.id);
+  return {fine, tactical, macroZone, wholePitch: {level: "WholePitch", columns: 1, rows: 1, x: 0, y: 0, id: 0, parentId: null}};
+}
+function gridCellFromCompact(parts) {
+  if (!Array.isArray(parts)) return null;
+  return {id: Number(parts[0] ?? 0), parentId: Number(parts[1] ?? 0), x: Number(parts[2] ?? 0), y: Number(parts[3] ?? 0)};
+}
+function intentTargetGridLabel(i) {
+  const compact = i?.targetGrid;
+  if (!compact?.f || !compact?.t || !compact?.m) return "";
+  const fine = gridCellFromCompact(compact.f);
+  const tactical = gridCellFromCompact(compact.t);
+  const macro = gridCellFromCompact(compact.m);
+  const facing = i?.targetFacing ? ` F${i.targetFacing}` : "";
+  return ` G${fine?.id ?? 0}/${tactical?.id ?? 0}/${macro?.id ?? 0}${facing}`;
+}
+function gridAddressForPlayer(p) {
+  const compact = p?.playerGrid;
+  if (compact?.f && compact?.t && compact?.m) {
+    return {
+      fine: gridCellFromCompact(compact.f),
+      tactical: gridCellFromCompact(compact.t),
+      macroZone: gridCellFromCompact(compact.m),
+    };
+  }
+  return compact || p?.lastDecision?.observation?.playerGrid || pitchGridAddressFromPosition(p?.position);
+}
+function selectedPlayerGridFacingLabel(p) {
+  const grid = gridAddressForPlayer(p);
+  const fine = grid?.fine || {};
+  const tactical = grid?.tactical || {};
+  const macro = grid?.macroZone || grid?.macro_zone || {};
+  const receive = String(p?.receiveFacing || p?.lastDecision?.observation?.receiveFacing || "Unknown");
+  const action = String(p?.actionFacing || p?.lastDecision?.observation?.actionFacing || "Unknown");
+  return ` G${fine.id ?? 0}/${tactical.id ?? 0}/${macro.id ?? 0} F${receive}->${action}`;
+}
+function gridDimensionsForLevel(level) {
+  if (level === "fine") return {columns: 12, rows: 16, label: "Fine"};
+  if (level === "tactical") return {columns: 6, rows: 8, label: "Tactical"};
+  if (level === "macro") return {columns: 3, rows: 4, label: "Macro"};
+  return null;
+}
+function gridCellForLevel(grid, level) {
+  if (!grid) return null;
+  if (level === "fine") return grid.fine || null;
+  if (level === "tactical") return grid.tactical || null;
+  if (level === "macro") return grid.macroZone || grid.macro_zone || null;
+  return null;
+}
+function selectedGridAddress() {
+  const p = selectedPlayerSnapshot();
+  return p ? gridAddressForPlayer(p) : null;
+}
+function fieldRectForGridCell(cell, level) {
+  const dims = gridDimensionsForLevel(level);
+  if (!cell || !dims) return null;
+  const columns = Math.max(1, Number(cell.columns ?? dims.columns));
+  const rows = Math.max(1, Number(cell.rows ?? dims.rows));
+  return {
+    x: Number(cell.x ?? 0) / columns,
+    y: Number(cell.y ?? 0) / rows,
+    w: 1 / columns,
+    h: 1 / rows,
+    columns,
+    rows,
+    label: dims.label
+  };
+}
+function compactNumber(value, digits = 2) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number.toFixed(digits) : Number(0).toFixed(digits);
+}
+function compactYards(value) {
+  const number = Number(value ?? 0);
+  if (!Number.isFinite(number)) return "0y";
+  return `${Math.round(number)}y`;
+}
+function selectedPlayerPomdpLabel(p = selectedPlayerSnapshot()) {
+  const decision = p?.lastDecision;
+  const observation = decision?.observation;
+  if (!observation) return "-";
+  const ballState = observation.hasBall ? "B" : "NoB";
+  const duel = observation.looseBallFiftyFifty ? " 50:50" : "";
+  const goal = `G${compactYards(observation.yardsToGoal)}`;
+  const pressure = `P${compactNumber(observation.perceivedPressure)} U${compactNumber(observation.decisionUrgency)}`;
+  const pass = `F${Number(observation.visibleForwardPassOptions ?? 0)}/${Number(observation.visiblePassOptions ?? 0)} O${Number(observation.openSupportOutlets ?? 0)} C${compactNumber(observation.expectedPassCompletion)}`;
+  const shot = `S${observation.shotLaneOpen ? "O" : "B"} ${compactNumber(observation.shotBeatGoalkeeperProbability)}`;
+  return `${ballState}${duel} ${goal} ${pressure} ${pass} ${shot}`;
+}
+function selectedPlayerPomdpTitle(p = selectedPlayerSnapshot()) {
+  const decision = p?.lastDecision;
+  const observation = decision?.observation;
+  if (!observation) return "No selected-player decision trace";
+  const state = decision?.mdpState || {};
+  const grid = observation.playerGrid || state.playerGrid || gridAddressForPlayer(p);
+  const fine = grid?.fine || {};
+  const tactical = grid?.tactical || {};
+  const macro = grid?.macroZone || grid?.macro_zone || {};
+  const parts = [
+    `Action: ${String(decision.action || p?.lastAction || "-")}`,
+    `State: phase=${String(state.phase || "-")} possession=${String(state.possessionTeam ?? "-")} grid=${fine.id ?? 0}/${tactical.id ?? 0}/${macro.id ?? 0} facing=${String(observation.receiveFacing || state.receiveFacing || "Unknown")}->${String(observation.actionFacing || state.actionFacing || "Unknown")}`,
+    `Goal: toGoal=${compactYards(observation.yardsToGoal)} ownGoal=${compactYards(observation.yardsToOwnGoal)} angle=${compactNumber(observation.opponentGoalAngleDegrees, 1)} forwardSpace=${compactYards(observation.forwardDribbleSpaceYards)}`,
+    `Pressure: real=${compactNumber(observation.realPressure)} perceived=${compactNumber(observation.perceivedPressure)} urgency=${compactNumber(observation.decisionUrgency)} attack=${compactNumber(observation.offensiveUrgency)} defend=${compactNumber(observation.defensiveUrgency)}`,
+    `Pass: visible=${Number(observation.visiblePassOptions ?? 0)} forward=${Number(observation.visibleForwardPassOptions ?? 0)} aerial=${Number(observation.visibleAerialPassOptions ?? 0)} openSupport=${Number(observation.openSupportOutlets ?? 0)} completion=${compactNumber(observation.expectedPassCompletion)} aerialCompletion=${compactNumber(observation.expectedAerialPassCompletion)} openness=${compactNumber(observation.bestForwardPassReceiverOpenness)} lane=${compactNumber(observation.floorPassLaneScore)} stride=${compactNumber(observation.bestPassStrideFit)}`,
+    `Shot: lane=${observation.shotLaneOpen ? "open" : "blocked"} block=${compactNumber(observation.shotBlockProbability)} onFrame=${compactNumber(observation.shotOnFrameProbability)} beatGK=${compactNumber(observation.shotBeatGoalkeeperProbability)} curl=${compactNumber(observation.shotCurlProbability)}`,
+    `Loose: loose=${observation.looseBall ? "yes" : "no"} duel=${observation.looseBallFiftyFifty ? "yes" : "no"} timeToBall=${compactNumber(observation.looseBallPlayerTimeToBallSeconds)} advantage=${compactNumber(observation.looseBallTeamTimeAdvantageSeconds)}`,
+  ];
+  return parts.join("\n");
+}
+function vecLen(v) {
+  if (!v) return 0;
+  return Math.hypot(Number(v.x || 0), Number(v.y || 0));
+}
+function finiteVec2(v) {
+  const point = v?.position || v;
+  return {
+    x: Number(point?.x ?? 0),
+    y: Number(point?.y ?? 0),
+  };
+}
+function vecSub(a, b) {
+  return {x: Number(a?.x ?? 0) - Number(b?.x ?? 0), y: Number(a?.y ?? 0) - Number(b?.y ?? 0)};
+}
+function vecScale(v, scale) {
+  return {x: Number(v?.x ?? 0) * scale, y: Number(v?.y ?? 0) * scale};
+}
+function vecDot(a, b) {
+  return Number(a?.x ?? 0) * Number(b?.x ?? 0) + Number(a?.y ?? 0) * Number(b?.y ?? 0);
+}
+function pointSegmentDistance(point, a, b) {
+  const ab = vecSub(b, a);
+  const len2 = Math.max(1e-9, vecDot(ab, ab));
+  const t = Math.max(0, Math.min(1, vecDot(vecSub(point, a), ab) / len2));
+  const closest = {x: Number(a?.x ?? 0) + ab.x * t, y: Number(a?.y ?? 0) + ab.y * t};
+  return vecLen(vecSub(point, closest));
+}
+function staticShotLaneOpenToTarget(frame, player, target) {
+  if (!frame || !player || !Array.isArray(frame.players)) return true;
+  const blockRadiusYards = 2.2;
+  return !frame.players.some(other =>
+    other.team !== player.team
+      && pointSegmentDistance(other.position, player.position, target) <= blockRadiusYards
+      && vecDot(vecSub(other.position, player.position), vecSub(target, player.position)) > 0
+  );
+}
+function staticShotLaneTargets(goalY) {
+  const fieldWidth = Number(config.fieldWidthYards || 80);
+  const goalWidth = Number(config.goalWidthYards || 8);
+  const centerX = fieldWidth * 0.5;
+  const halfGoal = Math.max(1, goalWidth) * 0.5;
+  return [-0.92, -0.46, 0, 0.46, 0.92].map(fraction => ({
+    x: Math.max(0, Math.min(fieldWidth, centerX + halfGoal * fraction)),
+    y: goalY,
+  }));
+}
+function staticShotLaneOpen(frame, player, goalY) {
+  return staticShotLaneTargets(goalY).some(target => staticShotLaneOpenToTarget(frame, player, target));
+}
+function historyKinematicsFromPositions(history, dtSeconds) {
+  const samples = Array.isArray(history) ? history.map(finiteVec2) : [];
+  const dt = Math.max(1e-6, Number(dtSeconds || trace.config?.dtSeconds || 0.1));
+  const last = samples.length - 1;
+  const velocity = samples.length >= 2 ? vecScale(vecSub(samples[last], samples[last - 1]), 1 / dt) : null;
+  if (samples.length < 3) return {samples: samples.length, velocity, acceleration: null, jerk: null};
+  const v0 = vecScale(vecSub(samples[last - 1], samples[last - 2]), 1 / dt);
+  const v1 = velocity;
+  const acceleration = vecScale(vecSub(v1, v0), 1 / dt);
+  if (samples.length < 4) return {samples: samples.length, velocity, acceleration, jerk: null};
+  const vMinus = vecScale(vecSub(samples[last - 2], samples[last - 3]), 1 / dt);
+  const a0 = vecScale(vecSub(v0, vMinus), 1 / dt);
+  const jerk = vecScale(vecSub(acceleration, a0), 1 / dt);
+  return {samples: samples.length, velocity, acceleration, jerk};
+}
+function playbackPlayerHistoryForFrame(playerId, index = frameIndex) {
+  if (playerId == null) return [];
+  const start = Math.max(0, Number(index || 0) - 49);
+  return trace.frames.slice(start, Number(index || 0) + 1)
+    .map(frame => frame.players?.find(player => player.id === playerId)?.position)
+    .filter(Boolean);
+}
+function playerHistoryKinematicsLabel(p, dtSeconds = trace.config?.dtSeconds, history = null) {
+  const sourceHistory = Array.isArray(history) ? history : p?.positionHistory;
+  const k = historyKinematicsFromPositions(sourceHistory, dtSeconds);
+  const velocity = k.velocity || p?.velocity || {x: 0, y: 0};
+  const acceleration = k.acceleration || p?.acceleration || {x: 0, y: 0};
+  const jerk = k.jerk || p?.jerk || {x: 0, y: 0};
+  return `H${k.samples} V${vecLen(velocity).toFixed(1)} A${vecLen(acceleration).toFixed(1)} J${vecLen(jerk).toFixed(1)}`;
+}
+function playbackOfficialHistoryForFrame(officialId, index = frameIndex) {
+  if (officialId == null) return [];
+  const start = Math.max(0, Number(index || 0) - 49);
+  return trace.frames.slice(start, Number(index || 0) + 1)
+    .map(frame => frame.officials?.find(official => official.id === officialId)?.position)
+    .filter(Boolean);
+}
+function officialHistoryKinematicsLabel(o, dtSeconds = trace.config?.dtSeconds, history = null) {
+  const sourceHistory = Array.isArray(history) ? history : o?.positionHistory || playbackOfficialHistoryForFrame(o?.id);
+  const k = historyKinematicsFromPositions(sourceHistory, dtSeconds);
+  const velocity = k.velocity || o?.velocity || {x: 0, y: 0};
+  const acceleration = k.acceleration || o?.acceleration || {x: 0, y: 0};
+  const jerk = k.jerk || o?.jerk || {x: 0, y: 0};
+  return `H${k.samples} V${vecLen(velocity).toFixed(1)} A${vecLen(acceleration).toFixed(1)} J${vecLen(jerk).toFixed(1)}`;
+}
+function playbackBallHistoryForFrame(index = frameIndex) {
+  const start = Math.max(0, Number(index || 0) - 49);
+  return trace.frames.slice(start, Number(index || 0) + 1).map(frame => frame.ball?.position).filter(Boolean);
+}
+function ballHistoryKinematicsLabel(f, dtSeconds = trace.config?.dtSeconds) {
+  const k = historyKinematicsFromPositions(playbackBallHistoryForFrame(frameIndex), dtSeconds);
+  const ball = f?.ball || {};
+  const velocity = k.velocity || ball.velocity || {x: 0, y: 0};
+  const acceleration = k.acceleration || ball.acceleration || {x: 0, y: 0};
+  const jerk = k.jerk || ball.jerk || {x: 0, y: 0};
+  return `H${k.samples} V${vecLen(velocity).toFixed(1)} A${vecLen(acceleration).toFixed(1)} J${vecLen(jerk).toFixed(1)}`;
+}
+function fmtClock(s) {
+  const m = Math.floor(s / 60);
+  const sec = (s - m * 60).toFixed(1).padStart(4, "0");
+  return `${m}:${sec}`;
+}
+function fmtDuration(seconds) {
+  const total = Number(seconds || 0);
+  if (total >= 60) return `${(total / 60).toFixed(1)}m`;
+  return `${total.toFixed(1)}s`;
+}
+function pitchRect() {
+  const pad = 34;
+  const w = canvas.width - pad * 2;
+  const h = canvas.height - pad * 2;
+  const config = trace.config || FALLBACK_CONFIG;
+  const fieldAspect = config.fieldWidthYards / config.fieldLengthYards;
+  let drawH = h;
+  let drawW = drawH * fieldAspect;
+  if (drawW > w) {
+    drawW = w;
+    drawH = drawW / fieldAspect;
+  }
+  return {
+    x: (canvas.width - drawW) / 2,
+    y: (canvas.height - drawH) / 2,
+    w: drawW,
+    h: drawH
+  };
+}
+function mapPoint(p, r) {
+  const config = trace.config || FALLBACK_CONFIG;
+  return {
+    x: r.x + p.x / config.fieldWidthYards * r.w,
+    y: r.y + (1 - p.y / config.fieldLengthYards) * r.h
+  };
+}
+function fieldDirToCanvas(dir, r) {
+  const config = trace.config || FALLBACK_CONFIG;
+  return {x: dir.x / config.fieldWidthYards * r.w, y: -dir.y / config.fieldLengthYards * r.h};
+}
+function norm(v) {
+  const len = Math.hypot(Number(v?.x || 0), Number(v?.y || 0));
+  return len <= 1e-9 ? {x: 0, y: 0} : {x: Number(v.x || 0) / len, y: Number(v.y || 0) / len};
+}
+function facingVectorFromBucket(bucket) {
+  const d = Math.SQRT1_2;
+  switch (bucket) {
+    case "East": return {x: 1, y: 0};
+    case "SouthEast": return {x: d, y: d};
+    case "South": return {x: 0, y: 1};
+    case "SouthWest": return {x: -d, y: d};
+    case "West": return {x: -1, y: 0};
+    case "NorthWest": return {x: -d, y: -d};
+    case "North": return {x: 0, y: -1};
+    case "NorthEast": return {x: d, y: -d};
+    default: return null;
+  }
+}
+function playerFacing(p) {
+  const bucketFacing = facingVectorFromBucket(p.actionFacing || p.receiveFacing);
+  if (bucketFacing) return bucketFacing;
+  if (vecLen(p.velocity) > 0.35) return norm(p.velocity);
+  return {x: 0, y: p.team === "Home" ? 1 : -1};
+}
+function drawFacingIndicator(p, pt, r) {
+  const facing = norm(fieldDirToCanvas(playerFacing(p), r));
+  if (facing.x === 0 && facing.y === 0) return;
+  const angle = Math.atan2(facing.y, facing.x);
+  ctx.save();
+  ctx.translate(pt.x, pt.y);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.arc(0, 0, 10, -Math.PI / 2, Math.PI / 2);
+  ctx.lineTo(0, -10);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,.24)";
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(6, -7);
+  ctx.lineTo(6, 7);
+  ctx.strokeStyle = "rgba(255,255,255,.86)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+function drawPitch(r) {
+  ctx.fillStyle = "#238547";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (let i = 0; i < 8; i++) {
+    ctx.fillStyle = i % 2 ? "#2f9b57" : "#238547";
+    ctx.fillRect(r.x, r.y + (r.h / 8) * i, r.w, r.h / 8);
+  }
+  ctx.strokeStyle = "rgba(255,255,255,.88)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(r.x, r.y, r.w, r.h);
+  ctx.beginPath();
+  ctx.moveTo(r.x, r.y + r.h / 2);
+  ctx.lineTo(r.x + r.w, r.y + r.h / 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r.x + r.w / 2, r.y + r.h / 2, r.h * 0.085, 0, Math.PI * 2);
+  ctx.stroke();
+  const boxW = r.w * 0.44;
+  const boxH = r.h * 0.14;
+  ctx.strokeRect(r.x + (r.w - boxW) / 2, r.y, boxW, boxH);
+  ctx.strokeRect(r.x + (r.w - boxW) / 2, r.y + r.h - boxH, boxW, boxH);
+  drawGoalPosts(r);
+}
+function drawPitchGridOverlay(r) {
+  const level = gridOverlayLevel.value;
+  const dims = gridDimensionsForLevel(level);
+  if (!dims) return;
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,.22)";
+  ctx.lineWidth = level === "fine" ? 0.75 : 1.25;
+  ctx.setLineDash(level === "fine" ? [2, 5] : []);
+  for (let column = 1; column < dims.columns; column++) {
+    const x = r.x + r.w * column / dims.columns;
+    ctx.beginPath();
+    ctx.moveTo(x, r.y);
+    ctx.lineTo(x, r.y + r.h);
+    ctx.stroke();
+  }
+  for (let row = 1; row < dims.rows; row++) {
+    const y = r.y + r.h * row / dims.rows;
+    ctx.beginPath();
+    ctx.moveTo(r.x, y);
+    ctx.lineTo(r.x + r.w, y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  const selected = fieldRectForGridCell(gridCellForLevel(selectedGridAddress(), level), level);
+  if (selected) {
+    const x = r.x + selected.x * r.w;
+    const y = r.y + (1 - selected.y - selected.h) * r.h;
+    const w = selected.w * r.w;
+    const h = selected.h * r.h;
+    ctx.fillStyle = "rgba(246,201,68,.16)";
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "rgba(246,201,68,.86)";
+    ctx.lineWidth = 2.25;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = "rgba(17,24,39,.78)";
+    ctx.fillRect(x + 5, y + 5, 64, 18);
+    ctx.fillStyle = "#fff4c2";
+    ctx.font = "700 11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`${selected.label} ${Math.round(selected.x * selected.columns)},${Math.round(selected.y * selected.rows)}`, x + 10, y + 14);
+  }
+  ctx.restore();
+}
+function assistantOffsideLines(frame = currentFrame()) {
+  if (!Array.isArray(frame?.officials)) return [];
+  const seen = new Set();
+  const lines = [];
+  for (const official of frame.officials) {
+    const line = official.offsideLine || official.offside_line;
+    if (!line) continue;
+    const key = `${line.attackingTeam || line.attacking_team}:${Number(line.effectiveLineY ?? line.effective_line_y ?? 0).toFixed(3)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(line);
+  }
+  return lines;
+}
+function drawAssistantOffsideLines(f, r) {
+  for (const line of assistantOffsideLines(f)) {
+    const y = mapPoint({x: 0, y: Number(line.effectiveLineY ?? line.effective_line_y ?? 0)}, r).y;
+    const attackingTeam = line.attackingTeam || line.attacking_team;
+    ctx.beginPath();
+    ctx.moveTo(r.x, y);
+    ctx.lineTo(r.x + r.w, y);
+    ctx.strokeStyle = attackingTeam === "Home" ? "rgba(31,111,235,.72)" : "rgba(214,69,69,.72)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([9, 7]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+function drawGoalPosts(r) {
+  const config = trace.config || FALLBACK_CONFIG;
+  const fieldWidth = Number(config.fieldWidthYards || 80);
+  const goalWidth = Number(config.goalWidthYards || 8);
+  const centerX = r.x + r.w * 0.5;
+  const halfGoalPx = r.w * (goalWidth / fieldWidth) * 0.5;
+  const postRadius = 4;
+  const goalDepth = 9;
+  const topY = r.y;
+  const bottomY = r.y + r.h;
+  const posts = [
+    {x: centerX - halfGoalPx, y: topY},
+    {x: centerX + halfGoalPx, y: topY},
+    {x: centerX - halfGoalPx, y: bottomY},
+    {x: centerX + halfGoalPx, y: bottomY},
+  ];
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,.96)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(centerX - halfGoalPx, topY);
+  ctx.lineTo(centerX - halfGoalPx, topY - goalDepth);
+  ctx.lineTo(centerX + halfGoalPx, topY - goalDepth);
+  ctx.lineTo(centerX + halfGoalPx, topY);
+  ctx.moveTo(centerX - halfGoalPx, bottomY);
+  ctx.lineTo(centerX - halfGoalPx, bottomY + goalDepth);
+  ctx.lineTo(centerX + halfGoalPx, bottomY + goalDepth);
+  ctx.lineTo(centerX + halfGoalPx, bottomY);
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  for (const post of posts) {
+    ctx.beginPath();
+    ctx.arc(post.x, post.y, postRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(17,32,38,.55)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawArrow(from, to, color, width = 2, dashed = false) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 5) return;
+  const ux = dx / len;
+  const uy = dy / len;
+  const end = {x: to.x - ux * 8, y: to.y - uy * 8};
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.setLineDash(dashed ? [7, 7] : []);
+  ctx.beginPath();
+  ctx.moveTo(from.x + ux * 14, from.y + uy * 14);
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(to.x, to.y);
+  ctx.lineTo(end.x - uy * 5, end.y + ux * 5);
+  ctx.lineTo(end.x + uy * 5, end.y - ux * 5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+function drawIntentTraces(f, r) {
+  const intents = Array.isArray(f?.intents) ? f.intents.slice(0, 8) : [];
+  if (!intents.length) return;
+  const playersById = new Map((f.players || []).map(p => [p.id, p]));
+  for (const intent of intents.slice().reverse()) {
+    const player = playersById.get(intent.playerId);
+    if (!player || !intent.targetPoint) continue;
+    const from = mapPoint(player.position, r);
+    const to = mapPoint(intent.targetPoint, r);
+    const isHolder = intent.playerId === f.ball?.holder;
+    const isSupport = intent.action === "space";
+    const isAerial = intent.flight === "aerial";
+    const color = isHolder
+      ? (isAerial ? "rgba(246,201,68,.92)" : "rgba(255,255,255,.86)")
+      : (intent.team === "Home" ? "rgba(137,205,255,.58)" : "rgba(255,164,164,.58)");
+    drawArrow(from, to, color, isHolder ? 3.2 : 2, isSupport);
+    if (intent.targetPlayer != null || isAerial) {
+      ctx.beginPath();
+      ctx.arc(to.x, to.y, isHolder ? 7 : 5, 0, Math.PI * 2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isHolder ? 2.5 : 1.5;
+      ctx.stroke();
+    }
+  }
+}
+function pendingPassPhase(frame = currentFrame()) {
+  return frame?.pendingPass || frame?.pending_pass || null;
+}
+function yardsToCanvasRadius(yards, r) {
+  const config = trace.config || FALLBACK_CONFIG;
+  return Number(yards || 0)
+    * ((r.w / Number(config.fieldWidthYards || 80)) + (r.h / Number(config.fieldLengthYards || 120)))
+    * 0.5;
+}
+function drawPendingPassPhase(f, r) {
+  const pass = pendingPassPhase(f);
+  if (!pass?.origin || !pass?.intendedTarget) return;
+  const from = mapPoint(pass.origin, r);
+  const to = mapPoint(pass.intendedTarget, r);
+  const aerial = String(pass.flight || "").toLowerCase() === "aerial";
+  const offside = pass.offside || null;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.strokeStyle = offside ? "rgba(239,68,68,.86)" : aerial ? "rgba(246,201,68,.68)" : "rgba(255,255,255,.58)";
+  ctx.lineWidth = offside ? 3 : 2;
+  ctx.setLineDash(aerial ? [8, 6] : []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const urgency = Math.max(0, Math.min(1, Number(pass.receiverUrgency ?? 0)));
+  const receiverId = pass.nearestReceiver ?? pass.nearest_receiver;
+  const receiver = receiverId != null ? f?.players?.find(player => player.id === receiverId) : null;
+  if (receiver?.position) {
+    const pt = mapPoint(receiver.position, r);
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, 15 + urgency * 9, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(246,201,68,${0.28 + urgency * 0.42})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  if (offside?.position) {
+    const pt = mapPoint(offside.position, r);
+    const radius = yardsToCanvasRadius(offside.interferenceRadiusYards ?? offside.interference_radius_yards ?? 3, r);
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(239,68,68,.82)";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = "rgba(239,68,68,.16)";
+    ctx.fill();
+  }
+  ctx.restore();
+}
+function pendingReboundPhase(frame = currentFrame()) {
+  return frame?.pendingRebound || frame?.pending_rebound || null;
+}
+function drawPendingReboundPhase(f, r) {
+  const rebound = pendingReboundPhase(f);
+  const parry = rebound?.parryPosition || rebound?.parry_position;
+  if (!parry) return;
+  const target = mapPoint(parry, r);
+  const keeperId = rebound.keeperId ?? rebound.keeper_id;
+  const keeper = f?.players?.find(player => player.id === keeperId);
+  const pulse = 0.5 + Math.sin(Number(f?.tick || 0) * 0.75) * 0.5;
+  ctx.save();
+  if (keeper?.position) {
+    drawArrow(mapPoint(keeper.position, r), target, "rgba(246,201,68,.64)", 2.25, true);
+  }
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, 21 + pulse * 5, 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(246,201,68,.92)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, 7, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,.84)";
+  ctx.fill();
+  ctx.strokeStyle = "#7a4b00";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+function gaitCueStrength(gait) {
+  const key = String(gait || "stand").toLowerCase();
+  if (key.includes("sprint")) return 1.0;
+  if (key.includes("run")) return 0.78;
+  if (key.includes("skip")) return 0.58;
+  if (key.includes("jog")) return 0.45;
+  if (key.includes("side")) return 0.38;
+  if (key.includes("walk")) return 0.25;
+  return 0.0;
+}
+function drawGaitCue(p, pt, r) {
+  const cue = gaitCueStrength(p.movementGait);
+  if (cue <= 0.0) return;
+  const speed = vecLen(p.velocity || {x: 0, y: 0});
+  const motion = norm(fieldDirToCanvas(p.velocity || {x: 0, y: 0}, r));
+  const radius = 13.5 + cue * 4.5;
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = `rgba(246,201,68,${0.12 + cue * 0.34})`;
+  ctx.lineWidth = 1 + cue * 1.6;
+  ctx.stroke();
+  if (motion.x || motion.y) {
+    ctx.beginPath();
+    ctx.moveTo(pt.x + motion.x * 12, pt.y + motion.y * 12);
+    ctx.lineTo(pt.x + motion.x * (18 + speed * 0.65), pt.y + motion.y * (18 + speed * 0.65));
+    ctx.strokeStyle = `rgba(255,255,255,${0.22 + cue * 0.42})`;
+    ctx.lineWidth = 1.2 + cue * 1.4;
+    ctx.stroke();
+  }
+}
+function drawPlayer(p, r) {
+  const pt = mapPoint(p.position, r);
+  const color = p.team === "Home" ? "#1f6feb" : "#d64545";
+  drawGaitCue(p, pt, r);
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, 12, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  drawFacingIndicator(p, pt, r);
+  ctx.lineWidth = p.controllerSlot === activeSlot ? 4 : 1.5;
+  ctx.strokeStyle = p.controllerSlot === activeSlot ? "#f6c944" : "rgba(255,255,255,.9)";
+  ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "700 10px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(p.shirt), pt.x, pt.y);
+}
+function drawOfficial(o, r) {
+  const pt = mapPoint(o.position, r);
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, 8, 0, Math.PI * 2);
+  ctx.fillStyle = "#111827";
+  ctx.fill();
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  const motion = norm(fieldDirToCanvas(o.velocity || {x: 0, y: 0}, r));
+  if (motion.x || motion.y) {
+    ctx.beginPath();
+    ctx.moveTo(pt.x, pt.y);
+    ctx.lineTo(pt.x + motion.x * 13, pt.y + motion.y * 13);
+    ctx.strokeStyle = "rgba(255,255,255,.72)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+function ballAltitudeYards(ball) {
+  return Math.max(0, Number(ball?.altitudeYards ?? ball?.altitude_yards ?? 0));
+}
+function drawBall(ball, r) {
+  const pt = mapPoint(ball.position, r);
+  const altitude = ballAltitudeYards(ball);
+  const lift = Math.min(15, altitude * 1.65);
+  const radius = 6.5 + Math.min(2.2, altitude * 0.16);
+  ctx.beginPath();
+  ctx.ellipse(pt.x + lift * 0.18, pt.y + lift * 0.14, radius * 0.95, radius * 0.44, 0, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(21, 29, 17, ${altitude > 0.05 ? 0.26 : 0.18})`;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y - lift, radius, 0, Math.PI * 2);
+  ctx.fillStyle = "#c58a13";
+  ctx.fill();
+  ctx.strokeStyle = "#4b3306";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+function render() {
+  const r = pitchRect();
+  drawPitch(r);
+  drawPitchGridOverlay(r);
+  const f = currentFrame();
+  if (!f) return;
+  drawAssistantOffsideLines(f, r);
+  drawPendingPassPhase(f, r);
+  drawPendingReboundPhase(f, r);
+  drawIntentTraces(f, r);
+  for (const o of f.officials) drawOfficial(o, r);
+  for (const p of f.players) drawPlayer(p, r);
+  drawBall(f.ball, r);
+  homeScore.textContent = f.scoreHome;
+  awayScore.textContent = f.scoreAway;
+  clock.textContent = fmtClock(f.clockSeconds);
+  phase.textContent = phaseLabel(f.phase);
+  centralBrain.textContent = centralBrainLabel(f.centralBrain);
+  agentOrder.textContent = agentScheduleLabel(f);
+  agentOrder.title = agentScheduleFullLabel(f);
+  homeBrain.textContent = teamBrainLabel(f.homeBrain, f.homeDirective);
+  awayBrain.textContent = teamBrainLabel(f.awayBrain, f.awayDirective);
+  ballPhysics.textContent = `${vecLen(f.ball.velocity).toFixed(1)}y/s ${vecLen(f.ball.acceleration).toFixed(1)}y/s2 z${ballAltitudeYards(f.ball).toFixed(1)}y`;
+  ballKinematics.textContent = ballHistoryKinematicsLabel(f, trace.config?.dtSeconds);
+  ballAgent.textContent = playbackBallAgentLabel(f.ball);
+  ballAgent.title = Array.isArray(f.ball?.operationOrder) && f.ball.operationOrder.length
+    ? f.ball.operationOrder.join(" > ")
+    : "";
+  officialAgents.textContent = officialAgentsLabel(f);
+  officialAgents.title = officialAgentsTitle(f);
+  const intent = primaryIntent(f);
+  actionIntent.textContent = intentLabel(intent);
+  actionIntent.title = liveIntentTitle(primaryIntent(f));
+  ticks.textContent = `${f.tick} / ${trace.summary.ticks}`;
+  updateAgentStatePanel();
+  scrub.value = frameIndex;
+}
+function updateMetrics() {
+  const s = trace.summary?.stats || emptyStats();
+  shots.textContent = `${s.shotsHome} - ${s.shotsAway}`;
+  onTarget.textContent = `${s.shotsOnTargetHome ?? 0} - ${s.shotsOnTargetAway ?? 0}`;
+  saves.textContent = `${s.savesHome ?? 0} - ${s.savesAway ?? 0}`;
+  gkPhysics.textContent = goalkeeperPhysicsLabel();
+  gkPhysics.title = goalkeeperPhysicsTitle();
+  passes.textContent = `${s.passesCompletedHome + s.passesCompletedAway} / ${s.passesAttemptedHome + s.passesAttemptedAway}`;
+  tacticalLiveness.textContent = tacticalLivenessLabel();
+  tacticalLiveness.title = tacticalLivenessTitle();
+  dribbleBeats.textContent = `${s.dribbleBeatsHome ?? 0} - ${s.dribbleBeatsAway ?? 0}`;
+  clearances.textContent = `${s.clearancesHome ?? 0} - ${s.clearancesAway ?? 0}`;
+  routeOne.textContent = `${s.routeOneBallsHome ?? 0} - ${s.routeOneBallsAway ?? 0}`;
+  const tackleSplitKnown = s.tacklesHome != null || s.tacklesAway != null;
+  tackles.textContent = tackleSplitKnown ? `${s.tacklesHome ?? 0} - ${s.tacklesAway ?? 0}` : `${s.tackles ?? 0}`;
+  interceptions.textContent = `${s.interceptionsHome ?? 0} - ${s.interceptionsAway ?? 0}`;
+  shotBlocks.textContent = `${s.shotBlocksHome ?? 0} - ${s.shotBlocksAway ?? 0}`;
+  recoveries.textContent = `${s.looseBallRecoveriesHome ?? 0} - ${s.looseBallRecoveriesAway ?? 0}`;
+  offsides.textContent = `${s.offsidesHome ?? 0} - ${s.offsidesAway ?? 0}`;
+  const homeRestarts = (s.throwInsHome ?? 0) + (s.goalKicksHome ?? 0) + (s.cornerKicksHome ?? 0) + (s.freeKicksHome ?? 0);
+  const awayRestarts = (s.throwInsAway ?? 0) + (s.goalKicksAway ?? 0) + (s.cornerKicksAway ?? 0) + (s.freeKicksAway ?? 0);
+  restarts.textContent = `${homeRestarts} - ${awayRestarts}`;
+  fouls.textContent = `${s.foulsHome ?? 0} - ${s.foulsAway ?? 0}`;
+  const dt = cadenceDtSeconds();
+  const expectedFrames = expectedFrameCount();
+  const duration = Number(trace.cadence?.durationSeconds || Math.max(0, expectedFrames - 1) * dt);
+  const tickHz = Number(trace.cadence?.tickHz || (dt > 0 ? 1 / dt : 0));
+  const contract = trace.cadence?.defaultTenMinuteContract ? " ok" : "";
+  cadence.textContent = `${dt.toFixed(2)}s/${tickHz.toFixed(0)}Hz; ${fmtDuration(duration)}; ${expectedFrames || trace.frames.length}f${contract}`;
+  stepBudget.textContent = stepBudgetLabel();
+  stepBudget.title = stepBudgetTitle();
+  seed.textContent = trace.config?.seed ?? "-";
+  runId.textContent = runIdLabel();
+  controllerRuntime.textContent = controllerRuntimeLabel();
+  controllerRuntime.title = controllerRuntimeTitle();
+  events.innerHTML = (trace.events || []).slice(-12).reverse().map(e => `<li>${fmtClock(e.clockSeconds)} ${e.description}</li>`).join("");
+}
+function tick(ts) {
+  queueGamepadInputs();
+  if (!lastTs) lastTs = ts;
+  const elapsed = ts - lastTs;
+  const fps = 10 * Number(speed.value);
+  if (playing && elapsed > 1000 / fps) {
+    if (frameIndex < trace.frames.length - 1) {
+      frameIndex += 1;
+      if (traceFramesComplete && frameIndex >= trace.frames.length - 1) playing = false;
+      play.textContent = playing ? "Pause" : "Play";
+      render();
+    } else if (traceFramesComplete) {
+      playing = false;
+      play.textContent = "Play";
+    } else {
+      play.textContent = "Buffering";
+    }
+    lastTs = ts;
+  }
+  requestAnimationFrame(tick);
+}
+function selectedPlayer(slot) {
+  const sel = document.getElementById(`slot-${slot}`);
+  return sel && sel.value !== "" ? Number(sel.value) : null;
+}
+function isFormEditingTarget(target) {
+  const tag = String(target?.tagName || "").toLowerCase();
+  return tag === "input" || tag === "select" || tag === "textarea" || !!target?.isContentEditable;
+}
+function selectedPassTarget() {
+  return passTarget.value === "" ? null : Number(passTarget.value);
+}
+function maxHumanControllerSlots() {
+  const contractSlots = Number(trace.controllerContract?.maxHumanControllers);
+  return contractSlots > 0 ? contractSlots : 4;
+}
+function controllerInputRuntimeMode() {
+  return trace.controllerContract?.notificationDrivenInput ? "notify" : "poll";
+}
+function controllerRuntimeLabel() {
+  const contract = trace.controllerContract || {};
+  const yieldStats = trace.controllerYield || {};
+  const maxSlots = Number(contract.maxHumanControllers ?? maxHumanControllerSlots());
+  const configured = Number(contract.configuredHumanControllers ?? visibleHumanSlotCount());
+  const threads = contract.nativeThreadPerControllerEnabled ? "threads" : "direct";
+  const mode = contract.notificationDrivenInput ? "notify" : "poll";
+  const yieldMs = Number(contract.yieldBudgetMs ?? 0);
+  const debounceMs = Number(contract.defaultDebounceMs ?? 0);
+  const relevant = Number(yieldStats.relevantNotifiedWaits ?? 0);
+  const waits = Number(yieldStats.waitAttempts ?? 0);
+  const wake = waits > 0 ? ` R${relevant}/${waits}` : "";
+  return `${configured}/${maxSlots} ${threads} ${mode} Y${yieldMs} D${debounceMs}${wake}`;
+}
+function controllerRuntimeTitle() {
+  const contract = trace.controllerContract || {};
+  const yieldStats = trace.controllerYield || {};
+  if (!trace.controllerContract) return "Controller runtime contract not loaded";
+  const parts = [
+    `maxHumanControllers=${contract.maxHumanControllers}`,
+    `configuredHumanControllers=${contract.configuredHumanControllers}`,
+    `nativeThreadPerController=${contract.nativeThreadPerControllerEnabled}`,
+    `singleThreadedSimulationLoop=${contract.singleThreadedSimulationLoop}`,
+    `sharedInputQueueUsesRwLock=${contract.sharedInputQueueUsesRwLock}`,
+    `controllerMailboxUsesCondvar=${contract.controllerMailboxUsesCondvar}`,
+    `mainLoopUsesCondvarYield=${contract.mainLoopUsesCondvarYield}`,
+    `notificationDrivenInput=${contract.notificationDrivenInput}`,
+    `sameSlotCoalescing=${contract.sameSlotCoalescingEnabled}`,
+    `debounceMs=${contract.defaultDebounceMs}`,
+    `coalesceMs=${contract.coalesceMs}`,
+    `yieldBudgetMs=${contract.yieldBudgetMs}`,
+    `lateYieldSliceMs=${contract.lateYieldSliceMs}`,
+    `queueLimit=${contract.queueLimit}`,
+    `maxQueueAgeMs=${contract.maxQueueAgeMs}`,
+    `threadNamePrefix=${contract.threadNamePrefix}`,
+    `assignedPlayers=${yieldStats.assignedPlayers ?? 0}`,
+    `waitAttempts=${yieldStats.waitAttempts ?? 0}`,
+    `relevantNotifiedWaits=${yieldStats.relevantNotifiedWaits ?? 0}`,
+    `lastRelevantNotified=${yieldStats.lastRelevantNotified ?? false}`,
+    `lastRelevantVersion=${yieldStats.lastRelevantVersionBefore ?? 0}->${yieldStats.lastRelevantVersionAfter ?? 0}`,
+  ];
+  return parts.join("\n");
+}
+function physicsHistoryWindowSeconds() {
+  return Number(trace.physicsContract?.playerHistoryWindowSeconds || trace.physicsContract?.ballHistoryWindowSeconds || 0);
+}
+function goalkeeperPhysicsLabel() {
+  const contract = trace.physicsContract || {};
+  const saveCap = Number(contract.goalkeeperClearSightlineSaveCap ?? 0);
+  const parryMin = Number(contract.goalkeeperParryMinYards ?? 0);
+  const parryMax = Number(contract.goalkeeperParryMaxYards ?? 0);
+  const rebound = contract.goalkeeperParryReboundEnabled ? "reb" : "catch";
+  if (saveCap > 0 && parryMin > 0 && parryMax > 0) {
+    return `cap ${(saveCap * 100).toFixed(0)}% ${rebound} ${parryMin.toFixed(0)}-${parryMax.toFixed(0)}y`;
+  }
+  return "save/parry";
+}
+function goalkeeperPhysicsTitle() {
+  const contract = trace.physicsContract || {};
+  if (!trace.physicsContract) return "Goalkeeper physics contract not loaded";
+  const parts = [
+    `saveUsesDistanceAndSightline=${contract.goalkeeperSaveProbabilityUsesDistanceAndSightline}`,
+    `clearSightlineSaveCap=${contract.goalkeeperClearSightlineSaveCap}`,
+    `catchUsesDistanceSpeedSightline=${contract.goalkeeperCatchProbabilityUsesDistanceSpeedSightline}`,
+    `parryReboundEnabled=${contract.goalkeeperParryReboundEnabled}`,
+    `parryRangeYards=${contract.goalkeeperParryMinYards}-${contract.goalkeeperParryMaxYards}`,
+    `closeHardShotsCanCreateRebounds=${contract.closeHardShotsCanCreateRebounds}`,
+  ];
+  return parts.join("\n");
+}
+function learningPersistenceLabel() {
+  const contract = trace.learningContract || trace.playback?.learningContract || null;
+  const ui = trace.uiContract || trace.playback?.uiContract || null;
+  if (!contract) return "learn ?";
+  const mode = contract.learningEnabled ? "learn" : "observe";
+  const backend = contract.policyPersistenceBackend || "json";
+  const retention = contract.policyPersistenceStoresAllWeightHistory ? "history" : "tip";
+  const batched = contract.policyPersistenceExternalWritesPerTimestep === false ? "batched" : "per-tick?";
+  const playbackPosts = contract.policyPersistencePlaybackHttpPostsEnabled || ui?.playbackStepPostEnabled || ui?.playbackInputPostEnabled ? "POST" : "GET";
+  const livePosts = ui?.liveStepPostEnabled || ui?.liveInputPostEnabled ? "POST" : "off";
+  return `${mode} ${backend} ${retention} ${batched} playback ${playbackPosts} live-only ${livePosts}`;
+}
+function visibleHumanSlotCount() {
+  const configured = Number(trace.config?.maxHumanPlayers);
+  const fallback = Number(FALLBACK_CONFIG.maxHumanPlayers || 4);
+  const slotCount = configured > 0 ? configured : fallback;
+  return Math.min(Math.max(slotCount, 0), maxHumanControllerSlots());
+}
+function keyName(code) {
+  return String(code || "")
+    .replace(/^Arrow/, "")
+    .replace(/^Key/, "")
+    .replace(/^Numpad/, "Num")
+    .replace(/^ShiftLeft$/, "LShift")
+    .replace(/^ShiftRight$/, "RShift");
+}
+function controllerKeymapLabel(slot) {
+  const map = CONTROLLER_KEYMAPS[slot] || CONTROLLER_KEYMAPS[0];
+  return `Move ${keyName(map.up)}/${keyName(map.left)}/${keyName(map.down)}/${keyName(map.right)}; Sprint ${keyName(map.sprint)}; Pass ${keyName(map.pass)}; Shoot ${keyName(map.shoot)}`;
+}
+function controllerSlotForKey(code) {
+  const visible = visibleHumanSlotCount();
+  const slot = CONTROLLER_KEYMAPS.findIndex(map =>
+    [map.left, map.right, map.up, map.down, map.sprint, map.pass, map.shoot].includes(code)
+  );
+  return slot >= 0 && slot < visible ? slot : null;
+}
+function controllerKeyKind(slot, code) {
+  const map = CONTROLLER_KEYMAPS[slot] || CONTROLLER_KEYMAPS[0];
+  if (code === map.left || code === map.right || code === map.up || code === map.down) return "move";
+  if (code === map.sprint) return "sprint";
+  if (code === map.pass) return "pass";
+  if (code === map.shoot) return "shoot";
+  return null;
+}
+function refreshActiveSlotRows() {
+  for (let slot = 0; slot < visibleHumanSlotCount(); slot++) {
+    const row = document.getElementById(`slot-row-${slot}`);
+    if (row) row.classList.toggle("active", slot === activeSlot);
+  }
+}
+function setActiveSlot(slot) {
+  const visible = visibleHumanSlotCount();
+  if (visible <= 0) return;
+  activeSlot = Math.min(Math.max(Number(slot) || 0, 0), visible - 1);
+  refreshActiveSlotRows();
+  rebuildPassTargets();
+  updateAgentStatePanel();
+}
+function selectedPlayerSnapshot(slot = activeSlot) {
+  const frame = currentFrame();
+  const playerId = selectedPlayer(slot);
+  return frame && playerId != null ? frame.players.find(p => p.id === playerId) || null : null;
+}
+function playerLabel(p) {
+  return `${p.team} ${p.shirt} ${p.name}`;
+}
+function syncStaticSlotAvailability() {
+  const assigned = new Map();
+  for (let slot = 0; slot < visibleHumanSlotCount(); slot++) {
+    const sel = document.getElementById(`slot-${slot}`);
+    if (!sel || sel.value === "") continue;
+    const playerId = Number(sel.value);
+    if (assigned.has(playerId)) {
+      sel.value = "";
+    } else {
+      assigned.set(playerId, slot);
+    }
+  }
+  for (let slot = 0; slot < visibleHumanSlotCount(); slot++) {
+    const sel = document.getElementById(`slot-${slot}`);
+    if (!sel) continue;
+    for (const opt of sel.options) {
+      if (opt.value === "") continue;
+      const assignedSlot = assigned.get(Number(opt.value));
+      const assignedElsewhere = assignedSlot != null && assignedSlot !== slot;
+      opt.disabled = assignedElsewhere;
+      const baseLabel = opt.dataset.baseLabel || opt.textContent;
+      opt.textContent = assignedElsewhere ? `${baseLabel} - S${assignedSlot + 1}` : baseLabel;
+    }
+  }
+}
+function applyControllerAssignments(assignments) {
+  const normalized = Array.isArray(assignments) ? assignments : [];
+  const byPlayer = new Map();
+  for (const assignment of normalized) {
+    const playerId = Number(assignment.playerId);
+    const slot = Number(assignment.controllerSlot);
+    if (Number.isInteger(playerId) && Number.isInteger(slot)) byPlayer.set(playerId, slot);
+  }
+  for (const frame of trace.frames) {
+    for (const player of frame.players || []) {
+      if (byPlayer.has(Number(player.id))) {
+        player.controllerSlot = byPlayer.get(Number(player.id));
+      } else {
+        player.controllerSlot = null;
+      }
+    }
+    if (frame.centralBrain) {
+      frame.centralBrain.controllerAssignments = normalized;
+      frame.centralBrain.controlledHumanPlayers = normalized.length;
+    }
+  }
+}
+async function syncControllerAssignment(slot, playerId) {
+  const requestId = ++controllerAssignmentSyncSeq;
+  const payload = {controllerSlot: slot, playerId: playerId == null ? null : playerId};
+  if (!soccerLivePostApiEnabled("assign")) return;
+  try {
+    const data = await postSoccerJson("/api/assign", payload, "assign");
+    if (requestId !== controllerAssignmentSyncSeq) return;
+    if (Array.isArray(data.controllerAssignments)) {
+      applyControllerAssignments(data.controllerAssignments);
+      syncStaticSlotAvailability();
+      rebuildPassTargets();
+      render();
+    }
+  } catch (err) {
+    console.warn("controller assignment sync unavailable; keeping local selection", err);
+  }
+}
+function scheduleInputFlush(delayMs = LIVE_INPUT_FLUSH_INTERVAL_MS) {
+  if (!soccerLivePostApiEnabled("input")) {
+    window.__humanInputQueue = [];
+    updateInputStatusLabels();
+    return;
+  }
+  if (inputFlushTimer != null || inputFlushInFlight) return;
+  inputFlushTimer = window.setTimeout(
+    flushQueuedInputsToInputApi,
+    Math.max(0, Number(delayMs || 0))
+  );
+}
+function scheduleInputRetry() {
+  inputFlushRetryAttempt = Math.min(inputFlushRetryAttempt + 1, 6);
+  updateInputStatusLabels();
+  const delay = Math.min(
+    LIVE_INPUT_RETRY_MAX_MS,
+    LIVE_INPUT_RETRY_MIN_MS * inputFlushRetryAttempt
+  );
+  scheduleInputFlush(delay);
+}
+function slotQueuedInputCount(slot) {
+  return window.__humanInputQueue.filter(input => Number(input.controllerSlot) === slot).length;
+}
+function latestQueuedInputSeq(slot) {
+  return window.__humanInputQueue.reduce((max, input) => {
+    if (Number(input.controllerSlot) !== slot) return max;
+    return Math.max(max, Number(input.seq || 0));
+  }, 0);
+}
+function inputStatusLabel(slot) {
+  if (!soccerLivePostApiEnabled("input")) return "Playback local";
+  const queued = slotQueuedInputCount(slot);
+  const latestSeq = latestQueuedInputSeq(slot);
+  const sending = inputFlushInFlight ? " sending" : "";
+  const retry = inputFlushRetryAttempt > 0 ? ` retry${inputFlushRetryAttempt}` : "";
+  const offline = lastInputAck.error ? " offline" : "";
+  const serverQueued = Number(lastInputAck.queuedHumanInputs || 0);
+  const accepted = Number(lastInputAck.acceptedInputs || 0);
+  if (queued > 0) return `Input Q${queued}${latestSeq ? ` #${latestSeq}` : ""}${sending}${retry}${offline}`;
+  if (serverQueued > 0) return `Input server Q${serverQueued}${sending}${retry}${offline}`;
+  if (accepted > 0 && performance.now() - Number(lastInputAck.at || 0) < 2500) {
+    return `Input ok +${accepted}`;
+  }
+  return "Input ready";
+}
+function updateInputStatusLabels() {
+  for (let slot = 0; slot < visibleHumanSlotCount(); slot++) {
+    const status = document.getElementById(`slot-input-${slot}`);
+    if (!status) continue;
+    const label = inputStatusLabel(slot);
+    status.textContent = label;
+    status.classList.toggle("bad", label.includes("offline"));
+    status.classList.toggle("warn", label.includes("Q") || label.includes("retry"));
+  }
+}
+async function flushQueuedInputsToInputApi() {
+  inputFlushTimer = null;
+  if (!soccerLivePostApiEnabled("input")) {
+    window.__humanInputQueue = [];
+    updateInputStatusLabels();
+    return;
+  }
+  if (inputFlushInFlight || window.__humanInputQueue.length === 0) return;
+  inputFlushInFlight = true;
+  updateInputStatusLabels();
+  const inputs = drainQueuedInputsForDispatch();
+  let accepted = false;
+  let requeued = false;
+  try {
+    const ack = await postSoccerJson("/api/input", inputs, "input");
+    lastInputAck = {
+      acceptedInputs: Number(ack?.acceptedInputs || 0),
+      queuedHumanInputs: Number(ack?.queuedHumanInputs || 0),
+      error: "",
+      at: performance.now()
+    };
+    if (Number(ack?.acceptedInputs ?? 0) > 0 || ack?.queued) {
+      inputFlushRetryAttempt = 0;
+      accepted = true;
+    }
+  } catch (err) {
+    requeueInputFrames(inputs);
+    requeued = true;
+    lastInputAck = {
+      ...lastInputAck,
+      error: String(err?.message || err || "input sync unavailable"),
+      at: performance.now()
+    };
+    console.warn("live input sync unavailable; keeping local input queue", err);
+  } finally {
+    inputFlushInFlight = false;
+    if (!accepted && !requeued && inputs.length > 0) {
+      requeueInputFrames(inputs);
+    }
+    if (accepted && window.__humanInputQueue.length > 0) {
+      scheduleInputFlush(0);
+    } else if (!accepted && window.__humanInputQueue.length > 0) {
+      scheduleInputRetry();
+    }
+    updateInputStatusLabels();
+  }
+}
+function updateAgentStatePanel() {
+  const p = selectedPlayerSnapshot();
+  if (!p) {
+    agentSelected.textContent = "Autonomous";
+    agentKinematics.textContent = "-";
+    agentShotLane.textContent = "-";
+    agentTactical.textContent = "-";
+    agentPomdp.textContent = "-";
+    agentPomdp.title = "";
+    return;
+  }
+  agentSelected.textContent = `${p.team} ${p.shirt} ${p.name}`;
+  agentKinematics.textContent = playerHistoryKinematicsLabel(
+    p,
+    trace.config?.dtSeconds,
+    playbackPlayerHistoryForFrame(p.id)
+  );
+  agentShotLane.textContent = selectedPlayerShotLaneLabel();
+  agentTactical.textContent = selectedPlayerTacticalLabel(p);
+  agentPomdp.textContent = selectedPlayerPomdpLabel(p);
+  agentPomdp.title = selectedPlayerPomdpTitle(p);
+}
+function selectedPlayerTacticalLabel(p = selectedPlayerSnapshot()) {
+  const observation = p?.lastDecision?.observation;
+  const action = String(p?.lastDecision?.action || p?.lastAction || "").replace(/-/g, " ");
+  const schedule = playbackScheduleSlotLabel(p?.scheduledIndex);
+  const ops = operationOrderLabel(p?.lastDecision?.operationOrder || p?.operationOrder, 2);
+  const probability = selectedPlayerDecisionProbabilityLabel(p);
+  const gridFacing = selectedPlayerGridFacingLabel(p);
+  const skillBands = selectedPlayerSkillBandLabel(p);
+  const agentTrace = action ? `${action}${schedule}${probability} ${gridFacing}${skillBands ? ` ${skillBands}` : ""}${ops ? ` ${ops}` : ""}` : `${gridFacing}${skillBands ? ` ${skillBands}` : ""}`;
+  if (!observation) return agentTrace || "-";
+  const keeperLine = Number(observation.goalkeeperBallGoalLineAlignmentScore ?? 0);
+  const breakThreat = Number(observation.defensiveLineBreakThreat ?? 0);
+  const pressure = Number(observation.perceivedPressure ?? 0);
+  const urgency = Number(observation.decisionUrgency ?? 0);
+  const tactical = `K${keeperLine.toFixed(2)} B${breakThreat.toFixed(2)} P${pressure.toFixed(2)} U${urgency.toFixed(2)}`;
+  return agentTrace ? `${tactical} ${agentTrace}` : tactical;
+}
+function selectedPlayerShotContext(slot = activeSlot) {
+  const frame = currentFrame();
+  const p = selectedPlayerSnapshot(slot);
+  if (!frame || !p) return null;
+  if (frame.ball?.holder !== p.id) return {kind: "no-ball"};
+  const config = trace.config || FALLBACK_CONFIG;
+  const goalY = p.team === "Home" ? Number(config.fieldLengthYards || 120) : 0;
+  const yardsToGoal = Math.abs(goalY - Number(p.position?.y || 0));
+  const nearGoal = yardsToGoal <= 20;
+  const laneOpen = staticShotLaneOpen(frame, p, goalY);
+  return {kind: "holder", nearGoal, laneOpen, yardsToGoal};
+}
+function selectedPlayerShotLaneLabel() {
+  const context = selectedPlayerShotContext();
+  if (!context) return "-";
+  if (context.kind === "no-ball") return "No ball";
+  if (!context.nearGoal) return `${context.yardsToGoal.toFixed(0)}y`;
+  return context.laneOpen ? "Open" : "Blocked";
+}
+function selectedPlayerCanShoot(slot = activeSlot) {
+  const context = selectedPlayerShotContext(slot);
+  return !!context && context.kind === "holder" && context.nearGoal && context.laneOpen;
+}
+function pushActionInput(forceShoot = false, slot = activeSlot) {
+  if (selectedPlayer(slot) == null) return false;
+  const shoot = forceShoot
+    || controllerSprintForSlot(slot)
+    || selectedPlayerCanShoot(slot);
+  return queueSlotInput(slot, !shoot, shoot);
+}
+function controllerAxisForSlot(slot) {
+  const map = CONTROLLER_KEYMAPS[slot] || CONTROLLER_KEYMAPS[0];
+  const axis = {x: 0, y: 0};
+  if (keys.has(map.left)) axis.x -= 1;
+  if (keys.has(map.right)) axis.x += 1;
+  if (keys.has(map.up)) axis.y += 1;
+  if (keys.has(map.down)) axis.y -= 1;
+  return axis;
+}
+function controllerSprintForSlot(slot) {
+  const map = CONTROLLER_KEYMAPS[slot] || CONTROLLER_KEYMAPS[0];
+  return keys.has(map.sprint);
+}
+function isPassLikeHumanAction(action) {
+  const normalizedAction = String(action || "").toLowerCase();
+  return ["pass", "aerial-pass", "killer-pass"].includes(normalizedAction);
+}
+function queueControllerFrame(slot, axis, sprint, pass = false, shoot = false, action = null) {
+  const playerId = selectedPlayer(slot);
+  if (playerId == null) return false;
+  const passLike = pass || isPassLikeHumanAction(action);
+  setActiveSlot(slot);
+  window.dispatchHumanInput({
+    controllerSlot: slot,
+    playerId,
+    seq: ++inputSeq,
+    axis,
+    sprint: controllerSprintForSlot(slot),
+    pass: passLike,
+    passFlight: passLike ? passFlight.value : "floor",
+    shoot,
+    action,
+    targetPlayer: passLike ? selectedPassTarget() : null
+  });
+  return true;
+}
+function queueSlotInput(slot, pass = false, shoot = false, action = null) {
+  return queueControllerFrame(
+    slot,
+    controllerAxisForSlot(slot),
+    controllerSprintForSlot(slot),
+    pass,
+    shoot,
+    action
+  );
+}
+function pushInput(pass = false, shoot = false, action = null) {
+  return queueSlotInput(activeSlot, pass, shoot, action);
+}
+function gamepadButtonPressed(gamepad, buttonIndex) {
+  const button = gamepad?.buttons?.[buttonIndex];
+  return Boolean(button?.pressed || Number(button?.value || 0) > 0.50);
+}
+function gamepadPressedThisPulse(slot, gamepad, buttonIndex) {
+  const key = `${slot}:${Number(gamepad?.index ?? slot)}:${buttonIndex}`;
+  const pressed = gamepadButtonPressed(gamepad, buttonIndex);
+  const wasPressed = gamepadButtonLatch.get(key) === true;
+  gamepadButtonLatch.set(key, pressed);
+  return pressed && !wasPressed;
+}
+function gamepadAxisValue(value) {
+  const v = Number(value || 0);
+  if (Math.abs(v) < GAMEPAD_STICK_DEADZONE) return 0;
+  return Math.max(-1, Math.min(1, v));
+}
+function axisFromGamepad(gamepad) {
+  const axis = {
+    x: gamepadAxisValue(gamepad?.axes?.[0]),
+    y: -gamepadAxisValue(gamepad?.axes?.[1])
+  };
+  if (gamepadButtonPressed(gamepad, GAMEPAD_BUTTONS.dpadLeft)) axis.x -= 1;
+  if (gamepadButtonPressed(gamepad, GAMEPAD_BUTTONS.dpadRight)) axis.x += 1;
+  if (gamepadButtonPressed(gamepad, GAMEPAD_BUTTONS.dpadUp)) axis.y += 1;
+  if (gamepadButtonPressed(gamepad, GAMEPAD_BUTTONS.dpadDown)) axis.y -= 1;
+  const length = Math.hypot(axis.x, axis.y);
+  return length > 1 ? {x: axis.x / length, y: axis.y / length} : axis;
+}
+function connectedGamepads() {
+  if (typeof navigator === "undefined" || typeof navigator.getGamepads !== "function") return [];
+  return Array.from(navigator.getGamepads()).filter(Boolean);
+}
+function gamepadForSlot(slot) {
+  const pads = connectedGamepads();
+  return pads.find(pad => Number(pad.index) === slot) || pads[slot] || null;
+}
+function gamepadActionForSlot(slot, gamepad) {
+  if (gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.carry)) return "carry-forward";
+  if (gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.protect)) return "protect-ball";
+  if (gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.clearance)) return "clearance";
+  if (gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.routeOne)) return "route-one";
+  if (gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.killerPass)) return "killer-pass";
+  return null;
+}
+function queueGamepadInputs() {
+  let queued = 0;
+  for (let slot = 0; slot < visibleHumanSlotCount(); slot++) {
+    const gamepad = gamepadForSlot(slot);
+    if (!gamepad || selectedPlayer(slot) == null) continue;
+    const axis = axisFromGamepad(gamepad);
+    const sprint = gamepadButtonPressed(gamepad, GAMEPAD_BUTTONS.sprint);
+    const actionPressed = gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.action);
+    const passPressed = gamepadPressedThisPulse(slot, gamepad, GAMEPAD_BUTTONS.pass);
+    const explicitAction = gamepadActionForSlot(slot, gamepad);
+    const shoot = actionPressed && (sprint || selectedPlayerCanShoot(slot));
+    const pass = passPressed || (actionPressed && !shoot);
+    if (axis.x !== 0 || axis.y !== 0 || sprint || pass || shoot || explicitAction != null) {
+      if (queueControllerFrame(slot, axis, sprint, pass, shoot, explicitAction)) queued++;
+    }
+  }
+  if (queued > 0) scheduleInputFlush(0);
+  return queued;
+}
+function rebuildPassTargets() {
+  const frame = currentFrame();
+  if (!frame) return;
+  const players = frame.players;
+  const activePlayerId = selectedPlayer(activeSlot);
+  const activePlayer = players.find(p => p.id === activePlayerId);
+  const existing = passTarget.value;
+  passTarget.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Auto target";
+  passTarget.appendChild(auto);
+  if (activePlayer) {
+    for (const p of players.filter(p => p.team === activePlayer.team && p.id !== activePlayer.id)) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = playerLabel(p);
+      passTarget.appendChild(opt);
+    }
+  }
+  if (Array.from(passTarget.options).some(o => o.value === existing)) {
+    passTarget.value = existing;
+  }
+}
+function buildSlots() {
+  const firstFrame = trace.frames[0];
+  if (!firstFrame) return;
+  const players = firstFrame.players;
+  slots.innerHTML = "";
+  for (let i = 0; i < visibleHumanSlotCount(); i++) {
+    const row = document.createElement("div");
+    row.className = "slot";
+    row.id = `slot-row-${i}`;
+    const label = document.createElement("label");
+    label.textContent = `Slot ${i + 1}`;
+    const select = document.createElement("select");
+    select.id = `slot-${i}`;
+    const autonomous = document.createElement("option");
+    autonomous.value = "";
+    autonomous.textContent = "Autonomous";
+    select.appendChild(autonomous);
+    for (const p of players) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = playerLabel(p);
+      opt.dataset.baseLabel = playerLabel(p);
+      if (p.controllerSlot === i) opt.selected = true;
+      select.appendChild(opt);
+    }
+    const keymap = document.createElement("div");
+    keymap.className = "keymap";
+    keymap.textContent = controllerKeymapLabel(i);
+    const inputStatus = document.createElement("div");
+    inputStatus.className = "input-status";
+    inputStatus.id = `slot-input-${i}`;
+    inputStatus.textContent = "Input ready";
+    select.addEventListener("focus", () => { setActiveSlot(i); syncStaticSlotAvailability(); });
+    select.addEventListener("change", () => {
+      setActiveSlot(i);
+      syncStaticSlotAvailability();
+      const selected = selectedPlayer(i);
+      applyControllerAssignments(
+        Array.from({length: visibleHumanSlotCount()}, (_, slot) => {
+          const playerId = selectedPlayer(slot);
+          return playerId == null ? null : {controllerSlot: slot, playerId};
+        }).filter(Boolean)
+      );
+      rebuildPassTargets();
+      render();
+      syncControllerAssignment(i, selected);
+    });
+    row.append(label, select, keymap, inputStatus);
+    slots.appendChild(row);
+  }
+  refreshActiveSlotRows();
+  syncStaticSlotAvailability();
+  updateInputStatusLabels();
+  rebuildPassTargets();
+}
+
+function appendFrameLine(line) {
+  const raw = line.trim();
+  if (!raw) return;
+  trace.frames.push(JSON.parse(raw));
+  recordRecentLoadRateSample();
+  scrub.max = Math.max(0, trace.frames.length - 1);
+  initializeUiWhenReady();
+  if (!playing && frameIndex >= trace.frames.length - 2) render();
+}
+
+async function loadTraceMeta(signal) {
+  const response = await fetchRequiredResource(TRACE_META_URL, "application/json", signal, 'metadata');
+  const meta = await response.json();
+  trace.config = meta.config || trace.config || {...FALLBACK_CONFIG};
+  trace.summary = meta.summary || trace.summary || {ticks: 0, stats: emptyStats()};
+  trace.summary.stats = trace.summary.stats || emptyStats();
+  trace.cadence = meta.cadence || meta.playback?.cadence || null;
+  trace.agentContract = meta.agentContract || meta.playback?.agentContract || null;
+  trace.decisionModel = meta.decisionModel || meta.playback?.decisionModel || null;
+  trace.controllerContract = meta.controllerContract || meta.playback?.controllerContract || null;
+  trace.uiContract = meta.uiContract || meta.playback?.uiContract || null;
+  trace.physicsContract = meta.physicsContract || meta.playback?.physicsContract || null;
+  trace.learningContract = meta.learningContract || meta.playback?.learningContract || null;
+  trace.stepTiming = meta.stepTiming || meta.step_timing || null;
+  trace.controllerYield = meta.controllerYield || meta.controller_yield || meta.playback?.controllerYield || null;
+  trace.tacticalLiveness = meta.tacticalLiveness || meta.playback?.tacticalLiveness || null;
+  trace.events = Array.isArray(meta.events) ? meta.events : [];
+  trace.runId = meta.runId || null;
+  trace.generatedAtUnixMs = meta.generatedAtUnixMs || null;
+  updateMetrics();
+}
+
+async function loadTraceFrames(signal) {
+  const response = await fetchRequiredResource(
+    TRACE_FRAMES_URL,
+    "application/x-ndjson,text/plain,application/jsonl",
+    signal,
+    'frames'
+  );
+  const totalBytes = Number(response.headers.get("content-length") || 0);
+  let loadedBytes = 0;
+  let buffer = "";
+  loadStartedAt = performance.now();
+  resetRecentLoadRate();
+
+  if (!response.body || !response.body.getReader) {
+    updateLoadingProgress(0, totalBytes, "Downloading frames");
+    const text = await response.text();
+    loadedBytes = textByteLength(text);
+    for (const line of text.split(/\n/)) appendFrameLine(line);
+    traceFramesComplete = true;
+    updateLoadingProgress(loadedBytes, totalBytes || loadedBytes, "Frames loaded");
+    hideLoadingOverlay();
+    updatePlaybackAvailability();
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    loadedBytes += value.byteLength;
+    buffer += decoder.decode(value, {stream: true});
+    const lines = buffer.split(/\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) appendFrameLine(line);
+    updateLoadingProgress(loadedBytes, totalBytes, "Streaming frames");
+  }
+  buffer += decoder.decode();
+  appendFrameLine(buffer);
+  traceFramesComplete = true;
+  updateLoadingProgress(loadedBytes, totalBytes || loadedBytes, "Frames loaded");
+  hideLoadingOverlay();
+  updatePlaybackAvailability();
+}
+
+async function bootstrapTrace(options = {}) {
+  if (traceLoadController) traceLoadController.abort();
+  const controller = new AbortController();
+  traceLoadController = controller;
+  if (options.reset) resetTraceState();
+  loadingOverlay.classList.remove("hidden", "playable");
+  setControlsEnabled(false);
+  updateLoadingProgress(0, 0, options.message || "Loading metadata");
+  render();
+  try {
+    await loadTraceMeta(controller.signal);
+    updateLoadingProgress(0, 0, "Connecting to frame stream");
+    await loadTraceFrames(controller.signal);
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    playing = false;
+    loadingBar.style.width = "100%";
+    loadingProgress.setAttribute("aria-valuenow", "100");
+    if (err.name === "AuthRequiredError") {
+      setLoadingTitle("Authentication required", "auth");
+      loadingStatus.textContent = `Auth required: ${err.message}`;
+      loadingBytes.textContent = "Enter the legacy Auth header to load the split trace";
+      loadingProgress.setAttribute("aria-valuetext", loadingStatus.textContent);
+      play.textContent = "Auth required";
+      authToken.focus();
+    } else {
+      setLoadingTitle("Load failed", "failed");
+      loadingStatus.textContent = `Load failed: ${err.message}`;
+      loadingBytes.textContent = "Retry after redeploying the split trace artifacts";
+      loadingProgress.setAttribute("aria-valuetext", loadingStatus.textContent);
+      play.textContent = "Load failed";
+    }
+    setControlsEnabled(false);
+  } finally {
+    if (traceLoadController === controller) traceLoadController = null;
+  }
+}
+
+async function runNewSimulation() {
+  if (runningNewSimulation) return;
+  const previousRunKey = traceRunKey();
+  runningNewSimulation = true;
+  runNewSimButton.disabled = true;
+  runNewSimButton.textContent = "Running";
+  if (traceLoadController) traceLoadController.abort();
+  playing = false;
+  loadingOverlay.classList.remove("hidden", "playable");
+  setControlsEnabled(false);
+  updateLoadingProgress(0, 0, "Running main_soccer");
+  play.textContent = "Running";
+  try {
+    const response = await fetchRequiredResource(RUN_NEW_SIM_URL, "application/json", undefined, 'run');
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "simulation failed");
+    runNewSimButton.textContent = "Loading";
+    await bootstrapTrace({reset: true, message: "Loading new match"});
+    assertFreshRunLoaded(previousRunKey);
+  } catch (err) {
+    loadingBar.style.width = "100%";
+    loadingProgress.setAttribute("aria-valuenow", "100");
+    if (err.name === "AuthRequiredError") {
+      setLoadingTitle("Authentication required", "auth");
+      loadingStatus.textContent = `Auth required: ${err.message}`;
+      loadingBytes.textContent = "Enter the legacy Auth header to run a fresh simulation";
+      loadingProgress.setAttribute("aria-valuetext", loadingStatus.textContent);
+      play.textContent = "Auth required";
+      authToken.focus();
+    } else {
+      setLoadingTitle("Run failed", "failed");
+      loadingStatus.textContent = `Run failed: ${err.message}`;
+      loadingBytes.textContent = "main_soccer did not produce a fresh split trace";
+      loadingProgress.setAttribute("aria-valuetext", loadingStatus.textContent);
+      play.textContent = "Run failed";
+    }
+  } finally {
+    runningNewSimulation = false;
+    runNewSimButton.textContent = "Run New Sim";
+    updatePlaybackAvailability();
+  }
+}
+
+scrub.addEventListener("input", () => { frameIndex = Number(scrub.value); rebuildPassTargets(); render(); });
+play.addEventListener("click", () => {
+  if (play.disabled) return;
+  playing = !playing;
+  play.textContent = playing ? "Pause" : "Play";
+});
+runNewSimButton.addEventListener("click", runNewSimulation);
+gridOverlayLevel.addEventListener("change", () => render());
+authForm.addEventListener("submit", e => {
+  e.preventDefault();
+  const token = authToken.value.trim();
+  if (!token) return;
+  storeSessionAuthToken(token);
+  authToken.value = "";
+  bootstrapTrace({reset: true, message: "Retrying match data"});
+});
+document.getElementById("prev").addEventListener("click", () => {
+  frameIndex = Math.max(0, frameIndex - 1);
+  rebuildPassTargets();
+  render();
+});
+document.getElementById("next").addEventListener("click", () => {
+  frameIndex = Math.min(trace.frames.length - 1, frameIndex + 1);
+  rebuildPassTargets();
+  render();
+});
+document.getElementById("capture").addEventListener("click", () => pushInput(false, false));
+document.getElementById("pass").addEventListener("click", () => pushInput(true, false));
+document.getElementById("shoot").addEventListener("click", () => pushInput(false, true));
+carryActionButton.addEventListener("click", () => pushInput(false, false, "carry-forward"));
+protectActionButton.addEventListener("click", () => pushInput(false, false, "protect-ball"));
+killerPassActionButton.addEventListener("click", () => pushInput(true, false, "killer-pass"));
+clearanceActionButton.addEventListener("click", () => pushInput(false, false, "clearance"));
+routeOneActionButton.addEventListener("click", () => pushInput(false, false, "route-one"));
+window.addEventListener("keydown", e => {
+  if (isFormEditingTarget(e.target)) return;
+  keys.add(e.code);
+  if (e.code === "KeyT" || e.code === "KeyC" || e.code === "KeyR") {
+    e.preventDefault();
+    if (!e.repeat && e.code === "KeyT") pushInput(true, false, "killer-pass");
+    if (!e.repeat && e.code === "KeyC") pushInput(false, false, "clearance");
+    if (!e.repeat && e.code === "KeyR") pushInput(false, false, "route-one");
+    return;
+  }
+  if (/^Digit[1-4]$/.test(e.code)) {
+    const slot = Number(e.code.slice(-1)) - 1;
+    if (slot < visibleHumanSlotCount()) {
+      e.preventDefault();
+      setActiveSlot(slot);
+      render();
+    }
+    return;
+  }
+  const slot = controllerSlotForKey(e.code);
+  const kind = slot == null ? null : controllerKeyKind(slot, e.code);
+  if (kind === "move" || kind === "sprint") {
+    e.preventDefault();
+    queueSlotInput(slot, false, false);
+  } else if (kind === "pass" || kind === "shoot") {
+    e.preventDefault();
+    if (!e.repeat) {
+      if (kind === "shoot") {
+        queueSlotInput(slot, false, true);
+      } else {
+        pushActionInput(false, slot);
+      }
+    }
+  }
+});
+window.addEventListener("keyup", e => {
+  if (isFormEditingTarget(e.target)) return;
+  keys.delete(e.code);
+  const slot = controllerSlotForKey(e.code);
+  const kind = slot == null ? null : controllerKeyKind(slot, e.code);
+  if (kind === "move" || kind === "sprint") {
+    e.preventDefault();
+    queueSlotInput(slot, false, false);
+  }
+});
+setControlsEnabled(false);
+updateMetrics();
+render();
+requestAnimationFrame(tick);
+initializeAuthTokenFromLocation();
+bootstrapTrace();
+</script>
+</body>
+</html>

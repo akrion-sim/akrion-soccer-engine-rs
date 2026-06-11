@@ -1,0 +1,1346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soccer rotation planner</title>
+<style>
+:root{color-scheme:dark;--bg:#081018;--panel:#101922;--panel2:#0c141d;--line:#283746;--ink:#eef4f8;--muted:#91a1ad;--blue:#2f80ed;--green:#31c48d;--red:#ef5a5a;--gold:#e7b84a}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+header{height:58px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:#0b141d}
+.brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+h1{margin:0;font-size:18px;font-weight:650;letter-spacing:0}
+.build-info{flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);white-space:nowrap}
+.header-actions{display:flex;gap:8px;align-items:center}
+.layout{flex:1;display:grid;grid-template-columns:460px minmax(0,1fr);min-height:0}
+aside{overflow:auto;border-right:1px solid var(--line);background:var(--panel);padding:12px}
+main{display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;min-width:0;min-height:0;background:#071019}
+.section{border-top:1px solid var(--line);padding:12px 0}
+.section:first-child{border-top:0;padding-top:0}
+h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.06em}
+label{display:block;margin:0 0 4px;color:var(--muted);font-size:12px}
+input,select,button,textarea{font:inherit}
+input[type=text],input[type=number],select,textarea{width:100%;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--ink);padding:7px 8px}
+input[type=range]{width:100%}
+textarea{min-height:138px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.35}
+button{border:1px solid var(--line);border-radius:6px;background:#172433;color:var(--ink);padding:7px 10px;cursor:pointer}
+button:hover{border-color:#49647d;background:#1b2b3c}
+button.primary{background:var(--blue);border-color:var(--blue);font-weight:700;color:white}
+button.danger{border-color:#6c3131;color:#ffd2d2;background:#2a1719}
+button:disabled{opacity:.55;cursor:wait}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.grid4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+.row{display:flex;gap:8px;align-items:center}
+.row>*{min-width:0}
+.row .grow{flex:1}
+.check{display:flex;align-items:center;gap:6px;color:var(--ink);font-size:13px;margin-top:20px}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px}
+.pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:12px;color:var(--muted);background:#0b141d}
+.player{border:1px solid var(--line);border-radius:8px;background:#0b141d;margin-bottom:8px;padding:8px}
+.player-head{display:grid;grid-template-columns:minmax(90px,1fr) 104px 34px;gap:6px;align-items:center}
+.player-tools{display:grid;grid-template-columns:1fr 1fr 82px 82px 82px;gap:6px;margin-top:6px}
+.banned{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.banned label{display:inline-flex;align-items:center;gap:3px;margin:0;padding:3px 6px;border:1px solid var(--line);border-radius:999px;font-size:11px;color:var(--muted)}
+.scores{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:8px}
+.scores label{margin:0;font-size:11px}
+.scores input{padding:4px;font-size:12px}
+details{margin-top:6px}
+summary{cursor:pointer;color:var(--muted);font-size:12px}
+.synergy{border:1px dashed #3a5267;border-radius:8px;background:#0b141d;margin-bottom:8px;padding:8px}
+.synergy-grid{display:grid;grid-template-columns:1fr 76px 1fr 76px;gap:6px}
+.synergy-scores{display:grid;grid-template-columns:1fr 1fr 1fr 1fr 34px;gap:6px;margin-top:6px;align-items:end}
+.tabs{display:flex;border-bottom:1px solid var(--line);background:#0b141d}
+.tab{border:0;border-right:1px solid var(--line);border-radius:0;background:transparent;color:var(--muted);padding:10px 14px}
+.tab.active{color:var(--ink);background:#102033;box-shadow:inset 0 -2px 0 var(--blue)}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:1px;border-bottom:1px solid var(--line);background:var(--line)}
+.metric{background:#0b141d;padding:9px 12px;min-width:0}
+.metric span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}
+.metric b{display:block;margin-top:2px;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.view{position:relative;min-height:0;overflow:auto}
+.pane{display:none;min-height:100%;height:100%}
+.pane.active{display:block}
+#animationPane{position:relative;overflow:hidden;background:#071019}
+#solverPane{grid-template-rows:minmax(0,1fr) minmax(170px,32%);overflow:hidden;background:#071019}
+#solverPane.active{display:grid}
+#viewFrame,#solverFrame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#071019}
+#solverPane #solverFrame{position:relative;height:100%;min-height:0}
+.solver-insights{overflow:auto;border-top:1px solid var(--line);background:#0b141d;padding:10px 14px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;color:var(--muted);white-space:pre-wrap}
+.solver-insights b{color:var(--ink)}
+.solver-insights .alt{display:inline-block;margin:4px 8px 0 0;padding:4px 7px;border:1px solid var(--line);border-radius:6px;background:#071019;color:var(--ink)}
+#schedulePane,#streamPane{padding:14px;overflow:auto}
+.schedule-table{width:100%;border-collapse:collapse;font-size:13px}
+.schedule-table th,.schedule-table td{border-bottom:1px solid var(--line);padding:7px;text-align:left;vertical-align:top}
+.schedule-table th{color:var(--muted);font-size:11px;text-transform:uppercase}
+.bench-list{color:var(--muted);font-size:12px}
+.loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(5,12,18,.86);z-index:3;font-weight:700}
+.hidden{display:none!important}
+#status{border-top:1px solid var(--line);padding:9px 14px;color:var(--muted);background:#0b141d;font-size:13px;min-height:38px}
+#status.ok{color:var(--green)}
+#status.err{color:#ffb4b4}
+.stream-log{margin-top:10px;max-height:160px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:#071019;padding:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);white-space:pre-wrap}
+@media (max-width:960px){.layout{grid-template-columns:1fr}aside{max-height:46vh;border-right:0;border-bottom:1px solid var(--line)}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.scores{grid-template-columns:repeat(3,minmax(0,1fr))}.grid4,.player-tools,.synergy-scores{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Soccer rotation planner</h1>
+    <span class="build-info" id="buildInfo" data-version="__PLANNER_VERSION__" data-git-commit="__PLANNER_GIT_COMMIT__" data-git-commit-short="__PLANNER_GIT_COMMIT_SHORT__" title="git commit source">vdev @ source</span>
+  </div>
+  <div class="header-actions">
+    <span class="pill" id="shapePill">11v11</span>
+    <button type="button" id="snapshotBtn">Snapshot</button>
+    <button type="button" class="primary" id="solveBtn">Solve</button>
+  </div>
+</header>
+<div class="layout">
+  <aside>
+    <div class="section">
+      <h2>Match</h2>
+      <label>Preset</label>
+      <select id="preset">
+        <option value="11">11v11 / 4-4-2 / 18 players</option>
+        <option value="9">9v9 / 3-3-2 / 14 players</option>
+        <option value="7">7v7 / 2-3-1 / 12 players</option>
+        <option value="custom">Custom</option>
+      </select>
+      <div class="grid3" style="margin-top:8px">
+        <div><label>Formation</label><input type="text" id="formation" value="4-4-2"></div>
+        <div><label>Periods</label><input type="number" id="numPeriods" min="1" max="8" value="2"></div>
+        <div><label>Min/period</label><input type="number" id="minutesPerPeriod" min="1" max="60" value="45"></div>
+      </div>
+      <div class="grid4" style="margin-top:8px">
+        <div><label>Min subs</label><input type="number" id="minSubs" min="0" max="40" value="0"></div>
+        <div><label>Max subs</label><input type="number" id="maxSubs" min="0" max="120" value="119"></div>
+        <div><label>Default min blocks</label><input type="number" id="defaultMinBlocks" min="1" max="18" value="1"></div>
+        <div><label>Default max blocks</label><input type="number" id="defaultMaxBlocks" min="1" max="18" value="4"></div>
+      </div>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Default max bench</label><input type="number" id="defaultMaxBenchBlocks" min="1" max="18" value="3"></div>
+        <div><label>Seed</label><input type="number" id="seed" min="1" value="4242"></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Solver</h2>
+      <div class="grid2">
+        <div><label>Time limit (s)</label><input type="number" id="solverSeconds" min="1" max="300" value="120"></div>
+        <div><label>Max nodes</label><input type="number" id="solverMaxNodes" min="1" value="20000"></div>
+      </div>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Max ticks</label><input type="number" id="solverMaxTicks" min="1" value="200000"></div>
+        <div><label>LP iters</label><input type="number" id="solverLpIters" min="1" value="6000"></div>
+      </div>
+      <div class="grid2" style="margin-top:8px">
+        <div><label>Heuristic passes</label><input type="number" id="solverHeuristics" min="1" value="120"></div>
+        <label class="check"><input type="checkbox" id="fallbackToMdp" checked> Fallback</label>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Roster Variables</h2>
+      <div class="row">
+        <div class="grow"><label>Roster size</label><input type="number" id="rosterTarget" min="2" max="30" value="18"></div>
+        <button type="button" id="resizeRoster" style="margin-top:20px">Set</button>
+        <button type="button" id="addGuest" style="margin-top:20px">Add</button>
+      </div>
+      <div id="roster" style="margin-top:10px"></div>
+    </div>
+
+    <div class="section">
+      <h2>Chemistry</h2>
+      <div id="synergies"></div>
+      <button type="button" id="addSynergy">Add chemistry</button>
+    </div>
+
+    <div class="section">
+      <h2>Command Stream</h2>
+      <div class="toolbar">
+        <button type="button" id="cmdAddPlayer">Player var</button>
+        <button type="button" id="cmdBanGk">Ban GK</button>
+        <button type="button" id="cmdStamina">Stamina</button>
+        <button type="button" id="cmdApply">Apply</button>
+        <button type="button" id="cmdStreamSolve">Stream solve</button>
+        <button type="button" id="cmdClear">Clear</button>
+      </div>
+      <textarea id="commandStream" spellcheck="false"></textarea>
+    </div>
+  </aside>
+  <main>
+    <div class="metrics">
+      <div class="metric"><span>Players</span><b id="mPlayers">18</b></div>
+      <div class="metric"><span>On field</span><b id="mPositions">11</b></div>
+      <div class="metric"><span>Variables</span><b id="mVars">-</b></div>
+      <div class="metric"><span>Constraints</span><b id="mCons">-</b></div>
+      <div class="metric"><span>Subs</span><b id="mSubs">-</b></div>
+      <div class="metric"><span>Status</span><b id="mStatus">ready</b></div>
+    </div>
+    <div class="tabs">
+      <button type="button" class="tab active" data-tab="pitch">Pitch</button>
+      <button type="button" class="tab" data-tab="solver">Solver</button>
+      <button type="button" class="tab" data-tab="schedule">Schedule</button>
+      <button type="button" class="tab" data-tab="stream">Stream</button>
+    </div>
+    <div class="view">
+      <div class="pane active" id="animationPane">
+        <div class="loading hidden" id="loading">Solving...</div>
+        <iframe id="viewFrame" title="animation"></iframe>
+      </div>
+      <div class="pane" id="solverPane">
+        <iframe id="solverFrame" title="solver animation"></iframe>
+        <div class="solver-insights" id="solverInsights">No solve yet.</div>
+      </div>
+      <div class="pane" id="schedulePane">
+        <table class="schedule-table" id="scheduleTable"></table>
+      </div>
+      <div class="pane" id="streamPane">
+        <textarea id="requestJson" spellcheck="false"></textarea>
+        <div class="stream-log" id="streamLog"></div>
+      </div>
+    </div>
+    <div id="status">Ready.</div>
+  </main>
+</div>
+<script type="application/json" id="default-config">__DEFAULT_CONFIG__</script>
+<script>
+function fallbackDefaultState() {
+  const outfieldFormation = [4, 4, 2];
+  const names = positionNames(outfieldFormation);
+  const players = [];
+  for (let i = 0; i < 18; i++) {
+    const scores = names.map(() => 0.35);
+    const best = i % names.length;
+    scores[best] = 0.88;
+    if (best > 0) scores[best - 1] = 0.58;
+    if (best + 1 < names.length) scores[best + 1] = 0.62;
+    if (i === 0) {
+      scores.fill(0.2);
+      scores[0] = 0.95;
+    }
+    players.push({
+      id: i,
+      name: 'Player' + (i + 1),
+      status: 'available',
+      positionScores: scores,
+      bannedPositions: [],
+      fixedPosition: null,
+      minContiguousBlocks: null,
+      maxContiguousBlocks: null,
+      maxBenchBlocks: null
+    });
+  }
+  return {
+    outfieldFormation,
+    numPeriods: 2,
+    minutesPerPeriod: 45,
+    minSubsPerGame: 0,
+    maxSubsPerGame: 119,
+    defaultMinContiguousBlocks: 1,
+    defaultMaxContiguousBlocks: 4,
+    defaultMaxBenchBlocks: 3,
+    players,
+    synergies: [{player: 9, position: 10, partnerPlayer: 7, partnerPosition: 6, scoreWith: 0.92, scoreWithout: 0.78, partnerScoreWith: 0.9, partnerScoreWithout: 0.76}],
+    seed: 4242,
+    solverTimeLimitMs: 120000,
+    solverMaxNodes: 20000,
+    solverMaxTicks: 200000,
+    solverLpMaxIters: 6000,
+    solverHeuristicPasses: 120,
+    fallbackToMdp: true
+  };
+}
+
+function loadDefaultState() {
+  const raw = document.getElementById('default-config').textContent.trim();
+  const templateSentinel = '__DEFAULT_' + 'CONFIG__';
+  if (!raw || raw === templateSentinel) return fallbackDefaultState();
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return fallbackDefaultState();
+  }
+}
+
+let state = loadDefaultState();
+let posNames = [];
+let activeTab = 'pitch';
+let lastPitchAnim = null;
+let lastSolverAnim = null;
+let lastResponse = null;
+let solverStartedAt = 0;
+let solverProgressTimer = null;
+let solverProgressTick = 0;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number.isFinite(+v) ? +v : lo));
+
+function initBuildInfo() {
+  const el = $('buildInfo');
+  if (!el) return;
+  const unresolved = (v) => !v || v.includes('__PLANNER_');
+  const version = el.dataset.version;
+  const commit = el.dataset.gitCommit;
+  const commitShort = el.dataset.gitCommitShort;
+  if (unresolved(version) || unresolved(commit) || unresolved(commitShort)) return;
+  el.textContent = `v${version} @ ${commitShort}`;
+  el.title = 'git commit ' + commit;
+}
+
+function apiPath(suffix) {
+  const p = window.location.pathname;
+  let prefix = '';
+  const out = p.indexOf('/out/');
+  const marker = '/soccer/planner';
+  if (out >= 0) prefix = p.slice(0, out);
+  else {
+    const i = p.indexOf(marker);
+    if (i >= 0) prefix = p.slice(0, i);
+  }
+  return prefix + '/soccer/planner/' + suffix;
+}
+
+function canUsePlannerApi() {
+  return window.location.protocol === 'http:' || window.location.protocol === 'https:';
+}
+
+function parseFormation(s) {
+  return String(s || '').split(/[-,\s]+/).filter(Boolean).map(x => parseInt(x, 10)).filter(n => n > 0);
+}
+
+function positionNames(outfield) {
+  const rows = [1, ...outfield];
+  const names = [];
+  const outRows = rows.length - 1;
+  for (let r = 0; r < rows.length; r++) {
+    if (r === 0) { names.push('GK'); continue; }
+    const n = rows[r];
+    const role = outRows === 1 ? 'M' : r === 1 ? 'B' : r === outRows ? 'F' : 'M';
+    for (let c = 0; c < n; c++) {
+      let side = 'C';
+      if (n === 2) side = ['L','R'][c];
+      else if (n === 3) side = ['L','C','R'][c];
+      else if (n === 4) side = ['L','LC','RC','R'][c];
+      else if (c === 0) side = 'L';
+      else if (c + 1 === n) side = 'R';
+      names.push(role === 'F' && n === 1 ? 'ST' : side + role);
+    }
+  }
+  return names;
+}
+
+function syncStateFromControls() {
+  state.outfieldFormation = parseFormation($('formation').value);
+  if (!state.outfieldFormation.length) state.outfieldFormation = [4,4,2];
+  state.numPeriods = Math.max(1, +$('numPeriods').value || 1);
+  state.minutesPerPeriod = Math.max(1, +$('minutesPerPeriod').value || 1);
+  state.maxSubsPerGame = Math.max(0, +$('maxSubs').value || 0);
+  state.minSubsPerGame = Math.min(Math.max(0, +$('minSubs').value || 0), state.maxSubsPerGame);
+  state.defaultMinContiguousBlocks = clamp($('defaultMinBlocks').value, 1, 18);
+  state.defaultMaxContiguousBlocks = clamp($('defaultMaxBlocks').value, 1, 18);
+  if (state.defaultMinContiguousBlocks > state.defaultMaxContiguousBlocks) state.defaultMaxContiguousBlocks = state.defaultMinContiguousBlocks;
+  state.defaultMaxBenchBlocks = clamp($('defaultMaxBenchBlocks').value, 1, 18);
+  state.seed = Math.max(1, +$('seed').value || 4242);
+  state.solverTimeLimitMs = Math.max(250, (+$('solverSeconds').value || 1) * 1000);
+  state.solverMaxNodes = Math.max(1, +$('solverMaxNodes').value || 1);
+  state.solverMaxTicks = Math.max(1, +$('solverMaxTicks').value || 1);
+  state.solverLpMaxIters = Math.max(1, +$('solverLpIters').value || 1);
+  state.solverHeuristicPasses = Math.max(1, +$('solverHeuristics').value || 1);
+  state.fallbackToMdp = $('fallbackToMdp').checked;
+  normalizeState();
+}
+
+function syncControlsFromState() {
+  $('formation').value = state.outfieldFormation.join('-');
+  $('numPeriods').value = state.numPeriods;
+  $('minutesPerPeriod').value = state.minutesPerPeriod;
+  $('minSubs').value = state.minSubsPerGame || 0;
+  $('maxSubs').value = state.maxSubsPerGame;
+  $('defaultMinBlocks').value = state.defaultMinContiguousBlocks;
+  $('defaultMaxBlocks').value = state.defaultMaxContiguousBlocks;
+  $('defaultMaxBenchBlocks').value = state.defaultMaxBenchBlocks;
+  $('seed').value = state.seed;
+  $('solverSeconds').value = Math.round((state.solverTimeLimitMs || 120000) / 1000);
+  $('solverMaxNodes').value = state.solverMaxNodes || 20000;
+  $('solverMaxTicks').value = state.solverMaxTicks || 200000;
+  $('solverLpIters').value = state.solverLpMaxIters || 6000;
+  $('solverHeuristics').value = state.solverHeuristicPasses || 120;
+  $('fallbackToMdp').checked = state.fallbackToMdp !== false;
+  $('rosterTarget').value = state.players.length;
+}
+
+function normalizeState() {
+  posNames = positionNames(state.outfieldFormation || [4,4,2]);
+  state.defaultMinContiguousBlocks = clamp(state.defaultMinContiguousBlocks ?? 1, 1, 18);
+  state.defaultMaxContiguousBlocks = clamp(state.defaultMaxContiguousBlocks ?? state.maxConsecutiveOnField ?? 4, 1, 18);
+  if (state.defaultMinContiguousBlocks > state.defaultMaxContiguousBlocks) state.defaultMaxContiguousBlocks = state.defaultMinContiguousBlocks;
+  state.defaultMaxBenchBlocks = clamp(state.defaultMaxBenchBlocks ?? 3, 1, 18);
+  for (let i = 0; i < state.players.length; i++) {
+    const p = state.players[i];
+    p.id = i;
+    p.name = p.name || ('Player' + (i + 1));
+    p.status = p.status || 'available';
+    p.positionScores = Array.isArray(p.positionScores) ? p.positionScores : [];
+    while (p.positionScores.length < posNames.length) p.positionScores.push(0.35);
+    p.positionScores.length = posNames.length;
+    p.positionScores = p.positionScores.map(v => clamp(v, 0, 1));
+  p.bannedPositions = Array.from(new Set((p.bannedPositions || []).filter(x => x >= 0 && x < posNames.length))).sort((a,b)=>a-b);
+    if (p.fixedPosition != null && (p.fixedPosition < 0 || p.fixedPosition >= posNames.length)) p.fixedPosition = null;
+    p.minContiguousBlocks = p.minContiguousBlocks == null || p.minContiguousBlocks === '' ? null : clamp(p.minContiguousBlocks, 1, 18);
+    p.maxContiguousBlocks = p.maxContiguousBlocks == null || p.maxContiguousBlocks === '' ? null : clamp(p.maxContiguousBlocks, 1, 18);
+    p.maxBenchBlocks = p.maxBenchBlocks == null || p.maxBenchBlocks === '' ? null : clamp(p.maxBenchBlocks, 1, 18);
+    if (p.minContiguousBlocks != null && p.maxContiguousBlocks != null && p.minContiguousBlocks > p.maxContiguousBlocks) {
+      p.maxContiguousBlocks = p.minContiguousBlocks;
+    }
+  }
+  state.maxSubsPerGame = Math.max(0, +state.maxSubsPerGame || 0);
+  state.minSubsPerGame = Math.max(0, +state.minSubsPerGame || 0);
+  if (state.minSubsPerGame > state.maxSubsPerGame) state.minSubsPerGame = state.maxSubsPerGame;
+  state.synergies = (state.synergies || []).filter(s =>
+    s.player < state.players.length && s.partnerPlayer < state.players.length &&
+    s.position < posNames.length && s.partnerPosition < posNames.length);
+  for (const s of state.synergies) {
+    s.scoreWith = clamp(s.scoreWith ?? 0.9, 0, 1);
+    s.scoreWithout = clamp(s.scoreWithout ?? 0.75, 0, 1);
+    s.partnerScoreWith = clamp(s.partnerScoreWith ?? s.scoreWith, 0, 1);
+    s.partnerScoreWithout = clamp(s.partnerScoreWithout ?? s.scoreWithout, 0, 1);
+  }
+  $('shapePill').textContent = posNames.length + 'v' + posNames.length + ' / ' + state.players.length;
+}
+
+function matchMinutes() {
+  return Math.max(1, (+state.numPeriods || 1) * (+state.minutesPerPeriod || 1));
+}
+
+function solverBlockCount() {
+  return Math.max(1, Math.min(18, Math.ceil(matchMinutes() / 5)));
+}
+
+function playerMinBlocks(p) {
+  return clamp(p?.minContiguousBlocks ?? state.defaultMinContiguousBlocks ?? 1, 1, 18);
+}
+
+function playerMaxBlocks(p) {
+  return clamp(p?.maxContiguousBlocks ?? state.defaultMaxContiguousBlocks ?? 4, 1, 18);
+}
+
+function playerMaxBenchBlocks(p) {
+  return clamp(p?.maxBenchBlocks ?? state.defaultMaxBenchBlocks ?? 3, 1, 18);
+}
+
+function fixedOptions(value) {
+  return '<option value="">Free</option>' + posNames.map((n,i) =>
+    `<option value="${i}" ${value===i?'selected':''}>${esc(n)}</option>`).join('');
+}
+
+function renderRoster() {
+  normalizeState();
+  const el = $('roster');
+  el.innerHTML = '';
+  state.players.forEach((p, idx) => {
+    const div = document.createElement('div');
+    div.className = 'player';
+    const banned = posNames.map((n,i) =>
+      `<label><input type="checkbox" data-ban="${idx}:${i}" ${(p.bannedPositions||[]).includes(i)?'checked':''}>${esc(n)}</label>`).join('');
+    const scores = posNames.map((n,i) =>
+      `<label>${esc(n)}<input type="number" min="0" max="1" step="0.05" data-score="${idx}:${i}" value="${Number(p.positionScores[i] ?? 0.35).toFixed(2)}"></label>`).join('');
+    div.innerHTML = `
+      <div class="player-head">
+        <input type="text" value="${esc(p.name)}" data-name="${idx}">
+        <select data-status="${idx}">
+          ${['available','guest','awol','injured'].map(s => `<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <button type="button" class="danger" data-remove-player="${idx}">x</button>
+      </div>
+      <div class="player-tools">
+        <div><label>Fixed</label><select data-fixed="${idx}">${fixedOptions(p.fixedPosition)}</select></div>
+        <div><label>Base score</label><input type="range" min="0" max="1" step="0.05" data-base-score="${idx}" value="${average(p.positionScores).toFixed(2)}"></div>
+        <div><label>Min blocks</label><input type="number" min="1" max="18" data-min-blocks="${idx}" placeholder="${state.defaultMinContiguousBlocks}" value="${p.minContiguousBlocks ?? ''}"></div>
+        <div><label>Max blocks</label><input type="number" min="1" max="18" data-max-blocks="${idx}" placeholder="${state.defaultMaxContiguousBlocks}" value="${p.maxContiguousBlocks ?? ''}"></div>
+        <div><label>Max bench</label><input type="number" min="1" max="18" data-max-bench-blocks="${idx}" placeholder="${state.defaultMaxBenchBlocks}" value="${p.maxBenchBlocks ?? ''}"></div>
+      </div>
+      <div class="banned">${banned}</div>
+      <details><summary>Position scores</summary><div class="scores">${scores}</div></details>`;
+    el.appendChild(div);
+  });
+  el.querySelectorAll('[data-name]').forEach(inp => inp.onchange = () => { state.players[+inp.dataset.name].name = inp.value; renderSynergies(); updateRequestJson(); });
+  el.querySelectorAll('[data-status]').forEach(sel => sel.onchange = () => { state.players[+sel.dataset.status].status = sel.value; updateRequestJson(); });
+  el.querySelectorAll('[data-fixed]').forEach(sel => sel.onchange = () => { state.players[+sel.dataset.fixed].fixedPosition = sel.value === '' ? null : +sel.value; updateRequestJson(); });
+  el.querySelectorAll('[data-min-blocks]').forEach(inp => inp.onchange = () => {
+    const p = state.players[+inp.dataset.minBlocks];
+    p.minContiguousBlocks = inp.value === '' ? null : clamp(inp.value, 1, 18);
+    normalizeState();
+    renderRoster();
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-max-blocks]').forEach(inp => inp.onchange = () => {
+    const p = state.players[+inp.dataset.maxBlocks];
+    p.maxContiguousBlocks = inp.value === '' ? null : clamp(inp.value, 1, 18);
+    normalizeState();
+    renderRoster();
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-max-bench-blocks]').forEach(inp => inp.onchange = () => {
+    const p = state.players[+inp.dataset.maxBenchBlocks];
+    p.maxBenchBlocks = inp.value === '' ? null : clamp(inp.value, 1, 18);
+    normalizeState();
+    renderRoster();
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-base-score]').forEach(inp => inp.oninput = () => {
+    state.players[+inp.dataset.baseScore].positionScores = posNames.map(() => +inp.value);
+    renderRoster();
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-ban]').forEach(cb => cb.onchange = () => {
+    const [pi, pos] = cb.dataset.ban.split(':').map(Number);
+    const p = state.players[pi];
+    p.bannedPositions = p.bannedPositions || [];
+    if (cb.checked && !p.bannedPositions.includes(pos)) p.bannedPositions.push(pos);
+    if (!cb.checked) p.bannedPositions = p.bannedPositions.filter(x => x !== pos);
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-score]').forEach(inp => inp.onchange = () => {
+    const [pi, pos] = inp.dataset.score.split(':').map(Number);
+    state.players[pi].positionScores[pos] = clamp(inp.value, 0, 1);
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-remove-player]').forEach(btn => btn.onclick = () => {
+    applyCommand({op:'remove_player', id:+btn.dataset.removePlayer});
+    renderAll();
+  });
+}
+
+function average(xs) {
+  return xs.length ? xs.reduce((a,b)=>a+(+b||0),0)/xs.length : 0;
+}
+
+function renderSynergies() {
+  normalizeState();
+  const el = $('synergies');
+  el.innerHTML = '';
+  state.synergies.forEach((s, i) => {
+    const div = document.createElement('div');
+    div.className = 'synergy';
+    const playerOpts = (value) => state.players.map((p, pi) => `<option value="${pi}" ${value===pi?'selected':''}>${esc(p.name)}</option>`).join('');
+    const posOpts = (value) => posNames.map((n, pi) => `<option value="${pi}" ${value===pi?'selected':''}>${esc(n)}</option>`).join('');
+    div.innerHTML = `
+      <div class="synergy-grid">
+        <select data-syn="${i}" data-field="player">${playerOpts(s.player)}</select>
+        <select data-syn="${i}" data-field="position">${posOpts(s.position)}</select>
+        <select data-syn="${i}" data-field="partnerPlayer">${playerOpts(s.partnerPlayer)}</select>
+        <select data-syn="${i}" data-field="partnerPosition">${posOpts(s.partnerPosition)}</select>
+      </div>
+      <div class="synergy-scores">
+        <div><label>${esc(state.players[s.player]?.name || 'Player')} with</label><input type="number" min="0" max="1" step="0.01" data-syn="${i}" data-field="scoreWith" value="${(+s.scoreWith).toFixed(2)}"></div>
+        <div><label>${esc(state.players[s.player]?.name || 'Player')} without</label><input type="number" min="0" max="1" step="0.01" data-syn="${i}" data-field="scoreWithout" value="${(+s.scoreWithout).toFixed(2)}"></div>
+        <div><label>${esc(state.players[s.partnerPlayer]?.name || 'Partner')} with</label><input type="number" min="0" max="1" step="0.01" data-syn="${i}" data-field="partnerScoreWith" value="${(+(s.partnerScoreWith ?? s.scoreWith)).toFixed(2)}"></div>
+        <div><label>${esc(state.players[s.partnerPlayer]?.name || 'Partner')} without</label><input type="number" min="0" max="1" step="0.01" data-syn="${i}" data-field="partnerScoreWithout" value="${(+(s.partnerScoreWithout ?? s.scoreWithout)).toFixed(2)}"></div>
+        <button type="button" class="danger" data-remove-syn="${i}">x</button>
+      </div>`;
+    el.appendChild(div);
+  });
+  el.querySelectorAll('[data-syn][data-field]').forEach(inp => inp.onchange = () => {
+    const s = state.synergies[+inp.dataset.syn];
+    const f = inp.dataset.field;
+    s[f] = f.startsWith('score') ? clamp(inp.value, 0, 1) : +inp.value;
+    updateRequestJson();
+  });
+  el.querySelectorAll('[data-remove-syn]').forEach(btn => btn.onclick = () => {
+    state.synergies.splice(+btn.dataset.removeSyn, 1);
+    renderSynergies();
+    updateRequestJson();
+  });
+}
+
+function applyCommand(cmd) {
+  const op = cmd.op || '';
+  if (op === 'reset') state = loadDefaultState();
+  if (op === 'set_match') {
+    for (const k of ['numPeriods','minutesPerPeriod','minSubsPerGame','maxSubsPerGame','defaultMinContiguousBlocks','defaultMaxContiguousBlocks','defaultMaxBenchBlocks','seed','solverTimeLimitMs','solverMaxNodes','solverMaxTicks','solverLpMaxIters','solverHeuristicPasses','fallbackToMdp']) {
+      if (cmd[k] !== undefined) state[k] = cmd[k];
+    }
+    if (cmd.maxConsecutiveOnField !== undefined) state.defaultMaxContiguousBlocks = cmd.maxConsecutiveOnField;
+    if (cmd.minContiguousBlocks !== undefined) state.defaultMinContiguousBlocks = cmd.minContiguousBlocks;
+    if (cmd.maxContiguousBlocks !== undefined) state.defaultMaxContiguousBlocks = cmd.maxContiguousBlocks;
+    if (cmd.maxBenchBlocks !== undefined) state.defaultMaxBenchBlocks = cmd.maxBenchBlocks;
+  }
+  if (op === 'set_formation') state.outfieldFormation = cmd.outfieldFormation || parseFormation(cmd.formation);
+  if (op === 'add_player' || op === 'add_variable') {
+    normalizeState();
+    const p = cmd.player || {name: cmd.name || ('Guest' + (state.players.length + 1)), status: cmd.status || 'guest'};
+    p.id = state.players.length;
+    p.positionScores = cmd.positionScores || p.positionScores || posNames.map(() => 0.5);
+    p.bannedPositions = cmd.bannedPositions || p.bannedPositions || [];
+    p.fixedPosition = cmd.fixedPosition ?? p.fixedPosition ?? null;
+    p.minContiguousBlocks = cmd.minContiguousBlocks ?? p.minContiguousBlocks ?? null;
+    p.maxContiguousBlocks = cmd.maxContiguousBlocks ?? p.maxContiguousBlocks ?? null;
+    p.maxBenchBlocks = cmd.maxBenchBlocks ?? p.maxBenchBlocks ?? null;
+    state.players.push(p);
+  }
+  if (op === 'remove_player' || op === 'remove_variable') {
+    const id = cmd.id ?? cmd.player;
+    state.players.splice(id, 1);
+    state.synergies = state.synergies.filter(s => s.player !== id && s.partnerPlayer !== id).map(s => ({
+      ...s,
+      player: s.player > id ? s.player - 1 : s.player,
+      partnerPlayer: s.partnerPlayer > id ? s.partnerPlayer - 1 : s.partnerPlayer
+    }));
+  }
+  if (op === 'set_player' || op === 'set_player_status' || op === 'rename_player') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) Object.assign(p, Object.fromEntries(Object.entries(cmd).filter(([k]) => !['op','id','player'].includes(k))));
+  }
+  if (op === 'set_position_score') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) p.positionScores[cmd.position] = clamp(cmd.score, 0, 1);
+  }
+  if (op === 'set_position_scores') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) p.positionScores = cmd.scores || cmd.positionScores || p.positionScores;
+  }
+  if (op === 'ban_position' || op === 'add_constraint') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p && !p.bannedPositions.includes(cmd.position)) p.bannedPositions.push(cmd.position);
+  }
+  if (op === 'allow_position' || op === 'remove_constraint') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) p.bannedPositions = p.bannedPositions.filter(x => x !== cmd.position);
+  }
+  if (op === 'set_fixed_position') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) p.fixedPosition = cmd.position ?? null;
+  }
+  if (op === 'clear_fixed_position') {
+    const p = state.players[cmd.id ?? cmd.player];
+    if (p) p.fixedPosition = null;
+  }
+  if (op === 'add_synergy') state.synergies.push(cmd.synergy || {
+    player: cmd.player, position: cmd.position, partnerPlayer: cmd.partnerPlayer,
+    partnerPosition: cmd.partnerPosition, scoreWith: cmd.scoreWith ?? 0.9, scoreWithout: cmd.scoreWithout ?? 0.75,
+    partnerScoreWith: cmd.partnerScoreWith ?? 0.9, partnerScoreWithout: cmd.partnerScoreWithout ?? 0.75
+  });
+  if (op === 'remove_synergy') state.synergies.splice(cmd.index, 1);
+  if (op === 'clear_synergies') state.synergies = [];
+  normalizeState();
+}
+
+function appendCommand(cmd, applyNow) {
+  $('commandStream').value += JSON.stringify(cmd) + '\n';
+  logStream('> ' + JSON.stringify(cmd));
+  if (applyNow) {
+    applyCommand(cmd);
+    renderAll();
+  }
+}
+
+function applyStreamText() {
+  const lines = $('commandStream').value.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  for (const line of lines) {
+    const cmd = JSON.parse(line);
+    applyCommand(cmd);
+    logStream('applied ' + (cmd.op || '?'));
+  }
+  renderAll();
+}
+
+function logStream(s) {
+  $('streamLog').textContent += s + '\n';
+  $('streamLog').scrollTop = $('streamLog').scrollHeight;
+}
+
+function solverElapsed() {
+  if (!solverStartedAt) return '00.0s';
+  return ((performance.now() - solverStartedAt) / 1000).toFixed(1).padStart(4, '0') + 's';
+}
+
+function logSolver(s) {
+  const line = `[${solverElapsed()}] ${s}`;
+  $('solverInsights').textContent += line + '\n';
+  $('solverInsights').scrollTop = $('solverInsights').scrollHeight;
+  logStream('solver ' + line);
+}
+
+function safeJson(value) {
+  try {
+    const text = JSON.stringify(value);
+    return text === undefined ? String(value) : text;
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function errorText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message || value.name || 'Error';
+  if (typeof value === 'object') {
+    if (value.error != null) return errorText(value.error);
+    if (value.message != null) return String(value.message);
+  }
+  return safeJson(value);
+}
+
+function describeThrown(value) {
+  if (value instanceof Error) {
+    const detail = {name: value.name || 'Error', message: value.message || ''};
+    if (value.cause !== undefined) detail.cause = describeThrown(value.cause);
+    return detail;
+  }
+  return value && typeof value === 'object' ? value : {message: String(value)};
+}
+
+function responseSnippet(text, max) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  return s.length > (max || 1200) ? s.slice(0, max || 1200) + '...' : s;
+}
+
+function parseJsonBody(text) {
+  if (!String(text || '').trim()) return null;
+  return JSON.parse(text);
+}
+
+function normalizeApiPayload(payload, response, label) {
+  let data = payload;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    data = {ok: response.ok, value: data};
+  }
+  if (data.httpStatus == null) data.httpStatus = response.status;
+  if (data.httpStatusText == null) data.httpStatusText = response.statusText;
+  if (data.contentType == null) data.contentType = response.headers.get('content-type') || '';
+  if (data.url == null) data.url = response.url;
+  if (!response.ok && data.ok !== false) data.ok = false;
+  if (!response.ok && !data.error) data.error = `${label} failed with HTTP ${response.status} ${response.statusText || ''}`.trim();
+  return data;
+}
+
+async function readJsonResponse(response, label) {
+  const text = await response.text();
+  if (!text.trim()) {
+    return normalizeApiPayload({ok:false, error:`${label} returned an empty response`}, response, label);
+  }
+  try {
+    return normalizeApiPayload(parseJsonBody(text), response, label);
+  } catch (e) {
+    return normalizeApiPayload({
+      ok: false,
+      error: `${label} returned malformed or non-JSON data`,
+      parseError: describeThrown(e),
+      bodySnippet: responseSnippet(text)
+    }, response, label);
+  }
+}
+
+function payloadFromTextResponse(response, text, label) {
+  try {
+    return normalizeApiPayload(parseJsonBody(text), response, label);
+  } catch (e) {
+    return normalizeApiPayload({
+      ok: false,
+      error: `${label} returned malformed or non-JSON data`,
+      parseError: describeThrown(e),
+      bodySnippet: responseSnippet(text)
+    }, response, label);
+  }
+}
+
+function networkFailurePayload(label, url, error) {
+  return {
+    ok: false,
+    error: `${label} did not receive a JSON response from the backend`,
+    kind: 'network',
+    url,
+    exception: describeThrown(error),
+    hint: 'The request may have been closed by the browser, gateway, or backend before a JSON body was returned.'
+  };
+}
+
+function logApiFailure(label, payload) {
+  logSolver(`${label}: ${errorText(payload) || 'request failed'}`);
+  logSolver(`${label} details: ${safeJson(payload)}`);
+}
+
+function resetSolverLog(label) {
+  stopSolverProgress();
+  solverStartedAt = performance.now();
+  solverProgressTick = 0;
+  $('solverInsights').textContent = '';
+  logSolver(label || 'solver log opened');
+}
+
+function stopSolverProgress() {
+  if (solverProgressTimer) clearInterval(solverProgressTimer);
+  solverProgressTimer = null;
+}
+
+function maxSubstitutionCapacity() {
+  normalizeState();
+  const fieldable = state.players.filter(p => p.status !== 'awol' && p.status !== 'injured').length;
+  const slots = posNames.length;
+  const blocks = solverBlockCount();
+  if (blocks <= 1 || fieldable <= slots) return 0;
+  return (blocks - 1) * Math.min(slots, fieldable - slots);
+}
+
+function preflightSolverRequest(mode) {
+  normalizeState();
+  const shape = estimateModelShape();
+  const fieldable = state.players.filter(p => p.status !== 'awol' && p.status !== 'injured').length;
+  const cap = maxSubstitutionCapacity();
+  logSolver(`${mode}: ${posNames.length} on-field slots, ${fieldable}/${state.players.length} fieldable players, ${solverBlockCount()} five-minute blocks`);
+  logSolver(`model build estimate: ${shape.variables} binary variables, ${shape.constraints} constraint rows`);
+  logSolver(`substitution bounds: min ${state.minSubsPerGame}, max ${state.maxSubsPerGame}; maximum possible across 5-minute blocks is ${cap}`);
+  if (fieldable < posNames.length) {
+    logSolver(`preflight infeasible: only ${fieldable} fieldable players for ${posNames.length} on-field slots`);
+    logSolver('best guess: add available/guest players, mark players available, or reduce the formation size');
+    setStatus('err', `Need ${posNames.length} fieldable players; only ${fieldable} are available.`);
+    return false;
+  }
+  if (state.minSubsPerGame > cap) {
+    logSolver(`preflight infeasible: Min subs ${state.minSubsPerGame} exceeds the ${cap} substitutions possible with this roster/block setup`);
+    logSolver('best guess: lower Min subs, raise Max subs, add bench depth, or lengthen the match');
+    setStatus('err', `Min subs ${state.minSubsPerGame} is infeasible here; max possible is ${cap}.`);
+    return false;
+  }
+  if (state.minSubsPerGame > state.maxSubsPerGame) {
+    logSolver(`preflight infeasible: Min subs ${state.minSubsPerGame} exceeds Max subs ${state.maxSubsPerGame}`);
+    setStatus('err', 'Min subs cannot exceed Max subs.');
+    return false;
+  }
+  const fixedSlots = new Map();
+  for (const p of state.players) {
+    const unavailable = p.status === 'awol' || p.status === 'injured';
+    if (p.fixedPosition != null && unavailable) {
+      logSolver(`preflight infeasible: ${p.name} is ${p.status} but fixed to ${posNames[p.fixedPosition]}`);
+      logSolver('best guess: clear the fixed position or mark the player available/guest');
+      setStatus('err', `${p.name} is unavailable and fixed to a position.`);
+      return false;
+    }
+    if (p.fixedPosition != null && (p.bannedPositions || []).includes(p.fixedPosition)) {
+      logSolver(`preflight infeasible: ${p.name} is fixed to banned position ${posNames[p.fixedPosition]}`);
+      logSolver('best guess: allow that position or clear/change the fixed position');
+      setStatus('err', `${p.name} is fixed to a banned position.`);
+      return false;
+    }
+    if (p.fixedPosition != null) {
+      if (fixedSlots.has(p.fixedPosition)) {
+        logSolver(`preflight infeasible: ${fixedSlots.get(p.fixedPosition)} and ${p.name} are both fixed to ${posNames[p.fixedPosition]}`);
+        logSolver('best guess: clear one fixed-position lock or choose a different slot');
+        setStatus('err', `Two players are fixed to ${posNames[p.fixedPosition]}.`);
+        return false;
+      }
+      fixedSlots.set(p.fixedPosition, p.name);
+    }
+  }
+  for (let pos = 0; pos < posNames.length; pos++) {
+    const eligible = state.players.some(p => {
+      if (p.status === 'awol' || p.status === 'injured') return false;
+      if (p.fixedPosition != null && p.fixedPosition !== pos) return false;
+      return !(p.bannedPositions || []).includes(pos);
+    });
+    if (!eligible) {
+      logSolver(`preflight infeasible: no eligible player can play ${posNames[pos]}`);
+      logSolver('best guess: allow that position for at least one fieldable player, clear fixed locks, or add a guest');
+      setStatus('err', `No eligible player can play ${posNames[pos]}.`);
+      return false;
+    }
+  }
+  return true;
+}
+
+function startSolverProgress(mode) {
+  const phases = [
+    'queued behind the serialized DES engine lock',
+    'building assignment, eligibility, stamina, substitution, and chemistry rows',
+    'root LP relaxation / feasibility repair station active',
+    'branch-and-bound/cut stations running; server-side incumbent and bound are pending',
+    'still solving; final incumbent, bound, and trace will append when the backend returns'
+  ];
+  solverProgressTimer = setInterval(() => {
+    const shape = estimateModelShape();
+    const phase = phases[Math.min(solverProgressTick, phases.length - 1)];
+    solverProgressTick += 1;
+    logSolver(`${mode} progress: ${phase}; ${shape.variables} vars/${shape.constraints} rows; incumbent=pending; bound=pending`);
+    $('mStatus').textContent = 'solving';
+  }, 1200);
+}
+
+function appendSolutionLog(data) {
+  if (!data) return;
+  logSolver(`final status=${data.mipStatus || '?'} ok=${!!data.ok} affinity=${Number(data.affinity || 0).toFixed(2)} subs=${data.totalSubs}/${subsLimitLabel()} elapsed=${Number(data.elapsedMs || 0).toFixed(0)}ms nodes=${data.nodesExplored || 0}`);
+  if (data.usedFallback) logSolver(`fallback: ${data.fallbackReason || 'used fallback schedule'}`);
+  (data.solverNotes || []).forEach(note => logSolver('note: ' + note));
+  (data.constraintViolations || []).forEach(v => logSolver(`violation [${v.constraint || v.kind || 'constraint'}]: ${v.message || ''}${v.suggestion ? ' | try: ' + v.suggestion : ''}`));
+  if (data.suggestedFix) logSolver('best guess: ' + data.suggestedFix);
+  (data.alternatives || []).forEach(alt => logSolver(`alt #${alt.rank}: affinity=${Number(alt.affinity || 0).toFixed(2)} subs=${alt.totalSubs}`));
+}
+
+function failureStatus(data, label) {
+  const base = errorText(data?.error) || 'solver could not produce a feasible schedule';
+  return `${label}: ${base}${data?.suggestedFix ? ' Best guess: ' + data.suggestedFix : ''}`;
+}
+
+function updateRequestJson() {
+  normalizeState();
+  $('requestJson').value = JSON.stringify(state, null, 2);
+  $('mPlayers').textContent = state.players.length;
+  $('mPositions').textContent = posNames.length;
+  $('mVars').textContent = lastResponse?.numVariables ?? '-';
+  $('mCons').textContent = lastResponse?.numConstraints ?? '-';
+  $('mSubs').textContent = lastResponse ? (lastResponse.totalSubs + '/' + subsLimitLabel()) : '-';
+  $('mStatus').textContent = lastResponse?.mipStatus ?? 'ready';
+}
+
+function subsLimitLabel() {
+  return state.minSubsPerGame > 0 ? `${state.minSubsPerGame}-${state.maxSubsPerGame}` : String(state.maxSubsPerGame);
+}
+
+function renderAll() {
+  normalizeState();
+  syncControlsFromState();
+  renderRoster();
+  renderSynergies();
+  updateRequestJson();
+}
+
+function resizeRoster(n) {
+  normalizeState();
+  while (state.players.length < n) applyCommand({op:'add_player', name:'Guest' + (state.players.length + 1), status:'guest'});
+  while (state.players.length > n) applyCommand({op:'remove_player', id:state.players.length - 1});
+  renderAll();
+}
+
+function setPreset(v) {
+  if (v === '7') { state.outfieldFormation = [2,3,1]; resizeRosterRaw(12); state.minSubsPerGame = 0; state.maxSubsPerGame = 119; state.numPeriods = 4; state.minutesPerPeriod = 10; state.defaultMinContiguousBlocks = 1; state.defaultMaxContiguousBlocks = 4; state.defaultMaxBenchBlocks = 3; }
+  if (v === '9') { state.outfieldFormation = [3,3,2]; resizeRosterRaw(14); state.minSubsPerGame = 0; state.maxSubsPerGame = 119; state.numPeriods = 3; state.minutesPerPeriod = 20; state.defaultMinContiguousBlocks = 1; state.defaultMaxContiguousBlocks = 4; state.defaultMaxBenchBlocks = 3; }
+  if (v === '11') { state.outfieldFormation = [4,4,2]; resizeRosterRaw(18); state.minSubsPerGame = 0; state.maxSubsPerGame = 119; state.numPeriods = 2; state.minutesPerPeriod = 45; state.defaultMinContiguousBlocks = 1; state.defaultMaxContiguousBlocks = 4; state.defaultMaxBenchBlocks = 3; }
+  renderAll();
+}
+
+function resizeRosterRaw(n) {
+  normalizeState();
+  while (state.players.length < n) {
+    state.players.push({id:state.players.length,name:'Player'+(state.players.length+1),status:'available',positionScores:posNames.map(()=>0.45),bannedPositions:[],fixedPosition:null,minContiguousBlocks:null,maxContiguousBlocks:null,maxBenchBlocks:null});
+  }
+  while (state.players.length > n) state.players.pop();
+  state.synergies = [];
+  normalizeState();
+}
+
+function buildMinimalPlayer(anim) {
+  const safe = JSON.stringify(anim).replace(/</g, '\\u003c');
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+body{margin:0;background:${anim.background||'#071019'};font-family:system-ui,sans-serif;color:#e6edf3}
+svg{width:100%;height:calc(100vh - 54px);display:block}
+.ctrl{height:54px;display:flex;gap:8px;align-items:center;padding:8px 12px;background:#0b141d;border-top:1px solid #283746}
+button{cursor:pointer;padding:6px 10px;border-radius:6px;border:1px solid #334155;background:#1e293b;color:#e6edf3}
+input[type=range]{flex:1;min-width:100px}.info{font-size:12px;color:#9aa4b2;min-width:180px}</style></head><body>
+<svg id="stage" viewBox="0 0 ${anim.width||100} ${anim.height||100}" preserveAspectRatio="xMidYMid meet"></svg>
+<div class="ctrl"><button id="play">Play</button><button id="back">Back</button><button id="fwd">Next</button><input type="range" id="scrub" min="0" max="${Math.max(0,(anim.frames||[]).length-1)}" value="0"><span class="info" id="info"></span></div>
+<script type="application/json" id="anim">${safe}<\/script>
+<script>
+const ANIM=JSON.parse(document.getElementById('anim').textContent),NS='http://www.w3.org/2000/svg',stage=document.getElementById('stage');
+let fi=0,playing=false,last=0;
+function attr(el,k,v){if(v!==undefined&&v!==null)el.setAttribute(k,v)}
+function addTitle(el,t){if(!t)return;const n=document.createElementNS(NS,'title');n.textContent=t;el.appendChild(n)}
+function render(i){fi=Math.max(0,Math.min((ANIM.frames||[]).length-1,i|0));stage.replaceChildren();const f=(ANIM.frames||[])[fi]||{};
+for(const sh of (f.shapes||[])){let el;if(sh.kind==='circle'){el=document.createElementNS(NS,'circle');attr(el,'cx',sh.x);attr(el,'cy',sh.y);attr(el,'r',sh.r);attr(el,'fill',sh.fill||'none');}
+else if(sh.kind==='rect'){el=document.createElementNS(NS,'rect');attr(el,'x',sh.x);attr(el,'y',sh.y);attr(el,'width',sh.w);attr(el,'height',sh.h);attr(el,'rx',sh.rx);attr(el,'fill',sh.fill||'none');}
+else if(sh.kind==='line'){el=document.createElementNS(NS,'line');attr(el,'x1',sh.x1);attr(el,'y1',sh.y1);attr(el,'x2',sh.x2);attr(el,'y2',sh.y2);attr(el,'fill','none');}
+else if(sh.kind==='path'){el=document.createElementNS(NS,'path');attr(el,'d',sh.d);attr(el,'fill',sh.fill||'none');}
+else if(sh.kind==='text'){el=document.createElementNS(NS,'text');attr(el,'x',sh.x);attr(el,'y',sh.y);attr(el,'fill',sh.fill||'#fff');attr(el,'font-size',sh.fontSize||12);attr(el,'text-anchor',sh.anchor||'start');attr(el,'font-weight',sh.fontWeight);el.textContent=sh.text||'';}
+else continue;attr(el,'stroke',sh.stroke);attr(el,'stroke-width',sh.strokeWidth);attr(el,'stroke-dasharray',sh.dasharray);attr(el,'opacity',sh.opacity);addTitle(el,sh.title);stage.appendChild(el)}
+document.getElementById('scrub').value=fi;document.getElementById('info').textContent=(fi+1)+'/'+((ANIM.frames||[]).length||1)+(f.caption?' - '+f.caption:'')}
+document.getElementById('scrub').oninput=e=>render(+e.target.value);document.getElementById('play').onclick=()=>{playing=!playing;document.getElementById('play').textContent=playing?'Pause':'Play'};document.getElementById('back').onclick=()=>render(fi-1);document.getElementById('fwd').onclick=()=>render(fi+1);
+function tick(ts){if(playing&&ts-last>1000/(ANIM.fps||6)){render(fi+1>=(ANIM.frames||[]).length?0:fi+1);last=ts}requestAnimationFrame(tick)}render(0);requestAnimationFrame(tick);
+<\/script></body></html>`;
+}
+
+function showAnimation(anim, frameId) {
+  const frame = $(frameId || 'viewFrame');
+  if (!anim || !anim.frames || !anim.frames.length) {
+    frame.removeAttribute('src');
+    frame.srcdoc = '<!doctype html><html><body style="margin:0;display:grid;place-items:center;height:100vh;background:#071019;color:#91a1ad;font:14px system-ui,sans-serif">No animation frames yet.</body></html>';
+    return;
+  }
+  frame.removeAttribute('srcdoc');
+  frame.src = URL.createObjectURL(new Blob([buildMinimalPlayer(anim)], {type:'text/html'}));
+}
+
+function showActiveAnimation() {
+  if (activeTab === 'solver') showAnimation(lastSolverAnim, 'solverFrame');
+  else showAnimation(lastPitchAnim, 'viewFrame');
+}
+
+function renderSchedule(data) {
+  const table = $('scheduleTable');
+  if (!data || !data.assignment) { table.innerHTML = '<tr><td>No solved schedule yet.</td></tr>'; return; }
+  const playerName = (pid) => (pid == null || pid < 0) ? '(empty)' : (state.players[pid]?.name || ('Player'+(pid+1)));
+  let html = '<thead><tr><th>Block</th>' + posNames.map(n => `<th>${esc(n)}</th>`).join('') + '<th>Bench</th></tr></thead><tbody>';
+  data.assignment.forEach((row, t) => {
+    const start = t * 5;
+    const end = Math.min(start + 5, matchMinutes());
+    html += `<tr><th>${t+1}<br><span class="bench-list">${start}-${end}'</span></th>`;
+    row.forEach(pid => html += `<td>${esc(playerName(pid))}</td>`);
+    html += `<td class="bench-list">${(data.bench[t]||[]).map(pid => esc(playerName(pid))).join(', ')}</td></tr>`;
+  });
+  table.innerHTML = html + '</tbody>';
+}
+
+function estimateModelShape() {
+  const p = state.players.length;
+  const k = posNames.length;
+  const t = solverBlockCount();
+  const base = p * k * t;
+  const synergy = (state.synergies || []).length * t;
+  const subVars = p * t + Math.max(0, p * (t - 1));
+  let constraints = p * t + 2 * k * t + p * Math.max(0, t - 1);
+  constraints += state.players.reduce((n, pl) => n + (t > playerMaxBlocks(pl) ? t - playerMaxBlocks(pl) : 0), 0);
+  constraints += state.players.reduce((n, pl) => n + (t > playerMaxBenchBlocks(pl) ? t - playerMaxBenchBlocks(pl) : 0), 0);
+  constraints += state.players.reduce((n, pl) => {
+    const m = playerMinBlocks(pl);
+    if (m <= 1) return n;
+    let rows = 0;
+    for (let t0 = 0; t0 < t; t0++) rows += t0 + m <= t ? m - 1 : 1;
+    return n + rows;
+  }, 0);
+  constraints += state.players.reduce((n, pl) => n + ((pl.status === 'awol' || pl.status === 'injured') ? t : 0), 0);
+  constraints += state.players.reduce((n, pl) => n + ((pl.fixedPosition == null) ? 0 : t * k), 0);
+  constraints += state.players.reduce((n, pl) => n + (pl.bannedPositions || []).length * t, 0);
+  constraints += synergy * 3;
+  const hasMaxSubs = state.maxSubsPerGame != null;
+  const hasMinSubs = state.minSubsPerGame != null;
+  if (hasMaxSubs || hasMinSubs) {
+    constraints += subVars ? (hasMaxSubs ? 1 : 0) + (hasMinSubs ? 1 : 0) + p * t + 3 * p * Math.max(0, t - 1) : 0;
+  }
+  return { variables: base + synergy + subVars, constraints };
+}
+
+function localPreviewSolve() {
+  normalizeState();
+  const nPos = posNames.length;
+  const fieldable = state.players.filter(p => p.status !== 'awol' && p.status !== 'injured');
+  if (fieldable.length < nPos) throw new Error(`need ${nPos} fieldable players; only ${fieldable.length} available`);
+  const fixedSlots = new Map();
+  for (const p of fieldable) {
+    if (p.fixedPosition != null) {
+      if ((p.bannedPositions || []).includes(p.fixedPosition)) throw new Error(`${p.name} is fixed to a banned position`);
+      if (fixedSlots.has(p.fixedPosition)) throw new Error(`two players are fixed to ${posNames[p.fixedPosition]}`);
+      fixedSlots.set(p.fixedPosition, p.id);
+    }
+  }
+  const assignment = [];
+  const bench = [];
+  const run = state.players.map(() => 0);
+  let prevOn = new Set();
+  let prevBench = new Set();
+  let totalSubs = 0;
+  let affinity = 0;
+  const benchRun = state.players.map(() => 0);
+  const blocks = solverBlockCount();
+  for (let period = 0; period < blocks; period++) {
+    const row = Array(nPos).fill(-1);
+    const used = new Set();
+    for (const [pos, pid] of fixedSlots.entries()) {
+      row[pos] = pid;
+      used.add(pid);
+    }
+    const mustContinue = new Set([...prevOn].filter(pid => {
+      const p = state.players[pid];
+      return p && run[pid] > 0 && run[pid] < playerMinBlocks(p) && !used.has(pid);
+    }));
+    for (const pid of mustContinue) {
+      const p = state.players[pid];
+      const pos = bestOpenPositionFor(p, row, used);
+      if (pos == null) throw new Error(`${p.name} cannot continue a minimum-block stint in block ${period + 1}`);
+      row[pos] = pid;
+      used.add(pid);
+    }
+    const mustPlay = new Set([...prevBench].filter(pid => {
+      const p = state.players[pid];
+      return p && benchRun[pid] >= playerMaxBenchBlocks(p) && fieldable.some(fp => fp.id === pid) && !used.has(pid);
+    }));
+    for (const pid of mustPlay) {
+      const p = state.players[pid];
+      const pos = bestOpenPositionFor(p, row, used);
+      if (pos == null) throw new Error(`${p.name} cannot return from a maximum bench stint in block ${period + 1}`);
+      row[pos] = pid;
+      used.add(pid);
+    }
+    const chooseFor = (pos) => {
+      const scored = fieldable.filter(p => {
+        if (used.has(p.id)) return false;
+        if (p.fixedPosition != null && p.fixedPosition !== pos) return false;
+        if ((p.bannedPositions || []).includes(pos)) return false;
+        return true;
+      }).map(p => {
+        const shouldRest = run[p.id] >= playerMaxBlocks(p) && !mustPlay.has(p.id);
+        const fairnessBoost = mustPlay.has(p.id) ? 2.0 : 0.0;
+        const restPenalty = shouldRest ? 3.0 : 0.0;
+        const continuity = prevOn.has(p.id) ? 0.05 : 0;
+        return {p, score: (p.positionScores[pos] || 0) + fairnessBoost + continuity - restPenalty};
+      }).sort((a,b) => b.score - a.score || a.p.id - b.p.id);
+      return scored[0]?.p || null;
+    };
+    for (let pos = 0; pos < nPos; pos++) {
+      if (row[pos] >= 0) continue;
+      const picked = chooseFor(pos);
+      if (!picked) throw new Error(`no eligible player for ${posNames[pos]} in period ${period + 1}`);
+      row[pos] = picked.id;
+      used.add(picked.id);
+    }
+    const curBench = state.players.map(p => p.id).filter(pid => !used.has(pid));
+    row.forEach((pid, pos) => affinity += state.players[pid]?.positionScores?.[pos] || 0);
+    if (period > 0) {
+      for (const pid of prevOn) if (!used.has(pid)) totalSubs++;
+    }
+    for (const p of state.players) {
+      if (used.has(p.id)) {
+        run[p.id] = run[p.id] + 1;
+        benchRun[p.id] = 0;
+      } else {
+        run[p.id] = 0;
+        benchRun[p.id] = (p.status === 'awol' || p.status === 'injured') ? 0 : benchRun[p.id] + 1;
+      }
+    }
+    assignment.push(row);
+    bench.push(curBench);
+    prevOn = used;
+    prevBench = new Set(curBench);
+  }
+  const shape = estimateModelShape();
+  return {
+    ok: true,
+    error: null,
+    affinity,
+    totalSubs,
+    fairnessOk: true,
+    staminaOk: true,
+    subsOk: totalSubs >= state.minSubsPerGame && totalSubs <= state.maxSubsPerGame,
+    mipStatus: 'local-preview',
+    elapsedMs: 0,
+    nodesExplored: 0,
+    numPlayers: state.players.length,
+    numPositions: nPos,
+    numVariables: shape.variables,
+    numConstraints: shape.constraints,
+    usedFallback: true,
+    fallbackReason: 'Browser-side preview because this page was opened without the planner API.',
+    assignment,
+    bench,
+    pitchAnimation: null,
+    solverAnimation: null
+  };
+}
+
+function bestOpenPositionFor(p, row, used) {
+  let best = null;
+  let bestScore = -Infinity;
+  for (let pos = 0; pos < row.length; pos++) {
+    if (row[pos] >= 0) continue;
+    if (p.fixedPosition != null && p.fixedPosition !== pos) continue;
+    if ((p.bannedPositions || []).includes(pos)) continue;
+    const score = p.positionScores?.[pos] ?? 0;
+    if (score > bestScore) {
+      bestScore = score;
+      best = pos;
+    }
+  }
+  return best;
+}
+
+async function solveViaJson() {
+  syncStateFromControls();
+  document.querySelector('.tab[data-tab="solver"]').click();
+  resetSolverLog('Solve requested from planner UI');
+  if (!preflightSolverRequest('json solve')) return;
+  if (!canUsePlannerApi()) {
+    try {
+      startSolverProgress('local preview');
+      const data = localPreviewSolve();
+      stopSolverProgress();
+      receiveSolution(data);
+      setStatus('ok', `Local preview: affinity ${data.affinity.toFixed(2)}, subs ${data.totalSubs}/${subsLimitLabel()}. Serve the page for the Rust IP/MIP solve.`);
+    } catch (e) {
+      stopSolverProgress();
+      logSolver('preview failed: ' + e.message);
+      setStatus('err', 'Preview failed: ' + e.message);
+    }
+    return;
+  }
+  setBusy(true, 'Solving via JSON endpoint...');
+  startSolverProgress('json solve');
+  const url = apiPath('solve');
+  try {
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(state)});
+    const data = await readJsonResponse(r, 'JSON solve');
+    stopSolverProgress();
+    if (!data.ok) {
+      receiveSolution(data);
+      logApiFailure('solve failed', data);
+      setStatus('err', failureStatus(data, 'Solve failed'));
+      return;
+    }
+    receiveSolution(data);
+    setStatus('ok', `Solved: affinity ${data.affinity.toFixed(2)}, subs ${data.totalSubs}/${subsLimitLabel()}, ${data.numVariables} vars, ${data.numConstraints} constraints.`);
+  } catch (e) {
+    stopSolverProgress();
+    const payload = networkFailurePayload('JSON solve', url, e);
+    logApiFailure('solve failed', payload);
+    setStatus('err', failureStatus(payload, 'Solve failed'));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function solveViaStream() {
+  syncStateFromControls();
+  document.querySelector('.tab[data-tab="solver"]').click();
+  resetSolverLog('Stream solve requested from planner UI');
+  if (!preflightSolverRequest('jsonl stream solve')) return;
+  const lines = $('commandStream').value.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  if (!canUsePlannerApi()) {
+    try {
+      startSolverProgress('stream preview');
+      applyStreamText();
+      const data = localPreviewSolve();
+      stopSolverProgress();
+      receiveSolution(data);
+      setStatus('ok', `Stream preview: ${data.numVariables} vars, ${data.numConstraints} constraints.`);
+    } catch (e) {
+      stopSolverProgress();
+      logSolver('stream preview failed: ' + e.message);
+      setStatus('err', 'Stream preview failed: ' + e.message);
+    }
+    return;
+  }
+  const body = ['{"op":"init","request":' + JSON.stringify(state) + '}'].concat(lines, ['{"op":"solve","includeAnimations":true}']).join('\n') + '\n';
+  setBusy(true, 'Solving via JSONL stream...');
+  startSolverProgress('jsonl stream solve');
+  const url = apiPath('stream');
+  try {
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/x-ndjson'}, body});
+    const text = await r.text();
+    stopSolverProgress();
+    if (!r.ok) {
+      const payload = payloadFromTextResponse(r, text, 'JSONL stream solve');
+      logStream(text.trim() || safeJson(payload));
+      logApiFailure('stream solve failed', payload);
+      setStatus('err', failureStatus(payload, 'Stream solve failed'));
+      return;
+    }
+    logStream(text.trim() || '(empty stream response)');
+    let frames;
+    try {
+      frames = text.split(/\n+/).filter(Boolean).map((line, index) => {
+        try { return JSON.parse(line); }
+        catch (e) {
+          throw {
+            ok: false,
+            error: `JSONL stream solve returned malformed JSON at line ${index + 1}`,
+            parseError: describeThrown(e),
+            line: responseSnippet(line),
+            bodySnippet: responseSnippet(text)
+          };
+        }
+      });
+    } catch (e) {
+      const payload = e && typeof e === 'object' ? e : {ok:false, error:errorText(e), exception:describeThrown(e)};
+      logApiFailure('stream solve failed', payload);
+      setStatus('err', failureStatus(payload, 'Stream solve failed'));
+      return;
+    }
+    const sol = frames.reverse().find(f => f.event === 'solution');
+    if (!sol || !sol.response || !sol.response.ok) {
+      if (sol?.response) {
+        receiveSolution(sol.response);
+        logApiFailure('stream solve failed', sol.response);
+        setStatus('err', failureStatus(sol.response, 'Stream solve failed'));
+        return;
+      }
+      const payload = {ok:false, error: sol?.response?.error || 'stream solve failed', lastFrame: frames[0] || null};
+      logApiFailure('stream solve failed', payload);
+      setStatus('err', failureStatus(payload, 'Stream solve failed'));
+      return;
+    }
+    receiveSolution(sol.response);
+    setStatus('ok', `Stream solved: ${sol.variables} vars, ${sol.constraints} constraints.`);
+  } catch (e) {
+    stopSolverProgress();
+    const payload = networkFailurePayload('JSONL stream solve', url, e);
+    logApiFailure('stream solve failed', payload);
+    setStatus('err', failureStatus(payload, 'Stream solve failed'));
+  } finally {
+    setBusy(false);
+  }
+}
+
+function receiveSolution(data) {
+  if (!data) return;
+  lastResponse = data;
+  lastPitchAnim = data.pitchAnimation;
+  lastSolverAnim = data.solverAnimation;
+  appendSolutionLog(data);
+  renderSchedule(data);
+  updateRequestJson();
+  if (!data.pitchAnimation?.frames?.length && !data.solverAnimation?.frames?.length && activeTab !== 'stream') {
+    if (activeTab === 'solver' || data.ok === false) return;
+    document.querySelector('.tab[data-tab="schedule"]').click();
+    return;
+  }
+  if (activeTab === 'schedule' || activeTab === 'stream') return;
+  showActiveAnimation();
+}
+
+function setBusy(on, msg) {
+  $('solveBtn').disabled = on;
+  $('loading').classList.toggle('hidden', !on);
+  if (msg) $('loading').textContent = msg;
+}
+
+function setStatus(kind, text) {
+  $('status').className = kind || '';
+  $('status').textContent = text;
+}
+
+document.querySelectorAll('.tab').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  activeTab = btn.dataset.tab;
+  $('animationPane').classList.toggle('active', activeTab === 'pitch');
+  $('solverPane').classList.toggle('active', activeTab === 'solver');
+  $('schedulePane').classList.toggle('active', activeTab === 'schedule');
+  $('streamPane').classList.toggle('active', activeTab === 'stream');
+  if (activeTab === 'pitch' || activeTab === 'solver') showActiveAnimation();
+});
+
+$('solveBtn').onclick = solveViaJson;
+$('snapshotBtn').onclick = () => { syncStateFromControls(); updateRequestJson(); logStream('snapshot players=' + state.players.length + ' positions=' + posNames.length); };
+$('preset').onchange = () => setPreset($('preset').value);
+['formation','numPeriods','minutesPerPeriod','minSubs','maxSubs','defaultMinBlocks','defaultMaxBlocks','defaultMaxBenchBlocks','seed','solverSeconds','solverMaxNodes','solverMaxTicks','solverLpIters','solverHeuristics','fallbackToMdp'].forEach(id => $(id).onchange = () => { syncStateFromControls(); renderAll(); });
+$('resizeRoster').onclick = () => resizeRoster(Math.max(posNames.length + 1, +$('rosterTarget').value || state.players.length));
+$('addGuest').onclick = () => { applyCommand({op:'add_player', name:'Guest' + (state.players.length + 1), status:'guest'}); renderAll(); };
+$('addSynergy').onclick = () => { normalizeState(); state.synergies.push({player:Math.min(9,state.players.length-1),position:Math.max(0,posNames.length-1),partnerPlayer:Math.min(7,state.players.length-1),partnerPosition:Math.max(0,posNames.length-2),scoreWith:.9,scoreWithout:.75,partnerScoreWith:.9,partnerScoreWithout:.75}); renderSynergies(); updateRequestJson(); };
+$('cmdAddPlayer').onclick = () => appendCommand({op:'add_player', name:'Guest' + (state.players.length + 1), status:'guest'}, true);
+$('cmdBanGk').onclick = () => appendCommand({op:'ban_position', player:Math.min(1,state.players.length-1), position:0}, true);
+$('cmdStamina').onclick = () => appendCommand({op:'set_match', defaultMinContiguousBlocks:1, defaultMaxContiguousBlocks:4, defaultMaxBenchBlocks:3}, true);
+$('cmdApply').onclick = () => { try { applyStreamText(); setStatus('', 'Stream applied.'); } catch(e) { setStatus('err', 'Bad stream: ' + e.message); } };
+$('cmdStreamSolve').onclick = solveViaStream;
+$('cmdClear').onclick = () => { $('commandStream').value = ''; logStream('cleared'); };
+
+state.solverTimeLimitMs = state.solverTimeLimitMs || 120000;
+state.solverMaxNodes = state.solverMaxNodes || 20000;
+state.solverMaxTicks = state.solverMaxTicks || 200000;
+state.solverLpMaxIters = state.solverLpMaxIters || 6000;
+state.solverHeuristicPasses = state.solverHeuristicPasses || 120;
+state.fallbackToMdp = state.fallbackToMdp !== false;
+state.defaultMinContiguousBlocks = state.defaultMinContiguousBlocks || 1;
+state.defaultMaxContiguousBlocks = state.defaultMaxContiguousBlocks || state.maxConsecutiveOnField || 4;
+state.defaultMaxBenchBlocks = state.defaultMaxBenchBlocks || 3;
+initBuildInfo();
+renderAll();
+</script>
+</body>
+</html>
