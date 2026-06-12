@@ -3771,6 +3771,28 @@ function setPassTarget(playerId) {
   render();
   return true;
 }
+// --- Tap-to-accelerate pace tiers (per controller slot) ---------------------
+// Each fresh tap of a movement key bumps the speed tier: 1 walk, 2 skip, 3 jog,
+// 4 run, 5 sprint. Taps within PACE_TAP_WINDOW_MS accumulate; a longer pause
+// resets to a walk on the next press. The tier is sent as `pace` and is held
+// while a direction is held; releasing all movement keys sends pace 0 (stop), so
+// the (server-side) player brakes to a halt instead of drifting.
+const PACE_TAP_WINDOW_MS = 650;
+const controllerPace = {};
+function nowMs() {
+  return (window.performance && performance.now) ? performance.now() : Date.now();
+}
+function bumpPaceTier(slot) {
+  const now = nowMs();
+  const s = controllerPace[slot] || { tier: 0, lastTapAt: 0 };
+  s.tier = (now - s.lastTapAt <= PACE_TAP_WINDOW_MS) ? Math.min(s.tier + 1, 5) : 1;
+  s.lastTapAt = now;
+  controllerPace[slot] = s;
+  return s.tier;
+}
+function paceTierForSlot(slot) {
+  return (controllerPace[slot] && controllerPace[slot].tier) || 0;
+}
 function queueInput(pass = false, shoot = false, slot = Number(slotPick.value || 0), action = null, overrides = {}) {
   const playerId = selectedPlayerId(slot);
   if (playerId == null) return false;
@@ -3779,12 +3801,17 @@ function queueInput(pass = false, shoot = false, slot = Number(slotPick.value ||
   const actionIsPass = ["pass", "aerial-pass", "killer-pass"].includes(normalizedAction);
   const axis = overrides.axis || axisFromKeys(map);
   const sprint = overrides.sprint ?? keys.has(map.sprint);
+  // Tap-tier pace: held tier while moving (min walk), 0 = release → stop. The
+  // sprint key forces the top tier regardless of taps.
+  const axisMoving = !!axis && (Math.abs(axis.x || 0) > 1e-6 || Math.abs(axis.y || 0) > 1e-6);
+  const pace = axisMoving ? (sprint ? 5 : Math.max(1, paceTierForSlot(slot))) : 0;
   queuedInputs.push({
     controllerSlot: slot,
     playerId,
     seq: ++inputSeq,
     axis,
     sprint,
+    pace,
     pass: pass || actionIsPass,
     passFlight: normalizedAction === "aerial-pass" ? "aerial" : pass ? passFlight.value : "floor",
     shoot: shoot || normalizedAction === "shoot",
@@ -4964,6 +4991,9 @@ window.addEventListener("keydown", e => {
   const arrowDir = {ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right"}[e.code];
   if (arrowDir) {
     e.preventDefault();
+    // Each fresh tap bumps the pace tier (walk→skip→jog→run→sprint); holding
+    // keeps the current tier. Key auto-repeat (e.repeat) is not a new tap.
+    if (!e.repeat) bumpPaceTier(activeSlot);
     litPadButton(arrowDir, true);
     pushControlAxis();
     return;
