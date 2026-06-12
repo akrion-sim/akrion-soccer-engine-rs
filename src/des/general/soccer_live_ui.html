@@ -340,6 +340,9 @@
         <button id="step">Step</button>
         <button id="resetMatch">New Match</button>
         <a id="freshMatchLink" class="control-link" href="/fresh">Fresh</a>
+        <button id="restartServer" title="Restart the live server process in place">Restart Server</button>
+        <button id="killIntServer" title="Send kill -INT (SIGINT) to the live server process">Kill -INT</button>
+        <button id="killKillServer" title="Send kill -KILL (SIGKILL) to the live server process">Kill -KILL</button>
         <button id="exportPolicy">Export Policy</button>
         <button id="exportPostgresPolicy">Export PG Tip</button>
         <button id="exportPostgresPolicyJsonl">Export PG JSONL</button>
@@ -4826,6 +4829,27 @@ runButton.addEventListener("click", () => {
   updateRunButton();
 });
 resetMatchButton.addEventListener("click", () => resetMatch().catch(e => statusEl.textContent = e.message));
+async function postServerControl(path, label) {
+  const response = await postJson(path, {});
+  const pid = response?.pid != null ? ` (pid ${response.pid})` : "";
+  statusEl.textContent = `${label}: ${response?.action || "ok"}${pid}`;
+  return response;
+}
+const restartServerButton = document.getElementById("restartServer");
+const killIntServerButton = document.getElementById("killIntServer");
+const killKillServerButton = document.getElementById("killKillServer");
+restartServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Restart the live server process? The page will reconnect once it is back up.")) return;
+  postServerControl("/api/server/restart", "restart server").catch(e => statusEl.textContent = `restart failed: ${e.message}`);
+});
+killIntServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Send kill -INT (SIGINT) to the live server process? This stops the server.")) return;
+  postServerControl("/api/server/kill-int", "kill -INT server").catch(e => statusEl.textContent = `kill -INT failed: ${e.message}`);
+});
+killKillServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Send kill -KILL (SIGKILL) to the live server process? This force-kills the server.")) return;
+  postServerControl("/api/server/kill-kill", "kill -KILL server").catch(e => statusEl.textContent = `kill -KILL failed: ${e.message}`);
+});
 replaySeedButton.addEventListener("click", () => {
   try {
     resetMatch({seed: seedResetValue()}).catch(e => statusEl.textContent = e.message);
