@@ -779,6 +779,9 @@ let queuedInputs = [];
 let eventLog = [];
 let recentLearningTransitions = [];
 let stepping = false;
+// Fractional remainder so dt-scaled ticks-per-pulse average exactly real-time
+// (e.g. 1.5 ticks/pulse at 1/15s alternates 1 and 2 instead of rounding up to 2).
+let simTickCarry = 0;
 let resetting = false;
 let inputFlushInFlight = false;
 let inputFlushTimer = null;
@@ -4647,7 +4650,20 @@ async function stepOnce(options = {}) {
     const beforeAssignments = assignmentKey(state.controllerAssignments);
     const previousPolicyHistory = state.policyHistory || null;
     const previousHistoryRecords = Number(state.policyAutosave?.historyRecords ?? 0);
-    const ticksThisPulse = options.manual ? 1 : effectiveSimTicksPerPulse();
+    let ticksThisPulse = 1;
+    if (!options.manual) {
+      if (liveControllerAssigned()) {
+        ticksThisPulse = 1;
+      } else {
+        // dt-scaled to hold real-time speed, with the fractional carry so the
+        // average is exact (no slow-motion at 1/15s, no round-up overshoot).
+        const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
+        const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
+        const want = clamp(configuredSimTicksPerPulse() * dtScale, 1, 1000) + simTickCarry;
+        ticksThisPulse = Math.max(1, Math.floor(want));
+        simTickCarry = want - ticksThisPulse;
+      }
+    }
     let response;
     try {
       response = await postSoccerJson("/api/step", {
