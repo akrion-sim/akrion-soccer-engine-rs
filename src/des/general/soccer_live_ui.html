@@ -799,6 +799,10 @@ let hoverPlayerId = null;
 let inspectedPlayerId = null;
 let lastSemanticBallAction = null;
 const LIVE_STEP_INTERVAL_MS = 100;
+// Single fallback for the simulation timestep when a frame/config somehow omits it.
+// Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
+// keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
+const FALLBACK_DT_SECONDS = 1 / 15;
 const LIVE_DEFAULT_TICKS_PER_PULSE = 1;
 const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
 const LIVE_INPUT_RETRY_MIN_MS = 120;
@@ -1752,7 +1756,7 @@ function matchStepLabel(config = state?.config) {
   const cadenceTotalTicks = Math.max(0, Math.round(Number(cadence.totalTicks ?? 0)));
   const contract = cadence.defaultTenMinuteContract ? " ok" : "";
   if (clock) {
-    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? 0.1);
+    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? FALLBACK_DT_SECONDS);
     const total = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : Number(clock.totalSeconds ?? effectiveMatchDurationSeconds(config));
     const remaining = Number(clock.remainingSeconds ?? Math.max(0, total - Number(clock.elapsedSeconds ?? 0)));
     const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : Math.max(0, Math.round(Number(clock.totalTicks ?? 0)));
@@ -1760,7 +1764,7 @@ function matchStepLabel(config = state?.config) {
     return `dt ${dt.toFixed(1)}s ${fmtClock(total)} left ${fmtClock(remaining)} ${totalTicks}t${contract}${done}`;
   }
   if (!config) return "dt 0.1s 10:00";
-  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? 0.1);
+  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? FALLBACK_DT_SECONDS);
   const duration = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : effectiveMatchDurationSeconds(config);
   const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : (dt > 0 ? Math.round(duration / dt) : 0);
   return `dt ${dt.toFixed(1)}s ${fmtClock(duration)} ${totalTicks}t${contract}`;
@@ -2007,7 +2011,7 @@ function vecScale(v, scale) {
 }
 function historyKinematicsFromPositions(history, dtSeconds) {
   const samples = Array.isArray(history) ? history.map(finiteVec2) : [];
-  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || 0.1));
+  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || FALLBACK_DT_SECONDS));
   const last = samples.length - 1;
   const velocity = samples.length >= 2 ? vecScale(vecSub(samples[last], samples[last - 1]), 1 / dt) : null;
   if (samples.length < 3) return {samples: samples.length, velocity, acceleration: null, jerk: null};
@@ -3469,7 +3473,7 @@ function currentStepIntervalMs() {
 function simSpeedLabel() {
   const configured = configuredSimTicksPerPulse();
   const effective = effectiveSimTicksPerPulse();
-  const dt = Number(state?.config?.dtSeconds ?? 0.1);
+  const dt = Number(state?.config?.dtSeconds ?? FALLBACK_DT_SECONDS);
   const speed = effective * dt / (currentStepIntervalMs() / 1000);
   const speedText = speed >= 10 ? speed.toFixed(0) : speed.toFixed(1);
   const inputText = liveControllerAssigned() ? " + input" : "";
