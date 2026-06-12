@@ -294,6 +294,7 @@
     margin-right: 4px;
   }
   .status { color: var(--muted); font-size: 12px; }
+  .build-info { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; cursor: help; white-space: nowrap; }
   @media (max-width: 860px) {
     header { grid-template-columns: 1fr; }
     .main {
@@ -331,6 +332,7 @@
       <strong id="clock">0:00.0</strong>
       <span id="awayScore">0</span>
     </div>
+    <span class="status build-info" id="buildInfo" title="Release identity of the running stack">build —</span>
   </header>
   <div class="main">
     <div class="stage"><canvas id="pitch" width="1280" height="720"></canvas></div>
@@ -2797,6 +2799,42 @@ function yardsToCanvasRadius(yards, r) {
   const fieldLength = Number(state.config.fieldLengthYards || 120);
   return Number(yards || 0) * ((r.w / fieldLength) + (r.h / fieldWidth)) * 0.5;
 }
+function drawCornerKickRadius(frame, r) {
+  // During a corner kick, draw the 10-yard (Law 17) keep-out radius around the corner
+  // spot — the distance opponents must stay from the ball until it is in play.
+  const call = frame?.activeSetPlay;
+  if (!call || String(call.restart || "").toLowerCase() !== "corner-kick") return;
+  const ball = frame?.ball?.position;
+  if (!ball) return;
+  const fieldWidth = Number(state.config.fieldWidthYards || 80);
+  const fieldLength = Number(state.config.fieldLengthYards || 120);
+  // Anchor on the actual corner nearest the ball (the ball is spotted there), so the
+  // arc stays put even as the taker addresses the ball.
+  const corner = {
+    x: Number(ball.x || 0) < fieldWidth / 2 ? 0 : fieldWidth,
+    y: Number(ball.y || 0) < fieldLength / 2 ? 0 : fieldLength,
+  };
+  const center = mapPoint(corner, r);
+  // Aspect is preserved (r.w spans fieldLength, r.h spans fieldWidth), so 10yd is the
+  // same pixel radius either axis.
+  const radiusPx = (10 / fieldLength) * r.w;
+  ctx.save();
+  // Clip to the pitch so only the in-field portion of the circle shows (a corner arc).
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  ctx.beginPath();
+  ctx.arc(center.x, center.y, radiusPx, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255, 214, 64, 0.08)";
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.setLineDash([7, 6]);
+  ctx.strokeStyle = "rgba(255, 214, 64, 0.85)";
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
 function drawPendingPassPhase(r) {
   const pass = pendingPassPhase();
   if (!pass?.origin || !pass?.intendedTarget) return;
@@ -3245,6 +3283,7 @@ function interpolatedFrame(prev, target, t) {
 function drawField(frame, r) {
   drawPitch(r);
   drawPitchGridOverlay(r);
+  drawCornerKickRadius(frame, r);
   drawAssistantOffsideLines(r);
   drawOffsideFlash(r);
   drawPendingPassPhase(r);
@@ -4694,7 +4733,12 @@ async function stepOnce(options = {}) {
       done: response.done,
       policyHistory: previousPolicyHistory
     };
-    if (response.events.length) eventLog.push(...response.events);
+    if (response.events.length) {
+      eventLog.push(...response.events);
+      // Only the last 12 are ever displayed; cap so a long live session can't grow this
+      // unbounded and slowly choke the tab (a cause of the "freezing up at times").
+      if (eventLog.length > 256) eventLog = eventLog.slice(-256);
+    }
     // On an offside call, freeze a red line where it occurred and pause ~2s.
     const offsideEvent = response.events.find(e => String(e.kind || "").toLowerCase() === "offside");
     if (offsideEvent) {
@@ -5069,7 +5113,42 @@ if (playbackSpeedSelect) {
     simSpeed.textContent = simSpeedLabel();
   });
 }
+// Release identity badge: shows the running git commits + build timestamps for
+// each layer of the stack (web server, soccer engine, des engine). Populated
+// from GET /api/build; failure is non-fatal (the sim still runs).
+function buildLayerOrder(info) {
+  // web_server first when present (it's the outermost layer), then the engines.
+  return ["web_server", "soccer_engine", "des_engine"].filter(k => info && info[k]);
+}
+function shortLabelFor(key) {
+  return { web_server: "web", soccer_engine: "engine", des_engine: "des" }[key] || key;
+}
+async function loadBuildInfo() {
+  const el = document.getElementById("buildInfo");
+  if (!el) return;
+  try {
+    const res = await fetchLive("/api/build");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const info = await res.json();
+    const layers = buildLayerOrder(info);
+    if (!layers.length) { el.textContent = "build —"; return; }
+    const compact = layers
+      .map(k => `${shortLabelFor(k)} ${info[k].git_commit_short || "unknown"}`)
+      .join(" · ");
+    el.textContent = "build " + compact;
+    const detail = layers.map(k => {
+      const c = info[k];
+      return `${c.name} v${c.version}\n  commit:  ${c.git_commit}\n  release: ${c.commit_date}\n  built:   ${c.build_timestamp}`;
+    }).join("\n\n");
+    el.title = detail;
+  } catch (e) {
+    el.textContent = "build (unavailable)";
+    el.title = "Could not load /api/build: " + (e && e.message ? e.message : e);
+  }
+}
+
 initializeAuthTokenFromLocation();
+loadBuildInfo();
 bootLivePage().catch(e => statusEl.textContent = e.message);
 </script>
 </body>
