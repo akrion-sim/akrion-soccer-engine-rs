@@ -99,3 +99,16 @@ share machinery with the killer/threaded-pass cluster being fixed now.
     upfield >=20yd (grounded) / >=15yd (in transit). *(Implemented: defensive_line_cushion.)*
 23. **Intercept the ball earlier** — players let the ball roll too long; they should take it
     earlier in its trajectory when it's controllable. *(Pending.)*
+
+24. **Can't reverse-kick at speed** — a running/sprinting player reaching the ball can't instantly
+    kick it the opposite way; must take a settling/shielding touch (1-2) then play it. (Partly via
+    kick_power_factor_for; needs convert-to-touch when severely opposed at speed.) *(Pending.)*
+25. **Body-rotation audit (z-axis)** — players gyroscope/rotate far too much, looks stupid. Rule:
+    must FACE the direction of movement when walking/jogging/running/sprinting (walk/jog/skip may
+    go backwards); SKIPPING may face up to 90° off movement; overarching goal is to face the ball
+    as much as possible. LP should optimize movement to both face the ball and reach the target as
+    fast as fatigue/urgency dictate. Harden the yaw-rate cap to kill the gyroscoping. *(Pending.)*
+
+26. **Goalside anticipation off-ball** — when the ball is loose/in-flight (pass/shot), players with
+    no chance of receiving it (given trajectory) should reposition to be GOALSIDE of where the ball
+    will be at the next anticipated possession, not just goalside of its current spot. *(Pending.)*
