@@ -48,6 +48,11 @@ clean commit. Several refine/supersede earlier requests (noted).
     side of the box to the other AND highly uncontested. *(Implemented: own-box play-out pass
     scoring — short-pass penalty, flank reward, across-goal penalty waived when the lane is clear.)*
 
+14. **Wingers get open on the flanks (CRITICAL)** — wide attackers must run/sprint to open space
+    on the wings far more; off-ball flank runs into space when their team has possession. And the
+    engine should **prioritize playing the ball forward to the most-open player, almost always**
+    (strong forward × openness bias in pass selection). *(In progress.)*
+
 ## Sequencing note
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
