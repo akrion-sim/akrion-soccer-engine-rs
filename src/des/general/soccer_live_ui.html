@@ -3439,7 +3439,16 @@ function liveControllerAssigned() {
   return Array.isArray(state?.controllerAssignments) && state.controllerAssignments.length > 0;
 }
 function effectiveSimTicksPerPulse() {
-  return liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
+  if (liveControllerAssigned()) return 1;
+  // Keep wall-clock speed independent of the sim timestep. The pulse rate is fixed
+  // (~10Hz), so with a fixed tick count a smaller dt plays in slow motion (each tick
+  // spans less real time). Scale ticks-per-pulse by (pulseInterval / dt) so the same
+  // configured fast-forward multiplier maps to the same real-time speed at any dt:
+  // e.g. 1/15s advances ~1.5x the ticks 1/10s did, restoring real-time with finer
+  // (smoother) integration. (wall-clock = ticksPerPulse * tempo, per the model below.)
+  const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
+  const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
+  return clamp(Math.round(configuredSimTicksPerPulse() * dtScale), 1, 1000);
 }
 // Target gap between step starts. The tempo selector scales the base pulse
 // interval (1/2x doubles it, 2x halves it); ticks-per-pulse stays the separate
