@@ -3752,7 +3752,6 @@ mod tests {
             "possessionRelative": -1,
             "ballZoneX": 3,
             "ballZoneY": 4,
-            "playerTacticalCellId": 77,
             "scoreDiffBucket": 0,
             "teamBrainPressBin": 4,
             "teamBrainRiskBin": 2,
@@ -3770,8 +3769,6 @@ mod tests {
             "ballDistanceBin": 1,
             "yardsToGoalBin": 4,
             "pressureBin": 3,
-            "skillPassingBin": 5,
-            "skillFirstTouchBin": 4,
             "openSpaceBin": 2
         });
         let state: SoccerQStateKey =
@@ -3779,7 +3776,8 @@ mod tests {
         let persisted_state_json =
             serde_json::to_value(&state).expect("state key serializes for postgres jsonb");
 
-        assert_eq!(persisted_state_json["playerTacticalCellId"], json!(77));
+        // Player pitch-grid cells and skill bins were removed from the Q-key; this
+        // test now covers the retained team-brain / formation-LP bins.
         assert_eq!(persisted_state_json["teamBrainPressBin"], json!(4));
         assert_eq!(
             persisted_state_json["teamCentroidBallDistanceBin"],
@@ -3790,8 +3788,6 @@ mod tests {
         assert_eq!(persisted_state_json["formationLpPairErrorBin"], json!(2));
         assert_eq!(persisted_state_json["formationLpPressureBin"], json!(4));
         assert_eq!(persisted_state_json["formationLpSpeedMatchBin"], json!(1));
-        assert_eq!(persisted_state_json["skillPassingBin"], json!(5));
-        assert_eq!(persisted_state_json["skillFirstTouchBin"], json!(4));
         let hash = state_hash(&persisted_state_json);
         // 128-bit FNV-1a renders as 32 lowercase hex chars (still within the
         // schema CHECK `state_hash ~ '^[a-f0-9]{16,32}$'`).

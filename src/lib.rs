@@ -20,10 +20,7 @@
 
 pub use des_engine;
 
-pub mod build_info;
 pub mod des;
-
-pub use build_info::{build_info, live_build_info, live_build_info_json, LiveBuildInfo};
 
 // Ergonomic top-level re-exports so consumers (the axum servers, a desktop game)
 // can reach the engine without the mirrored `des::general::…` path, e.g.
