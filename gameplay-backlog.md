@@ -65,6 +65,13 @@ clean commit. Several refine/supersede earlier requests (noted).
     controllable); under low pressure B may let a low ball run a little onto a better foot.
     *(Implemented: non-zero unpressured early-touch pull in pending_pass_reception_target_for.)*
 
+17. **Strikers stop shooting from too far** — when a striker dribbling forward has no forward
+    pass option, they shoot from distance too readily. A 25yd+ shot should be RARE unless the
+    keeper is out of position / moving (beatable); otherwise carry closer (ideally inside 20yd)
+    or wait for support. *(Implemented: speculative_long_shot_attempt_probability now scaled by
+    shot_beat_goalkeeper_probability so far-shot frequency tracks keeper position; legality kept.
+    Follow-up: other attackers feel urgency to JOIN the attack so there IS a forward option.)*
+
 ## Sequencing note
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
