@@ -40,6 +40,14 @@ clean commit. Several refine/supersede earlier requests (noted).
 12. **First-touch into space** — audit/harden first touch: a player may take a longer first touch into
     space if it takes them away from the closest marking defender's movement/momentum/trajectory.
 
+## Positioning / passing (cont.)
+13. **Play-out-from-own-box under pressure** — defending team in possession inside their OWN 18yd
+    box under pressure (1+ opponent within 3yd): 1–2yd passes are bad. Prefer passes that are
+    lateral and/or 3+ yards, and **to the flanks is best** (get the ball wide out of the box).
+    **Rarely play across the goal** (square ball across the own-goal face) unless it's from one
+    side of the box to the other AND highly uncontested. *(Implemented: own-box play-out pass
+    scoring — short-pass penalty, flank reward, across-goal penalty waived when the lane is clear.)*
+
 ## Sequencing note
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
