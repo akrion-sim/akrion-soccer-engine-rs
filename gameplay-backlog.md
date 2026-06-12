@@ -91,3 +91,11 @@ share machinery with the killer/threaded-pass cluster being fixed now.
 20. **Defensive line stays within 20yd of the ball** (CRITICAL) — the back four's average
     position must not be more than 20yd upfield of the ball; use the LP to nudge them back into
     position when they over-push.
+
+21. **Midfield line band in front of defenders** — midfield average sits 15-30yd in front of the
+    back four through the central 3/5 of the pitch, tapering linearly to 10-15yd in the outer 1/5
+    at each end (continuous). *(Implemented: midfield_line_band_adjusted_intent.)*
+22. **Defensive-line band vs ball** — in possession <=20yd behind ball; opponent-possession
+    upfield >=20yd (grounded) / >=15yd (in transit). *(Implemented: defensive_line_cushion.)*
+23. **Intercept the ball earlier** — players let the ball roll too long; they should take it
+    earlier in its trajectory when it's controllable. *(Pending.)*
