@@ -53,6 +53,13 @@ clean commit. Several refine/supersede earlier requests (noted).
     engine should **prioritize playing the ball forward to the most-open player, almost always**
     (strong forward × openness bias in pass selection). *(In progress.)*
 
+15. **Don't crowd the ball carrier** — off-ball teammates must not run directly at a team-mate
+    who is dribbling. General 3yd-outside / 2yd-inside teammate padding is the existing SOFT
+    barrier (TEAMMATE_SPACING clocks). The HARD rule on top: when the carrier is **unpressured**,
+    no teammate may run at them and get within **2yd** (outside the 18yd box) — ever.
+    *(Implemented: dribble_carrier_standoff_adjusted_target, hard 2yd floor when carrier is
+    unpressured + outside box; chained into discipline_intent_against_bunchball.)*
+
 ## Sequencing note
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
