@@ -76,3 +76,9 @@ clean commit. Several refine/supersede earlier requests (noted).
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
 share machinery with the killer/threaded-pass cluster being fixed now.
+
+18. **Use field WIDTH on offense / attack down the flanks** — teams bunch centrally and don't
+    use the flanks to progress the ball upfield. Restore the push-ball-up-the-flank strategy
+    and cross into the box. Team-level width usage on offense (broader than the winger-run item
+    14): the team shape should stretch wide in possession, work the ball up the wings, and
+    deliver crosses. *(Pending.)*
