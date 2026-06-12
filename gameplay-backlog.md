@@ -82,3 +82,12 @@ share machinery with the killer/threaded-pass cluster being fixed now.
     and cross into the box. Team-level width usage on offense (broader than the winger-run item
     14): the team shape should stretch wide in possession, work the ball up the wings, and
     deliver crosses. *(Pending.)*
+
+19. **Shots 40-60mph + animate to goal-line + fix random "goal scored"** (CRITICAL) — shots on
+    goal should be 40-60mph; animate the ball all the way to the goal-line so the keeper gets a
+    real chance to save; there's a bug where "goal scored" is selected RANDOMLY (like the old
+    random corner) even when no shot was taken / the ball isn't animated toward goal. Remove the
+    random goal outcome; resolve goals by the ball actually crossing the line past the keeper.
+20. **Defensive line stays within 20yd of the ball** (CRITICAL) — the back four's average
+    position must not be more than 20yd upfield of the ball; use the LP to nudge them back into
+    position when they over-push.
