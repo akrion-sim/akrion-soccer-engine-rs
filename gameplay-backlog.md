@@ -112,3 +112,8 @@ share machinery with the killer/threaded-pass cluster being fixed now.
 26. **Goalside anticipation off-ball** — when the ball is loose/in-flight (pass/shot), players with
     no chance of receiving it (given trajectory) should reposition to be GOALSIDE of where the ball
     will be at the next anticipated possession, not just goalside of its current spot. *(Pending.)*
+
+27. **play_backwards_to_goad strategy** — a team-brain attack policy: when in possession in the
+    upper 2/3 of the pitch (not near own 18yd box) and play is too compact, play the ball BACKWARDS
+    to bait the opponent to step up, opening space to then play forward. Add as an MDP/POMDP
+    team-level strategy/mode. *(Pending.)*
