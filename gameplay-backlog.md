@@ -60,6 +60,11 @@ clean commit. Several refine/supersede earlier requests (noted).
     *(Implemented: dribble_carrier_standoff_adjusted_target, hard 2yd floor when carrier is
     unpressured + outside box; chained into discipline_intent_against_bunchball.)*
 
+16. **Receiver attacks the ball** — when A passes to B, B sometimes drifts away instead of toward
+    the ball. B should step toward it to control it earlier (a chest-or-lower pass is
+    controllable); under low pressure B may let a low ball run a little onto a better foot.
+    *(Implemented: non-zero unpressured early-touch pull in pending_pass_reception_target_for.)*
+
 ## Sequencing note
 These land AFTER the test-suite green-up (foundation that lets each be verified), then are
 implemented one-at-a-time with tests + commits alongside the earlier ~50-item pass. Items 1–5
