@@ -117,3 +117,7 @@ share machinery with the killer/threaded-pass cluster being fixed now.
     upper 2/3 of the pitch (not near own 18yd box) and play is too compact, play the ball BACKWARDS
     to bait the opponent to step up, opening space to then play forward. Add as an MDP/POMDP
     team-level strategy/mode. *(Pending.)*
+
+28. **Intercept earlier vs a contesting opponent** — when an opponent is within controlling
+    distance of a loose ball's projected drop, our chaser cuts it off EARLIER on the path (toward
+    the current ball) to beat them to it. *(Implemented in loose_ball_recovery_target_for.)*
