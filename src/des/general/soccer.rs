@@ -1543,6 +1543,18 @@ const CENTER_REF_BALL_POSITION_WEIGHT: f64 = 0.20;
 const ASSISTANT_REF_BALL_CLEARANCE_YARDS: f64 = 4.0;
 const ASSISTANT_REF_TOUCHLINE_OFFSET_YARDS: f64 = 0.5;
 const LIVE_HTTP_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Per-request cap on `/api/step` ticks. The step loop holds the session lock for its whole
+/// duration, so an unbounded `ticks` (u64) from an unauthenticated request would pin a
+/// worker + the lock running heavy per-tick neural/LP work. `is_done()` already stops at a
+/// match's end; this bounds a single call (~4 min of match time) so long runs must page
+/// through multiple calls instead of monopolising the server.
+const LIVE_HTTP_MAX_STEP_TICKS: u64 = 3600;
+/// Per-request bounds on `/api/train-self-play`, which runs synchronously under the session
+/// lock: cap episode count and match minutes, floor dt, so a single request cannot pin the
+/// server for an unbounded time.
+const LIVE_HTTP_MAX_TRAIN_EPISODES: usize = 1000;
+const LIVE_HTTP_MAX_TRAIN_MINUTES: f64 = 240.0;
+const LIVE_HTTP_MIN_TRAIN_DT_SECONDS: f64 = 1.0 / 240.0;
 const LIVE_HTTP_ACCESS_CONTROL_ALLOW_HEADERS: &str = "content-type, Auth";
 
 fn defensive_line_break_threat_fit(line_gap: f64) -> f64 {
@@ -2198,14 +2210,25 @@ fn limit_vec2_len(vector: Vec2, max_len: f64) -> Vec2 {
     }
 }
 
+/// Floor on the integration step. Stops an absurdly tiny `dt` (whether from a future
+/// client-supplied config or a bug) from making `total_ticks()` astronomically large —
+/// `duration / dt` would otherwise approach `u64::MAX` and turn `run_simulation` into an
+/// effectively unbounded loop. No ceiling: a large `dt` only yields FEWER ticks (the engine
+/// supports coarse single-step integration, e.g. dt=2.0 in goal-line-overshoot tests).
+const MIN_SANE_DT_SECONDS: f64 = 1.0 / 240.0;
+/// Upper bound on a sanitized match duration (24 h) — far beyond any real fixture; exists
+/// only to keep `total_ticks()` bounded against a pathological/huge `duration_seconds`.
+const MAX_MATCH_DURATION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
 fn sane_dt_seconds(dt_seconds: f64, fallback: f64) -> f64 {
-    if dt_seconds.is_finite() && dt_seconds > 0.0 {
+    let chosen = if dt_seconds.is_finite() && dt_seconds > 0.0 {
         dt_seconds
     } else if fallback.is_finite() && fallback > 0.0 {
         fallback
     } else {
         DEFAULT_DT_SECONDS
-    }
+    };
+    chosen.max(MIN_SANE_DT_SECONDS)
 }
 
 impl std::ops::Add for Vec2 {
@@ -10633,6 +10656,9 @@ impl MatchConfig {
         if !config.duration_seconds.is_finite() || config.duration_seconds < 0.0 {
             config.duration_seconds = DEFAULT_DURATION_SECONDS;
         }
+        // Cap the match length so `total_ticks()` (duration / dt) stays bounded even for a
+        // pathological config — pure defense-in-depth; no real match approaches this.
+        config.duration_seconds = config.duration_seconds.min(MAX_MATCH_DURATION_SECONDS);
         if !config.half_duration_seconds.is_finite() || config.half_duration_seconds < 0.0 {
             config.half_duration_seconds = DEFAULT_HALF_DURATION_SECONDS;
         }
@@ -24922,30 +24948,58 @@ impl Default for SoccerLiveServerConfig {
     }
 }
 
-fn team_policy_disk_path(request: Option<&SoccerTeamPolicyDiskRequest>) -> PathBuf {
-    request
-        .and_then(|request| request.path.as_deref())
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LIVE_TEAM_POLICY_PATH))
+/// Reject a request-supplied artifact path that uses parent-directory traversal (`..`) or an
+/// embedded NUL. A relative path containing `..` resolves above the server's CWD (escaping
+/// the working tree), which a request must never be able to do. Note: ABSOLUTE paths are
+/// intentionally allowed — configuring an absolute policy/autosave/replay location (e.g.
+/// `/var/lib/soccer/...`) is a legitimate, exercised operator capability. The protection
+/// against an *unauthenticated* caller abusing that capability is the admin-token gate on
+/// the destructive endpoints + the loopback default bind, not this traversal check.
+fn request_artifact_path_is_confined(path: &str) -> bool {
+    use std::path::Component;
+    if path.contains('\0') {
+        return false;
+    }
+    !Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
 }
 
-fn team_policy_snapshot_disk_path(request: Option<&SoccerTeamPolicyDiskRequest>) -> PathBuf {
-    request
-        .and_then(|request| request.path.as_deref())
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_TRACKED_TEAM_POLICY_PATH))
+/// Resolve a request-supplied artifact path against a default, rejecting paths that would
+/// escape the working tree. Returns `Err` (→ surfaced as a 400) for an unsafe path rather
+/// than silently writing to the default.
+fn confined_artifact_path(request_path: Option<&str>, default: &Path) -> Result<PathBuf, String> {
+    match request_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) if request_artifact_path_is_confined(path) => Ok(PathBuf::from(path)),
+        Some(path) => Err(format!(
+            "rejected unsafe artifact path {path:?}: must be a relative path within the working tree (no leading '/' or '..')"
+        )),
+        None => Ok(default.to_path_buf()),
+    }
+}
+
+fn team_policy_disk_path(
+    request: Option<&SoccerTeamPolicyDiskRequest>,
+) -> Result<PathBuf, String> {
+    confined_artifact_path(
+        request.and_then(|request| request.path.as_deref()),
+        Path::new(DEFAULT_LIVE_TEAM_POLICY_PATH),
+    )
+}
+
+fn team_policy_snapshot_disk_path(
+    request: Option<&SoccerTeamPolicyDiskRequest>,
+) -> Result<PathBuf, String> {
+    confined_artifact_path(
+        request.and_then(|request| request.path.as_deref()),
+        Path::new(DEFAULT_TRACKED_TEAM_POLICY_PATH),
+    )
 }
 
 fn policy_autosave_disk_path(request_path: Option<&str>, fallback: &Path) -> PathBuf {
-    request_path
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.to_path_buf())
+    // Autosave path comes from the same request channel; an unsafe path falls back to the
+    // existing (already-validated) autosave path rather than escaping the tree.
+    confined_artifact_path(request_path, fallback).unwrap_or_else(|_| fallback.to_path_buf())
 }
 
 fn policy_history_disk_path(policy_path: &Path) -> PathBuf {
@@ -28091,7 +28145,7 @@ impl SoccerRealtimeSession {
     pub fn step(&mut self, request: SoccerStepRequest) -> SoccerStepResponse {
         let accepted_inputs = self.push_human_inputs(request.inputs);
 
-        let ticks = request.ticks.max(1);
+        let ticks = request.ticks.clamp(1, LIVE_HTTP_MAX_STEP_TICKS);
         let record_every = request.record_every_ticks.unwrap_or(1).max(1);
         let mut frames = Vec::new();
         for i in 0..ticks {
@@ -28172,7 +28226,7 @@ impl SoccerRealtimeSession {
     pub fn step_for_live_http(&mut self, request: SoccerStepRequest) -> SoccerStepResponse {
         let accepted_inputs = self.push_human_inputs(request.inputs);
 
-        let ticks = request.ticks.max(1);
+        let ticks = request.ticks.clamp(1, LIVE_HTTP_MAX_STEP_TICKS);
         let record_every = request.record_every_ticks.unwrap_or(1).max(1);
         for i in 0..ticks {
             if self.sim.is_done() {
@@ -28801,13 +28855,10 @@ impl SoccerRealtimeSession {
                 .to_string();
             (source, content.to_string())
         } else {
-            let path = request
-                .path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.moment_storage.path.clone());
+            // Confine the request-supplied path: an unauthenticated request must not read
+            // arbitrary files (`/etc/passwd`, `../../secret`) off the server's disk.
+            let path =
+                confined_artifact_path(request.path.as_deref(), &self.moment_storage.path)?;
             let raw = fs::read_to_string(&path)
                 .map_err(|err| format!("read moment replay {}: {err}", path.display()))?;
             (path.display().to_string(), raw)
@@ -28823,11 +28874,23 @@ impl SoccerRealtimeSession {
         if request.episodes == 0 {
             return Err("self-play training episodes must be at least 1".to_string());
         }
+        // This runs synchronously under the session lock, so bound the work an
+        // unauthenticated request can demand: episodes, match length, and dt floor.
+        if request.episodes > LIVE_HTTP_MAX_TRAIN_EPISODES {
+            return Err(format!(
+                "self-play training episodes must be at most {LIVE_HTTP_MAX_TRAIN_EPISODES}"
+            ));
+        }
 
         let mut config = self.sim.config.clone();
         if let Some(minutes) = request.minutes {
             if !minutes.is_finite() || minutes <= 0.0 {
                 return Err("self-play training minutes must be positive and finite".to_string());
+            }
+            if minutes > LIVE_HTTP_MAX_TRAIN_MINUTES {
+                return Err(format!(
+                    "self-play training minutes must be at most {LIVE_HTTP_MAX_TRAIN_MINUTES}"
+                ));
             }
             config.duration_seconds = minutes * 60.0;
         }
@@ -28849,6 +28912,11 @@ impl SoccerRealtimeSession {
         if let Some(dt_seconds) = request.dt_seconds {
             if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
                 return Err("self-play training dtSeconds must be positive and finite".to_string());
+            }
+            if dt_seconds < LIVE_HTTP_MIN_TRAIN_DT_SECONDS {
+                return Err(format!(
+                    "self-play training dtSeconds must be at least {LIVE_HTTP_MIN_TRAIN_DT_SECONDS}"
+                ));
             }
             config.dt_seconds = dt_seconds;
         }
@@ -29572,7 +29640,22 @@ impl SoccerLiveServer {
                             Err(_) => break,
                         }
                     };
-                    let _ = handle_live_soccer_stream(stream, Arc::clone(&registry));
+                    // A panic inside a handler must never kill this worker: with a small
+                    // worker pool, a few panic-inducing requests would otherwise exhaust
+                    // every worker and lock up the server permanently. Isolate each
+                    // connection so the loop keeps serving.
+                    let registry = Arc::clone(&registry);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_live_soccer_stream(stream, registry)
+                    }));
+                    if let Err(panic) = result {
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        eprintln!("soccer live http worker {worker_id} recovered from panic: {detail}");
+                    }
                 })?;
         }
         let mut connection_id = 0usize;
@@ -29929,20 +30012,119 @@ struct LiveHttpRequest<'a> {
     method: &'a str,
     path: &'a str,
     body: &'a str,
+    /// Value of the `Auth` request header, if present (used to gate destructive endpoints).
+    auth: Option<&'a str>,
 }
 
 fn parse_live_http_request(raw: &str) -> Result<LiveHttpRequest<'_>, String> {
     let (head, body) = raw
         .split_once("\r\n\r\n")
         .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-    let first = head
-        .lines()
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
+    let mut lines = head.lines();
+    let first = lines.next().ok_or_else(|| "missing request line".to_string())?;
     let mut parts = first.split_whitespace();
     let method = parts.next().ok_or_else(|| "missing method".to_string())?;
     let path = parts.next().ok_or_else(|| "missing path".to_string())?;
-    Ok(LiveHttpRequest { method, path, body })
+    let auth = lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("auth").then(|| value.trim())
+    });
+    Ok(LiveHttpRequest {
+        method,
+        path,
+        body,
+        auth,
+    })
+}
+
+/// Shared-secret token required to invoke destructive live-server endpoints, read once from
+/// `SOCCER_LIVE_ADMIN_TOKEN`. When unset/empty, those endpoints are disabled (default-deny):
+/// the server is unauthenticated and CORS-open, so a self-kill/restart must never be
+/// reachable from an unauthenticated (or drive-by browser) request.
+fn live_admin_token() -> Option<String> {
+    use std::sync::OnceLock;
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| std::env::var("SOCCER_LIVE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()))
+        .clone()
+}
+
+/// Constant-time equality so a wrong-length-or-value token cannot be recovered by timing.
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Whether a request may invoke a destructive `/api/server/*` endpoint.
+fn live_admin_request_authorized(req: &LiveHttpRequest) -> bool {
+    match live_admin_token() {
+        Some(token) => req
+            .auth
+            .map(|provided| constant_time_str_eq(provided, &token))
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn live_admin_forbidden() -> LiveHttpResponse {
+    LiveHttpResponse::error(
+        403,
+        "Forbidden",
+        "destructive server endpoint requires a valid Auth header matching SOCCER_LIVE_ADMIN_TOKEN (unset = disabled)",
+    )
+}
+
+/// Endpoints that read or write a request-supplied filesystem path (policy save/snapshot,
+/// moment replay, autosave-path configuration). These are the arbitrary read/write surface.
+fn live_file_endpoint_requires_auth(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/api/team-policy/save")
+            | ("POST", "/api/policy/save")
+            | ("POST", "/api/team-policy/snapshot")
+            | ("POST", "/api/policy/snapshot")
+            | ("POST", "/api/team-policy/autosave")
+            | ("POST", "/api/policy/autosave")
+            | ("POST", "/api/moments/replay")
+            | ("POST", "/api/moment-windows/replay")
+    )
+}
+
+/// Authorization for a path read/write endpoint. Unlike the destructive `/api/server/*`
+/// gate (default-DENY), these are default-OPEN when no token is configured — saving/loading
+/// a policy to an operator-chosen (incl. absolute) path is a standard, tested workflow. When
+/// `SOCCER_LIVE_ADMIN_TOKEN` IS set, every such request must present a matching `Auth`
+/// header, so an exposed deployment can lock down the arbitrary read/write surface.
+fn live_file_endpoint_authorized(token: Option<&str>, provided: Option<&str>) -> bool {
+    match token {
+        Some(token) => provided
+            .map(|provided| constant_time_str_eq(provided, token))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+/// Value for `Access-Control-Allow-Origin`, read once from `SOCCER_LIVE_ALLOWED_ORIGIN`.
+/// Defaults to `*` (unchanged behavior); set it to a specific origin to stop arbitrary
+/// cross-origin pages from driving the API in a victim's browser.
+fn live_allowed_origin() -> &'static str {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<String> = OnceLock::new();
+    ORIGIN
+        .get_or_init(|| {
+            std::env::var("SOCCER_LIVE_ALLOWED_ORIGIN")
+                .ok()
+                .filter(|origin| !origin.is_empty())
+                .unwrap_or_else(|| "*".to_string())
+        })
+        .as_str()
 }
 
 fn normalize_live_http_path(path: &str) -> &str {
@@ -30074,11 +30256,12 @@ impl LiveHttpResponse {
 
     fn to_bytes(&self) -> Vec<u8> {
         let headers = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: {}\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Headers: {}\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nConnection: close\r\n\r\n",
             self.status,
             self.reason,
             self.content_type,
             self.body.as_bytes().len(),
+            live_allowed_origin(),
             LIVE_HTTP_ACCESS_CONTROL_ALLOW_HEADERS
         );
         let mut out = headers.into_bytes();
@@ -30176,9 +30359,10 @@ fn write_live_http_chunked_header<W: Write>(
     reason: &str,
     content_type: &str,
 ) -> std::io::Result<()> {
+    let allowed_origin = live_allowed_origin();
     write!(
         writer,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: {LIVE_HTTP_ACCESS_CONTROL_ALLOW_HEADERS}\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {allowed_origin}\r\nAccess-Control-Allow-Headers: {LIVE_HTTP_ACCESS_CONTROL_ALLOW_HEADERS}\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -30341,6 +30525,13 @@ fn handle_live_soccer_request_inner(
         Err(e) => return LiveHttpResponse::error(400, "Bad Request", &e),
     };
     let path = normalize_live_http_path(req.path);
+    // Gate the arbitrary read/write (path-bearing) endpoints behind the admin token when one
+    // is configured — default-open otherwise to preserve the standard save/load workflow.
+    if live_file_endpoint_requires_auth(req.method, path)
+        && !live_file_endpoint_authorized(live_admin_token().as_deref(), req.auth)
+    {
+        return live_admin_forbidden();
+    }
     match (req.method, path) {
         ("OPTIONS", _) => LiveHttpResponse::options(),
         ("GET", "/")
@@ -30730,7 +30921,10 @@ fn handle_live_soccer_request_inner(
                     }
                 }
             };
-            let path = team_policy_disk_path(disk_req.as_ref());
+            let path = match team_policy_disk_path(disk_req.as_ref()) {
+                Ok(path) => path,
+                Err(e) => return LiveHttpResponse::error(400, "Bad Request", &e),
+            };
             let mut guard = match session.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -30765,7 +30959,10 @@ fn handle_live_soccer_request_inner(
                     }
                 }
             };
-            let path = team_policy_snapshot_disk_path(disk_req.as_ref());
+            let path = match team_policy_snapshot_disk_path(disk_req.as_ref()) {
+                Ok(path) => path,
+                Err(e) => return LiveHttpResponse::error(400, "Bad Request", &e),
+            };
             let mut guard = match session.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -30895,7 +31092,10 @@ fn handle_live_soccer_request_inner(
                     }
                 }
             };
-            let path = team_policy_disk_path(disk_req.as_ref());
+            let path = match team_policy_disk_path(disk_req.as_ref()) {
+                Ok(path) => path,
+                Err(e) => return LiveHttpResponse::error(400, "Bad Request", &e),
+            };
             let mut guard = match session.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -31128,30 +31328,42 @@ fn handle_live_soccer_request_inner(
             }
         }
         ("POST", "/api/server/restart") => {
-            spawn_server_restart();
-            LiveHttpResponse::json(&serde_json::json!({
-                "ok": true,
-                "action": "restart",
-                "pid": std::process::id(),
-            }))
+            if !live_admin_request_authorized(&req) {
+                live_admin_forbidden()
+            } else {
+                spawn_server_restart();
+                LiveHttpResponse::json(&serde_json::json!({
+                    "ok": true,
+                    "action": "restart",
+                    "pid": std::process::id(),
+                }))
+            }
         }
         ("POST", "/api/server/kill-int") | ("POST", "/api/server/sigint") => {
-            spawn_server_self_signal("INT");
-            LiveHttpResponse::json(&serde_json::json!({
-                "ok": true,
-                "action": "kill-int",
-                "signal": "SIGINT",
-                "pid": std::process::id(),
-            }))
+            if !live_admin_request_authorized(&req) {
+                live_admin_forbidden()
+            } else {
+                spawn_server_self_signal("INT");
+                LiveHttpResponse::json(&serde_json::json!({
+                    "ok": true,
+                    "action": "kill-int",
+                    "signal": "SIGINT",
+                    "pid": std::process::id(),
+                }))
+            }
         }
         ("POST", "/api/server/kill-kill") | ("POST", "/api/server/sigkill") => {
-            spawn_server_self_signal("KILL");
-            LiveHttpResponse::json(&serde_json::json!({
-                "ok": true,
-                "action": "kill-kill",
-                "signal": "SIGKILL",
-                "pid": std::process::id(),
-            }))
+            if !live_admin_request_authorized(&req) {
+                live_admin_forbidden()
+            } else {
+                spawn_server_self_signal("KILL");
+                LiveHttpResponse::json(&serde_json::json!({
+                    "ok": true,
+                    "action": "kill-kill",
+                    "signal": "SIGKILL",
+                    "pid": std::process::id(),
+                }))
+            }
         }
         ("POST", "/api/feedback") | ("POST", "/api/coaching-feedback") => {
             let feedback_req =

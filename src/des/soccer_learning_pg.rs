@@ -82,6 +82,10 @@ const SOCCER_PG_CONNECT_MAX_BACKOFF_MILLIS: u64 = 5_000;
 // distinct states that collide on the 64-bit state_hash, or an idempotent retry
 // re-inserting the same parent's rows — are skipped instead of aborting the
 // whole transaction. DO UPDATE would raise "cannot affect row a second time".
+/// Page size for streaming a policy version's entries via keyset pagination. Bounds the
+/// per-fetch result buffered in client memory (the full decoded policy must still be held —
+/// it is the resume state — but the raw result set is no longer materialised all at once).
+const SOCCER_POLICY_ENTRY_PAGE_SIZE: i64 = 4096;
 const SOCCER_POLICY_ENTRY_ON_CONFLICT_CLAUSE: &str =
     " on conflict (policy_version_id, team, entry_kind, state_hash, action, \
 target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
@@ -459,11 +463,38 @@ fn validate_soccer_neural_network_snapshot_for_pg(
 
 pub struct SoccerLearningPgStore {
     client: Client,
+    /// Retained so a connection dropped mid-session (e.g. RDS failover, idle socket reaped)
+    /// can be rebuilt — `connect_with_retry` originally covered only the first connect.
+    database_url: String,
 }
 
 impl SoccerLearningPgStore {
     pub fn connect(database_url: &str) -> Result<Self, String> {
         Self::connect_with_retry(database_url, soccer_learning_pg_connect_max_attempts())
+    }
+
+    /// Rebuild the client (with the same retry/backoff as the initial connect) after the
+    /// session has dropped. Re-applies the session timeouts via `connect_with_retry`.
+    fn reconnect(&mut self) -> Result<(), String> {
+        let rebuilt = Self::connect_with_retry(
+            &self.database_url,
+            soccer_learning_pg_connect_max_attempts(),
+        )?;
+        self.client = rebuilt.client;
+        Ok(())
+    }
+
+    /// Reconnect if the connection has been closed since the last operation. Called at the
+    /// top of the store's public entry points so a long-lived queue/server loop self-heals
+    /// across a failover instead of erroring on every subsequent call until restart.
+    fn ensure_connected(&mut self) -> Result<(), String> {
+        if self.client.is_closed() {
+            eprintln!(
+                "soccer-learning-pg: connection closed since last use; reconnecting before next operation"
+            );
+            self.reconnect()?;
+        }
+        Ok(())
     }
 
     fn build_tls_connector(database_url: &str) -> Result<MakeTlsConnector, String> {
@@ -499,7 +530,22 @@ impl SoccerLearningPgStore {
             attempt += 1;
             let tls = Self::build_tls_connector(database_url)?;
             match Client::connect(database_url, tls) {
-                Ok(client) => return Ok(Self { client }),
+                Ok(mut client) => {
+                    // Bound server-side work so a slow/stuck query or an abandoned open
+                    // transaction can't hang a long-lived queue/server loop indefinitely.
+                    if let Err(err) = client.batch_execute(
+                        "SET statement_timeout = '30s'; \
+                         SET idle_in_transaction_session_timeout = '60s'",
+                    ) {
+                        return Err(format!(
+                            "set soccer learning postgres session timeouts: {err}"
+                        ));
+                    }
+                    return Ok(Self {
+                        client,
+                        database_url: database_url.to_string(),
+                    });
+                }
                 Err(err) => {
                     let transient = soccer_learning_pg_error_is_transient(&err);
                     if attempt >= max_attempts || !transient {
@@ -532,6 +578,7 @@ impl SoccerLearningPgStore {
         display_name: &str,
         config: &MatchConfig,
     ) -> Result<String, String> {
+        self.ensure_connected()?;
         if let Some(row) = self
             .client
             .query_opt(
@@ -572,6 +619,7 @@ impl SoccerLearningPgStore {
         home_options: SoccerQPolicyOptions,
         away_options: SoccerQPolicyOptions,
     ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
+        self.ensure_connected()?;
         let Some(metadata) = self.load_latest_active_policy_metadata(experiment_id)? else {
             return Ok(None);
         };
@@ -599,6 +647,7 @@ impl SoccerLearningPgStore {
         &mut self,
         experiment_id: &str,
     ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
+        self.ensure_connected()?;
         let Some(row) = self
             .client
             .query_opt(
@@ -794,6 +843,7 @@ impl SoccerLearningPgStore {
         neural_network: Option<&SoccerNeuralNetworkSnapshot>,
         search_metadata: Option<&Value>,
     ) -> Result<(), String> {
+        self.ensure_connected()?;
         let config_json =
             serde_json::to_value(config).map_err(|err| format!("serialize match config: {err}"))?;
         let options_json = json!({
@@ -1114,6 +1164,7 @@ impl SoccerLearningPgStore {
         if runs.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_connected()?;
 
         let mut tx = self
             .client
@@ -1140,6 +1191,7 @@ impl SoccerLearningPgStore {
         experiment_id: &str,
         keep_latest_runs: usize,
     ) -> Result<SoccerLearningPgCompletedRunRetentionPrune, String> {
+        self.ensure_connected()?;
         let Some(keep_latest_runs) = soccer_completed_run_retention_limit(keep_latest_runs) else {
             return Ok(SoccerLearningPgCompletedRunRetentionPrune::default());
         };
@@ -1210,6 +1262,7 @@ impl SoccerLearningPgStore {
         artifact: &SoccerSetPlayTrainingArtifact,
         elapsed_seconds: f64,
     ) -> Result<(String, String), String> {
+        self.ensure_connected()?;
         let policies = SoccerTeamQPolicies {
             home: SoccerQPolicy::from_entries_with_targets(
                 artifact.options.clone(),
@@ -1565,34 +1618,82 @@ impl SoccerLearningPgStore {
         home_options: SoccerQPolicyOptions,
         away_options: SoccerQPolicyOptions,
     ) -> Result<SoccerTeamQPolicies, String> {
-        let rows = self
-            .client
-            .query(
-                r#"
-                select
-                  team,
-                  entry_kind,
-                  state_key,
-                  action,
-                  target_fine_cell_id,
-                  target_tactical_cell_id,
-                  target_macro_cell_id,
-                  target_root_cell_id,
-                  value_micros,
-                  visits
-                from des_soccer_learning_policy_entries
-                where policy_version_id = $1::text::uuid
-                order by team, entry_kind, state_hash, action
-                "#,
-                &[&policy_version_id],
-            )
-            .map_err(|err| format!("select soccer policy entries: {err}"))?;
         let mut home_entries = Vec::new();
         let mut away_entries = Vec::new();
         let mut home_targets = Vec::new();
         let mut away_targets = Vec::new();
 
-        for row in rows {
+        // Keyset (seek) pagination over the FULL unique key — paging on only
+        // (team, entry_kind, state_hash, action) would skip rows at a page boundary because
+        // target entries can share that prefix across distinct target cells. There is no
+        // total LIMIT: the entire policy must load to resume correctly; paging only bounds
+        // how much is buffered in client memory per round-trip (vs the prior load-everything
+        // -at-once query). The empty/MIN seed makes the first page's `> (...)` match all rows.
+        let mut cursor_team = String::new();
+        let mut cursor_kind = String::new();
+        let mut cursor_hash = String::new();
+        let mut cursor_action = String::new();
+        let mut cursor_fine = i32::MIN;
+        let mut cursor_tactical = i32::MIN;
+        let mut cursor_macro = i32::MIN;
+        let mut cursor_root = i32::MIN;
+        loop {
+            let rows = self
+                .client
+                .query(
+                    r#"
+                    select
+                      team,
+                      entry_kind,
+                      state_key,
+                      action,
+                      target_fine_cell_id,
+                      target_tactical_cell_id,
+                      target_macro_cell_id,
+                      target_root_cell_id,
+                      value_micros,
+                      visits,
+                      state_hash
+                    from des_soccer_learning_policy_entries
+                    where policy_version_id = $1::text::uuid
+                      and (team, entry_kind, state_hash, action,
+                           target_fine_cell_id, target_tactical_cell_id,
+                           target_macro_cell_id, target_root_cell_id)
+                        > ($2::text, $3::text, $4::text, $5::text,
+                           $6::int, $7::int, $8::int, $9::int)
+                    order by team, entry_kind, state_hash, action,
+                             target_fine_cell_id, target_tactical_cell_id,
+                             target_macro_cell_id, target_root_cell_id
+                    limit $10
+                    "#,
+                    &[
+                        &policy_version_id,
+                        &cursor_team,
+                        &cursor_kind,
+                        &cursor_hash,
+                        &cursor_action,
+                        &cursor_fine,
+                        &cursor_tactical,
+                        &cursor_macro,
+                        &cursor_root,
+                        &SOCCER_POLICY_ENTRY_PAGE_SIZE,
+                    ],
+                )
+                .map_err(|err| format!("select soccer policy entries page: {err}"))?;
+            let page_len = rows.len();
+            // Advance the cursor to the last row of this page (rows are ordered by the key).
+            if let Some(last) = rows.last() {
+                cursor_team = last.get(0);
+                cursor_kind = last.get(1);
+                cursor_action = last.get(3);
+                cursor_fine = last.get(4);
+                cursor_tactical = last.get(5);
+                cursor_macro = last.get(6);
+                cursor_root = last.get(7);
+                cursor_hash = last.get(10);
+            }
+
+            for row in &rows {
             let team: String = row.get(0);
             let entry_kind: String = row.get(1);
             let state_key_json: Value = row.get(2);
@@ -1641,6 +1742,12 @@ impl SoccerLearningPgStore {
                     visits,
                 }),
                 _ => {}
+            }
+            }
+
+            // A short page means the last row of the version has been read.
+            if page_len < SOCCER_POLICY_ENTRY_PAGE_SIZE as usize {
+                break;
             }
         }
 

@@ -10618,6 +10618,58 @@
     }
 
     #[test]
+    fn live_artifact_request_paths_reject_parent_traversal() {
+        // Relative names and absolute operator paths are accepted (absolute is a feature).
+        assert!(request_artifact_path_is_confined("out/soccer-live/team-policy.json"));
+        assert!(request_artifact_path_is_confined("./data/x.json"));
+        assert!(request_artifact_path_is_confined("/var/lib/soccer/policy.json"));
+        // Parent traversal and NUL are rejected (cannot escape the working tree via `..`).
+        assert!(!request_artifact_path_is_confined("../../etc/cron.d/x"));
+        assert!(!request_artifact_path_is_confined("out/../../escape.json"));
+        assert!(!request_artifact_path_is_confined("x\0y"));
+        // A default is returned when no path is supplied; a traversal path is an error.
+        assert_eq!(
+            confined_artifact_path(None, Path::new("out/default.json")).unwrap(),
+            PathBuf::from("out/default.json")
+        );
+        assert!(confined_artifact_path(Some("../../x"), Path::new("out/d.json")).is_err());
+        assert!(team_policy_disk_path(Some(&SoccerTeamPolicyDiskRequest {
+            path: Some("../../etc/passwd".to_string()),
+            max_action_entries_per_team: 0,
+            max_target_entries_per_team: 0,
+            min_visits: 0,
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn live_file_endpoint_auth_is_open_without_token_and_strict_with_one() {
+        // Path-bearing endpoints are recognised; read-only/other endpoints are not gated.
+        assert!(live_file_endpoint_requires_auth("POST", "/api/team-policy/save"));
+        assert!(live_file_endpoint_requires_auth("POST", "/api/policy/snapshot"));
+        assert!(live_file_endpoint_requires_auth("POST", "/api/moments/replay"));
+        assert!(live_file_endpoint_requires_auth("POST", "/api/team-policy/autosave"));
+        assert!(!live_file_endpoint_requires_auth("GET", "/api/team-policy"));
+        assert!(!live_file_endpoint_requires_auth("POST", "/api/step"));
+        // No token configured ⇒ open (preserves the default save/load workflow).
+        assert!(live_file_endpoint_authorized(None, None));
+        assert!(live_file_endpoint_authorized(None, Some("anything")));
+        // Token configured ⇒ exact match required.
+        assert!(live_file_endpoint_authorized(Some("tok"), Some("tok")));
+        assert!(!live_file_endpoint_authorized(Some("tok"), Some("nope")));
+        assert!(!live_file_endpoint_authorized(Some("tok"), None));
+    }
+
+    #[test]
+    fn live_admin_token_constant_time_eq_matches_only_exact() {
+        assert!(constant_time_str_eq("s3cret-token", "s3cret-token"));
+        assert!(!constant_time_str_eq("s3cret-token", "s3cret-toke"));
+        assert!(!constant_time_str_eq("s3cret-token", "S3cret-token"));
+        assert!(!constant_time_str_eq("", "x"));
+        assert!(constant_time_str_eq("", ""));
+    }
+
+    #[test]
     fn movement_acceleration_uses_strength_to_weight_ratio() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             dt_seconds: 0.1,
@@ -44162,7 +44214,7 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
             .unwrap()
             .is_empty());
         assert_eq!(
-            team_policy_snapshot_disk_path(None),
+            team_policy_snapshot_disk_path(None).unwrap(),
             PathBuf::from(DEFAULT_TRACKED_TEAM_POLICY_PATH)
         );
 
