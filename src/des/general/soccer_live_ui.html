@@ -320,6 +320,27 @@
 .padbtn:hover{background:#1d3327}
 .padbtn.lit{background:#f6a40c;color:#172026;border-color:#f6a40c;box-shadow:0 0 8px rgba(246,164,12,.7)}
 #controlPad{margin:6px 0;display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+/* Pause & Analyze decision-trace overlay */
+#analyzeOverlay{position:fixed;inset:0;background:rgba(6,12,9,.72);z-index:1000;display:none;align-items:center;justify-content:center}
+#analyzeOverlay.open{display:flex}
+#analyzePanel{width:min(1100px,94vw);max-height:88vh;display:flex;flex-direction:column;background:#0d1813;border:1px solid #2f9b57;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+#analyzeHead{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #21372a}
+#analyzeHead h2{margin:0;font-size:15px;color:#cfe9d8;flex:1}
+#analyzeMeta{font-size:12px;color:#8fcaa6}
+#analyzeBody{overflow:auto;padding:8px 12px;font-size:12px;color:#cfe9d8}
+.dtrow{border:1px solid #21372a;border-radius:8px;margin:7px 0;padding:8px 10px;background:#0f1f17}
+.dtrow .hdr{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}
+.dtrow .tk{color:#f6a40c;font-weight:700}
+.dtrow .who{color:#cfe9d8;font-weight:700}
+.dtrow .act{margin-left:auto;color:#172026;background:#5fd08a;border-radius:5px;padding:1px 7px;font-weight:700}
+.dtrow .ctx{color:#9fd8b6;font-size:11px;margin-bottom:5px;line-height:1.5}
+.dtrow .ctx b{color:#e6f5ec}
+.dtopts{display:flex;flex-wrap:wrap;gap:4px}
+.dtopt{font-size:11px;border:1px solid #284736;border-radius:5px;padding:1px 6px;color:#b9d8c6;background:#11241a}
+.dtopt.illegal{opacity:.42;text-decoration:line-through}
+.dtopt.chosen{border-color:#5fd08a;color:#172026;background:#5fd08a;font-weight:700}
+#analyzeClose,#analyzeCopy{min-width:30px;height:28px;padding:0 12px;font-weight:700;border-radius:6px;border:1px solid #2f9b57;background:#16241c;color:#cfe9d8;cursor:pointer}
+#analyzeClose:hover,#analyzeCopy:hover{background:#1d3327}
 </style>
 </head>
 <body>
@@ -338,8 +359,12 @@
       <div class="row">
         <button id="run" aria-label="Run live simulation">Run</button>
         <button id="step">Step</button>
+        <button id="pauseAnalyze" title="Pause and dump the last 100 on-ball MDP/POMDP decisions">Pause &amp; Analyze</button>
         <button id="resetMatch">New Match</button>
         <a id="freshMatchLink" class="control-link" href="/fresh">Fresh</a>
+        <button id="restartServer" title="Restart the live server process in place">Restart Server</button>
+        <button id="killIntServer" title="Send kill -INT (SIGINT) to the live server process">Kill -INT</button>
+        <button id="killKillServer" title="Send kill -KILL (SIGKILL) to the live server process">Kill -KILL</button>
         <button id="exportPolicy">Export Policy</button>
         <button id="exportPostgresPolicy">Export PG Tip</button>
         <button id="exportPostgresPolicyJsonl">Export PG JSONL</button>
@@ -610,6 +635,17 @@
     </aside>
   </div>
 </div>
+<div id="analyzeOverlay" role="dialog" aria-modal="true" aria-label="Decision analysis">
+  <div id="analyzePanel">
+    <div id="analyzeHead">
+      <h2>Pause &amp; Analyze — last on-ball MDP/POMDP decisions</h2>
+      <span id="analyzeMeta"></span>
+      <button id="analyzeCopy" type="button" title="Copy the full decision trace to the clipboard as JSON">Copy JSON</button>
+      <button id="analyzeClose" type="button">Close</button>
+    </div>
+    <div id="analyzeBody"></div>
+  </div>
+</div>
 <script>
 const canvas = document.getElementById("pitch");
 const ctx = canvas.getContext("2d");
@@ -779,6 +815,17 @@ let queuedInputs = [];
 let eventLog = [];
 let recentLearningTransitions = [];
 let stepping = false;
+// When the in-flight step started, so the loop can self-heal a wedged `stepping`
+// flag (e.g. a /api/step fetch that hung or was aborted while paused for Pause &
+// Analyze) instead of silently refusing to resume until a page refresh.
+let steppingSince = 0;
+// Fractional remainder so dt-scaled ticks-per-pulse average exactly real-time
+// (e.g. 1.5 ticks/pulse at 1/15s alternates 1 and 2 instead of rounding up to 2).
+let simTickCarry = 0;
+// Wall-clock timestamp of the last auto pulse, so we can advance exactly the number
+// of ticks that real time elapsed — making playback real-time regardless of dt,
+// step duration, or machine load. Reset (0) forces a single-interval first pulse.
+let lastAutoPulseAt = 0;
 let resetting = false;
 let inputFlushInFlight = false;
 let inputFlushTimer = null;
@@ -792,6 +839,10 @@ let hoverPlayerId = null;
 let inspectedPlayerId = null;
 let lastSemanticBallAction = null;
 const LIVE_STEP_INTERVAL_MS = 100;
+// Single fallback for the simulation timestep when a frame/config somehow omits it.
+// Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
+// keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
+const FALLBACK_DT_SECONDS = 1 / 15;
 const LIVE_DEFAULT_TICKS_PER_PULSE = 1;
 const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
 const LIVE_INPUT_RETRY_MIN_MS = 120;
@@ -1745,7 +1796,7 @@ function matchStepLabel(config = state?.config) {
   const cadenceTotalTicks = Math.max(0, Math.round(Number(cadence.totalTicks ?? 0)));
   const contract = cadence.defaultTenMinuteContract ? " ok" : "";
   if (clock) {
-    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? 0.1);
+    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? FALLBACK_DT_SECONDS);
     const total = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : Number(clock.totalSeconds ?? effectiveMatchDurationSeconds(config));
     const remaining = Number(clock.remainingSeconds ?? Math.max(0, total - Number(clock.elapsedSeconds ?? 0)));
     const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : Math.max(0, Math.round(Number(clock.totalTicks ?? 0)));
@@ -1753,7 +1804,7 @@ function matchStepLabel(config = state?.config) {
     return `dt ${dt.toFixed(1)}s ${fmtClock(total)} left ${fmtClock(remaining)} ${totalTicks}t${contract}${done}`;
   }
   if (!config) return "dt 0.1s 10:00";
-  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? 0.1);
+  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? FALLBACK_DT_SECONDS);
   const duration = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : effectiveMatchDurationSeconds(config);
   const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : (dt > 0 ? Math.round(duration / dt) : 0);
   return `dt ${dt.toFixed(1)}s ${fmtClock(duration)} ${totalTicks}t${contract}`;
@@ -2000,7 +2051,7 @@ function vecScale(v, scale) {
 }
 function historyKinematicsFromPositions(history, dtSeconds) {
   const samples = Array.isArray(history) ? history.map(finiteVec2) : [];
-  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || 0.1));
+  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || FALLBACK_DT_SECONDS));
   const last = samples.length - 1;
   const velocity = samples.length >= 2 ? vecScale(vecSub(samples[last], samples[last - 1]), 1 / dt) : null;
   if (samples.length < 3) return {samples: samples.length, velocity, acceleration: null, jerk: null};
@@ -2930,7 +2981,10 @@ function drawSelectedVision(p, r) {
   const facing = playerFacing(p);
   const range = Number(p.visionRangeYards || 0);
   const halfFov = Number(p.fieldOfViewDegrees || 0) * Math.PI / 360;
-  if (range > 0 && halfFov > 0) {
+  // The yellow FOV halo obfuscates the view, so only show it while the controlled
+  // player actually has the ball (when their facing/vision matters for the next action).
+  const hasBall = state?.frame?.ball?.holder === p.id;
+  if (hasBall && range > 0 && halfFov > 0) {
     ctx.beginPath();
     ctx.moveTo(origin.x, origin.y);
     for (let i = 0; i <= 28; i++) {
@@ -3439,7 +3493,17 @@ function liveControllerAssigned() {
   return Array.isArray(state?.controllerAssignments) && state.controllerAssignments.length > 0;
 }
 function effectiveSimTicksPerPulse() {
-  return liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
+  // Keep wall-clock speed independent of the sim timestep. The pulse rate is fixed
+  // (~10Hz), so with a fixed tick count a smaller dt plays in slow motion (each tick
+  // spans less real time). Scale ticks-per-pulse by (pulseInterval / dt) so the same
+  // configured fast-forward multiplier maps to the same real-time speed at any dt:
+  // e.g. 1/15s advances ~1.5x the ticks 1/10s did, restoring real-time with finer
+  // (smoother) integration. Applies to human-controlled play too (base = 1), so the
+  // default controller-assigned game is real-time. (wall-clock = ticksPerPulse * tempo.)
+  const base = liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
+  const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
+  const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
+  return clamp(Math.round(base * dtScale), 1, 1000);
 }
 // Target gap between step starts. The tempo selector scales the base pulse
 // interval (1/2x doubles it, 2x halves it); ticks-per-pulse stays the separate
@@ -3452,7 +3516,7 @@ function currentStepIntervalMs() {
 function simSpeedLabel() {
   const configured = configuredSimTicksPerPulse();
   const effective = effectiveSimTicksPerPulse();
-  const dt = Number(state?.config?.dtSeconds ?? 0.1);
+  const dt = Number(state?.config?.dtSeconds ?? FALLBACK_DT_SECONDS);
   const speed = effective * dt / (currentStepIntervalMs() / 1000);
   const speedText = speed >= 10 ? speed.toFixed(0) : speed.toFixed(1);
   const inputText = liveControllerAssigned() ? " + input" : "";
@@ -3771,6 +3835,28 @@ function setPassTarget(playerId) {
   render();
   return true;
 }
+// --- Tap-to-accelerate pace tiers (per controller slot) ---------------------
+// Each fresh tap of a movement key bumps the speed tier: 1 walk, 2 skip, 3 jog,
+// 4 run, 5 sprint. Taps within PACE_TAP_WINDOW_MS accumulate; a longer pause
+// resets to a walk on the next press. The tier is sent as `pace` and is held
+// while a direction is held; releasing all movement keys sends pace 0 (stop), so
+// the (server-side) player brakes to a halt instead of drifting.
+const PACE_TAP_WINDOW_MS = 650;
+const controllerPace = {};
+function nowMs() {
+  return (window.performance && performance.now) ? performance.now() : Date.now();
+}
+function bumpPaceTier(slot) {
+  const now = nowMs();
+  const s = controllerPace[slot] || { tier: 0, lastTapAt: 0 };
+  s.tier = (now - s.lastTapAt <= PACE_TAP_WINDOW_MS) ? Math.min(s.tier + 1, 5) : 1;
+  s.lastTapAt = now;
+  controllerPace[slot] = s;
+  return s.tier;
+}
+function paceTierForSlot(slot) {
+  return (controllerPace[slot] && controllerPace[slot].tier) || 0;
+}
 function queueInput(pass = false, shoot = false, slot = Number(slotPick.value || 0), action = null, overrides = {}) {
   const playerId = selectedPlayerId(slot);
   if (playerId == null) return false;
@@ -3779,12 +3865,17 @@ function queueInput(pass = false, shoot = false, slot = Number(slotPick.value ||
   const actionIsPass = ["pass", "aerial-pass", "killer-pass"].includes(normalizedAction);
   const axis = overrides.axis || axisFromKeys(map);
   const sprint = overrides.sprint ?? keys.has(map.sprint);
+  // Tap-tier pace: held tier while moving (min walk), 0 = release → stop. The
+  // sprint key forces the top tier regardless of taps.
+  const axisMoving = !!axis && (Math.abs(axis.x || 0) > 1e-6 || Math.abs(axis.y || 0) > 1e-6);
+  const pace = axisMoving ? (sprint ? 5 : Math.max(1, paceTierForSlot(slot))) : 0;
   queuedInputs.push({
     controllerSlot: slot,
     playerId,
     seq: ++inputSeq,
     axis,
     sprint,
+    pace,
     pass: pass || actionIsPass,
     passFlight: normalizedAction === "aerial-pass" ? "aerial" : pass ? passFlight.value : "floor",
     shoot: shoot || normalizedAction === "shoot",
@@ -3962,27 +4053,45 @@ function soccerLivePostApiEnabled(resource = "api") {
   if (resource === "input" || resource === "assign") return ui.liveInputPostEnabled !== false;
   return true;
 }
+// Match the server's sanitizer: [a-z0-9-], max 64 chars.
+function sanitizeGameId(id) {
+  return String(id || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 64);
+}
+function generateGameId() {
+  const raw = (window.crypto && window.crypto.randomUUID)
+    ? window.crypto.randomUUID()
+    : "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  return sanitizeGameId(raw);
+}
+// Mint a brand-new game uuid, point the session + address bar at it, and forget
+// the old one. The server lazily creates (and seeds, from the uuid) the new match
+// on first `/api/*` contact, so this is how "New Match" becomes a genuinely fresh
+// game (new seed/kickoff) rather than an in-place reset of the current one.
+function mintNewGameId() {
+  const id = generateGameId();
+  window.__SOCCER_GAME_ID__ = id;
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("game", id);
+    window.history.replaceState(null, "", url.toString());
+  } catch (_) {}
+  return id;
+}
 function liveGameId() {
   if (window.__SOCCER_GAME_ID__) return window.__SOCCER_GAME_ID__;
   let id = "";
   try {
     const url = new URL(window.location.href);
-    id = (url.searchParams.get("game") || "").trim();
+    id = sanitizeGameId(url.searchParams.get("game"));
     if (!id) {
       // First visit: mint a game uuid and put it in the address bar so the match
       // is addressable/shareable (`/` becomes `/?game=<uuid>`). Each `/api/*` call
       // then carries it, and the server creates that game on first contact.
-      id = (window.crypto && window.crypto.randomUUID)
-        ? window.crypto.randomUUID()
-        : "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
-      url.searchParams.set("game", id);
-      window.history.replaceState(null, "", url.toString());
+      return mintNewGameId();
     }
   } catch (_) {
-    id = id || ("g-" + Date.now().toString(36));
+    id = id || sanitizeGameId("g-" + Date.now().toString(36));
   }
-  // Match the server's sanitizer: [a-z0-9-], max 64 chars.
-  id = id.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 64);
   window.__SOCCER_GAME_ID__ = id;
   return id;
 }
@@ -4789,6 +4898,7 @@ async function stepOnce(options = {}) {
   // still proceeds (it falls back to HTTP, which is not driver-gated).
   if (!options.injectedResponse && !options.manual && liveSocketShouldFollow()) return;
   stepping = true;
+  steppingSince = performance.now();
   try {
     // A pushed frame already reflects the driver's authoritative state (including
     // its own episode resets), so do not run the local auto-reset for it.
@@ -4813,7 +4923,29 @@ async function stepOnce(options = {}) {
       queueMotionInputsForPressedControllers();
       queueGamepadInputs();
       inputs = drainQueuedInputsForDispatch();
-      const ticksThisPulse = options.manual ? 1 : effectiveSimTicksPerPulse();
+      let ticksThisPulse = 1;
+      if (!options.manual) {
+        // Advance exactly the ticks that real wall-clock time elapsed since the last
+        // pulse (× the fast-forward multiplier), so playback is real-time at ANY dt,
+        // regardless of how long each step takes or machine load. A fixed tick count
+        // would play 1/15s in slow motion; scaling by an assumed interval still drifts
+        // when steps run long. Applies to auto AND human play (base=1 with a
+        // controller); the input frame latches across the pulse, so control stays
+        // responsive while the ~10Hz pulse/input cadence is unchanged.
+        const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        const elapsedSec = lastAutoPulseAt
+          ? Math.min(0.5, Math.max(0, (now - lastAutoPulseAt) / 1000))
+          : (LIVE_STEP_INTERVAL_MS / 1000);
+        lastAutoPulseAt = now;
+        const base = liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
+        const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
+        const want =
+          clamp(base * (playbackSpeed || 1) * elapsedSec / Math.max(1e-3, dt), 0, 4000) + simTickCarry;
+        ticksThisPulse = Math.max(1, Math.floor(want));
+        simTickCarry = Math.max(0, want - ticksThisPulse);
+      } else {
+        lastAutoPulseAt = 0; // a manual single-step breaks the wall-clock chain
+      }
       try {
         response = await postSoccerJson("/api/step", {
           ticks: ticksThisPulse,
@@ -4978,7 +5110,121 @@ runButton.addEventListener("click", () => {
   running = !running;
   updateRunButton();
 });
-resetMatchButton.addEventListener("click", () => resetMatch().catch(e => statusEl.textContent = e.message));
+// --- Pause & Analyze: dump the last on-ball MDP/POMDP decisions ---
+const pauseAnalyzeButton = document.getElementById("pauseAnalyze");
+const analyzeOverlay = document.getElementById("analyzeOverlay");
+const analyzeBody = document.getElementById("analyzeBody");
+const analyzeMeta = document.getElementById("analyzeMeta");
+const analyzeCloseButton = document.getElementById("analyzeClose");
+const analyzeCopyButton = document.getElementById("analyzeCopy");
+let lastDecisionTracePayload = null;
+function closeAnalyze() { analyzeOverlay?.classList.remove("open"); }
+analyzeCloseButton?.addEventListener("click", closeAnalyze);
+async function copyAnalyzeJson() {
+  if (!analyzeCopyButton) return;
+  const text = JSON.stringify(lastDecisionTracePayload ?? {}, null, 2);
+  const label = analyzeCopyButton.textContent;
+  let ok = false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch (_) { /* fall back below */ }
+  if (!ok) {
+    // Fallback for non-secure contexts where navigator.clipboard is unavailable.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+    ta.remove();
+  }
+  analyzeCopyButton.textContent = ok ? "Copied!" : "Copy failed";
+  setTimeout(() => { analyzeCopyButton.textContent = label; }, 1200);
+}
+analyzeCopyButton?.addEventListener("click", () => { copyAnalyzeJson(); });
+analyzeOverlay?.addEventListener("click", e => { if (e.target === analyzeOverlay) closeAnalyze(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && analyzeOverlay?.classList.contains("open")) closeAnalyze();
+});
+function dtFmt(n, d) { return (typeof n === "number" && isFinite(n)) ? n.toFixed(d == null ? 2 : d) : "–"; }
+function dtMph(yps) { return (typeof yps === "number" && isFinite(yps)) ? (yps * 0.681818).toFixed(1) : "–"; }
+function dtEscape(s) { return String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function renderDecisionTrace(payload) {
+  lastDecisionTracePayload = payload ?? null;
+  const entries = (payload && payload.entries) || [];
+  analyzeMeta.textContent = entries.length
+    ? `${entries.length} on-ball decisions, newest first${payload.captureEnabled ? "" : " — capture OFF"}`
+    : (payload && payload.captureEnabled ? "no on-ball decisions captured yet" : "decision capture is OFF");
+  if (!entries.length) {
+    analyzeBody.innerHTML = '<div class="dtrow">Nothing captured yet — let the match run a few seconds with the ball in play, then Pause &amp; Analyze again.</div>';
+    return;
+  }
+  analyzeBody.innerHTML = entries.map(e => {
+    const opts = (e.options || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0)).map(o => {
+      const cls = "dtopt" + (o.chosen ? " chosen" : "") + (o.legal ? "" : " illegal");
+      return `<span class="${cls}">${dtEscape(o.label)} ${dtFmt(o.score)}</span>`;
+    }).join("");
+    return `<div class="dtrow">
+      <div class="hdr"><span class="tk">t${e.tick}</span><span class="who">${dtEscape(e.playerName)} (${dtEscape(e.team)} ${dtEscape(e.role)})</span><span class="act">${dtEscape(e.action)}</span></div>
+      <div class="ctx">press <b>${dtFmt(e.perceivedPressure)}</b> &middot; urgency <b>${dtFmt(e.pressureUrgency)}</b> &middot; nearestOpp <b>${dtFmt(e.nearestOpponentDistance, 1)}yd</b> closing <b>${dtMph(e.nearestOpponentClosingRateYps)}mph</b> &middot; toGoal <b>${dtFmt(e.yardsToGoal, 0)}yd</b> &middot; passComp <b>${dtFmt(e.expectedPassCompletion)}</b> &middot; openRcvr <b>${dtFmt(e.bestPassReceiverOpenness)}</b> &middot; dispRisk <b>${dtFmt(e.immediateDispossessionRisk)}</b> &middot; fwdSpace <b>${dtFmt(e.forwardDribbleSpaceYards, 1)}yd</b> &middot; onBall <b>${dtFmt(e.timeOnBallSeconds, 1)}s</b></div>
+      <div class="dtopts">${opts}</div>
+    </div>`;
+  }).join("");
+}
+async function pauseAndAnalyze() {
+  running = false;
+  updateRunButton();
+  analyzeOverlay.classList.add("open");
+  // Don't wipe a previously-captured trace until we know the refetch has data:
+  // closing and reopening (or a paused/reset game) must not lose the JSON context.
+  const hadCapture = (lastDecisionTracePayload?.entries?.length || 0) > 0;
+  if (!hadCapture) {
+    analyzeBody.innerHTML = '<div class="dtrow">Loading…</div>';
+    analyzeMeta.textContent = "";
+  }
+  const resp = await fetchLive("/api/decision-trace");
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const payload = await resp.json();
+  // Only overwrite the view if the refetch actually captured something, OR we had
+  // nothing before — otherwise keep the prior capture (and its Copy-JSON payload).
+  if ((payload?.entries?.length || 0) > 0 || !hadCapture) {
+    renderDecisionTrace(payload);
+  }
+}
+pauseAnalyzeButton?.addEventListener("click", () => pauseAndAnalyze().catch(e => {
+  analyzeBody.innerHTML = `<div class="dtrow">Failed to load decision trace: ${dtEscape(e.message)}</div>`;
+}));
+resetMatchButton.addEventListener("click", () => {
+  // "New Match" is a genuinely new game: mint a fresh uuid (new URL + new
+  // server-side seed/kickoff), then reset the UI onto it.
+  mintNewGameId();
+  resetMatch().catch(e => statusEl.textContent = e.message);
+});
+async function postServerControl(path, label) {
+  const response = await postJson(path, {});
+  const pid = response?.pid != null ? ` (pid ${response.pid})` : "";
+  statusEl.textContent = `${label}: ${response?.action || "ok"}${pid}`;
+  return response;
+}
+const restartServerButton = document.getElementById("restartServer");
+const killIntServerButton = document.getElementById("killIntServer");
+const killKillServerButton = document.getElementById("killKillServer");
+restartServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Restart the live server process? The page will reconnect once it is back up.")) return;
+  postServerControl("/api/server/restart", "restart server").catch(e => statusEl.textContent = `restart failed: ${e.message}`);
+});
+killIntServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Send kill -INT (SIGINT) to the live server process? This stops the server.")) return;
+  postServerControl("/api/server/kill-int", "kill -INT server").catch(e => statusEl.textContent = `kill -INT failed: ${e.message}`);
+});
+killKillServerButton?.addEventListener("click", () => {
+  if (!window.confirm("Send kill -KILL (SIGKILL) to the live server process? This force-kills the server.")) return;
+  postServerControl("/api/server/kill-kill", "kill -KILL server").catch(e => statusEl.textContent = `kill -KILL failed: ${e.message}`);
+});
 replaySeedButton.addEventListener("click", () => {
   try {
     resetMatch({seed: seedResetValue()}).catch(e => statusEl.textContent = e.message);
@@ -5169,6 +5415,9 @@ window.addEventListener("keydown", e => {
   const arrowDir = {ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right"}[e.code];
   if (arrowDir) {
     e.preventDefault();
+    // Each fresh tap bumps the pace tier (walk→skip→jog→run→sprint); holding
+    // keeps the current tier. Key auto-repeat (e.repeat) is not a new tap.
+    if (!e.repeat) bumpPaceTier(activeSlot);
     litPadButton(arrowDir, true);
     pushControlAxis();
     return;
@@ -5223,6 +5472,12 @@ setInterval(() => {
 function stepLoopTick() {
   const interval = currentStepIntervalMs();
   const started = performance.now();
+  // Self-heal a wedged step: a real step is <100ms, so if `stepping` has been held
+  // for seconds the in-flight request hung/was abandoned (commonly after Pause &
+  // Analyze) — clear it so Run resumes instead of needing a page refresh.
+  if (stepping && started - steppingSince > 3000) {
+    stepping = false;
+  }
   const finish = () => {
     const elapsed = performance.now() - started;
     const wait = clamp(currentStepIntervalMs() - elapsed, MIN_STEP_GAP_MS, 4000);

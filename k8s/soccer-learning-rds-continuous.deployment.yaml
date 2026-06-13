@@ -1,0 +1,314 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dd-soccer-learning-rds-continuous
+  namespace: default
+  labels:
+    app: dd-soccer-learning-rds-continuous
+    app.kubernetes.io/name: dd-soccer-learning-rds-continuous
+    app.kubernetes.io/part-of: des-soccer-learning
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 1200
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dd-soccer-learning-rds-continuous
+  template:
+    metadata:
+      labels:
+        app: dd-soccer-learning-rds-continuous
+        app.kubernetes.io/name: dd-soccer-learning-rds-continuous
+        app.kubernetes.io/part-of: des-soccer-learning
+    spec:
+      serviceAccountName: dd-remote-rest-api
+      automountServiceAccountToken: true
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: soccer-learning
+          image: docker.io/library/rust:1.90-bookworm
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+              export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+              run_prefix="${SOCCER_RUN_ID_PREFIX:-codex-soccer-learning-continuous}"
+              source_repo="${SOCCER_SOURCE_REPO:-https://github.com/ORESoftware/discrete-event-system.rs.git}"
+              source_ref="${SOCCER_SOURCE_REF:-main}"
+              work_base="/tmp/${run_prefix}-src"
+              work="${work_base}"
+              target="/tmp/${run_prefix}-target"
+              ready_file="/tmp/${run_prefix}-ready"
+              export CARGO_TARGET_DIR="${target}"
+
+              require_value() {
+                name="$1"
+                expected="$2"
+                actual="${!name:-}"
+                if [ "${actual}" != "${expected}" ]; then
+                  echo "continuous_config_invalid ${name}=${actual:-unset} expected=${expected}" >&2
+                  exit 78
+                fi
+              }
+
+              require_value SOCCER_REQUIRE_POSTGRES true
+              require_value SOCCER_NEURAL_LEARNING_ENABLED true
+              require_value SOCCER_NEURAL_LEARNING_BACKEND threaded
+              require_value SOCCER_PARALLEL_GAMES 1
+              require_value SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES 1
+              require_value SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES 1
+              require_value SOCCER_POSTGRES_TACTICAL_LEARNING_AUTHORITATIVE true
+              require_value SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT true
+              require_value SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM true
+              require_value SOCCER_EVOLUTION_ENABLED true
+              require_value SOCCER_EVOLUTION_INTERVAL_GAMES 5
+
+              echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
+              echo "games_per_cycle=${SOCCER_GAMES}"
+              echo "parallel_games=${SOCCER_PARALLEL_GAMES}"
+              echo "dt_seconds=${SOCCER_DT_SECONDS}"
+              echo "neural_learning=${SOCCER_NEURAL_LEARNING_ENABLED}"
+              echo "neural_backend=${SOCCER_NEURAL_LEARNING_BACKEND}"
+              echo "policy_version_interval=${SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES}"
+              echo "completed_batch_games=${SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES}"
+              echo "flush_before_new_sim=${SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM}"
+              echo "refresh_with_resume=${SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT}"
+              echo "source_ref=${source_ref}"
+
+              if [ -d "${work}/.git" ]; then
+                echo "source_checkout_mode=fetch work=${work}"
+                git -C "${work}" fetch --depth 1 origin "${source_ref}"
+                git -C "${work}" checkout --force FETCH_HEAD
+              else
+                if [ -e "${work}" ]; then
+                  work="${work_base}-$(date -u +%Y%m%dT%H%M%SZ)"
+                  echo "source_checkout_mode=clone-after-existing-path work=${work}"
+                else
+                  echo "source_checkout_mode=clone work=${work}"
+                fi
+                git clone --depth 1 --branch "${source_ref}" "${source_repo}" "${work}"
+              fi
+              cd "${work}"
+              actual_commit="$(git rev-parse HEAD)"
+              echo "source_commit_actual=${actual_commit}"
+              export SOCCER_SOURCE_COMMIT="${actual_commit}"
+
+              /usr/local/cargo/bin/cargo build --release --bin main_soccer_learning_run
+              touch "${ready_file}"
+
+              cycle=0
+              seed_base="${SOCCER_SEED_BASE:-2026}"
+              seed_stride="${SOCCER_SEED_STRIDE:-1000}"
+              evolution_seed_base="${SOCCER_EVOLUTION_SEED_BASE:-20260607}"
+              while true; do
+                cycle="$((cycle + 1))"
+                stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                export SOCCER_SEED="$((seed_base + cycle * seed_stride))"
+                export SOCCER_EVOLUTION_SEED="$((evolution_seed_base + cycle))"
+                export SOCCER_RUN_ID="${run_prefix}-${stamp}-c${cycle}"
+                export SOCCER_RUN_DIR="/tmp/${SOCCER_RUN_ID}"
+                echo "continuous_cycle_start cycle=${cycle} run_id=${SOCCER_RUN_ID} seed=${SOCCER_SEED} evolution_seed=${SOCCER_EVOLUTION_SEED} started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                if "${target}/release/main_soccer_learning_run"; then
+                  echo "continuous_cycle_complete cycle=${cycle} run_id=${SOCCER_RUN_ID} finished_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                  sleep "${SOCCER_CYCLE_SLEEP_SECONDS:-30}"
+                else
+                  status="$?"
+                  echo "continuous_cycle_failed cycle=${cycle} run_id=${SOCCER_RUN_ID} status=${status} failed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+                  sleep "${SOCCER_FAILURE_SLEEP_SECONDS:-300}"
+                fi
+              done
+          env:
+            - name: HOME
+              value: /tmp
+            - name: CARGO_HOME
+              value: /tmp/cargo
+            - name: CARGO_BUILD_JOBS
+              value: "4"
+            - name: CARGO_NET_RETRY
+              value: "5"
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: SOCCER_SOURCE_REPO
+              value: https://github.com/ORESoftware/discrete-event-system.rs.git
+            - name: SOCCER_SOURCE_REF
+              value: main
+            - name: SOCCER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dd-remote-rest-api-secrets
+                  key: RDS_DATABASE_URL
+            - name: SOCCER_REQUIRE_POSTGRES
+              value: "true"
+            - name: SOCCER_RUN_ID_PREFIX
+              value: codex-soccer-learning-overnight
+            - name: SOCCER_SEED_BASE
+              value: "2026"
+            - name: SOCCER_SEED_STRIDE
+              value: "1000"
+            - name: SOCCER_EXPERIMENT_SLUG
+              value: soccer-self-play-k8s-overnight
+            - name: SOCCER_EXPERIMENT_NAME
+              value: Soccer self-play k8s overnight evolutionary learning
+            - name: SOCCER_GAMES
+              value: "100"
+            - name: SOCCER_PARALLEL_GAMES
+              value: "1"
+            - name: SOCCER_HALVES
+              value: "2"
+            - name: SOCCER_HALF_MINUTES
+              value: "45"
+            - name: SOCCER_MINUTES
+              value: "90"
+            - name: SOCCER_PERIOD_BREAK_RECOVERY_SECONDS
+              value: "900"
+            - name: SOCCER_DT_SECONDS
+              value: "0.2"
+            - name: SOCCER_LEARNING_INTERVAL_TICKS
+              value: "4"
+            - name: SOCCER_NEURAL_LEARNING_ENABLED
+              value: "true"
+            - name: SOCCER_NEURAL_LEARNING_BACKEND
+              value: threaded
+            - name: SOCCER_NEURAL_BATCH_SIZE
+              value: "32"
+            - name: SOCCER_NEURAL_TRAIN_EVERY_TICKS
+              value: "1"
+            - name: SOCCER_NEURAL_MAX_BATCHES_PER_TICK
+              value: "2"
+            - name: SOCCER_NEURAL_REPLAY_CAPACITY
+              value: "2048"
+            - name: SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK
+              value: "32"
+            - name: SOCCER_NEURAL_MAX_PENDING_BATCHES
+              value: "64"
+            - name: SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES
+              value: "16"
+            - name: SOCCER_NEURAL_DRAIN_TIMEOUT_MS
+              value: "60000"
+            - name: SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES
+              value: "1"
+            - name: SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES
+              value: "1"
+            - name: SOCCER_POSTGRES_COMPLETED_RUN_RETENTION_GAMES
+              value: "500"
+            - name: SOCCER_POSTGRES_ASYNC_BATCH_QUEUE
+              value: "1"
+            - name: SOCCER_POSTGRES_ASYNC_COALESCE_BATCHES
+              value: "1"
+            - name: SOCCER_POSTGRES_ASYNC_COALESCE_WAIT_MS
+              value: "50"
+            - name: SOCCER_POSTGRES_TACTICAL_LEARNING_AUTHORITATIVE
+              value: "true"
+            - name: SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT
+              value: "true"
+            - name: SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM
+              value: "true"
+            - name: SOCCER_EVOLUTION_ENABLED
+              value: "true"
+            - name: SOCCER_EVOLUTION_INTERVAL_GAMES
+              value: "5"
+            - name: SOCCER_EVOLUTION_ELITE_GAMES
+              value: "5"
+            - name: SOCCER_EVOLUTION_WINDOW_GAMES
+              value: "25"
+            - name: SOCCER_EVOLUTION_MUTATION_RATE
+              value: "0.08"
+            - name: SOCCER_EVOLUTION_MUTATION_SCALE
+              value: "0.34"
+            - name: SOCCER_EVOLUTION_CROSSOVER_RATE
+              value: "0.62"
+            - name: SOCCER_EVOLUTION_EXPLORATION_RATE
+              value: "0.14"
+            - name: SOCCER_EVOLUTION_EXPLORATION_SCALE
+              value: "0.90"
+            - name: SOCCER_EVOLUTION_ELITE_WEIGHT_FLOOR
+              value: "0.08"
+            - name: SOCCER_EVOLUTION_POPULATION_SIZE
+              value: "16"
+            - name: SOCCER_EVOLUTION_SEED_BASE
+              value: "20260608"
+            - name: SOCCER_MAX_POLICY_ENTRIES_PER_TEAM
+              value: "250000"
+            - name: SOCCER_MAX_POLICY_TARGET_ENTRIES_PER_TEAM
+              value: "250000"
+            - name: SOCCER_MIN_POLICY_VISITS
+              value: "1"
+            - name: SOCCER_GAME_ARTIFACT_MODE
+              value: summary
+            - name: SOCCER_WRITE_GAME_ARTIFACTS
+              value: "false"
+            - name: SOCCER_WRITE_FINAL_ARTIFACTS
+              value: "false"
+            - name: SOCCER_WRITE_FINAL_POLICY_ARTIFACT
+              value: "false"
+            - name: SOCCER_WRITE_CHECKPOINT_ARTIFACTS
+              value: "false"
+            - name: SOCCER_WRITE_EPISODE_LOG
+              value: "false"
+            - name: SOCCER_PRINT_COMPLETED_GAMES
+              value: "false"
+            - name: SOCCER_ARTIFACT_PATH
+              value: /dev/null
+            - name: SOCCER_CHECKPOINT_ARTIFACT_PATH
+              value: /dev/null
+            - name: SOCCER_EPISODE_LOG_PATH
+              value: /dev/null
+            - name: SOCCER_LEARNED_PARAMS_PATH
+              value: /dev/null
+          # Memory limit MUST stay below the node RAM (~123Gi) so a leaking learner
+          # OOM-kills the POD (it restarts + resumes from Postgres) instead of OOMing
+          # the whole NODE (which wedges it: load 240, API server down). The learner
+          # has unbounded in-memory growth (Q-tables / neural replay / policy) that ate
+          # 122GB; cap at 64Gi to protect the node. Real fix is bounding that in code.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 16Gi
+            limits:
+              cpu: "8"
+              memory: 64Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -lc
+                - test -f /tmp/codex-soccer-learning-overnight-ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 90
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Persist the build cache (git checkout + cargo registry + compiled target —
+        # all under /tmp via HOME=/tmp, CARGO_HOME=/tmp/cargo, CARGO_TARGET_DIR=
+        # /tmp/*-target) on the node's local disk, so pod restarts AND node reboots
+        # reuse it. The startup script already does an incremental `git fetch` when
+        # the checkout exists and reuses CARGO_TARGET_DIR, so a warm cache turns the
+        # ~5min cold clone+full rebuild into a ~seconds incremental build. The cold
+        # rebuild-on-every-restart (ephemeral emptyDir) is what caused the post-reboot
+        # rustc stampede that wedged the node.
+        - name: tmp
+          hostPath:
+            path: /var/cache/dd-soccer-learning
+            type: DirectoryOrCreate
