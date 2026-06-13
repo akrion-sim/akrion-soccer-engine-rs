@@ -3698,7 +3698,9 @@ function rebuildControls(assignments) {
     activeButton.type = "button";
     activeButton.textContent = "Use";
     activeButton.className = slot === activeSlot ? "active" : "";
-    activeButton.addEventListener("click", () => setActiveSlot(slot));
+    activeButton.addEventListener("click", () => {
+      useSlot(slot).catch(e => statusEl.textContent = e.message);
+    });
     const keymap = document.createElement("div");
     keymap.className = "keymap";
     keymap.textContent = controllerKeymapLabel(slot);
@@ -4221,23 +4223,71 @@ async function assignSlot(slot, playerId) {
   render();
 }
 async function maybeAutoAssignFirstController() {
-  // Hook up controller 1 out of the box so the arrow keys work immediately: assign
-  // slot 0 to a home midfielder once, unless a controller is already assigned. The
-  // user can reassign by clicking any player, or clear it.
+  // All controller slots start AUTONOMOUS (AI plays every player) by default. We no
+  // longer grab a player on load — the user opts in by clicking "Use" on a slot, which
+  // claims a player for that slot and makes the keyboard control it. Show the hint once.
   if (autoAssignedController) return;
   if (!state?.frame?.players?.length || humanSlotCount() < 1) return;
-  if ((state.controllerAssignments || []).length > 0) { autoAssignedController = true; return; }
-  const players = state.frame.players;
-  const pick = players.find(p => p.team === "Home" && p.role === "Midfielder")
-            || players.find(p => p.team === "Home" && p.role !== "Goalkeeper")
-            || players[0];
-  if (!pick) return;
-  autoAssignedController = true; // set before await to avoid re-entry
-  try {
-    await assignSlot(0, pick.id);
-    setActiveSlot(0);
-    statusEl.textContent = `controller 1 → #${pick.shirt} · arrow keys move, Enter = pass/shoot`;
-  } catch (err) { autoAssignedController = false; }
+  autoAssignedController = true;
+  if ((state.controllerAssignments || []).length === 0) {
+    statusEl.textContent = "all slots autonomous · click \"Use\" on a slot to take control";
+  }
+}
+
+// Best player to hand to a slot when the user clicks "Use" on an autonomous slot: the
+// current ball holder if free, otherwise the outfielder nearest the ball, preferring the
+// team already being controlled (or Home), and never poaching a player another slot holds.
+function bestUnassignedPlayerToClaim(slot) {
+  const players = state?.frame?.players || [];
+  if (!players.length) return null;
+  const taken = new Set((state.controllerAssignments || [])
+    .filter(a => Number(a.controllerSlot) !== Number(slot))
+    .map(a => Number(a.playerId)));
+  const assignedTeams = (state.controllerAssignments || [])
+    .map(a => playerById(a.playerId)?.team)
+    .filter(Boolean);
+  const preferTeam = assignedTeams[0] || "Home";
+  const free = players.filter(p => !taken.has(Number(p.id)) && p.role !== "Goalkeeper");
+  if (!free.length) return null;
+  const pool = free.filter(p => p.team === preferTeam);
+  const candidates = pool.length ? pool : free;
+  const ball = state?.frame?.ball;
+  const holder = ball?.holder != null
+    ? candidates.find(p => Number(p.id) === Number(ball.holder))
+    : null;
+  if (holder) return holder;
+  const ballPos = ball?.position;
+  if (ballPos) {
+    return candidates.slice().sort((a, b) => {
+      const da = Math.hypot((a.position?.x ?? 0) - (ballPos.x ?? 0), (a.position?.y ?? 0) - (ballPos.y ?? 0));
+      const db = Math.hypot((b.position?.x ?? 0) - (ballPos.x ?? 0), (b.position?.y ?? 0) - (ballPos.y ?? 0));
+      return da - db;
+    })[0];
+  }
+  return candidates[0];
+}
+
+// "Use" a slot: make it the active (keyboard-controlled) slot, and if it is still
+// autonomous, claim a sensible player for it so the arrow keys actually drive someone.
+async function useSlot(slot) {
+  if (!assignmentForSlot(slot)) {
+    const pick = bestUnassignedPlayerToClaim(slot);
+    if (pick) {
+      try {
+        await assignSlot(slot, pick.id);
+        inspectedPlayerId = pick.id;
+      } catch (e) {
+        statusEl.textContent = e.message;
+      }
+    } else {
+      statusEl.textContent = "no free player to control";
+    }
+  }
+  setActiveSlot(slot);
+  const claimed = playerForSlot(slot);
+  if (claimed) {
+    statusEl.textContent = `slot ${slot + 1} → #${claimed.shirt} ${claimed.name} · arrow keys move, Enter = pass/shoot`;
+  }
 }
 
 async function handlePitchClick(e) {
