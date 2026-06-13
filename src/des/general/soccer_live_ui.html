@@ -2981,7 +2981,10 @@ function drawSelectedVision(p, r) {
   const facing = playerFacing(p);
   const range = Number(p.visionRangeYards || 0);
   const halfFov = Number(p.fieldOfViewDegrees || 0) * Math.PI / 360;
-  if (range > 0 && halfFov > 0) {
+  // The yellow FOV halo obfuscates the view, so only show it while the controlled
+  // player actually has the ball (when their facing/vision matters for the next action).
+  const hasBall = state?.frame?.ball?.holder === p.id;
+  if (hasBall && range > 0 && halfFov > 0) {
     ctx.beginPath();
     ctx.moveTo(origin.x, origin.y);
     for (let i = 0; i <= 28; i++) {
