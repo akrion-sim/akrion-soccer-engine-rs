@@ -815,6 +815,10 @@ let queuedInputs = [];
 let eventLog = [];
 let recentLearningTransitions = [];
 let stepping = false;
+// When the in-flight step started, so the loop can self-heal a wedged `stepping`
+// flag (e.g. a /api/step fetch that hung or was aborted while paused for Pause &
+// Analyze) instead of silently refusing to resume until a page refresh.
+let steppingSince = 0;
 // Fractional remainder so dt-scaled ticks-per-pulse average exactly real-time
 // (e.g. 1.5 ticks/pulse at 1/15s alternates 1 and 2 instead of rounding up to 2).
 let simTickCarry = 0;
@@ -4680,6 +4684,7 @@ async function stepOnce(options = {}) {
   if (!state) return;
   if (stepping || resetting) return;
   stepping = true;
+  steppingSince = performance.now();
   try {
     if (state.done) {
       if (running && autoEpisodeEnabled.checked) {
@@ -4948,11 +4953,21 @@ async function pauseAndAnalyze() {
   running = false;
   updateRunButton();
   analyzeOverlay.classList.add("open");
-  analyzeBody.innerHTML = '<div class="dtrow">Loading…</div>';
-  analyzeMeta.textContent = "";
+  // Don't wipe a previously-captured trace until we know the refetch has data:
+  // closing and reopening (or a paused/reset game) must not lose the JSON context.
+  const hadCapture = (lastDecisionTracePayload?.entries?.length || 0) > 0;
+  if (!hadCapture) {
+    analyzeBody.innerHTML = '<div class="dtrow">Loading…</div>';
+    analyzeMeta.textContent = "";
+  }
   const resp = await fetchLive("/api/decision-trace");
   if (!resp.ok) throw new Error("HTTP " + resp.status);
-  renderDecisionTrace(await resp.json());
+  const payload = await resp.json();
+  // Only overwrite the view if the refetch actually captured something, OR we had
+  // nothing before — otherwise keep the prior capture (and its Copy-JSON payload).
+  if ((payload?.entries?.length || 0) > 0 || !hadCapture) {
+    renderDecisionTrace(payload);
+  }
 }
 pauseAnalyzeButton?.addEventListener("click", () => pauseAndAnalyze().catch(e => {
   analyzeBody.innerHTML = `<div class="dtrow">Failed to load decision trace: ${dtEscape(e.message)}</div>`;
@@ -5226,6 +5241,12 @@ setInterval(() => {
 function stepLoopTick() {
   const interval = currentStepIntervalMs();
   const started = performance.now();
+  // Self-heal a wedged step: a real step is <100ms, so if `stepping` has been held
+  // for seconds the in-flight request hung/was abandoned (commonly after Pause &
+  // Analyze) — clear it so Run resumes instead of needing a page refresh.
+  if (stepping && started - steppingSince > 3000) {
+    stepping = false;
+  }
   const finish = () => {
     const elapsed = performance.now() - started;
     const wait = clamp(currentStepIntervalMs() - elapsed, MIN_STEP_GAP_MS, 4000);
