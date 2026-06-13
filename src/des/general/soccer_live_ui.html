@@ -320,6 +320,27 @@
 .padbtn:hover{background:#1d3327}
 .padbtn.lit{background:#f6a40c;color:#172026;border-color:#f6a40c;box-shadow:0 0 8px rgba(246,164,12,.7)}
 #controlPad{margin:6px 0;display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+/* Pause & Analyze decision-trace overlay */
+#analyzeOverlay{position:fixed;inset:0;background:rgba(6,12,9,.72);z-index:1000;display:none;align-items:center;justify-content:center}
+#analyzeOverlay.open{display:flex}
+#analyzePanel{width:min(1100px,94vw);max-height:88vh;display:flex;flex-direction:column;background:#0d1813;border:1px solid #2f9b57;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+#analyzeHead{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #21372a}
+#analyzeHead h2{margin:0;font-size:15px;color:#cfe9d8;flex:1}
+#analyzeMeta{font-size:12px;color:#8fcaa6}
+#analyzeBody{overflow:auto;padding:8px 12px;font-size:12px;color:#cfe9d8}
+.dtrow{border:1px solid #21372a;border-radius:8px;margin:7px 0;padding:8px 10px;background:#0f1f17}
+.dtrow .hdr{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:4px}
+.dtrow .tk{color:#f6a40c;font-weight:700}
+.dtrow .who{color:#cfe9d8;font-weight:700}
+.dtrow .act{margin-left:auto;color:#172026;background:#5fd08a;border-radius:5px;padding:1px 7px;font-weight:700}
+.dtrow .ctx{color:#9fd8b6;font-size:11px;margin-bottom:5px;line-height:1.5}
+.dtrow .ctx b{color:#e6f5ec}
+.dtopts{display:flex;flex-wrap:wrap;gap:4px}
+.dtopt{font-size:11px;border:1px solid #284736;border-radius:5px;padding:1px 6px;color:#b9d8c6;background:#11241a}
+.dtopt.illegal{opacity:.42;text-decoration:line-through}
+.dtopt.chosen{border-color:#5fd08a;color:#172026;background:#5fd08a;font-weight:700}
+#analyzeClose{min-width:30px;height:28px;padding:0 12px;font-weight:700;border-radius:6px;border:1px solid #2f9b57;background:#16241c;color:#cfe9d8;cursor:pointer}
+#analyzeClose:hover{background:#1d3327}
 </style>
 </head>
 <body>
@@ -338,6 +359,7 @@
       <div class="row">
         <button id="run" aria-label="Run live simulation">Run</button>
         <button id="step">Step</button>
+        <button id="pauseAnalyze" title="Pause and dump the last 100 on-ball MDP/POMDP decisions">Pause &amp; Analyze</button>
         <button id="resetMatch">New Match</button>
         <a id="freshMatchLink" class="control-link" href="/fresh">Fresh</a>
         <button id="restartServer" title="Restart the live server process in place">Restart Server</button>
@@ -611,6 +633,16 @@
       <div class="section">Events</div>
       <ul class="events" id="events"></ul>
     </aside>
+  </div>
+</div>
+<div id="analyzeOverlay" role="dialog" aria-modal="true" aria-label="Decision analysis">
+  <div id="analyzePanel">
+    <div id="analyzeHead">
+      <h2>Pause &amp; Analyze — last on-ball MDP/POMDP decisions</h2>
+      <span id="analyzeMeta"></span>
+      <button id="analyzeClose" type="button">Close</button>
+    </div>
+    <div id="analyzeBody"></div>
   </div>
 </div>
 <script>
@@ -4828,6 +4860,55 @@ runButton.addEventListener("click", () => {
   running = !running;
   updateRunButton();
 });
+// --- Pause & Analyze: dump the last on-ball MDP/POMDP decisions ---
+const pauseAnalyzeButton = document.getElementById("pauseAnalyze");
+const analyzeOverlay = document.getElementById("analyzeOverlay");
+const analyzeBody = document.getElementById("analyzeBody");
+const analyzeMeta = document.getElementById("analyzeMeta");
+const analyzeCloseButton = document.getElementById("analyzeClose");
+function closeAnalyze() { analyzeOverlay?.classList.remove("open"); }
+analyzeCloseButton?.addEventListener("click", closeAnalyze);
+analyzeOverlay?.addEventListener("click", e => { if (e.target === analyzeOverlay) closeAnalyze(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && analyzeOverlay?.classList.contains("open")) closeAnalyze();
+});
+function dtFmt(n, d) { return (typeof n === "number" && isFinite(n)) ? n.toFixed(d == null ? 2 : d) : "–"; }
+function dtMph(yps) { return (typeof yps === "number" && isFinite(yps)) ? (yps * 0.681818).toFixed(1) : "–"; }
+function dtEscape(s) { return String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function renderDecisionTrace(payload) {
+  const entries = (payload && payload.entries) || [];
+  analyzeMeta.textContent = entries.length
+    ? `${entries.length} on-ball decisions, newest first${payload.captureEnabled ? "" : " — capture OFF"}`
+    : (payload && payload.captureEnabled ? "no on-ball decisions captured yet" : "decision capture is OFF");
+  if (!entries.length) {
+    analyzeBody.innerHTML = '<div class="dtrow">Nothing captured yet — let the match run a few seconds with the ball in play, then Pause &amp; Analyze again.</div>';
+    return;
+  }
+  analyzeBody.innerHTML = entries.map(e => {
+    const opts = (e.options || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0)).map(o => {
+      const cls = "dtopt" + (o.chosen ? " chosen" : "") + (o.legal ? "" : " illegal");
+      return `<span class="${cls}">${dtEscape(o.label)} ${dtFmt(o.score)}</span>`;
+    }).join("");
+    return `<div class="dtrow">
+      <div class="hdr"><span class="tk">t${e.tick}</span><span class="who">${dtEscape(e.playerName)} (${dtEscape(e.team)} ${dtEscape(e.role)})</span><span class="act">${dtEscape(e.action)}</span></div>
+      <div class="ctx">press <b>${dtFmt(e.perceivedPressure)}</b> &middot; urgency <b>${dtFmt(e.pressureUrgency)}</b> &middot; nearestOpp <b>${dtFmt(e.nearestOpponentDistance, 1)}yd</b> closing <b>${dtMph(e.nearestOpponentClosingRateYps)}mph</b> &middot; toGoal <b>${dtFmt(e.yardsToGoal, 0)}yd</b> &middot; passComp <b>${dtFmt(e.expectedPassCompletion)}</b> &middot; openRcvr <b>${dtFmt(e.bestPassReceiverOpenness)}</b> &middot; dispRisk <b>${dtFmt(e.immediateDispossessionRisk)}</b> &middot; fwdSpace <b>${dtFmt(e.forwardDribbleSpaceYards, 1)}yd</b> &middot; onBall <b>${dtFmt(e.timeOnBallSeconds, 1)}s</b></div>
+      <div class="dtopts">${opts}</div>
+    </div>`;
+  }).join("");
+}
+async function pauseAndAnalyze() {
+  running = false;
+  updateRunButton();
+  analyzeOverlay.classList.add("open");
+  analyzeBody.innerHTML = '<div class="dtrow">Loading…</div>';
+  analyzeMeta.textContent = "";
+  const resp = await fetchLive("/api/decision-trace");
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  renderDecisionTrace(await resp.json());
+}
+pauseAnalyzeButton?.addEventListener("click", () => pauseAndAnalyze().catch(e => {
+  analyzeBody.innerHTML = `<div class="dtrow">Failed to load decision trace: ${dtEscape(e.message)}</div>`;
+}));
 resetMatchButton.addEventListener("click", () => resetMatch().catch(e => statusEl.textContent = e.message));
 async function postServerControl(path, label) {
   const response = await postJson(path, {});
