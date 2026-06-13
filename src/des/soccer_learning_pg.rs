@@ -22,6 +22,8 @@ use crate::des::soccer_learning::{
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
     SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
+use crate::des::general::tournament::TournamentReport;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct SoccerLearningPgPolicyVersion {
@@ -611,6 +613,197 @@ impl SoccerLearningPgStore {
             )
             .map_err(|err| format!("insert soccer learning experiment: {err}"))?;
         Ok(row.get(0))
+    }
+
+    /// Durably store a finished learning tournament: one header row, every match,
+    /// and every team's final evolved brain (neural snapshot + record). Returns the
+    /// new tournament id.
+    ///
+    /// A transaction-scoped advisory lock keyed by `(experiment, date)` serializes
+    /// concurrent writers so two nightly runs for the same date can't interleave —
+    /// the second blocks until the first commits, then writes its own row.
+    pub fn persist_tournament(
+        &mut self,
+        experiment_id: &str,
+        tournament_date: &str,
+        seed: u32,
+        wall_time_seconds: f64,
+        report: &TournamentReport,
+    ) -> Result<i64, String> {
+        self.ensure_connected()?;
+        // Schema in its own COMMITTED tx so the tables exist even on a cold DB.
+        {
+            let mut tx = self
+                .client
+                .transaction()
+                .map_err(|err| format!("begin tournament schema tx: {err}"))?;
+            ensure_soccer_tournament_tables(&mut tx)?;
+            tx.commit()
+                .map_err(|err| format!("commit tournament schema: {err}"))?;
+        }
+
+        let format_json = json!({
+            "teamCount": report.format.team_count,
+            "groupSize": report.format.group_size,
+            "advancersPerGroup": report.format.advancers_per_group,
+            "doubleRoundRobin": report.format.double_round_robin,
+            "thirdPlaceMatch": report.format.third_place_match,
+        });
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin tournament insert tx: {err}"))?;
+
+        // Serialize nightly runs for the same (experiment, date). Auto-released on
+        // commit/rollback.
+        tx.execute(
+            "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            &[&experiment_id, &tournament_date],
+        )
+        .map_err(|err| format!("acquire tournament advisory lock: {err}"))?;
+
+        let third_place = report.third_place_id.map(|id| id as i32);
+        let tournament_id: i64 = tx
+            .query_one(
+                r#"
+                insert into des_soccer_tournaments
+                  (experiment_id, tournament_date, seed, learning_mode, format,
+                   team_count, match_count, champion_team_id, runner_up_team_id,
+                   third_place_team_id, wall_time_seconds, status)
+                values
+                  ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'completed')
+                returning id
+                "#,
+                &[
+                    &experiment_id,
+                    &tournament_date,
+                    &(seed as i64),
+                    &format!("{:?}", report.learning_mode),
+                    &format_json,
+                    &(report.format.team_count as i32),
+                    &(report.match_count() as i32),
+                    &(report.champion_id as i32),
+                    &(report.runner_up_id as i32),
+                    &third_place,
+                    &wall_time_seconds,
+                ],
+            )
+            .map_err(|err| format!("insert tournament header: {err}"))?
+            .get(0);
+
+        for (match_index, m) in report.matches.iter().enumerate() {
+            let shootout = m.shootout_winner.map(|id| id as i32);
+            tx.execute(
+                r#"
+                insert into des_soccer_tournament_matches
+                  (tournament_id, match_index, stage, home_team_id, away_team_id,
+                   home_goals, away_goals, shootout_winner_team_id,
+                   home_training_steps, away_training_steps)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#,
+                &[
+                    &tournament_id,
+                    &(match_index as i32),
+                    &m.stage.label(),
+                    &(m.home_id as i32),
+                    &(m.away_id as i32),
+                    &(m.home_goals as i32),
+                    &(m.away_goals as i32),
+                    &shootout,
+                    &(m.home_training_steps as i64),
+                    &(m.away_training_steps as i64),
+                ],
+            )
+            .map_err(|err| format!("insert tournament match {match_index}: {err}"))?;
+        }
+
+        for team in &report.teams {
+            let neural_json = match &team.brain.neural {
+                Some(snapshot) => {
+                    validate_soccer_neural_network_snapshot_for_pg(snapshot)?;
+                    Some(
+                        serde_json::to_value(snapshot)
+                            .map_err(|err| format!("serialize team {} brain: {err}", team.id))?,
+                    )
+                }
+                None => None,
+            };
+            tx.execute(
+                r#"
+                insert into des_soccer_tournament_team_brains
+                  (tournament_id, team_id, team_name, seed, matches_learned,
+                   training_steps, played, wins, draws, losses, goals_for,
+                   goals_against, neural_snapshot)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                "#,
+                &[
+                    &tournament_id,
+                    &(team.id as i32),
+                    &team.name,
+                    &(team.seed as i64),
+                    &(team.brain.matches_learned as i32),
+                    &(team.brain.training_steps as i64),
+                    &(team.record.played as i32),
+                    &(team.record.wins as i32),
+                    &(team.record.draws as i32),
+                    &(team.record.losses as i32),
+                    &(team.record.goals_for as i32),
+                    &(team.record.goals_against as i32),
+                    &neural_json,
+                ],
+            )
+            .map_err(|err| format!("insert team {} brain: {err}", team.id))?;
+        }
+
+        tx.commit()
+            .map_err(|err| format!("commit tournament: {err}"))?;
+        Ok(tournament_id)
+    }
+
+    /// Warm-start brains for the next tournament: each team's final neural snapshot
+    /// from this experiment's most recently completed tournament, keyed by team id.
+    /// Empty when no prior tournament exists (callers start those teams fresh).
+    pub fn load_latest_tournament_team_brains(
+        &mut self,
+        experiment_id: &str,
+    ) -> Result<HashMap<usize, SoccerNeuralNetworkSnapshot>, String> {
+        self.ensure_connected()?;
+        {
+            let mut tx = self
+                .client
+                .transaction()
+                .map_err(|err| format!("begin tournament read schema tx: {err}"))?;
+            ensure_soccer_tournament_tables(&mut tx)?;
+            tx.commit()
+                .map_err(|err| format!("commit tournament read schema: {err}"))?;
+        }
+        let rows = self
+            .client
+            .query(
+                r#"
+                select b.team_id, b.neural_snapshot
+                from des_soccer_tournament_team_brains b
+                where b.tournament_id = (
+                  select id from des_soccer_tournaments
+                  where experiment_id = $1::text::uuid and status = 'completed'
+                  order by created_at desc, id desc
+                  limit 1
+                )
+                and b.neural_snapshot is not null
+                "#,
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("load latest tournament brains: {err}"))?;
+        let mut brains = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let team_id: i32 = row.get(0);
+            let snapshot_json: Value = row.get(1);
+            let snapshot: SoccerNeuralNetworkSnapshot = serde_json::from_value(snapshot_json)
+                .map_err(|err| format!("decode team {team_id} brain: {err}"))?;
+            validate_soccer_neural_network_snapshot_for_pg(&snapshot)?;
+            brains.insert(team_id.max(0) as usize, snapshot);
+        }
+        Ok(brains)
     }
 
     pub fn load_latest_active_policy(
@@ -2771,6 +2964,69 @@ pub fn soccer_moment_neighbors_attack_defense(neighbors: &[SoccerMomentNeighbor]
 /// `create extension if not exists vector` is a no-op when an admin has already
 /// enabled it (the RDS-allowlisted path), and only needs elevated privilege the
 /// first time. The `vector(N)` width is `SOCCER_MOMENT_EMBEDDING_DIM`.
+/// Durable storage for nightly learning tournaments: one header per tournament,
+/// every match, and each team's final evolved brain (neural snapshot + record).
+fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
+    tx.batch_execute(
+        r#"
+        create table if not exists des_soccer_tournaments (
+          id bigserial primary key,
+          experiment_id uuid not null,
+          tournament_date text not null,
+          seed bigint not null,
+          learning_mode text not null,
+          format jsonb not null,
+          team_count integer not null,
+          match_count integer not null,
+          champion_team_id integer not null,
+          runner_up_team_id integer not null,
+          third_place_team_id integer,
+          wall_time_seconds double precision,
+          status text not null default 'completed',
+          created_at timestamptz not null default now()
+        );
+        create index if not exists des_soccer_tournaments_experiment_idx
+          on des_soccer_tournaments (experiment_id, created_at desc);
+
+        create table if not exists des_soccer_tournament_matches (
+          id bigserial primary key,
+          tournament_id bigint not null
+            references des_soccer_tournaments(id) on delete cascade,
+          match_index integer not null,
+          stage text not null,
+          home_team_id integer not null,
+          away_team_id integer not null,
+          home_goals integer not null,
+          away_goals integer not null,
+          shootout_winner_team_id integer,
+          home_training_steps bigint not null,
+          away_training_steps bigint not null,
+          unique (tournament_id, match_index)
+        );
+
+        create table if not exists des_soccer_tournament_team_brains (
+          id bigserial primary key,
+          tournament_id bigint not null
+            references des_soccer_tournaments(id) on delete cascade,
+          team_id integer not null,
+          team_name text not null,
+          seed bigint not null,
+          matches_learned integer not null,
+          training_steps bigint not null,
+          played integer not null,
+          wins integer not null,
+          draws integer not null,
+          losses integer not null,
+          goals_for integer not null,
+          goals_against integer not null,
+          neural_snapshot jsonb,
+          unique (tournament_id, team_id)
+        );
+        "#,
+    )
+    .map_err(|err| format!("ensure soccer tournament tables: {err}"))
+}
+
 fn ensure_soccer_moment_embedding_tables(
     tx: &mut postgres::Transaction<'_>,
 ) -> Result<(), String> {

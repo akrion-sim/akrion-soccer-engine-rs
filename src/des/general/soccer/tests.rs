@@ -32563,6 +32563,60 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         );
     }
 
+    /// Regression: an open forward runner must not be vetoed just because the LED
+    /// reception point (pushed ahead of his sprint) overshoots into a deep defender,
+    /// when his CURRENT feet are open with a clear lane. Before the fix the pass-lane
+    /// veto only tested the led point, so this forward option was dropped from the
+    /// candidate set and the carrier was left to play a backward/square ball instead.
+    #[test]
+    fn open_forward_feet_survive_even_when_led_point_overshoots_into_defender() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let passer = 6; // Home midfielder, attacks +y
+        let runner = 9; // Home forward sprinting straight upfield
+        let blocker = 12; // Away defender sitting just beyond the runner's feet
+        sim.ball.holder = Some(passer);
+        sim.ball.position = Vec2::new(40.0, 40.0);
+        sim.ball.last_touch_team = Some(Team::Home);
+        // Park everyone else: Home parked players land deep in their own end (a
+        // backward option that no_pressure filtering removes), Away parked players sit
+        // deep by their own goal (so the runner stays comfortably onside).
+        park_players_except(&mut sim, &[passer, runner, blocker]);
+        sim.players[passer].position = sim.ball.position;
+        sim.players[passer].velocity = Vec2::new(0.0, 2.5); // facing upfield → runner visible
+        sim.players[passer].skills.passing = 8.2;
+        sim.players[passer].skills.passing_completion_rate = 8.6;
+        sim.players[passer].skills.vision = 8.4;
+        // Runner's feet (40,52) are genuinely open — no defender close enough to win the
+        // race to them — and he is sprinting straight up at 6 yps so the anticipated
+        // reception point is led far upfield (~y70).
+        sim.players[runner].position = Vec2::new(40.0, 52.0);
+        sim.players[runner].velocity = Vec2::new(0.0, 6.0);
+        // The defender sits deep at (40,70), right where the LED point lands: it blocks
+        // the led lane, but is 18yd from the open feet (40,52), so the feet lane stays
+        // clear AND the ball wins the race to the feet.
+        sim.players[blocker].position = Vec2::new(40.0, 70.0);
+        sim.players[blocker].velocity = Vec2::zero();
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+
+        // Sanity: the led point really does overshoot into the blocker's lane while the
+        // feet lane is clear — i.e. this is the exact case the fix targets.
+        let speed = pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+        let led = snapshot
+            .anticipated_pass_reception_point(passer, runner, PassFlight::Floor, speed)
+            .expect("anticipated reception point");
+        assert!(
+            led.y > 52.0 + 3.0,
+            "runner's reception point should be led upfield ahead of his feet: {led:?}"
+        );
+
+        assert_eq!(
+            snapshot.ranked_visible_pass_targets(passer, 1),
+            vec![runner],
+            "open forward runner must remain selectable on his open feet despite the led-point overshoot"
+        );
+    }
+
     #[test]
     fn pass_target_ranking_avoids_teammate_occupied_future_reception_space() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());

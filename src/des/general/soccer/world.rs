@@ -14603,29 +14603,55 @@ impl WorldSnapshot {
                 // lane, still hard-vetoes. A defender merely DRIFTING into the lane no
                 // longer vetoes — that's carried as a penalty (below) so a brave forward
                 // ball to an open runner stays possible instead of being forced square.
-                let (lane_clear_now, anticipation_clear) = self.pass_lane_clearance(
+                //
+                // Crucially, the lane is checked against the LED reception point, which is
+                // pushed ahead of a runner and can overshoot into a deep defender even when
+                // the receiver is open AT HIS FEET with a clear lane. Binning the option in
+                // that case is exactly the "open forward man ignored, square ball played"
+                // bug. So mirror the reception-race benefit-of-doubt (which already credits
+                // the led point OR the current feet): aim at the led point when its lane is
+                // clear now, else fall back to the receiver's CURRENT feet when THAT lane is
+                // clear. Only veto when BOTH are blocked. (This is a selection aim only — the
+                // executed pass is re-led to the anticipated point at release time.)
+                let (led_clear_now, led_anticipation_clear) = self.pass_lane_clearance(
                     me_position,
                     anticipated_position,
                     me.team.other(),
                     2.5,
                     nominal_speed,
                 );
-                ((!visible_only || self.player_can_see_player(me.id, p.id))
-                    && lane_clear_now
-                    && (!require_reception_won || reception_won)
-                    && !self.pass_lane_has_set_interceptor(
+                let aim_point_and_anticipation = if led_clear_now {
+                    Some((anticipated_position, led_anticipation_clear))
+                } else {
+                    let (feet_clear_now, feet_anticipation_clear) = self.pass_lane_clearance(
                         me_position,
-                        anticipated_position,
-                        me.team,
-                    )
-                    && self.pending_offside_for_pass(me.id, p.id).is_none()
-                    && !self.final_third_forward_pass_to_nobody(
-                        me.team,
-                        me.id,
-                        me_position,
-                        anticipated_position,
-                    ))
-                .then_some((p, position, anticipated_position, anticipation_clear))
+                        position,
+                        me.team.other(),
+                        2.5,
+                        nominal_speed,
+                    );
+                    if feet_clear_now {
+                        Some((position, feet_anticipation_clear))
+                    } else {
+                        None
+                    }
+                };
+                aim_point_and_anticipation
+                    .filter(|(aim_point, _)| {
+                        (!visible_only || self.player_can_see_player(me.id, p.id))
+                            && (!require_reception_won || reception_won)
+                            && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
+                            && self.pending_offside_for_pass(me.id, p.id).is_none()
+                            && !self.final_third_forward_pass_to_nobody(
+                                me.team,
+                                me.id,
+                                me_position,
+                                *aim_point,
+                            )
+                    })
+                    .map(|(aim_point, anticipation_clear)| {
+                        (p, position, aim_point, anticipation_clear)
+                    })
             })
             .map(|p| {
                 let (p, position, pass_point, anticipation_clear) = p;

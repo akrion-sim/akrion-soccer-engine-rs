@@ -684,61 +684,8 @@ impl Tournament {
             }
         }
 
-        // ---- Group tables + advancers -----------------------------------
-        let mut group_tables = Vec::with_capacity(groups.len());
-        let mut group_winners: Vec<usize> = Vec::with_capacity(groups.len());
-        let mut group_runners_up: Vec<usize> = Vec::with_capacity(groups.len());
-        for (group_index, group) in groups.iter().enumerate() {
-            let ranked = self.rank_group(group, &head_to_head);
-            let advancers = self.format.advancers_per_group;
-            let standings = ranked
-                .iter()
-                .enumerate()
-                .map(|(position, &team_id)| {
-                    let team = &self.teams[self.team_index(team_id)];
-                    GroupStanding {
-                        team_id,
-                        name: team.name.clone(),
-                        record: team.record,
-                        advanced: position < advancers,
-                    }
-                })
-                .collect();
-            group_tables.push(GroupTable {
-                group_index,
-                standings,
-            });
-            // Seed the knockout: top finisher and runner-up (works for the common
-            // 2-advancer World-Cup shape; extra advancers extend the field below).
-            group_winners.push(ranked[0]);
-            if advancers >= 2 {
-                group_runners_up.push(ranked[1]);
-            }
-            for &extra in ranked.iter().take(advancers).skip(2) {
-                group_runners_up.push(extra);
-            }
-        }
-
-        // ---- Knockout bracket seeding (World-Cup crossing) --------------
-        // Winner of group i meets runner-up of neighbour group (i ^ 1), so two
-        // teams from the same group can only meet again in a later round.
-        let mut bracket: Vec<usize> = Vec::with_capacity(self.format.knockout_team_count());
-        if group_runners_up.len() == group_winners.len() && group_winners.len() % 2 == 0 {
-            // Even group count: cross neighbours (Wᵢ vs runner-up of group i^1).
-            for i in 0..group_winners.len() {
-                bracket.push(group_winners[i]);
-                bracket.push(group_runners_up[i ^ 1]);
-            }
-        } else {
-            // Single/odd group count or non-standard advancers: interleave each
-            // group's winner then its runner-up (no neighbour to cross with).
-            for i in 0..group_winners.len() {
-                bracket.push(group_winners[i]);
-                if let Some(&runner_up) = group_runners_up.get(i) {
-                    bracket.push(runner_up);
-                }
-            }
-        }
+        // ---- Group tables + advancers + knockout bracket seeding --------
+        let (group_tables, bracket) = self.group_tables_and_bracket(&groups, &head_to_head);
 
         // ---- Single-elimination knockout --------------------------------
         let mut semifinal_losers: Vec<usize> = Vec::new();
@@ -824,6 +771,375 @@ impl Tournament {
         // runner only owes a well-formed score here.
         runner.play(ctx, home, away)
     }
+
+    /// Final group tables + the seeded knockout bracket. Shared by the sequential
+    /// [`run`](Self::run) and the parallel [`run_parallel`](Self::run_parallel) so
+    /// both crown the bracket identically.
+    fn group_tables_and_bracket(
+        &self,
+        groups: &[Vec<usize>],
+        head_to_head: &HashMap<(usize, usize), (u32, u32)>,
+    ) -> (Vec<GroupTable>, Vec<usize>) {
+        let mut group_tables = Vec::with_capacity(groups.len());
+        let mut group_winners: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut group_runners_up: Vec<usize> = Vec::with_capacity(groups.len());
+        for (group_index, group) in groups.iter().enumerate() {
+            let ranked = self.rank_group(group, head_to_head);
+            let advancers = self.format.advancers_per_group;
+            let standings = ranked
+                .iter()
+                .enumerate()
+                .map(|(position, &team_id)| {
+                    let team = &self.teams[self.team_index(team_id)];
+                    GroupStanding {
+                        team_id,
+                        name: team.name.clone(),
+                        record: team.record,
+                        advanced: position < advancers,
+                    }
+                })
+                .collect();
+            group_tables.push(GroupTable {
+                group_index,
+                standings,
+            });
+            // Seed the knockout: top finisher and runner-up (works for the common
+            // 2-advancer World-Cup shape; extra advancers extend the field below).
+            group_winners.push(ranked[0]);
+            if advancers >= 2 {
+                group_runners_up.push(ranked[1]);
+            }
+            for &extra in ranked.iter().take(advancers).skip(2) {
+                group_runners_up.push(extra);
+            }
+        }
+
+        // Winner of group i meets runner-up of neighbour group (i ^ 1), so two
+        // teams from the same group can only meet again in a later round.
+        let mut bracket: Vec<usize> = Vec::with_capacity(self.format.knockout_team_count());
+        if group_runners_up.len() == group_winners.len() && group_winners.len() % 2 == 0 {
+            for i in 0..group_winners.len() {
+                bracket.push(group_winners[i]);
+                bracket.push(group_runners_up[i ^ 1]);
+            }
+        } else {
+            for i in 0..group_winners.len() {
+                bracket.push(group_winners[i]);
+                if let Some(&runner_up) = group_runners_up.get(i) {
+                    bracket.push(runner_up);
+                }
+            }
+        }
+        (group_tables, bracket)
+    }
+
+    /// Run a whole tournament with up to `max_parallelism` matches executing
+    /// concurrently. Produces the **exact same** bracket, champion, brains, and
+    /// match records the sequential [`run`](Self::run) would: matches are batched
+    /// into "waves" (one group round, or one knockout round) in which no team
+    /// appears twice, so brain carry-forward is well-defined, and the shootout RNG
+    /// + per-team commits stay sequential on the calling thread.
+    ///
+    /// `on_progress` fires on the calling thread after each wave commits (for
+    /// logging / metrics / an ops controller). If `deadline` is reached before a
+    /// wave starts the run aborts with an error instead of risking a mid-write
+    /// kill — callers should persist incrementally and treat that as a graceful
+    /// early stop. The default-format tournament's critical path is only ~10 waves,
+    /// so a generous window almost never trips this.
+    pub fn run_parallel<R>(
+        mut self,
+        runner: &R,
+        max_parallelism: usize,
+        deadline: Option<std::time::Instant>,
+        mut on_progress: impl FnMut(&TournamentProgress),
+    ) -> Result<TournamentReport, String>
+    where
+        R: TournamentMatchRunner + Clone + Send,
+    {
+        let started = std::time::Instant::now();
+        let max_par = max_parallelism.max(1);
+        let mut rng = TournamentRng::new(self.seed);
+        let mut reports: Vec<MatchReport> = Vec::new();
+
+        // ---- Group stage: round-by-round across ALL groups (each round a wave).
+        let groups = self.group_assignment();
+        let group_legs: Vec<Vec<Vec<(usize, usize)>>> =
+            groups.iter().map(|group| self.round_robin(group)).collect();
+        let group_round_count = group_legs.iter().map(|legs| legs.len()).max().unwrap_or(0);
+        let group_match_total: usize = group_legs
+            .iter()
+            .map(|legs| legs.iter().map(|round| round.len()).sum::<usize>())
+            .sum();
+        let knockout_total = self.format.knockout_team_count().saturating_sub(1)
+            + usize::from(self.format.third_place_match);
+        let matches_total = group_match_total + knockout_total;
+
+        let mut head_to_head: HashMap<(usize, usize), (u32, u32)> = HashMap::new();
+        for round_index in 0..group_round_count {
+            let mut wave: Vec<TournamentMatchContext> = Vec::new();
+            for (group_index, legs) in group_legs.iter().enumerate() {
+                if let Some(fixtures) = legs.get(round_index) {
+                    for (match_index, &(home_id, away_id)) in fixtures.iter().enumerate() {
+                        wave.push(self.match_context(
+                            TournamentStage::Group,
+                            round_index,
+                            group_index * 1000 + match_index,
+                            home_id,
+                            away_id,
+                        ));
+                    }
+                }
+            }
+            check_deadline(deadline, reports.len(), matches_total)?;
+            let outcomes = self.play_wave(runner, &wave, max_par)?;
+            for (ctx, outcome) in wave.iter().zip(outcomes) {
+                self.commit_match(ctx, outcome, None, Some(&mut head_to_head), &mut reports);
+            }
+            on_progress(&TournamentProgress::new(
+                reports.len(),
+                matches_total,
+                format!("Group round {}", round_index + 1),
+                started.elapsed(),
+            ));
+        }
+
+        let (group_tables, bracket) = self.group_tables_and_bracket(&groups, &head_to_head);
+
+        // ---- Knockout: one round per wave.
+        let mut semifinal_losers: Vec<usize> = Vec::new();
+        let mut round_index = 0usize;
+        let mut current = bracket;
+        while current.len() > 1 {
+            let remaining = current.len();
+            let stage = TournamentStage::Knockout { remaining };
+            let wave: Vec<TournamentMatchContext> = current
+                .chunks(2)
+                .enumerate()
+                .map(|(match_index, pair)| {
+                    self.match_context(stage, round_index, match_index, pair[0], pair[1])
+                })
+                .collect();
+            check_deadline(deadline, reports.len(), matches_total)?;
+            let outcomes = self.play_wave(runner, &wave, max_par)?;
+            let mut winners = Vec::with_capacity(remaining / 2);
+            let mut losers = Vec::with_capacity(remaining / 2);
+            for (ctx, outcome) in wave.iter().zip(outcomes) {
+                let (winner, shootout) = self.knockout_winner(ctx, &outcome, &mut rng);
+                let loser = if winner == ctx.home_id { ctx.away_id } else { ctx.home_id };
+                self.commit_match(ctx, outcome, shootout, None, &mut reports);
+                winners.push(winner);
+                losers.push(loser);
+            }
+            if remaining == 4 {
+                semifinal_losers = losers;
+            }
+            current = winners;
+            round_index += 1;
+            on_progress(&TournamentProgress::new(
+                reports.len(),
+                matches_total,
+                stage.label(),
+                started.elapsed(),
+            ));
+        }
+        let champion_id = *current
+            .first()
+            .ok_or_else(|| "knockout produced no champion".to_string())?;
+        let runner_up_id = final_runner_up(&reports, champion_id);
+
+        // ---- Optional third-place play-off (a single match).
+        let mut third_place_id = None;
+        if self.format.third_place_match && semifinal_losers.len() == 2 {
+            let ctx = self.match_context(
+                TournamentStage::ThirdPlace,
+                round_index,
+                0,
+                semifinal_losers[0],
+                semifinal_losers[1],
+            );
+            check_deadline(deadline, reports.len(), matches_total)?;
+            let outcome = self
+                .play_wave(runner, std::slice::from_ref(&ctx), max_par)?
+                .pop()
+                .ok_or_else(|| "third-place play-off produced no result".to_string())?;
+            let (winner, shootout) = self.knockout_winner(&ctx, &outcome, &mut rng);
+            self.commit_match(&ctx, outcome, shootout, None, &mut reports);
+            third_place_id = Some(winner);
+            on_progress(&TournamentProgress::new(
+                reports.len(),
+                matches_total,
+                "Third-place play-off".to_string(),
+                started.elapsed(),
+            ));
+        }
+
+        Ok(TournamentReport {
+            format: self.format,
+            learning_mode: self.mode,
+            group_tables,
+            matches: reports,
+            champion_id,
+            runner_up_id,
+            third_place_id,
+            teams: self.teams,
+        })
+    }
+
+    /// Play one wave (a set of fixtures that share no team) with up to
+    /// `max_parallelism` matches running concurrently, returning the outcomes in
+    /// the same order as `contexts`. Brains are cloned up front on the calling
+    /// thread; each match runs against an independent clone of `runner` (the
+    /// engine runner is a cheap config holder and each `SoccerMatch` is a
+    /// self-contained, inline-neural, deterministic computation).
+    fn play_wave<R>(
+        &self,
+        runner: &R,
+        contexts: &[TournamentMatchContext],
+        max_parallelism: usize,
+    ) -> Result<Vec<MatchOutcome>, String>
+    where
+        R: TournamentMatchRunner + Clone + Send,
+    {
+        if contexts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inputs: Vec<(TournamentMatchContext, TeamBrain, TeamBrain)> = contexts
+            .iter()
+            .map(|ctx| {
+                let home = self.teams[self.team_index(ctx.home_id)].brain.clone();
+                let away = self.teams[self.team_index(ctx.away_id)].brain.clone();
+                (ctx.clone(), home, away)
+            })
+            .collect();
+
+        // Sequential fast path keeps single-threaded callers (and `max_par == 1`)
+        // free of any thread/scope overhead and matches `run` exactly.
+        if max_parallelism.max(1) == 1 {
+            let mut runner = runner.clone();
+            return inputs
+                .iter()
+                .map(|(ctx, home, away)| runner.play(ctx, home, away))
+                .collect();
+        }
+
+        let mut outcomes: Vec<Option<MatchOutcome>> = (0..inputs.len()).map(|_| None).collect();
+        let mut first_err: Option<String> = None;
+        std::thread::scope(|scope| {
+            for chunk_start in (0..inputs.len()).step_by(max_parallelism) {
+                let chunk_end = (chunk_start + max_parallelism).min(inputs.len());
+                let handles: Vec<_> = (chunk_start..chunk_end)
+                    .map(|i| {
+                        let mut thread_runner = runner.clone();
+                        let (ctx, home, away) = &inputs[i];
+                        scope.spawn(move || thread_runner.play(ctx, home, away))
+                    })
+                    .collect();
+                for (offset, handle) in handles.into_iter().enumerate() {
+                    let i = chunk_start + offset;
+                    match handle.join() {
+                        Ok(Ok(outcome)) => outcomes[i] = Some(outcome),
+                        Ok(Err(err)) => {
+                            first_err.get_or_insert(err);
+                        }
+                        Err(_) => {
+                            let (ctx, ..) = &inputs[i];
+                            first_err.get_or_insert_with(|| {
+                                format!(
+                                    "tournament match thread panicked ({} vs {})",
+                                    ctx.home_id, ctx.away_id
+                                )
+                            });
+                        }
+                    }
+                }
+                if first_err.is_some() {
+                    break;
+                }
+            }
+        });
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.ok_or_else(|| "missing tournament match outcome".to_string()))
+            .collect()
+    }
+}
+
+/// Progress snapshot handed to `run_parallel`'s callback after each wave. Drives
+/// logging, metrics, and a finish-by-deadline ops controller.
+#[derive(Clone, Debug)]
+pub struct TournamentProgress {
+    pub matches_played: usize,
+    pub matches_total: usize,
+    pub stage_label: String,
+    pub elapsed: Duration,
+}
+
+impl TournamentProgress {
+    fn new(
+        matches_played: usize,
+        matches_total: usize,
+        stage_label: String,
+        elapsed: Duration,
+    ) -> Self {
+        TournamentProgress {
+            matches_played,
+            matches_total,
+            stage_label,
+            elapsed,
+        }
+    }
+
+    /// Mean wall time per completed match so far (0 before any match completes).
+    pub fn avg_match_seconds(&self) -> f64 {
+        if self.matches_played == 0 {
+            0.0
+        } else {
+            self.elapsed.as_secs_f64() / self.matches_played as f64
+        }
+    }
+
+    /// Projected total wall time to finish all matches at the current per-match
+    /// rate (the simple, robust estimate the deadline controller relies on).
+    pub fn projected_total_seconds(&self) -> f64 {
+        self.avg_match_seconds() * self.matches_total as f64
+    }
+}
+
+/// Abort a parallel run before a wave if the deadline has already passed, so the
+/// process exits cleanly (flushing persistence) rather than being SIGKILLed
+/// mid-write.
+fn check_deadline(
+    deadline: Option<std::time::Instant>,
+    matches_played: usize,
+    matches_total: usize,
+) -> Result<(), String> {
+    if let Some(deadline) = deadline {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "tournament deadline reached after {matches_played}/{matches_total} matches"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runner-up = whoever the champion beat in the final.
+fn final_runner_up(reports: &[MatchReport], champion_id: usize) -> usize {
+    reports
+        .iter()
+        .rev()
+        .find(|report| matches!(report.stage, TournamentStage::Knockout { remaining: 2 }))
+        .map(|final_report| {
+            if final_report.home_id == champion_id {
+                final_report.away_id
+            } else {
+                final_report.home_id
+            }
+        })
+        .unwrap_or(champion_id)
 }
 
 /// Stage discriminant folded into each match seed so the same pairing in
@@ -872,6 +1188,7 @@ fn head_to_head_result_points(scored: u32, conceded: u32) -> u32 {
 /// the team seed, with a seeded jitter so upsets happen. It performs no real
 /// simulation and returns brains unchanged — ideal for exercising the bracket,
 /// standings, tiebreakers, and champion logic deterministically.
+#[derive(Clone)]
 pub struct StrengthMatchRunner {
     strengths: HashMap<usize, f64>,
 }
@@ -983,6 +1300,7 @@ impl Default for EngineMatchRunnerConfig {
 /// brain on its side (frozen per the learning flags), plays to the final whistle
 /// with both brains learning as configured, then extracts the score and the
 /// updated brains so the tournament carries learning forward.
+#[derive(Clone)]
 pub struct EngineMatchRunner {
     config: EngineMatchRunnerConfig,
 }
@@ -1044,8 +1362,18 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
 
         // Carry forward each side's (possibly updated) brain.
-        let home_brain = carry_brain(home, sim.neural_network_snapshot_for(Team::Home), ctx.home_learns);
-        let away_brain = carry_brain(away, sim.neural_network_snapshot_for(Team::Away), ctx.away_learns);
+        let home_brain = carry_brain(
+            home,
+            sim.neural_network_snapshot_for(Team::Home),
+            ctx.home_learns,
+            home_training_steps as u64,
+        );
+        let away_brain = carry_brain(
+            away,
+            sim.neural_network_snapshot_for(Team::Away),
+            ctx.away_learns,
+            away_training_steps as u64,
+        );
 
         Ok(MatchOutcome {
             home_goals,
@@ -1062,6 +1390,7 @@ fn carry_brain(
     previous: &TeamBrain,
     snapshot: Option<SoccerNeuralNetworkSnapshot>,
     learned: bool,
+    match_training_steps: u64,
 ) -> TeamBrain {
     let mut next = previous.clone();
     // Keep the freshest trained net; if the sim produced none (e.g. too short to
@@ -1071,6 +1400,9 @@ fn carry_brain(
     }
     if learned {
         next.matches_learned += 1;
+        // Accumulate this match's gradient steps so the brain's lineage (persisted
+        // to Postgres) reflects its total training, not just match count.
+        next.training_steps = next.training_steps.saturating_add(match_training_steps);
     }
     next
 }
@@ -1237,6 +1569,72 @@ mod tests {
             .find(|m| matches!(m.stage, TournamentStage::Knockout { remaining: 2 }))
             .expect("a final was played");
         assert_eq!(final_match.winner_id(), Some(report.champion_id));
+    }
+
+    #[test]
+    fn parallel_run_matches_sequential_run_exactly() {
+        // run_parallel batches matches into team-disjoint waves, so it must crown
+        // the identical bracket the sequential run does — champion, podium, group
+        // tables, and the full multiset of match results — at any parallelism.
+        let make = || {
+            let teams = fresh_teams(128, 4242);
+            (
+                teams.clone(),
+                Tournament::new(
+                    teams,
+                    TournamentFormat::default(),
+                    TournamentLearningMode::Frozen,
+                    4242,
+                )
+                .unwrap(),
+            )
+        };
+
+        let (seed_a, seq) = make();
+        let mut seq_runner = StrengthMatchRunner::from_teams(&seed_a);
+        let seq_report = seq.run(&mut seq_runner).expect("sequential run");
+
+        let (seed_b, par) = make();
+        let par_runner = StrengthMatchRunner::from_teams(&seed_b);
+        let par_report = par
+            .run_parallel(&par_runner, 8, None, |_| {})
+            .expect("parallel run");
+
+        assert_eq!(seq_report.champion_id, par_report.champion_id);
+        assert_eq!(seq_report.runner_up_id, par_report.runner_up_id);
+        assert_eq!(seq_report.third_place_id, par_report.third_place_id);
+        assert_eq!(seq_report.match_count(), par_report.match_count());
+
+        // Group tables are produced by the same shared helper → identical order.
+        let standings = |r: &TournamentReport| {
+            r.group_tables
+                .iter()
+                .flat_map(|t| t.standings.iter().map(|s| (s.team_id, s.record.points(), s.advanced)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(standings(&seq_report), standings(&par_report));
+
+        // The match VECTOR order differs (group-by-group vs round-by-round), but
+        // the multiset of results must be identical.
+        let sorted = |r: &TournamentReport| {
+            let mut rows: Vec<_> = r
+                .matches
+                .iter()
+                .map(|m| {
+                    (
+                        m.stage.label(),
+                        m.home_id,
+                        m.away_id,
+                        m.home_goals,
+                        m.away_goals,
+                        m.shootout_winner,
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(sorted(&seq_report), sorted(&par_report));
     }
 
     #[test]
