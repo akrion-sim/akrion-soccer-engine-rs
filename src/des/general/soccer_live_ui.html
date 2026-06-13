@@ -339,8 +339,8 @@
 .dtopt{font-size:11px;border:1px solid #284736;border-radius:5px;padding:1px 6px;color:#b9d8c6;background:#11241a}
 .dtopt.illegal{opacity:.42;text-decoration:line-through}
 .dtopt.chosen{border-color:#5fd08a;color:#172026;background:#5fd08a;font-weight:700}
-#analyzeClose{min-width:30px;height:28px;padding:0 12px;font-weight:700;border-radius:6px;border:1px solid #2f9b57;background:#16241c;color:#cfe9d8;cursor:pointer}
-#analyzeClose:hover{background:#1d3327}
+#analyzeClose,#analyzeCopy{min-width:30px;height:28px;padding:0 12px;font-weight:700;border-radius:6px;border:1px solid #2f9b57;background:#16241c;color:#cfe9d8;cursor:pointer}
+#analyzeClose:hover,#analyzeCopy:hover{background:#1d3327}
 </style>
 </head>
 <body>
@@ -640,6 +640,7 @@
     <div id="analyzeHead">
       <h2>Pause &amp; Analyze — last on-ball MDP/POMDP decisions</h2>
       <span id="analyzeMeta"></span>
+      <button id="analyzeCopy" type="button" title="Copy the full decision trace to the clipboard as JSON">Copy JSON</button>
       <button id="analyzeClose" type="button">Close</button>
     </div>
     <div id="analyzeBody"></div>
@@ -4884,8 +4885,36 @@ const analyzeOverlay = document.getElementById("analyzeOverlay");
 const analyzeBody = document.getElementById("analyzeBody");
 const analyzeMeta = document.getElementById("analyzeMeta");
 const analyzeCloseButton = document.getElementById("analyzeClose");
+const analyzeCopyButton = document.getElementById("analyzeCopy");
+let lastDecisionTracePayload = null;
 function closeAnalyze() { analyzeOverlay?.classList.remove("open"); }
 analyzeCloseButton?.addEventListener("click", closeAnalyze);
+async function copyAnalyzeJson() {
+  if (!analyzeCopyButton) return;
+  const text = JSON.stringify(lastDecisionTracePayload ?? {}, null, 2);
+  const label = analyzeCopyButton.textContent;
+  let ok = false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch (_) { /* fall back below */ }
+  if (!ok) {
+    // Fallback for non-secure contexts where navigator.clipboard is unavailable.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+    ta.remove();
+  }
+  analyzeCopyButton.textContent = ok ? "Copied!" : "Copy failed";
+  setTimeout(() => { analyzeCopyButton.textContent = label; }, 1200);
+}
+analyzeCopyButton?.addEventListener("click", () => { copyAnalyzeJson(); });
 analyzeOverlay?.addEventListener("click", e => { if (e.target === analyzeOverlay) closeAnalyze(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && analyzeOverlay?.classList.contains("open")) closeAnalyze();
@@ -4894,6 +4923,7 @@ function dtFmt(n, d) { return (typeof n === "number" && isFinite(n)) ? n.toFixed
 function dtMph(yps) { return (typeof yps === "number" && isFinite(yps)) ? (yps * 0.681818).toFixed(1) : "–"; }
 function dtEscape(s) { return String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 function renderDecisionTrace(payload) {
+  lastDecisionTracePayload = payload ?? null;
   const entries = (payload && payload.entries) || [];
   analyzeMeta.textContent = entries.length
     ? `${entries.length} on-ball decisions, newest first${payload.captureEnabled ? "" : " — capture OFF"}`
