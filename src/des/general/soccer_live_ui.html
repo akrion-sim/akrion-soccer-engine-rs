@@ -4053,27 +4053,45 @@ function soccerLivePostApiEnabled(resource = "api") {
   if (resource === "input" || resource === "assign") return ui.liveInputPostEnabled !== false;
   return true;
 }
+// Match the server's sanitizer: [a-z0-9-], max 64 chars.
+function sanitizeGameId(id) {
+  return String(id || "").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 64);
+}
+function generateGameId() {
+  const raw = (window.crypto && window.crypto.randomUUID)
+    ? window.crypto.randomUUID()
+    : "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  return sanitizeGameId(raw);
+}
+// Mint a brand-new game uuid, point the session + address bar at it, and forget
+// the old one. The server lazily creates (and seeds, from the uuid) the new match
+// on first `/api/*` contact, so this is how "New Match" becomes a genuinely fresh
+// game (new seed/kickoff) rather than an in-place reset of the current one.
+function mintNewGameId() {
+  const id = generateGameId();
+  window.__SOCCER_GAME_ID__ = id;
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("game", id);
+    window.history.replaceState(null, "", url.toString());
+  } catch (_) {}
+  return id;
+}
 function liveGameId() {
   if (window.__SOCCER_GAME_ID__) return window.__SOCCER_GAME_ID__;
   let id = "";
   try {
     const url = new URL(window.location.href);
-    id = (url.searchParams.get("game") || "").trim();
+    id = sanitizeGameId(url.searchParams.get("game"));
     if (!id) {
       // First visit: mint a game uuid and put it in the address bar so the match
       // is addressable/shareable (`/` becomes `/?game=<uuid>`). Each `/api/*` call
       // then carries it, and the server creates that game on first contact.
-      id = (window.crypto && window.crypto.randomUUID)
-        ? window.crypto.randomUUID()
-        : "g-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
-      url.searchParams.set("game", id);
-      window.history.replaceState(null, "", url.toString());
+      return mintNewGameId();
     }
   } catch (_) {
-    id = id || ("g-" + Date.now().toString(36));
+    id = id || sanitizeGameId("g-" + Date.now().toString(36));
   }
-  // Match the server's sanitizer: [a-z0-9-], max 64 chars.
-  id = id.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 64);
   window.__SOCCER_GAME_ID__ = id;
   return id;
 }
@@ -4975,7 +4993,12 @@ async function pauseAndAnalyze() {
 pauseAnalyzeButton?.addEventListener("click", () => pauseAndAnalyze().catch(e => {
   analyzeBody.innerHTML = `<div class="dtrow">Failed to load decision trace: ${dtEscape(e.message)}</div>`;
 }));
-resetMatchButton.addEventListener("click", () => resetMatch().catch(e => statusEl.textContent = e.message));
+resetMatchButton.addEventListener("click", () => {
+  // "New Match" is a genuinely new game: mint a fresh uuid (new URL + new
+  // server-side seed/kickoff), then reset the UI onto it.
+  mintNewGameId();
+  resetMatch().catch(e => statusEl.textContent = e.message);
+});
 async function postServerControl(path, label) {
   const response = await postJson(path, {});
   const pid = response?.pid != null ? ` (pid ${response.pid})` : "";
