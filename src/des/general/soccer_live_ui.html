@@ -4050,9 +4050,194 @@ function liveFetchOptions(options = {}) {
 async function fetchLive(path, options) {
   return fetch(liveApiPath(path), liveFetchOptions(options));
 }
+// ---------------------------------------------------------------------------
+// Live WebSocket transport (optional, additive). The HTTP request/response path
+// remains fully functional and is the fallback for everything. When the socket
+// is open the server elects exactly ONE connection per game as the "driver":
+// it sends step RPCs over the socket (client pull) and the server pushes the
+// resulting frames to every other connection (server push), so spectators stop
+// re-stepping the shared session over HTTP. Backend: des-rs `GET /api/ws`.
+// ---------------------------------------------------------------------------
+const LIVE_WS_RPC_TIMEOUT_MS = 8000;
+const LIVE_WS_RECONNECT_MIN_MS = 750;
+const LIVE_WS_RECONNECT_MAX_MS = 15000;
+let liveSocket = null;
+let liveSocketIsDriver = false;
+let liveSocketReconnectTimer = null;
+let liveSocketReconnectAttempt = 0;
+let liveRpcSeq = 0;
+const liveRpcPending = new Map();
+
+function liveSocketEnabled() {
+  if (typeof WebSocket === "undefined") return false;
+  if (soccerPlaybackAssetMode()) return false;
+  return true;
+}
+function wsIsOpen() {
+  return !!liveSocket && liveSocket.readyState === WebSocket.OPEN;
+}
+// We are a follower (render pushes, do not drive) when the socket is open but
+// the driver slot is held by another connection.
+function liveSocketShouldFollow() {
+  return wsIsOpen() && !liveSocketIsDriver;
+}
+// Only the driver routes its high-frequency traffic (step/input/assign) over the
+// socket; followers and every other resource keep using HTTP.
+function liveSocketCarries(resource) {
+  if (!wsIsOpen() || !liveSocketIsDriver) return false;
+  return resource === "step" || resource === "input" || resource === "assign";
+}
+// The path handed to the server's request bridge is NOT ingress-mounted (unlike
+// the browser fetch URL), so build it without the mount prefix but with ?game=.
+function liveApiPathBare(path) {
+  const raw = String(path || "");
+  const id = liveGameId();
+  if (!id) return raw;
+  const sep = raw.indexOf("?") === -1 ? "?" : "&";
+  return raw + sep + "game=" + encodeURIComponent(id);
+}
+function liveSocketUrl() {
+  const loc = window.location;
+  const proto = loc.protocol === "https:" ? "wss:" : "ws:";
+  const path = livePathWithMount("/api/ws");
+  const id = liveGameId();
+  const query = id ? "?game=" + encodeURIComponent(id) : "";
+  return `${proto}//${loc.host}${path}${query}`;
+}
+// Send a request over the socket and resolve with the parsed reply body. Rejects
+// with {__wsClosed} when the socket is unusable (caller may safely fall back to
+// HTTP), or {__wsStatus}/{__wsTimeout} once the request has been sent (caller
+// must NOT retry a step over HTTP, to avoid double-advancing the sim).
+function wsRpc(method, path, body) {
+  return new Promise((resolve, reject) => {
+    if (!wsIsOpen()) { reject({__wsClosed: true}); return; }
+    const id = ++liveRpcSeq;
+    const timer = setTimeout(() => {
+      if (liveRpcPending.has(id)) {
+        liveRpcPending.delete(id);
+        reject({__wsTimeout: true, message: "ws rpc timeout"});
+      }
+    }, LIVE_WS_RPC_TIMEOUT_MS);
+    liveRpcPending.set(id, {resolve, reject, timer});
+    try {
+      liveSocket.send(JSON.stringify({
+        t: "rpc", id, method, path, body: JSON.stringify(body == null ? {} : body)
+      }));
+    } catch (err) {
+      liveRpcPending.delete(id);
+      clearTimeout(timer);
+      reject({__wsClosed: true});
+    }
+  });
+}
+function rejectAllPendingRpcs() {
+  for (const [, pending] of liveRpcPending) {
+    clearTimeout(pending.timer);
+    pending.reject({__wsClosed: true});
+  }
+  liveRpcPending.clear();
+}
+// Render a server-pushed frame through the exact same application path a local
+// step uses, by injecting it into stepOnce.
+function applyPushedFrame(pushBody) {
+  if (!pushBody) return;
+  let response;
+  try { response = JSON.parse(pushBody); } catch (_) { return; }
+  stepOnce({injectedResponse: response}).catch(e => { statusEl.textContent = e.message; });
+}
+function setLiveSocketRole(isDriver) {
+  const changed = liveSocketIsDriver !== isDriver;
+  liveSocketIsDriver = isDriver;
+  if (changed) {
+    statusEl.textContent = isDriver
+      ? "live socket: driver (pull)"
+      : "live socket: follower (server push)";
+  }
+}
+function handleLiveSocketMessage(ev) {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch (_) { return; }
+  switch (msg && msg.t) {
+    case "hello":
+      setLiveSocketRole(!!msg.driver);
+      break;
+    case "reply": {
+      const pending = liveRpcPending.get(msg.id);
+      if (!pending) break;
+      liveRpcPending.delete(msg.id);
+      clearTimeout(pending.timer);
+      const status = Number(msg.status || 0);
+      if (status >= 200 && status < 400) {
+        let parsed = {};
+        try { parsed = msg.body ? JSON.parse(msg.body) : {}; } catch (_) { parsed = {}; }
+        pending.resolve(parsed);
+      } else {
+        pending.reject({__wsStatus: status, message: msg.body || ("ws status " + status)});
+      }
+      break;
+    }
+    case "push":
+      applyPushedFrame(msg.body);
+      break;
+    case "driver-open":
+      // The driver left; bid to take over so the match keeps advancing.
+      if (!liveSocketIsDriver && wsIsOpen()) {
+        try { liveSocket.send(JSON.stringify({t: "claim"})); } catch (_) {}
+      }
+      break;
+    default:
+      break;
+  }
+}
+function scheduleLiveSocketReconnect() {
+  if (liveSocketReconnectTimer != null) return;
+  if (!liveSocketEnabled()) return;
+  const delay = Math.min(
+    LIVE_WS_RECONNECT_MAX_MS,
+    LIVE_WS_RECONNECT_MIN_MS * Math.pow(2, Math.min(liveSocketReconnectAttempt, 5))
+  );
+  liveSocketReconnectAttempt += 1;
+  liveSocketReconnectTimer = setTimeout(() => {
+    liveSocketReconnectTimer = null;
+    connectLiveSocket();
+  }, delay);
+}
+function connectLiveSocket() {
+  if (!liveSocketEnabled()) return;
+  if (liveSocket && (liveSocket.readyState === WebSocket.CONNECTING || liveSocket.readyState === WebSocket.OPEN)) {
+    return;
+  }
+  let url;
+  try { url = liveSocketUrl(); } catch (_) { scheduleLiveSocketReconnect(); return; }
+  let sock;
+  try { sock = new WebSocket(url); } catch (_) { scheduleLiveSocketReconnect(); return; }
+  liveSocket = sock;
+  sock.onopen = () => { liveSocketReconnectAttempt = 0; };
+  sock.onmessage = handleLiveSocketMessage;
+  sock.onerror = () => { /* onclose handles teardown + reconnect */ };
+  sock.onclose = () => {
+    if (liveSocket === sock) liveSocket = null;
+    liveSocketIsDriver = false;
+    rejectAllPendingRpcs();
+    scheduleLiveSocketReconnect();
+  };
+}
 async function postSoccerJson(path, body, resource = "api") {
   if (!soccerLivePostApiEnabled(resource)) {
     throw new Error("playback mode uses GET-only assets");
+  }
+  // Prefer the WebSocket for the driver's high-frequency traffic when it is open.
+  // Any socket-level failure transparently falls back to the HTTP request below,
+  // so the HTTP path is always available (both transports are kept).
+  if (liveSocketCarries(resource)) {
+    try {
+      return await wsRpc("POST", liveApiPathBare(path), body);
+    } catch (err) {
+      if (!(err && err.__wsClosed)) {
+        throw (err && err.message) ? new Error(err.message) : err;
+      }
+      // Socket dropped before the request was sent — fall through to HTTP.
+    }
   }
   const res = await fetch(soccerApiUrl(path), liveFetchOptions({
     method: "POST",
@@ -4588,16 +4773,26 @@ async function bootLivePage() {
   syncLiveRouteLinks();
   if (freshMatchRequestedOnLoad()) {
     await resetMatch({freshLoad: true, clearFreshUrl: true});
-    return;
+  } else {
+    await loadState();
   }
-  await loadState();
+  // Open the live push socket once initial state exists; on any failure the page
+  // simply keeps driving over HTTP.
+  connectLiveSocket();
 }
 async function stepOnce(options = {}) {
   if (!state) return;
   if (stepping || resetting) return;
+  // When another tab holds the server-elected driver slot this tab is a
+  // follower: it does not advance the sim, it renders the frames the server
+  // pushes (delivered here as options.injectedResponse). A manual single-step
+  // still proceeds (it falls back to HTTP, which is not driver-gated).
+  if (!options.injectedResponse && !options.manual && liveSocketShouldFollow()) return;
   stepping = true;
   try {
-    if (state.done) {
+    // A pushed frame already reflects the driver's authoritative state (including
+    // its own episode resets), so do not run the local auto-reset for it.
+    if (state.done && !options.injectedResponse) {
       if (running && autoEpisodeEnabled.checked) {
         await resetMatch({auto: true, keepRunning: true});
       } else {
@@ -4605,24 +4800,31 @@ async function stepOnce(options = {}) {
       }
       return;
     }
-    queueMotionInputsForPressedControllers();
-    queueGamepadInputs();
-    const inputs = drainQueuedInputsForDispatch();
     const beforeAssignments = assignmentKey(state.controllerAssignments);
     const previousPolicyHistory = state.policyHistory || null;
     const previousHistoryRecords = Number(state.policyAutosave?.historyRecords ?? 0);
-    const ticksThisPulse = options.manual ? 1 : effectiveSimTicksPerPulse();
+    let inputs = [];
     let response;
-    try {
-      response = await postSoccerJson("/api/step", {
-        ticks: ticksThisPulse,
-        recordEveryTicks: Math.max(1, ticksThisPulse),
-        inputs
-      }, "step");
-    } catch (err) {
-      requeueInputFrames(inputs);
-      scheduleInputRetry();
-      throw err;
+    if (options.injectedResponse) {
+      // Server-pushed frame: skip local input draining and stepping, and render
+      // it directly through the shared application path below.
+      response = options.injectedResponse;
+    } else {
+      queueMotionInputsForPressedControllers();
+      queueGamepadInputs();
+      inputs = drainQueuedInputsForDispatch();
+      const ticksThisPulse = options.manual ? 1 : effectiveSimTicksPerPulse();
+      try {
+        response = await postSoccerJson("/api/step", {
+          ticks: ticksThisPulse,
+          recordEveryTicks: Math.max(1, ticksThisPulse),
+          inputs
+        }, "step");
+      } catch (err) {
+        requeueInputFrames(inputs);
+        scheduleInputRetry();
+        throw err;
+      }
     }
     applyInputAck(response, inputs.length);
     // Guard against a rewinding view: ignore a step response whose tick is behind
@@ -4632,7 +4834,10 @@ async function stepOnce(options = {}) {
     // backward tick here is spurious and must not re-render older frames.
     const incomingTick = Number(response.frame?.tick ?? 0);
     const currentTick = Number(state.frame?.tick ?? 0);
-    if (incomingTick + 0.5 < currentTick) {
+    // A pushed frame may legitimately jump backward when the driver starts a new
+    // episode; pull frames arrive in order, so the rewind guard only applies to
+    // our own HTTP/driver steps.
+    if (!options.injectedResponse && incomingTick + 0.5 < currentTick) {
       return;
     }
     state = {
