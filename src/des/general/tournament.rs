@@ -824,6 +824,285 @@ impl Tournament {
         // runner only owes a well-formed score here.
         runner.play(ctx, home, away)
     }
+
+    /// Like [`run`], but plays INDEPENDENT fixtures on up to `threads` OS threads:
+    /// the group stage runs all groups concurrently (groups share no teams, so each
+    /// team's within-group brain-carry stays sequential inside its own group), and
+    /// each knockout round plays its matches concurrently with a barrier between
+    /// rounds (every team appears in exactly one match per round). Every match seed
+    /// and the shootout RNG call order are identical to [`run`], and results are
+    /// committed serially in fixture order, so the crowned champion is exactly what
+    /// the serial path produces — just faster. `threads <= 1` is serial.
+    pub fn run_parallel<R: TournamentMatchRunner + Clone + Send>(
+        mut self,
+        runner: R,
+        threads: usize,
+    ) -> Result<TournamentReport, String> {
+        let threads = threads.max(1);
+        let mut rng = TournamentRng::new(self.seed);
+        let mut reports: Vec<MatchReport> = Vec::new();
+        let mut head_to_head: HashMap<(usize, usize), (u32, u32)> = HashMap::new();
+
+        // ---- Group stage (parallel ACROSS groups) -----------------------
+        let groups = self.group_assignment();
+        let mut group_ctxs: Vec<Vec<TournamentMatchContext>> = Vec::with_capacity(groups.len());
+        let mut group_jobs: Vec<GroupJob> = Vec::with_capacity(groups.len());
+        for (group_index, group) in groups.iter().enumerate() {
+            let legs = self.round_robin(group);
+            let mut ctxs = Vec::new();
+            for (round_index, fixtures) in legs.iter().enumerate() {
+                for (match_index, &(home_id, away_id)) in fixtures.iter().enumerate() {
+                    // Same match_index encoding as `run` so the seed is identical.
+                    ctxs.push(self.match_context(
+                        TournamentStage::Group,
+                        round_index,
+                        group_index * 1000 + match_index,
+                        home_id,
+                        away_id,
+                    ));
+                }
+            }
+            let brains = group
+                .iter()
+                .map(|&id| (id, self.teams[self.team_index(id)].brain.clone()))
+                .collect::<HashMap<usize, TeamBrain>>();
+            group_jobs.push(GroupJob {
+                ctxs: ctxs.clone(),
+                brains,
+            });
+            group_ctxs.push(ctxs);
+        }
+
+        let group_runner = runner.clone();
+        let group_outcomes = parallel_map(group_jobs, threads, move |job| {
+            // Play this group's fixtures sequentially, carrying brains locally.
+            let mut brains = job.brains;
+            let mut outcomes = Vec::with_capacity(job.ctxs.len());
+            for ctx in &job.ctxs {
+                let mut runner = group_runner.clone();
+                let home = brains.get(&ctx.home_id).cloned().unwrap_or_default();
+                let away = brains.get(&ctx.away_id).cloned().unwrap_or_default();
+                let outcome = runner.play(ctx, &home, &away)?;
+                brains.insert(ctx.home_id, outcome.home_brain.clone());
+                brains.insert(ctx.away_id, outcome.away_brain.clone());
+                outcomes.push(outcome);
+            }
+            Ok::<Vec<MatchOutcome>, String>(outcomes)
+        });
+
+        for (ctxs, outcomes) in group_ctxs.into_iter().zip(group_outcomes) {
+            for (ctx, outcome) in ctxs.into_iter().zip(outcomes?) {
+                self.commit_match(&ctx, outcome, None, Some(&mut head_to_head), &mut reports);
+            }
+        }
+
+        // ---- Group tables + advancers (identical to `run`) --------------
+        let mut group_tables = Vec::with_capacity(groups.len());
+        let mut group_winners: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut group_runners_up: Vec<usize> = Vec::with_capacity(groups.len());
+        for (group_index, group) in groups.iter().enumerate() {
+            let ranked = self.rank_group(group, &head_to_head);
+            let advancers = self.format.advancers_per_group;
+            let standings = ranked
+                .iter()
+                .enumerate()
+                .map(|(position, &team_id)| {
+                    let team = &self.teams[self.team_index(team_id)];
+                    GroupStanding {
+                        team_id,
+                        name: team.name.clone(),
+                        record: team.record,
+                        advanced: position < advancers,
+                    }
+                })
+                .collect();
+            group_tables.push(GroupTable {
+                group_index,
+                standings,
+            });
+            group_winners.push(ranked[0]);
+            if advancers >= 2 {
+                group_runners_up.push(ranked[1]);
+            }
+            for &extra in ranked.iter().take(advancers).skip(2) {
+                group_runners_up.push(extra);
+            }
+        }
+
+        // ---- Knockout bracket seeding (World-Cup crossing) --------------
+        let mut bracket: Vec<usize> = Vec::with_capacity(self.format.knockout_team_count());
+        if group_runners_up.len() == group_winners.len() && group_winners.len() % 2 == 0 {
+            for i in 0..group_winners.len() {
+                bracket.push(group_winners[i]);
+                bracket.push(group_runners_up[i ^ 1]);
+            }
+        } else {
+            for i in 0..group_winners.len() {
+                bracket.push(group_winners[i]);
+                if let Some(&runner_up) = group_runners_up.get(i) {
+                    bracket.push(runner_up);
+                }
+            }
+        }
+
+        // ---- Single-elimination knockout (parallel WITHIN each round) ---
+        let mut semifinal_losers: Vec<usize> = Vec::new();
+        let mut round_index = 0usize;
+        let mut current = bracket;
+        while current.len() > 1 {
+            let remaining = current.len();
+            let stage = TournamentStage::Knockout { remaining };
+            let round_ctxs: Vec<TournamentMatchContext> = current
+                .chunks(2)
+                .enumerate()
+                .map(|(match_index, pair)| {
+                    self.match_context(stage, round_index, match_index, pair[0], pair[1])
+                })
+                .collect();
+            let jobs: Vec<FixtureJob> = round_ctxs
+                .iter()
+                .map(|ctx| FixtureJob {
+                    home: self.teams[self.team_index(ctx.home_id)].brain.clone(),
+                    away: self.teams[self.team_index(ctx.away_id)].brain.clone(),
+                    ctx: ctx.clone(),
+                })
+                .collect();
+            let round_runner = runner.clone();
+            let outcomes = parallel_map(jobs, threads, move |job| {
+                let mut runner = round_runner.clone();
+                runner.play(&job.ctx, &job.home, &job.away)
+            });
+            // Commit serially in fixture order so records, reports, and the shootout
+            // RNG advance exactly as in the serial path.
+            let mut winners = Vec::with_capacity(remaining / 2);
+            let mut losers = Vec::with_capacity(remaining / 2);
+            for (ctx, outcome) in round_ctxs.into_iter().zip(outcomes) {
+                let outcome = outcome?;
+                let (winner, shootout) = self.knockout_winner(&ctx, &outcome, &mut rng);
+                let loser = if winner == ctx.home_id {
+                    ctx.away_id
+                } else {
+                    ctx.home_id
+                };
+                self.commit_match(&ctx, outcome, shootout, None, &mut reports);
+                winners.push(winner);
+                losers.push(loser);
+            }
+            if remaining == 4 {
+                semifinal_losers = losers;
+            }
+            current = winners;
+            round_index += 1;
+        }
+        let champion_id = *current
+            .first()
+            .ok_or_else(|| "knockout produced no champion".to_string())?;
+
+        let runner_up_id = reports
+            .iter()
+            .rev()
+            .find(|report| matches!(report.stage, TournamentStage::Knockout { remaining: 2 }))
+            .and_then(|final_report| {
+                if final_report.home_id == champion_id {
+                    Some(final_report.away_id)
+                } else {
+                    Some(final_report.home_id)
+                }
+            })
+            .unwrap_or(champion_id);
+
+        // ---- Optional third-place play-off (single match) ---------------
+        let mut third_place_id = None;
+        if self.format.third_place_match && semifinal_losers.len() == 2 {
+            let (home_id, away_id) = (semifinal_losers[0], semifinal_losers[1]);
+            let ctx =
+                self.match_context(TournamentStage::ThirdPlace, round_index, 0, home_id, away_id);
+            let mut runner = runner.clone();
+            let outcome = runner.play(
+                &ctx,
+                &self.teams[self.team_index(home_id)].brain.clone(),
+                &self.teams[self.team_index(away_id)].brain.clone(),
+            )?;
+            let (winner, shootout) = self.knockout_winner(&ctx, &outcome, &mut rng);
+            self.commit_match(&ctx, outcome, shootout, None, &mut reports);
+            third_place_id = Some(winner);
+        }
+
+        Ok(TournamentReport {
+            format: self.format,
+            learning_mode: self.mode,
+            group_tables,
+            matches: reports,
+            champion_id,
+            runner_up_id,
+            third_place_id,
+            teams: self.teams,
+        })
+    }
+}
+
+/// A group-stage work unit: the group's ordered match contexts plus the initial
+/// brains of its teams. Played sequentially inside one worker (brain-carry), but
+/// groups run concurrently since they share no teams.
+struct GroupJob {
+    ctxs: Vec<TournamentMatchContext>,
+    brains: HashMap<usize, TeamBrain>,
+}
+
+/// A single independent knockout fixture: context + the two entrants' brains.
+struct FixtureJob {
+    ctx: TournamentMatchContext,
+    home: TeamBrain,
+    away: TeamBrain,
+}
+
+/// Map `worker` over `jobs` on up to `threads` scoped OS threads, returning results
+/// in input order. `threads <= 1` (or ≤1 job) runs inline. Jobs are round-robin
+/// assigned to balance uneven workloads (e.g. differing group sizes). Each worker
+/// thread owns its own clone of `worker` (and thus its own match runner), so no
+/// `Sync` bound is needed on the runner — only `Clone + Send`.
+fn parallel_map<J, U, W>(jobs: Vec<J>, threads: usize, worker: W) -> Vec<U>
+where
+    J: Send,
+    U: Send,
+    W: Fn(J) -> U + Clone + Send,
+{
+    let n = jobs.len();
+    let threads = threads.max(1).min(n.max(1));
+    if threads <= 1 || n <= 1 {
+        return jobs.into_iter().map(|job| worker(job)).collect();
+    }
+    let mut buckets: Vec<Vec<(usize, J)>> = (0..threads).map(|_| Vec::new()).collect();
+    for (index, job) in jobs.into_iter().enumerate() {
+        buckets[index % threads].push((index, job));
+    }
+    let collected: Vec<Vec<(usize, U)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                let worker = worker.clone();
+                scope.spawn(move || {
+                    bucket
+                        .into_iter()
+                        .map(|(index, job)| (index, worker(job)))
+                        .collect::<Vec<(usize, U)>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("tournament worker thread panicked"))
+            .collect()
+    });
+    let mut out: Vec<Option<U>> = (0..n).map(|_| None).collect();
+    for bucket in collected {
+        for (index, value) in bucket {
+            out[index] = Some(value);
+        }
+    }
+    out.into_iter()
+        .map(|value| value.expect("every job index filled"))
+        .collect()
 }
 
 /// Stage discriminant folded into each match seed so the same pairing in
@@ -872,6 +1151,7 @@ fn head_to_head_result_points(scored: u32, conceded: u32) -> u32 {
 /// the team seed, with a seeded jitter so upsets happen. It performs no real
 /// simulation and returns brains unchanged — ideal for exercising the bracket,
 /// standings, tiebreakers, and champion logic deterministically.
+#[derive(Clone)]
 pub struct StrengthMatchRunner {
     strengths: HashMap<usize, f64>,
 }
@@ -983,6 +1263,7 @@ impl Default for EngineMatchRunnerConfig {
 /// brain on its side (frozen per the learning flags), plays to the final whistle
 /// with both brains learning as configured, then extracts the score and the
 /// updated brains so the tournament carries learning forward.
+#[derive(Clone)]
 pub struct EngineMatchRunner {
     config: EngineMatchRunnerConfig,
 }
@@ -1183,6 +1464,51 @@ mod tests {
             TournamentLearningMode::FrozenOpponent.per_match(),
             (true, false)
         );
+    }
+
+    #[test]
+    fn parallel_run_is_byte_identical_to_serial() {
+        // The parallel bracket must produce EXACTLY the serial result — same champion,
+        // runner-up, third place, and the full match log in the same order — because
+        // match seeds and the shootout RNG order are preserved. Checked across seeds
+        // on the real 128-team format with 8 worker threads.
+        let key = |report: &TournamentReport| {
+            report
+                .matches
+                .iter()
+                .map(|m| (m.stage, m.home_id, m.away_id, m.home_goals, m.away_goals, m.shootout_winner))
+                .collect::<Vec<_>>()
+        };
+        for seed in [1u32, 7, 2026, 99_999] {
+            let teams = fresh_teams(128, seed);
+            let serial = {
+                let tournament = Tournament::new(
+                    teams.clone(),
+                    TournamentFormat::default(),
+                    TournamentLearningMode::BiLearning,
+                    seed,
+                )
+                .unwrap();
+                let mut runner = StrengthMatchRunner::from_teams(&teams);
+                tournament.run(&mut runner).unwrap()
+            };
+            let parallel = {
+                let tournament = Tournament::new(
+                    teams.clone(),
+                    TournamentFormat::default(),
+                    TournamentLearningMode::BiLearning,
+                    seed,
+                )
+                .unwrap();
+                let runner = StrengthMatchRunner::from_teams(&teams);
+                tournament.run_parallel(runner, 8).unwrap()
+            };
+            assert_eq!(serial.champion_id, parallel.champion_id, "champion seed={seed}");
+            assert_eq!(serial.runner_up_id, parallel.runner_up_id, "runner-up seed={seed}");
+            assert_eq!(serial.third_place_id, parallel.third_place_id, "third seed={seed}");
+            assert_eq!(serial.match_count(), parallel.match_count(), "count seed={seed}");
+            assert_eq!(key(&serial), key(&parallel), "full match log seed={seed}");
+        }
     }
 
     #[test]

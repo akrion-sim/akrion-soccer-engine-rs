@@ -1,0 +1,190 @@
+# Nightly 128-team learning tournament.
+#
+# Runs `main_soccer_tournament_run` once per night: seeds the entrant field from
+# the latest active Postgres policy, plays the full World-Cup-style bracket with
+# the real engine (neural-authoritative), and promotes the champion back as the
+# new active policy version — so each night builds on the last.
+#
+# Scheduling contract (the "2am → finish by 7am" the design called for):
+#   * schedule "0 2 * * *" + spec.timeZone (k8s CronJobs are UTC unless timeZone
+#     is set; 2am LOCAL requires it).
+#   * concurrencyPolicy: Forbid — never overlap two tournaments.
+#   * activeDeadlineSeconds: 18000 (5h) — HARD 7am stop; the Job is killed if it
+#     overruns, so a slow/stuck run can never bleed into the day.
+#
+# Runtime budget: the bracket runs INDEPENDENT fixtures in parallel on
+# SOCCER_TOURNAMENT_THREADS worker threads (all 32 groups concurrently; each
+# knockout round's matches concurrently — barrier between rounds). Results are
+# byte-identical to a serial run regardless of thread count (verified by the
+# parallel_run_is_byte_identical_to_serial test). With T=8 the 256-match World-Cup
+# format's critical path is ~35 "match-times" (group stage ceil(32/8)*6 ≈ 24 +
+# knockout ≈ 11). MEASURED neural-on throughput is ~137 engine-ticks/sec (~7x
+# slower than bare Q — critic training is the cost). At dt 0.2, T=8:
+#   match_seconds  ticks/match  wall/match  ~35 match-times (T=8)
+#      3600 (60m)    18000        ~131s       ~1.3h   <- default, big margin
+#      5400 (90m)    27000        ~197s       ~1.9h   <- full match, still fits
+# Raise SOCCER_TOURNAMENT_THREADS (and the CPU limit) to shrink this further; T=16
+# roughly halves the group-stage critical path. activeDeadlineSeconds hard-kills an
+# overrun (losing the champion promotion), so keep margin and watch the
+# `tournament_complete ... elapsed_secs=` log; node throughput may differ from the
+# dev measurement above. Cross-POD fan-out (claiming fixtures across machines) is a
+# further follow-up needing the per-fixture/lease tournament schema — not required
+# while a single multi-core node finishes comfortably inside the window.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dd-soccer-tournament-nightly
+  namespace: default
+  labels:
+    app: dd-soccer-tournament-nightly
+    app.kubernetes.io/name: dd-soccer-tournament-nightly
+    app.kubernetes.io/part-of: des-soccer-learning
+spec:
+  schedule: "0 2 * * *"
+  timeZone: America/Chicago
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Hard 2am–7am stop (5h). Includes build time; the warm hostPath cache keeps
+      # the incremental build to seconds after the first cold run.
+      activeDeadlineSeconds: 18000
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: dd-soccer-tournament-nightly
+            app.kubernetes.io/name: dd-soccer-tournament-nightly
+            app.kubernetes.io/part-of: des-soccer-learning
+        spec:
+          serviceAccountName: dd-remote-rest-api
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: soccer-tournament
+              image: docker.io/library/rust:1.90-bookworm
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+              args:
+                - |
+                  set -euo pipefail
+                  export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+                  run_prefix="${SOCCER_RUN_ID_PREFIX:-codex-soccer-tournament-nightly}"
+                  # `main_soccer_tournament_run` lives in soccer-sim-game-engine.rs, which
+                  # depends on discrete-event-system.rs via a `../discrete-event-system.rs`
+                  # path dependency — so BOTH repos must be checked out as siblings.
+                  soccer_repo="${SOCCER_SOURCE_REPO:-https://github.com/ORESoftware/soccer-sim-game-engine.rs.git}"
+                  engine_repo="${SOCCER_ENGINE_SOURCE_REPO:-https://github.com/ORESoftware/discrete-event-system.rs.git}"
+                  source_ref="${SOCCER_SOURCE_REF:-main}"
+                  engine_ref="${SOCCER_ENGINE_SOURCE_REF:-main}"
+                  base="/tmp/${run_prefix}-src"
+                  soccer="${base}/soccer-sim-game-engine.rs"
+                  engine="${base}/discrete-event-system.rs"
+                  target="/tmp/${run_prefix}-target"
+                  export CARGO_TARGET_DIR="${target}"
+
+                  checkout() {
+                    repo="$1"; ref="$2"; dir="$3"
+                    if [ -d "${dir}/.git" ]; then
+                      echo "checkout_mode=fetch dir=${dir} ref=${ref}"
+                      git -C "${dir}" fetch --depth 1 origin "${ref}"
+                      git -C "${dir}" checkout --force FETCH_HEAD
+                    else
+                      echo "checkout_mode=clone dir=${dir} ref=${ref}"
+                      rm -rf "${dir}"
+                      git clone --depth 1 --branch "${ref}" "${repo}" "${dir}"
+                    fi
+                  }
+
+                  mkdir -p "${base}"
+                  checkout "${engine_repo}" "${engine_ref}" "${engine}"
+                  checkout "${soccer_repo}" "${source_ref}" "${soccer}"
+
+                  cd "${soccer}"
+                  echo "soccer_commit=$(git rev-parse HEAD) engine_commit=$(git -C "${engine}" rev-parse HEAD)"
+                  echo "tournament_build_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                  /usr/local/cargo/bin/cargo build --release --bin main_soccer_tournament_run
+
+                  export SOCCER_RUN_ID="${run_prefix}-$(date -u +%Y%m%dT%H%M%SZ)"
+                  echo "tournament_run_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) run_id=${SOCCER_RUN_ID}"
+                  exec "${target}/release/main_soccer_tournament_run"
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: CARGO_HOME
+                  value: /tmp/cargo
+                - name: CARGO_BUILD_JOBS
+                  value: "4"
+                - name: CARGO_NET_RETRY
+                  value: "5"
+                - name: RUST_BACKTRACE
+                  value: "1"
+                - name: SOCCER_SOURCE_REPO
+                  value: https://github.com/ORESoftware/soccer-sim-game-engine.rs.git
+                - name: SOCCER_SOURCE_REF
+                  value: main
+                - name: SOCCER_ENGINE_SOURCE_REPO
+                  value: https://github.com/ORESoftware/discrete-event-system.rs.git
+                - name: SOCCER_ENGINE_SOURCE_REF
+                  value: main
+                - name: SOCCER_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: dd-remote-rest-api-secrets
+                      key: RDS_DATABASE_URL
+                - name: SOCCER_EXPERIMENT_SLUG
+                  value: soccer-nightly-tournament
+                # 60-min matches → ~1.3h at T=8 (see the budget table in the header).
+                - name: SOCCER_TOURNAMENT_MATCH_SECONDS
+                  value: "3600"
+                # Parallel workers — keep == the CPU limit below. Each worker runs one
+                # full SoccerMatch at a time.
+                - name: SOCCER_TOURNAMENT_THREADS
+                  value: "8"
+                - name: SOCCER_TOURNAMENT_LEARNING_MODE
+                  value: bilearning
+                - name: SOCCER_TOURNAMENT_SEED_FRACTION
+                  value: "0.5"
+                - name: SOCCER_TOURNAMENT_PROMOTE
+                  value: "true"
+                - name: SOCCER_TOURNAMENT_SEED
+                  value: "20260613"
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: 8Gi
+                limits:
+                  # Keep cpu == SOCCER_TOURNAMENT_THREADS (8). The tournament holds 128
+                  # neural brains + up to THREADS concurrent live matches — still far
+                  # below the continuous learner's Q-table bloat, so 32Gi is ample and
+                  # stays well under node RAM.
+                  cpu: "8"
+                  memory: 32Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            # Share the build cache with the continuous learner (same node-local
+            # hostPath) so the incremental build is seconds, not a ~5min cold rebuild.
+            - name: tmp
+              hostPath:
+                path: /var/cache/dd-soccer-learning
+                type: DirectoryOrCreate

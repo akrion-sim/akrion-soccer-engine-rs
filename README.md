@@ -51,7 +51,7 @@ or unset, is **off**.
 | `DD_SOCCER_DISABLE_SPACING_NUDGE` | Disable the territorial-spacing nudge. |
 | `DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP` | Disable the defensive line push-up. |
 | `DD_SOCCER_DISABLE_FORMATION_STAGGER` | Disable formation staggering. |
-| `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` | Use the internal simplex (not Clarabel) for the formation LP. |
+| `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` | Run the exact per-tick formation solve (Clarabel interior-point). **Default OFF**: the realtime tick skips the solve and uses a fast heuristic-anchor fallback. (Name is a fossil — the enabled solver is Clarabel/IPM, not a simplex.) |
 | `SOCCER_LP_DEBUG` / `SOCCER_SHOW_LP_BOUND` / `SOCCER_GOAL_DEBUG` | Extra LP / goal diagnostics. |
 
 ### Learning / Postgres / artifacts

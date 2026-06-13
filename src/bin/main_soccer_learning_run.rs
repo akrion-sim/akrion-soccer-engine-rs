@@ -3513,11 +3513,11 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES"),
-            Some("5")
+            Some("1")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES"),
-            Some("5")
+            Some("1")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_POSTGRES_ASYNC_BATCH_QUEUE"),
@@ -3560,10 +3560,10 @@ mod tests {
             Some("false")
         );
         assert_continuous_manifest_contains("key: RDS_DATABASE_URL");
-        assert_continuous_manifest_contains("memory: 32Gi");
-        assert_continuous_manifest_contains("memory: 128Gi");
-        assert_continuous_manifest_contains("cpu: \"4\"");
-        assert_continuous_manifest_contains("cpu: \"10\"");
+        assert_continuous_manifest_contains("memory: 16Gi");
+        assert_continuous_manifest_contains("memory: 64Gi");
+        assert_continuous_manifest_contains("cpu: \"2\"");
+        assert_continuous_manifest_contains("cpu: \"8\"");
     }
 
     #[test]
@@ -3571,7 +3571,7 @@ mod tests {
         assert_eq!(continuous_manifest_env_value("SOCCER_GAMES"), Some("100"));
         assert_eq!(
             continuous_manifest_env_value("SOCCER_PARALLEL_GAMES"),
-            Some("5")
+            Some("1")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_DT_SECONDS"),
@@ -3585,9 +3585,12 @@ mod tests {
             continuous_manifest_env_value("SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES"),
             continuous_manifest_env_value("SOCCER_PARALLEL_GAMES")
         );
+        // Evolution interval is intentionally decoupled from the parallel wave
+        // (the hardened manifest runs parallel=1 but evolves every 5 games — see
+        // the `require_value SOCCER_EVOLUTION_INTERVAL_GAMES 5` startup preflight).
         assert_eq!(
             continuous_manifest_env_value("SOCCER_EVOLUTION_INTERVAL_GAMES"),
-            continuous_manifest_env_value("SOCCER_PARALLEL_GAMES")
+            Some("5")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_MAX_POLICY_ENTRIES_PER_TEAM"),
