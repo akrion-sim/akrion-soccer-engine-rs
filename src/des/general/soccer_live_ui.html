@@ -817,6 +817,10 @@ let stepping = false;
 // Fractional remainder so dt-scaled ticks-per-pulse average exactly real-time
 // (e.g. 1.5 ticks/pulse at 1/15s alternates 1 and 2 instead of rounding up to 2).
 let simTickCarry = 0;
+// Wall-clock timestamp of the last auto pulse, so we can advance exactly the number
+// of ticks that real time elapsed — making playback real-time regardless of dt,
+// step duration, or machine load. Reset (0) forces a single-interval first pulse.
+let lastAutoPulseAt = 0;
 let resetting = false;
 let inputFlushInFlight = false;
 let inputFlushTimer = null;
@@ -830,6 +834,10 @@ let hoverPlayerId = null;
 let inspectedPlayerId = null;
 let lastSemanticBallAction = null;
 const LIVE_STEP_INTERVAL_MS = 100;
+// Single fallback for the simulation timestep when a frame/config somehow omits it.
+// Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
+// keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
+const FALLBACK_DT_SECONDS = 1 / 15;
 const LIVE_DEFAULT_TICKS_PER_PULSE = 1;
 const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
 const LIVE_INPUT_RETRY_MIN_MS = 120;
@@ -1783,7 +1791,7 @@ function matchStepLabel(config = state?.config) {
   const cadenceTotalTicks = Math.max(0, Math.round(Number(cadence.totalTicks ?? 0)));
   const contract = cadence.defaultTenMinuteContract ? " ok" : "";
   if (clock) {
-    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? 0.1);
+    const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(clock.dtSeconds ?? config?.dtSeconds ?? FALLBACK_DT_SECONDS);
     const total = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : Number(clock.totalSeconds ?? effectiveMatchDurationSeconds(config));
     const remaining = Number(clock.remainingSeconds ?? Math.max(0, total - Number(clock.elapsedSeconds ?? 0)));
     const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : Math.max(0, Math.round(Number(clock.totalTicks ?? 0)));
@@ -1791,7 +1799,7 @@ function matchStepLabel(config = state?.config) {
     return `dt ${dt.toFixed(1)}s ${fmtClock(total)} left ${fmtClock(remaining)} ${totalTicks}t${contract}${done}`;
   }
   if (!config) return "dt 0.1s 10:00";
-  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? 0.1);
+  const dt = Number.isFinite(cadenceDt) && cadenceDt > 0 ? cadenceDt : Number(config.dtSeconds ?? FALLBACK_DT_SECONDS);
   const duration = Number.isFinite(cadenceDuration) && cadenceDuration > 0 ? cadenceDuration : effectiveMatchDurationSeconds(config);
   const totalTicks = cadenceTotalTicks > 0 ? cadenceTotalTicks : (dt > 0 ? Math.round(duration / dt) : 0);
   return `dt ${dt.toFixed(1)}s ${fmtClock(duration)} ${totalTicks}t${contract}`;
@@ -2038,7 +2046,7 @@ function vecScale(v, scale) {
 }
 function historyKinematicsFromPositions(history, dtSeconds) {
   const samples = Array.isArray(history) ? history.map(finiteVec2) : [];
-  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || 0.1));
+  const dt = Math.max(1e-6, Number(dtSeconds || state?.config?.dtSeconds || FALLBACK_DT_SECONDS));
   const last = samples.length - 1;
   const velocity = samples.length >= 2 ? vecScale(vecSub(samples[last], samples[last - 1]), 1 / dt) : null;
   if (samples.length < 3) return {samples: samples.length, velocity, acceleration: null, jerk: null};
@@ -3477,16 +3485,17 @@ function liveControllerAssigned() {
   return Array.isArray(state?.controllerAssignments) && state.controllerAssignments.length > 0;
 }
 function effectiveSimTicksPerPulse() {
-  if (liveControllerAssigned()) return 1;
   // Keep wall-clock speed independent of the sim timestep. The pulse rate is fixed
   // (~10Hz), so with a fixed tick count a smaller dt plays in slow motion (each tick
   // spans less real time). Scale ticks-per-pulse by (pulseInterval / dt) so the same
   // configured fast-forward multiplier maps to the same real-time speed at any dt:
   // e.g. 1/15s advances ~1.5x the ticks 1/10s did, restoring real-time with finer
-  // (smoother) integration. (wall-clock = ticksPerPulse * tempo, per the model below.)
+  // (smoother) integration. Applies to human-controlled play too (base = 1), so the
+  // default controller-assigned game is real-time. (wall-clock = ticksPerPulse * tempo.)
+  const base = liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
   const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
   const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
-  return clamp(Math.round(configuredSimTicksPerPulse() * dtScale), 1, 1000);
+  return clamp(Math.round(base * dtScale), 1, 1000);
 }
 // Target gap between step starts. The tempo selector scales the base pulse
 // interval (1/2x doubles it, 2x halves it); ticks-per-pulse stays the separate
@@ -3499,7 +3508,7 @@ function currentStepIntervalMs() {
 function simSpeedLabel() {
   const configured = configuredSimTicksPerPulse();
   const effective = effectiveSimTicksPerPulse();
-  const dt = Number(state?.config?.dtSeconds ?? 0.1);
+  const dt = Number(state?.config?.dtSeconds ?? FALLBACK_DT_SECONDS);
   const speed = effective * dt / (currentStepIntervalMs() / 1000);
   const speedText = speed >= 10 ? speed.toFixed(0) : speed.toFixed(1);
   const inputText = liveControllerAssigned() ? " + input" : "";
@@ -4687,17 +4696,26 @@ async function stepOnce(options = {}) {
     const previousHistoryRecords = Number(state.policyAutosave?.historyRecords ?? 0);
     let ticksThisPulse = 1;
     if (!options.manual) {
-      if (liveControllerAssigned()) {
-        ticksThisPulse = 1;
-      } else {
-        // dt-scaled to hold real-time speed, with the fractional carry so the
-        // average is exact (no slow-motion at 1/15s, no round-up overshoot).
-        const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
-        const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
-        const want = clamp(configuredSimTicksPerPulse() * dtScale, 1, 1000) + simTickCarry;
-        ticksThisPulse = Math.max(1, Math.floor(want));
-        simTickCarry = want - ticksThisPulse;
-      }
+      // Advance exactly the ticks that real wall-clock time elapsed since the last
+      // pulse (× the fast-forward multiplier), so playback is real-time at ANY dt,
+      // regardless of how long each step takes or machine load. A fixed tick count
+      // would play 1/15s in slow motion; scaling by an assumed interval still drifts
+      // when steps run long. Applies to auto AND human play (base=1 with a
+      // controller); the input frame latches across the pulse, so control stays
+      // responsive while the ~10Hz pulse/input cadence is unchanged.
+      const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      const elapsedSec = lastAutoPulseAt
+        ? Math.min(0.5, Math.max(0, (now - lastAutoPulseAt) / 1000))
+        : (LIVE_STEP_INTERVAL_MS / 1000);
+      lastAutoPulseAt = now;
+      const base = liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
+      const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
+      const want =
+        clamp(base * (playbackSpeed || 1) * elapsedSec / Math.max(1e-3, dt), 0, 4000) + simTickCarry;
+      ticksThisPulse = Math.max(1, Math.floor(want));
+      simTickCarry = Math.max(0, want - ticksThisPulse);
+    } else {
+      lastAutoPulseAt = 0; // a manual single-step breaks the wall-clock chain
     }
     let response;
     try {
