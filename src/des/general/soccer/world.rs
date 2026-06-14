@@ -144,14 +144,12 @@ pub struct SoccerMatch {
     /// `decision_trace_capture_enabled`. Powers the live UI's "Pause & Analyze"
     /// dump so a human can see exactly which state/options/action produced bad
     /// play, including why off-ball players (e.g. a striker) did or didn't attack.
-    /// Each ring is bounded to `SOCCER_DECISION_TRACE_PER_PLAYER`, so it is
-    /// negligible memory and zero work when capture is off. Never serialized into
-    /// the per-tick state frame.
+    /// Each ring holds only the last `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of a
+    /// player's DISTINCT decisions, so it is negligible memory and zero work when
+    /// capture is off. Player decisions only — the team brain is not captured
+    /// here. Never serialized into the per-tick state frame.
     pub(crate) decision_trace_capture_enabled: bool,
     pub(crate) decision_trace_by_player: BTreeMap<usize, VecDeque<LiveDecisionTraceEntry>>,
-    /// Companion ring of the team (central) brain's most recent DISTINCT tactical
-    /// decisions, on the same change-only basis.
-    pub(crate) decision_trace_brain: VecDeque<CentralBrainDecisionTrace>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -539,7 +537,6 @@ impl SoccerMatch {
             possession_swaps: VecDeque::new(),
             decision_trace_capture_enabled: false,
             decision_trace_by_player: BTreeMap::new(),
-            decision_trace_brain: VecDeque::new(),
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -3257,7 +3254,6 @@ impl SoccerMatch {
         self.decision_trace_capture_enabled = enabled;
         if !enabled {
             self.decision_trace_by_player.clear();
-            self.decision_trace_brain.clear();
         }
     }
 
@@ -3266,28 +3262,29 @@ impl SoccerMatch {
     }
 
     /// Every captured player decision (all 22 players' rings flattened), NEWEST
-    /// first (index 0 = most recent tick). Each player contributes up to
-    /// `SOCCER_DECISION_TRACE_PER_PLAYER` distinct decisions.
+    /// first (index 0 = most recent tick). Only the last
+    /// `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of distinct decisions are returned —
+    /// re-applied here so a paused match (clock frozen, no new writes pruning)
+    /// still reports only the final window.
     pub fn decision_trace_recent(&self) -> Vec<LiveDecisionTraceEntry> {
+        let cutoff = self.clock_seconds - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
         let mut all: Vec<LiveDecisionTraceEntry> = self
             .decision_trace_by_player
             .values()
-            .flat_map(|ring| ring.iter().cloned())
+            .flat_map(|ring| ring.iter())
+            .filter(|entry| entry.clock_seconds >= cutoff)
+            .cloned()
             .collect();
         all.sort_by(|a, b| b.tick.cmp(&a.tick).then(a.player_id.cmp(&b.player_id)));
         all
     }
 
-    /// The team (central) brain's recent distinct tactical decisions, NEWEST first.
-    pub fn decision_trace_brain_recent(&self) -> Vec<CentralBrainDecisionTrace> {
-        self.decision_trace_brain.iter().rev().cloned().collect()
-    }
-
     /// Append each player's last decision to that player's ring, but ONLY when the
     /// chosen action changed from their previous recorded decision (decisions
     /// repeat every tick; we keep distinct ones so the ring spans seconds). Records
-    /// ALL 22 players (on- and off-ball) plus the team brain. No-op unless capture
-    /// is enabled.
+    /// ALL 22 players (on- and off-ball). The team brain is intentionally not
+    /// captured — the trace is player decisions only. No-op unless capture is
+    /// enabled.
     fn record_decision_trace_if_enabled(&mut self) {
         if !self.decision_trace_capture_enabled {
             return;
@@ -3306,6 +3303,7 @@ impl SoccerMatch {
                     .map(|decision| build_live_decision_trace_entry(player, decision, tick, clock))
             })
             .collect();
+        let cutoff = clock - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
         for entry in entries {
             let ring = self.decision_trace_by_player.entry(entry.player_id).or_default();
             let changed = ring.back().map_or(true, |last| {
@@ -3314,22 +3312,14 @@ impl SoccerMatch {
             });
             if changed {
                 ring.push_back(entry);
-                while ring.len() > SOCCER_DECISION_TRACE_PER_PLAYER {
-                    ring.pop_front();
-                }
             }
-        }
-        if let Some(brain) = self.central_brain.last_decision.as_ref() {
-            let changed = self.decision_trace_brain.back().map_or(true, |last| {
-                last.action != brain.action
-                    || last.phase != brain.phase
-                    || last.possession_team != brain.possession_team
-            });
-            if changed {
-                self.decision_trace_brain.push_back(brain.clone());
-                while self.decision_trace_brain.len() > SOCCER_DECISION_TRACE_PER_PLAYER {
-                    self.decision_trace_brain.pop_front();
-                }
+            // Keep only the last `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of decisions
+            // (entries are appended in clock order, so the front is the oldest), with
+            // the per-player count as a hard memory-safety backstop.
+            while ring.front().is_some_and(|front| front.clock_seconds < cutoff)
+                || ring.len() > SOCCER_DECISION_TRACE_PER_PLAYER
+            {
+                ring.pop_front();
             }
         }
     }
@@ -8279,16 +8269,17 @@ impl SoccerMatch {
             SoccerSetPlayRoutineKind::GoalKickBuildOut => {
                 let left_back = defenders.first().copied().or(outlet);
                 let right_back = defenders.last().copied().or(outlet);
+                // Backs receive OUTSIDE the 18-yard line so the goal kick leaves the box (Law 16).
                 add_assignment(
                     left_back,
                     SoccerSetPlayAssignmentRole::Outlet,
-                    Vec2::new(width * 0.22, own_goal_y + dir * 18.0),
+                    Vec2::new(width * 0.22, own_goal_y + dir * 20.0),
                     0.0,
                 );
                 add_assignment(
                     right_back,
                     SoccerSetPlayAssignmentRole::Outlet,
-                    Vec2::new(width * 0.78, own_goal_y + dir * 18.0),
+                    Vec2::new(width * 0.78, own_goal_y + dir * 20.0),
                     0.0,
                 );
                 add_assignment(
@@ -8615,11 +8606,13 @@ impl SoccerMatch {
         let length = self.config.field_length_yards;
         let dir = team.attack_dir();
         let own_goal_y = team.other().goal_y(length);
+        // Outlet slots sit OUTSIDE the 18-yard line (>=20yd from the own goal line) so a
+        // goal-kick pass to any of them clears the penalty area on the first touch (Law 16).
         let outlet_slots = [
-            Vec2::new(width * 0.20, own_goal_y + dir * 18.0),
+            Vec2::new(width * 0.20, own_goal_y + dir * 20.0),
             Vec2::new(width * 0.36, own_goal_y + dir * 22.0),
             Vec2::new(width * 0.64, own_goal_y + dir * 22.0),
-            Vec2::new(width * 0.80, own_goal_y + dir * 18.0),
+            Vec2::new(width * 0.80, own_goal_y + dir * 20.0),
             Vec2::new(width * 0.34, own_goal_y + dir * 36.0),
             Vec2::new(width * 0.66, own_goal_y + dir * 36.0),
         ];
@@ -15378,6 +15371,21 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Build-up short-pass discouragement: outside the final attacking third, a
+                // sub-4yd tap is dangerous busy-work — keep the ball progressing with a longer
+                // ball. Unconditional (not pressure-gated) and lifted once we reach the final
+                // third, where short combinations near goal earn their keep.
+                let build_up_short_pass_penalty = {
+                    let in_attacking_third = (me.team.goal_y(self.field_length) - me_position.y)
+                        .abs()
+                        <= self.field_length / 3.0;
+                    if !in_attacking_third && dist < SHORT_PASS_BUILDUP_MAX_YARDS {
+                        let shortness = (1.0 - dist / SHORT_PASS_BUILDUP_MAX_YARDS).clamp(0.0, 1.0);
+                        SHORT_PASS_BUILDUP_PENALTY * shortness
+                    } else {
+                        0.0
+                    }
+                };
                 // Under a through-ball possession strategy, answer a forward/mid breaking
                 // in behind: nudge the holder to thread / loft the ball over the top to a
                 // teammate already making the run (their call for the over-the-top ball).
@@ -15396,6 +15404,7 @@ impl WorldSnapshot {
                     - reception_teammate_penalty
                     - reception_congestion_penalty
                     - pointless_short_pass_penalty
+                    - build_up_short_pass_penalty
                     + over_the_top_invite_bonus
                     + own_box_play_out_adjustment
                     + forward_open_bonus

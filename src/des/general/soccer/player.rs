@@ -1865,9 +1865,33 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
         restart_label: &str,
     ) -> Option<(SoccerAction, String)> {
+        // On a goal kick the ball must leave the penalty area with the first touch
+        // (Law 16): a pass to a teammate still inside our own box is illegal. This guard
+        // applies to both the planned set-play release and the freely-computed restart
+        // pass below — the keeper plays to an outlet that has stepped outside the area, or
+        // clears it long, rather than tapping it short to a defender in the box.
+        let goal_kick_receiver_legal = |target: Option<usize>| -> bool {
+            if restart_label != "goal-kick" {
+                return true;
+            }
+            match target {
+                None => true,
+                Some(id) => snapshot
+                    .player_position(id)
+                    .map(|pos| !snapshot.point_in_own_penalty_area(self.team, pos))
+                    .unwrap_or(true),
+            }
+        };
+
         if let Some(planned_release) = snapshot.active_set_play_release_for(self.id, restart_label)
         {
-            return Some(planned_release);
+            let release_legal = match &planned_release.0 {
+                SoccerAction::Pass { target_player, .. } => goal_kick_receiver_legal(*target_player),
+                _ => true,
+            };
+            if release_legal {
+                return Some(planned_release);
+            }
         }
 
         // Goal kick: the keeper may hold the ball up to ~7 s to let teammates reset
@@ -1900,15 +1924,22 @@ impl PlayerAgent {
         }
 
         let prefer_aerial = matches!(restart_label, "throw-in" | "corner-kick" | "goal-kick");
-        let visible_targets = if prefer_aerial {
+        let mut visible_targets = if prefer_aerial {
             snapshot.ranked_visible_aerial_pass_targets(self.id, 11)
         } else {
             snapshot.ranked_visible_pass_targets(self.id, 11)
         };
-        let target = visible_targets
+        // Drop any in-box receiver on a goal kick so the chosen outlet is outside the area.
+        visible_targets.retain(|&id| goal_kick_receiver_legal(Some(id)));
+        let mut target = visible_targets
             .first()
             .copied()
             .or_else(|| snapshot.best_pass_target(self.id));
+        // If the only remaining option is still inside our box, clear it long (no target)
+        // so the ball is guaranteed to leave the penalty area on the first touch.
+        if !goal_kick_receiver_legal(target) {
+            target = None;
+        }
         let flight = if prefer_aerial {
             PassFlight::Aerial
         } else {
@@ -4507,10 +4538,21 @@ impl PlayerAgent {
 
         // Even an elite dribbler is NOT exempt when boxed in: with no forward
         // space ahead, carrying on simply walks the ball into the defender.
-        // Only exempt the elite when there is genuine room to attack.
+        // Only exempt the elite when there is genuine room to attack. He ALSO
+        // yields the carry when he is genuinely about to be dispossessed AND a
+        // forward teammate is clearly open — there, carrying on just gifts the ball
+        // away, so the open forward pass is the better ball. (Falls through to the
+        // floor-pass release below, which is guaranteed viable since overall
+        // openness >= the open forward openness here.) In moderate pressure the
+        // elite keeps the carry — the whole point of the exemption.
+        let yield_to_open_forward_outlet = observation.visible_forward_pass_options > 0
+            && observation.best_forward_pass_receiver_openness
+                >= ELITE_HOLD_OPEN_FORWARD_OUTLET_OPENNESS
+            && observation.immediate_dispossession_risk >= ELITE_HOLD_YIELD_DISPOSSESSION_RISK;
         if dribbling >= NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF
             && hold_pressure < 0.64
             && observation.forward_dribble_space_yards >= carry_min_forward_space
+            && !yield_to_open_forward_outlet
         {
             return None;
         }
