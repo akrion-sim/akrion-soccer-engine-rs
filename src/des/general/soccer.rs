@@ -808,6 +808,13 @@ const FINAL_THIRD_CONGESTION_FLOOR: f64 = 0.35;
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_MIN_YARDS: f64 = 8.0;
 const PASS_LENGTH_OPTIMAL_MAX_YARDS: f64 = 12.0;
+// Build-up short-pass discouragement. OUTSIDE the final attacking third, sub-4yd passes are
+// dangerous busy-work that neither progresses nor relieves — longer, progressive balls are
+// prioritised. This penalty applies regardless of pressure (unlike the pressure-gated
+// `POINTLESS_SHORT_PASS_PENALTY`) and is fully lifted in the final third, where short
+// combination play around the box is valuable. Scaled by how far under 4yd the pass is.
+const SHORT_PASS_BUILDUP_MAX_YARDS: f64 = 4.0;
+const SHORT_PASS_BUILDUP_PENALTY: f64 = 2.8;
 // Scoop (lofted dink over a close defender): a teammate this far away, open on all sides by
 // this radius, with a defender within this distance of the direct lane.
 const SCOOP_PASS_MIN_RANGE_YARDS: f64 = 5.0;

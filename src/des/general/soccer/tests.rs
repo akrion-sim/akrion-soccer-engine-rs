@@ -41121,18 +41121,44 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
 
         let mut elite_holder = sim.players[holder].clone();
         elite_holder.skills.dribbling = 9.4;
+        // High dispossession risk (0.74) + a clearly-open forward outlet: even an
+        // elite dribbler yields the carry and releases the open pass rather than
+        // dribbling into a likely turnover (the reported "should have passed" bug).
         let elite_observation = SoccerPomdpObservation {
             excessive_hold_pressure: excessive_hold_pressure(&observation, ability01(9.4)),
-            ..observation
+            ..observation.clone()
         };
         let (elite_action, elite_label) = elite_holder
             .action_from_learned_plan(&plan, &snapshot, &elite_observation)
-            .expect("elite dribbler should still be allowed to execute the carry");
+            .expect("elite under high dispossession risk should release the open outlet");
+        assert_eq!(elite_label, "pass1");
         assert!(
-            matches!(elite_action, SoccerAction::DribbleMove { .. }),
-            "elite dribbler should retain carry permission, got {elite_action:?}"
+            matches!(
+                elite_action,
+                SoccerAction::Pass {
+                    target_player: Some(target),
+                    flight: PassFlight::Floor,
+                    ..
+                } if target == outlet
+            ),
+            "elite should release the open forward outlet under high dispossession risk, got {elite_action:?}"
         );
-        assert_ne!(elite_label, "pass1");
+
+        // In MODERATE pressure (dispossession risk below the yield floor) the elite
+        // KEEPS carry permission — the exemption that lets a skilled dribbler take a
+        // man on is preserved; only an imminent turnover overrides it.
+        let moderate_elite_observation = SoccerPomdpObservation {
+            immediate_dispossession_risk: 0.30,
+            ..elite_observation
+        };
+        let (moderate_action, moderate_label) = elite_holder
+            .action_from_learned_plan(&plan, &snapshot, &moderate_elite_observation)
+            .expect("elite in moderate pressure should retain the carry");
+        assert!(
+            matches!(moderate_action, SoccerAction::DribbleMove { .. }),
+            "elite dribbler should retain carry permission in moderate pressure, got {moderate_action:?}"
+        );
+        assert_ne!(moderate_label, "pass1");
     }
 
     #[test]

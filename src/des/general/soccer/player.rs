@@ -1865,9 +1865,33 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
         restart_label: &str,
     ) -> Option<(SoccerAction, String)> {
+        // On a goal kick the ball must leave the penalty area with the first touch
+        // (Law 16): a pass to a teammate still inside our own box is illegal. This guard
+        // applies to both the planned set-play release and the freely-computed restart
+        // pass below — the keeper plays to an outlet that has stepped outside the area, or
+        // clears it long, rather than tapping it short to a defender in the box.
+        let goal_kick_receiver_legal = |target: Option<usize>| -> bool {
+            if restart_label != "goal-kick" {
+                return true;
+            }
+            match target {
+                None => true,
+                Some(id) => snapshot
+                    .player_position(id)
+                    .map(|pos| !snapshot.point_in_own_penalty_area(self.team, pos))
+                    .unwrap_or(true),
+            }
+        };
+
         if let Some(planned_release) = snapshot.active_set_play_release_for(self.id, restart_label)
         {
-            return Some(planned_release);
+            let release_legal = match &planned_release.0 {
+                SoccerAction::Pass { target_player, .. } => goal_kick_receiver_legal(*target_player),
+                _ => true,
+            };
+            if release_legal {
+                return Some(planned_release);
+            }
         }
 
         // Goal kick: the keeper may hold the ball up to ~7 s to let teammates reset
@@ -1900,15 +1924,22 @@ impl PlayerAgent {
         }
 
         let prefer_aerial = matches!(restart_label, "throw-in" | "corner-kick" | "goal-kick");
-        let visible_targets = if prefer_aerial {
+        let mut visible_targets = if prefer_aerial {
             snapshot.ranked_visible_aerial_pass_targets(self.id, 11)
         } else {
             snapshot.ranked_visible_pass_targets(self.id, 11)
         };
-        let target = visible_targets
+        // Drop any in-box receiver on a goal kick so the chosen outlet is outside the area.
+        visible_targets.retain(|&id| goal_kick_receiver_legal(Some(id)));
+        let mut target = visible_targets
             .first()
             .copied()
             .or_else(|| snapshot.best_pass_target(self.id));
+        // If the only remaining option is still inside our box, clear it long (no target)
+        // so the ball is guaranteed to leave the penalty area on the first touch.
+        if !goal_kick_receiver_legal(target) {
+            target = None;
+        }
         let flight = if prefer_aerial {
             PassFlight::Aerial
         } else {

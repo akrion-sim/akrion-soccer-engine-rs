@@ -8269,16 +8269,17 @@ impl SoccerMatch {
             SoccerSetPlayRoutineKind::GoalKickBuildOut => {
                 let left_back = defenders.first().copied().or(outlet);
                 let right_back = defenders.last().copied().or(outlet);
+                // Backs receive OUTSIDE the 18-yard line so the goal kick leaves the box (Law 16).
                 add_assignment(
                     left_back,
                     SoccerSetPlayAssignmentRole::Outlet,
-                    Vec2::new(width * 0.22, own_goal_y + dir * 18.0),
+                    Vec2::new(width * 0.22, own_goal_y + dir * 20.0),
                     0.0,
                 );
                 add_assignment(
                     right_back,
                     SoccerSetPlayAssignmentRole::Outlet,
-                    Vec2::new(width * 0.78, own_goal_y + dir * 18.0),
+                    Vec2::new(width * 0.78, own_goal_y + dir * 20.0),
                     0.0,
                 );
                 add_assignment(
@@ -8605,11 +8606,13 @@ impl SoccerMatch {
         let length = self.config.field_length_yards;
         let dir = team.attack_dir();
         let own_goal_y = team.other().goal_y(length);
+        // Outlet slots sit OUTSIDE the 18-yard line (>=20yd from the own goal line) so a
+        // goal-kick pass to any of them clears the penalty area on the first touch (Law 16).
         let outlet_slots = [
-            Vec2::new(width * 0.20, own_goal_y + dir * 18.0),
+            Vec2::new(width * 0.20, own_goal_y + dir * 20.0),
             Vec2::new(width * 0.36, own_goal_y + dir * 22.0),
             Vec2::new(width * 0.64, own_goal_y + dir * 22.0),
-            Vec2::new(width * 0.80, own_goal_y + dir * 18.0),
+            Vec2::new(width * 0.80, own_goal_y + dir * 20.0),
             Vec2::new(width * 0.34, own_goal_y + dir * 36.0),
             Vec2::new(width * 0.66, own_goal_y + dir * 36.0),
         ];
@@ -15368,6 +15371,21 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Build-up short-pass discouragement: outside the final attacking third, a
+                // sub-4yd tap is dangerous busy-work — keep the ball progressing with a longer
+                // ball. Unconditional (not pressure-gated) and lifted once we reach the final
+                // third, where short combinations near goal earn their keep.
+                let build_up_short_pass_penalty = {
+                    let in_attacking_third = (me.team.goal_y(self.field_length) - me_position.y)
+                        .abs()
+                        <= self.field_length / 3.0;
+                    if !in_attacking_third && dist < SHORT_PASS_BUILDUP_MAX_YARDS {
+                        let shortness = (1.0 - dist / SHORT_PASS_BUILDUP_MAX_YARDS).clamp(0.0, 1.0);
+                        SHORT_PASS_BUILDUP_PENALTY * shortness
+                    } else {
+                        0.0
+                    }
+                };
                 // Under a through-ball possession strategy, answer a forward/mid breaking
                 // in behind: nudge the holder to thread / loft the ball over the top to a
                 // teammate already making the run (their call for the over-the-top ball).
@@ -15386,6 +15404,7 @@ impl WorldSnapshot {
                     - reception_teammate_penalty
                     - reception_congestion_penalty
                     - pointless_short_pass_penalty
+                    - build_up_short_pass_penalty
                     + over_the_top_invite_bonus
                     + own_box_play_out_adjustment
                     + forward_open_bonus
