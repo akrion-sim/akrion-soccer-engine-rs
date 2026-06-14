@@ -150,6 +150,18 @@ pub struct SoccerMatch {
     /// here. Never serialized into the per-tick state frame.
     pub(crate) decision_trace_capture_enabled: bool,
     pub(crate) decision_trace_by_player: BTreeMap<usize, VecDeque<LiveDecisionTraceEntry>>,
+    /// Tier-2 per-player Model Predictive Control controllers, created lazily for
+    /// the active subset (ball carrier + players contesting near the ball) and
+    /// retained across ticks so each controller's receding-horizon warm start
+    /// persists (successive solves then converge in a handful of iterations).
+    /// Empty and never touched unless `config.mpc.tier2_player_enabled`. Pure
+    /// runtime state — never serialized into a frame.
+    pub(crate) mpc_player_controllers:
+        HashMap<usize, crate::des::general::mpc_point_mass::PlanarPointMassMpc>,
+    /// Running tally of MDP↔MPC decision divergence and how reconciliation
+    /// resolved it. Only updated while `config.mpc.reconcile_enabled`; otherwise
+    /// stays at its zero default. Runtime telemetry — never serialized.
+    pub(crate) mpc_reconcile_stats: SoccerMpcReconcileStats,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -537,6 +549,8 @@ impl SoccerMatch {
             possession_swaps: VecDeque::new(),
             decision_trace_capture_enabled: false,
             decision_trace_by_player: BTreeMap::new(),
+            mpc_player_controllers: HashMap::new(),
+            mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -3927,6 +3941,10 @@ impl SoccerMatch {
                 soccer_live_duration_ms(full_game_learning_elapsed),
             );
         }
+        // Publish this tick's fully-advanced state to the zero-copy inspector ring
+        // (no-op unless SOCCER_INSPECT=1). External tools read it without the
+        // server serialising everything to I/O every tick.
+        super::inspect::record_frame(self);
     }
 
     pub fn to_frame(&self) -> MatchFrame {
@@ -6812,7 +6830,13 @@ impl SoccerMatch {
             // Decisiveness: an unsure player (low belief-grounded confidence) commits less
             // pace; a confident one moves full speed.
             * movement_decisiveness(self.players[player_id].decision_confidence);
-        let desired = self.collision_aware_desired_velocity(player_id, target, speed);
+        // MPC execution + MDP↔MPC reconciliation layer. For the active subset
+        // (carrier + nearby contesters) a short-horizon point-mass MPC plans a
+        // dynamically-feasible movement; depending on config it either refines the
+        // policy's speed profile (Tier-2) or is reconciled against the policy
+        // decision (logged, and averaged only when sensible). Inert — byte-identical
+        // to the analytic path — when `tier2_player_enabled` is off.
+        let desired = self.mpc_movement_desired_velocity(player_id, target, speed);
         let acceleration_factor =
             (0.62 + fatigue_factor * 0.38).clamp(0.45, 1.05) * proximity_urgency;
         let strength_to_weight_factor =
@@ -6919,6 +6943,274 @@ impl SoccerMatch {
         self.ball.curl_acceleration = Vec2::zero();
         self.ball.altitude_yards = 0.0;
         self.ball.last_touch_team = Some(team);
+    }
+
+    /// Is this player in the Tier-2 MPC "active subset"? The ball carrier always
+    /// is; an off-ball outfield player joins it only while within
+    /// `mpc.active_radius_yards` of the ball. This caps MPC to the handful of
+    /// players whose execution actually matters per tick, so 22 controllers never
+    /// solve at once. Off-ball goalkeepers stay on the analytic path; a keeper
+    /// in possession is still the ball carrier and can use the execution layer.
+    fn mpc_tier2_active(&self, player_id: usize) -> bool {
+        if self.ball.holder == Some(player_id) {
+            return true;
+        }
+        let Some(player) = self.players.get(player_id) else {
+            return false;
+        };
+        if player.role == PlayerRole::Goalkeeper {
+            return false;
+        }
+        let radius = self.config.mpc.active_radius_yards.max(0.0);
+        player.position.distance(self.ball.position) <= radius
+    }
+
+    pub(crate) fn mpc_field_obstacles(
+        &self,
+        player_id: usize,
+        my_team: Team,
+        dt: f64,
+    ) -> Vec<PlanarObstacle> {
+        let (field_width, field_length) = sane_pitch_dimensions(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let half_dt2 = 0.5 * dt * dt;
+        let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
+        let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
+        let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
+        let mut obstacles = Vec::with_capacity(self.players.len().saturating_add(1));
+
+        for other in &self.players {
+            if other.id == player_id {
+                continue;
+            }
+            let position = finite_pitch_point(
+                other.position,
+                field_width,
+                field_length,
+                Vec2::new(field_width * 0.5, field_length * 0.5),
+            );
+            let velocity = finite_vec2(other.velocity, Vec2::zero());
+            let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+            let center = finite_pitch_point(
+                position + velocity * dt + acceleration * half_dt2,
+                field_width,
+                field_length,
+                position,
+            );
+            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 28.0);
+            let opponent = other.team != my_team;
+            let holder_bonus = if self.ball.holder == Some(other.id) {
+                0.4
+            } else {
+                0.0
+            };
+            let kinematic_weight = 1.0
+                + velocity.len().clamp(0.0, 18.0) / 54.0
+                + acceleration.len().clamp(0.0, 14.0) / 56.0;
+            obstacles.push(PlanarObstacle {
+                center: [center.x, center.y],
+                velocity: [obstacle_velocity.x, obstacle_velocity.y],
+                radius: if opponent {
+                    opponent_radius
+                } else {
+                    teammate_radius
+                } + holder_bonus,
+                weight: if opponent {
+                    keepout_weight
+                } else {
+                    keepout_weight * 0.25
+                } * kinematic_weight,
+            });
+        }
+
+        if self.ball.holder != Some(player_id) {
+            let position = finite_pitch_point(
+                self.ball.position,
+                field_width,
+                field_length,
+                Vec2::new(field_width * 0.5, field_length * 0.5),
+            );
+            let velocity = finite_vec2(self.ball.velocity, Vec2::zero());
+            let acceleration = finite_vec2(self.ball.acceleration, Vec2::zero());
+            let center = finite_pitch_point(
+                position + velocity * dt + acceleration * half_dt2,
+                field_width,
+                field_length,
+                position,
+            );
+            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 36.0);
+            let ball_weight = keepout_weight
+                * 0.15
+                * (1.0
+                    + velocity.len().clamp(0.0, 30.0) / 60.0
+                    + acceleration.len().clamp(0.0, 30.0) / 90.0);
+            obstacles.push(PlanarObstacle {
+                center: [center.x, center.y],
+                velocity: [obstacle_velocity.x, obstacle_velocity.y],
+                radius: 0.75,
+                weight: ball_weight,
+            });
+        }
+
+        obstacles
+    }
+
+    /// The desired velocity actually executed this tick, after the MPC execution
+    /// and (optionally) MDP↔MPC reconciliation layers. The "MDP" decision is the
+    /// learned-policy/heuristic [`Self::collision_aware_desired_velocity`]; the
+    /// "MPC" decision is a horizon-aware point-mass plan. The whole method reduces
+    /// to the analytic decision (byte-identical) whenever MPC is off or the player
+    /// is not in the active subset.
+    fn mpc_movement_desired_velocity(
+        &mut self,
+        player_id: usize,
+        target: Vec2,
+        speed: f64,
+    ) -> Vec2 {
+        let v_mdp = self.collision_aware_desired_velocity(player_id, target, speed);
+        if !self.config.mpc.tier2_player_enabled || !self.mpc_tier2_active(player_id) {
+            return v_mdp;
+        }
+        let Some(v_mpc) = self.mpc_desired_velocity(player_id, target, speed) else {
+            return v_mdp;
+        };
+        if self.config.mpc.reconcile_enabled {
+            return self.reconcile_mdp_mpc(v_mdp, v_mpc, speed);
+        }
+        // Tier-2 execution refinement (no reconciliation): keep the policy's
+        // direction + collision steering, adopt only the MPC's feasible speed
+        // profile (so it brakes into targets instead of overshooting). Re-running
+        // the steering with the reduced speed preserves collision behaviour.
+        let mpc_speed = v_mpc.len().min(speed);
+        self.collision_aware_desired_velocity(player_id, target, mpc_speed)
+    }
+
+    /// Run the player's receding-horizon MPC one step toward `target` and return
+    /// the full dynamically-feasible velocity vector it plans for the next tick
+    /// (direction *and* magnitude), capped to the heuristic `speed` envelope so it
+    /// can never exceed the player's fatigue/gait-limited top speed. The controller
+    /// is created lazily and retained on the match so its warm start persists
+    /// across ticks. `None` on degenerate input (caller falls back to the policy).
+    fn mpc_desired_velocity(&mut self, player_id: usize, target: Vec2, speed: f64) -> Option<Vec2> {
+        use crate::des::general::mpc_point_mass::{
+            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
+        };
+        let player = self.players.get(player_id)?;
+        let pos = player.position;
+        let vel = player.velocity;
+        let my_team = player.team;
+        // Acceleration disk radius from the player's own acceleration attribute —
+        // the dominant term in the downstream accel limit, which re-clamps anyway.
+        let accel_cap = acceleration_yps2_from_score(player.skills.acceleration).max(0.5);
+        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        let horizon = self.config.mpc.player_horizon.max(1);
+
+        // Field awareness: the controlled player is the MPC state; every other
+        // player plus the ball becomes a moving soft keep-out, projected with
+        // position, velocity, and acceleration before the mutable controller borrow.
+        let obstacles: Vec<PlanarObstacle> = if self.config.mpc.field_aware_enabled {
+            self.mpc_field_obstacles(player_id, my_team, dt)
+        } else {
+            Vec::new()
+        };
+
+        let stale = self
+            .mpc_player_controllers
+            .get(&player_id)
+            .map(|c| {
+                let cfg = c.config();
+                cfg.horizon != horizon
+                    || (cfg.dt - dt).abs() > 1e-9
+                    || (cfg.a_max - accel_cap).abs() > 1e-6
+            })
+            .unwrap_or(true);
+        if stale {
+            // More projected-gradient iterations for the longer (multi-second)
+            // horizon so a cold solve converges; warm-started ticks stop early.
+            let iters = ((horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+            // Trust obstacle predictions with a ~1.5 s half-life (dt-robust), so the
+            // far end of a 3 s plan discounts constant-velocity opponent fiction.
+            let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5);
+            let cfg = PlanarMpcConfig {
+                horizon,
+                dt,
+                a_max: accel_cap,
+                iters,
+                obstacle_decay_per_step,
+                ..PlanarMpcConfig::default()
+            };
+            let controller = PlanarPointMassMpc::new(cfg).ok()?;
+            self.mpc_player_controllers.insert(player_id, controller);
+        }
+
+        let controller = self.mpc_player_controllers.get_mut(&player_id)?;
+        let state = PlanarState {
+            pos: [pos.x, pos.y],
+            vel: [vel.x, vel.y],
+        };
+        let reference = PlanarReference::arrive([target.x, target.y]);
+        let accel = controller.control_with_obstacles(state, &[reference], &obstacles);
+        let next = Vec2::new(vel.x + accel[0] * dt, vel.y + accel[1] * dt);
+        // Cap to the heuristic speed envelope (MPC may only equal or undercut it).
+        let len = next.len();
+        if len > speed && len > 1e-9 {
+            Some(next * (speed / len))
+        } else {
+            Some(next)
+        }
+    }
+
+    /// Reconcile the learned-policy ("MDP") desired velocity with the MPC desired
+    /// velocity. Records their divergence, then returns the executed velocity:
+    /// a weighted average **only when the two are not directionally opposed** (an
+    /// average of opposed vectors would cancel into a meaningless crawl); when
+    /// they contradict, the learned policy owns WHERE to go and its decision is
+    /// kept. Updates [`Self::mpc_reconcile_stats`].
+    fn reconcile_mdp_mpc(&mut self, v_mdp: Vec2, v_mpc: Vec2, speed: f64) -> Vec2 {
+        let mdp_len = v_mdp.len();
+        let mpc_len = v_mpc.len();
+        let deviation = (v_mdp - v_mpc).len();
+
+        // Directional agreement (cosine). If either is ~stationary there is no
+        // direction to oppose, so treat it as aligned (averaging magnitudes is fine).
+        let alignment = if mdp_len > 1e-6 && mpc_len > 1e-6 {
+            dot(v_mdp, v_mpc) / (mdp_len * mpc_len)
+        } else {
+            1.0
+        };
+
+        let stats = &mut self.mpc_reconcile_stats;
+        stats.samples += 1;
+        stats.sum_deviation_yps += deviation;
+        if deviation > stats.max_deviation_yps {
+            stats.max_deviation_yps = deviation;
+        }
+        if deviation > self.config.mpc.deviation_threshold_yps {
+            stats.deviating_samples += 1;
+        }
+
+        if alignment >= self.config.mpc.blend_min_alignment {
+            // Average makes sense — blend.
+            self.mpc_reconcile_stats.blended_samples += 1;
+            let alpha = self.config.mpc.blend_alpha.clamp(0.0, 1.0);
+            let blended = v_mdp * (1.0 - alpha) + v_mpc * alpha;
+            // Never exceed the speed envelope.
+            let len = blended.len();
+            if len > speed && len > 1e-9 {
+                return blended * (speed / len);
+            }
+            return blended;
+        }
+        // Contradictory decisions — defer to the learned policy (no average).
+        self.mpc_reconcile_stats.deferred_to_policy_samples += 1;
+        v_mdp
+    }
+
+    /// Snapshot of the MDP↔MPC reconciliation telemetry accumulated this match.
+    pub fn mpc_reconcile_stats(&self) -> SoccerMpcReconcileStats {
+        self.mpc_reconcile_stats
     }
 
     fn collision_aware_desired_velocity(&self, player_id: usize, target: Vec2, speed: f64) -> Vec2 {

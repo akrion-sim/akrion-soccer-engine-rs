@@ -44,6 +44,8 @@ mod team;
 pub use team::*;
 mod world;
 pub use world::*;
+mod inspect;
+pub use inspect::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -115,9 +117,13 @@ const OFF_BALL_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.8; // ~103 deg/s at a flat-out s
                                                    // ball within a cone of the movement).
 const MOVING_FACING_MIN_SPEED_YPS: f64 = 1.2;
 // Angular-acceleration cap: the turn rate itself can only change this fast, so a
-// player cannot instantly start or stop spinning even on an instant decision
-// (~0.25 s to wind up to the max rate). Models rotational inertia of the body.
-const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 80.0;
+// player cannot instantly start or stop spinning even on an instant decision.
+// Models rotational inertia of the body. At 18 rad/s² it takes ~0.25 s to wind up
+// to the max rate and ~0.45 s to REVERSE a flat-out spin (±4 rad/s) — so transient
+// 1-2 tick target jitter can't whip the body around. (Was 80, which let the body
+// reverse spin in ~1.5 ticks — that produced the "facing flips 5+ times in 3 s"
+// flip-flop, since the cap was 20x too high to impose any real inertia.)
+const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 18.0;
 // Human-scale mass bounds (lbs) the physics smoke report holds players within.
 const PLAYER_MIN_WEIGHT_POUNDS: f64 = 90.0;
 const PLAYER_MAX_WEIGHT_POUNDS: f64 = 320.0;
@@ -130,6 +136,12 @@ const CARRIER_FORWARD_FACING_NUDGE: f64 = 0.55;
 // resting facing tracks the ball's current bearing. The yaw-rate cap and dizziness
 // model then bound how fast/far they can keep swivelling.
 const CARRIER_BALL_FACING_FOLLOW: f64 = 0.82;
+// Hysteresis deadband on the CARRIER's committed action-facing bucket: keep the
+// current heading unless the new movement intent points more than ~60° away from
+// it (dot < cos60° = 0.5). Buckets are 45° apart, so this suppresses flip-flopping
+// between two adjacent buckets every tick while still letting a genuine cut/turn
+// (≥~70°) re-commit. Stops the decision layer from churning the target heading.
+const CARRIER_FACING_COMMIT_DOT: f64 = 0.5;
 const COMFORT_YAW_RATE_RAD_S: f64 = 2.8; // below this, turning is free of dizziness
 const DIZZINESS_GAIN_PER_RAD: f64 = 0.22; // accrual per rad/s over comfort, per sec
 const DIZZINESS_RECOVERY_PER_SECOND: f64 = 0.60;
@@ -10810,6 +10822,168 @@ impl SoccerNeuralLearningConfig {
     }
 }
 
+/// Model Predictive Control coupling. The learned MDP/POMDP policy and the
+/// formation LP own the *perennial* decisions (which intent, which shape); MPC is
+/// a short-horizon, real-time *execution* layer solved every tick by a numerical
+/// (projected-gradient QP) optimizer — never a neural net. It refines HOW a
+/// chosen intent is carried out (dynamically-feasible, accel-limited trajectories)
+/// rather than WHAT the intent is. Everything is off by default, so a run that
+/// does not opt in behaves byte-for-byte as before.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerMpcConfig {
+    /// Tier-2 per-player receding-horizon execution: the active subset (ball
+    /// carrier + players contesting near the ball) has its arrival/acceleration
+    /// speed profile planned by a 2-D point-mass MPC instead of the open-loop
+    /// "head straight at the target at top speed" heuristic. Direction and
+    /// collision-avoidance steering stay heuristic. Off by default.
+    #[serde(default)]
+    pub tier2_player_enabled: bool,
+    /// Tier-1 team tactical shape-transition MPC layered ABOVE the formation LP:
+    /// the LP picks the target shape, MPC smooths the collective transition into
+    /// it over a short horizon under per-player acceleration limits. Off by
+    /// default. (Wired in a later step; the flag is reserved here.)
+    #[serde(default)]
+    pub tier1_team_enabled: bool,
+    /// Horizon length (ticks) for the per-player controller.
+    #[serde(default = "default_soccer_mpc_player_horizon")]
+    pub player_horizon: usize,
+    /// Radius (yards) around the ball within which an off-ball player joins the
+    /// Tier-2 active subset. The ball carrier is always included; players farther
+    /// than this stay on the cheap analytic path so 22 × MPC never runs per tick.
+    #[serde(default = "default_soccer_mpc_active_radius_yards")]
+    pub active_radius_yards: f64,
+    /// MDP↔MPC reconciliation. When on (requires `tier2_player_enabled`), the
+    /// learned-policy/heuristic movement decision (the "MDP" side) and the MPC
+    /// movement decision are computed independently, their divergence is recorded,
+    /// and — *only when an average makes sense* (the two are not pulling in
+    /// opposed directions) — the executed velocity is a weighted average of the
+    /// two. When they contradict, the learned policy owns WHERE to go (no average)
+    /// and the divergence is logged. Off by default.
+    #[serde(default)]
+    pub reconcile_enabled: bool,
+    /// Weight on the MPC decision in the blend, in `[0, 1]` (0 = pure MDP,
+    /// 1 = pure MPC). Only consulted while reconciling and the two agree enough.
+    #[serde(default = "default_soccer_mpc_blend_alpha")]
+    pub blend_alpha: f64,
+    /// Minimum directional agreement (cosine of the angle between the MDP and MPC
+    /// desired velocities) for an average to "make sense". At/above this the two
+    /// are blended; below it (e.g. one says push forward, the other says brake or
+    /// peel off) averaging would cancel into nonsense, so the policy decision is
+    /// kept instead. Default 0.0 → blend whenever they are not actively opposed.
+    #[serde(default = "default_soccer_mpc_blend_min_alignment")]
+    pub blend_min_alignment: f64,
+    /// Divergence (yards/second between the two desired velocities) above which a
+    /// tick is counted as "deviating" in the reconciliation stats.
+    #[serde(default = "default_soccer_mpc_deviation_threshold_yps")]
+    pub deviation_threshold_yps: f64,
+    /// Field awareness: when on (requires `tier2_player_enabled`), the per-player
+    /// MPC keeps the controlled player as the point-mass state, then plans around
+    /// every other player plus the ball as moving soft keep-outs. Obstacle centers
+    /// and velocities are projected from position, velocity, and acceleration, so
+    /// the planned path bends around where opponents/teammates/the ball will be.
+    /// Off by default (the plan only tracks its target).
+    #[serde(default)]
+    pub field_aware_enabled: bool,
+    /// Keep-out radius (yards) around each opponent the plan avoids.
+    #[serde(default = "default_soccer_mpc_opponent_keepout_yards")]
+    pub opponent_keepout_yards: f64,
+    /// Keep-out radius (yards) around each teammate (smaller — just don't collide;
+    /// shape/spacing is owned by the formation LP, not this layer).
+    #[serde(default = "default_soccer_mpc_teammate_keepout_yards")]
+    pub teammate_keepout_yards: f64,
+    /// Soft-penalty weight on opponent incursion (per yard²). Teammates use a
+    /// quarter of this.
+    #[serde(default = "default_soccer_mpc_keepout_weight")]
+    pub keepout_weight: f64,
+}
+
+fn default_soccer_mpc_player_horizon() -> usize {
+    // ~3.0 s of lookahead at the 15 Hz default tick (45 × 1/15). Long enough to
+    // plan a real route around traffic and brake smoothly into a target, short
+    // enough that constant-velocity opponent prediction (decayed further by
+    // `obstacle_decay_per_step`) is still worth something.
+    45
+}
+
+fn default_soccer_mpc_active_radius_yards() -> f64 {
+    14.0
+}
+
+fn default_soccer_mpc_blend_alpha() -> f64 {
+    0.5
+}
+
+fn default_soccer_mpc_blend_min_alignment() -> f64 {
+    0.0
+}
+
+fn default_soccer_mpc_deviation_threshold_yps() -> f64 {
+    1.0
+}
+
+fn default_soccer_mpc_opponent_keepout_yards() -> f64 {
+    2.0
+}
+
+fn default_soccer_mpc_teammate_keepout_yards() -> f64 {
+    1.5
+}
+
+fn default_soccer_mpc_keepout_weight() -> f64 {
+    40.0
+}
+
+impl Default for SoccerMpcConfig {
+    fn default() -> Self {
+        SoccerMpcConfig {
+            tier2_player_enabled: false,
+            tier1_team_enabled: false,
+            player_horizon: default_soccer_mpc_player_horizon(),
+            active_radius_yards: default_soccer_mpc_active_radius_yards(),
+            reconcile_enabled: false,
+            blend_alpha: default_soccer_mpc_blend_alpha(),
+            blend_min_alignment: default_soccer_mpc_blend_min_alignment(),
+            deviation_threshold_yps: default_soccer_mpc_deviation_threshold_yps(),
+            field_aware_enabled: false,
+            opponent_keepout_yards: default_soccer_mpc_opponent_keepout_yards(),
+            teammate_keepout_yards: default_soccer_mpc_teammate_keepout_yards(),
+            keepout_weight: default_soccer_mpc_keepout_weight(),
+        }
+    }
+}
+
+/// Running tally of how often the learned-policy ("MDP") movement decision and
+/// the MPC movement decision diverged, and how the reconciliation resolved it.
+/// Pure runtime telemetry — reset per match, never serialized into a frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerMpcReconcileStats {
+    /// Active-player ticks where both decisions were computed and compared.
+    pub samples: u64,
+    /// Of those, how many diverged by more than `deviation_threshold_yps`.
+    pub deviating_samples: u64,
+    /// How many were resolved by averaging the two (they agreed enough).
+    pub blended_samples: u64,
+    /// How many kept the policy decision because an average made no sense
+    /// (the decisions were directionally opposed).
+    pub deferred_to_policy_samples: u64,
+    /// Sum of per-sample divergence (yards/second), for a running mean.
+    pub sum_deviation_yps: f64,
+    /// Largest single divergence (yards/second) seen this match.
+    pub max_deviation_yps: f64,
+}
+
+impl SoccerMpcReconcileStats {
+    /// Mean divergence (yards/second) across all compared samples.
+    pub fn mean_deviation_yps(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.sum_deviation_yps / self.samples as f64
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchConfig {
@@ -10863,6 +11037,10 @@ pub struct MatchConfig {
     /// Additive + actor-critic blend so the nets integrate with the tabular policy.
     #[serde(default)]
     pub neural_blend: SoccerNeuralBlendConfig,
+    /// Short-horizon real-time Model Predictive Control execution layer. Off by
+    /// default; see [`SoccerMpcConfig`].
+    #[serde(default)]
+    pub mpc: SoccerMpcConfig,
     #[serde(default = "default_adversarial_embedding_exploitation_enabled")]
     pub adversarial_embedding_exploitation_enabled: bool,
     #[serde(default = "default_adversarial_moment_memory_limit")]
@@ -10900,6 +11078,7 @@ impl Default for MatchConfig {
             spacing: SoccerSpacingParams::default(),
             neural_learning: SoccerNeuralLearningConfig::default(),
             neural_blend: SoccerNeuralBlendConfig::default(),
+            mpc: SoccerMpcConfig::default(),
             adversarial_embedding_exploitation_enabled: true,
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
             max_human_players: 4,
@@ -29616,6 +29795,137 @@ impl SoccerRealtimeSession {
             done: self.sim.is_done(),
         }
     }
+
+    /// Transport-agnostic, read-only introspection of EVERYTHING the live engine
+    /// holds for this game — the full physical frame PLUS the learner internals
+    /// (neural critic, Q-policy aggregates, per-agent MDP/POMDP decision state with
+    /// its observation vector + masked/scored action options + chosen target, the
+    /// central-brain/formation-LP decision, and the reward plumbing) that the normal
+    /// `state_response` frame deliberately omits.
+    ///
+    /// This is the "let an external program read the engine's memory to debug it"
+    /// seam: it is **pull-based** (built only when asked, under one brief session
+    /// lock) so it costs nothing when nobody is looking — unlike continuously
+    /// writing everything to I/O. It is also deliberately **transport-agnostic**:
+    /// it returns serializable data and knows nothing about HTTP/WebSocket. An
+    /// outer server (kept OUT of this library) decides how to ship it to the
+    /// inspector. `include_neural_weights` additionally embeds the raw network
+    /// snapshot, which is large — leave it off for routine polling.
+    pub fn inspector_snapshot(&self, include_neural_weights: bool) -> serde_json::Value {
+        let sim = &self.sim;
+        // A non-`Serialize` corner or a poisoned sub-value becomes `null` rather than
+        // failing the whole snapshot — a debugger view should degrade, not vanish.
+        let val = |result: Result<serde_json::Value, serde_json::Error>| {
+            result.unwrap_or(serde_json::Value::Null)
+        };
+
+        // Every agent's most recent decision — on AND off the ball — is the richest
+        // internal: the MDP state, the POMDP observation vector, the belief, the
+        // masked+scored action options, and the chosen target. This is what answers
+        // "why did player N do that?".
+        let per_player: Vec<serde_json::Value> = sim
+            .players
+            .iter()
+            .map(|player| {
+                serde_json::json!({
+                    "playerId": player.id,
+                    "name": player.name,
+                    "team": val(serde_json::to_value(player.team)),
+                    "role": val(serde_json::to_value(player.role)),
+                    "hasBall": sim.ball.holder == Some(player.id),
+                    "decision": player
+                        .last_decision
+                        .as_ref()
+                        .map(|trace| val(serde_json::to_value(trace))),
+                })
+            })
+            .collect();
+
+        let neural = serde_json::json!({
+            "home": sim
+                .neural_learner
+                .as_ref()
+                .map(|learner| soccer_neural_learner_inspect(learner, include_neural_weights)),
+            // `None` here means the away team shares the home critic (the historical
+            // single-net behavior); `Some` is a dedicated per-team brain.
+            "away": match sim.away_neural_learner.as_ref() {
+                Some(learner) => soccer_neural_learner_inspect(learner, include_neural_weights),
+                None => serde_json::Value::String("shared-with-home".to_string()),
+            },
+            "homeFrozen": sim.home_neural_frozen,
+            "awayFrozen": sim.away_neural_frozen,
+            "blend": val(serde_json::to_value(sim.neural_blend)),
+            "actorCriticEnabled": sim.policy_head.is_some(),
+            "worldModelEnabled": sim.world_model.is_some(),
+        });
+
+        serde_json::json!({
+            "schemaVersion": 1,
+            "capturedAtUnixMs": soccer_unix_millis(),
+            "game": {
+                "tick": sim.tick,
+                "clockSeconds": sim.clock_seconds,
+                "scoreHome": sim.score_home,
+                "scoreAway": sim.score_away,
+                "done": sim.is_done(),
+                "episodeIndex": self.episode_index,
+                "matchClock": val(serde_json::to_value(sim.match_clock())),
+            },
+            // Full (uncompacted) physical frame: all players, ball, officials, kinematics.
+            "frame": val(serde_json::to_value(sim.to_live_http_frame())),
+            "learning": val(serde_json::to_value(sim.learning_stats_snapshot())),
+            "policyProbability": val(serde_json::to_value(sim.team_policy_probability_summary())),
+            "tacticalSummary": val(serde_json::to_value(&sim.tactical_summary)),
+            // Team brain: tactical phase, directives, and the formation-LP decision trace.
+            "centralBrain": val(serde_json::to_value(&sim.central_brain)),
+            "decisionTrace": {
+                "captureEnabled": sim.decision_trace_capture_enabled(),
+                "entries": val(serde_json::to_value(sim.decision_trace_recent())),
+            },
+            "perPlayerDecisions": per_player,
+            "ballDecision": sim
+                .ball
+                .last_decision
+                .as_ref()
+                .map(|trace| val(serde_json::to_value(trace))),
+            // Reward plumbing depths (the queues that drive credit assignment).
+            "rewards": {
+                "deferredRewardTransitions": sim.deferred_reward_transitions.len(),
+                "recentLearningHistory": sim.recent_learning_history.len(),
+                "rewardEventsThisTick": sim.reward_events.len(),
+                "episodeLearningTransitions": sim.episode_learning_transitions.len(),
+                "turnoverPenaltyHistory": sim.turnover_penalty_history.len(),
+            },
+            "neural": neural,
+        })
+    }
+}
+
+/// Summarize one neural value/critic learner for the inspector: backend, whether a
+/// prediction network is live, training progress, replay depth, and (only when
+/// `include_weights`) the raw network snapshot — which is large, so it is opt-in.
+fn soccer_neural_learner_inspect(
+    learner: &SoccerNeuralLearner,
+    include_weights: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "backend": format!("{:?}", learner.backend),
+        "hasPredictionNetwork": learner.has_prediction_network(),
+        "trainingSteps": learner.training_steps(),
+        "averageLoss": learner.average_loss(),
+        "parameterCount": learner.stats.parameter_count,
+        "replayLen": learner.replay.len(),
+        "replayCapacity": learner.stats.replay_capacity,
+        "pendingBatches": learner.stats.pending_batches,
+        "droppedBatches": learner.stats.dropped_batches,
+    });
+    if include_weights {
+        if let Some(snapshot) = learner.last_network_snapshot.as_ref() {
+            value["networkSnapshot"] =
+                serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
+        }
+    }
+    return value;
 }
 
 fn tracking_frame_from_match(sim: &SoccerMatch) -> SoccerTrackingFrame {
@@ -30004,6 +30314,15 @@ impl SoccerLiveHttpBridge {
 
     pub fn session(&self) -> Arc<Mutex<SoccerRealtimeSession>> {
         Arc::clone(&self.session)
+    }
+
+    /// Read-only introspection of this game's full engine internals for an external
+    /// debugger/inspector. Locks the session briefly and delegates to
+    /// [`SoccerRealtimeSession::inspector_snapshot`]; returns transport-agnostic JSON
+    /// the outer server ships however it likes (HTTP, WebSocket, IPC).
+    pub fn inspector_snapshot(&self, include_neural_weights: bool) -> serde_json::Value {
+        let guard = soccer_mutex_lock(&self.session, "soccer_live_session");
+        return guard.inspector_snapshot(include_neural_weights);
     }
 
     pub fn input_queue(&self) -> SharedHumanInputs {
@@ -31154,6 +31473,21 @@ fn handle_live_soccer_request_inner(
                 "count": entries.len(),
                 "entries": entries,
             }))
+        }
+        ("GET", "/api/inspect") => {
+            // On-demand live-state inspection (pull). Serialises ONLY the slice
+            // asked for via the query string, e.g.
+            //   /api/inspect?player=18&fields=facing_yaw,yaw_rate,action_facing&history=45
+            //   /api/inspect?section=ball,brain
+            // History requires the shared-memory ring (SOCCER_INSPECT=1); the
+            // zero-copy mmap path is for external readers (soccer_inspect bin).
+            let query = req.path.split('?').nth(1).unwrap_or("");
+            let selection = inspect::InspectSelection::from_query(query);
+            let body = {
+                let guard = soccer_mutex_lock(session, "soccer_live_session");
+                inspect::inspect_response_json(&guard.sim, &selection)
+            };
+            LiveHttpResponse::json(&body)
         }
         ("GET", "/api/team-policy") | ("GET", "/api/policy") => {
             let guard = match session.lock() {
@@ -43311,6 +43645,20 @@ fn movement_action_facing_bucket(
     current_facing: FacingBucket,
 ) -> FacingBucket {
     if has_ball && to_target.len() > 1e-6 {
+        // Hysteresis: a carrier commits to a heading instead of flip-flopping the
+        // target bucket on small intent wobbles. Keep the current facing unless the
+        // intent points clearly away from it (beyond the deadband); only then
+        // re-commit to where the movement now points. (The continuous facing_yaw is
+        // still rate/accel-limited on top of this.)
+        if current_facing != FacingBucket::Unknown {
+            if let Some(current_vec) = facing_bucket_to_vector(current_facing) {
+                let cur = current_vec.normalized();
+                let intent = to_target.normalized();
+                if cur.dot(intent) >= CARRIER_FACING_COMMIT_DOT {
+                    return current_facing;
+                }
+            }
+        }
         return facing_bucket_from_vector(to_target);
     }
 

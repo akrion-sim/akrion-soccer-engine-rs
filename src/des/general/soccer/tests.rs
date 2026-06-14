@@ -114,6 +114,223 @@ fn default_match_config_preserves_initial_runtime_contract() {
 }
 
 #[test]
+fn tier2_mpc_is_inert_when_disabled_and_active_when_enabled() {
+    // Disabled (default): the analytic movement path runs and no per-player
+    // MPC controller is ever instantiated, no matter how long the match runs.
+    let mut off = SoccerMatch::default_11v11(MatchConfig {
+        seed: 7_777,
+        ..Default::default()
+    });
+    assert!(!off.config.mpc.tier2_player_enabled);
+    for _ in 0..300 {
+        off.run_time_step();
+    }
+    assert!(
+        off.mpc_player_controllers.is_empty(),
+        "MPC must not allocate controllers when tier2 is off"
+    );
+
+    // Enabled: controllers are created lazily for the active subset, the match
+    // still advances normally, and no controller drives a player past the
+    // heuristic speed envelope.
+    let mut on = SoccerMatch::default_11v11(MatchConfig {
+        seed: 7_777,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..300 {
+        on.run_time_step();
+    }
+    assert!(
+        !on.mpc_player_controllers.is_empty(),
+        "tier2 enabled should populate controllers for the active subset"
+    );
+    assert_eq!(on.tick, 300, "match must advance the same with MPC on");
+    for player in &on.players {
+        let speed = player.velocity.len();
+        let cap = player_top_speed_yps(player.role, &player.skills) * 1.5 + 1.0;
+        assert!(
+            speed <= cap,
+            "player {} exceeded plausible speed under MPC: {speed} > {cap}",
+            player.id
+        );
+    }
+}
+
+#[test]
+fn field_aware_mpc_runs_a_full_match_without_breaking_physics() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 5_150,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            field_aware_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..300 {
+        sim.run_time_step();
+    }
+    assert_eq!(sim.tick, 300);
+    assert!(!sim.mpc_player_controllers.is_empty());
+    for player in &sim.players {
+        let speed = player.velocity.len();
+        assert!(
+            speed.is_finite(),
+            "player {} got non-finite velocity",
+            player.id
+        );
+        let cap = player_top_speed_yps(player.role, &player.skills) * 1.5 + 1.0;
+        assert!(
+            speed <= cap,
+            "player {} too fast under field-aware MPC: {speed}",
+            player.id
+        );
+    }
+}
+
+#[test]
+fn tier2_mpc_field_obstacles_use_player_and_ball_kinematics() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 5_151,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            field_aware_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let player_id = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("controlled player");
+    let opponent_id = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("opponent obstacle");
+    let obstacle_position = Vec2::new(31.0, 44.0);
+    let obstacle_velocity = Vec2::new(3.5, -4.0);
+    let obstacle_acceleration = Vec2::new(6.0, 2.5);
+    if let Some(opponent) = sim
+        .players
+        .iter_mut()
+        .find(|player| player.id == opponent_id)
+    {
+        opponent.position = obstacle_position;
+        opponent.velocity = obstacle_velocity;
+        opponent.acceleration = obstacle_acceleration;
+    }
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(62.0, 33.0);
+    sim.ball.velocity = Vec2::new(-8.0, 5.0);
+    sim.ball.acceleration = Vec2::new(-5.0, 3.0);
+
+    let dt = sane_dt_seconds(sim.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let half_dt2 = 0.5 * dt * dt;
+    let (width, length) =
+        sane_pitch_dimensions(sim.config.field_width_yards, sim.config.field_length_yards);
+    let my_team = sim
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .map(|player| player.team)
+        .expect("controlled player team");
+    let obstacles = sim.mpc_field_obstacles(player_id, my_team, dt);
+    assert_eq!(
+        obstacles.len(),
+        sim.players.len(),
+        "Tier-2 MPC should model every other player plus the ball"
+    );
+
+    let expected_opponent_center = finite_pitch_point(
+        obstacle_position + obstacle_velocity * dt + obstacle_acceleration * half_dt2,
+        width,
+        length,
+        obstacle_position,
+    );
+    let expected_opponent_velocity =
+        limit_vec2_len(obstacle_velocity + obstacle_acceleration * dt, 28.0);
+    let opponent_obstacle = obstacles
+        .iter()
+        .find(|obstacle| {
+            Vec2::new(obstacle.center[0], obstacle.center[1]).distance(expected_opponent_center)
+                < 1e-9
+        })
+        .expect("opponent obstacle should use projected position");
+    assert!(
+        Vec2::new(opponent_obstacle.velocity[0], opponent_obstacle.velocity[1])
+            .distance(expected_opponent_velocity)
+            < 1e-9,
+        "opponent obstacle velocity should include acceleration over the tick"
+    );
+    assert!(
+        opponent_obstacle.weight > sim.config.mpc.keepout_weight,
+        "moving/accelerating opponent should carry extra obstacle pressure"
+    );
+
+    let expected_ball_center = finite_pitch_point(
+        sim.ball.position + sim.ball.velocity * dt + sim.ball.acceleration * half_dt2,
+        width,
+        length,
+        sim.ball.position,
+    );
+    let expected_ball_velocity =
+        limit_vec2_len(sim.ball.velocity + sim.ball.acceleration * dt, 36.0);
+    let ball_obstacle = obstacles
+        .iter()
+        .find(|obstacle| {
+            (obstacle.radius - 0.75).abs() < 1e-9
+                && Vec2::new(obstacle.center[0], obstacle.center[1]).distance(expected_ball_center)
+                    < 1e-9
+        })
+        .expect("ball obstacle should use projected ball kinematics");
+    assert!(
+        Vec2::new(ball_obstacle.velocity[0], ball_obstacle.velocity[1])
+            .distance(expected_ball_velocity)
+            < 1e-9,
+        "ball obstacle velocity should include acceleration over the tick"
+    );
+}
+
+#[test]
+fn mdp_mpc_reconciliation_records_divergence_and_blends_when_sensible() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 9_191,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(sim.mpc_reconcile_stats().samples, 0);
+    for _ in 0..300 {
+        sim.run_time_step();
+    }
+    let stats = sim.mpc_reconcile_stats();
+    assert!(
+        stats.samples > 0,
+        "expected MDP/MPC comparisons to be recorded"
+    );
+    assert_eq!(
+        stats.blended_samples + stats.deferred_to_policy_samples,
+        stats.samples,
+        "every compared sample must be resolved exactly one way"
+    );
+    assert!(stats.deviating_samples <= stats.samples);
+    assert!(stats.max_deviation_yps >= stats.mean_deviation_yps() - 1e-9);
+    assert!(stats.mean_deviation_yps() >= 0.0);
+    assert_eq!(sim.tick, 300);
+}
+
+#[test]
 fn default_roster_exposes_role_specific_skills_to_learning_state() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         seed: 44_001,
@@ -1298,10 +1515,10 @@ fn simulation_summary_runner_advances_without_trace_frames() {
 
     assert_eq!(summary.config.dt_seconds, DEFAULT_DT_SECONDS);
     assert_eq!(summary.config.total_ticks(), 30);
-    assert_eq!(summary.summary.ticks, 20);
+    assert_eq!(summary.summary.ticks, 30);
     assert!((summary.summary.simulated_seconds - 2.0).abs() < 1e-9);
-    assert_eq!(summary.step_timing.ticks, 20);
-    assert_eq!(summary.controller_yield.skipped_no_assignment, 20);
+    assert_eq!(summary.step_timing.ticks, 30);
+    assert_eq!(summary.controller_yield.skipped_no_assignment, 30);
     assert!(
         summary.step_timing.total_ms.is_finite() && summary.step_timing.total_ms > 0.0,
         "summary runner should retain timing telemetry without retaining frame history"
@@ -1323,7 +1540,7 @@ fn simulation_summary_runner_reaches_full_ten_minute_default_duration_without_fr
         ..MatchConfig::default()
     });
 
-    assert_eq!(summary.config.dt_seconds, 0.1);
+    assert_eq!(summary.config.dt_seconds, DEFAULT_DT_SECONDS);
     assert_eq!(summary.config.effective_duration_seconds(), 600.0);
     assert_eq!(summary.config.total_ticks(), 9_000);
     assert_eq!(summary.summary.ticks, 9_000);
@@ -29418,8 +29635,10 @@ fn loose_ball_recovery_uses_weighted_operation_order() {
 
 #[test]
 fn carrier_turn_rate_drops_with_speed_and_below_off_ball_agility() {
-    // One tick of facing update with a 180° turn demanded; returns how far the body
-    // actually rotated.
+    // Integrate several ticks of a 180-degree turn. With realistic rotational
+    // inertia, the angular acceleration cap limits the first ticks identically
+    // regardless of speed; the speed-scaled rate cap separates them as the turn
+    // winds up over time.
     let turn = |speed: f64, holder: bool| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let id = 5usize;
@@ -29427,15 +29646,14 @@ fn carrier_turn_rate_drops_with_speed_and_below_off_ball_agility() {
         sim.players[id].yaw_rate = 0.0;
         sim.players[id].action_facing = FacingBucket::West; // demand a 180° turn
         sim.players[id].velocity = Vec2::new(0.0, speed); // magnitude is what matters
-        if holder {
-            sim.ball.holder = Some(id);
-        } else {
-            sim.ball.holder = None;
-            // Off-ball players face the ball; put it due West for the same 180° demand.
-            sim.ball.position = sim.players[id].position - Vec2::new(10.0, 0.0);
-        }
+                                                          // Ball due West in both cases, so the desired heading is the same for
+                                                          // the carrier and the off-ball face-the-ball path.
+        sim.ball.position = sim.players[id].position - Vec2::new(10.0, 0.0);
+        sim.ball.holder = if holder { Some(id) } else { None };
         let before = sim.players[id].facing_yaw;
-        sim.update_player_facing_dizziness_energy();
+        for _ in 0..5 {
+            sim.update_player_facing_dizziness_energy();
+        }
         (sim.players[id].facing_yaw - before).abs()
     };
 
@@ -29450,7 +29668,35 @@ fn carrier_turn_rate_drops_with_speed_and_below_off_ball_agility() {
     assert!(
             slow_carrier < off_ball - 1e-6,
             "even a slow carrier turns less freely than an off-ball player: carrier={slow_carrier:.3} off_ball={off_ball:.3}"
-        );
+    );
+}
+
+#[test]
+fn rotational_inertia_makes_reversing_a_spin_take_real_time() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let id = 5usize;
+    park_players_except(&mut sim, &[id]);
+    sim.players[id].position = Vec2::new(40.0, 60.0);
+    sim.players[id].facing_yaw = 0.0; // facing East
+    sim.players[id].velocity = Vec2::zero();
+    sim.ball.holder = None;
+    sim.ball.position = sim.players[id].position + Vec2::new(0.0, -10.0);
+    sim.players[id].yaw_rate = 4.5;
+
+    let mut ticks_to_reverse = None;
+    for t in 1..=45 {
+        sim.update_player_facing_dizziness_energy();
+        if sim.players[id].yaw_rate <= -4.0 {
+            ticks_to_reverse = Some(t);
+            break;
+        }
+    }
+
+    let ticks = ticks_to_reverse.expect("the spin should eventually reverse");
+    assert!(
+        ticks >= 6,
+        "reversing a saturated spin must take real time; took {ticks} ticks"
+    );
 }
 
 #[test]
@@ -40855,7 +41101,7 @@ fn match_step_timing_stats_accumulate_and_reset() {
     assert_eq!(stats.tick_budget_ms, DEFAULT_DT_SECONDS * 1_000.0);
     assert_eq!(
         stats.learning_budget_ms,
-        100.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
+        stats.tick_budget_ms * SOCCER_LEARNING_TICK_BUDGET_RATIO
     );
     assert_eq!(stats.over_budget, stats.over_budget_ticks > 0);
     assert_eq!(
@@ -43773,6 +44019,53 @@ fn decision_trace_endpoint_returns_capture_state() {
     assert_eq!(response.status, 200);
     assert!(response.body.contains("\"captureEnabled\":true"));
     assert!(response.body.contains("\"entries\""));
+}
+
+#[test]
+fn inspector_snapshot_exposes_engine_internals() {
+    let mut session = SoccerRealtimeSession::new_without_controller_threads(MatchConfig {
+        duration_seconds: 30.0,
+        seed: 72,
+        ..Default::default()
+    });
+    for _ in 0..30 {
+        session.sim.run_time_step();
+    }
+
+    let snapshot = session.inspector_snapshot(false);
+    let obj = snapshot.as_object().expect("snapshot is a JSON object");
+    for key in [
+        "schemaVersion",
+        "game",
+        "frame",
+        "learning",
+        "centralBrain",
+        "decisionTrace",
+        "perPlayerDecisions",
+        "rewards",
+        "neural",
+    ] {
+        assert!(obj.contains_key(key), "snapshot missing `{key}`");
+    }
+
+    let per_player = snapshot["perPlayerDecisions"]
+        .as_array()
+        .expect("perPlayerDecisions is an array");
+    assert_eq!(per_player.len(), 22);
+
+    let neural = snapshot["neural"]
+        .as_object()
+        .expect("neural section is an object");
+    assert!(neural.contains_key("home"));
+    assert!(neural.contains_key("away"));
+    if snapshot["neural"]["home"].is_object() {
+        assert!(snapshot["neural"]["home"]["trainingSteps"].is_number());
+        assert!(snapshot["neural"]["home"].get("networkSnapshot").is_none());
+        let with_weights = session.inspector_snapshot(true);
+        assert!(with_weights["neural"]["home"]
+            .get("networkSnapshot")
+            .is_some());
+    }
 }
 
 #[test]
@@ -53787,15 +54080,21 @@ fn soccer_playback_artifact_writer_persists_split_assets() {
     assert_eq!(meta["cadence"], meta["playback"]["cadence"]);
     assert_eq!(meta["cadence"]["dtSeconds"], trace.config.dt_seconds);
     assert_eq!(meta["cadence"]["tickHz"], 15.0);
-    assert_eq!(meta["cadence"]["tickMillis"], 100.0);
+    assert_eq!(
+        meta["cadence"]["tickMillis"],
+        trace.config.dt_seconds * 1_000.0
+    );
     assert_eq!(
         meta["cadence"]["durationSeconds"],
         trace.config.effective_duration_seconds()
     );
     assert_eq!(meta["cadence"]["totalTicks"], trace.config.total_ticks());
     assert_eq!(meta["cadence"]["defaultDtSeconds"], DEFAULT_DT_SECONDS);
-    assert_eq!(meta["cadence"]["defaultTickHz"], 10.0);
-    assert_eq!(meta["cadence"]["defaultTickMillis"], 100.0);
+    assert_eq!(meta["cadence"]["defaultTickHz"], 1.0 / DEFAULT_DT_SECONDS);
+    assert_eq!(
+        meta["cadence"]["defaultTickMillis"],
+        DEFAULT_DT_SECONDS * 1_000.0
+    );
     assert_eq!(
         meta["cadence"]["defaultDurationSeconds"],
         DEFAULT_DURATION_SECONDS
@@ -54103,15 +54402,18 @@ fn soccer_playback_streaming_writer_persists_every_tick_jsonl() {
     assert_eq!(meta["cadence"], meta["playback"]["cadence"]);
     assert_eq!(meta["cadence"]["dtSeconds"], config.dt_seconds);
     assert_eq!(meta["cadence"]["tickHz"], 15.0);
-    assert_eq!(meta["cadence"]["tickMillis"], 100.0);
+    assert_eq!(meta["cadence"]["tickMillis"], config.dt_seconds * 1_000.0);
     assert_eq!(
         meta["cadence"]["durationSeconds"],
         config.effective_duration_seconds()
     );
     assert_eq!(meta["cadence"]["totalTicks"], config.total_ticks());
     assert_eq!(meta["cadence"]["defaultDtSeconds"], DEFAULT_DT_SECONDS);
-    assert_eq!(meta["cadence"]["defaultTickHz"], 10.0);
-    assert_eq!(meta["cadence"]["defaultTickMillis"], 100.0);
+    assert_eq!(meta["cadence"]["defaultTickHz"], 1.0 / DEFAULT_DT_SECONDS);
+    assert_eq!(
+        meta["cadence"]["defaultTickMillis"],
+        DEFAULT_DT_SECONDS * 1_000.0
+    );
     assert_eq!(
         meta["cadence"]["defaultDurationSeconds"],
         DEFAULT_DURATION_SECONDS
@@ -54170,7 +54472,7 @@ fn soccer_playback_streaming_writer_persists_every_tick_jsonl() {
                 .expect("frame tick")
         })
         .collect::<Vec<_>>();
-    assert_eq!(ticks, vec![0, 1, 2, 3]);
+    assert_eq!(ticks, (0..=config.total_ticks()).collect::<Vec<_>>());
     assert_eq!(ticks.len() as u64, config.total_ticks() + 1);
     assert!(fs::read_dir(&out_dir)
         .expect("read out dir")
@@ -54214,8 +54516,13 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
         std::process::id()
     ));
 
-    let paths = write_soccer_playback_artifacts_streaming_to_dir(&out_dir, config.clone(), 100)
-        .expect("write sparse default playback assets");
+    let record_every_ticks = 100u64;
+    let paths = write_soccer_playback_artifacts_streaming_to_dir(
+        &out_dir,
+        config.clone(),
+        record_every_ticks,
+    )
+    .expect("write sparse default playback assets");
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&paths.meta_path).expect("meta asset"))
             .expect("meta json");
@@ -54224,8 +54531,11 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
     assert_eq!(meta["cadence"]["dtSeconds"], DEFAULT_DT_SECONDS);
     assert_eq!(meta["cadence"]["durationSeconds"], DEFAULT_DURATION_SECONDS);
     assert_eq!(meta["cadence"]["totalTicks"], 9_000);
-    assert_eq!(meta["cadence"]["recordEveryTicks"], 100);
-    assert_eq!(meta["cadence"]["expectedFrameCount"], 61);
+    assert_eq!(meta["cadence"]["recordEveryTicks"], record_every_ticks);
+    assert_eq!(
+        meta["cadence"]["expectedFrameCount"],
+        config.total_ticks() / record_every_ticks + 1
+    );
     assert_eq!(meta["cadence"]["tenHzTimestepContract"], true);
     assert_eq!(meta["cadence"]["tenMinuteDurationContract"], true);
     assert_eq!(meta["cadence"]["defaultTenMinuteContract"], true);
@@ -54375,15 +54685,27 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
     let agent_accounting_ok_frames = meta["tacticalLiveness"]["agentAccountingOkFrames"]
         .as_u64()
         .expect("agent accounting ok frames");
-    assert_eq!(agent_accounting_frames, 6001);
+    assert_eq!(agent_accounting_frames, config.total_ticks() + 1);
     assert_eq!(
         agent_accounting_ok_frames, agent_accounting_frames,
         "default trace should report complete agent accounting coverage"
     );
-    assert_eq!(meta["tacticalLiveness"]["fullRosterFrames"], 6001);
-    assert_eq!(meta["tacticalLiveness"]["completeScheduleFrames"], 6001);
-    assert_eq!(meta["tacticalLiveness"]["centralBrainDecisionFrames"], 6000);
-    assert_eq!(meta["tacticalLiveness"]["ballDecisionFrames"], 6000);
+    assert_eq!(
+        meta["tacticalLiveness"]["fullRosterFrames"],
+        config.total_ticks() + 1
+    );
+    assert_eq!(
+        meta["tacticalLiveness"]["completeScheduleFrames"],
+        config.total_ticks() + 1
+    );
+    assert_eq!(
+        meta["tacticalLiveness"]["centralBrainDecisionFrames"],
+        config.total_ticks()
+    );
+    assert_eq!(
+        meta["tacticalLiveness"]["ballDecisionFrames"],
+        config.total_ticks()
+    );
     assert_eq!(
         meta["tacticalLiveness"]["officialDecisionFrames"],
         SOCCER_MATCH_OFFICIAL_COUNT as u64 * config.total_ticks()
@@ -54496,7 +54818,7 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
     let lines = frame_lines.lines().collect::<Vec<_>>();
     assert_eq!(
         lines.len(),
-        61,
+        (config.total_ticks() / record_every_ticks + 1) as usize,
         "sparse default playback should emit initial frame plus every 100 ticks"
     );
     let first_frame: serde_json::Value =

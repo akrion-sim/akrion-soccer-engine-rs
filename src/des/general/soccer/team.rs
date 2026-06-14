@@ -470,12 +470,20 @@ mod team_strategy_mode_tests {
         sim.players[p].dizziness = 0.0;
         sim.ball.holder = None;
         // Force repeated large reversals: the ball jumps to opposite sides so the
-        // player whips its head back and forth.
-        for _ in 0..20 {
+        // player whips its head back and forth. Each side is held a few ticks so the
+        // head actually winds up to a fast spin before reversing — with realistic
+        // rotational inertia a body cannot build speed if the target flips EVERY tick
+        // (it just jitters slowly); a real whip-around is a fast spin one way, then the
+        // other, every few tenths of a second.
+        for _ in 0..10 {
             sim.ball.position = Vec2::new(40.0, 95.0);
-            sim.update_player_facing_dizziness_energy();
+            for _ in 0..3 {
+                sim.update_player_facing_dizziness_energy();
+            }
             sim.ball.position = Vec2::new(40.0, 25.0);
-            sim.update_player_facing_dizziness_energy();
+            for _ in 0..3 {
+                sim.update_player_facing_dizziness_energy();
+            }
         }
         let dizzy = sim.players[p].dizziness;
         assert!(
