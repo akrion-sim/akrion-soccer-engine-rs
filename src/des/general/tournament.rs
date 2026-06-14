@@ -639,7 +639,9 @@ impl Tournament {
                 let away_gd = self.teams[self.team_index(ctx.away_id)]
                     .record
                     .goal_difference();
-                let bias = ((home_gd - away_gd) as f64 / 16.0).clamp(-0.6, 0.6);
+                // Widen to i64 before subtracting: goal_difference() is i32 and accumulates
+                // across the whole run, so a pathological score can't overflow the subtraction.
+                let bias = ((i64::from(home_gd) - i64::from(away_gd)) as f64 / 16.0).clamp(-0.6, 0.6);
                 let winner = if rng.biased_coin(bias) {
                     ctx.home_id
                 } else {
@@ -693,6 +695,14 @@ impl Tournament {
         let mut current = bracket;
         while current.len() > 1 {
             let remaining = current.len();
+            // Defensive: the knockout fold assumes even rounds (validate() guarantees a
+            // power-of-two field for the standard advancers=2 config). A non-standard config
+            // producing an odd round would panic on `chunks(2)`'s `pair[1]`; fail cleanly.
+            if remaining % 2 != 0 {
+                return Err(format!(
+                    "knockout round has an odd team count ({remaining}); only even brackets are supported"
+                ));
+            }
             let stage = TournamentStage::Knockout { remaining };
             let mut winners = Vec::with_capacity(remaining / 2);
             let mut losers = Vec::with_capacity(remaining / 2);
@@ -911,6 +921,13 @@ impl Tournament {
         let mut current = bracket;
         while current.len() > 1 {
             let remaining = current.len();
+            // Defensive: see the serial path — keep `chunks(2)` total so an odd round fails
+            // cleanly instead of panicking on `pair[1]`.
+            if remaining % 2 != 0 {
+                return Err(format!(
+                    "knockout round has an odd team count ({remaining}); only even brackets are supported"
+                ));
+            }
             let stage = TournamentStage::Knockout { remaining };
             let wave: Vec<TournamentMatchContext> = current
                 .chunks(2)
@@ -1350,6 +1367,13 @@ impl TournamentMatchRunner for EngineMatchRunner {
             sim.run_time_step();
             guard += 1;
             if guard > max_ticks {
+                // The guard should never trip for a well-formed match (`is_done()` ends it
+                // first). Surface it instead of silently recording a truncated score, which
+                // would otherwise corrupt standings with no signal.
+                eprintln!(
+                    "tournament_match_guard_tripped home={} away={} max_ticks={max_ticks} score={}-{} (did not reach is_done; recording truncated score)",
+                    ctx.home_id, ctx.away_id, sim.score_home, sim.score_away
+                );
                 break;
             }
         }
