@@ -11427,6 +11427,20 @@ fn live_file_endpoint_auth_is_open_without_token_and_strict_with_one() {
 }
 
 #[test]
+fn introspection_read_is_gated_like_the_file_endpoints() {
+    assert!(live_introspection_requires_auth("GET", "/api/inspect"));
+    assert!(!live_introspection_requires_auth("GET", "/api/state"));
+    assert!(!live_introspection_requires_auth(
+        "GET",
+        "/api/decision-trace"
+    ));
+    assert!(!live_introspection_requires_auth("POST", "/api/inspect"));
+    assert!(live_file_endpoint_authorized(None, None));
+    assert!(live_file_endpoint_authorized(Some("tok"), Some("tok")));
+    assert!(!live_file_endpoint_authorized(Some("tok"), None));
+}
+
+#[test]
 fn live_admin_token_constant_time_eq_matches_only_exact() {
     assert!(constant_time_str_eq("s3cret-token", "s3cret-token"));
     assert!(!constant_time_str_eq("s3cret-token", "s3cret-toke"));
@@ -45201,7 +45215,7 @@ fn live_http_routes_state_and_step_json() {
         .contains("simTicksPerPulse.value || LIVE_DEFAULT_TICKS_PER_PULSE"));
     assert!(html
         .body
-        .contains("return clamp(Math.round(configuredSimTicksPerPulse() * dtScale), 1, 1000);"));
+        .contains("return clamp(Math.round(base * dtScale), 1, 1000);"));
     assert!(html
         .body
         .contains("<a id=\"freshMatchLink\" class=\"control-link\" href=\"/fresh\">Fresh</a>"));
@@ -45247,11 +45261,18 @@ fn live_http_routes_state_and_step_json() {
     assert_eq!(state.status, 200);
     assert!(state.body.contains("\"controllerAssignments\""));
     let state_value: serde_json::Value = serde_json::from_str(&state.body).expect("state json");
+    let expected_total_ticks = (1.0 / DEFAULT_DT_SECONDS).round() as u64;
     assert_eq!(state_value["learning"]["teamPoliciesEnabled"], true);
     assert_eq!(state_value["config"]["seed"], 55);
     assert_eq!(state_value["matchClock"]["tick"], 0);
-    assert_eq!(state_value["matchClock"]["totalTicks"], 10);
-    assert_eq!(state_value["matchClock"]["remainingTicks"], 10);
+    assert_eq!(
+        state_value["matchClock"]["totalTicks"],
+        expected_total_ticks
+    );
+    assert_eq!(
+        state_value["matchClock"]["remainingTicks"],
+        expected_total_ticks
+    );
     assert_eq!(state_value["matchClock"]["totalSeconds"], 1.0);
     assert_eq!(state_value["matchClock"]["remainingSeconds"], 1.0);
     assert_eq!(state_value["matchClock"]["progress"], 0.0);
@@ -45437,7 +45458,7 @@ fn live_http_routes_state_and_step_json() {
     assert_eq!(state_value["stepTiming"]["totalMs"], 0.0);
     assert_eq!(
         state_value["controllerLatencyBudget"]["tickBudgetMs"],
-        100.0
+        DEFAULT_DT_SECONDS * 1_000.0
     );
     assert_eq!(state_value["controllerLatencyBudget"]["consumedInputs"], 0);
     assert_eq!(state_value["controllerLatencyBudget"]["expiredInputs"], 0);
@@ -45471,11 +45492,20 @@ fn live_http_routes_state_and_step_json() {
     );
     assert_eq!(step.status, 200);
     let value: serde_json::Value = serde_json::from_str(&step.body).expect("step json");
+    let step_ticks = 2_u64;
     assert_eq!(value["summary"]["ticks"], 2);
     assert_eq!(value["matchClock"]["tick"], 2);
-    assert_eq!(value["matchClock"]["totalTicks"], 10);
-    assert_eq!(value["matchClock"]["remainingTicks"], 8);
-    assert!((value["matchClock"]["remainingSeconds"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+    assert_eq!(value["matchClock"]["totalTicks"], expected_total_ticks);
+    assert_eq!(
+        value["matchClock"]["remainingTicks"],
+        expected_total_ticks - step_ticks
+    );
+    assert!(
+        (value["matchClock"]["remainingSeconds"].as_f64().unwrap()
+            - (expected_total_ticks - step_ticks) as f64 * DEFAULT_DT_SECONDS)
+            .abs()
+            < 1e-9
+    );
     assert!(value["matchClock"]["progress"].as_f64().unwrap() > 0.0);
     assert_eq!(value["matchClock"]["done"], false);
     assert_eq!(value["episodeIndex"], 0);
@@ -45485,10 +45515,13 @@ fn live_http_routes_state_and_step_json() {
     assert_eq!(value["liveHttp"]["spawnsPerRequest"], false);
     assert_eq!(value["liveHttp"]["batchesStepTicks"], true);
     assert_eq!(value["stepTiming"]["ticks"], 2);
-    assert_eq!(value["stepTiming"]["tickBudgetMs"], 100.0);
+    assert_eq!(
+        value["stepTiming"]["tickBudgetMs"],
+        DEFAULT_DT_SECONDS * 1_000.0
+    );
     assert_eq!(
         value["stepTiming"]["learningBudgetMs"],
-        100.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
+        DEFAULT_DT_SECONDS * 1_000.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
     );
     assert!(value["stepTiming"]["overBudget"].is_boolean());
     assert!(value["stepTiming"]["learningOverBudget"].is_boolean());
@@ -45576,9 +45609,9 @@ fn live_http_routes_state_and_step_json() {
         "live HTTP step response should avoid duplicating the current frame"
     );
     assert!(
-            value["learningTransitions"].as_array().unwrap().is_empty(),
-            "live HTTP step response should rely on learning summaries instead of shipping every transition"
-        );
+        value["learningTransitions"].as_array().unwrap().is_empty(),
+        "live HTTP step response should rely on learning summaries instead of shipping every transition"
+    );
     assert!(value["recentMoments"].as_array().unwrap().is_empty());
     assert_eq!(value["momentStorage"]["storedRecords"], 0);
     assert_eq!(value["learning"]["totalTransitions"], 44);
@@ -55259,12 +55292,13 @@ fn live_soccer_page_exposes_four_human_controller_slots_and_keymaps() {
             "dt ${dt.toFixed(1)}s ${fmtClock(total)} left ${fmtClock(remaining)} ${totalTicks}t${contract}${done}"
         ));
     assert!(html.contains("dt ${dt.toFixed(1)}s ${fmtClock(duration)} ${totalTicks}t${contract}"));
-    assert!(
-        html.contains("return clamp(Math.round(configuredSimTicksPerPulse() * dtScale), 1, 1000);")
-    );
-    assert!(
-        html.contains("const ticksThisPulse = options.manual ? 1 : effectiveSimTicksPerPulse();")
-    );
+    assert!(html.contains("return clamp(Math.round(base * dtScale), 1, 1000);"));
+    assert!(html.contains("let ticksThisPulse = 1;"));
+    assert!(html.contains(
+        "clamp(base * (playbackSpeed || 1) * elapsedSec / Math.max(1e-3, dt), 0, 4000) + simTickCarry"
+    ));
+    assert!(html.contains("ticksThisPulse = Math.max(1, Math.floor(want));"));
+    assert!(html.contains("simTickCarry = Math.max(0, want - ticksThisPulse);"));
     assert!(html.contains("const inputText = liveControllerAssigned() ? \" + input\" : \"\";"));
     assert!(html.contains("observation.shotLaneOpen === true"));
     assert!(html.contains("observation.shotBlockProbability"));

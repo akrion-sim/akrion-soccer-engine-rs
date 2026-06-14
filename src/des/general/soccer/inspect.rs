@@ -391,6 +391,15 @@ impl BrainInspect {
 }
 
 impl FrameInspect {
+    /// The players actually present this frame, clamped to the fixed array bound.
+    /// `FrameInspect` may be read from an mmap file an external (or hostile) process
+    /// wrote, so `player_count` is untrusted; clamping here means a corrupt count
+    /// can never index out of bounds / panic in any reader path.
+    pub fn players_slice(&self) -> &[PlayerInspect] {
+        let n = (self.player_count as usize).min(INSPECT_MAX_PLAYERS);
+        &self.players[..n]
+    }
+
     /// Capture the current state of `sim` into a fresh frame. `write_seq` is left
     /// at 0; the ring writer owns the seqlock sequencing.
     pub fn capture(sim: &SoccerMatch) -> Self {
@@ -429,12 +438,17 @@ impl InspectRing {
     /// header. Errors propagate so the caller can decide whether to disable.
     pub fn create(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(true);
+        // The ring exposes raw sim internals; keep it owner-only (0600) so it is
+        // not world-readable in a shared /tmp. Set the mode at create time to avoid
+        // a window where the file exists with the default umask permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
         file.set_len(INSPECT_FILE_SIZE as u64)?;
         // SAFETY: the file is sized to exactly INSPECT_FILE_SIZE; we are the sole
         // writer of this freshly created mapping.
@@ -493,13 +507,22 @@ impl InspectRing {
         };
         seq.store(odd, Ordering::Release);
         fence(Ordering::Release);
-        frame.write_seq = odd + 1; // the even value we will publish
-                                   // SAFETY: writing the whole frame (including write_seq) into the slot.
+        // Bake the ODD (in-progress) value into the payload's leading write_seq
+        // field, NOT the even one we will publish. The bulk `write_unaligned`
+        // below rewrites those same leading 8 bytes; if we wrote the even value
+        // here, a cross-process reader could observe an even/"consistent" seq
+        // partway through the copy and return a torn frame. Writing `odd` keeps
+        // offset-0 byte-identical to the atomic store above (odd over odd) for the
+        // whole memcpy, so the slot reads "in-progress" until the final atomic
+        // store — the only thing that publishes the even value — completes.
+        frame.write_seq = odd;
+        // SAFETY: writing the whole frame into the slot.
         unsafe {
             std::ptr::write_unaligned(ptr, frame);
         }
         fence(Ordering::Release);
-        // End write: publish even seq.
+        // End write: publish even seq. This is the sole publisher of the even
+        // value, so a reader sees `even` only once every payload byte is in place.
         seq.store(odd + 1, Ordering::Release);
 
         // Publish newest index (count of frames written so far).
@@ -810,7 +833,8 @@ fn brain_json(br: &BrainInspect) -> serde_json::Value {
 
 fn frame_json(frame: &FrameInspect, selection: &InspectSelection) -> serde_json::Value {
     let fields = selection.fields_ref();
-    let players: Vec<serde_json::Value> = frame.players[..frame.player_count as usize]
+    let players: Vec<serde_json::Value> = frame
+        .players_slice()
         .iter()
         .filter(|p| selection.player_id.map(|id| p.id == id).unwrap_or(true))
         .map(|p| player_json_fields(p, &fields))
@@ -854,6 +878,12 @@ impl InspectSelection {
         self.sections.is_empty() || self.sections.iter().any(|s| s == name)
     }
 
+    /// Upper bound on how many `fields`/`sections` entries we retain from one
+    /// query, so a pathologically long query string can't amplify into a large
+    /// per-player projection loop (22 players × N fields). Far above any real use
+    /// (there are ~16 inspectable fields).
+    const MAX_SELECTOR_ITEMS: usize = 64;
+
     /// Parse from a raw query string (the part after `?`).
     pub fn from_query(query: &str) -> Self {
         let mut sel = InspectSelection::default();
@@ -871,6 +901,7 @@ impl InspectSelection {
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
+                        .take(Self::MAX_SELECTOR_ITEMS)
                         .collect();
                 }
                 "section" | "sections" => {
@@ -878,6 +909,7 @@ impl InspectSelection {
                         .split(',')
                         .map(|s| s.trim().to_ascii_lowercase())
                         .filter(|s| !s.is_empty())
+                        .take(Self::MAX_SELECTOR_ITEMS)
                         .collect();
                 }
                 "history" => {
@@ -1019,5 +1051,43 @@ mod inspect_tests {
         assert_eq!(sel.history, 45);
         assert!(sel.wants_section("players"));
         assert!(!sel.wants_section("ball"));
+    }
+
+    #[test]
+    fn selection_caps_selector_lists_against_query_amplification() {
+        let many = (0..500)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sel = InspectSelection::from_query(&format!("fields={many}&sections={many}"));
+        assert_eq!(sel.fields.len(), InspectSelection::MAX_SELECTOR_ITEMS);
+        assert_eq!(sel.sections.len(), InspectSelection::MAX_SELECTOR_ITEMS);
+    }
+
+    #[test]
+    fn players_slice_clamps_a_corrupt_player_count() {
+        // A frame read from an untrusted/corrupt mmap file can carry any
+        // player_count; the reader must clamp to the array bound, never panic.
+        let mut frame = FrameInspect::default();
+        frame.player_count = u32::MAX;
+        assert_eq!(frame.players_slice().len(), INSPECT_MAX_PLAYERS);
+        frame.player_count = 3;
+        assert_eq!(frame.players_slice().len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ring_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("soccer_inspect_perm_{}.shm", std::process::id()));
+        let _ring = InspectRing::create(&path).expect("create ring");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "ring file must not be world/group readable"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

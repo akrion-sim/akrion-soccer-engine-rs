@@ -30964,6 +30964,14 @@ fn live_file_endpoint_requires_auth(method: &str, path: &str) -> bool {
     )
 }
 
+/// The raw-internals introspection read (`GET /api/inspect`). It exposes live
+/// kinematics/brain state (and, in the deep tier, decision/learning internals), so
+/// when `SOCCER_LIVE_ADMIN_TOKEN` is set it must be locked down like the file
+/// endpoints. Default-open (token unset) preserves the local debugging workflow.
+fn live_introspection_requires_auth(method: &str, path: &str) -> bool {
+    matches!((method, path), ("GET", "/api/inspect"))
+}
+
 /// Authorization for a path read/write endpoint. Unlike the destructive `/api/server/*`
 /// gate (default-DENY), these are default-OPEN when no token is configured — saving/loading
 /// a policy to an operator-chosen (incl. absolute) path is a standard, tested workflow. When
@@ -31402,9 +31410,11 @@ fn handle_live_soccer_request_inner(
         Err(e) => return LiveHttpResponse::error(400, "Bad Request", &e),
     };
     let path = normalize_live_http_path(req.path);
-    // Gate the arbitrary read/write (path-bearing) endpoints behind the admin token when one
-    // is configured — default-open otherwise to preserve the standard save/load workflow.
-    if live_file_endpoint_requires_auth(req.method, path)
+    // Gate the arbitrary read/write (path-bearing) endpoints AND the raw-internals
+    // introspection read behind the admin token when one is configured — default-open
+    // otherwise to preserve the standard save/load + local-debugging workflow.
+    if (live_file_endpoint_requires_auth(req.method, path)
+        || live_introspection_requires_auth(req.method, path))
         && !live_file_endpoint_authorized(live_admin_token().as_deref(), req.auth)
     {
         return live_admin_forbidden();
