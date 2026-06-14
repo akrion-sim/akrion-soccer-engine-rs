@@ -86,6 +86,12 @@ pub struct SoccerMatch {
     pub(crate) restart_double_touch_guard: Option<usize>,
     pub(crate) recent_learning_history: VecDeque<SoccerLearningTransition>,
     pub(crate) deferred_reward_transitions: Vec<SoccerLearningTransition>,
+    /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
+    /// only while the turnover-window penalty is enabled, so a dispossession/interception
+    /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
+    pub(crate) turnover_penalty_history: VecDeque<SoccerLearningTransition>,
+    /// De-dupes the windowed penalty when multiple turnover signals fire on one tick.
+    pub(crate) last_turnover_penalty_tick: Option<u64>,
     pub(crate) defensive_delay_clocks: HashMap<usize, f64>,
     pub(crate) defensive_beat_clocks: HashMap<usize, f64>,
     pub(crate) offside_clocks: HashMap<usize, f64>,
@@ -482,6 +488,8 @@ impl SoccerMatch {
             }),
             recent_learning_history: VecDeque::new(),
             deferred_reward_transitions: Vec::new(),
+            turnover_penalty_history: VecDeque::new(),
+            last_turnover_penalty_tick: None,
             defensive_delay_clocks: HashMap::new(),
             defensive_beat_clocks: HashMap::new(),
             offside_clocks: HashMap::new(),
@@ -3478,14 +3486,14 @@ impl SoccerMatch {
                     );
                     // Anti-bunchball: keep at most two field players engaging the
                     // ball; bias any excess off-ball mover back to its formation slot.
-                    let intent = if std::env::var("DD_SOCCER_DISABLE_ANTI_BUNCH").is_ok() {
+                    let intent = if dd_soccer_disable_anti_bunch() {
                         intent
                     } else {
                         snapshot.discipline_intent_against_bunchball(intent)
                     };
                     // Territorial spacing: nudge a player the brain flagged as camped
                     // on a teammate back toward open space / its own slot.
-                    let intent = if std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok() {
+                    let intent = if dd_soccer_disable_spacing_nudge() {
                         intent
                     } else {
                         snapshot.nudge_intent_for_teammate_spacing(intent)
@@ -4422,6 +4430,8 @@ impl SoccerMatch {
         if let Some(pass) = intercepted_pass {
             let penalty = intercepted_pass_passer_penalty(pass, self.config.field_length_yards);
             self.record_reward_event(pass.from, -penalty);
+            // The intercepted team just turned the ball over — penalize its last ~5s.
+            self.penalize_turnover_window(pass.team);
         }
     }
 
@@ -5450,6 +5460,9 @@ impl SoccerMatch {
             -LOST_POSSESSION_CHAIN_PENALTY_POINTS,
             &LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS,
         );
+        // Retroactively penalize the dispossessed team's last ~5s of actions across all
+        // gradient learners (the chain penalty above only hits the turnover-tick touchers).
+        self.penalize_turnover_window(attacker_team);
         self.ball.holder = Some(defender_id);
         self.ball.position = (defender_position + defender_lead * 0.35).clamp_to_pitch(
             self.config.field_width_yards,
@@ -8792,7 +8805,7 @@ impl SoccerMatch {
             // metabolic power demand and lets it drain the reserve above CP or
             // recharge it below; `anaerobic_load` is the depletion fraction. A
             // legacy ad-hoc model is kept behind an env flag as an escape hatch.
-            if std::env::var("DD_SOCCER_DISABLE_POWER_DURATION_CEILING").is_ok() {
+            if dd_soccer_disable_power_duration_ceiling() {
                 let burst_load = match player.movement_gait {
                     MovementGait::Sprint => ANAEROBIC_SPRINT_LOAD_PER_SECOND,
                     MovementGait::Run => ANAEROBIC_SPRINT_LOAD_PER_SECOND * 0.45,
@@ -9614,6 +9627,64 @@ impl SoccerMatch {
         while self.recent_learning_history.len() > DEFENSIVE_GOAL_HISTORY_ACTIONS * 4 {
             self.recent_learning_history.pop_front();
         }
+        // Keep a separate ~5s window (evicted by tick-age) for the turnover penalty, only
+        // when enabled — so the feature adds zero cost when off.
+        if !dd_soccer_disable_turnover_window_penalty() {
+            for transition in transitions {
+                self.turnover_penalty_history.push_back(transition.clone());
+            }
+            let cutoff = self.tick.saturating_sub(TURNOVER_PENALTY_WINDOW_TICKS);
+            while self
+                .turnover_penalty_history
+                .front()
+                .is_some_and(|transition| transition.tick < cutoff)
+            {
+                self.turnover_penalty_history.pop_front();
+            }
+        }
+    }
+
+    /// Retroactively penalize the losing team's actions over the last
+    /// [`TURNOVER_PENALTY_WINDOW_TICKS`] (~5s) when it loses possession. Each recent
+    /// transition for that team is re-queued into `deferred_reward_transitions` with a
+    /// recency-scaled negative reward (full at the turnover tick, ramping to zero at the
+    /// window edge), so it is re-trained by tabular Q (`train_adversarial` + `policy.train`)
+    /// AND the neural value models — every gradient learner nudges those state→action pairs
+    /// down. De-duped per tick (simultaneous dispossession + interception penalize once) and
+    /// capped at [`TURNOVER_PENALTY_MAX_TRANSITIONS`] newest transitions. No-op when disabled.
+    pub(crate) fn penalize_turnover_window(&mut self, losing_team: Team) {
+        if dd_soccer_disable_turnover_window_penalty() || !self.config.learning_enabled {
+            return;
+        }
+        if self.last_turnover_penalty_tick == Some(self.tick) {
+            return;
+        }
+        self.last_turnover_penalty_tick = Some(self.tick);
+        let tick = self.tick;
+        let window = TURNOVER_PENALTY_WINDOW_TICKS.max(1);
+        let cutoff = tick.saturating_sub(window);
+        let mut penalized = Vec::new();
+        // Newest first: stop once we fall out of the window (history is tick-ordered).
+        for transition in self.turnover_penalty_history.iter().rev() {
+            if transition.tick < cutoff {
+                break;
+            }
+            if transition.team != losing_team {
+                continue;
+            }
+            let age = tick.saturating_sub(transition.tick) as f64;
+            let recency = (1.0 - age / window as f64).clamp(0.0, 1.0);
+            if recency <= 1e-3 {
+                continue;
+            }
+            let mut penalized_transition = transition.clone();
+            penalized_transition.reward -= TURNOVER_WINDOW_PENALTY_POINTS * recency;
+            penalized.push(penalized_transition);
+            if penalized.len() >= TURNOVER_PENALTY_MAX_TRANSITIONS {
+                break;
+            }
+        }
+        self.deferred_reward_transitions.extend(penalized);
     }
 
     pub(crate) fn learning_transitions_for(
@@ -10865,6 +10936,38 @@ pub(crate) fn open_space_score_from_distances(opponent_distance: f64, teammate_c
     let teammate_pressure = teammate_occupied_space_pressure_from_distance(teammate_crowding);
     opponent_distance * 0.68 + teammate_crowding * 0.32
         - TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY * teammate_pressure * 0.72
+}
+
+// Per-process cached reads of the `DD_SOCCER_DISABLE_*` toggles. These are set in the
+// environment and never change during a run, but were being read via `std::env::var` —
+// which takes a process-wide lock and allocates a String — on the hot per-player-per-tick
+// path (anti-bunch + spacing-nudge fire 2×/player/tick, the energy + defensive-pushup ones
+// once/player/tick). Caching them once removes ~tens of thousands of syscalls per match and
+// the lock contention that spikes the live server's tail latency. No test toggles these.
+fn dd_soccer_disable_anti_bunch() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ANTI_BUNCH").is_ok())
+}
+fn dd_soccer_disable_spacing_nudge() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
+}
+fn dd_soccer_disable_power_duration_ceiling() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_POWER_DURATION_CEILING").is_ok())
+}
+fn dd_soccer_disable_defensive_pushup() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP").is_ok())
+}
+fn dd_soccer_disable_turnover_window_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
 }
 
 fn pending_pass_snapshot_from(
@@ -18669,7 +18772,7 @@ impl WorldSnapshot {
         // mid/high block: it ramps to zero as the ball enters our defensive third,
         // so we hold and cover the goal (not push off goal-side) when the opponent
         // is attacking the box.
-        let pushup_on = std::env::var("DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP").is_err();
+        let pushup_on = !dd_soccer_disable_defensive_pushup();
         let line_forward_bias = if pushup_on && me.role == PlayerRole::Defender {
             let ball_from_own_goal =
                 (self.ball.position.y - self.own_goal_y_for(me.team)).abs();

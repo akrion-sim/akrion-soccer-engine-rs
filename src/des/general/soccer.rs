@@ -747,6 +747,17 @@ const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
 // largest share, and the previous one or two who built the move share the rest.
 const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 7.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
+// Beyond the immediate possession-chain penalty above, a turnover also retroactively
+// penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
+// for that team in the window is re-queued with a recency-scaled negative reward (full at
+// the turnover, ramping to zero at the window edge), so all gradient learners — tabular Q
+// (`train_adversarial` + `policy.train`) and the neural value/critic models — nudge those
+// state→action pairs down. 5 s = 75 ticks at dt = 1/15.
+pub(crate) const TURNOVER_PENALTY_WINDOW_TICKS: u64 = 75;
+const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 3.0;
+// Bound the re-queued work per turnover (newest, most-blameworthy transitions first) so a
+// flurry of turnovers can't back up the deferred-training queue.
+const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
 const FAILED_DISPOSSESSION_PENALTY_POINTS: f64 = 2.0;
 const LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS: f64 = FAILED_DISPOSSESSION_PENALTY_POINTS;
 const UNTARGETED_LONG_BALL_RECOVERY_REWARD_POINTS: f64 = 5.2;
