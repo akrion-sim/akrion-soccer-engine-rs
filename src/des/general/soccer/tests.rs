@@ -120,6 +120,88 @@
     }
 
     #[test]
+    fn tier2_mpc_is_inert_when_disabled_and_active_when_enabled() {
+        // Disabled (default): the analytic movement path runs and NO per-player
+        // MPC controller is ever instantiated, no matter how long the match runs.
+        let mut off = SoccerMatch::default_11v11(MatchConfig {
+            seed: 7_777,
+            ..Default::default()
+        });
+        assert!(!off.config.mpc.tier2_player_enabled);
+        for _ in 0..300 {
+            off.run_time_step();
+        }
+        assert!(
+            off.mpc_player_controllers.is_empty(),
+            "MPC must not allocate controllers when tier2 is off"
+        );
+
+        // Enabled: controllers are created lazily for the active subset (the ball
+        // carrier + nearby contesters), the match still advances normally, and no
+        // controller ever drives a player faster than the heuristic envelope (MPC
+        // can only brake, never exceed top speed).
+        let mut on = SoccerMatch::default_11v11(MatchConfig {
+            seed: 7_777,
+            mpc: SoccerMpcConfig {
+                tier2_player_enabled: true,
+                ..SoccerMpcConfig::default()
+            },
+            ..Default::default()
+        });
+        for _ in 0..300 {
+            on.run_time_step();
+        }
+        assert!(
+            !on.mpc_player_controllers.is_empty(),
+            "tier2 enabled should populate controllers for the active subset"
+        );
+        assert_eq!(on.tick, 300, "match must advance the same with MPC on");
+        // Every player still on the pitch is within physical speed limits.
+        for player in &on.players {
+            let speed = player.velocity.len();
+            let cap = player_top_speed_yps(player.role, &player.skills) * 1.5 + 1.0;
+            assert!(
+                speed <= cap,
+                "player {} exceeded plausible speed under MPC: {speed} > {cap}",
+                player.id
+            );
+        }
+    }
+
+    #[test]
+    fn mdp_mpc_reconciliation_records_divergence_and_blends_when_sensible() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 9_191,
+            mpc: SoccerMpcConfig {
+                tier2_player_enabled: true,
+                reconcile_enabled: true,
+                ..SoccerMpcConfig::default()
+            },
+            ..Default::default()
+        });
+        // No reconciliation has happened yet.
+        assert_eq!(sim.mpc_reconcile_stats().samples, 0);
+        for _ in 0..300 {
+            sim.run_time_step();
+        }
+        let stats = sim.mpc_reconcile_stats();
+        // Active players were compared every tick they moved.
+        assert!(stats.samples > 0, "expected MDP↔MPC comparisons to be recorded");
+        // Every sample was resolved exactly once: either blended or deferred.
+        assert_eq!(
+            stats.blended_samples + stats.deferred_to_policy_samples,
+            stats.samples,
+            "every compared sample must be resolved exactly one way"
+        );
+        // Divergence accounting is self-consistent.
+        assert!(stats.deviating_samples <= stats.samples);
+        assert!(stats.max_deviation_yps >= stats.mean_deviation_yps() - 1e-9);
+        assert!(stats.mean_deviation_yps() >= 0.0);
+        // The match still advanced normally under the blended controller.
+        assert_eq!(sim.tick, 300);
+    }
+
+    #[test]
     fn default_roster_exposes_role_specific_skills_to_learning_state() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             seed: 44_001,
@@ -28983,8 +29065,11 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
 
     #[test]
     fn carrier_turn_rate_drops_with_speed_and_below_off_ball_agility() {
-        // One tick of facing update with a 180° turn demanded; returns how far the body
-        // actually rotated.
+        // Integrate several ticks of a 180° turn and return how far the body rotated.
+        // (We integrate rather than measure one tick because, with realistic
+        // rotational inertia, the angular-ACCELERATION cap limits the first ticks
+        // identically regardless of speed — the speed-scaled rate cap only separates
+        // them as the turn winds up over time, which is the property under test.)
         let turn = |speed: f64, holder: bool| -> f64 {
             let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
             let id = 5usize;
@@ -28992,15 +29077,16 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
             sim.players[id].yaw_rate = 0.0;
             sim.players[id].action_facing = FacingBucket::West; // demand a 180° turn
             sim.players[id].velocity = Vec2::new(0.0, speed); // magnitude is what matters
-            if holder {
-                sim.ball.holder = Some(id);
-            } else {
-                sim.ball.holder = None;
-                // Off-ball players face the ball; put it due West for the same 180° demand.
-                sim.ball.position = sim.players[id].position - Vec2::new(10.0, 0.0);
-            }
+            // Ball due West in both cases, so the desired heading (~180° turn) is the
+            // same for the carrier (ball-follow) and the off-ball (face-the-ball) paths.
+            sim.ball.position = sim.players[id].position - Vec2::new(10.0, 0.0);
+            sim.ball.holder = if holder { Some(id) } else { None };
             let before = sim.players[id].facing_yaw;
-            sim.update_player_facing_dizziness_energy();
+            // Five ticks is short enough that none of the cases completes the 180°
+            // (so the cumulative rotation still ranks by the rate cap).
+            for _ in 0..5 {
+                sim.update_player_facing_dizziness_energy();
+            }
             (sim.players[id].facing_yaw - before).abs()
         };
 
@@ -29015,6 +29101,51 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert!(
             slow_carrier < off_ball - 1e-6,
             "even a slow carrier turns less freely than an off-ball player: carrier={slow_carrier:.3} off_ball={off_ball:.3}"
+        );
+    }
+
+    #[test]
+    fn rotational_inertia_makes_reversing_a_spin_take_real_time() {
+        // Regression for the "dribbler changes facing 5+ times in 3 s" flip-flop. The
+        // root cause was the angular-acceleration cap being ~20x too high, so a body
+        // spinning flat-out one way could reverse to flat-out the other in ~1.5 ticks
+        // (0.1 s) — letting the facing whip back and forth. With realistic inertia a
+        // reversal must take real time, so the body physically cannot whip.
+        //
+        // Drive a sustained opposite-direction demand and count the ticks needed to
+        // reverse a saturated spin. (At the old 80 rad/s² this took ~2 ticks; the body
+        // could flip its heading several times a second.)
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let id = 5usize;
+        park_players_except(&mut sim, &[id]);
+        sim.players[id].position = Vec2::new(40.0, 60.0);
+        sim.players[id].facing_yaw = 0.0; // facing East
+        sim.players[id].velocity = Vec2::zero();
+        sim.ball.holder = None; // off the ball: body faces the ball
+        // Ball due South ⇒ desired heading -π/2: a sustained demand to spin negative.
+        sim.ball.position = sim.players[id].position + Vec2::new(0.0, -10.0);
+        // Start already spinning flat-out the WRONG way (positive), so the controller
+        // has to decelerate through zero and build up the opposite spin.
+        let start_rate = 4.5;
+        sim.players[id].yaw_rate = start_rate;
+
+        let mut ticks_to_reverse = None;
+        for t in 1..=45 {
+            sim.update_player_facing_dizziness_energy();
+            // Fully reversed once the spin is saturated in the opposite direction.
+            if sim.players[id].yaw_rate <= -4.0 {
+                ticks_to_reverse = Some(t);
+                break;
+            }
+        }
+
+        let ticks = ticks_to_reverse.expect("the spin should eventually reverse");
+        // ~0.45 s of real inertia: from +4.5 to -4.0 at 18 rad/s² is ~7 ticks. Demand
+        // ≥6 so a regression back toward an inertia-free cap (which reverses in ~2) is
+        // caught. A real body simply cannot whip its heading around at the tick rate.
+        assert!(
+            ticks >= 6,
+            "reversing a saturated spin must take real time (rotational inertia); took {ticks} ticks"
         );
     }
 
@@ -43313,6 +43444,61 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert_eq!(response.status, 200);
         assert!(response.body.contains("\"captureEnabled\":true"));
         assert!(response.body.contains("\"entries\""));
+    }
+
+    #[test]
+    fn inspector_snapshot_exposes_engine_internals() {
+        let mut session = SoccerRealtimeSession::new_without_controller_threads(MatchConfig {
+            duration_seconds: 30.0,
+            seed: 72,
+            ..Default::default()
+        });
+        // Step a bit so per-agent decisions and learning state are populated.
+        for _ in 0..30 {
+            session.sim.run_time_step();
+        }
+
+        let snapshot = session.inspector_snapshot(false);
+
+        // Transport-agnostic data — a JSON object with all the internal sections.
+        let obj = snapshot.as_object().expect("snapshot is a JSON object");
+        for key in [
+            "schemaVersion",
+            "game",
+            "frame",
+            "learning",
+            "centralBrain",
+            "decisionTrace",
+            "perPlayerDecisions",
+            "rewards",
+            "neural",
+        ] {
+            assert!(obj.contains_key(key), "snapshot missing `{key}`");
+        }
+
+        // Every one of the 22 agents has a decision slot (on AND off the ball).
+        let per_player = snapshot["perPlayerDecisions"]
+            .as_array()
+            .expect("perPlayerDecisions is an array");
+        assert_eq!(per_player.len(), 22);
+
+        // The neural section is always present. The home critic is lazily created,
+        // so `home` may be null; when present it carries the critic internals, and
+        // the raw network snapshot stays opt-in (absent without `include_weights`).
+        let neural = snapshot["neural"]
+            .as_object()
+            .expect("neural section is an object");
+        assert!(neural.contains_key("home"));
+        assert!(neural.contains_key("away"));
+        if snapshot["neural"]["home"].is_object() {
+            assert!(snapshot["neural"]["home"]["trainingSteps"].is_number());
+            assert!(snapshot["neural"]["home"].get("networkSnapshot").is_none());
+            // Weights are embedded only when requested.
+            let with_weights = session.inspector_snapshot(true);
+            assert!(with_weights["neural"]["home"]
+                .get("networkSnapshot")
+                .is_some());
+        }
     }
 
     #[test]

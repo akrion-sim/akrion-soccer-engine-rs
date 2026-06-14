@@ -33,6 +33,10 @@ uuid = { version = "1", features = ["v4"] }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 native-tls = "0.2"
 postgres-native-tls = "0.5"
+# Zero-copy shared-memory snapshot ring for the external live-state inspector
+# (src/des/general/soccer/inspect.rs + the `soccer_inspect` bin). Tiny, pure,
+# cross-platform (macOS dev + Linux cluster); writer maps MmapMut, readers Mmap.
+memmap2 = "0.9"
 
 [features]
 default = []
