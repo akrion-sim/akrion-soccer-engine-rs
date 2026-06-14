@@ -163,16 +163,20 @@ spec:
                 - name: SOCCER_TOURNAMENT_SEED
                   value: "20260613"
               resources:
+                # Low scheduling floor so the job fits on busy/oversubscribed
+                # nodes (both clusters run many other pods); it still bursts to the
+                # 8-CPU limit when the node is idle (e.g. 2am), so throughput is
+                # unchanged when capacity is free.
                 requests:
-                  cpu: "4"
-                  memory: 8Gi
+                  cpu: "2"
+                  memory: 4Gi
                 limits:
-                  # Keep cpu == SOCCER_TOURNAMENT_THREADS (8). The tournament holds 128
-                  # neural brains + up to THREADS concurrent live matches — still far
-                  # below the continuous learner's Q-table bloat, so 32Gi is ample and
-                  # stays well under node RAM.
+                  # cpu == SOCCER_TOURNAMENT_THREADS (8). The tournament holds 128
+                  # neural brains + up to THREADS concurrent live matches — a few GB
+                  # in practice; 16Gi is ample and stays safely under the 32GB
+                  # Hetzner node RAM (and well under the 128GB AWS node).
                   cpu: "8"
-                  memory: 32Gi
+                  memory: 16Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
