@@ -1596,6 +1596,50 @@ mod tests {
     }
 
     #[test]
+    fn run_parallel_progress_callback_delivers_committed_reports_and_teams() {
+        // The as-you-go Postgres persistence depends on the progress callback exposing the
+        // committed reports (to write fixtures) and the current teams (to checkpoint brains).
+        let format = TournamentFormat {
+            team_count: 16,
+            group_size: 4,
+            advancers_per_group: 2,
+            double_round_robin: false,
+            third_place_match: true,
+        };
+        let teams = fresh_teams(16, 7);
+        let runner_seed_teams = teams.clone();
+        let tournament =
+            Tournament::new(teams, format, TournamentLearningMode::BiLearning, 7).unwrap();
+        let runner = StrengthMatchRunner::from_teams(&runner_seed_teams);
+
+        let mut callbacks = 0usize;
+        let mut max_reports = 0usize;
+        let mut team_counts_ok = true;
+        let mut monotonic = true;
+        let mut last_reports = 0usize;
+        let report = tournament
+            .run_parallel(&runner, 4, None, |progress, reports, teams| {
+                callbacks += 1;
+                // matches_played mirrors the committed-reports length, and reports only grow.
+                if progress.matches_played != reports.len() || reports.len() < last_reports {
+                    monotonic = false;
+                }
+                last_reports = reports.len();
+                max_reports = max_reports.max(reports.len());
+                if teams.len() != 16 {
+                    team_counts_ok = false;
+                }
+            })
+            .unwrap();
+
+        assert!(callbacks > 0, "callback should fire per wave");
+        assert!(monotonic, "reports must equal matches_played and never shrink");
+        assert!(team_counts_ok, "every callback sees the full team list");
+        // The final callback sees every match the report holds.
+        assert_eq!(max_reports, report.match_count());
+    }
+
+    #[test]
     fn parallel_run_matches_sequential_run_exactly() {
         // run_parallel batches matches into team-disjoint waves, so it must crown
         // the identical bracket the sequential run does — champion, podium, group
