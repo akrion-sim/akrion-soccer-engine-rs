@@ -361,7 +361,7 @@
       <div class="row">
         <button id="run" aria-label="Run live simulation">Run</button>
         <button id="step">Step</button>
-        <button id="pauseAnalyze" title="Pause and dump the last 100 on-ball MDP/POMDP decisions">Pause &amp; Analyze</button>
+        <button id="pauseAnalyze" title="Pause and dump the last 10 seconds of player decisions">Pause &amp; Analyze</button>
         <button id="pauseDrag" title="Pause and drag players to where they should be (drop on the pitch; same team as the ball-holder = receive spot)">Pause &amp; Drag</button>
         <button id="resetMatch">New Match</button>
         <a id="freshMatchLink" class="control-link" href="/fresh">Fresh</a>
@@ -641,7 +641,7 @@
 <div id="analyzeOverlay" role="dialog" aria-modal="true" aria-label="Decision analysis">
   <div id="analyzePanel">
     <div id="analyzeHead">
-      <h2>Pause &amp; Analyze — last on-ball MDP/POMDP decisions</h2>
+      <h2>Pause &amp; Analyze — last 10s of player decisions</h2>
       <span id="analyzeMeta"></span>
       <button id="analyzeCopy" type="button" title="Copy the full decision trace to the clipboard as JSON">Copy JSON</button>
       <button id="analyzeClose" type="button">Close</button>
@@ -5366,8 +5366,8 @@ function renderDecisionTrace(payload) {
   lastDecisionTracePayload = payload ?? null;
   const entries = (payload && payload.entries) || [];
   analyzeMeta.textContent = entries.length
-    ? `${entries.length} on-ball decisions, newest first${payload.captureEnabled ? "" : " — capture OFF"}`
-    : (payload && payload.captureEnabled ? "no on-ball decisions captured yet" : "decision capture is OFF");
+    ? `${entries.length} player decisions (last 10s), newest first${payload.captureEnabled ? "" : " — capture OFF"}`
+    : (payload && payload.captureEnabled ? "no player decisions captured yet" : "decision capture is OFF");
   if (!entries.length) {
     analyzeBody.innerHTML = '<div class="dtrow">Nothing captured yet — let the match run a few seconds with the ball in play, then Pause &amp; Analyze again.</div>';
     return;

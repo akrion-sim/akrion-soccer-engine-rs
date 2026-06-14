@@ -144,14 +144,12 @@ pub struct SoccerMatch {
     /// `decision_trace_capture_enabled`. Powers the live UI's "Pause & Analyze"
     /// dump so a human can see exactly which state/options/action produced bad
     /// play, including why off-ball players (e.g. a striker) did or didn't attack.
-    /// Each ring is bounded to `SOCCER_DECISION_TRACE_PER_PLAYER`, so it is
-    /// negligible memory and zero work when capture is off. Never serialized into
-    /// the per-tick state frame.
+    /// Each ring holds only the last `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of a
+    /// player's DISTINCT decisions, so it is negligible memory and zero work when
+    /// capture is off. Player decisions only — the team brain is not captured
+    /// here. Never serialized into the per-tick state frame.
     pub(crate) decision_trace_capture_enabled: bool,
     pub(crate) decision_trace_by_player: BTreeMap<usize, VecDeque<LiveDecisionTraceEntry>>,
-    /// Companion ring of the team (central) brain's most recent DISTINCT tactical
-    /// decisions, on the same change-only basis.
-    pub(crate) decision_trace_brain: VecDeque<CentralBrainDecisionTrace>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -539,7 +537,6 @@ impl SoccerMatch {
             possession_swaps: VecDeque::new(),
             decision_trace_capture_enabled: false,
             decision_trace_by_player: BTreeMap::new(),
-            decision_trace_brain: VecDeque::new(),
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -3257,7 +3254,6 @@ impl SoccerMatch {
         self.decision_trace_capture_enabled = enabled;
         if !enabled {
             self.decision_trace_by_player.clear();
-            self.decision_trace_brain.clear();
         }
     }
 
@@ -3266,28 +3262,29 @@ impl SoccerMatch {
     }
 
     /// Every captured player decision (all 22 players' rings flattened), NEWEST
-    /// first (index 0 = most recent tick). Each player contributes up to
-    /// `SOCCER_DECISION_TRACE_PER_PLAYER` distinct decisions.
+    /// first (index 0 = most recent tick). Only the last
+    /// `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of distinct decisions are returned —
+    /// re-applied here so a paused match (clock frozen, no new writes pruning)
+    /// still reports only the final window.
     pub fn decision_trace_recent(&self) -> Vec<LiveDecisionTraceEntry> {
+        let cutoff = self.clock_seconds - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
         let mut all: Vec<LiveDecisionTraceEntry> = self
             .decision_trace_by_player
             .values()
-            .flat_map(|ring| ring.iter().cloned())
+            .flat_map(|ring| ring.iter())
+            .filter(|entry| entry.clock_seconds >= cutoff)
+            .cloned()
             .collect();
         all.sort_by(|a, b| b.tick.cmp(&a.tick).then(a.player_id.cmp(&b.player_id)));
         all
     }
 
-    /// The team (central) brain's recent distinct tactical decisions, NEWEST first.
-    pub fn decision_trace_brain_recent(&self) -> Vec<CentralBrainDecisionTrace> {
-        self.decision_trace_brain.iter().rev().cloned().collect()
-    }
-
     /// Append each player's last decision to that player's ring, but ONLY when the
     /// chosen action changed from their previous recorded decision (decisions
     /// repeat every tick; we keep distinct ones so the ring spans seconds). Records
-    /// ALL 22 players (on- and off-ball) plus the team brain. No-op unless capture
-    /// is enabled.
+    /// ALL 22 players (on- and off-ball). The team brain is intentionally not
+    /// captured — the trace is player decisions only. No-op unless capture is
+    /// enabled.
     fn record_decision_trace_if_enabled(&mut self) {
         if !self.decision_trace_capture_enabled {
             return;
@@ -3306,6 +3303,7 @@ impl SoccerMatch {
                     .map(|decision| build_live_decision_trace_entry(player, decision, tick, clock))
             })
             .collect();
+        let cutoff = clock - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
         for entry in entries {
             let ring = self.decision_trace_by_player.entry(entry.player_id).or_default();
             let changed = ring.back().map_or(true, |last| {
@@ -3314,22 +3312,14 @@ impl SoccerMatch {
             });
             if changed {
                 ring.push_back(entry);
-                while ring.len() > SOCCER_DECISION_TRACE_PER_PLAYER {
-                    ring.pop_front();
-                }
             }
-        }
-        if let Some(brain) = self.central_brain.last_decision.as_ref() {
-            let changed = self.decision_trace_brain.back().map_or(true, |last| {
-                last.action != brain.action
-                    || last.phase != brain.phase
-                    || last.possession_team != brain.possession_team
-            });
-            if changed {
-                self.decision_trace_brain.push_back(brain.clone());
-                while self.decision_trace_brain.len() > SOCCER_DECISION_TRACE_PER_PLAYER {
-                    self.decision_trace_brain.pop_front();
-                }
+            // Keep only the last `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of decisions
+            // (entries are appended in clock order, so the front is the oldest), with
+            // the per-player count as a hard memory-safety backstop.
+            while ring.front().is_some_and(|front| front.clock_seconds < cutoff)
+                || ring.len() > SOCCER_DECISION_TRACE_PER_PLAYER
+            {
+                ring.pop_front();
             }
         }
     }

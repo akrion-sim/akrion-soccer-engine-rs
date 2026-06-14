@@ -10421,14 +10421,8 @@
             classify_movement_gait(Team::Home, Vec2::new(0.0, -8.0), false, true),
             MovementGait::Run
         );
-        // A 4yd lateral move is real ground to cover — turn and run (jog) facing it,
-        // not a sideways shuffle. Only a SHORT (<=2.5yd) lateral move side-steps.
         assert_eq!(
             classify_movement_gait(Team::Home, Vec2::new(4.0, 0.2), false, false),
-            MovementGait::Jog
-        );
-        assert_eq!(
-            classify_movement_gait(Team::Home, Vec2::new(2.0, 0.1), false, false),
             MovementGait::SideStep
         );
         assert_eq!(
@@ -10506,25 +10500,12 @@
         sim.players[player].position = Vec2::new(40.0, 60.0);
         sim.players[player].velocity = Vec2::zero();
 
-        // A SHORT lateral move is a shuffle: keep the chest/eyes toward the ball.
-        sim.move_player_towards(player, Vec2::new(42.0, 60.0), false);
+        sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
         assert_eq!(sim.players[player].movement_gait, MovementGait::SideStep);
         assert_eq!(
             sim.players[player].action_facing,
             FacingBucket::South,
-            "a short side-step keeps the chest/eyes toward the ball, not the lateral shuffle"
-        );
-
-        // A LONGER lateral move is real ground to cover — turn and run (jog) facing the
-        // direction of travel rather than shuffling sideways across the pitch.
-        sim.players[player].position = Vec2::new(40.0, 60.0);
-        sim.players[player].velocity = Vec2::zero();
-        sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
-        assert_eq!(sim.players[player].movement_gait, MovementGait::Jog);
-        assert_ne!(
-            sim.players[player].action_facing,
-            FacingBucket::South,
-            "a lateral RUN faces the direction of travel, not the ball"
+            "side-stepping defenders should keep their chest/eyes toward the ball, not the lateral shuffle"
         );
 
         sim.ball.position = Vec2::new(40.0, 40.0);
@@ -43212,15 +43193,26 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert!(sim.decision_trace_recent().is_empty());
         assert!(!sim.decision_trace_capture_enabled());
 
-        // Enable and run well past the cap: the ring buffer fills and stays bounded.
+        // Enable and run well past the 10s window: the ring buffer only ever
+        // retains the last `SOCCER_DECISION_TRACE_WINDOW_SECONDS` of decisions.
+        // At 1/15s per tick, 300 ticks is 20s — twice the window.
         sim.set_decision_trace_capture(true);
-        for _ in 0..150 {
+        for _ in 0..300 {
             sim.run_time_step();
         }
         let trace = sim.decision_trace_recent();
         assert!(!trace.is_empty(), "capture should record decisions");
-        // Per-player rings stay bounded; ALL players (on- and off-ball) are now
-        // captured, not just the holder.
+        // Only the last 10s of decisions are retained — nothing older leaks through.
+        let cutoff = sim.clock_seconds - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
+        for entry in &trace {
+            assert!(
+                entry.clock_seconds >= cutoff,
+                "entry at {}s is older than the {SOCCER_DECISION_TRACE_WINDOW_SECONDS}s window (cutoff {cutoff}s)",
+                entry.clock_seconds
+            );
+        }
+        // Per-player rings stay bounded by the memory-safety backstop; ALL players
+        // (on- and off-ball) are now captured, not just the holder.
         let mut per_player: HashMap<usize, usize> = HashMap::new();
         for entry in &trace {
             *per_player.entry(entry.player_id).or_default() += 1;

@@ -374,9 +374,6 @@ const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
 const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
-// Eyes-on-ball shuffles (side-step / skip) only cover a SHORT distance; beyond this a
-// player turns and runs facing the direction of travel (no "running sideways").
-const SHUFFLE_MAX_DISTANCE_YARDS: f64 = 2.5;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
 const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 // --- Carried-ball orbital mechanics (planet/sun dribbling model) ---
@@ -671,6 +668,20 @@ const DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL: f64 = 36.0;
 // the learned policy dribbles straight past an obviously open advanced outlet.
 const OPEN_OUTLET_RELEASE_OPENNESS: f64 = 0.55;
 const OPEN_OUTLET_RELEASE_COMPLETION: f64 = 0.62;
+// Under the genuine pressure that reaches the elite-dribbler hold exemption, even an
+// elite carrier with forward room yields the ball to a clearly-open ADVANCED outlet
+// rather than carrying into the tackle. Lower than the pressure-independent
+// `OPEN_OUTLET_RELEASE_OPENNESS` (0.55) on purpose: we only get here when the carrier
+// is already under real pressure, where moving the ball to an open forward runner
+// beats dribbling on. Closes the "elite ignored an open pass and dribbled into a
+// turnover" hole. The elite only yields when ALSO genuinely about to be
+// dispossessed (below) — in moderate pressure he keeps the carry, which is the
+// whole point of the exemption.
+const ELITE_HOLD_OPEN_FORWARD_OUTLET_OPENNESS: f64 = 0.46;
+// The elite-carry exemption is only overridden when the carrier is genuinely about
+// to lose the ball. Above this immediate-dispossession risk, carrying on with an
+// open forward outlet is a likely giveaway, so the elite yields the pass.
+const ELITE_HOLD_YIELD_DISPOSSESSION_RISK: f64 = 0.5;
 // A learned-policy pass is only executed if SOMETHING about it is viable — either
 // a real completion estimate or an open receiver. When BOTH are below these floors
 // the "pass" is a hoof at nobody (the giveaways seen live: aerial-pass at
@@ -3556,11 +3567,16 @@ pub struct AgentDecisionTrace {
     pub action: String,
 }
 
-/// How many on-ball decisions the live "Pause & Analyze" ring buffer retains.
-// Pause & Analyze keeps the last N DISTINCT decisions PER player (all 22) plus
-// the team brain. Decisions repeat tick-to-tick, so we only append when the
-// chosen action changes — 50 distinct decisions then span several seconds of
-// play, not a fraction of one. ~22*50 + 50 ≈ 1150 small structs: negligible.
+/// The live "Pause & Analyze" ring retains only the last
+/// [`SOCCER_DECISION_TRACE_WINDOW_SECONDS`] of *player* decisions — and only the
+/// DISTINCT ones (we append a player's entry only when its chosen action changes
+/// from the last recorded one, since decisions repeat tick-to-tick). The team
+/// brain is deliberately NOT captured here: the trace is player decisions only.
+const SOCCER_DECISION_TRACE_WINDOW_SECONDS: f64 = 10.0;
+
+/// Hard per-player ring cap, kept purely as a memory-safety bound on the
+/// time-window above (a player thrashing its action every tick can't grow the
+/// ring without limit). In normal play the 10s window binds first.
 const SOCCER_DECISION_TRACE_PER_PLAYER: usize = 50;
 
 /// One scored action option in a captured decision (a row of the "why").
@@ -30896,20 +30912,17 @@ fn handle_live_soccer_request_inner(
             }
         }
         ("GET", "/api/decision-trace") | ("GET", "/api/decisions") => {
-            let (enabled, entries, brain) = {
+            let (enabled, entries) = {
                 let guard = soccer_mutex_lock(session, "soccer_live_session");
                 (
                     guard.sim.decision_trace_capture_enabled(),
                     guard.sim.decision_trace_recent(),
-                    guard.sim.decision_trace_brain_recent(),
                 )
             };
             LiveHttpResponse::json(&serde_json::json!({
                 "captureEnabled": enabled,
                 "count": entries.len(),
                 "entries": entries,
-                "brainCount": brain.len(),
-                "brain": brain,
             }))
         }
         ("GET", "/api/team-policy") | ("GET", "/api/policy") => {
@@ -42426,18 +42439,13 @@ fn classify_movement_gait(team: Team, to_target: Vec2, sprint: bool, chased: boo
         }
     } else if sprint && distance > 1.0 {
         MovementGait::Sprint
-    } else if lateral_dominant && distance > 0.75 && distance <= SHUFFLE_MAX_DISTANCE_YARDS {
-        // A side-step / shuffle keeps the eyes on the ball, but ONLY over a short
-        // distance — you cannot shuffle sideways across the pitch. Covering real
-        // ground (below) turns and runs facing the direction of travel.
+    } else if lateral_dominant && distance > 0.75 && distance <= 7.0 {
         MovementGait::SideStep
     } else if distance <= 1.8 {
         MovementGait::Walk
-    } else if distance <= SHUFFLE_MAX_DISTANCE_YARDS {
+    } else if distance <= 4.6 {
         MovementGait::Skip
     } else if distance <= 10.0 {
-        // Covering ground: a jog faces the movement direction (no more "running
-        // sideways" — a real run turns to face where it is going).
         MovementGait::Jog
     } else {
         MovementGait::Run
@@ -42734,13 +42742,11 @@ fn movement_action_facing_bucket(
         return current_facing;
     }
 
-    // A genuine RUN faces the direction of travel — you cannot jog/run/sprint sideways
-    // or keep facing the ball while covering ground. (The slower shuffle gaits below —
-    // walk / skip / side-step / back-pedal — keep the eyes on the ball.)
-    if matches!(
-        gait,
-        MovementGait::Jog | MovementGait::Run | MovementGait::Sprint
-    ) && to_target.len() > PLAYER_CONTROL_RADIUS_YARDS
+    // A RUN or SPRINT faces the direction of travel — you cannot run/sprint sideways
+    // or keep facing the ball while flat-out covering ground. (The slower gaits — walk
+    // / jog / skip / side-step / back-pedal — keep the eyes on the ball to track play.)
+    if matches!(gait, MovementGait::Run | MovementGait::Sprint)
+        && to_target.len() > PLAYER_CONTROL_RADIUS_YARDS
     {
         return facing_bucket_from_vector(to_target);
     }

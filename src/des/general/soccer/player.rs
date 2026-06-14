@@ -4507,10 +4507,21 @@ impl PlayerAgent {
 
         // Even an elite dribbler is NOT exempt when boxed in: with no forward
         // space ahead, carrying on simply walks the ball into the defender.
-        // Only exempt the elite when there is genuine room to attack.
+        // Only exempt the elite when there is genuine room to attack. He ALSO
+        // yields the carry when he is genuinely about to be dispossessed AND a
+        // forward teammate is clearly open — there, carrying on just gifts the ball
+        // away, so the open forward pass is the better ball. (Falls through to the
+        // floor-pass release below, which is guaranteed viable since overall
+        // openness >= the open forward openness here.) In moderate pressure the
+        // elite keeps the carry — the whole point of the exemption.
+        let yield_to_open_forward_outlet = observation.visible_forward_pass_options > 0
+            && observation.best_forward_pass_receiver_openness
+                >= ELITE_HOLD_OPEN_FORWARD_OUTLET_OPENNESS
+            && observation.immediate_dispossession_risk >= ELITE_HOLD_YIELD_DISPOSSESSION_RISK;
         if dribbling >= NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF
             && hold_pressure < 0.64
             && observation.forward_dribble_space_yards >= carry_min_forward_space
+            && !yield_to_open_forward_outlet
         {
             return None;
         }
