@@ -10801,10 +10801,32 @@ pub struct SoccerMpcConfig {
     /// tick is counted as "deviating" in the reconciliation stats.
     #[serde(default = "default_soccer_mpc_deviation_threshold_yps")]
     pub deviation_threshold_yps: f64,
+    /// Field awareness: when on (requires `tier2_player_enabled`), the per-player
+    /// MPC plans around the *other 22 players* — each nearby player becomes a
+    /// moving soft keep-out propagated along its own velocity over the horizon, so
+    /// the planned path bends around where opponents/teammates *will be*. Off by
+    /// default (the plan only tracks its target).
+    #[serde(default)]
+    pub field_aware_enabled: bool,
+    /// Keep-out radius (yards) around each opponent the plan avoids.
+    #[serde(default = "default_soccer_mpc_opponent_keepout_yards")]
+    pub opponent_keepout_yards: f64,
+    /// Keep-out radius (yards) around each teammate (smaller — just don't collide;
+    /// shape/spacing is owned by the formation LP, not this layer).
+    #[serde(default = "default_soccer_mpc_teammate_keepout_yards")]
+    pub teammate_keepout_yards: f64,
+    /// Soft-penalty weight on opponent incursion (per yard²). Teammates use a
+    /// quarter of this.
+    #[serde(default = "default_soccer_mpc_keepout_weight")]
+    pub keepout_weight: f64,
 }
 
 fn default_soccer_mpc_player_horizon() -> usize {
-    12
+    // ~3.0 s of lookahead at the 15 Hz default tick (45 × 1/15). Long enough to
+    // plan a real route around traffic and brake smoothly into a target, short
+    // enough that constant-velocity opponent prediction (decayed further by
+    // `obstacle_decay_per_step`) is still worth something.
+    45
 }
 
 fn default_soccer_mpc_active_radius_yards() -> f64 {
@@ -10823,6 +10845,18 @@ fn default_soccer_mpc_deviation_threshold_yps() -> f64 {
     1.0
 }
 
+fn default_soccer_mpc_opponent_keepout_yards() -> f64 {
+    2.0
+}
+
+fn default_soccer_mpc_teammate_keepout_yards() -> f64 {
+    1.5
+}
+
+fn default_soccer_mpc_keepout_weight() -> f64 {
+    40.0
+}
+
 impl Default for SoccerMpcConfig {
     fn default() -> Self {
         SoccerMpcConfig {
@@ -10834,6 +10868,10 @@ impl Default for SoccerMpcConfig {
             blend_alpha: default_soccer_mpc_blend_alpha(),
             blend_min_alignment: default_soccer_mpc_blend_min_alignment(),
             deviation_threshold_yps: default_soccer_mpc_deviation_threshold_yps(),
+            field_aware_enabled: false,
+            opponent_keepout_yards: default_soccer_mpc_opponent_keepout_yards(),
+            teammate_keepout_yards: default_soccer_mpc_teammate_keepout_yards(),
+            keepout_weight: default_soccer_mpc_keepout_weight(),
         }
     }
 }

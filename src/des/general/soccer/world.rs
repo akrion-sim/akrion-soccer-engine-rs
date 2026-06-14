@@ -6912,16 +6912,43 @@ impl SoccerMatch {
     /// across ticks. `None` on degenerate input (caller falls back to the policy).
     fn mpc_desired_velocity(&mut self, player_id: usize, target: Vec2, speed: f64) -> Option<Vec2> {
         use crate::des::general::mpc_point_mass::{
-            PlanarMpcConfig, PlanarPointMassMpc, PlanarReference, PlanarState,
+            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
         };
         let player = self.players.get(player_id)?;
         let pos = player.position;
         let vel = player.velocity;
+        let my_team = player.team;
         // Acceleration disk radius from the player's own acceleration attribute —
         // the dominant term in the downstream accel limit, which re-clamps anyway.
         let accel_cap = acceleration_yps2_from_score(player.skills.acceleration).max(0.5);
         let dt = self.config.dt_seconds;
         let horizon = self.config.mpc.player_horizon.max(1);
+
+        // Field awareness: every OTHER player becomes a moving soft keep-out,
+        // propagated along its own velocity over the horizon, so the plan accounts
+        // for all 22 players' positions AND velocities (opponents weighted harder
+        // than teammates; the ball influences the target/reference upstream, not
+        // as a keep-out). Built before the mutable controller borrow below.
+        let obstacles: Vec<PlanarObstacle> = if self.config.mpc.field_aware_enabled {
+            let opp_r = self.config.mpc.opponent_keepout_yards.max(0.0);
+            let team_r = self.config.mpc.teammate_keepout_yards.max(0.0);
+            let w = self.config.mpc.keepout_weight.max(0.0);
+            self.players
+                .iter()
+                .filter(|o| o.id != player_id)
+                .map(|o| {
+                    let opponent = o.team != my_team;
+                    PlanarObstacle {
+                        center: [o.position.x, o.position.y],
+                        velocity: [o.velocity.x, o.velocity.y],
+                        radius: if opponent { opp_r } else { team_r },
+                        weight: if opponent { w } else { w * 0.25 },
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let stale = self
             .mpc_player_controllers
@@ -6934,10 +6961,18 @@ impl SoccerMatch {
             })
             .unwrap_or(true);
         if stale {
+            // More projected-gradient iterations for the longer (multi-second)
+            // horizon so a cold solve converges; warm-started ticks stop early.
+            let iters = ((horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+            // Trust obstacle predictions with a ~1.5 s half-life (dt-robust), so the
+            // far end of a 3 s plan discounts constant-velocity opponent fiction.
+            let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5);
             let cfg = PlanarMpcConfig {
                 horizon,
                 dt,
                 a_max: accel_cap,
+                iters,
+                obstacle_decay_per_step,
                 ..PlanarMpcConfig::default()
             };
             let controller = PlanarPointMassMpc::new(cfg).ok()?;
@@ -6950,7 +6985,7 @@ impl SoccerMatch {
             vel: [vel.x, vel.y],
         };
         let reference = PlanarReference::arrive([target.x, target.y]);
-        let accel = controller.control(state, &[reference]);
+        let accel = controller.control_with_obstacles(state, &[reference], &obstacles);
         let next = Vec2::new(vel.x + accel[0] * dt, vel.y + accel[1] * dt);
         // Cap to the heuristic speed envelope (MPC may only equal or undercut it).
         let len = next.len();

@@ -169,6 +169,33 @@
     }
 
     #[test]
+    fn field_aware_mpc_runs_a_full_match_without_breaking_physics() {
+        // Tier-2 + field awareness: the per-player MPC plans around all other 22
+        // players as moving keep-outs. The match must advance normally and every
+        // player stays within plausible speed limits.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 5_150,
+            mpc: SoccerMpcConfig {
+                tier2_player_enabled: true,
+                field_aware_enabled: true,
+                ..SoccerMpcConfig::default()
+            },
+            ..Default::default()
+        });
+        for _ in 0..300 {
+            sim.run_time_step();
+        }
+        assert_eq!(sim.tick, 300);
+        assert!(!sim.mpc_player_controllers.is_empty());
+        for player in &sim.players {
+            let speed = player.velocity.len();
+            assert!(speed.is_finite(), "player {} got non-finite velocity", player.id);
+            let cap = player_top_speed_yps(player.role, &player.skills) * 1.5 + 1.0;
+            assert!(speed <= cap, "player {} too fast under field-aware MPC: {speed}", player.id);
+        }
+    }
+
+    #[test]
     fn mdp_mpc_reconciliation_records_divergence_and_blends_when_sensible() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             seed: 9_191,
@@ -1357,10 +1384,10 @@
 
         assert_eq!(summary.config.dt_seconds, DEFAULT_DT_SECONDS);
         assert_eq!(summary.config.total_ticks(), 30);
-        assert_eq!(summary.summary.ticks, 20);
+        assert_eq!(summary.summary.ticks, 30);
         assert!((summary.summary.simulated_seconds - 2.0).abs() < 1e-9);
-        assert_eq!(summary.step_timing.ticks, 20);
-        assert_eq!(summary.controller_yield.skipped_no_assignment, 20);
+        assert_eq!(summary.step_timing.ticks, 30);
+        assert_eq!(summary.controller_yield.skipped_no_assignment, 30);
         assert!(
             summary.step_timing.total_ms.is_finite() && summary.step_timing.total_ms > 0.0,
             "summary runner should retain timing telemetry without retaining frame history"
@@ -11388,8 +11415,8 @@
         assert_eq!(config.max_human_players, 0);
 
         let trace = run_simulation(config, 60);
-        assert_eq!(trace.summary.ticks, 120);
-        assert!(trace.events.iter().all(|event| event.tick <= 120));
+        assert_eq!(trace.summary.ticks, 180);
+        assert!(trace.events.iter().all(|event| event.tick <= 180));
         assert!(trace
             .frames
             .iter()
@@ -40614,7 +40641,7 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert_eq!(stats.tick_budget_ms, DEFAULT_DT_SECONDS * 1_000.0);
         assert_eq!(
             stats.learning_budget_ms,
-            100.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
+            stats.tick_budget_ms * SOCCER_LEARNING_TICK_BUDGET_RATIO
         );
         assert_eq!(stats.over_budget, stats.over_budget_ticks > 0);
         assert_eq!(
@@ -53530,15 +53557,18 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert_eq!(meta["cadence"], meta["playback"]["cadence"]);
         assert_eq!(meta["cadence"]["dtSeconds"], trace.config.dt_seconds);
         assert_eq!(meta["cadence"]["tickHz"], 15.0);
-        assert_eq!(meta["cadence"]["tickMillis"], 100.0);
+        assert_eq!(meta["cadence"]["tickMillis"], trace.config.dt_seconds * 1_000.0);
         assert_eq!(
             meta["cadence"]["durationSeconds"],
             trace.config.effective_duration_seconds()
         );
         assert_eq!(meta["cadence"]["totalTicks"], trace.config.total_ticks());
         assert_eq!(meta["cadence"]["defaultDtSeconds"], DEFAULT_DT_SECONDS);
-        assert_eq!(meta["cadence"]["defaultTickHz"], 10.0);
-        assert_eq!(meta["cadence"]["defaultTickMillis"], 100.0);
+        assert_eq!(meta["cadence"]["defaultTickHz"], 1.0 / DEFAULT_DT_SECONDS);
+        assert_eq!(
+            meta["cadence"]["defaultTickMillis"],
+            DEFAULT_DT_SECONDS * 1_000.0
+        );
         assert_eq!(
             meta["cadence"]["defaultDurationSeconds"],
             DEFAULT_DURATION_SECONDS
@@ -53846,15 +53876,18 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert_eq!(meta["cadence"], meta["playback"]["cadence"]);
         assert_eq!(meta["cadence"]["dtSeconds"], config.dt_seconds);
         assert_eq!(meta["cadence"]["tickHz"], 15.0);
-        assert_eq!(meta["cadence"]["tickMillis"], 100.0);
+        assert_eq!(meta["cadence"]["tickMillis"], config.dt_seconds * 1_000.0);
         assert_eq!(
             meta["cadence"]["durationSeconds"],
             config.effective_duration_seconds()
         );
         assert_eq!(meta["cadence"]["totalTicks"], config.total_ticks());
         assert_eq!(meta["cadence"]["defaultDtSeconds"], DEFAULT_DT_SECONDS);
-        assert_eq!(meta["cadence"]["defaultTickHz"], 10.0);
-        assert_eq!(meta["cadence"]["defaultTickMillis"], 100.0);
+        assert_eq!(meta["cadence"]["defaultTickHz"], 1.0 / DEFAULT_DT_SECONDS);
+        assert_eq!(
+            meta["cadence"]["defaultTickMillis"],
+            DEFAULT_DT_SECONDS * 1_000.0
+        );
         assert_eq!(
             meta["cadence"]["defaultDurationSeconds"],
             DEFAULT_DURATION_SECONDS
