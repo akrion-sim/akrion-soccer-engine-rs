@@ -4224,6 +4224,67 @@
     }
 
     #[test]
+    fn pass_facing_outcome_models_the_body_facing_kick_envelope() {
+        use std::f64::consts::FRAC_PI_2;
+        let yps = |mph: f64| mph_to_yps(mph);
+        // A unit kick direction `deg` degrees off East (the facing for yaw 0).
+        let dir = |deg: f64| Vec2::new(deg.to_radians().cos(), deg.to_radians().sin());
+
+        // ~30 deg off-centre (either side) is full power & accuracy.
+        let full = pass_facing_outcome(0.0, dir(30.0), false);
+        assert!((full.power_factor - 1.0).abs() < 1e-6, "30 deg off = full power");
+        assert!((full.accuracy_factor - 1.0).abs() < 1e-6, "30 deg off = full accuracy");
+        assert!(full.speed_cap_yps.is_none());
+        assert!(!full.must_turn && !full.forbidden);
+        let full_neg = pass_facing_outcome(0.0, dir(-30.0), false);
+        assert!((full_neg.power_factor - 1.0).abs() < 1e-6, "-30 deg off = full power");
+
+        // Dead-ahead (0 deg, square-on) loses 30% of power and accuracy.
+        let ahead = pass_facing_outcome(0.0, dir(0.0), false);
+        assert!((ahead.power_factor - PASS_FACING_DEAD_AHEAD_FACTOR).abs() < 1e-6);
+        assert!((ahead.accuracy_factor - PASS_FACING_DEAD_AHEAD_FACTOR).abs() < 1e-6);
+        assert!(ahead.speed_cap_yps.is_none());
+
+        // Power/accuracy fall off between 30 and 90 deg (a 60 deg strike < a 30 deg one).
+        let oblique = pass_facing_outcome(0.0, dir(60.0), false);
+        assert!(
+            oblique.power_factor < full.power_factor
+                && oblique.power_factor > PASS_FACING_PERP_FLOOR_FACTOR
+        );
+        assert!(oblique.speed_cap_yps.is_none());
+
+        // 90-120 deg: a near-perpendicular prod you must turn into, hard-capped at 10mph.
+        let perp = pass_facing_outcome(0.0, dir(105.0), false);
+        assert!(perp.must_turn);
+        assert!(!perp.forbidden);
+        assert!((perp.speed_cap_yps.unwrap() - yps(PASS_PERP_MAX_MPH)).abs() < 1e-6);
+
+        // Dead behind (180 deg) in the OPPONENT half: a legal backheel, capped at 20mph.
+        let backheel = pass_facing_outcome(0.0, dir(180.0), false);
+        assert!(!backheel.forbidden, "backheel allowed in opponent half");
+        assert!(backheel.must_turn);
+        assert!((backheel.speed_cap_yps.unwrap() - yps(PASS_BACKHEEL_MAX_MPH)).abs() < 1e-6);
+
+        // Dead behind in our OWN half: not a legal backheel — forbidden, must turn first.
+        let own_half_back = pass_facing_outcome(0.0, dir(180.0), true);
+        assert!(own_half_back.forbidden, "no backheel in own half");
+        assert!(own_half_back.must_turn);
+
+        // A forward ball relative to a player facing +y is unaffected by which half.
+        let forward_own_half = pass_facing_outcome(FRAC_PI_2, Vec2::new(0.0, 1.0), true);
+        assert!(!forward_own_half.forbidden);
+        assert!((forward_own_half.power_factor - PASS_FACING_DEAD_AHEAD_FACTOR).abs() < 1e-6);
+
+        // Degenerate inputs never restrict the kick.
+        let degenerate = pass_facing_outcome(0.0, Vec2::zero(), true);
+        assert!(
+            !degenerate.forbidden
+                && degenerate.power_factor == 1.0
+                && degenerate.speed_cap_yps.is_none()
+        );
+    }
+
+    #[test]
     fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
         // 100 points for a goal, 40 for a shot on target, distributed back through the
         // attacking chain (so an intermediate received pass that leads to a shot/goal
@@ -5294,7 +5355,15 @@
                 .expect("ball scheduled");
             if ball_slot < holder_slot {
                 let holder_agent = &sim.players[holder];
-                let expected_ball = (holder_agent.position + carried_ball_lead(holder_agent))
+                // With the orbital carry model the ball is re-anchored to the holder's
+                // CURRENT position via the stored orbit (angle + radius), even when the
+                // ball was scheduled first — it must not be left behind at the old spot.
+                let orbit_dir = Vec2::new(
+                    sim.ball.carry_orbit_world_rad.cos(),
+                    sim.ball.carry_orbit_world_rad.sin(),
+                );
+                let expected_ball = (holder_agent.position
+                    + orbit_dir * sim.ball.carry_orbit_radius_yards)
                     .clamp_to_pitch(sim.config.field_width_yards, sim.config.field_length_yards);
                 assert_eq!(sim.ball.holder, Some(holder));
                 assert!(
@@ -5303,8 +5372,12 @@
                 );
                 assert!(
                     sim.ball.position.distance(expected_ball) < 1e-9,
-                    "held ball should stay attached after holder's later move: seed={seed}, holder_slot={holder_slot}, ball_slot={ball_slot}, ball={:?}, expected={expected_ball:?}",
+                    "held ball should stay attached to the (moved) holder after their later move: seed={seed}, holder_slot={holder_slot}, ball_slot={ball_slot}, ball={:?}, expected={expected_ball:?}",
                     sim.ball.position
+                );
+                assert!(
+                    sim.ball.position.distance(holder_agent.position) <= CARRY_MAX_ORBIT_RADIUS_YARDS + 1e-6,
+                    "held ball must stay within close control of the holder, not be left behind"
                 );
                 assert_eq!(sim.ball.velocity, holder_agent.velocity);
                 assert_eq!(sim.ball.last_touch_team, Some(holder_agent.team));
@@ -10782,14 +10855,19 @@
         sim.players[high_stamina].skills.stamina = 10.0;
         sim.players[low_stamina].skills.stamina = 1.0;
 
-        for _ in 0..12 {
+        // Sprint for a sustained burst (dt=1s steps). With realistic all-match
+        // anaerobic rates the per-second gap between a weak and an elite engine is
+        // modest, so accumulate enough seconds to surface a clear, stable gap.
+        for _ in 0..48 {
             sim.move_player_towards(high_stamina, Vec2::new(25.0, 220.0), true);
             sim.move_player_towards(low_stamina, Vec2::new(35.0, 220.0), true);
         }
 
         let high_after_sprints = sim.players[high_stamina].fatigue;
         let low_after_sprints = sim.players[low_stamina].fatigue;
-        assert!(low_after_sprints > high_after_sprints + 0.12);
+        // Both tire from sprinting; the low-stamina engine tires distinctly faster.
+        assert!(high_after_sprints > 0.0);
+        assert!(low_after_sprints > high_after_sprints + 0.06);
 
         for _ in 0..8 {
             let rest_spot = sim.players[low_stamina].position;
@@ -10867,6 +10945,38 @@
             sim.players[p].anaerobic_load < loaded,
             "resting should recharge W′: {} !< {loaded}",
             sim.players[p].anaerobic_load
+        );
+    }
+
+    #[test]
+    fn metabolic_power_converts_acceleration_to_metric_before_metric_cap() {
+        let skills = SkillProfile {
+            weight_pounds: 165.0,
+            ..SkillProfile::default()
+        };
+        let speed_yps = 8.0;
+        let acceleration_at_metric_cap_yps2 = ACCEL_MAGNITUDE_CAP_MPS2 / METERS_PER_YARD;
+        let demand_at_cap =
+            metabolic_power_demand_w(&skills, speed_yps, acceleration_at_metric_cap_yps2);
+        let demand_above_cap =
+            metabolic_power_demand_w(&skills, speed_yps, acceleration_at_metric_cap_yps2 * 3.0);
+
+        let mass_kg = player_weight_pounds(skills.weight_pounds) * KG_PER_POUND;
+        let speed_mps = speed_yps * METERS_PER_YARD;
+        let expected = mass_kg * RUN_ENERGY_COST_J_PER_KG_M * speed_mps
+            + mass_kg * ACCEL_MAGNITUDE_CAP_MPS2 * speed_mps * ACCEL_POWER_COEFF;
+
+        assert!(
+            (demand_at_cap - expected).abs() < 1e-9,
+            "accel cap must be applied after yps2->mps2 conversion: got {demand_at_cap}, want {expected}"
+        );
+        assert!(
+            (demand_above_cap - demand_at_cap).abs() < 1e-9,
+            "accelerations above the metric cap should be capped"
+        );
+        assert!(
+            demand_at_cap
+                > metabolic_power_demand_w(&skills, speed_yps, acceleration_at_metric_cap_yps2 * 0.5)
         );
     }
 
@@ -41583,6 +41693,258 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
     }
 
     #[test]
+    fn carried_ball_orbit_holds_close_control_and_tightens_near_opponents() {
+        // The carried ball rests within close-control distance (≈0.25–1.0 yd) of the
+        // carrier's feet, tighter the nearer an opponent is.
+        let facing = std::f64::consts::FRAC_PI_2; // faces +y
+        let (_dir, loose_radius, _through, _rate) =
+            carried_ball_orbit_command(facing, None, f64::INFINITY);
+        assert!(
+            (0.95..=1.05).contains(&loose_radius),
+            "loose control radius should be ≈1yd in open space, got {loose_radius}"
+        );
+        let (_dir, tight_radius, _through, _rate) = carried_ball_orbit_command(facing, None, 0.8);
+        assert!(
+            (0.25..0.45).contains(&tight_radius),
+            "tight control radius should be ≈0.3yd with an opponent on top, got {tight_radius}"
+        );
+        assert!(
+            tight_radius < loose_radius,
+            "a closer opponent must tighten control (smaller orbit radius)"
+        );
+    }
+
+    #[test]
+    fn carried_ball_orbits_around_the_body_and_never_through_on_a_normal_carry() {
+        // On an ordinary carry the ball swings AROUND the carrier (radius floored by
+        // the body) — it never collapses through the player — and settles in front.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let carrier = sim.players.iter().find(|p| p.team == Team::Home).unwrap().id;
+        park_players_except(&mut sim, &[carrier]);
+        let player_pos = Vec2::new(40.0, 60.0);
+        sim.players[carrier].position = player_pos;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = Vec2::new(40.0, 59.0); // start the ball BEHIND the body
+        sim.ball.reset_carry_orbit();
+        let mut rng = SeededRandom::new(7);
+        let mut min_radius = f64::INFINITY;
+        for step in 0..30u64 {
+            let pos = sim.ball.advance_carried_ball_orbit(
+                step + 1,
+                player_pos,
+                Vec2::new(0.0, 1.0), // resting spot: in front of the body
+                0.9,
+                false, // ordinary carry: must arc around, not through
+                CARRY_ORBIT_NORMAL_RATE_RAD_S,
+                1.0 / 30.0,
+                sim.config.field_width_yards,
+                sim.config.field_length_yards,
+                &mut rng,
+            );
+            sim.ball.position = pos;
+            min_radius = min_radius.min(pos.distance(player_pos));
+        }
+        assert!(
+            min_radius >= CARRY_BODY_FLOOR_RADIUS_YARDS - 1e-6,
+            "a normal carry must keep the ball off the body (>= floor); min was {min_radius}"
+        );
+        let rel = sim.ball.position - player_pos;
+        assert!(
+            rel.y > 0.5,
+            "the ball should settle in front of the carrier, got rel {rel:?}"
+        );
+    }
+
+    #[test]
+    fn a_special_move_may_bring_the_ball_through_the_body_line() {
+        // Special moves (cuts / fakes / nutmeg) may pull the ball onto/through the body
+        // line — closer than the ordinary body floor.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let carrier = sim.players.iter().find(|p| p.team == Team::Home).unwrap().id;
+        park_players_except(&mut sim, &[carrier]);
+        let player_pos = Vec2::new(40.0, 60.0);
+        sim.players[carrier].position = player_pos;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = Vec2::new(40.0, 59.0);
+        sim.ball.reset_carry_orbit();
+        let mut rng = SeededRandom::new(11);
+        let mut min_radius = f64::INFINITY;
+        for step in 0..30u64 {
+            let pos = sim.ball.advance_carried_ball_orbit(
+                step + 1,
+                player_pos,
+                Vec2::new(0.0, 1.0),
+                0.2, // a special move can draw it right in through the body
+                true,
+                CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+                1.0 / 30.0,
+                sim.config.field_width_yards,
+                sim.config.field_length_yards,
+                &mut rng,
+            );
+            sim.ball.position = pos;
+            min_radius = min_radius.min(pos.distance(player_pos));
+        }
+        assert!(
+            min_radius < CARRY_BODY_FLOOR_RADIUS_YARDS,
+            "a special move must be allowed through the body line (< floor); min was {min_radius}"
+        );
+    }
+
+    #[test]
+    fn carried_ball_winding_is_capped_near_270_degrees_per_possession() {
+        // The ball rarely winds more than 270 deg around the carrier in one possession:
+        // a locked possession is clamped at the cap no matter how long it keeps turning.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let carrier = sim.players.iter().find(|p| p.team == Team::Home).unwrap().id;
+        park_players_except(&mut sim, &[carrier]);
+        let player_pos = Vec2::new(40.0, 60.0);
+        sim.players[carrier].position = player_pos;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = Vec2::new(40.9, 60.0); // start on the +x side
+        sim.ball.reset_carry_orbit();
+        let mut rng = SeededRandom::new(5);
+        let mut angle = 0.0_f64;
+        // First advance consumes the fresh-possession unlock roll; force this possession
+        // LOCKED so the cap is exercised deterministically.
+        let dir0 = Vec2::new(angle.cos(), angle.sin());
+        sim.ball.position = sim.ball.advance_carried_ball_orbit(
+            1,
+            player_pos,
+            dir0,
+            0.9,
+            false,
+            CARRY_ORBIT_NORMAL_RATE_RAD_S,
+            1.0 / 30.0,
+            sim.config.field_width_yards,
+            sim.config.field_length_yards,
+            &mut rng,
+        );
+        sim.ball.carry_orbit_wrap_unlocked = false;
+        // Chase a target that keeps rotating the SAME way around the body for ~13s.
+        for step in 1..400u64 {
+            angle += 0.25;
+            let dir = Vec2::new(angle.cos(), angle.sin());
+            sim.ball.position = sim.ball.advance_carried_ball_orbit(
+                step + 1,
+                player_pos,
+                dir,
+                0.9,
+                false,
+                CARRY_ORBIT_NORMAL_RATE_RAD_S,
+                1.0 / 30.0,
+                sim.config.field_width_yards,
+                sim.config.field_length_yards,
+                &mut rng,
+            );
+        }
+        assert!(
+            sim.ball.carry_orbit_swept_rad.abs() <= CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD + 1e-6,
+            "a locked possession must clamp winding at 270 deg, got {} rad",
+            sim.ball.carry_orbit_swept_rad
+        );
+    }
+
+    #[test]
+    fn the_carrier_turns_to_follow_the_orbiting_ball() {
+        // When the ball sits off to one side, the carrier's body turns to follow it
+        // (you keep the ball in front of you) — and swivelling fast enough accrues
+        // disorientation (dizziness).
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let carrier = sim.players.iter().find(|p| p.team == Team::Home).unwrap().id;
+        park_players_except(&mut sim, &[carrier]);
+        sim.players[carrier].position = Vec2::new(40.0, 60.0);
+        sim.players[carrier].facing_yaw = std::f64::consts::FRAC_PI_2; // faces +y
+        sim.players[carrier].velocity = Vec2::zero();
+        sim.players[carrier].dizziness = 0.0;
+        sim.ball.holder = Some(carrier);
+        // Ball off to the +x side of the body (bearing ≈ 0 rad).
+        sim.ball.position = Vec2::new(41.0, 60.0);
+
+        let before = sim.players[carrier].facing_yaw;
+        for _ in 0..12 {
+            sim.update_player_facing_dizziness_energy();
+        }
+        let after = sim.players[carrier].facing_yaw;
+        assert!(
+            after < before - 0.3 && after.abs() < 0.6,
+            "the carrier should rotate from facing +y toward the ball on its +x side: \
+             before={before} after={after}"
+        );
+        assert!(
+            sim.players[carrier].dizziness > 0.0,
+            "swivelling quickly to follow the ball should accrue some disorientation"
+        );
+    }
+
+    #[test]
+    fn a_defender_inside_two_yards_shifts_the_carrier_toward_passing() {
+        // Critical spacing discipline: as a defender closes inside the 2-yard comfort
+        // gap (with an open outlet) the carrier should release sooner — passing is
+        // lifted and forward dribbling damped — vs the same picture in open space.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let passer = 9;
+        let receiver = 7;
+        park_players_except(&mut sim, &[passer, receiver]);
+        sim.players[passer].role = PlayerRole::Midfielder;
+        sim.players[passer].position = Vec2::new(40.0, 70.0);
+        // Keep biases/skills modest so the scores are not pinned at their clamps and the
+        // crowding response is observable.
+        sim.players[passer].preferences.dribble_bias = 0.30;
+        sim.players[passer].preferences.pass_bias = 0.30;
+        sim.players[passer].skills.dribbling = 5.0;
+        sim.players[passer].skills.passing = 5.0;
+        sim.players[passer].skills.passing_completion_rate = 5.0;
+        sim.ball.holder = Some(passer);
+        sim.ball.position = sim.players[passer].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[receiver].role = PlayerRole::Forward;
+        sim.players[receiver].position = Vec2::new(44.0, 86.0);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let visible_targets = snapshot.ranked_visible_pass_targets(passer, 3);
+        let base = snapshot.observation_for(passer);
+        let directive = snapshot.tactical_directive(Team::Home);
+
+        let tops = |gap: f64| -> (f64, f64) {
+            let mut observation = base.clone();
+            observation.nearest_opponent_distance = gap;
+            observation.best_pass_receiver_openness = 0.85;
+            let options = sim.players[passer].possession_action_options(
+                &observation,
+                &directive,
+                visible_targets.len(),
+                snapshot.ranked_visible_aerial_pass_targets(passer, 3).len(),
+                false,
+                snapshot.dt_seconds,
+                snapshot.field_width,
+            );
+            let top = |pred: &dyn Fn(&str) -> bool| {
+                options
+                    .iter()
+                    .filter(|o| pred(o.label.as_str()))
+                    .map(|o| o.score)
+                    .fold(0.0_f64, f64::max)
+            };
+            let pass_top = top(&|l: &str| l == "killer-pass" || l.starts_with("pass"));
+            let dribble_top = top(&|l: &str| l == "dribble" || l.starts_with("carry"));
+            assert!(dribble_top > 0.0 && pass_top > 0.0, "expected scored options");
+            (pass_top, dribble_top)
+        };
+
+        let (pass_crowded, dribble_crowded) = tops(1.2);
+        let (pass_open, dribble_open) = tops(6.0);
+        assert!(
+            pass_crowded > pass_open,
+            "a defender inside 2yd must lift passing: crowded={pass_crowded} open={pass_open}"
+        );
+        assert!(
+            dribble_crowded < dribble_open,
+            "a defender inside 2yd must damp dribbling: crowded={dribble_crowded} open={dribble_open}"
+        );
+    }
+
+    #[test]
     fn passing_into_a_crowd_is_penalised_except_in_the_final_third() {
         // A reception point tightly marked by an opponent must be penalised when it is
         // out in midfield, but tolerated in the final third (a contested chance near
@@ -53340,7 +53702,7 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert!(html.contains("openSupportOutlets"));
         assert!(html.contains("label: \"KPass\""));
         assert!(html.contains("OS${Number(o.openSupportOutlets"));
-        assert!(html.contains(" KG${Number(intent.threadedGoalPassGoalGainYards"));
+        assert!(html.contains(" KGain${Number(intent.threadedGoalPassGoalGainYards"));
         assert!(html.contains("openSupportOutlets=${Number(intent.openSupportOutlets"));
         assert!(html.contains(" O${outlets.toFixed(0)}"));
         assert!(html.contains("function flankLaneTargetsForDirective"));

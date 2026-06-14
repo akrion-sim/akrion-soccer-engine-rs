@@ -1542,7 +1542,7 @@ function liveIntentLabel(intent = primaryLiveIntent()) {
   const teammatePressure = Number(intent.targetTeammateOccupiedSpacePressure ?? 0);
   const lane = intent.threadedGoalPassAvailable ? " KP" : intent.shotLaneOpen ? " lane" : "";
   const killerQuality = intent.threadedGoalPassAvailable
-    ? ` KG${Number(intent.threadedGoalPassGoalGainYards ?? 0).toFixed(0)} KO${Number(intent.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} KC${Number(intent.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)}`
+    ? ` KGain${Number(intent.threadedGoalPassGoalGainYards ?? 0).toFixed(0)}yd KO${Number(intent.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} KC${Number(intent.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)}`
     : "";
   const decisive = pressure > 0.01 || killer > 0.01
     ? ` D${pressure.toFixed(2)} K${killer.toFixed(2)} 1P${single.toFixed(2)}`
@@ -2026,7 +2026,7 @@ function agentPomdpLabel(d) {
   const killer = Number(o.killerPassGoalPressure ?? 0);
   const single = Number(o.singleThreadGoalPressure ?? 0);
   const killerQuality = o.threadedGoalPassAvailable
-    ? ` KG${Number(o.threadedGoalPassGoalGainYards ?? 0).toFixed(0)} KO${Number(o.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} KC${Number(o.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)}`
+    ? ` KGain${Number(o.threadedGoalPassGoalGainYards ?? 0).toFixed(0)}yd KO${Number(o.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} KC${Number(o.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)}`
     : "";
   const teamShape = `TC${Number(o.teamCentroidToBallYards ?? 0).toFixed(0)} W${Number(o.teamSpreadYards ?? 0).toFixed(0)} NB${Number(o.teamPlayersNearBall ?? 0)} FV${Number(o.teamForwardVelocityYps ?? 0).toFixed(1)}`;
   return `${ball} ${scheduleText} ${controlText} P${options} Q${passQ.toFixed(2)} B${Number(o.ballDistance ?? 0).toFixed(1)} O${Number(o.nearestOpponentDistance ?? 0).toFixed(1)} G${Number(o.yardsToGoal ?? 0).toFixed(1)} GA${goalWindow.toFixed(2)} D${decisive.toFixed(2)} K${killer.toFixed(2)} 1P${single.toFixed(2)}${killerQuality} ${teamShape} ${lane}`;
@@ -2392,11 +2392,11 @@ function decisionTelemetryItems(d) {
     {label: "Pressure", value: `${Number(o.realPressure ?? 0).toFixed(2)} / ${Number(o.perceivedPressure ?? 0).toFixed(2)}`, score: Number(o.perceivedPressure ?? 0), min: 0, max: 1},
     {label: "Input", value: o.humanInputPresent ? `H${o.controllerSlot ?? "-"} #${o.humanInputSeq ?? "-"} ${formatInputAgeMs(o.humanInputQueueAgeMs)}` : "AI"},
     {label: "On ball", value: `${Number(o.realTimeOnBallSeconds ?? 0).toFixed(1)} / ${Number(o.perceivedTimeOnBallSeconds ?? 0).toFixed(1)}s`},
-    {label: "Goal", value: `${Number(o.yardsToGoal ?? 0).toFixed(1)}y ${Number(o.opponentGoalAngleDegrees ?? 0).toFixed(0)}deg`},
+    {label: "Goal", value: `${Number(o.yardsToGoal ?? 0).toFixed(1)}yd ${Number(o.opponentGoalAngleDegrees ?? 0).toFixed(0)}deg`},
     {label: "Decide", value: `D${Number(o.decisiveGoalActionPressure ?? 0).toFixed(2)} K${Number(o.killerPassGoalPressure ?? 0).toFixed(2)} 1P${Number(o.singleThreadGoalPressure ?? 0).toFixed(2)} GA${Number(o.goalAttackWindowScore ?? 0).toFixed(2)}`, score: Number(o.decisiveGoalActionPressure ?? 0), min: 0, max: 1},
-    {label: "KPass", value: o.threadedGoalPassAvailable ? `T${o.threadedGoalPassTarget ?? "-"} F${Number(o.threadedGoalPassForwardYards ?? 0).toFixed(0)} G${Number(o.threadedGoalPassGoalGainYards ?? 0).toFixed(0)} W${Number(o.threadedGoalPassReceptionWindowScore ?? 0).toFixed(2)} O${Number(o.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} C${Number(o.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)} S${Number(o.threadedGoalPassStrideFit ?? 0).toFixed(2)}` : "none", score: Number(o.threadedGoalPassGoalGainYards ?? 0), min: 0, max: 24},
-    {label: "Keeper", value: `${Number(o.opposingGoalkeeperDistance ?? 0).toFixed(1)}y ${Number(o.opposingGoalkeeperAngleDegrees ?? 0).toFixed(0)}deg`},
-    {label: "Dribble", value: `${Number(o.forwardDribbleSpaceYards ?? 0).toFixed(1)}y`, score: Number(o.forwardDribbleSpaceYards ?? 0), min: 0, max: 24},
+    {label: "KPass", value: o.threadedGoalPassAvailable ? `T${o.threadedGoalPassTarget ?? "-"} F${Number(o.threadedGoalPassForwardYards ?? 0).toFixed(0)}yd G+${Number(o.threadedGoalPassGoalGainYards ?? 0).toFixed(0)}yd W${Number(o.threadedGoalPassReceptionWindowScore ?? 0).toFixed(2)} O${Number(o.threadedGoalPassReceiverOpenness ?? 0).toFixed(2)} C${Number(o.threadedGoalPassExpectedCompletion ?? 0).toFixed(2)} S${Number(o.threadedGoalPassStrideFit ?? 0).toFixed(2)}` : "none", score: Number(o.threadedGoalPassGoalGainYards ?? 0), min: 0, max: 24},
+    {label: "Keeper", value: `${Number(o.opposingGoalkeeperDistance ?? 0).toFixed(1)}yd ${Number(o.opposingGoalkeeperAngleDegrees ?? 0).toFixed(0)}deg`},
+    {label: "Dribble", value: `${Number(o.forwardDribbleSpaceYards ?? 0).toFixed(1)}yd`, score: Number(o.forwardDribbleSpaceYards ?? 0), min: 0, max: 24},
     {label: "Shape", value: `TC${Number(o.teamCentroidToBallYards ?? 0).toFixed(0)} W${Number(o.teamSpreadYards ?? 0).toFixed(0)} NB${Number(o.teamPlayersNearBall ?? 0)} FV${Number(o.teamForwardVelocityYps ?? 0).toFixed(1)}`, score: Number(o.teamPlayersNearBall ?? 0), min: 0, max: 5},
     {label: "Passes", value: `${Number(o.visiblePassOptions ?? 0)}F ${Number(o.visibleAerialPassOptions ?? 0)}A OS${Number(o.openSupportOutlets ?? 0)}`},
     {label: "PassQ", value: `C${Number(o.expectedPassCompletion ?? 0).toFixed(2)} O${Number(o.bestPassReceiverOpenness ?? 0).toFixed(2)}`, score: Number(o.expectedPassCompletion ?? 0), min: 0, max: 1},
@@ -5204,7 +5204,12 @@ async function stepOnce(options = {}) {
       done: response.done,
       policyHistory: previousPolicyHistory
     };
-    if (response.events.length) eventLog.push(...response.events);
+    if (response.events.length) {
+      eventLog.push(...response.events);
+      // Only the last 12 are ever shown — keep the array bounded so a long match
+      // doesn't grow the heap unboundedly (it was only cleared on New Match).
+      if (eventLog.length > 256) eventLog.splice(0, eventLog.length - 256);
+    }
     // On an offside call, freeze a red line where it occurred and pause ~2s.
     const offsideEvent = response.events.find(e => String(e.kind || "").toLowerCase() === "offside");
     if (offsideEvent) {

@@ -423,6 +423,25 @@ impl PlayerAgent {
         } else {
             0.0
         };
+        // Critical 2-yard spacing: how far the nearest defender (in ANY direction) has
+        // closed inside the 2-yard comfort gap. 0 at >=2 yds (no effect — the open-space
+        // regime is untouched), rising to 1 as the defender gets on top of the ball.
+        // Damps forward dribbling and lifts passing so the carrier releases sooner rather
+        // than letting the gap close below 2 yds.
+        let defender_crowding = if observation.nearest_opponent_distance.is_finite() {
+            (1.0 - observation.nearest_opponent_distance / DRIBBLE_OPPONENT_MIN_SPACE_YARDS)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let crowded_dribble_damp = (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
+        // The flip side: when a defender is inside 2 yds AND a receiver is open, lift
+        // passing so the carrier releases the ball before the gap closes. Gated on an
+        // open outlet so a crowded carrier with no pass isn't pushed into a giveaway.
+        let crowded_pass_lift = 1.0
+            + defender_crowding
+                * PASS_CROWDED_RELEASE_LIFT
+                * observation.best_pass_receiver_openness.clamp(0.0, 1.0);
         let pre_fatigue_dribble_score = (self.preferences.dribble_bias
             * (0.62 + dribbling * 0.48)
             * directive.carry_priority
@@ -433,7 +452,8 @@ impl PlayerAgent {
             * (1.0 - pressured_release_signal * open_support_fit * 0.18).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.30).clamp(0.62, 1.0)
             * (1.0 - open_forward_outlet * 0.34).clamp(0.58, 1.0)
-            * dribble_into_opponent_penalty)
+            * dribble_into_opponent_penalty
+            * crowded_dribble_damp)
         .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
             * fatigue_dribble
@@ -880,6 +900,7 @@ impl PlayerAgent {
             * near_goal_pass_multiplier.max(0.72)
             * floor_pass_patience_multiplier
             * hold_release_multiplier
+            * crowded_pass_lift
             * pressured_release_multiplier(observation))
         .clamp(0.01, 1.68);
         options.push(AgentActionOptionTrace::new(
@@ -910,6 +931,7 @@ impl PlayerAgent {
                 * floor_pass_patience_multiplier
                 * hold_release_multiplier
                 * low_cross_multiplier
+                * crowded_pass_lift
                 * pressured_release_multiplier(observation)
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
@@ -2659,7 +2681,7 @@ impl PlayerAgent {
                     observation,
                     belief,
                     vec!["long-ball-duel".to_string(), "recover".to_string()],
-                    single_action_option("long-ball-duel"),
+                    single_action_option("recover"),
                     &action,
                     "recover",
                 ));

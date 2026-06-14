@@ -123,15 +123,26 @@ const PLAYER_MAX_WEIGHT_POUNDS: f64 = 320.0;
 // face every cut/carry-out (z-axis spin for no reason). A nudge, not a clamp: a
 // genuine shield/turn still dominates; this just tilts the resting facing forward.
 const CARRIER_FORWARD_FACING_NUDGE: f64 = 0.55;
+// As the ball orbits the carrier, the carrier turns to FOLLOW it (you keep the ball
+// in front of your body) ~all of the time — this is how strongly the carrier's
+// resting facing tracks the ball's current bearing. The yaw-rate cap and dizziness
+// model then bound how fast/far they can keep swivelling.
+const CARRIER_BALL_FACING_FOLLOW: f64 = 0.82;
 const COMFORT_YAW_RATE_RAD_S: f64 = 2.8; // below this, turning is free of dizziness
 const DIZZINESS_GAIN_PER_RAD: f64 = 0.22; // accrual per rad/s over comfort, per sec
 const DIZZINESS_RECOVERY_PER_SECOND: f64 = 0.60;
 const DIZZINESS_MAX: f64 = 1.2;
 const DIZZINESS_CONTROL_PENALTY: f64 = 0.30; // control-radius loss at max dizziness
 const DIZZINESS_REWARD_PENALTY_POINTS: f64 = 2.2; // per unit dizziness, per second
-const YAW_ENERGY_FATIGUE_PER_RAD: f64 = 0.0035; // energy cost of rotating
-// Sustained, contiguous high-urgency involvement near the ball is tiring.
-const BALL_INVOLVEMENT_FATIGUE_PER_SECOND: f64 = 0.045;
+// A disoriented carrier (too much swivelling in a short window) is easier to
+// dispossess: scales the steal probability up by this much per unit dizziness.
+const DIZZINESS_DISPOSSESSION_RISK: f64 = 0.55;
+const YAW_ENERGY_FATIGUE_PER_RAD: f64 = 0.0006; // energy cost of rotating (per radian turned)
+// Sustained, contiguous high-urgency involvement near the ball is tiring. Scaled
+// to the same all-match budget as the anaerobic gait rates (see `fatigue_delta`):
+// the 12yd ball radius catches many players, so a high rate here would wall the
+// whole midfield within seconds.
+const BALL_INVOLVEMENT_FATIGUE_PER_SECOND: f64 = 0.005;
 const BALL_INVOLVEMENT_RADIUS_YARDS: f64 = 12.0;
 // Two-tier energy: `fatigue` is the slow aerobic drain; `anaerobic_load` is the
 // fast burst reserve spent by sprints/accelerations and recovered over ~tens of
@@ -166,6 +177,9 @@ const ANAEROBIC_RECOVERY_PER_SECOND: f64 = 0.022;
 // ~45 kJ reserve, a flat-out sprint nets ~1.5 kW above CP (≈⅓ of the tank per
 // 10 s), and a walk refills it in ~1–2 min — matching modern GPS match data.
 const METERS_PER_YARD: f64 = 0.9144;
+const YARDS_PER_MILE: f64 = 1760.0;
+const SECONDS_PER_HOUR: f64 = 3600.0;
+const INCHES_PER_YARD: f64 = 36.0;
 const KG_PER_POUND: f64 = 0.453_592_37;
 // Energy cost of level running (di Prampero): metabolic J per kg per metre.
 const RUN_ENERGY_COST_J_PER_KG_M: f64 = 3.6;
@@ -184,7 +198,7 @@ const ANAEROBIC_CAPACITY_MAX_J_PER_KG: f64 = 600.0;
 const ANAEROBIC_RECOVERY_GAIN: f64 = 0.32;
 const ANAEROBIC_RECOVERY_CAP_W_PER_KG: f64 = 4.0;
 // A slice of supra-CP work also accrues slow aerobic fatigue (per kJ over CP).
-const SUPRA_CP_AEROBIC_FATIGUE_PER_KJ: f64 = 0.0009;
+const SUPRA_CP_AEROBIC_FATIGUE_PER_KJ: f64 = 0.00015;
 // Burst-speed ceiling: a mild linear sag plus a steep cliff as W′ empties.
 const ANAEROBIC_CEILING_LINEAR_SAG: f64 = 0.15;
 const ANAEROBIC_CEILING_KNEE: f64 = 0.72; // depletion fraction where the cliff begins
@@ -238,13 +252,12 @@ const POSSESSION_REGAIN_GRACE_TICKS: u64 = secs_to_ticks(0.5);
 /// ~80% of the time, but at the cost of progression (modelled elsewhere).
 const SHIELDED_HOLDER_TACKLE_SUCCESS_CAP: f64 = 0.20;
 /// Geometric body-shield gate (see `carrier_shields_ball_from_defender`): when the
-/// ball is pushed in front of the carrier and the defender is behind the body and
-/// more than a yard off the ball, a *clean* steal is impossible (foul only).
-/// `BALL_AHEAD_DOT`: how aligned the ball must be with the carrier's facing to count
-/// as "in front" (≈ within 72°). `DEFENDER_OPPOSITE_DOT`: how anti-aligned the
-/// defender must be with the ball direction to count as "behind the body" (≈ within
-/// 72° of straight behind). `DEFENDER_BALL_GAP_YARDS`: the user's "more than a yard".
-const SHIELD_BALL_AHEAD_DOT: f64 = 0.30;
+/// carrier's body is between the ball and the defender and the defender is more
+/// than a yard off the ball, a *clean* steal is impossible (foul only).
+/// `DEFENDER_OPPOSITE_DOT`: how anti-aligned the defender must be with the ball
+/// direction (about the carrier) to count as "on the far side of the body" (≈
+/// within 72° of straight opposite). `DEFENDER_BALL_GAP_YARDS`: the user's "more
+/// than a yard".
 const SHIELD_DEFENDER_OPPOSITE_DOT: f64 = 0.30;
 const SHIELD_DEFENDER_BALL_GAP_YARDS: f64 = 1.0;
 /// Carrier goalward speed (yards/sec) above which the nearest defender engages
@@ -345,10 +358,48 @@ const PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS: f64 = 3.2;
 // allowed, so the guard is relaxed there.
 const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
+// Critical spacing discipline: the carrier should keep 2+ yards between the ball
+// and the NEAREST defender (in any direction), not just space straight ahead. As
+// that gap closes inside 2 yards the carrier should release the ball sooner —
+// forward dribbling is damped and passing is lifted — rather than let a defender
+// get on top of the ball. These weight that crowding response.
+const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.55;
+const PASS_CROWDED_RELEASE_LIFT: f64 = 0.80;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
 const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
+// --- Carried-ball orbital mechanics (planet/sun dribbling model) ---
+// The carried ball orbits the player (and the player can pivot around the ball);
+// neither snaps. These cap how fast/far the ball can swing around the body and
+// keep the ball on one side (going AROUND the carrier) on ordinary touches.
+//
+// Max angular speed (rad/s) at which the ball can orbit the body on a NORMAL
+// touch — ~230 deg/s, so a 90-deg swing takes ~0.4s (a few touches), never a
+// single-tick teleport around the carrier.
+const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 4.0;
+// Special moves (cuts / fakes / nutmeg) chop the ball across the body far faster.
+const CARRY_ORBIT_SPECIAL_RATE_RAD_S: f64 = 11.0;
+// The ball stays at least this far from the carrier's feet on ordinary play, so
+// it arcs AROUND the body. Only special moves may pull it closer (passing it
+// THROUGH the player line).
+const CARRY_BODY_FLOOR_RADIUS_YARDS: f64 = 0.22;
+const CARRY_THROUGH_MIN_RADIUS_YARDS: f64 = 0.05;
+const CARRY_MAX_ORBIT_RADIUS_YARDS: f64 = 1.10;
+// Close-control orbit radius band: the ball sits ~0.25 yd from the feet under
+// tight pressure (tight control) and out to ~1.0 yd in open space.
+const CARRY_TIGHT_RADIUS_YARDS: f64 = 0.30;
+const CARRY_LOOSE_RADIUS_YARDS: f64 = 1.00;
+// An opponent inside this range tightens the carrier's control (shrinks the orbit
+// radius toward the tight value); fully tight by ~1 yd away.
+const CARRY_TIGHT_CONTROL_RANGE_YARDS: f64 = 5.0;
+// How fast the carried ball's radius eases toward the target radius (yds/s).
+const CARRY_ORBIT_RADIUS_EASE_YPS: f64 = 6.0;
+// Per-possession winding soft cap: the ball rarely wraps more than 270 deg around
+// the carrier in one possession. On reaching it, a rare roll either unlocks
+// further winding or clamps it.
+const CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD: f64 = 4.712_388_980_384_69; // 270 deg
+const CARRY_ORBIT_WRAP_UNLOCK_PROBABILITY: f64 = 0.05;
 const SHOT_ON_FRAME_MIN_PROBABILITY: f64 = 0.60;
 const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
@@ -1350,6 +1401,30 @@ const SHOT_MIN_KICK_POWER_FACTOR: f64 = 0.90;
 // settling/shielding touch first, then play it. The floor scales from the at-rest floor down to
 // this with speed, so a jog keeps most power but a sprint cannot reverse-blast.
 const KICK_REVERSE_AT_SPRINT_FLOOR: f64 = 0.12;
+// Body-facing kick model: you can only strike the ball with the slice of your range the body
+// is turned toward, so the angle between your CURRENT body facing and the line you want to play
+// decides how much power and accuracy you can put on it. You cannot pass one way while facing the
+// other — to play a ball behind you, you must first turn to face it.
+//
+//  - within ±PASS_FACING_FULL_POWER_DEG of facing: full strength & accuracy. The natural
+//    plant-and-strike puts the ball slightly off-centre to the kicking-foot side, so a ball dead
+//    in line with the body (0°) loses power/accuracy (PASS_FACING_DEAD_AHEAD_FACTOR), ramping up
+//    to full by ±30°.
+//  - out to PASS_FACING_PERP_MIN_DEG (90°): power/accuracy fall off toward the perpendicular.
+//  - PASS_FACING_PERP_MIN_DEG..PASS_FACING_BACK_MIN_DEG (90–120°): a near-perpendicular prod you
+//    have to twist into — capped at PASS_PERP_MAX_MPH.
+//  - beyond PASS_FACING_BACK_MIN_DEG (120°): a true backward ball, only legal as a BACKHEEL
+//    (capped at PASS_BACKHEEL_MAX_MPH) and only in the opponent half — never in your own half,
+//    where you must turn to face the ball before you can play it.
+const PASS_FACING_FULL_POWER_DEG: f64 = 30.0;
+const PASS_FACING_DEAD_AHEAD_FACTOR: f64 = 0.70;
+const PASS_FACING_PERP_MIN_DEG: f64 = 90.0;
+const PASS_FACING_BACK_MIN_DEG: f64 = 120.0;
+const PASS_FACING_PERP_FLOOR_FACTOR: f64 = 0.30;
+const PASS_FACING_PERP_ACCURACY: f64 = 0.45;
+const PASS_FACING_BACKHEEL_ACCURACY: f64 = 0.55;
+const PASS_PERP_MAX_MPH: f64 = 10.0;
+const PASS_BACKHEEL_MAX_MPH: f64 = 20.0;
 // When in possession and attacking, the back line pushes up this far to fill the
 // space behind midfield (soft-capped at halfway+5).
 const ATTACKING_DEFENDER_PUSH_UP_YARDS: f64 = 8.0;
@@ -2588,16 +2663,24 @@ impl MovementGait {
     fn fatigue_delta(self, stamina: f64, dt_seconds: f64) -> f64 {
         let cardio = ability01(stamina);
         let dt = dt_seconds.max(0.0);
+        // Per-second change in the 0..1 fatigue scalar, split along the aerobic /
+        // anaerobic line. Aerobic gaits (stand/walk/jog) sit at or below critical
+        // power, so a fit player SUSTAINS them all match — they recover or hold
+        // steady, they never empty the tank. Only the anaerobic gaits (run/sprint)
+        // deplete, and at a rate calibrated so a full match leaves players tired
+        // (mean fatigue well under the ~0.78 anaerobic "wall" knee) rather than
+        // exhausted in the first minute. See [`fatigue_speed_factor`].
         match self {
-            MovementGait::Stand => -0.012 * (0.75 + cardio * 0.75) * dt,
-            MovementGait::Walk | MovementGait::BackWalk => -0.008 * (0.70 + cardio * 0.60) * dt,
-            MovementGait::BackJog => 0.002 * (1.12 - cardio * 0.52) * dt,
+            MovementGait::Stand => -0.020 * (0.75 + cardio * 0.75) * dt,
+            MovementGait::Walk | MovementGait::BackWalk => -0.012 * (0.70 + cardio * 0.60) * dt,
+            // Jogging is aerobic: fit legs hold steady or recover slightly; only
+            // weak-cardio players tire, and very slowly.
+            MovementGait::BackJog | MovementGait::Jog => (0.0007 - cardio * 0.0011) * dt,
             MovementGait::Skip | MovementGait::BackSkip | MovementGait::SideStep => {
-                0.001 * (1.10 - cardio * 0.45) * dt
+                0.0004 * (1.10 - cardio * 0.45) * dt
             }
-            MovementGait::Jog => 0.003 * (1.15 - cardio * 0.55) * dt,
-            MovementGait::Run => 0.010 * (1.35 - cardio * 0.65) * dt,
-            MovementGait::Sprint => 0.025 * (1.55 - cardio * 0.80) * dt,
+            MovementGait::Run => 0.0011 * (1.35 - cardio * 0.65) * dt,
+            MovementGait::Sprint => 0.0030 * (1.55 - cardio * 0.80) * dt,
         }
     }
 }
@@ -12533,6 +12616,98 @@ fn pass_is_backheel(facing: Vec2, pass_dir: Vec2) -> bool {
     }
     // cos(110°) ~= -0.34: a target more than ~110 deg off the facing line is a backheel.
     facing.normalized().dot(pass_dir.normalized()) < -0.34
+}
+
+/// How the angle between a player's current body facing and the direction they want to
+/// strike the ball constrains the kick. See the `PASS_FACING_*` constants for the model.
+#[derive(Clone, Copy, Debug)]
+struct PassFacingOutcome {
+    /// Multiplier on launch power for off-centre strikes, in (0, 1].
+    power_factor: f64,
+    /// Multiplier degrading effective passing skill (aim noise), in (0, 1].
+    accuracy_factor: f64,
+    /// Hard launch-speed ceiling in yps, if this band imposes one.
+    speed_cap_yps: Option<f64>,
+    /// The strike requires turning the body into the ball as it is struck.
+    must_turn: bool,
+    /// Physically impossible from this body shape (a backward ball that is not a legal
+    /// backheel) — the player must turn to face it before passing, not release the ball.
+    forbidden: bool,
+}
+
+impl PassFacingOutcome {
+    fn unrestricted() -> Self {
+        PassFacingOutcome {
+            power_factor: 1.0,
+            accuracy_factor: 1.0,
+            speed_cap_yps: None,
+            must_turn: false,
+            forbidden: false,
+        }
+    }
+}
+
+/// Evaluate a kick along `kick_dir` by a player whose body points along `facing_yaw`
+/// (radians, standard atan2 convention), located in their own half or not. Decides the
+/// power/accuracy penalty, any hard speed cap, and whether the strike is a legal play at
+/// all. This is what stops a player from blasting the ball one way while facing 180° the
+/// other — the only backward ball is a backheel, and only in the opponent half.
+fn pass_facing_outcome(facing_yaw: f64, kick_dir: Vec2, in_own_half: bool) -> PassFacingOutcome {
+    if kick_dir.len() < 1e-6 || !facing_yaw.is_finite() {
+        return PassFacingOutcome::unrestricted();
+    }
+    let facing = Vec2::new(facing_yaw.cos(), facing_yaw.sin());
+    let cos = facing.dot(kick_dir.normalized()).clamp(-1.0, 1.0);
+    let deg = cos.acos().to_degrees(); // 0 (straight ahead) .. 180 (dead behind)
+    if deg <= PASS_FACING_FULL_POWER_DEG {
+        // Dead-ahead (0°) is awkwardly square-on and loses power/accuracy; ramps to full by ±30°.
+        let t = (deg / PASS_FACING_FULL_POWER_DEG).clamp(0.0, 1.0);
+        let f = PASS_FACING_DEAD_AHEAD_FACTOR + (1.0 - PASS_FACING_DEAD_AHEAD_FACTOR) * t;
+        return PassFacingOutcome {
+            power_factor: f,
+            accuracy_factor: f,
+            ..PassFacingOutcome::unrestricted()
+        };
+    }
+    if deg <= PASS_FACING_PERP_MIN_DEG {
+        // 30°→90°: power and accuracy fall off from full toward the perpendicular floor.
+        let t = ((deg - PASS_FACING_FULL_POWER_DEG)
+            / (PASS_FACING_PERP_MIN_DEG - PASS_FACING_FULL_POWER_DEG))
+            .clamp(0.0, 1.0);
+        let f = 1.0 - t * (1.0 - PASS_FACING_PERP_FLOOR_FACTOR);
+        return PassFacingOutcome {
+            power_factor: f,
+            accuracy_factor: f,
+            ..PassFacingOutcome::unrestricted()
+        };
+    }
+    if deg <= PASS_FACING_BACK_MIN_DEG {
+        // 90°–120°: a near-perpendicular prod you must twist into — weak and hard-capped.
+        return PassFacingOutcome {
+            power_factor: PASS_FACING_PERP_FLOOR_FACTOR,
+            accuracy_factor: PASS_FACING_PERP_ACCURACY,
+            speed_cap_yps: Some(mph_to_yps(PASS_PERP_MAX_MPH)),
+            must_turn: true,
+            forbidden: false,
+        };
+    }
+    // Beyond 120°: a true backward ball — only a backheel, and only in the opponent half.
+    if in_own_half {
+        return PassFacingOutcome {
+            power_factor: 0.0,
+            accuracy_factor: 0.0,
+            speed_cap_yps: Some(0.0),
+            must_turn: true,
+            forbidden: true,
+        };
+    }
+    PassFacingOutcome {
+        power_factor: 1.0,
+        accuracy_factor: PASS_FACING_BACKHEEL_ACCURACY,
+        speed_cap_yps: Some(mph_to_yps(PASS_BACKHEEL_MAX_MPH)),
+        must_turn: true,
+        forbidden: false,
+    }
 }
 
 /// Preference bonus for shorter (<20 yd) passes that keep possession. Shorter is
@@ -37951,6 +38126,59 @@ fn carried_ball_lead(player: &PlayerAgent) -> Vec2 {
     facing * DRIBBLE_TOUCH_LEAD_YARDS
 }
 
+/// Where the carrier wants the ball this tick — the resting spot the orbital
+/// model eases toward. Returns `(desired_world_dir, desired_radius, allow_through_body,
+/// max_orbit_rate_rad_s)`.
+///
+/// - Direction is derived from the body facing and the active dribble move: an
+///   ordinary carry keeps the ball ahead; carry-outs nudge it to a front-side; cuts
+///   / fakes / nutmegs swing it hard across (and may take it THROUGH the body line).
+/// - Radius is close control: ~0.25 yd under tight pressure out to ~1.0 yd in space
+///   (tighter the nearer the closest opponent).
+/// - Only special moves set `allow_through_body` (ordinary play arcs AROUND the body).
+fn carried_ball_orbit_command(
+    facing_yaw: f64,
+    move_kind: Option<DribbleMoveKind>,
+    nearest_opponent_distance: f64,
+) -> (Vec2, f64, bool, f64) {
+    let tightness = if nearest_opponent_distance.is_finite() {
+        ((CARRY_TIGHT_CONTROL_RANGE_YARDS - nearest_opponent_distance)
+            / (CARRY_TIGHT_CONTROL_RANGE_YARDS - 1.0).max(1e-6))
+        .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let radius =
+        CARRY_LOOSE_RADIUS_YARDS + (CARRY_TIGHT_RADIUS_YARDS - CARRY_LOOSE_RADIUS_YARDS) * tightness;
+    let dir_at = |relative_degrees: f64| {
+        let angle = facing_yaw + relative_degrees.to_radians();
+        Vec2::new(angle.cos(), angle.sin())
+    };
+    let (dir, allow_through, rate) = match move_kind {
+        Some(DribbleMoveKind::CarryOutLeft) => {
+            (dir_at(32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
+        }
+        Some(DribbleMoveKind::CarryOutRight) => {
+            (dir_at(-32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
+        }
+        Some(DribbleMoveKind::LeftCut) => (dir_at(78.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
+        Some(DribbleMoveKind::RightCut) => (dir_at(-78.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
+        Some(DribbleMoveKind::FakeLeftCutRight) => {
+            (dir_at(-72.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
+        }
+        Some(DribbleMoveKind::FakeRightCutLeft) => {
+            (dir_at(72.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
+        }
+        // A nutmeg pushes the ball straight through the gap — close and through.
+        Some(DribbleMoveKind::Nutmeg) => {
+            (dir_at(0.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
+        }
+        // Carry-forward, protect-ball, plain hold: keep the ball ahead of the body.
+        _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
+    };
+    (dir.normalized(), radius, allow_through, rate)
+}
+
 fn dribble_heavy_touch_probability(player: &PlayerAgent, pressure: f64) -> f64 {
     let control = ability01(player.skills.dribbling) * 0.58
         + ability01(player.skills.first_touch) * 0.30
@@ -40274,7 +40502,7 @@ fn noisy_pass_target_with_receiver_openness(
 }
 
 fn mph_to_yps(mph: f64) -> f64 {
-    mph.max(0.0) * 1760.0 / 3600.0
+    mph.max(0.0) * YARDS_PER_MILE / SECONDS_PER_HOUR
 }
 
 fn shot_power_for_skill(shooting_skill: f64) -> f64 {
@@ -41104,7 +41332,8 @@ fn goalkeeper_save_probability_from_traits(
     let keeper_top_speed = top_speed_yps_from_score(skills.top_speed).max(1.0);
     let movement_reach =
         (acceleration_reach + velocity_reach).min(keeper_top_speed * available_move_time);
-    let height_reach = (height_inches_from_score(skills.height) - 66.0).max(0.0) / 36.0;
+    let height_reach =
+        (height_inches_from_score(skills.height) - 66.0).max(0.0) / INCHES_PER_YARD;
     let reachable_radius = 1.05 + reaction * 0.85 + movement_reach + height_reach;
     // Reach is measured against the SHOT'S PATH (perpendicular distance), NOT the keeper's
     // distance to the goal-line crossing. A keeper standing in the ball's lane saves it
@@ -42628,10 +42857,10 @@ fn player_anaerobic_capacity_j(skills: &SkillProfile) -> f64 {
 /// running, are what empty the anaerobic battery.
 fn metabolic_power_demand_w(skills: &SkillProfile, speed_yps: f64, accel_yps2: f64) -> f64 {
     let mass_kg = player_weight_pounds(skills.weight_pounds) * KG_PER_POUND;
-    let v = speed_yps.max(0.0) * METERS_PER_YARD;
-    let a = accel_yps2.abs().min(ACCEL_MAGNITUDE_CAP_MPS2) * METERS_PER_YARD;
-    let run_power = mass_kg * RUN_ENERGY_COST_J_PER_KG_M * v;
-    let accel_power = mass_kg * a * v * ACCEL_POWER_COEFF;
+    let v_mps = speed_yps.max(0.0) * METERS_PER_YARD;
+    let a_mps2 = (accel_yps2.abs() * METERS_PER_YARD).min(ACCEL_MAGNITUDE_CAP_MPS2);
+    let run_power = mass_kg * RUN_ENERGY_COST_J_PER_KG_M * v_mps;
+    let accel_power = mass_kg * a_mps2 * v_mps * ACCEL_POWER_COEFF;
     run_power + accel_power
 }
 
