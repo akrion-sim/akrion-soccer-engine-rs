@@ -41457,15 +41457,44 @@ fn goalkeeper_catch_probability_after_save(
     goal_width: f64,
     sightline_screen_probability: f64,
 ) -> f64 {
+    let keeper_position = finite_vec2(keeper.position, Vec2::zero());
+    let shooter_position = finite_vec2(shooter_position, keeper_position);
+    let shot_crossing = finite_vec2(shot_crossing, shooter_position);
+    let shot_speed = if shot_speed.is_finite() && shot_speed > 0.0 {
+        shot_speed
+    } else {
+        1.0
+    };
+    let goal_width = if goal_width.is_finite() && goal_width > 0.0 {
+        goal_width
+    } else {
+        DEFAULT_GOAL_WIDTH_YARDS
+    };
+    let sightline_screen_probability = if sightline_screen_probability.is_finite() {
+        sightline_screen_probability.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let shot_distance = shooter_position.distance(shot_crossing);
-    let clean_sightline = (1.0 - sightline_screen_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let shot_distance = if shot_distance.is_finite() {
+        shot_distance.max(0.0)
+    } else {
+        0.0
+    };
+    let clean_sightline = 1.0 - sightline_screen_probability;
     let handling = (ability01(keeper.skills.goalkeeping) * 0.58
         + ability01(keeper.skills.first_touch) * 0.42)
         .clamp(0.0, 1.0);
     let distance_fit = ((shot_distance - 18.0) / 42.0).clamp(0.0, 1.0);
     let high_speed_fit = (shot_speed / mph_to_yps(60.0)).clamp(0.0, 1.25);
+    let keeper_to_crossing = keeper_position.distance(shot_crossing);
+    let keeper_to_crossing = if keeper_to_crossing.is_finite() {
+        keeper_to_crossing.max(0.0)
+    } else {
+        goal_width
+    };
     let near_keeper_fit = (1.0
-        - keeper.position.distance(shot_crossing) / (goal_width * 0.72).max(0.1))
+        - keeper_to_crossing / (goal_width * 0.72).max(0.1))
     .clamp(0.0, 1.0);
     let short_medium_fit = if shot_distance <= 32.0 {
         (1.0 - (shot_distance - 18.0).abs() / 22.0).clamp(0.0, 1.0)
@@ -41480,7 +41509,7 @@ fn goalkeeper_catch_probability_after_save(
     (0.20 + handling * 0.30 + clean_sightline * 0.18 + distance_fit * 0.24 + long_range_control
         - high_speed_fit * 0.18
         - short_medium_fit * near_keeper_fit * 0.28
-        - sightline_screen_probability.clamp(0.0, 1.0) * 0.16)
+        - sightline_screen_probability * 0.16)
         .clamp(0.08, 0.96)
 }
 
@@ -41896,17 +41925,27 @@ fn pass_length_preference(dist: f64) -> f64 {
 pub fn segment_distance_to_point(a: Vec2, b: Vec2, p: Vec2) -> f64 {
     let t = segment_projection_factor(a, b, p);
     let projection = a + (b - a) * t;
-    p.distance(projection)
+    let distance = p.distance(projection);
+    if distance.is_finite() {
+        distance.max(0.0)
+    } else {
+        f64::INFINITY
+    }
 }
 
 fn segment_projection_factor(a: Vec2, b: Vec2, p: Vec2) -> f64 {
     let ab = b - a;
     let denom = ab.x * ab.x + ab.y * ab.y;
-    if denom <= 1e-12 {
+    if !denom.is_finite() || denom <= 1e-12 {
         return 0.0;
     }
     let ap = p - a;
-    ((ap.x * ab.x + ap.y * ab.y) / denom).clamp(0.0, 1.0)
+    let projection = (ap.x * ab.x + ap.y * ab.y) / denom;
+    if projection.is_finite() {
+        projection.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn dot(a: Vec2, b: Vec2) -> f64 {

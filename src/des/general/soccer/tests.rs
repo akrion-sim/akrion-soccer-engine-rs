@@ -818,6 +818,61 @@
     }
 
     #[test]
+    fn segment_geometry_helpers_sanitize_degenerate_geometry() {
+        let regular = segment_projection_factor(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(2.5, 5.0),
+        );
+        assert!((regular - 0.25).abs() < 1e-9);
+        let regular_distance = segment_distance_to_point(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(2.5, 5.0),
+        );
+        assert!((regular_distance - 5.0).abs() < 1e-9);
+
+        let cases = [
+            (
+                "zero-length",
+                Vec2::new(0.0, 0.0),
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 1.0),
+            ),
+            (
+                "nan endpoint",
+                Vec2::new(f64::NAN, 0.0),
+                Vec2::new(10.0, 0.0),
+                Vec2::new(1.0, 1.0),
+            ),
+            (
+                "infinite endpoint",
+                Vec2::new(0.0, 0.0),
+                Vec2::new(f64::INFINITY, 0.0),
+                Vec2::new(1.0, 1.0),
+            ),
+            (
+                "overflow-scale",
+                Vec2::new(f64::MAX, f64::MAX),
+                Vec2::new(-f64::MAX, f64::MAX),
+                Vec2::new(0.0, 0.0),
+            ),
+        ];
+        for (name, a, b, point) in cases {
+            let t = segment_projection_factor(a, b, point);
+            assert!(
+                t.is_finite() && (0.0..=1.0).contains(&t),
+                "{name} produced invalid projection factor {t}"
+            );
+            let distance = segment_distance_to_point(a, b, point);
+            assert!(
+                !distance.is_nan() && distance >= 0.0,
+                "{name} produced invalid segment distance {distance}"
+            );
+        }
+    }
+
+    #[test]
     fn sprint_top_speed_lands_between_22_and_25_mph() {
         let sprint = MovementGait::Sprint.speed_multiplier();
         let lo = mph_to_yps(SPRINT_MIN_SPEED_MPH);
@@ -41576,6 +41631,107 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
     }
 
     #[test]
+    fn goalkeeper_save_probability_sanitizes_bad_physics_inputs() {
+        let skills = SkillProfile {
+            goalkeeping: 8.0,
+            defending: 7.2,
+            first_touch: 7.5,
+            acceleration: 7.1,
+            top_speed: 7.4,
+            ..SkillProfile::default()
+        };
+        let keeper = Vec2::new(40.0, 118.4);
+        let shooter = Vec2::new(40.0, 100.0);
+        let crossing = Vec2::new(40.0, 120.0);
+        let cases = [
+            (
+                "nan shot speed",
+                keeper,
+                Vec2::zero(),
+                0.0,
+                shooter,
+                crossing,
+                f64::NAN,
+                DEFAULT_GOAL_WIDTH_YARDS,
+                0.0,
+            ),
+            (
+                "nan goal width",
+                keeper,
+                Vec2::zero(),
+                0.0,
+                shooter,
+                crossing,
+                mph_to_yps(48.0),
+                f64::NAN,
+                0.0,
+            ),
+            (
+                "nan sightline",
+                keeper,
+                Vec2::zero(),
+                0.0,
+                shooter,
+                crossing,
+                mph_to_yps(48.0),
+                DEFAULT_GOAL_WIDTH_YARDS,
+                f64::NAN,
+            ),
+            (
+                "non-finite vectors",
+                Vec2::new(f64::NAN, f64::INFINITY),
+                Vec2::new(f64::NAN, 0.0),
+                f64::NAN,
+                Vec2::new(f64::NAN, 100.0),
+                Vec2::new(40.0, f64::NAN),
+                f64::INFINITY,
+                -1.0,
+                f64::INFINITY,
+            ),
+            (
+                "overflow-scale geometry",
+                keeper,
+                Vec2::zero(),
+                0.0,
+                Vec2::new(f64::MAX, f64::MAX),
+                Vec2::new(-f64::MAX, f64::MAX),
+                mph_to_yps(48.0),
+                DEFAULT_GOAL_WIDTH_YARDS,
+                0.0,
+            ),
+        ];
+
+        for (
+            name,
+            keeper_position,
+            keeper_velocity,
+            keeper_fatigue,
+            shooter_position,
+            shot_crossing,
+            shot_speed,
+            goal_width,
+            sightline_screen_probability,
+        ) in cases
+        {
+            let probability = goalkeeper_save_probability_from_traits(
+                &skills,
+                keeper_position,
+                keeper_velocity,
+                keeper_fatigue,
+                shooter_position,
+                shot_crossing,
+                shot_speed,
+                goal_width,
+                sightline_screen_probability,
+            );
+            assert!(
+                probability.is_finite() && (0.0..=0.995).contains(&probability),
+                "{name} produced invalid save probability {probability}"
+            );
+        }
+    }
+
+    #[test]
     fn goalkeeper_reach_saves_slow_ball_within_one_yard() {
         // A ball crossing within ~1 yard of the keeper that is slow (<20mph) or
         // struck from range should be saved markedly more often than the same
@@ -42442,6 +42598,89 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
             long_clean > close_hard_screened + 0.25,
             "long clean shots should be catchable; close hard screened shots should invite parries: long={long_clean} close={close_hard_screened}"
         );
+    }
+
+    #[test]
+    fn goalkeeper_catch_probability_sanitizes_bad_physics_inputs() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let keeper_id = sim.goalkeeper_for(Team::Away).expect("away keeper");
+        sim.players[keeper_id].position = Vec2::new(40.0, 118.4);
+        sim.players[keeper_id].skills.goalkeeping = 8.0;
+        sim.players[keeper_id].skills.first_touch = 7.6;
+        let shooter = Vec2::new(40.0, 100.0);
+        let crossing = Vec2::new(40.0, 120.0);
+        let cases = [
+            (
+                "nan shot speed",
+                sim.players[keeper_id].position,
+                shooter,
+                crossing,
+                f64::NAN,
+                DEFAULT_GOAL_WIDTH_YARDS,
+                0.0,
+            ),
+            (
+                "nan goal width",
+                sim.players[keeper_id].position,
+                shooter,
+                crossing,
+                mph_to_yps(48.0),
+                f64::NAN,
+                0.0,
+            ),
+            (
+                "nan sightline",
+                sim.players[keeper_id].position,
+                shooter,
+                crossing,
+                mph_to_yps(48.0),
+                DEFAULT_GOAL_WIDTH_YARDS,
+                f64::NAN,
+            ),
+            (
+                "non-finite vectors",
+                Vec2::new(f64::NAN, f64::INFINITY),
+                Vec2::new(f64::NAN, 100.0),
+                Vec2::new(40.0, f64::NAN),
+                f64::INFINITY,
+                -1.0,
+                f64::INFINITY,
+            ),
+            (
+                "overflow-scale geometry",
+                sim.players[keeper_id].position,
+                Vec2::new(f64::MAX, f64::MAX),
+                Vec2::new(-f64::MAX, f64::MAX),
+                mph_to_yps(48.0),
+                DEFAULT_GOAL_WIDTH_YARDS,
+                0.0,
+            ),
+        ];
+
+        for (
+            name,
+            keeper_position,
+            shooter_position,
+            shot_crossing,
+            shot_speed,
+            goal_width,
+            sightline_screen_probability,
+        ) in cases
+        {
+            sim.players[keeper_id].position = keeper_position;
+            let probability = goalkeeper_catch_probability_after_save(
+                &sim.players[keeper_id],
+                shooter_position,
+                shot_crossing,
+                shot_speed,
+                goal_width,
+                sightline_screen_probability,
+            );
+            assert!(
+                probability.is_finite() && (0.08..=0.96).contains(&probability),
+                "{name} produced invalid catch probability {probability}"
+            );
+        }
     }
 
     #[test]
