@@ -909,6 +909,34 @@ const MATCH_RESULT_MARGIN_PENALTY_PER_GOAL: f64 = 0.75;
 const DEFENSIVE_GOAL_HISTORY_ACTIONS: usize = 50;
 const DEFENSIVE_GOAL_HISTORY_MAX_PENALTY: f64 = 0.075;
 const DEFENSIVE_GOAL_HISTORY_MIN_PENALTY: f64 = 0.014;
+/// When a team loses controlled possession to the opponent in open play (a
+/// dispossession, interception, miscontrol — any turnover), the actions the
+/// losing team took over the preceding [`TURNOVER_HISTORY_WINDOW_SECONDS`] are
+/// retroactively penalized and replayed into every learner (tabular Q, the
+/// adversarial team policies, and the neural value/actor-critic models). The
+/// blame is recency-weighted: the action at the moment of loss is most culpable
+/// (`MAX`), decaying linearly to the action at the window edge (`MIN`).
+const TURNOVER_HISTORY_WINDOW_SECONDS: f64 = 5.0;
+const TURNOVER_HISTORY_MAX_PENALTY: f64 = 0.05;
+const TURNOVER_HISTORY_MIN_PENALTY: f64 = 0.008;
+/// Cap on how many recent transitions a single turnover replays, so a dense
+/// possession burst can't flood the training stream.
+const TURNOVER_HISTORY_MAX_ACTIONS: usize = 80;
+/// Hard ceiling on the deferred reward-transition backlog. Retroactive penalties
+/// (turnovers, conceded goals) and reward-only ticks push onto this buffer; it is
+/// drained at most `policy_train_max_transitions_per_tick` per learning-due tick,
+/// so a turnover-heavy scrum can out-pace the drain. Capping the backlog (oldest
+/// dropped first) bounds memory regardless of the inflow/drain imbalance.
+const MAX_DEFERRED_REWARD_TRANSITIONS: usize = 4096;
+/// Off-ball actions (support runs, shape) share the blame for a turnover but are
+/// less culpable than the on-ball action that actually conceded it.
+const TURNOVER_OFFBALL_BLAME_FRACTION: f64 = 0.45;
+/// How long a manual drag-and-drop coaching position hint steers a player before
+/// it expires and the AI resumes its own positioning.
+const COACH_POSITION_HINT_LIFETIME_SECONDS: f64 = 12.0;
+/// Once the dragged player is within this distance of the hinted spot the hint is
+/// considered satisfied and released (they've arrived).
+const COACH_POSITION_HINT_ARRIVAL_YARDS: f64 = 1.5;
 const DEFENSIVE_RELAXATION_THREAT_YARDS: f64 = 48.0;
 const NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS: f64 = 10.0;
 const SETTLED_POSSESSION_SECONDS: f64 = 5.0;
@@ -13541,6 +13569,51 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
             | "clearance"
             | "route-one"
     )
+}
+
+/// Whether an action label is an on-ball action — one the player performs while
+/// in possession of the ball. The carrier/passer who actually conceded a
+/// turnover will have one of these as their last action, so it carries the full
+/// turnover blame; off-ball actions share a reduced fraction.
+fn soccer_action_is_on_ball(action: &str) -> bool {
+    matches!(
+        normalize_soccer_action_label(action),
+        "shoot"
+            | "first-time-shot"
+            | "first-time-header"
+            | "pass"
+            | "killer-pass"
+            | "aerial-pass"
+            | "flank-low-cross"
+            | "flank-high-cross"
+            | "first-time-pass"
+            | "dribble"
+            | "carry-forward"
+            | "carry-out-left"
+            | "carry-out-right"
+            | "protect-ball"
+            | "side-step"
+            | "left-cut"
+            | "right-cut"
+            | "nutmeg"
+            | "fake-left-cut-right"
+            | "fake-right-cut-left"
+            | "hold-up-flank"
+            | "control-touch"
+            | "clearance"
+            | "route-one"
+    )
+}
+
+/// Recency- and culpability-blended turnover blame for one recent action. The
+/// on-ball action that conceded possession is fully culpable; off-ball support
+/// shares [`TURNOVER_OFFBALL_BLAME_FRACTION`].
+fn turnover_action_blame_multiplier(action: &str) -> f64 {
+    if soccer_action_is_on_ball(action) {
+        1.0
+    } else {
+        TURNOVER_OFFBALL_BLAME_FRACTION
+    }
 }
 
 fn soccer_context_defender_distance(transition: &SoccerLearningTransition, fallback: f64) -> f64 {
@@ -30490,6 +30563,16 @@ enum LiveInputDispatch<'a> {
     Router(&'a HumanControllerInputRouter),
 }
 
+/// Body of a manual drag-and-drop coaching hint POST: which player was dragged
+/// and where (in pitch yards) it was dropped.
+#[derive(Debug, Clone, Deserialize)]
+struct CoachHintRequest {
+    #[serde(alias = "playerId")]
+    player_id: usize,
+    x: f64,
+    y: f64,
+}
+
 fn handle_live_soccer_request(
     raw: &str,
     session: &Arc<Mutex<SoccerRealtimeSession>>,
@@ -30549,6 +30632,39 @@ fn handle_live_soccer_request_inner(
                 guard.state_response()
             };
             LiveHttpResponse::json(&state.compact_for_live_http())
+        }
+        ("POST", "/api/coach-hint") | ("POST", "/api/position-hint") => {
+            let hint = match serde_json::from_str::<CoachHintRequest>(req.body) {
+                Ok(hint) => hint,
+                Err(err) => {
+                    return LiveHttpResponse::error(
+                        400,
+                        "Bad Request",
+                        &format!("parse coach hint: {err}"),
+                    )
+                }
+            };
+            let mut guard = soccer_mutex_lock(session, "soccer_live_session");
+            match guard
+                .sim
+                .set_coach_position_hint(hint.player_id, Vec2::new(hint.x, hint.y))
+            {
+                Some(applied) => LiveHttpResponse::json(&serde_json::json!({
+                    "ok": true,
+                    "playerId": hint.player_id,
+                    "x": applied.target.x,
+                    "y": applied.target.y,
+                    // "receive" => drop is where to get open for a pass (player's
+                    // team was on the ball); otherwise a defensive/offensive
+                    // positioning spot.
+                    "intent": if applied.receive { "receive" } else { "position" },
+                })),
+                None => LiveHttpResponse::error(
+                    404,
+                    "Not Found",
+                    &format!("no player with id {}", hint.player_id),
+                ),
+            }
         }
         ("GET", "/api/decision-trace") | ("GET", "/api/decisions") => {
             let (enabled, entries, brain) = {

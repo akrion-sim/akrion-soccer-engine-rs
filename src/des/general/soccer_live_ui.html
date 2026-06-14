@@ -316,6 +316,8 @@
       overflow: visible;
     }
   }
+.stage.dragmode canvas{outline:2px dashed #f4b740;outline-offset:-2px;cursor:grab}
+#pauseDrag.active{background:#f4b740;color:#172026;border-color:#f4b740}
 .padbtn{min-width:30px;height:28px;padding:0 8px;font-size:14px;font-weight:700;border-radius:6px;border:1px solid #2f9b57;background:#16241c;color:#cfe9d8;cursor:pointer;user-select:none}
 .padbtn:hover{background:#1d3327}
 .padbtn.lit{background:#f6a40c;color:#172026;border-color:#f6a40c;box-shadow:0 0 8px rgba(246,164,12,.7)}
@@ -360,6 +362,7 @@
         <button id="run" aria-label="Run live simulation">Run</button>
         <button id="step">Step</button>
         <button id="pauseAnalyze" title="Pause and dump the last 100 on-ball MDP/POMDP decisions">Pause &amp; Analyze</button>
+        <button id="pauseDrag" title="Pause and drag players to where they should be (drop on the pitch; same team as the ball-holder = receive spot)">Pause &amp; Drag</button>
         <button id="resetMatch">New Match</button>
         <a id="freshMatchLink" class="control-link" href="/fresh">Fresh</a>
         <button id="restartServer" title="Restart the live server process in place">Restart Server</button>
@@ -3310,6 +3313,81 @@ function drawField(frame, r) {
   for (const o of frame.officials || []) drawOfficial(o, r);
   for (const p of frame.players || []) drawPlayer(p, r);
   if (frame.ball) drawBall(frame.ball, r);
+  drawCoachHintMarkers(r);
+  drawCoachHintDrag(r);
+}
+
+// Persistent markers for the positions you've set in Pause & Drag mode: a ring at
+// the dropped spot and a line from the player, coloured by intent.
+function drawCoachHintMarkers(r) {
+  if (!coachDragMode || coachHintMarkers.size === 0) return;
+  for (const [playerId, m] of coachHintMarkers) {
+    const player = (state?.frame?.players || []).find(p => p.id === playerId);
+    const to = mapPoint({x: m.x, y: m.y}, r);
+    const color = m.receive ? "#39d98a" : "#f4b740";
+    ctx.save();
+    if (player) {
+      const from = mapPoint(player.position, r);
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(to.x, to.y, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(to.x - 4, to.y);
+    ctx.lineTo(to.x + 4, to.y);
+    ctx.moveTo(to.x, to.y - 4);
+    ctx.lineTo(to.x, to.y + 4);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// While a coaching drag is in progress, draw a dashed arrow from the grabbed
+// player to the cursor plus a target ring at the drop point. The colour reflects
+// the interpretation that will be applied on drop: green = "get open here to
+// receive a pass" (the player's team is on the ball), amber = "stand here".
+function coachHintIsReceive(player) {
+  const holder = state?.frame?.ball?.holder;
+  if (holder == null) return false;
+  const holderTeam = state?.frame?.players?.find(p => p.id === holder)?.team;
+  return holderTeam != null && player?.team === holderTeam;
+}
+function drawCoachHintDrag(r) {
+  if (!coachDrag || !coachDrag.dragging || !coachDrag.current) return;
+  const player = (state?.frame?.players || []).find(p => p.id === coachDrag.playerId);
+  if (!player) return;
+  const from = mapPoint(player.position, r);
+  const to = coachDrag.current;
+  const receive = coachHintIsReceive(player);
+  const color = receive ? "#39d98a" : "#f4b740";
+  ctx.save();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = color;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.arc(to.x, to.y, 9, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.fillText(receive ? "receive here" : "position here", to.x + 12, to.y - 10);
+  ctx.restore();
 }
 
 function animateField() {
@@ -4502,6 +4580,7 @@ async function handlePitchClick(e) {
   await assignSlot(activeSlot, clicked.id);
 }
 function handlePitchHover(e) {
+  if (coachDrag) return;
   if (!state?.frame?.players?.length) return;
   const hit = nearestPlayerAtCanvas(canvasPointFromEvent(e));
   const next = hit ? hit.player.id : null;
@@ -4509,6 +4588,76 @@ function handlePitchHover(e) {
   if (next !== hoverPlayerId) {
     hoverPlayerId = next;
     render();
+  }
+}
+
+// --- Drag-and-drop coaching hints -------------------------------------------
+// Grab a player and drop it where it should be: on D/O (plain positioning) or,
+// if its team has the ball, where it should get open to receive a pass. A short
+// pointer press without movement is left to the normal click handler (select /
+// inspect / assign controller).
+let coachDrag = null;
+let suppressNextPitchClick = false;
+const COACH_DRAG_THRESHOLD_PX = 6;
+// "Pause & Drag" mode: pause the match and arrange players. Markers (client-side)
+// remember where each player was sent so you can see the configuration you set.
+let coachDragMode = false;
+const coachHintMarkers = new Map(); // playerId -> {x, y, receive}
+const stageEl = document.querySelector(".stage");
+function setCoachDragMode(on) {
+  coachDragMode = on;
+  stageEl?.classList.toggle("dragmode", on);
+  pauseDragButton?.classList.toggle("active", on);
+  if (on) {
+    running = false;
+    updateRunButton();
+    statusEl.textContent = "Drag mode — drag players to where they should be, then Run to apply. Green = receive a pass, amber = position.";
+  } else {
+    coachHintMarkers.clear();
+  }
+}
+function coachDragStart(e) {
+  // Every interaction starts here, so clear any stale suppression flag first: a
+  // real drag may not emit a trailing click to consume it, and we must never eat
+  // a later, unrelated click.
+  suppressNextPitchClick = false;
+  if (!state?.frame?.players?.length) return;
+  // Modifier-clicks and inspect mode keep their existing click semantics.
+  if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey) return;
+  const startPt = canvasPointFromEvent(e);
+  const hit = nearestPlayerAtCanvas(startPt);
+  if (!hit) return;
+  coachDrag = {playerId: hit.player.id, start: startPt, current: startPt, dragging: false};
+}
+function coachDragMove(e) {
+  if (!coachDrag) return;
+  const pt = canvasPointFromEvent(e);
+  coachDrag.current = pt;
+  if (!coachDrag.dragging
+      && Math.hypot(pt.x - coachDrag.start.x, pt.y - coachDrag.start.y) >= COACH_DRAG_THRESHOLD_PX) {
+    coachDrag.dragging = true;
+    canvas.style.cursor = "grabbing";
+  }
+}
+async function coachDragEnd(e) {
+  if (!coachDrag) return;
+  const drag = coachDrag;
+  coachDrag = null;
+  canvas.style.cursor = "default";
+  if (!drag.dragging) return; // a tap, not a drag — let the click handler run
+  suppressNextPitchClick = true; // the trailing click should not select/assign
+  const dropPt = canvasPointFromEvent(e);
+  const field = fieldPointFromCanvas(dropPt);
+  try {
+    const res = await postJson("/api/coach-hint", {playerId: drag.playerId, x: field.x, y: field.y});
+    const player = (state?.frame?.players || []).find(p => p.id === drag.playerId);
+    const who = player ? `#${player.shirt} ${player.name}` : `#${drag.playerId}`;
+    const receive = res?.intent === "receive";
+    // Remember the configuration so it stays visible (esp. in Pause & Drag mode).
+    coachHintMarkers.set(drag.playerId, {x: Number(res?.x ?? field.x), y: Number(res?.y ?? field.y), receive});
+    statusEl.textContent = `${who} → ${receive ? "receive a pass at" : "position at"} ${field.x.toFixed(0)},${field.y.toFixed(0)}`;
+  } catch (err) {
+    statusEl.textContent = `coach hint failed: ${err.message}`;
   }
 }
 async function updateSurface(values) {
@@ -4701,6 +4850,7 @@ async function loadTeamPolicySnapshot() {
 async function resetMatch(options = {}) {
   resetting = true;
   running = false;
+  if (coachDragMode) setCoachDragMode(false);
   updateRunButton();
   const previousPolicyHistory = state?.policyHistory || null;
   try {
@@ -5159,7 +5309,11 @@ runButton.addEventListener("click", () => {
   }
   running = !running;
   updateRunButton();
+  // Resuming play leaves drag mode (the hints you set now take effect).
+  if (running && coachDragMode) setCoachDragMode(false);
 });
+const pauseDragButton = document.getElementById("pauseDrag");
+pauseDragButton?.addEventListener("click", () => setCoachDragMode(!coachDragMode));
 // --- Pause & Analyze: dump the last on-ball MDP/POMDP decisions ---
 const pauseAnalyzeButton = document.getElementById("pauseAnalyze");
 const analyzeOverlay = document.getElementById("analyzeOverlay");
@@ -5328,7 +5482,19 @@ trackingFile.addEventListener("change", () => {
 slotPick.addEventListener("change", () => setActiveSlot(Number(slotPick.value || 0)));
 inspectModeButton.addEventListener("click", () => setInspectMode(!inspectModeEnabled()));
 canvas.addEventListener("click", e => {
+  if (suppressNextPitchClick) {
+    suppressNextPitchClick = false;
+    return;
+  }
   handlePitchClick(e).catch(err => statusEl.textContent = err.message);
+});
+canvas.addEventListener("pointerdown", coachDragStart);
+canvas.addEventListener("pointermove", e => {
+  if (coachDrag) coachDragMove(e);
+  else handlePitchHover(e);
+});
+window.addEventListener("pointerup", e => {
+  coachDragEnd(e).catch(err => statusEl.textContent = err.message);
 });
 canvas.addEventListener("mousemove", handlePitchHover);
 canvas.addEventListener("mouseleave", () => {

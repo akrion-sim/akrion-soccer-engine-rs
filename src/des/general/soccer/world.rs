@@ -117,6 +117,17 @@ pub struct SoccerMatch {
     /// the 1v1 duel livelock: the player who just lost the ball cannot
     /// immediately re-win it from the new holder for a short grace window.
     pub(crate) recent_dispossession: Option<RecentDispossession>,
+    /// The team that most recently held *controlled* possession (an actual ball
+    /// holder), retained across loose-ball ticks. When controlled possession
+    /// next lands with the *other* team without an intervening dead ball, that's
+    /// an open-play turnover by this team and its recent actions are penalized.
+    /// Cleared on every restart so a post-dead-ball touch (kickoff, throw-in,
+    /// goal kick) is never mistaken for a turnover.
+    pub(crate) last_controlled_possession_team: Option<Team>,
+    /// Manual coaching position hints (drag-and-drop on the live UI), keyed by
+    /// player id. Each steers the player to a dropped spot for a short window;
+    /// see [`CoachPositionHint`] and [`Self::active_coach_hint_target`].
+    pub(crate) coach_position_hints: HashMap<usize, CoachPositionHint>,
     /// Ring buffer of recent possession flips (steals), used by the ping-pong
     /// livelock detector to spot a ball cycling among a confined cluster of
     /// players and break it by squirting it loose to an uninvolved third man.
@@ -149,6 +160,25 @@ pub(crate) struct RecentDispossession {
     /// at POSSESSION_REGAIN_GRACE_TICKS and escalates when the ball has been
     /// ping-ponging in this zone (a shielding winner holds it more securely).
     pub(crate) grace_ticks: u64,
+}
+
+/// A manual coaching hint placed by dragging a player on the live UI: "be here."
+/// If the player's team had controlled possession at drop time it is a *receive*
+/// hint (where to get open for a pass); otherwise it is a positioning hint (where
+/// to stand on defense/offense). Applied as a movement override for a short
+/// window so the dragged player goes to the spot without permanently fighting the
+/// formation system.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoachPositionHint {
+    pub(crate) target: Vec2,
+    /// True when the hint means "get open here to receive a pass" (the player's
+    /// team was on the ball when dropped); false for a plain positioning hint.
+    pub(crate) receive: bool,
+    /// The team that held controlled possession at drop time. A receive hint is
+    /// dropped once this team no longer has the ball (you can't receive a pass
+    /// your team isn't making).
+    pub(crate) possession_team: Option<Team>,
+    pub(crate) set_tick: u64,
 }
 
 /// One possession flip (a completed defensive dispossession), logged for the
@@ -496,6 +526,8 @@ impl SoccerMatch {
             controller_yield_stats: ControllerYieldStats::default(),
             step_timing_stats: SoccerStepTimingStats::default(),
             recent_dispossession: None,
+            last_controlled_possession_team: None,
+            coach_position_hints: HashMap::new(),
             possession_swaps: VecDeque::new(),
             decision_trace_capture_enabled: false,
             decision_trace_by_player: BTreeMap::new(),
@@ -3625,6 +3657,7 @@ impl SoccerMatch {
         if self.config.learning_enabled || self.config.learning_logging_enabled {
             let phase_started = Instant::now();
             self.update_defensive_reward_trackers(&tick_start_snapshot, &next_snapshot);
+            self.detect_and_penalize_open_play_turnover(&next_snapshot);
             self.update_offside_lingering_rewards(&next_snapshot);
             self.update_defensive_clear_and_hold_reward_tracker(
                 &tick_start_snapshot,
@@ -3713,6 +3746,10 @@ impl SoccerMatch {
             self.apply_full_game_learning_if_ready();
             full_game_learning_elapsed += phase_started.elapsed();
         }
+        // Backstop: bound the deferred backlog every step regardless of the
+        // learning mode (goal/turnover/out-of-bounds penalties can push from
+        // paths outside the learning block).
+        self.cap_deferred_reward_transitions();
         if let Some(period_number) = self.config.period_start_after_tick(self.tick) {
             self.start_new_period(period_number, kickoff_team_for_period(period_number));
         } else if self.config.is_half_boundary_tick(self.tick) {
@@ -4856,6 +4893,149 @@ impl SoccerMatch {
         }
     }
 
+    /// Detect an open-play turnover (controlled possession passing from one team
+    /// to the other without an intervening dead ball) and retroactively penalize
+    /// the losing team's actions over the preceding window. Maintains
+    /// [`Self::last_controlled_possession_team`] across loose-ball ticks; a dead
+    /// ball clears it (see [`Self::apply_restart_with_label`]) so a kickoff /
+    /// throw-in / goal kick is never read as a turnover.
+    pub(crate) fn detect_and_penalize_open_play_turnover(&mut self, after: &WorldSnapshot) {
+        let Some(controlling) = after.controlled_possession_team() else {
+            // Loose ball: keep the last controller pinned so a steal that resolves
+            // a tick or two later still attributes to the team that had it.
+            return;
+        };
+        if let Some(previous) = self.last_controlled_possession_team {
+            if previous != controlling {
+                self.record_recent_turnover_penalties(previous);
+            }
+        }
+        self.last_controlled_possession_team = Some(controlling);
+    }
+
+    /// Retroactively penalize, and replay into every learner, the actions a team
+    /// took in the [`TURNOVER_HISTORY_WINDOW_SECONDS`] leading up to a turnover.
+    /// Recency-weighted (the action at the moment of loss is most culpable) and
+    /// scaled by on-ball culpability. Pushed onto `deferred_reward_transitions`,
+    /// which feeds the tabular Q policy, the adversarial team policies, and the
+    /// neural value/actor-critic models alike.
+    pub(crate) fn record_recent_turnover_penalties(&mut self, losing_team: Team) {
+        // No learner is consuming transitions when both learning and logging are
+        // off, so don't grow the deferred backlog (it would never drain).
+        if !(self.config.learning_enabled || self.config.learning_logging_enabled) {
+            return;
+        }
+        let window_ticks = ((TURNOVER_HISTORY_WINDOW_SECONDS
+            / self.config.dt_seconds.max(1e-6))
+        .round() as u64)
+            .max(1);
+        let now = self.tick;
+        let recent = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .filter(|transition| transition.team == losing_team)
+            .filter(|transition| now.saturating_sub(transition.tick) <= window_ticks)
+            .take(TURNOVER_HISTORY_MAX_ACTIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let span = window_ticks as f64;
+        for mut transition in recent {
+            let age_ticks = now.saturating_sub(transition.tick) as f64;
+            let recency = (1.0 - age_ticks / span).clamp(0.0, 1.0);
+            let blame = turnover_action_blame_multiplier(&transition.action);
+            let base = TURNOVER_HISTORY_MIN_PENALTY
+                + (TURNOVER_HISTORY_MAX_PENALTY - TURNOVER_HISTORY_MIN_PENALTY) * recency;
+            let amount = -(base * blame);
+            if !amount.is_finite() || amount.abs() <= 1e-9 {
+                continue;
+            }
+            transition.reward = amount;
+            transition.done = false;
+            self.deferred_reward_transitions.push(transition);
+        }
+        self.cap_deferred_reward_transitions();
+    }
+
+    /// Bound the deferred reward-transition backlog, dropping the oldest entries
+    /// first (stale penalties matter least). Called after every push burst and
+    /// once per step so a turnover/goal flurry can never grow it without limit.
+    pub(crate) fn cap_deferred_reward_transitions(&mut self) {
+        let len = self.deferred_reward_transitions.len();
+        if len > MAX_DEFERRED_REWARD_TRANSITIONS {
+            self.deferred_reward_transitions
+                .drain(0..len - MAX_DEFERRED_REWARD_TRANSITIONS);
+        }
+    }
+
+    /// Place a manual coaching position hint by dropping player `player_id` at
+    /// `target` on the live pitch. If the player's team holds controlled
+    /// possession at drop time, the hint means "get open here for a pass";
+    /// otherwise it means "stand here on defense/offense". Returns the resolved
+    /// hint so the caller can report which interpretation was applied.
+    /// The team currently in *controlled* possession (the team of the actual ball
+    /// holder), or `None` when the ball is loose.
+    pub(crate) fn controlled_possession_team_now(&self) -> Option<Team> {
+        self.ball
+            .holder
+            .and_then(|id| self.players.iter().find(|p| p.id == id))
+            .map(|p| p.team)
+    }
+
+    pub(crate) fn set_coach_position_hint(
+        &mut self,
+        player_id: usize,
+        target: Vec2,
+    ) -> Option<CoachPositionHint> {
+        if !target.x.is_finite() || !target.y.is_finite() {
+            return None;
+        }
+        let player = self.players.iter().find(|p| p.id == player_id)?;
+        let player_team = player.team;
+        let target = target.clamp_to_pitch(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let possession_team = self.controlled_possession_team_now();
+        let hint = CoachPositionHint {
+            target,
+            // "Same team as the ball-holder" → treat the drop as a receive spot.
+            receive: possession_team == Some(player_team),
+            possession_team,
+            set_tick: self.tick,
+        };
+        self.coach_position_hints.insert(player_id, hint);
+        Some(hint)
+    }
+
+    /// The active coaching target for a player, or `None` if there is no hint, it
+    /// has expired, the player has arrived, or (for a receive hint) the player's
+    /// team has since lost the ball. Expired/satisfied hints are pruned.
+    pub(crate) fn active_coach_hint_target(&mut self, player_id: usize) -> Option<Vec2> {
+        let hint = self.coach_position_hints.get(&player_id).copied()?;
+        let lifetime_ticks = ((COACH_POSITION_HINT_LIFETIME_SECONDS
+            / self.config.dt_seconds.max(1e-6))
+        .round() as u64)
+            .max(1);
+        let expired = self.tick.saturating_sub(hint.set_tick) > lifetime_ticks;
+        // A receive hint dies only when the OPPONENT wins controlled possession —
+        // not while the ball is merely loose or a pass is in flight (holder None),
+        // which is exactly when the player should be getting open to receive.
+        let possession_lost = hint.receive
+            && self.controlled_possession_team_now()
+                == hint.possession_team.map(Team::other);
+        let arrived = self
+            .players
+            .iter()
+            .find(|p| p.id == player_id)
+            .is_some_and(|p| p.position.distance(hint.target) <= COACH_POSITION_HINT_ARRIVAL_YARDS);
+        if expired || possession_lost || arrived {
+            self.coach_position_hints.remove(&player_id);
+            return None;
+        }
+        Some(hint.target)
+    }
+
     fn record_possession_team_reward_at(&mut self, tick: u64, team: Team, amount: f64) {
         if amount <= 1e-9 {
             return;
@@ -5708,6 +5888,23 @@ impl SoccerMatch {
                 SoccerAction::MoveTo(_) | SoccerAction::HoldShape
             ) {
                 self.apply_human_control_movement(player_id, dir, pace);
+                return;
+            }
+        }
+        // Manual drag-and-drop coaching hint: steer an AI player to the spot it
+        // was dropped on (where to stand on D/O, or where to get open to receive
+        // a pass). Only overrides off-ball movement of an un-controlled,
+        // non-carrier player; on-ball actions and human-controlled players keep
+        // their own logic.
+        if self.ball.holder != Some(player_id)
+            && self.players[player_id].controller_slot.is_none()
+            && matches!(
+                intent.action,
+                SoccerAction::MoveTo(_) | SoccerAction::HoldShape
+            )
+        {
+            if let Some(target) = self.active_coach_hint_target(player_id) {
+                self.move_player_towards(player_id, target, intent.sprint);
                 return;
             }
         }
@@ -7575,6 +7772,9 @@ impl SoccerMatch {
         self.pending_rebound = None;
         self.stat_restart(restart.kind, restart.awarded_team);
         self.record_out_of_bounds_turnover_penalty(restart.kind, restart.awarded_team);
+        // The ball is dead: the next controlled touch (kickoff, throw-in, goal
+        // kick taker) must not be mistaken for an open-play turnover.
+        self.last_controlled_possession_team = None;
         // A goal kick is taken by the keeper. Otherwise the nearest outfielder is
         // picked as taker and the keeper is left stranded on its goal-line (it never
         // gets repositioned to the ball), which looks broken.
@@ -9108,6 +9308,10 @@ impl SoccerMatch {
             return;
         }
         self.record_reward_event(offender, -OUT_OF_BOUNDS_TURNOVER_PENALTY_POINTS);
+        // Dribbling/passing the ball out under no pressure is a turnover too:
+        // give the offending team's last few seconds of play the same
+        // retroactive, all-learner penalty an open-play steal would.
+        self.record_recent_turnover_penalties(offending_team);
     }
 
     pub(crate) fn update_defensive_reward_trackers(&mut self, before: &WorldSnapshot, after: &WorldSnapshot) {
