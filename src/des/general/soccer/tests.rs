@@ -42125,16 +42125,24 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
             "a tightly-marked midfield reception must be penalised, got {midfield_penalty}"
         );
 
-        // Same crowding right in front of goal: final-third relief drops it to ~0.
+        // Same crowding right in front of goal: final-third relief RELAXES the penalty
+        // (a contested chance near goal is worth more risk) but no longer waives it
+        // entirely — feeding a tightly-marked man is still a likely turnover, so a floor
+        // of the penalty remains everywhere.
         let near_goal = Vec2::new(40.0, fl - 3.0);
         sim.players[marker].position = near_goal + Vec2::new(1.2, 0.0);
         let snapshot = WorldSnapshot::from_match(&sim);
         let final_third_penalty =
             snapshot.reception_congestion_penalty_at(Team::Home, near_goal);
         assert!(
-            final_third_penalty < midfield_penalty * 0.34,
-            "a contested reception in the final third is tolerated: \
+            final_third_penalty < midfield_penalty * 0.6,
+            "a contested final-third reception is tolerated more than in midfield: \
              final={final_third_penalty} mid={midfield_penalty}"
+        );
+        assert!(
+            final_third_penalty > 0.0,
+            "feeding a tightly-marked man is still penalised even in the final third: \
+             final={final_third_penalty}"
         );
     }
 

@@ -9062,11 +9062,19 @@ impl SoccerMatch {
             } else {
                 let cp = player_critical_power_w(&player.skills);
                 let w_prime_max = player_anaerobic_capacity_j(&player.skills);
-                let demand = metabolic_power_demand_w(
-                    &player.skills,
-                    player.velocity.len(),
-                    player.acceleration.len(),
-                );
+                // Only the FORWARD (speeding-up) component of acceleration carries a
+                // metabolic cost — turning and braking, and the per-tick solver jitter
+                // that rides on the raw acceleration vector, must not empty the sprint
+                // reserve. Using the full |a| made even a steady jog read as a sprint and
+                // drained W′ to empty in the first minute.
+                let speed_yps = player.velocity.len();
+                let accel_forward_yps2 = if speed_yps > 0.5 {
+                    dot(player.acceleration, player.velocity / speed_yps).max(0.0)
+                } else {
+                    player.acceleration.len()
+                };
+                let demand =
+                    metabolic_power_demand_w(&player.skills, speed_yps, accel_forward_yps2);
                 // Reconstruct the current charge from the stored depletion fraction.
                 let mut w_prime = (1.0 - player.anaerobic_load.clamp(0.0, 1.0)) * w_prime_max;
                 if demand >= cp {
@@ -16583,12 +16591,15 @@ impl WorldSnapshot {
         } else {
             pass_point.y
         };
-        // No penalty inside the final third (<=36yd to goal): contested receptions in
-        // dangerous areas are worth the risk. Ramps up to full weight by ~48yd out, so
-        // it bites in midfield / our own half but never suppresses a final-third ball.
+        // Contested receptions in the final third are worth more risk, so the penalty is
+        // RELAXED there — but not to zero: feeding a tightly-marked man is still demoted
+        // everywhere (a defender on the receiver is a likely turnover). Floors at ~35% of
+        // full weight in the final third and ramps to full by ~48yd out.
         let final_third_relief =
             ((yards_to_goal - DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL) / 12.0).clamp(0.0, 1.0);
-        opponent_pressure * RECEPTION_CONGESTION_PENALTY * final_third_relief
+        let weight = FINAL_THIRD_CONGESTION_FLOOR
+            + (1.0 - FINAL_THIRD_CONGESTION_FLOOR) * final_third_relief;
+        opponent_pressure * RECEPTION_CONGESTION_PENALTY * weight
     }
 
     fn attacker_pressure_on_point(&self, defending_team: Team, point: Vec2) -> f64 {

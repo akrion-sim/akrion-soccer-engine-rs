@@ -183,10 +183,11 @@ const INCHES_PER_YARD: f64 = 36.0;
 const KG_PER_POUND: f64 = 0.453_592_37;
 // Energy cost of level running (di Prampero): metabolic J per kg per metre.
 const RUN_ENERGY_COST_J_PER_KG_M: f64 = 3.6;
-// Extra demand of changing speed (mass·|a|·v), scaled up because accelerating
-// and braking are dearer than holding pace — the real repeated-sprint tax.
-const ACCEL_POWER_COEFF: f64 = 1.4;
-const ACCEL_MAGNITUDE_CAP_MPS2: f64 = 9.0; // ignore solver spikes past human accel
+// Extra demand of changing speed (mass·a_forward·v) — accelerating is dearer than
+// holding pace (the repeated-sprint tax). Only the forward accel component is fed
+// in (see the W′ update), so this is a moderate multiplier, not an unbounded one.
+const ACCEL_POWER_COEFF: f64 = 0.3;
+const ACCEL_MAGNITUDE_CAP_MPS2: f64 = 3.5; // ignore solver spikes past human forward accel
 // Critical-power band (metabolic W/kg), low → high cardio (`stamina`).
 const CRITICAL_POWER_MIN_W_PER_KG: f64 = 13.0;
 const CRITICAL_POWER_MAX_W_PER_KG: f64 = 19.0;
@@ -363,8 +364,8 @@ const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // that gap closes inside 2 yards the carrier should release the ball sooner —
 // forward dribbling is damped and passing is lifted — rather than let a defender
 // get on top of the ball. These weight that crowding response.
-const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.55;
-const PASS_CROWDED_RELEASE_LIFT: f64 = 0.80;
+const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
+const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
@@ -652,7 +653,7 @@ const EXCESSIVE_HOLD_RISING_SHRINK_SECONDS: f64 = 1.4;
 // Point 4: keep the carrier ~1.5-2yd off opponents in open play (dribbling straight
 // into a defender is a needless turnover); relax to a tight buffer in the final
 // third, where taking a man on is worth the risk.
-const DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS: f64 = 1.8;
+const DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL: f64 = 36.0;
 // "There's an open man — play it." When the learned policy proposes a dribble
 // but a teammate is this open with at least this expected completion, release
@@ -770,6 +771,9 @@ const POINTLESS_SHORT_PASS_PENALTY: f64 = 2.2;
 /// ~0 inside the final third, where a contested reception in a dangerous area is worth
 /// the risk.
 const RECEPTION_CONGESTION_PENALTY: f64 = 3.0;
+// Even in the final third, a pass to a tightly-marked receiver keeps at least this
+// fraction of the congestion penalty (a defender on the man is a likely turnover).
+const FINAL_THIRD_CONGESTION_FLOOR: f64 = 0.35;
 // Weight of the optimal-pass-length tiebreaker (peaks in the 8-12yd sweet spot).
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_MIN_YARDS: f64 = 8.0;
@@ -1477,6 +1481,11 @@ const CHASE_EMERGENCY_RADIUS_YARDS: f64 = 5.0;
 const CHASE_EMERGENCY_SPEED_YPS: f64 = 5.0;
 // A non-aerial ball within this radius is always trapped (players are elite at it).
 const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
+// A floor ball rolling THIS close to a player's feet is controlled no matter which
+// way they are facing — a ball right under you does not roll past because you were
+// looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
+// you still needs a turn first. (Below this, the facing/control-cone gate is waived.)
+const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 0.5;
 // Counterattack: with fewer than this many opponents ahead while in possession,
 // the break is on — off-ball players push forward into space (and sprint there).
 // Attack support: a teammate this far behind an advanced ball sprints forward to
@@ -41799,8 +41808,12 @@ fn nearest_ball_controller_for_segment(
         let facing_viable = cone_quality >= CONTROL_MIN_VIABLE_QUALITY;
         let guaranteed_trap = contact_altitude <= BALL_ROLLING_ALTITUDE_YARDS
             && !is_own_outgoing_pass
-            // A floor ball is always "low": it can only be trapped if you can take it.
-            && (is_pass_target || facing_viable)
+            // A floor ball is always "low": it can only be trapped if you can take it —
+            // unless it is right at the feet, where it is controlled regardless of facing
+            // (a ball at your feet does not roll past because you were looking away).
+            && (is_pass_target
+                || facing_viable
+                || actual_dist <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
             && actual_dist <= GUARANTEED_FLOOR_TRAP_RADIUS_YARDS;
         // The control-cone penalty gates only a LOW ball (<=6ft): the degraded angle / blind
         // ball shrinks the control radius and reception value, and a ball you cannot get your
@@ -41832,6 +41845,18 @@ fn nearest_ball_controller_for_segment(
             control_radius
         };
         if dist > effective_radius && !guaranteed_trap {
+            continue;
+        }
+        // Physical trap reach: the route/anticipation projection decides WHO is best
+        // placed to receive, but the ball can only actually be TAKEN when it is within
+        // reach of the player's REAL feet this tick. Without this, a pass target whose
+        // projected run point lined up with the ball could "magically" gain control while
+        // still 2+ yd away, and the ball would then teleport onto them. (Non-targets
+        // already gate on their real feet via `dist`.)
+        if is_pass_target
+            && !guaranteed_trap
+            && actual_dist > control_radius.max(GUARANTEED_FLOOR_TRAP_RADIUS_YARDS)
+        {
             continue;
         }
         // Altitude gate (non-targets only): a ball above the ground can only be
