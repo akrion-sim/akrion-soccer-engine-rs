@@ -484,9 +484,7 @@ impl InspectRing {
         // latest_index is the 2nd u64 in InspectHeader (offset 8).
         // SAFETY: header occupies the first INSPECT_HEADER_SIZE mapped bytes; the
         // field is 8-byte aligned at the mapping base (page-aligned).
-        unsafe {
-            &*(self.map.as_ptr().add(std::mem::size_of::<u64>()) as *const AtomicU64)
-        }
+        unsafe { &*(self.map.as_ptr().add(std::mem::size_of::<u64>()) as *const AtomicU64) }
     }
 
     /// Write one frame for the current tick and publish it. Tear-free for
@@ -502,7 +500,11 @@ impl InspectRing {
         let seq = unsafe { &*(ptr as *const AtomicU64) };
         // Begin write: make the per-frame seq odd.
         let started = seq.load(Ordering::Relaxed);
-        let odd = if started % 2 == 0 { started + 1 } else { started + 2 };
+        let odd = if started % 2 == 0 {
+            started + 1
+        } else {
+            started + 2
+        };
         seq.store(odd, Ordering::Release);
         fence(Ordering::Release);
         // Bake the ODD (in-progress) value into the payload's leading write_seq
@@ -606,7 +608,11 @@ impl InspectReader {
         if map.len() < INSPECT_FILE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("inspector file too small: {} < {}", map.len(), INSPECT_FILE_SIZE),
+                format!(
+                    "inspector file too small: {} < {}",
+                    map.len(),
+                    INSPECT_FILE_SIZE
+                ),
             ));
         }
         let reader = InspectReader { map };
@@ -835,7 +841,10 @@ fn frame_json(frame: &FrameInspect, selection: &InspectSelection) -> serde_json:
         .collect();
     let mut obj = serde_json::Map::new();
     obj.insert("tick".into(), serde_json::json!(frame.tick));
-    obj.insert("clockSeconds".into(), serde_json::json!(frame.clock_seconds));
+    obj.insert(
+        "clockSeconds".into(),
+        serde_json::json!(frame.clock_seconds),
+    );
     obj.insert("scoreHome".into(), serde_json::json!(frame.score_home));
     obj.insert("scoreAway".into(), serde_json::json!(frame.score_away));
     if selection.wants_section("ball") {
@@ -986,7 +995,10 @@ mod inspect_tests {
         assert_eq!(gait_label(gait_to_u8(MovementGait::Sprint)), "sprint");
         assert_eq!(facing_label(facing_to_u8(FacingBucket::NorthWest)), "NW");
         assert_eq!(role_label(role_to_u8(PlayerRole::Goalkeeper)), "GK");
-        assert_eq!(phase_label(phase_to_u8(TacticalPhase::AwayAttack)), "away-attack");
+        assert_eq!(
+            phase_label(phase_to_u8(TacticalPhase::AwayAttack)),
+            "away-attack"
+        );
     }
 
     #[test]
@@ -1021,14 +1033,19 @@ mod inspect_tests {
         let hist = reader.history(INSPECT_RING_SLOTS + 100);
         assert_eq!(hist.len(), INSPECT_RING_SLOTS);
         assert_eq!(hist.last().unwrap().tick, (total - 1) as u64);
-        assert_eq!(hist.first().unwrap().tick, (total - INSPECT_RING_SLOTS) as u64);
+        assert_eq!(
+            hist.first().unwrap().tick,
+            (total - INSPECT_RING_SLOTS) as u64
+        );
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn selection_parses_query() {
-        let sel = InspectSelection::from_query("player=18&fields=facing_yaw,yaw_rate&history=45&section=players");
+        let sel = InspectSelection::from_query(
+            "player=18&fields=facing_yaw,yaw_rate&history=45&section=players",
+        );
         assert_eq!(sel.player_id, Some(18));
         assert_eq!(sel.fields, vec!["facing_yaw", "yaw_rate"]);
         assert_eq!(sel.history, 45);
@@ -1038,7 +1055,10 @@ mod inspect_tests {
 
     #[test]
     fn selection_caps_selector_lists_against_query_amplification() {
-        let many = (0..500).map(|i| format!("f{i}")).collect::<Vec<_>>().join(",");
+        let many = (0..500)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let sel = InspectSelection::from_query(&format!("fields={many}&sections={many}"));
         assert_eq!(sel.fields.len(), InspectSelection::MAX_SELECTOR_ITEMS);
         assert_eq!(sel.sections.len(), InspectSelection::MAX_SELECTOR_ITEMS);
@@ -1059,10 +1079,15 @@ mod inspect_tests {
     #[test]
     fn ring_file_is_owner_only_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("soccer_inspect_perm_{}.shm", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("soccer_inspect_perm_{}.shm", std::process::id()));
         let _ring = InspectRing::create(&path).expect("create ring");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "ring file must not be world/group readable");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "ring file must not be world/group readable"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

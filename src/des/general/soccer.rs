@@ -10878,10 +10878,11 @@ pub struct SoccerMpcConfig {
     #[serde(default = "default_soccer_mpc_deviation_threshold_yps")]
     pub deviation_threshold_yps: f64,
     /// Field awareness: when on (requires `tier2_player_enabled`), the per-player
-    /// MPC plans around the *other 22 players* — each nearby player becomes a
-    /// moving soft keep-out propagated along its own velocity over the horizon, so
-    /// the planned path bends around where opponents/teammates *will be*. Off by
-    /// default (the plan only tracks its target).
+    /// MPC keeps the controlled player as the point-mass state, then plans around
+    /// every other player plus the ball as moving soft keep-outs. Obstacle centers
+    /// and velocities are projected from position, velocity, and acceleration, so
+    /// the planned path bends around where opponents/teammates/the ball will be.
+    /// Off by default (the plan only tracks its target).
     #[serde(default)]
     pub field_aware_enabled: bool,
     /// Keep-out radius (yards) around each opponent the plan avoids.

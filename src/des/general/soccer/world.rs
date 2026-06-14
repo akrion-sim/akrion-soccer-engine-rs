@@ -6949,7 +6949,8 @@ impl SoccerMatch {
     /// is; an off-ball outfield player joins it only while within
     /// `mpc.active_radius_yards` of the ball. This caps MPC to the handful of
     /// players whose execution actually matters per tick, so 22 controllers never
-    /// solve at once. Goalkeepers stay on the analytic path.
+    /// solve at once. Off-ball goalkeepers stay on the analytic path; a keeper
+    /// in possession is still the ball carrier and can use the execution layer.
     fn mpc_tier2_active(&self, player_id: usize) -> bool {
         if self.ball.holder == Some(player_id) {
             return true;
@@ -6964,13 +6965,110 @@ impl SoccerMatch {
         player.position.distance(self.ball.position) <= radius
     }
 
+    pub(crate) fn mpc_field_obstacles(
+        &self,
+        player_id: usize,
+        my_team: Team,
+        dt: f64,
+    ) -> Vec<PlanarObstacle> {
+        let (field_width, field_length) = sane_pitch_dimensions(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let half_dt2 = 0.5 * dt * dt;
+        let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
+        let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
+        let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
+        let mut obstacles = Vec::with_capacity(self.players.len().saturating_add(1));
+
+        for other in &self.players {
+            if other.id == player_id {
+                continue;
+            }
+            let position = finite_pitch_point(
+                other.position,
+                field_width,
+                field_length,
+                Vec2::new(field_width * 0.5, field_length * 0.5),
+            );
+            let velocity = finite_vec2(other.velocity, Vec2::zero());
+            let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+            let center = finite_pitch_point(
+                position + velocity * dt + acceleration * half_dt2,
+                field_width,
+                field_length,
+                position,
+            );
+            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 28.0);
+            let opponent = other.team != my_team;
+            let holder_bonus = if self.ball.holder == Some(other.id) {
+                0.4
+            } else {
+                0.0
+            };
+            let kinematic_weight = 1.0
+                + velocity.len().clamp(0.0, 18.0) / 54.0
+                + acceleration.len().clamp(0.0, 14.0) / 56.0;
+            obstacles.push(PlanarObstacle {
+                center: [center.x, center.y],
+                velocity: [obstacle_velocity.x, obstacle_velocity.y],
+                radius: if opponent {
+                    opponent_radius
+                } else {
+                    teammate_radius
+                } + holder_bonus,
+                weight: if opponent {
+                    keepout_weight
+                } else {
+                    keepout_weight * 0.25
+                } * kinematic_weight,
+            });
+        }
+
+        if self.ball.holder != Some(player_id) {
+            let position = finite_pitch_point(
+                self.ball.position,
+                field_width,
+                field_length,
+                Vec2::new(field_width * 0.5, field_length * 0.5),
+            );
+            let velocity = finite_vec2(self.ball.velocity, Vec2::zero());
+            let acceleration = finite_vec2(self.ball.acceleration, Vec2::zero());
+            let center = finite_pitch_point(
+                position + velocity * dt + acceleration * half_dt2,
+                field_width,
+                field_length,
+                position,
+            );
+            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 36.0);
+            let ball_weight = keepout_weight
+                * 0.15
+                * (1.0
+                    + velocity.len().clamp(0.0, 30.0) / 60.0
+                    + acceleration.len().clamp(0.0, 30.0) / 90.0);
+            obstacles.push(PlanarObstacle {
+                center: [center.x, center.y],
+                velocity: [obstacle_velocity.x, obstacle_velocity.y],
+                radius: 0.75,
+                weight: ball_weight,
+            });
+        }
+
+        obstacles
+    }
+
     /// The desired velocity actually executed this tick, after the MPC execution
     /// and (optionally) MDP↔MPC reconciliation layers. The "MDP" decision is the
     /// learned-policy/heuristic [`Self::collision_aware_desired_velocity`]; the
     /// "MPC" decision is a horizon-aware point-mass plan. The whole method reduces
     /// to the analytic decision (byte-identical) whenever MPC is off or the player
     /// is not in the active subset.
-    fn mpc_movement_desired_velocity(&mut self, player_id: usize, target: Vec2, speed: f64) -> Vec2 {
+    fn mpc_movement_desired_velocity(
+        &mut self,
+        player_id: usize,
+        target: Vec2,
+        speed: f64,
+    ) -> Vec2 {
         let v_mdp = self.collision_aware_desired_velocity(player_id, target, speed);
         if !self.config.mpc.tier2_player_enabled || !self.mpc_tier2_active(player_id) {
             return v_mdp;
@@ -7006,31 +7104,14 @@ impl SoccerMatch {
         // Acceleration disk radius from the player's own acceleration attribute —
         // the dominant term in the downstream accel limit, which re-clamps anyway.
         let accel_cap = acceleration_yps2_from_score(player.skills.acceleration).max(0.5);
-        let dt = self.config.dt_seconds;
+        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
         let horizon = self.config.mpc.player_horizon.max(1);
 
-        // Field awareness: every OTHER player becomes a moving soft keep-out,
-        // propagated along its own velocity over the horizon, so the plan accounts
-        // for all 22 players' positions AND velocities (opponents weighted harder
-        // than teammates; the ball influences the target/reference upstream, not
-        // as a keep-out). Built before the mutable controller borrow below.
+        // Field awareness: the controlled player is the MPC state; every other
+        // player plus the ball becomes a moving soft keep-out, projected with
+        // position, velocity, and acceleration before the mutable controller borrow.
         let obstacles: Vec<PlanarObstacle> = if self.config.mpc.field_aware_enabled {
-            let opp_r = self.config.mpc.opponent_keepout_yards.max(0.0);
-            let team_r = self.config.mpc.teammate_keepout_yards.max(0.0);
-            let w = self.config.mpc.keepout_weight.max(0.0);
-            self.players
-                .iter()
-                .filter(|o| o.id != player_id)
-                .map(|o| {
-                    let opponent = o.team != my_team;
-                    PlanarObstacle {
-                        center: [o.position.x, o.position.y],
-                        velocity: [o.velocity.x, o.velocity.y],
-                        radius: if opponent { opp_r } else { team_r },
-                        weight: if opponent { w } else { w * 0.25 },
-                    }
-                })
-                .collect()
+            self.mpc_field_obstacles(player_id, my_team, dt)
         } else {
             Vec::new()
         };
