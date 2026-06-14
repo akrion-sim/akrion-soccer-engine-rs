@@ -15611,8 +15611,21 @@ impl WorldSnapshot {
                         <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 aim_point_and_anticipation
                     .filter(|(aim_point, _)| {
+                        // In the final third, a FORWARD ball to a contested receiver is no
+                        // longer hard-vetoed just because a defender wins the race to the
+                        // (often aggressively LED) reception point. Near the opponent goal a
+                        // contested reception is worth the risk, so the race outcome is PRICED
+                        // into the score (the reception-congestion penalty, already relaxed in
+                        // the final third) instead of being used to HIDE the option — the same
+                        // treatment the threaded/"killer" ball already gets. Without this the
+                        // only "uncontested" option in a congested final third is a ball
+                        // backward, so a holder under rising hold-urgency recycles backwards
+                        // (or is dispossessed) instead of playing a brave forward pass.
+                        let final_third_forward = forward > 1.25
+                            && (me.team.goal_y(self.field_length) - aim_point.y).abs()
+                                <= self.field_length / 3.0;
                         (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && (!require_reception_won || reception_won)
+                            && (!require_reception_won || reception_won || final_third_forward)
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
