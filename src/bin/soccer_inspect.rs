@@ -150,9 +150,9 @@ fn field_value(p: &PlayerInspect, field: &str) -> String {
 }
 
 fn find_player(frame: &FrameInspect, id: u32) -> Option<&PlayerInspect> {
-    frame.players[..frame.player_count as usize]
-        .iter()
-        .find(|p| p.id == id)
+    // `players_slice` clamps player_count to the array bound — the file is
+    // externally written, so a corrupt count must not panic the reader.
+    frame.players_slice().iter().find(|p| p.id == id)
 }
 
 fn print_player_line(frame: &FrameInspect, p: &PlayerInspect, fields: &[String]) {
@@ -186,7 +186,7 @@ fn print_frame_summary(frame: &FrameInspect) {
         b.position.x, b.position.y, b.velocity.x, b.velocity.y, b.jerk.x, b.jerk.y,
         b.carry_orbit_world_rad, b.carry_orbit_radius_yards, b.carry_orbit_swept_rad
     );
-    for p in &frame.players[..frame.player_count as usize] {
+    for p in frame.players_slice() {
         println!(
             "  #{:<2} {:<10} {:<3} yaw={:+.3} yaw_rate={:+.3} face={:<3} gait={:<9} pos=({:.1},{:.1})",
             p.id,
@@ -334,7 +334,8 @@ fn player_to_json(frame: &FrameInspect, p: &PlayerInspect) -> serde_json::Value 
 }
 
 fn frame_to_json(frame: &FrameInspect) -> serde_json::Value {
-    let players: Vec<serde_json::Value> = frame.players[..frame.player_count as usize]
+    let players: Vec<serde_json::Value> = frame
+        .players_slice()
         .iter()
         .map(|p| player_to_json(frame, p))
         .collect();

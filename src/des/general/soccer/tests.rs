@@ -10937,6 +10937,20 @@
     }
 
     #[test]
+    fn introspection_read_is_gated_like_the_file_endpoints() {
+        // The raw-internals read is recognised so it locks down when a token is set...
+        assert!(live_introspection_requires_auth("GET", "/api/inspect"));
+        // ...but other reads (and non-GET) are not swept into the gate.
+        assert!(!live_introspection_requires_auth("GET", "/api/state"));
+        assert!(!live_introspection_requires_auth("GET", "/api/decision-trace"));
+        assert!(!live_introspection_requires_auth("POST", "/api/inspect"));
+        // Shares the default-open / strict-with-token authorization of the file gate.
+        assert!(live_file_endpoint_authorized(None, None));
+        assert!(live_file_endpoint_authorized(Some("tok"), Some("tok")));
+        assert!(!live_file_endpoint_authorized(Some("tok"), None));
+    }
+
+    #[test]
     fn live_admin_token_constant_time_eq_matches_only_exact() {
         assert!(constant_time_str_eq("s3cret-token", "s3cret-token"));
         assert!(!constant_time_str_eq("s3cret-token", "s3cret-toke"));
@@ -44938,10 +44952,10 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert_eq!(value["liveHttp"]["spawnsPerRequest"], false);
         assert_eq!(value["liveHttp"]["batchesStepTicks"], true);
         assert_eq!(value["stepTiming"]["ticks"], 2);
-        assert_eq!(value["stepTiming"]["tickBudgetMs"], 100.0);
+        assert_eq!(value["stepTiming"]["tickBudgetMs"], DEFAULT_DT_SECONDS * 1_000.0);
         assert_eq!(
             value["stepTiming"]["learningBudgetMs"],
-            100.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
+            DEFAULT_DT_SECONDS * 1_000.0 * SOCCER_LEARNING_TICK_BUDGET_RATIO
         );
         assert!(value["stepTiming"]["overBudget"].is_boolean());
         assert!(value["stepTiming"]["learningOverBudget"].is_boolean());
