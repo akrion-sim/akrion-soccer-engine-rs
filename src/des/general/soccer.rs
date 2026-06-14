@@ -920,28 +920,12 @@ const MATCH_RESULT_MARGIN_PENALTY_PER_GOAL: f64 = 0.75;
 const DEFENSIVE_GOAL_HISTORY_ACTIONS: usize = 50;
 const DEFENSIVE_GOAL_HISTORY_MAX_PENALTY: f64 = 0.075;
 const DEFENSIVE_GOAL_HISTORY_MIN_PENALTY: f64 = 0.014;
-/// When a team loses controlled possession to the opponent in open play (a
-/// dispossession, interception, miscontrol — any turnover), the actions the
-/// losing team took over the preceding [`TURNOVER_HISTORY_WINDOW_SECONDS`] are
-/// retroactively penalized and replayed into every learner (tabular Q, the
-/// adversarial team policies, and the neural value/actor-critic models). The
-/// blame is recency-weighted: the action at the moment of loss is most culpable
-/// (`MAX`), decaying linearly to the action at the window edge (`MIN`).
-const TURNOVER_HISTORY_WINDOW_SECONDS: f64 = 5.0;
-const TURNOVER_HISTORY_MAX_PENALTY: f64 = 0.05;
-const TURNOVER_HISTORY_MIN_PENALTY: f64 = 0.008;
-/// Cap on how many recent transitions a single turnover replays, so a dense
-/// possession burst can't flood the training stream.
-const TURNOVER_HISTORY_MAX_ACTIONS: usize = 80;
 /// Hard ceiling on the deferred reward-transition backlog. Retroactive penalties
 /// (turnovers, conceded goals) and reward-only ticks push onto this buffer; it is
 /// drained at most `policy_train_max_transitions_per_tick` per learning-due tick,
 /// so a turnover-heavy scrum can out-pace the drain. Capping the backlog (oldest
 /// dropped first) bounds memory regardless of the inflow/drain imbalance.
 const MAX_DEFERRED_REWARD_TRANSITIONS: usize = 4096;
-/// Off-ball actions (support runs, shape) share the blame for a turnover but are
-/// less culpable than the on-ball action that actually conceded it.
-const TURNOVER_OFFBALL_BLAME_FRACTION: f64 = 0.45;
 /// How long a manual drag-and-drop coaching position hint steers a player before
 /// it expires and the AI resumes its own positioning.
 const COACH_POSITION_HINT_LIFETIME_SECONDS: f64 = 12.0;
@@ -2258,6 +2242,11 @@ const MIN_SANE_DT_SECONDS: f64 = 1.0 / 240.0;
 /// Upper bound on a sanitized match duration (24 h) — far beyond any real fixture; exists
 /// only to keep `total_ticks()` bounded against a pathological/huge `duration_seconds`.
 const MAX_MATCH_DURATION_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+/// Runtime period structure bound. The CLI training paths already accept at most
+/// 8 halves; keep the library sanitizer aligned so malformed configs cannot turn
+/// per-tick period-boundary checks into an unbounded loop.
+const MAX_MATCH_HALVES: u8 = 8;
+const MAX_MATCH_PERIODS: usize = 8;
 
 fn sane_dt_seconds(dt_seconds: f64, fallback: f64) -> f64 {
     let chosen = if dt_seconds.is_finite() && dt_seconds > 0.0 {
@@ -2268,6 +2257,20 @@ fn sane_dt_seconds(dt_seconds: f64, fallback: f64) -> f64 {
         DEFAULT_DT_SECONDS
     };
     chosen.max(MIN_SANE_DT_SECONDS)
+}
+
+fn bounded_tick_count(duration_seconds: f64, dt_seconds: f64) -> u64 {
+    if !duration_seconds.is_finite()
+        || !dt_seconds.is_finite()
+        || duration_seconds <= 0.0
+        || dt_seconds <= 0.0
+    {
+        return 0;
+    }
+    let seconds = duration_seconds.min(MAX_MATCH_DURATION_SECONDS);
+    let dt = dt_seconds.max(MIN_SANE_DT_SECONDS);
+    let max_ticks = MAX_MATCH_DURATION_SECONDS / MIN_SANE_DT_SECONDS;
+    (seconds / dt).round().clamp(0.0, max_ticks) as u64
 }
 
 impl std::ops::Add for Vec2 {
@@ -10692,6 +10695,8 @@ impl MatchConfig {
     pub fn sanitized_for_runtime(&self) -> Self {
         let mut config = self.clone();
         config.dt_seconds = sane_dt_seconds(config.dt_seconds, DEFAULT_DT_SECONDS);
+        config.halves = config.halves.clamp(1, MAX_MATCH_HALVES);
+        config.period_count = config.period_count.clamp(1, MAX_MATCH_PERIODS);
         if !config.duration_seconds.is_finite() || config.duration_seconds < 0.0 {
             config.duration_seconds = DEFAULT_DURATION_SECONDS;
         }
@@ -10700,6 +10705,10 @@ impl MatchConfig {
         config.duration_seconds = config.duration_seconds.min(MAX_MATCH_DURATION_SECONDS);
         if !config.half_duration_seconds.is_finite() || config.half_duration_seconds < 0.0 {
             config.half_duration_seconds = DEFAULT_HALF_DURATION_SECONDS;
+        }
+        if config.half_duration_seconds > 0.0 {
+            let max_half_duration = MAX_MATCH_DURATION_SECONDS / f64::from(config.half_count());
+            config.half_duration_seconds = config.half_duration_seconds.min(max_half_duration);
         }
         if !config.halftime_fatigue_recovery.is_finite() || config.halftime_fatigue_recovery < 0.0 {
             config.halftime_fatigue_recovery = DEFAULT_HALFTIME_FATIGUE_RECOVERY;
@@ -10748,41 +10757,37 @@ impl MatchConfig {
     }
 
     pub fn half_count(&self) -> u8 {
-        self.halves.max(1)
+        self.halves.clamp(1, MAX_MATCH_HALVES)
     }
 
     pub fn effective_duration_seconds(&self) -> f64 {
-        if self.half_duration_seconds > 0.0 {
-            self.half_duration_seconds * f64::from(self.half_count())
+        if self.half_duration_seconds.is_finite() && self.half_duration_seconds > 0.0 {
+            let half_count = f64::from(self.half_count());
+            self.half_duration_seconds
+                .min(MAX_MATCH_DURATION_SECONDS / half_count)
+                * half_count
+        } else if self.duration_seconds.is_finite() {
+            self.duration_seconds.clamp(0.0, MAX_MATCH_DURATION_SECONDS)
         } else {
-            self.duration_seconds.max(0.0)
+            0.0
         }
     }
 
     pub fn effective_half_duration_seconds(&self) -> f64 {
-        if self.half_duration_seconds > 0.0 {
+        if self.half_duration_seconds.is_finite() && self.half_duration_seconds > 0.0 {
             self.half_duration_seconds
+                .min(MAX_MATCH_DURATION_SECONDS / f64::from(self.half_count()))
         } else {
             self.effective_duration_seconds() / f64::from(self.half_count())
         }
     }
 
     pub fn total_ticks(&self) -> u64 {
-        if self.dt_seconds <= 0.0 {
-            return 0;
-        }
-        (self.effective_duration_seconds() / self.dt_seconds)
-            .round()
-            .max(0.0) as u64
+        bounded_tick_count(self.effective_duration_seconds(), self.dt_seconds)
     }
 
     pub fn half_ticks(&self) -> u64 {
-        if self.dt_seconds <= 0.0 {
-            return 0;
-        }
-        (self.effective_half_duration_seconds() / self.dt_seconds)
-            .round()
-            .max(0.0) as u64
+        bounded_tick_count(self.effective_half_duration_seconds(), self.dt_seconds)
     }
 
     pub fn is_half_boundary_tick(&self, tick: u64) -> bool {
@@ -10795,7 +10800,7 @@ impl MatchConfig {
     }
 
     pub fn periods(&self) -> usize {
-        self.period_count.max(1)
+        self.period_count.clamp(1, MAX_MATCH_PERIODS)
     }
 
     pub fn period_start_after_tick(&self, tick: u64) -> Option<usize> {
@@ -13582,50 +13587,6 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
     )
 }
 
-/// Whether an action label is an on-ball action — one the player performs while
-/// in possession of the ball. The carrier/passer who actually conceded a
-/// turnover will have one of these as their last action, so it carries the full
-/// turnover blame; off-ball actions share a reduced fraction.
-fn soccer_action_is_on_ball(action: &str) -> bool {
-    matches!(
-        normalize_soccer_action_label(action),
-        "shoot"
-            | "first-time-shot"
-            | "first-time-header"
-            | "pass"
-            | "killer-pass"
-            | "aerial-pass"
-            | "flank-low-cross"
-            | "flank-high-cross"
-            | "first-time-pass"
-            | "dribble"
-            | "carry-forward"
-            | "carry-out-left"
-            | "carry-out-right"
-            | "protect-ball"
-            | "side-step"
-            | "left-cut"
-            | "right-cut"
-            | "nutmeg"
-            | "fake-left-cut-right"
-            | "fake-right-cut-left"
-            | "hold-up-flank"
-            | "control-touch"
-            | "clearance"
-            | "route-one"
-    )
-}
-
-/// Recency- and culpability-blended turnover blame for one recent action. The
-/// on-ball action that conceded possession is fully culpable; off-ball support
-/// shares [`TURNOVER_OFFBALL_BLAME_FRACTION`].
-fn turnover_action_blame_multiplier(action: &str) -> f64 {
-    if soccer_action_is_on_ball(action) {
-        1.0
-    } else {
-        TURNOVER_OFFBALL_BLAME_FRACTION
-    }
-}
 
 fn soccer_context_defender_distance(transition: &SoccerLearningTransition, fallback: f64) -> f64 {
     transition
@@ -17935,11 +17896,15 @@ fn soccer_policy_value_micros(value: f64) -> i64 {
 
 impl SoccerTrackingDataset {
     pub fn validate(&self) -> Result<(), String> {
-        if self.config.dt_seconds <= 0.0 {
-            return Err("tracking dataset config.dtSeconds must be positive".to_string());
+        if !self.config.dt_seconds.is_finite() || self.config.dt_seconds <= 0.0 {
+            return Err("tracking dataset config.dtSeconds must be positive and finite".to_string());
         }
-        if self.config.field_length_yards <= 0.0 || self.config.field_width_yards <= 0.0 {
-            return Err("tracking dataset field dimensions must be positive".to_string());
+        if !self.config.field_length_yards.is_finite()
+            || !self.config.field_width_yards.is_finite()
+            || self.config.field_length_yards <= 0.0
+            || self.config.field_width_yards <= 0.0
+        {
+            return Err("tracking dataset field dimensions must be positive and finite".to_string());
         }
         if self.frames.len() < 2 {
             return Err("tracking dataset needs at least two frames".to_string());
@@ -41122,9 +41087,6 @@ fn goalkeeper_save_probability_from_traits(
     } else {
         0.0
     };
-    let line_t = segment_projection_factor(shooter_position, shot_crossing, keeper_position);
-    let lateral_to_lane =
-        segment_distance_to_point(shooter_position, shot_crossing, keeper_position);
     let angle_cut_score = if (0.05..=0.92).contains(&line_t) {
         (1.0 - lateral_to_lane / (goal_width * 0.62).max(0.1)).clamp(0.0, 1.0)
             * (1.0 - line_t * 0.72).clamp(0.20, 1.0)

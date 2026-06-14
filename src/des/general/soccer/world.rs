@@ -4904,8 +4904,12 @@ impl SoccerMatch {
     }
 
     /// Detect an open-play turnover (controlled possession passing from one team
-    /// to the other without an intervening dead ball) and retroactively penalize
-    /// the losing team's actions over the preceding window. Maintains
+    /// to the other without an intervening dead ball — e.g. a miscontrol or a
+    /// loose-ball recovery that the explicit interception/dispossession hooks
+    /// don't cover) and route it through the single canonical turnover-penalty
+    /// engine [`Self::penalize_turnover_window`]. Its per-tick `last_turnover_penalty_tick`
+    /// guard de-duplicates against those explicit hooks, so a turnover is
+    /// penalized exactly once no matter how it was detected. Maintains
     /// [`Self::last_controlled_possession_team`] across loose-ball ticks; a dead
     /// ball clears it (see [`Self::apply_restart_with_label`]) so a kickoff /
     /// throw-in / goal kick is never read as a turnover.
@@ -4917,54 +4921,10 @@ impl SoccerMatch {
         };
         if let Some(previous) = self.last_controlled_possession_team {
             if previous != controlling {
-                self.record_recent_turnover_penalties(previous);
+                self.penalize_turnover_window(previous);
             }
         }
         self.last_controlled_possession_team = Some(controlling);
-    }
-
-    /// Retroactively penalize, and replay into every learner, the actions a team
-    /// took in the [`TURNOVER_HISTORY_WINDOW_SECONDS`] leading up to a turnover.
-    /// Recency-weighted (the action at the moment of loss is most culpable) and
-    /// scaled by on-ball culpability. Pushed onto `deferred_reward_transitions`,
-    /// which feeds the tabular Q policy, the adversarial team policies, and the
-    /// neural value/actor-critic models alike.
-    pub(crate) fn record_recent_turnover_penalties(&mut self, losing_team: Team) {
-        // No learner is consuming transitions when both learning and logging are
-        // off, so don't grow the deferred backlog (it would never drain).
-        if !(self.config.learning_enabled || self.config.learning_logging_enabled) {
-            return;
-        }
-        let window_ticks = ((TURNOVER_HISTORY_WINDOW_SECONDS
-            / self.config.dt_seconds.max(1e-6))
-        .round() as u64)
-            .max(1);
-        let now = self.tick;
-        let recent = self
-            .recent_learning_history
-            .iter()
-            .rev()
-            .filter(|transition| transition.team == losing_team)
-            .filter(|transition| now.saturating_sub(transition.tick) <= window_ticks)
-            .take(TURNOVER_HISTORY_MAX_ACTIONS)
-            .cloned()
-            .collect::<Vec<_>>();
-        let span = window_ticks as f64;
-        for mut transition in recent {
-            let age_ticks = now.saturating_sub(transition.tick) as f64;
-            let recency = (1.0 - age_ticks / span).clamp(0.0, 1.0);
-            let blame = turnover_action_blame_multiplier(&transition.action);
-            let base = TURNOVER_HISTORY_MIN_PENALTY
-                + (TURNOVER_HISTORY_MAX_PENALTY - TURNOVER_HISTORY_MIN_PENALTY) * recency;
-            let amount = -(base * blame);
-            if !amount.is_finite() || amount.abs() <= 1e-9 {
-                continue;
-            }
-            transition.reward = amount;
-            transition.done = false;
-            self.deferred_reward_transitions.push(transition);
-        }
-        self.cap_deferred_reward_transitions();
     }
 
     /// Bound the deferred reward-transition backlog, dropping the oldest entries
@@ -9323,8 +9283,9 @@ impl SoccerMatch {
         self.record_reward_event(offender, -OUT_OF_BOUNDS_TURNOVER_PENALTY_POINTS);
         // Dribbling/passing the ball out under no pressure is a turnover too:
         // give the offending team's last few seconds of play the same
-        // retroactive, all-learner penalty an open-play steal would.
-        self.record_recent_turnover_penalties(offending_team);
+        // retroactive, all-learner penalty an open-play steal would (via the
+        // canonical turnover engine, sharing its per-tick de-dup guard).
+        self.penalize_turnover_window(offending_team);
     }
 
     pub(crate) fn update_defensive_reward_trackers(&mut self, before: &WorldSnapshot, after: &WorldSnapshot) {

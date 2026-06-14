@@ -1164,6 +1164,45 @@
     }
 
     #[test]
+    fn runtime_match_config_bounds_half_duration_and_period_structure() {
+        let raw = MatchConfig {
+            dt_seconds: MIN_SANE_DT_SECONDS / 100.0,
+            duration_seconds: MAX_MATCH_DURATION_SECONDS * 10.0,
+            halves: u8::MAX,
+            half_duration_seconds: MAX_MATCH_DURATION_SECONDS * 10.0,
+            period_count: usize::MAX,
+            learning_enabled: false,
+            learning_logging_enabled: false,
+            neural_learning: SoccerNeuralLearningConfig {
+                enabled: false,
+                ..SoccerNeuralLearningConfig::default()
+            },
+            ..Default::default()
+        };
+        let max_total_ticks = (MAX_MATCH_DURATION_SECONDS / MIN_SANE_DT_SECONDS).round() as u64;
+
+        assert_eq!(raw.half_count(), MAX_MATCH_HALVES);
+        assert_eq!(raw.periods(), MAX_MATCH_PERIODS);
+        assert_eq!(raw.effective_duration_seconds(), MAX_MATCH_DURATION_SECONDS);
+        assert_eq!(raw.total_ticks(), max_total_ticks);
+
+        let sanitized = raw.sanitized_for_runtime();
+        assert_eq!(sanitized.dt_seconds, MIN_SANE_DT_SECONDS);
+        assert_eq!(sanitized.halves, MAX_MATCH_HALVES);
+        assert_eq!(sanitized.period_count, MAX_MATCH_PERIODS);
+        assert_eq!(
+            sanitized.half_duration_seconds,
+            MAX_MATCH_DURATION_SECONDS / f64::from(MAX_MATCH_HALVES)
+        );
+        assert_eq!(sanitized.effective_duration_seconds(), MAX_MATCH_DURATION_SECONDS);
+        assert_eq!(sanitized.total_ticks(), max_total_ticks);
+        assert_eq!(
+            sanitized.period_start_after_tick(max_total_ticks / 2),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn simulation_summary_runner_advances_without_trace_frames() {
         let summary = run_simulation_summary(MatchConfig {
             duration_seconds: 2.0,
@@ -21105,10 +21144,10 @@
             Team::Home => &decoded_artifact.home_entries,
             Team::Away => &decoded_artifact.away_entries,
         };
-        let decoded_entry = decoded_entries
-            .iter()
-            .find(|entry| entry.action == "pass")
-            .expect("serialized pass entry");
+        assert!(
+            decoded_entries.iter().any(|entry| entry.action == "pass"),
+            "serialized pass entry"
+        );
 
         let restored =
             SoccerTeamQPolicies::from_artifact(&decoded_artifact).expect("restore team policies");
@@ -25037,45 +25076,50 @@
     }
 
     #[test]
-    fn open_play_turnover_penalizes_losing_team_last_five_seconds() {
+    fn open_play_turnover_detector_routes_through_canonical_engine() {
+        // After consolidation, the open-play possession-flip detector funnels into
+        // the single `penalize_turnover_window` engine (reading `turnover_penalty_history`),
+        // stamping `last_turnover_penalty_tick` so it de-duplicates with the explicit
+        // interception/dispossession hooks.
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
             seed: 161,
             learning_enabled: true,
             ..Default::default()
         });
-        // dt defaults to 1/15s, so the 5s window is 75 ticks. At tick 100,
-        // anything at tick >= 25 is in-window.
         sim.tick = 100;
-        let window_ticks = (TURNOVER_HISTORY_WINDOW_SECONDS / sim.config.dt_seconds).round() as u64;
-        assert_eq!(window_ticks, 75);
         let snap = WorldSnapshot::from_match(&sim);
-        let push = |sim: &mut SoccerMatch, tick: u64, player_id: usize, team: Team, action: &str| {
-            sim.recent_learning_history.push_back(SoccerLearningTransition {
-                tick,
-                player_id,
-                team,
-                role: sim.players[player_id].role,
-                state: snap.mdp_state_for_player(player_id),
-                observation: snap.observation_for(player_id),
-                belief: belief_from_observation(&snap.observation_for(player_id)),
-                action: action.to_string(),
-                action_target: None,
-                decision_context: SoccerDecisionContext::default(),
-                tactical_trace: SoccerTacticalLearningTrace::default(),
-                reward: 0.0,
-                next_state: snap.mdp_state_for_player(player_id),
-                next_observation: snap.observation_for(player_id),
-                done: false,
-            });
+        let obs = snap.observation_for(0);
+        let base = SoccerLearningTransition {
+            tick: 0,
+            player_id: 0,
+            team: Team::Home,
+            role: sim.players[0].role,
+            state: snap.mdp_state_for_player(0),
+            observation: obs.clone(),
+            belief: belief_from_observation(&obs),
+            action: "carry".to_string(),
+            action_target: None,
+            decision_context: SoccerDecisionContext::default(),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.0,
+            next_state: snap.mdp_state_for_player(0),
+            next_observation: obs.clone(),
+            done: false,
         };
-        // Losing team (Home) actions: recent on-ball, old on-ball, recent off-ball.
-        push(&mut sim, 95, 5, Team::Home, "dribble"); // recent, on-ball
-        push(&mut sim, 30, 6, Team::Home, "dribble"); // near window edge, on-ball
-        push(&mut sim, 95, 7, Team::Home, "support-roam"); // recent, off-ball
-        // Out of window (tick 5 < 25) and the other team — both must be ignored.
-        push(&mut sim, 5, 8, Team::Home, "dribble");
-        push(&mut sim, 95, 12, Team::Away, "dribble");
+        let make = |tick: u64, team: Team, player_id: usize| SoccerLearningTransition {
+            tick,
+            team,
+            player_id,
+            ..base.clone()
+        };
+        // Window is TURNOVER_PENALTY_WINDOW_TICKS (75) before tick 100. The buffer is
+        // tick-ordered (the engine walks it newest-first and stops at the window edge),
+        // so push ascending as the real `remember_recent_learning_transitions` does.
+        sim.turnover_penalty_history.push_back(make(10, Team::Home, 8)); // out of window
+        sim.turnover_penalty_history.push_back(make(40, Team::Home, 6)); // in window, older
+        sim.turnover_penalty_history.push_back(make(95, Team::Away, 12)); // wrong team
+        sim.turnover_penalty_history.push_back(make(95, Team::Home, 5)); // in window, recent
 
         // Away now controls the ball: an open-play turnover by Home.
         sim.last_controlled_possession_team = Some(Team::Home);
@@ -25085,27 +25129,27 @@
         sim.detect_and_penalize_open_play_turnover(&after);
 
         assert_eq!(sim.last_controlled_possession_team, Some(Team::Away));
-        // Only the three in-window Home actions are replayed.
-        assert_eq!(sim.deferred_reward_transitions.len(), 3);
+        assert_eq!(sim.last_turnover_penalty_tick, Some(100));
+        // Only the two in-window Home actions are replayed, all penalized.
+        assert_eq!(sim.deferred_reward_transitions.len(), 2);
         assert!(sim
             .deferred_reward_transitions
             .iter()
             .all(|t| t.team == Team::Home && t.reward < 0.0));
-        let reward_at = |tick: u64, action: &str| -> f64 {
+        let reward_at = |tick: u64| -> f64 {
             sim.deferred_reward_transitions
                 .iter()
-                .find(|t| t.tick == tick && t.action == action)
+                .find(|t| t.tick == tick)
                 .map(|t| t.reward)
                 .expect("transition present")
         };
-        let recent_on_ball = reward_at(95, "dribble");
-        let old_on_ball = reward_at(30, "dribble");
-        let recent_off_ball = reward_at(95, "support-roam");
         // Recency: the action at the moment of loss is blamed hardest.
-        assert!(recent_on_ball < old_on_ball);
-        // On-ball culpability: the carrier is blamed more than an off-ball runner
-        // acting on the same tick.
-        assert!(recent_on_ball < recent_off_ball);
+        assert!(reward_at(95) < reward_at(40));
+
+        // De-dup: a second turnover penalty on the same tick (e.g. the explicit
+        // dispossession hook firing too) is suppressed — no extra transitions.
+        sim.penalize_turnover_window(Team::Home);
+        assert_eq!(sim.deferred_reward_transitions.len(), 2);
     }
 
     #[test]
@@ -26244,6 +26288,23 @@
             .validate()
             .expect_err("non-finite player confidence should be rejected")
             .contains("trackingConfidence"));
+    }
+
+    #[test]
+    fn tracking_dataset_rejects_non_finite_runtime_config() {
+        let mut tracking = sample_tracking_pass_dataset();
+        tracking.config.dt_seconds = f64::NAN;
+        assert!(tracking
+            .validate()
+            .expect_err("non-finite tracking dt should be rejected")
+            .contains("dtSeconds"));
+
+        let mut tracking = sample_tracking_pass_dataset();
+        tracking.config.field_width_yards = f64::INFINITY;
+        assert!(tracking
+            .validate()
+            .expect_err("non-finite tracking pitch dimensions should be rejected")
+            .contains("field dimensions"));
     }
 
     #[test]
