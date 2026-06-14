@@ -240,6 +240,12 @@ const SHOT_SAVE_DEPTH_YARDS: f64 = 1.6;
 // ball — keeps it inside the ~44yd-wide penalty area (≈22yd half) with a small margin, so
 // it doesn't follow a wide ball out of the box.
 const GOALKEEPER_BOX_STAY_HALF_WIDTH_YARDS: f64 = 20.0;
+// A ball-carrying keeper must release (pass / clear) rather than dribble once an
+// opponent has closed inside this radius — never carry it into a press near goal.
+const GOALKEEPER_RELEASE_PRESSURE_RADIUS_YARDS: f64 = 5.0;
+// Keep a keeper's carry target this far inside the penalty-area lines, so it never
+// dribbles the ball out of its own box.
+const GOALKEEPER_BOX_CARRY_MARGIN_YARDS: f64 = 1.0;
 // How far a keeper can extend to a save in one tick beyond its run — a full dive reaches a
 // couple of yards. The keeper is moved to the save point only within this reach (run + dive),
 // never TELEPORTED across to it.
@@ -368,6 +374,9 @@ const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
 const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
+// Eyes-on-ball shuffles (side-step / skip) only cover a SHORT distance; beyond this a
+// player turns and runs facing the direction of travel (no "running sideways").
+const SHUFFLE_MAX_DISTANCE_YARDS: f64 = 2.5;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
 const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 // --- Carried-ball orbital mechanics (planet/sun dribbling model) ---
@@ -376,9 +385,10 @@ const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 // keep the ball on one side (going AROUND the carrier) on ordinary touches.
 //
 // Max angular speed (rad/s) at which the ball can orbit the body on a NORMAL
-// touch — ~230 deg/s, so a 90-deg swing takes ~0.4s (a few touches), never a
-// single-tick teleport around the carrier.
-const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 4.0;
+// touch — fast enough that when carrying at a jog/run/sprint the ball tracks the
+// front foot and stays IN FRONT of the way the player faces (no lateral lag),
+// while still being rate-limited (no single-tick teleport around the carrier).
+const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 7.0;
 // Special moves (cuts / fakes / nutmeg) chop the ball across the body far faster.
 const CARRY_ORBIT_SPECIAL_RATE_RAD_S: f64 = 11.0;
 // The ball stays at least this far from the carrier's feet on ordinary play, so
@@ -689,6 +699,15 @@ const PASS_RECEPTION_CONGESTION_FLOOR: f64 = 0.28;
 // under 1.0 because the opponent-arrival estimate assumes a perfect sprint (no reaction
 // delay) and the receiver is also contesting the point.
 const PASS_RECEPTION_OPPONENT_TIME_MARGIN: f64 = 0.95;
+// A BACKWARD ball (aim point this far behind the passer along the attack direction)
+// is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
+// the ball back toward the opponent. A backward pass whose receiver has an opponent
+// within `BACKWARD_PASS_COVERED_RADIUS_YARDS` is vetoed (the holder keeps / shields /
+// clears it instead).
+const BACKWARD_PASS_MIN_FORWARD_YARDS: f64 = 1.0;
+// ~openness 0.2 on the (distance-2.5)/7.5 openness curve: a backward ball is only safe
+// to a teammate with at least this much space from the nearest opponent.
+const BACKWARD_PASS_COVERED_RADIUS_YARDS: f64 = 4.0;
 // The constant forward "lead the runner into space" bias tapers to zero over this much space
 // remaining to the attacking goal line, so a receiver near the box isn't led past the byline.
 const RECEPTION_FORWARD_BIAS_TAPER_YARDS: f64 = 28.0;
@@ -3590,6 +3609,22 @@ pub struct LiveDecisionTraceEntry {
     /// The player's belief-grounded action confidence (drives decisiveness + proaction).
     pub decision_confidence: f64,
     pub time_on_ball_seconds: f64,
+    /// The chosen action's target: the resolved receiver (for a pass) and the aim point.
+    /// `chosen_forward_yards` is signed along the player's own attack direction (negative
+    /// = a BACKWARD ball); `is_backward_pass` flags a pass played meaningfully backward —
+    /// the direct answer to "was that a backwards pass, and to whom?".
+    #[serde(default)]
+    pub chosen_target_player_id: Option<usize>,
+    #[serde(default)]
+    pub chosen_target_x: Option<f64>,
+    #[serde(default)]
+    pub chosen_target_y: Option<f64>,
+    #[serde(default)]
+    pub chosen_forward_yards: Option<f64>,
+    #[serde(default)]
+    pub is_pass: bool,
+    #[serde(default)]
+    pub is_backward_pass: bool,
     pub options: Vec<LiveDecisionTraceOption>,
 }
 
@@ -3604,6 +3639,27 @@ fn build_live_decision_trace_entry(
 ) -> LiveDecisionTraceEntry {
     let obs = &decision.observation;
     let chosen_norm = normalize_soccer_action_label(&decision.action).to_string();
+    let is_pass = decision_trace_action_is_pass(&decision.action);
+    let attack_dir = player.team.attack_dir();
+    let (chosen_target_player_id, chosen_target_x, chosen_target_y, chosen_forward_yards) =
+        match decision.action_target.as_ref() {
+            Some(target) => {
+                let (tx, ty, fwd) = match target.point {
+                    Some(point) => (
+                        Some(point.x),
+                        Some(point.y),
+                        Some((point.y - player.position.y) * attack_dir),
+                    ),
+                    None => (None, None, None),
+                };
+                (target.player_id, tx, ty, fwd)
+            }
+            None => (None, None, None, None),
+        };
+    // A pass is "backward" when its aim point is meaningfully behind the passer along the
+    // attacking direction (more than a yard — a square ball is not backward).
+    let is_backward_pass =
+        is_pass && chosen_forward_yards.is_some_and(|fwd| fwd < -1.0);
     let options = decision
         .action_options
         .iter()
@@ -3641,8 +3697,21 @@ fn build_live_decision_trace_entry(
         best_forward_pass_receiver_openness: obs.best_forward_pass_receiver_openness,
         decision_confidence: player.decision_confidence,
         time_on_ball_seconds: obs.actual_time_on_ball_seconds,
+        chosen_target_player_id,
+        chosen_target_x,
+        chosen_target_y,
+        chosen_forward_yards,
+        is_pass,
+        is_backward_pass,
         options,
     }
+}
+
+/// A chosen-action label that sends the ball to a teammate (a pass/cross), so the
+/// trace can flag a backward PASS specifically (vs a backward dribble/positioning move).
+fn decision_trace_action_is_pass(action: &str) -> bool {
+    let a = action.to_ascii_lowercase();
+    a.contains("pass") || a.contains("cross") || a == "route-one"
 }
 
 fn normalize_action_options(
@@ -42357,13 +42426,18 @@ fn classify_movement_gait(team: Team, to_target: Vec2, sprint: bool, chased: boo
         }
     } else if sprint && distance > 1.0 {
         MovementGait::Sprint
-    } else if lateral_dominant && distance > 0.75 && distance <= 7.0 {
+    } else if lateral_dominant && distance > 0.75 && distance <= SHUFFLE_MAX_DISTANCE_YARDS {
+        // A side-step / shuffle keeps the eyes on the ball, but ONLY over a short
+        // distance — you cannot shuffle sideways across the pitch. Covering real
+        // ground (below) turns and runs facing the direction of travel.
         MovementGait::SideStep
     } else if distance <= 1.8 {
         MovementGait::Walk
-    } else if distance <= 4.6 {
+    } else if distance <= SHUFFLE_MAX_DISTANCE_YARDS {
         MovementGait::Skip
     } else if distance <= 10.0 {
+        // Covering ground: a jog faces the movement direction (no more "running
+        // sideways" — a real run turns to face where it is going).
         MovementGait::Jog
     } else {
         MovementGait::Run
@@ -42660,6 +42734,17 @@ fn movement_action_facing_bucket(
         return current_facing;
     }
 
+    // A genuine RUN faces the direction of travel — you cannot jog/run/sprint sideways
+    // or keep facing the ball while covering ground. (The slower shuffle gaits below —
+    // walk / skip / side-step / back-pedal — keep the eyes on the ball.)
+    if matches!(
+        gait,
+        MovementGait::Jog | MovementGait::Run | MovementGait::Sprint
+    ) && to_target.len() > PLAYER_CONTROL_RADIUS_YARDS
+    {
+        return facing_bucket_from_vector(to_target);
+    }
+
     let ball_facing = ball_facing_bucket_from_position(team, position, ball_position);
     if matches!(gait, MovementGait::Run | MovementGait::Sprint)
         && velocity.len() >= FAST_AWAY_FACING_MIN_SPEED_YPS
@@ -42921,7 +43006,11 @@ fn player_anaerobic_capacity_j(skills: &SkillProfile) -> f64 {
 /// running, are what empty the anaerobic battery.
 fn metabolic_power_demand_w(skills: &SkillProfile, speed_yps: f64, accel_yps2: f64) -> f64 {
     let mass_kg = player_weight_pounds(skills.weight_pounds) * KG_PER_POUND;
-    let v_mps = speed_yps.max(0.0) * METERS_PER_YARD;
+    // Clamp to the physical single-frame speed ceiling so a transient solver velocity
+    // spike can't fabricate a huge demand and spuriously drain W′. (`max` over NaN
+    // returns the finite operand, so a non-finite speed sanitises to 0.)
+    let v_mps =
+        speed_yps.max(0.0).min(SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS) * METERS_PER_YARD;
     let a_mps2 = (accel_yps2.abs() * METERS_PER_YARD).min(ACCEL_MAGNITUDE_CAP_MPS2);
     let run_power = mass_kg * RUN_ENERGY_COST_J_PER_KG_M * v_mps;
     let accel_power = mass_kg * a_mps2 * v_mps * ACCEL_POWER_COEFF;

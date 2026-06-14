@@ -288,6 +288,11 @@ impl PlayerAgent {
         // In our own half, retention (shielding / safe dribbling) takes priority over
         // risky attacking dribbling — keep the ball rather than forcing it forward.
         let own_half = observation.yards_to_own_goal < observation.yards_to_goal;
+        // A ball-carrying keeper under proximate pressure must RELEASE (pass / clear) —
+        // never dribble it, and certainly never carry it out of the box into a press.
+        let keeper_must_release = self.role == PlayerRole::Goalkeeper
+            && observation.nearest_opponent_distance.is_finite()
+            && observation.nearest_opponent_distance <= GOALKEEPER_RELEASE_PRESSURE_RADIUS_YARDS;
         let offensive_urgency = observation.offensive_urgency.clamp(0.0, 1.0);
         let defensive_urgency = observation.defensive_urgency.clamp(0.0, 1.0);
         let decision_urgency = observation.decision_urgency.clamp(0.0, 1.0);
@@ -673,22 +678,42 @@ impl PlayerAgent {
         .clamp(0.03, 0.78);
         let mut options = vec![
             AgentActionOptionTrace::new("shoot", shot_score, shot_legal),
-            AgentActionOptionTrace::new("dribble", dribble_score, true),
-            AgentActionOptionTrace::new("carry-forward", carry_forward_score, carry_forward_legal),
+            AgentActionOptionTrace::new("dribble", dribble_score, !keeper_must_release),
+            AgentActionOptionTrace::new(
+                "carry-forward",
+                carry_forward_score,
+                carry_forward_legal && !keeper_must_release,
+            ),
             AgentActionOptionTrace::new(
                 "carry-out-left",
                 carry_out_left_score,
-                carry_out_left_legal,
+                carry_out_left_legal && !keeper_must_release,
             ),
             AgentActionOptionTrace::new(
                 "carry-out-right",
                 carry_out_right_score,
-                carry_out_right_legal,
+                carry_out_right_legal && !keeper_must_release,
             ),
-            AgentActionOptionTrace::new("protect-ball", protect_ball_score, protect_ball_legal),
-            AgentActionOptionTrace::new("side-step", side_step_score, side_step_legal),
-            AgentActionOptionTrace::new("fake-left-cut-right", feint_score, feint_legal),
-            AgentActionOptionTrace::new("fake-right-cut-left", feint_score, feint_legal),
+            AgentActionOptionTrace::new(
+                "protect-ball",
+                protect_ball_score,
+                protect_ball_legal && !keeper_must_release,
+            ),
+            AgentActionOptionTrace::new(
+                "side-step",
+                side_step_score,
+                side_step_legal && !keeper_must_release,
+            ),
+            AgentActionOptionTrace::new(
+                "fake-left-cut-right",
+                feint_score,
+                feint_legal && !keeper_must_release,
+            ),
+            AgentActionOptionTrace::new(
+                "fake-right-cut-left",
+                feint_score,
+                feint_legal && !keeper_must_release,
+            ),
             AgentActionOptionTrace::new(
                 "hold-up-flank",
                 hold_up_flank_score,

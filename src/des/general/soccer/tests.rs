@@ -10421,8 +10421,14 @@
             classify_movement_gait(Team::Home, Vec2::new(0.0, -8.0), false, true),
             MovementGait::Run
         );
+        // A 4yd lateral move is real ground to cover — turn and run (jog) facing it,
+        // not a sideways shuffle. Only a SHORT (<=2.5yd) lateral move side-steps.
         assert_eq!(
             classify_movement_gait(Team::Home, Vec2::new(4.0, 0.2), false, false),
+            MovementGait::Jog
+        );
+        assert_eq!(
+            classify_movement_gait(Team::Home, Vec2::new(2.0, 0.1), false, false),
             MovementGait::SideStep
         );
         assert_eq!(
@@ -10500,12 +10506,25 @@
         sim.players[player].position = Vec2::new(40.0, 60.0);
         sim.players[player].velocity = Vec2::zero();
 
-        sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
+        // A SHORT lateral move is a shuffle: keep the chest/eyes toward the ball.
+        sim.move_player_towards(player, Vec2::new(42.0, 60.0), false);
         assert_eq!(sim.players[player].movement_gait, MovementGait::SideStep);
         assert_eq!(
             sim.players[player].action_facing,
             FacingBucket::South,
-            "side-stepping defenders should keep their chest/eyes toward the ball, not the lateral shuffle"
+            "a short side-step keeps the chest/eyes toward the ball, not the lateral shuffle"
+        );
+
+        // A LONGER lateral move is real ground to cover — turn and run (jog) facing the
+        // direction of travel rather than shuffling sideways across the pitch.
+        sim.players[player].position = Vec2::new(40.0, 60.0);
+        sim.players[player].velocity = Vec2::zero();
+        sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
+        assert_eq!(sim.players[player].movement_gait, MovementGait::Jog);
+        assert_ne!(
+            sim.players[player].action_facing,
+            FacingBucket::South,
+            "a lateral RUN faces the direction of travel, not the ball"
         );
 
         sim.ball.position = Vec2::new(40.0, 40.0);
@@ -37682,6 +37701,9 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
             });
             let defender = 0;
             let attacker = 11;
+            // An OUTFIELD dribbler (player 11 is the away keeper by default; this test is
+            // about an open-play side-step, not a keeper — who must release under pressure).
+            sim.players[attacker].role = PlayerRole::Forward;
             sim.players[attacker].position = Vec2::new(41.0, 58.8);
             sim.players[attacker].position_history = VecDeque::from([Vec2::new(41.0, 61.0)]);
             sim.players[attacker].velocity = Vec2::zero();
@@ -42232,6 +42254,253 @@ tick,player_id,team,role,x,y,ball_x,ball_y,tracking_confidence,ball_confidence,p
         assert!(
             high.is_some(),
             "a high descending ball can still be taken while backpedalling under it"
+        );
+    }
+
+    #[test]
+    fn a_ball_right_at_the_feet_is_trapped_regardless_of_facing() {
+        // Complement to `cannot_control_a_low_ball_behind_you`: a ball rolling RIGHT under
+        // a player's feet (<=0.5yd) is controlled even when they face away — a ball at your
+        // feet does not roll past because you were looking elsewhere.
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 99,
+            ..Default::default()
+        });
+        let mut player = sim.players[12].clone();
+        player.position = Vec2::new(41.0, 55.0);
+        player.velocity = Vec2::zero();
+        player.action_facing = FacingBucket::East; // facing away from the westward ball
+        player.receive_facing = FacingBucket::East;
+        // Ball right at the feet (~0.2yd west), grounded.
+        let previous_ball_pos = Vec2::new(40.85, 55.0);
+        let ball_pos = Vec2::new(40.8, 55.0);
+        let ball_velocity = Vec2::new(-1.0, 0.0);
+        let got = nearest_ball_controller_for_segment(
+            1, previous_ball_pos, ball_pos, ball_velocity,
+            &[player], None, Some(Team::Home), None, 0.0, &mut mulberry32(2),
+        );
+        assert!(
+            got.is_some(),
+            "a ball right at the feet must be trapped even when facing away: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_pass_target_cannot_capture_the_ball_while_its_feet_are_out_of_reach() {
+        // The receiver's RUN/anticipation projection can line its expected reception point
+        // up with the ball's path, but the ball can only actually be TAKEN when it is
+        // within reach of the receiver's REAL feet — never captured (and teleported onto
+        // the receiver) from yards away.
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7,
+            ..Default::default()
+        });
+        let mut target = sim.players[10].clone();
+        // Ball rolling up the +y lane; the receiver's LAUNCH position sits right on the
+        // ball's path (so the projected reception point lines up), but the receiver's
+        // ACTUAL feet are 12yd back.
+        let origin = Vec2::new(40.0, 40.0);
+        let previous_ball_pos = Vec2::new(40.0, 41.9);
+        let ball_pos = Vec2::new(40.0, 42.0);
+        target.position = Vec2::new(40.0, 30.0); // real feet 12yd from the ball
+        target.velocity = Vec2::new(0.0, 5.0);
+        target.action_facing = FacingBucket::North;
+        target.receive_facing = FacingBucket::North;
+        let pass = PendingPass {
+            team: target.team,
+            from: 99,
+            target: Some(target.id),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 0,
+            origin,
+            intended_target: Vec2::new(40.0, 50.0),
+            distance_yards: 10.0,
+            receiver_openness: 1.0,
+            passer_skill: 1.0,
+            launch_speed_yps: 18.0,
+            receiver_position_at_launch: Some(Vec2::new(40.0, 42.0)),
+            receiver_velocity_at_launch: Some(Vec2::new(0.0, 5.0)),
+            offside: None,
+        };
+        let got = nearest_ball_controller_for_segment(
+            1, previous_ball_pos, ball_pos, Vec2::new(0.0, 18.0),
+            &[target], Some(&pass), None, None, 0.0, &mut mulberry32(3),
+        );
+        assert!(
+            got.is_none(),
+            "a pass target 12yd from the ball must not capture it from out of reach: {got:?}"
+        );
+    }
+
+    #[test]
+    fn metabolic_cost_counts_forward_acceleration_not_pure_turning() {
+        // Two identical players at the same speed: one accelerates straight ahead, the
+        // other has the same |a| purely sideways (turning). Only forward acceleration
+        // should drain the sprint reserve — turning / solver jitter must not empty W′.
+        let make = || {
+            let mut sim = SoccerMatch::default_11v11(MatchConfig {
+                dt_seconds: 1.0,
+                seed: 3,
+                ..Default::default()
+            });
+            sim.ball.holder = None;
+            sim.players[5].skills.stamina = 6.0;
+            sim.players[5].anaerobic_load = 0.0;
+            sim
+        };
+        let speed = 6.0_f64; // ~12mph run
+        let accel = 8.0_f64;
+        let mut forward = make();
+        let mut turning = make();
+        for _ in 0..10 {
+            forward.players[5].velocity = Vec2::new(0.0, speed);
+            forward.players[5].acceleration = Vec2::new(0.0, accel); // along velocity
+            forward.players[5].movement_gait = MovementGait::Run;
+            forward.update_player_facing_dizziness_energy();
+
+            turning.players[5].velocity = Vec2::new(0.0, speed);
+            turning.players[5].acceleration = Vec2::new(accel, 0.0); // perpendicular (turn)
+            turning.players[5].movement_gait = MovementGait::Run;
+            turning.update_player_facing_dizziness_energy();
+        }
+        assert!(
+            forward.players[5].anaerobic_load > turning.players[5].anaerobic_load + 1e-6,
+            "forward acceleration must cost more than pure turning: forward={} turning={}",
+            forward.players[5].anaerobic_load,
+            turning.players[5].anaerobic_load
+        );
+    }
+
+    #[test]
+    fn a_backward_pass_into_coverage_is_vetoed_but_to_an_open_man_is_allowed() {
+        // A backward ball is only safe to a clearly OPEN teammate. A backward pass to a
+        // COVERED teammate (opponent tight to them) must be vetoed even when the ball would
+        // win the arrival race — recycling backward into pressure hands it to the opponent.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let holder = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+            .unwrap()
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+            .unwrap()
+            .id;
+        let presserr = sim
+            .players
+            .iter()
+            .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+            .nth(0)
+            .unwrap()
+            .id;
+        let coverer = sim
+            .players
+            .iter()
+            .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+            .nth(1)
+            .unwrap()
+            .id;
+        park_players_except(&mut sim, &[holder, mate, presserr, coverer]);
+        // Home attacks +y. Holder pressured (so backward isn't auto-vetoed by "no pressure"),
+        // a teammate 3yd BEHIND, and a short backward ball that wins the arrival race.
+        sim.players[holder].position = Vec2::new(40.0, 60.0);
+        sim.players[holder].facing_yaw = std::f64::consts::FRAC_PI_2;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        // A MOVING side presser keeps the holder pressured in both cases (so the no-pressure
+        // backward veto never fires) without being a set interceptor in the backward lane.
+        sim.players[presserr].position = Vec2::new(46.0, 59.0);
+        sim.players[presserr].velocity = Vec2::new(-3.0, 0.0);
+        sim.players[mate].position = Vec2::new(40.0, 57.0); // 3yd behind the holder
+
+        // Covered: an opponent 2.8yd off the backward man (within the covered radius).
+        sim.players[coverer].position = Vec2::new(40.0, 54.2);
+        let covered = WorldSnapshot::from_match(&sim);
+        assert!(
+            !covered.ranked_pass_targets(holder, 11).contains(&mate),
+            "a backward pass to a COVERED teammate must be vetoed"
+        );
+
+        // Open: the coverer leaves — the backward man is free, so recycling is allowed.
+        sim.players[coverer].position = Vec2::new(8.0, 100.0);
+        let open = WorldSnapshot::from_match(&sim);
+        assert!(
+            open.ranked_pass_targets(holder, 11).contains(&mate),
+            "a backward pass to an OPEN teammate is still allowed (legit recycling)"
+        );
+    }
+
+    #[test]
+    fn a_pressured_keeper_releases_and_never_dribbles_out_of_its_box() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let gk = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+            .unwrap()
+            .id;
+        // Keeper on the ball near the top edge of its own box.
+        sim.players[gk].position = Vec2::new(40.0, 16.5);
+        sim.ball.holder = Some(gk);
+        sim.ball.position = sim.players[gk].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let directive = snapshot.tactical_directive(Team::Home);
+
+        // An opponent has closed inside 5yd: every dribble/carry/shield option must be
+        // illegal — the keeper must pass or clear.
+        let mut obs = snapshot.observation_for(gk);
+        obs.nearest_opponent_distance = 4.0;
+        let options = sim.players[gk].possession_action_options(
+            &obs,
+            &directive,
+            2,
+            1,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        );
+        for label in [
+            "dribble",
+            "carry-forward",
+            "carry-out-left",
+            "carry-out-right",
+            "protect-ball",
+            "side-step",
+            "fake-left-cut-right",
+            "fake-right-cut-left",
+        ] {
+            if let Some(o) = options.iter().find(|o| o.label == label) {
+                assert!(
+                    !o.legal,
+                    "a keeper pressured inside 5yd must not have {label} as a legal option"
+                );
+            }
+        }
+
+        // And even a carry target is clamped inside the box: a forward carry from the box
+        // edge cannot take the keeper (with the ball) out past the 18yd line.
+        let target = snapshot.dribble_move_target_for_touch(
+            gk,
+            sim.players[gk].home_position,
+            DribbleMoveKind::CarryForward,
+            DribbleTouchDecision::default(),
+        );
+        assert!(
+            target.y <= 17.0 + 1e-6,
+            "a keeper's carry target must stay inside its own box (y<=17): {target:?}"
+        );
+        assert!(
+            (target.x - snapshot.field_width * 0.5).abs() <= 21.0 + 1e-6,
+            "a keeper's carry target must stay inside the box width: {target:?}"
         );
     }
 

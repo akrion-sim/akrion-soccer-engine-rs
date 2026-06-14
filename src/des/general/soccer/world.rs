@@ -15179,10 +15179,18 @@ impl WorldSnapshot {
                         None
                     }
                 };
+                // Never recycle a BACKWARD ball into coverage: a backward pass is only safe
+                // to a clearly OPEN teammate. If it goes meaningfully backward AND an opponent
+                // is tight to the receiver, veto it — the holder keeps / shields / clears it
+                // rather than handing it back toward the opponent.
+                let backward_into_coverage = forward < -BACKWARD_PASS_MIN_FORWARD_YARDS
+                    && self.nearest_opponent_distance_at(me.team, position)
+                        <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 aim_point_and_anticipation
                     .filter(|(aim_point, _)| {
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || reception_won)
+                            && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
                             && !self.final_third_forward_pass_to_nobody(
@@ -15492,7 +15500,13 @@ impl WorldSnapshot {
                     .player_facing_direction(me)
                     .map(|facing| !pass_is_backheel(facing, pass_point - me_position))
                     .unwrap_or(true);
+                // Never loft a BACKWARD ball into coverage — a backward aerial to a
+                // covered receiver hands it back toward the opponent.
+                let backward_into_coverage = forward < -BACKWARD_PASS_MIN_FORWARD_YARDS
+                    && self.nearest_opponent_distance_at(me.team, position)
+                        <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 (aerial_strikeable
+                    && !backward_into_coverage
                     && (!visible_only || self.player_can_see_player(me.id, p.id))
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
                     && !self.final_third_forward_pass_to_nobody(
@@ -18482,6 +18496,20 @@ impl WorldSnapshot {
             self.goalmouth_carry_target_for_touch(player_id, current, target, kind, touch)
         {
             target = goalmouth_target;
+        }
+
+        // A keeper never dribbles the ball OUT of its own penalty area: clamp any carry
+        // target to the box (a yard inside the lines) so the keeper cannot leave the box
+        // with the ball at its feet.
+        if me.role == PlayerRole::Goalkeeper {
+            let center_x = self.field_width * 0.5;
+            let half_w = (22.0 - GOALKEEPER_BOX_CARRY_MARGIN_YARDS).max(0.0);
+            target.x = target.x.clamp(center_x - half_w, center_x + half_w);
+            let box_edge = (18.0 - GOALKEEPER_BOX_CARRY_MARGIN_YARDS).max(0.0);
+            match me.team {
+                Team::Home => target.y = target.y.min(box_edge),
+                Team::Away => target.y = target.y.max(self.field_length - box_edge),
+            }
         }
 
         target.clamp_to_pitch(self.field_width, self.field_length)
