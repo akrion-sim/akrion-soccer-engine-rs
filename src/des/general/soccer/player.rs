@@ -439,7 +439,8 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        let crowded_dribble_damp = (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
+        let crowded_dribble_damp =
+            (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
         // The flip side: when a defender is inside 2 yds AND a receiver is open, lift
         // passing so the carrier releases the ball before the gap closes. Gated on an
         // open outlet so a crowded carrier with no pass isn't pushed into a giveaway.
@@ -459,7 +460,7 @@ impl PlayerAgent {
             * (1.0 - open_forward_outlet * 0.34).clamp(0.58, 1.0)
             * dribble_into_opponent_penalty
             * crowded_dribble_damp)
-        .clamp(0.02, 1.36);
+            .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
             * fatigue_dribble
             * patient_dribble_lift
@@ -475,12 +476,14 @@ impl PlayerAgent {
         let central_defender_forward_blocked = is_central_defender
             && observation.forward_dribble_space_yards
                 < CENTRAL_DEFENDER_FORWARD_DRIBBLE_MIN_SPACE_YARDS;
-        let carry_forward_min_space = if observation.yards_to_goal <= DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL {
-            1.2
-        } else {
-            DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS
-        };
-        let carry_forward_legal = (observation.forward_dribble_space_yards >= carry_forward_min_space
+        let carry_forward_min_space =
+            if observation.yards_to_goal <= DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL {
+                1.2
+            } else {
+                DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS
+            };
+        let carry_forward_legal = (observation.forward_dribble_space_yards
+            >= carry_forward_min_space
             || goalmouth_carry_forced)
             && !goal_attack_shot_required
             && !central_defender_forward_blocked;
@@ -1294,7 +1297,11 @@ impl PlayerAgent {
             if pressure >= 0.45 && pass_quality >= 0.5 {
                 let dominance = (pressure * pass_quality).clamp(0.0, 1.0);
                 let first_time_floor = (0.40 + dominance * 0.50).clamp(0.40, 0.92);
-                ensure_min_legal_option_probability(&mut options, "first-time-pass", first_time_floor);
+                ensure_min_legal_option_probability(
+                    &mut options,
+                    "first-time-pass",
+                    first_time_floor,
+                );
                 let control_multiplier = (1.0 - dominance * 0.85).clamp(0.10, 1.0);
                 scale_legal_option_score(&mut options, control_label, control_multiplier);
             }
@@ -1302,7 +1309,10 @@ impl PlayerAgent {
         normalize_action_options(options)
     }
 
-    pub(crate) fn support_action_options(&self, snapshot: &WorldSnapshot) -> Vec<AgentActionOptionTrace> {
+    pub(crate) fn support_action_options(
+        &self,
+        snapshot: &WorldSnapshot,
+    ) -> Vec<AgentActionOptionTrace> {
         self.support_action_context(snapshot).options
     }
 
@@ -1635,7 +1645,10 @@ impl PlayerAgent {
         options
     }
 
-    pub(crate) fn immediate_defensive_steal_target(&self, snapshot: &WorldSnapshot) -> Option<usize> {
+    pub(crate) fn immediate_defensive_steal_target(
+        &self,
+        snapshot: &WorldSnapshot,
+    ) -> Option<usize> {
         if self.role == PlayerRole::Goalkeeper {
             return None;
         }
@@ -1886,7 +1899,9 @@ impl PlayerAgent {
         if let Some(planned_release) = snapshot.active_set_play_release_for(self.id, restart_label)
         {
             let release_legal = match &planned_release.0 {
-                SoccerAction::Pass { target_player, .. } => goal_kick_receiver_legal(*target_player),
+                SoccerAction::Pass { target_player, .. } => {
+                    goal_kick_receiver_legal(*target_player)
+                }
                 _ => true,
             };
             if release_legal {
@@ -2345,8 +2360,7 @@ impl PlayerAgent {
                 // A loose ball is, by definition, in nobody's possession. (An
                 // opponent's ball at the feet is handled by the steal logic below.)
                 if snapshot.ball.holder.is_none() {
-                    let target =
-                        self.control_touch_target_for_goal_context(snapshot, &observation);
+                    let target = self.control_touch_target_for_goal_context(snapshot, &observation);
                     let action = SoccerAction::ControlTouch { target };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
@@ -4796,4 +4810,3 @@ pub struct SoccerLearnedPlan {
     pub target_player: Option<usize>,
     pub target_point: Option<Vec2>,
 }
-

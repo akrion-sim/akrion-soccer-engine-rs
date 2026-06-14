@@ -23,15 +23,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::des::general::general::fisher_yates_shuffle;
-use crate::des::general::lp::{
-    solve_lp_clarabel, LPBasisWarmStart, LPProblem, LPStatus, Sense,
-};
 use crate::des::general::des_base::neural_network::NeuralNetworkLike;
+use crate::des::general::general::fisher_yates_shuffle;
+use crate::des::general::lp::{solve_lp_clarabel, LPBasisWarmStart, LPProblem, LPStatus, Sense};
 use crate::des::general::neural_network::{
     ActivationName, DenseLayerConfig, FeedForwardNetwork, RandomNetworkSpec,
 };
 use crate::des::general::prng::{mulberry32, SeededRandom};
+use crate::des::general::qp::{solve_qp_active_set, QPOptions, QPStatus, QuadraticProgram};
 use crate::des::shared::capabilities::RandomSource;
 
 mod referee;
@@ -96,21 +95,21 @@ const CONTROL_AERIAL_JUMP_REACH_YARDS: f64 = 2.2;
 // costs energy. Players therefore learn to watch the ball with economical
 // movement rather than whipping their head around.
 const MAX_BODY_YAW_RATE_RAD_S: f64 = 6.5; // ~372 deg/s, a hard biomechanical cap (players were spinning too fast)
-// While in possession the body cannot whip around — you have to keep the ball under
-// control, and the faster you are moving the less you can change direction (momentum).
-// The max yaw rate for the carrier ramps DOWN from a near-stop value to a sprint value
-// by speed fraction (current speed / the player's own top speed): a jogging carrier can
-// turn fairly tightly, a sprinting one only bends the run.
+                                          // While in possession the body cannot whip around — you have to keep the ball under
+                                          // control, and the faster you are moving the less you can change direction (momentum).
+                                          // The max yaw rate for the carrier ramps DOWN from a near-stop value to a sprint value
+                                          // by speed fraction (current speed / the player's own top speed): a jogging carrier can
+                                          // turn fairly tightly, a sprinting one only bends the run.
 const POSSESSION_MAX_YAW_RATE_SLOW_RAD_S: f64 = 4.0; // ~229 deg/s near a standstill
 const POSSESSION_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.2; // ~69 deg/s at a flat-out sprint
-// OFF the ball the body was uncapped (MAX_BODY_YAW_RATE_RAD_S, ~372 deg/s) so players gyroscoped.
-// Cap it too, scaled by speed: a near-stationary player can pivot to keep eyes on the ball, but a
-// runner/sprinter can only bend their heading (they face where they move).
+                                                     // OFF the ball the body was uncapped (MAX_BODY_YAW_RATE_RAD_S, ~372 deg/s) so players gyroscoped.
+                                                     // Cap it too, scaled by speed: a near-stationary player can pivot to keep eyes on the ball, but a
+                                                     // runner/sprinter can only bend their heading (they face where they move).
 const OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S: f64 = 4.5; // ~258 deg/s near a standstill
 const OFF_BALL_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.8; // ~103 deg/s at a flat-out sprint
-// Below this speed a player is effectively stationary and simply faces the ball; above it, the
-// facing follows the GAIT (forward gaits face the movement; back-pedalling / skipping face the
-// ball within a cone of the movement).
+                                                   // Below this speed a player is effectively stationary and simply faces the ball; above it, the
+                                                   // facing follows the GAIT (forward gaits face the movement; back-pedalling / skipping face the
+                                                   // ball within a cone of the movement).
 const MOVING_FACING_MIN_SPEED_YPS: f64 = 1.2;
 // Angular-acceleration cap: the turn rate itself can only change this fast, so a
 // player cannot instantly start or stop spinning even on an instant decision
@@ -134,14 +133,14 @@ const DIZZINESS_RECOVERY_PER_SECOND: f64 = 0.60;
 const DIZZINESS_MAX: f64 = 1.2;
 const DIZZINESS_CONTROL_PENALTY: f64 = 0.30; // control-radius loss at max dizziness
 const DIZZINESS_REWARD_PENALTY_POINTS: f64 = 2.2; // per unit dizziness, per second
-// A disoriented carrier (too much swivelling in a short window) is easier to
-// dispossess: scales the steal probability up by this much per unit dizziness.
+                                                  // A disoriented carrier (too much swivelling in a short window) is easier to
+                                                  // dispossess: scales the steal probability up by this much per unit dizziness.
 const DIZZINESS_DISPOSSESSION_RISK: f64 = 0.55;
 const YAW_ENERGY_FATIGUE_PER_RAD: f64 = 0.0006; // energy cost of rotating (per radian turned)
-// Sustained, contiguous high-urgency involvement near the ball is tiring. Scaled
-// to the same all-match budget as the anaerobic gait rates (see `fatigue_delta`):
-// the 12yd ball radius catches many players, so a high rate here would wall the
-// whole midfield within seconds.
+                                                // Sustained, contiguous high-urgency involvement near the ball is tiring. Scaled
+                                                // to the same all-match budget as the anaerobic gait rates (see `fatigue_delta`):
+                                                // the 12yd ball radius catches many players, so a high rate here would wall the
+                                                // whole midfield within seconds.
 const BALL_INVOLVEMENT_FATIGUE_PER_SECOND: f64 = 0.005;
 const BALL_INVOLVEMENT_RADIUS_YARDS: f64 = 12.0;
 // Two-tier energy: `fatigue` is the slow aerobic drain; `anaerobic_load` is the
@@ -188,7 +187,7 @@ const RUN_ENERGY_COST_J_PER_KG_M: f64 = 3.6;
 // in (see the W′ update), so this is a moderate multiplier, not an unbounded one.
 const ACCEL_POWER_COEFF: f64 = 0.3;
 const ACCEL_MAGNITUDE_CAP_MPS2: f64 = 3.5; // ignore solver spikes past human forward accel
-// Critical-power band (metabolic W/kg), low → high cardio (`stamina`).
+                                           // Critical-power band (metabolic W/kg), low → high cardio (`stamina`).
 const CRITICAL_POWER_MIN_W_PER_KG: f64 = 13.0;
 const CRITICAL_POWER_MAX_W_PER_KG: f64 = 19.0;
 // Anaerobic work capacity W′ band (J/kg), low → high cardio.
@@ -205,11 +204,11 @@ const ANAEROBIC_CEILING_LINEAR_SAG: f64 = 0.15;
 const ANAEROBIC_CEILING_KNEE: f64 = 0.72; // depletion fraction where the cliff begins
 const ANAEROBIC_CEILING_CLIFF_DROP: f64 = 0.32;
 const ANAEROBIC_CEILING_FLOOR: f64 = 0.52; // a fully-gassed player can still jog
-// Voluntary pacing: hitting the hard ceiling is rare; FAR more often a player
-// deliberately cruises to bank the reserve for the peak moments that decide the
-// game. Conservation only kicks in once the battery is past this comfort margin,
-// scales with how non-peak the current moment is, and is capped so a player
-// never paces themselves below a brisk cruise.
+                                           // Voluntary pacing: hitting the hard ceiling is rare; FAR more often a player
+                                           // deliberately cruises to bank the reserve for the peak moments that decide the
+                                           // game. Conservation only kicks in once the battery is past this comfort margin,
+                                           // scales with how non-peak the current moment is, and is capped so a player
+                                           // never paces themselves below a brisk cruise.
 const PACING_RESERVE_COMFORT: f64 = 0.35; // conserve only once >35% drained
 const PACING_MAX_THROTTLE: f64 = 0.30; // at most ~30% slower to save energy
 const PACING_FLOOR: f64 = 0.62;
@@ -298,10 +297,10 @@ const CARRIER_ADVANCE_STEAL_BOOST: f64 = 0.9; // cover + full advance ⇒ up to 
 const CARRIER_COVER_RADIUS_YARDS: f64 = 20.0; // a covering teammate goal-side within this range.
 const CARRIER_NO_COVER_CONTAIN_FACTOR: f64 = 0.7; // lone last defender: contain, don't lunge.
 const CARRIER_ADVANCE_STEPUP_FRACTION: f64 = 0.4; // close this share of the goal-side cushion when committing.
-// The step-up presses to JOCKEYING distance (edge of tackle range), not onto the
-// ball — diving to the carrier's feet pulls the defender into the on-ball cluster
-// and trips the anti-bunchball swarm cap. ~2.8yd keeps them within the 3.1yd tackle
-// reach while staying off the ball so they jockey rather than dogpile.
+                                                  // The step-up presses to JOCKEYING distance (edge of tackle range), not onto the
+                                                  // ball — diving to the carrier's feet pulls the defender into the on-ball cluster
+                                                  // and trips the anti-bunchball swarm cap. ~2.8yd keeps them within the 3.1yd tackle
+                                                  // reach while staying off the ball so they jockey rather than dogpile.
 const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
@@ -504,10 +503,10 @@ const LIVELOCK_SWAP_LOG_CAPACITY: usize = 16; // ring-buffer of recent flips to 
 const LIVELOCK_PERTURB_SPEED_YPS: f64 = 14.0; // loose-ball nudge toward the third man.
 const LIVELOCK_PERTURB_ALTITUDE_YARDS: f64 = 0.9; // a low scuffed deflection, not a hoof.
 const LIVELOCK_THIRD_MAN_MAX_DISTANCE_YARDS: f64 = 22.0; // how far out we look for an uninvolved player.
-// When the ball has been ping-ponging in a zone, each successive winner gets a
-// longer regain-protection window — the body-shielding defender is increasingly
-// likely to keep it rather than cough it straight back. Grace grows by this many
-// ticks per recent swap in the zone, capped so it never freezes possession.
+                                                         // When the ball has been ping-ponging in a zone, each successive winner gets a
+                                                         // longer regain-protection window — the body-shielding defender is increasingly
+                                                         // likely to keep it rather than cough it straight back. Grace grows by this many
+                                                         // ticks per recent swap in the zone, capped so it never freezes possession.
 const POSSESSION_REGAIN_GRACE_ESCALATION_PER_SWAP: u64 = 2;
 const POSSESSION_REGAIN_GRACE_MAX_TICKS: u64 = secs_to_ticks(1.4);
 // Proactive defensive line push-up. When the ball is deep in the opponent's half a
@@ -520,9 +519,9 @@ const DEFENSIVE_PUSH_UP_SPRINT_GAP_YARDS: f64 = 6.0; // gap above which it's a r
 const DEFENSIVE_PUSH_UP_DEFENDER_MAX_FRACTION: f64 = 0.54; // a centre-back holds up to ~54% upfield.
 const WINGBACK_PUSH_UP_MAX_FRACTION: f64 = 0.60; // wing-backs bomb on highest up the flank.
 const DEFENSIVE_PUSH_UP_MIDFIELDER_MAX_FRACTION: f64 = 0.62; // a midfielder pushes higher still.
-// The back four shifts across toward the ball more than their lane discipline alone
-// would allow — sliding as a unit to the ball side. Wing-backs (the wide defenders)
-// shuttle the most: bombing on when the ball is their side, tucking in when it's away.
+                                                             // The back four shifts across toward the ball more than their lane discipline alone
+                                                             // would allow — sliding as a unit to the ball side. Wing-backs (the wide defenders)
+                                                             // shuttle the most: bombing on when the ball is their side, tucking in when it's away.
 const DEFENDER_BALL_SIDE_PULL_BONUS: f64 = 0.14;
 const WINGBACK_BALL_SIDE_PULL_BONUS: f64 = 0.20;
 // Anti-dogpile / anti-ring discipline during a scrum (e.g. a possession livelock).
@@ -535,9 +534,9 @@ const WINGBACK_BALL_SIDE_PULL_BONUS: f64 = 0.20;
 const LIVELOCK_RING_DISPERSAL_RADIUS_YARDS: f64 = 7.0; // outer edge of the ring we disperse.
 const LIVELOCK_DOGPILE_FIELD_COUNT: usize = 5; // field players within the ring that flags a dogpile.
 const LIVELOCK_SHAPE_RECOVERY_BIAS: f64 = 0.85; // stronger pull to the marking slot during a dogpile.
-// Aerial header / flick reception: when a player meets a falling ball at head/chest
-// height (≈3–10 ft) under pressure, they head it away / flick it on instead of
-// settling it; with no opponent within the pressure radius they chest it down.
+                                                // Aerial header / flick reception: when a player meets a falling ball at head/chest
+                                                // height (≈3–10 ft) under pressure, they head it away / flick it on instead of
+                                                // settling it; with no opponent within the pressure radius they chest it down.
 const AERIAL_HEADER_MIN_ALTITUDE_YARDS: f64 = 1.0;
 const AERIAL_HEADER_MAX_ALTITUDE_YARDS: f64 = 3.3;
 const AERIAL_HEADER_PRESSURE_RADIUS_YARDS: f64 = 2.6;
@@ -1186,25 +1185,40 @@ impl SoccerSpacingParams {
         };
         let d = SoccerSpacingParams::default();
         self.near_radius_yards = yards(self.near_radius_yards, d.near_radius_yards, 40.0);
-        self.far_radius_yards = yards(self.far_radius_yards, d.far_radius_yards, 40.0)
-            .max(self.near_radius_yards);
-        self.box_radius_reduction_yards =
-            yards(self.box_radius_reduction_yards, d.box_radius_reduction_yards, 40.0);
+        self.far_radius_yards =
+            yards(self.far_radius_yards, d.far_radius_yards, 40.0).max(self.near_radius_yards);
+        self.box_radius_reduction_yards = yards(
+            self.box_radius_reduction_yards,
+            d.box_radius_reduction_yards,
+            40.0,
+        );
         self.near_grace_seconds = yards(self.near_grace_seconds, d.near_grace_seconds, 120.0);
         self.far_grace_seconds = yards(self.far_grace_seconds, d.far_grace_seconds, 120.0);
-        self.separation_margin_yards =
-            yards(self.separation_margin_yards, d.separation_margin_yards, 20.0);
+        self.separation_margin_yards = yards(
+            self.separation_margin_yards,
+            d.separation_margin_yards,
+            20.0,
+        );
         self.nudge_bias = frac(self.nudge_bias, d.nudge_bias, 1.0);
         self.max_nudge_yards = yards(self.max_nudge_yards, d.max_nudge_yards, 20.0);
         self.clock_decay_rate = frac(self.clock_decay_rate, d.clock_decay_rate, 100.0);
         self.relational_neighbors = self.relational_neighbors.clamp(1, 10);
-        self.relational_tolerance_yards =
-            yards(self.relational_tolerance_yards, d.relational_tolerance_yards, 60.0);
+        self.relational_tolerance_yards = yards(
+            self.relational_tolerance_yards,
+            d.relational_tolerance_yards,
+            60.0,
+        );
         self.relational_nudge_bias = frac(self.relational_nudge_bias, d.relational_nudge_bias, 1.0);
-        self.relational_max_nudge_yards =
-            yards(self.relational_max_nudge_yards, d.relational_max_nudge_yards, 20.0);
-        self.relational_lp_anchor_weight =
-            frac(self.relational_lp_anchor_weight, d.relational_lp_anchor_weight, 1.0);
+        self.relational_max_nudge_yards = yards(
+            self.relational_max_nudge_yards,
+            d.relational_max_nudge_yards,
+            20.0,
+        );
+        self.relational_lp_anchor_weight = frac(
+            self.relational_lp_anchor_weight,
+            d.relational_lp_anchor_weight,
+            1.0,
+        );
         self.relational_lp_anchor_full_error_yards = yards(
             self.relational_lp_anchor_full_error_yards,
             d.relational_lp_anchor_full_error_yards,
@@ -1216,10 +1230,17 @@ impl SoccerSpacingParams {
             d.relational_lp_anchor_deadzone_yards,
             60.0,
         );
-        self.relational_reward_per_yard =
-            frac(self.relational_reward_per_yard, d.relational_reward_per_yard, 5.0);
-        self.relational_reward_cap_yards =
-            yards(self.relational_reward_cap_yards, d.relational_reward_cap_yards, 120.0).max(0.0);
+        self.relational_reward_per_yard = frac(
+            self.relational_reward_per_yard,
+            d.relational_reward_per_yard,
+            5.0,
+        );
+        self.relational_reward_cap_yards = yards(
+            self.relational_reward_cap_yards,
+            d.relational_reward_cap_yards,
+            120.0,
+        )
+        .max(0.0);
         self
     }
 
@@ -2148,6 +2169,16 @@ fn default_formation_lp_enabled() -> bool {
     true
 }
 
+fn default_local_mpc_enabled() -> bool {
+    false
+}
+
+const DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM: usize = 3;
+
+fn default_local_mpc_max_players_per_team() -> usize {
+    DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM
+}
+
 fn default_neural_learning_config() -> SoccerNeuralLearningConfig {
     SoccerNeuralLearningConfig::default()
 }
@@ -2872,9 +2903,16 @@ impl TeamAttackStrategy {
     pub fn layer(self) -> StrategyLayer {
         use TeamAttackStrategy::*;
         match self {
-            GiveAndGoCentral | OneTwoLeftRelease | OneTwoRightRelease | WingOverlapLeftCross
-            | WingOverlapRightCross | UnderlapLeftCutback | UnderlapRightCutback
-            | DecoyFarSideCutbackLeft | DecoyFarSideCutbackRight | DragDefenderOpenChannelLeft
+            GiveAndGoCentral
+            | OneTwoLeftRelease
+            | OneTwoRightRelease
+            | WingOverlapLeftCross
+            | WingOverlapRightCross
+            | UnderlapLeftCutback
+            | UnderlapRightCutback
+            | DecoyFarSideCutbackLeft
+            | DecoyFarSideCutbackRight
+            | DragDefenderOpenChannelLeft
             | DragDefenderOpenChannelRight => StrategyLayer::Pair,
             ThirdManRunCentral | CentralDoubleOneTwo | HalfSpaceComboLeft | HalfSpaceComboRight => {
                 StrategyLayer::Triangle
@@ -3681,8 +3719,7 @@ fn build_live_decision_trace_entry(
         };
     // A pass is "backward" when its aim point is meaningfully behind the passer along the
     // attacking direction (more than a yard — a square ball is not backward).
-    let is_backward_pass =
-        is_pass && chosen_forward_yards.is_some_and(|fwd| fwd < -1.0);
+    let is_backward_pass = is_pass && chosen_forward_yards.is_some_and(|fwd| fwd < -1.0);
     let options = decision
         .action_options
         .iter()
@@ -4059,6 +4096,8 @@ pub struct SoccerTacticalLearningTrace {
     pub look_behind_shape_penalty: f64,
     #[serde(default)]
     pub formation_lp_guidance: bool,
+    #[serde(default)]
+    pub local_mpc_guidance: bool,
     #[serde(default)]
     pub formation_lp_recommended_move_yards: f64,
     #[serde(default)]
@@ -6066,7 +6105,11 @@ impl SoccerQPolicy {
         let mut keys = Vec::new();
         for receive_facing in Self::facing_query_values(state.receive_facing) {
             for action_facing in Self::facing_query_values(state.action_facing) {
-                keys.push(Self::state_with_facing(state, *receive_facing, *action_facing));
+                keys.push(Self::state_with_facing(
+                    state,
+                    *receive_facing,
+                    *action_facing,
+                ));
             }
         }
         keys
@@ -6865,7 +6908,8 @@ impl SoccerQPolicy {
                     let Some(key) = self.action_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if !key.state.matches_relaxed_learning_context(state) || !is_legal(&key.action) {
+                    if !key.state.matches_relaxed_learning_context(state) || !is_legal(&key.action)
+                    {
                         continue;
                     }
                     let Some(value) = self
@@ -10772,6 +10816,10 @@ pub struct MatchConfig {
     pub full_game_learning_enabled: bool,
     #[serde(default = "default_formation_lp_enabled")]
     pub formation_lp_enabled: bool,
+    #[serde(default = "default_local_mpc_enabled")]
+    pub local_mpc_enabled: bool,
+    #[serde(default = "default_local_mpc_max_players_per_team")]
+    pub local_mpc_max_players_per_team: usize,
     #[serde(default = "default_tactical_learning_weights")]
     pub tactical_learning: SoccerTacticalLearningWeights,
     #[serde(default = "default_spacing_params")]
@@ -10814,6 +10862,8 @@ impl Default for MatchConfig {
             policy_train_max_transitions_per_tick: default_policy_train_max_transitions_per_tick(),
             full_game_learning_enabled: true,
             formation_lp_enabled: true,
+            local_mpc_enabled: false,
+            local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             tactical_learning: SoccerTacticalLearningWeights::default(),
             spacing: SoccerSpacingParams::default(),
             neural_learning: SoccerNeuralLearningConfig::default(),
@@ -10838,6 +10888,7 @@ impl MatchConfig {
             learning_logging_enabled: false,
             full_game_learning_enabled: false,
             formation_lp_enabled: false,
+            local_mpc_enabled: false,
             neural_learning: SoccerNeuralLearningConfig {
                 enabled: false,
                 ..SoccerNeuralLearningConfig::default()
@@ -10855,6 +10906,8 @@ impl MatchConfig {
             learning_interval_ticks: 1,
             full_game_learning_enabled: true,
             formation_lp_enabled: true,
+            local_mpc_enabled: true,
+            local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             // Full synergy in real games: the neural value/actor TRAIN (threaded) AND
             // feed back into selection (Additive blend + actor-critic) so the nets
             // integrate with the tabular MDP/POMDP policy, and the trained critic
@@ -12042,8 +12095,7 @@ fn tactical_directive_for_team(
             // returns (asymptotes ~CENTRE_BACK_OVERSHOOT_SOFT_YARDS past the cap).
             let cap_excess = (within_two - halfway_cap) * attack_dir;
             let compressed = if cap_excess > 0.0 {
-                let damped =
-                    cap_excess / (1.0 + cap_excess / CENTRE_BACK_OVERSHOOT_SOFT_YARDS);
+                let damped = cap_excess / (1.0 + cap_excess / CENTRE_BACK_OVERSHOOT_SOFT_YARDS);
                 halfway_cap + attack_dir * damped
             } else {
                 within_two
@@ -12064,7 +12116,8 @@ fn tactical_directive_for_team(
         let halfway_cap = field_length * 0.5 + attack_dir * CENTRE_BACK_MAX_PAST_HALFWAY_YARDS;
         let cap_excess = (pushed - halfway_cap) * attack_dir;
         let capped = if cap_excess > 0.0 {
-            halfway_cap + attack_dir * (cap_excess / (1.0 + cap_excess / CENTRE_BACK_OVERSHOOT_SOFT_YARDS))
+            halfway_cap
+                + attack_dir * (cap_excess / (1.0 + cap_excess / CENTRE_BACK_OVERSHOOT_SOFT_YARDS))
         } else {
             pushed
         };
@@ -12858,7 +12911,8 @@ fn pass_to_nobody_passer_penalty(
     } else {
         1.0
     };
-    ((2.5 + openness_cost + direction_cost + opponent_cost) * final_third_multiplier).clamp(2.5, 16.0)
+    ((2.5 + openness_cost + direction_cost + opponent_cost) * final_third_multiplier)
+        .clamp(2.5, 16.0)
 }
 
 fn quick_receiver_dispossession_passer_penalty(
@@ -13863,7 +13917,6 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
     )
 }
 
-
 fn soccer_context_defender_distance(transition: &SoccerLearningTransition, fallback: f64) -> f64 {
     transition
         .decision_context
@@ -14457,9 +14510,7 @@ fn dense_soccer_transition_reward(
         if contest_urgency > 0.5 && ball_before <= EFFORT_CONTEST_RADIUS_YARDS {
             let approach = ball_before - after_pos.distance(after.ball.position);
             if approach > 0.3 {
-                reward += EFFORT_REWARD_POINTS
-                    * contest_urgency
-                    * (approach / 1.5).clamp(0.0, 1.0);
+                reward += EFFORT_REWARD_POINTS * contest_urgency * (approach / 1.5).clamp(0.0, 1.0);
             } else if moved_yards < 0.3 {
                 reward -= LAZINESS_PENALTY_POINTS * contest_urgency;
             }
@@ -14565,8 +14616,8 @@ fn dense_soccer_transition_reward(
             // Floor pass into a blocked lane (opponent in the path) = likely gift
             // to the opposition. Penalize at decision time, scaled by how blocked
             // the lane is; aerial passes clear the lane and are exempt.
-            let is_floor_pass = pass_like_action_flight(action)
-                .map_or(true, |flight| !flight.is_aerial());
+            let is_floor_pass =
+                pass_like_action_flight(action).map_or(true, |flight| !flight.is_aerial());
             if is_floor_pass {
                 let lane_open = before_obs.floor_pass_lane_score.clamp(0.0, 1.0);
                 if lane_open < BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD {
@@ -14610,7 +14661,9 @@ fn dense_soccer_transition_reward(
         // position — so the MDP/POMDP learns to take the long shot only then.
         if action == "shoot" && before_obs.yards_to_goal > LONG_SHOT_DISCOURAGED_YARDS {
             let over = before_obs.yards_to_goal - LONG_SHOT_DISCOURAGED_YARDS;
-            let keeper_relief = before_obs.opposing_goalkeeper_out_of_position.clamp(0.0, 1.0);
+            let keeper_relief = before_obs
+                .opposing_goalkeeper_out_of_position
+                .clamp(0.0, 1.0);
             let distance_penalty = (over / 7.0).min(3.0) * 2.4;
             reward -= distance_penalty * (1.0 - keeper_relief * 0.85);
         }
@@ -15752,6 +15805,7 @@ fn formation_lp_learning_trace_for_snapshots(
         * guidance.alignment_weight.clamp(0.20, 1.60);
     SoccerTacticalLearningTrace {
         formation_lp_guidance: true,
+        local_mpc_guidance: guidance.local_mpc_guidance,
         formation_lp_recommended_move_yards: recommended_move_yards,
         formation_lp_actual_move_yards: actual_move_yards,
         formation_lp_disagreement_yards: disagreement_yards,
@@ -18173,14 +18227,18 @@ fn soccer_policy_value_micros(value: f64) -> i64 {
 impl SoccerTrackingDataset {
     pub fn validate(&self) -> Result<(), String> {
         if !self.config.dt_seconds.is_finite() || self.config.dt_seconds <= 0.0 {
-            return Err("tracking dataset config.dtSeconds must be positive and finite".to_string());
+            return Err(
+                "tracking dataset config.dtSeconds must be positive and finite".to_string(),
+            );
         }
         if !self.config.field_length_yards.is_finite()
             || !self.config.field_width_yards.is_finite()
             || self.config.field_length_yards <= 0.0
             || self.config.field_width_yards <= 0.0
         {
-            return Err("tracking dataset field dimensions must be positive and finite".to_string());
+            return Err(
+                "tracking dataset field dimensions must be positive and finite".to_string(),
+            );
         }
         if self.frames.len() < 2 {
             return Err("tracking dataset needs at least two frames".to_string());
@@ -18393,8 +18451,7 @@ pub fn soccer_match_frame_physics_smoke_report_with_limits(
     let mut previous_players = HashMap::<usize, (u64, f64, Vec2, Vec2)>::new();
     // Rolling (clock, position) trail per player for the SUSTAINED-speed check: a footballer
     // can't average a flat-out sprint over a long window.
-    let mut player_speed_windows =
-        HashMap::<usize, std::collections::VecDeque<(f64, Vec2)>>::new();
+    let mut player_speed_windows = HashMap::<usize, std::collections::VecDeque<(f64, Vec2)>>::new();
     for frame in frames {
         check_clock_monotonicity(
             &mut report,
@@ -18569,7 +18626,12 @@ pub fn soccer_match_frame_physics_smoke_report_with_limits(
             }
             // Body validity: a player must have a positive, finite, human-scale
             // mass (force = mass × acceleration only makes sense with mass > 0).
-            check_player_mass(&mut report, frame.tick, &subject, player.skills.weight_pounds);
+            check_player_mass(
+                &mut report,
+                frame.tick,
+                &subject,
+                player.skills.weight_pounds,
+            );
             previous_players.insert(
                 player.id,
                 (
@@ -23145,6 +23207,8 @@ pub struct SoccerLearningRuntimeContract {
     pub policy_train_max_transitions_per_tick: usize,
     pub full_game_learning_enabled: bool,
     pub formation_lp_enabled: bool,
+    pub local_mpc_enabled: bool,
+    pub local_mpc_max_players_per_team: usize,
     pub mdp_enabled: bool,
     pub pomdp_enabled: bool,
     pub q_policy_enabled: bool,
@@ -23286,6 +23350,8 @@ fn soccer_learning_runtime_contract(config: &MatchConfig) -> SoccerLearningRunti
         policy_train_max_transitions_per_tick: config.policy_train_max_transitions_per_tick.max(1),
         full_game_learning_enabled: config.full_game_learning_enabled,
         formation_lp_enabled: config.formation_lp_enabled,
+        local_mpc_enabled: config.local_mpc_enabled,
+        local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         mdp_enabled: true,
         pomdp_enabled: true,
         q_policy_enabled: true,
@@ -23912,6 +23978,10 @@ pub struct SoccerSelfPlayTrainingRequest {
     pub learning_interval_ticks: Option<usize>,
     #[serde(default)]
     pub formation_lp_enabled: Option<bool>,
+    #[serde(default)]
+    pub local_mpc_enabled: Option<bool>,
+    #[serde(default)]
+    pub local_mpc_max_players_per_team: Option<usize>,
     pub seed: Option<u32>,
     pub options: Option<SoccerQPolicyOptions>,
     pub tactical_learning: Option<SoccerTacticalLearningWeights>,
@@ -25303,9 +25373,7 @@ fn confined_artifact_path(request_path: Option<&str>, default: &Path) -> Result<
     }
 }
 
-fn team_policy_disk_path(
-    request: Option<&SoccerTeamPolicyDiskRequest>,
-) -> Result<PathBuf, String> {
+fn team_policy_disk_path(request: Option<&SoccerTeamPolicyDiskRequest>) -> Result<PathBuf, String> {
     confined_artifact_path(
         request.and_then(|request| request.path.as_deref()),
         Path::new(DEFAULT_LIVE_TEAM_POLICY_PATH),
@@ -25964,7 +26032,10 @@ fn soccer_load_best_champion_policy(
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<SoccerChampionPolicyEntry>(line) {
-            if best.as_ref().map_or(true, |(f, _)| entry.fitness_micros > *f) {
+            if best
+                .as_ref()
+                .map_or(true, |(f, _)| entry.fitness_micros > *f)
+            {
                 best = Some((entry.fitness_micros, entry.artifact));
             }
         }
@@ -27108,8 +27179,16 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         "hold" => "hold",
         "space" | "move" => "space",
         "control-touch" => "control-touch",
-        "dribble" | "carry-forward" | "carry-out-left" | "carry-out-right" | "left-cut"
-        | "right-cut" | "nutmeg" | "fake-left-cut-right" | "fake-right-cut-left" | "side-step"
+        "dribble"
+        | "carry-forward"
+        | "carry-out-left"
+        | "carry-out-right"
+        | "left-cut"
+        | "right-cut"
+        | "nutmeg"
+        | "fake-left-cut-right"
+        | "fake-right-cut-left"
+        | "side-step"
         | "protect-ball" => "dribble",
         "pass" | "first-time-pass" => "pass",
         "aerial-pass" => "aerial-pass",
@@ -27122,7 +27201,9 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         "tackle" => "tackle",
         _ => return None,
     };
-    SOCCER_POLICY_ACTIONS.iter().position(|&label| label == family)
+    SOCCER_POLICY_ACTIONS
+        .iter()
+        .position(|&label| label == family)
 }
 
 fn soccer_neural_flank_policy_feature(policy: FlankAttackPolicy) -> f64 {
@@ -27157,16 +27238,14 @@ fn soccer_neural_extended_observation(
             snapshot.home_team_possession_seconds,
         ),
     };
-    let ball_forward_progress_rate_yps = match (
-        snapshot.ball_history.first(),
-        snapshot.ball_history.last(),
-    ) {
-        (Some(first), Some(last)) if last.tick > first.tick => {
-            let dt = (last.clock_seconds - first.clock_seconds).max(1e-3);
-            (last.position.y - first.position.y) * attack_dir / dt
-        }
-        _ => 0.0,
-    };
+    let ball_forward_progress_rate_yps =
+        match (snapshot.ball_history.first(), snapshot.ball_history.last()) {
+            (Some(first), Some(last)) if last.tick > first.tick => {
+                let dt = (last.clock_seconds - first.clock_seconds).max(1e-3);
+                (last.position.y - first.position.y) * attack_dir / dt
+            }
+            _ => 0.0,
+        };
     let own_recent_forward_progress_yards =
         match (me.position_history.first(), me.position_history.last()) {
             (Some(first), Some(last)) => (last.y - first.y) * attack_dir,
@@ -27224,7 +27303,8 @@ fn soccer_neural_extended_observation(
                 } else {
                     1
                 };
-                lane_density[sector] += (1.0 - distance / DRIBBLE_LANE_RADIUS_YARDS).clamp(0.0, 1.0);
+                lane_density[sector] +=
+                    (1.0 - distance / DRIBBLE_LANE_RADIUS_YARDS).clamp(0.0, 1.0);
             }
         }
     }
@@ -27547,11 +27627,17 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bool(state.threaded_goal_pass_available),
         soccer_neural_bin(state.single_thread_goal_pressure_bin, 5.0),
         soccer_neural_bin(
-            distance_bucket(obs.ball_surface_drag_per_tick, &[0.008, 0.020, 0.040, 0.070]),
+            distance_bucket(
+                obs.ball_surface_drag_per_tick,
+                &[0.008, 0.020, 0.040, 0.070],
+            ),
             5.0,
         ),
         soccer_neural_bin(
-            distance_bucket(obs.ball_surface_air_resistance, &[0.002, 0.006, 0.012, 0.024]),
+            distance_bucket(
+                obs.ball_surface_air_resistance,
+                &[0.002, 0.006, 0.012, 0.024],
+            ),
             5.0,
         ),
         soccer_neural_bin(
@@ -27566,11 +27652,17 @@ fn soccer_neural_transition_features_with_action(
             5.0,
         ),
         soccer_neural_bin(
-            distance_bucket(obs.ball_resistance_total_loss_yps, &[0.10, 0.35, 0.80, 1.40]),
+            distance_bucket(
+                obs.ball_resistance_total_loss_yps,
+                &[0.10, 0.35, 0.80, 1.40],
+            ),
             5.0,
         ),
         soccer_neural_bin(
-            distance_bucket(obs.ball_resistance_rolling_contact, &[0.20, 0.50, 0.80, 0.98]),
+            distance_bucket(
+                obs.ball_resistance_rolling_contact,
+                &[0.20, 0.50, 0.80, 0.98],
+            ),
             5.0,
         ),
         soccer_neural_bin(state.threaded_goal_pass_forward_bin, 5.0),
@@ -27598,50 +27690,109 @@ fn soccer_neural_transition_features_with_action(
         // --- Extended channels: temporal / relational / opponent-intent ---
         // (appended; legacy networks migrate these in as zero-weight columns).
         // Temporal: possession duration and momentum the single-tick view misses.
-        soccer_neural_scaled(transition.observation.neural_extended.own_possession_seconds, 12.0),
         soccer_neural_scaled(
-            transition.observation.neural_extended.opponent_possession_seconds,
+            transition
+                .observation
+                .neural_extended
+                .own_possession_seconds,
             12.0,
         ),
         soccer_neural_scaled(
-            transition.observation.neural_extended.ball_holder_possession_seconds,
+            transition
+                .observation
+                .neural_extended
+                .opponent_possession_seconds,
+            12.0,
+        ),
+        soccer_neural_scaled(
+            transition
+                .observation
+                .neural_extended
+                .ball_holder_possession_seconds,
             6.0,
         ),
         soccer_neural_scaled(
-            transition.observation.neural_extended.ball_forward_progress_rate_yps,
+            transition
+                .observation
+                .neural_extended
+                .ball_forward_progress_rate_yps,
             12.0,
         ),
         soccer_neural_scaled(
-            transition.observation.neural_extended.own_recent_forward_progress_yards,
+            transition
+                .observation
+                .neural_extended
+                .own_recent_forward_progress_yards,
             10.0,
         ),
         // Relational: local multi-agent structure the scalar aggregates collapse.
         soccer_neural_scaled(
-            transition.observation.neural_extended.second_nearest_opponent_distance,
+            transition
+                .observation
+                .neural_extended
+                .second_nearest_opponent_distance,
             28.0,
         ),
         soccer_neural_scaled(
-            transition.observation.neural_extended.nearest_teammate_distance,
+            transition
+                .observation
+                .neural_extended
+                .nearest_teammate_distance,
             28.0,
         ),
         soccer_neural_scaled(
-            transition.observation.neural_extended.nearest_teammate_forward_offset,
+            transition
+                .observation
+                .neural_extended
+                .nearest_teammate_forward_offset,
             20.0,
         ),
-        soccer_neural_scaled(transition.observation.neural_extended.local_opponent_count, 5.0),
-        soccer_neural_scaled(transition.observation.neural_extended.local_teammate_count, 5.0),
         soccer_neural_scaled(
-            transition.observation.neural_extended.nearest_opponent_closing_rate_yps,
+            transition.observation.neural_extended.local_opponent_count,
+            5.0,
+        ),
+        soccer_neural_scaled(
+            transition.observation.neural_extended.local_teammate_count,
+            5.0,
+        ),
+        soccer_neural_scaled(
+            transition
+                .observation
+                .neural_extended
+                .nearest_opponent_closing_rate_yps,
             10.0,
         ),
         // Opponent intent: the other team's directive (press / line / risk / shape).
-        soccer_neural_unit(transition.observation.neural_extended.opponent_press_intensity),
-        soccer_neural_signed_unit(
-            transition.observation.neural_extended.opponent_defensive_line_offset,
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .opponent_press_intensity,
         ),
-        soccer_neural_unit(transition.observation.neural_extended.opponent_risk_tolerance),
-        soccer_neural_unit(transition.observation.neural_extended.opponent_attacking_overload),
-        soccer_neural_unit(transition.observation.neural_extended.opponent_neural_intent_attack),
+        soccer_neural_signed_unit(
+            transition
+                .observation
+                .neural_extended
+                .opponent_defensive_line_offset,
+        ),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .opponent_risk_tolerance,
+        ),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .opponent_attacking_overload,
+        ),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .opponent_neural_intent_attack,
+        ),
         // Territorial spacing: sustained teammate-overlap pressure (index 153). A
         // learnable signal — the spacing distances/times behind it are seeds.
         soccer_neural_unit(transition.observation.teammate_overlap_pressure),
@@ -27649,18 +27800,41 @@ fn soccer_neural_transition_features_with_action(
         // ball — left / centre / right open-lane scores and the side the nearest
         // defender is on — so the net can learn carry direction, cut side and
         // engage-vs-avoid, not just "space straight ahead".
-        soccer_neural_unit(transition.observation.neural_extended.dribble_left_lane_openness),
-        soccer_neural_unit(transition.observation.neural_extended.dribble_center_lane_openness),
-        soccer_neural_unit(transition.observation.neural_extended.dribble_right_lane_openness),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .dribble_left_lane_openness,
+        ),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .dribble_center_lane_openness,
+        ),
+        soccer_neural_unit(
+            transition
+                .observation
+                .neural_extended
+                .dribble_right_lane_openness,
+        ),
         soccer_neural_signed_unit(
-            transition.observation.neural_extended.nearest_opponent_lateral_offset / 14.0,
+            transition
+                .observation
+                .neural_extended
+                .nearest_opponent_lateral_offset
+                / 14.0,
         ),
         // Granular pressure (index 158, appended): closing ACCELERATION of the nearest
         // opponent. Paired with distance (proximity) and closing velocity, this lets the
         // net differentiate pressure types — a man pulling out vs one still winding up the
         // press — rather than collapsing threat to a single distance scalar.
         soccer_neural_signed_unit(
-            transition.observation.neural_extended.nearest_opponent_closing_accel_yps2 / 12.0,
+            transition
+                .observation
+                .neural_extended
+                .nearest_opponent_closing_accel_yps2
+                / 12.0,
         ),
     ];
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
@@ -28949,7 +29123,8 @@ impl SoccerRealtimeSession {
                 if let Err(err) =
                     soccer_append_champion_policy(&log, fitness, self.sim.tick, &artifact)
                 {
-                    self.policy_autosave.record_error(format!("append champion: {err}"));
+                    self.policy_autosave
+                        .record_error(format!("append champion: {err}"));
                 } else {
                     self.champion_fitness = fitness;
                 }
@@ -28970,10 +29145,8 @@ impl SoccerRealtimeSession {
         };
         let over = policies.home.q_values.len() > SOCCER_LIVE_POLICY_AUTOPRUNE_HIGH_ENTRIES
             || policies.away.q_values.len() > SOCCER_LIVE_POLICY_AUTOPRUNE_HIGH_ENTRIES
-            || policies.home.target_values.len()
-                > SOCCER_LIVE_POLICY_AUTOPRUNE_TARGET_HIGH_ENTRIES
-            || policies.away.target_values.len()
-                > SOCCER_LIVE_POLICY_AUTOPRUNE_TARGET_HIGH_ENTRIES;
+            || policies.home.target_values.len() > SOCCER_LIVE_POLICY_AUTOPRUNE_TARGET_HIGH_ENTRIES
+            || policies.away.target_values.len() > SOCCER_LIVE_POLICY_AUTOPRUNE_TARGET_HIGH_ENTRIES;
         if over {
             policies.prune(
                 SOCCER_LIVE_POLICY_AUTOPRUNE_LOW_ENTRIES,
@@ -29001,14 +29174,13 @@ impl SoccerRealtimeSession {
             _ => "both",
         }
         .to_string();
-        let team = request
-            .team
-            .as_deref()
-            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        let team = request.team.as_deref().and_then(|value| {
+            match value.trim().to_ascii_lowercase().as_str() {
                 "home" => Some(Team::Home),
                 "away" => Some(Team::Away),
                 _ => None,
-            });
+            }
+        });
         let embed_team = team.unwrap_or(Team::Home);
         let frames = self.current_moment_search_frames(SOCCER_MOMENT_WINDOW_SECONDS);
         let field_embedding = if frames.is_empty() {
@@ -29182,8 +29354,7 @@ impl SoccerRealtimeSession {
         } else {
             // Confine the request-supplied path: an unauthenticated request must not read
             // arbitrary files (`/etc/passwd`, `../../secret`) off the server's disk.
-            let path =
-                confined_artifact_path(request.path.as_deref(), &self.moment_storage.path)?;
+            let path = confined_artifact_path(request.path.as_deref(), &self.moment_storage.path)?;
             let raw = fs::read_to_string(&path)
                 .map_err(|err| format!("read moment replay {}: {err}", path.display()))?;
             (path.display().to_string(), raw)
@@ -29255,6 +29426,13 @@ impl SoccerRealtimeSession {
         }
         if let Some(formation_lp_enabled) = request.formation_lp_enabled {
             config.formation_lp_enabled = formation_lp_enabled;
+        }
+        if let Some(local_mpc_enabled) = request.local_mpc_enabled {
+            config.local_mpc_enabled = local_mpc_enabled;
+        }
+        if let Some(local_mpc_max_players_per_team) = request.local_mpc_max_players_per_team {
+            config.local_mpc_max_players_per_team =
+                local_mpc_max_players_per_team.min(SOCCER_MATCH_TEAM_PLAYER_COUNT);
         }
         if let Some(seed) = request.seed {
             config.seed = seed;
@@ -29979,7 +30157,9 @@ impl SoccerLiveServer {
                             .map(|s| s.to_string())
                             .or_else(|| panic.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "unknown panic".to_string());
-                        eprintln!("soccer live http worker {worker_id} recovered from panic: {detail}");
+                        eprintln!(
+                            "soccer live http worker {worker_id} recovered from panic: {detail}"
+                        );
                     }
                 })?;
         }
@@ -30170,8 +30350,7 @@ fn handle_live_soccer_stream(
 ) -> std::io::Result<()> {
     let raw = read_http_request(&mut stream)?;
     // Route to the requested `?game=<uuid>` match, or the shared default game.
-    let game_id =
-        parse_live_http_game_id(&raw).unwrap_or_else(|| DEFAULT_LIVE_GAME_ID.to_string());
+    let game_id = parse_live_http_game_id(&raw).unwrap_or_else(|| DEFAULT_LIVE_GAME_ID.to_string());
     let instance = registry.resolve(&game_id);
     let session = instance.bridge.session();
     let input_queue = instance.bridge.input_queue();
@@ -30346,13 +30525,17 @@ fn parse_live_http_request(raw: &str) -> Result<LiveHttpRequest<'_>, String> {
         .split_once("\r\n\r\n")
         .ok_or_else(|| "missing HTTP header terminator".to_string())?;
     let mut lines = head.lines();
-    let first = lines.next().ok_or_else(|| "missing request line".to_string())?;
+    let first = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
     let mut parts = first.split_whitespace();
     let method = parts.next().ok_or_else(|| "missing method".to_string())?;
     let path = parts.next().ok_or_else(|| "missing path".to_string())?;
     let auth = lines.find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.trim().eq_ignore_ascii_case("auth").then(|| value.trim())
+        name.trim()
+            .eq_ignore_ascii_case("auth")
+            .then(|| value.trim())
     });
     Ok(LiveHttpRequest {
         method,
@@ -30370,7 +30553,11 @@ fn live_admin_token() -> Option<String> {
     use std::sync::OnceLock;
     static TOKEN: OnceLock<Option<String>> = OnceLock::new();
     TOKEN
-        .get_or_init(|| std::env::var("SOCCER_LIVE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()))
+        .get_or_init(|| {
+            std::env::var("SOCCER_LIVE_ADMIN_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
         .clone()
 }
 
@@ -31731,17 +31918,17 @@ fn handle_live_soccer_request_inner(
             }
         }
         ("POST", "/api/feedback") | ("POST", "/api/coaching-feedback") => {
-            let feedback_req =
-                match serde_json::from_str::<SoccerCoachingFeedbackRequest>(req.body) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return LiveHttpResponse::error(
-                            400,
-                            "Bad Request",
-                            &format!("parse coaching feedback request: {e}"),
-                        )
-                    }
-                };
+            let feedback_req = match serde_json::from_str::<SoccerCoachingFeedbackRequest>(req.body)
+            {
+                Ok(req) => req,
+                Err(e) => {
+                    return LiveHttpResponse::error(
+                        400,
+                        "Bad Request",
+                        &format!("parse coaching feedback request: {e}"),
+                    )
+                }
+            };
             let mut guard = soccer_mutex_lock(session, "soccer_live_session");
             match guard.record_coaching_feedback(feedback_req) {
                 Ok(response) => LiveHttpResponse::json(&response),
@@ -36826,6 +37013,8 @@ fn tracking_frame_to_world_snapshot(
             AttackingOverloadProfile::default(),
         ),
         formation_lp_enabled: config.formation_lp_enabled,
+        local_mpc_enabled: config.local_mpc_enabled,
+        local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
             frame.clock_seconds.max(0.0)
         } else {
@@ -38246,16 +38435,14 @@ fn carried_ball_orbit_command(
     } else {
         0.0
     };
-    let radius =
-        CARRY_LOOSE_RADIUS_YARDS + (CARRY_TIGHT_RADIUS_YARDS - CARRY_LOOSE_RADIUS_YARDS) * tightness;
+    let radius = CARRY_LOOSE_RADIUS_YARDS
+        + (CARRY_TIGHT_RADIUS_YARDS - CARRY_LOOSE_RADIUS_YARDS) * tightness;
     let dir_at = |relative_degrees: f64| {
         let angle = facing_yaw + relative_degrees.to_radians();
         Vec2::new(angle.cos(), angle.sin())
     };
     let (dir, allow_through, rate) = match move_kind {
-        Some(DribbleMoveKind::CarryOutLeft) => {
-            (dir_at(32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
-        }
+        Some(DribbleMoveKind::CarryOutLeft) => (dir_at(32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
         Some(DribbleMoveKind::CarryOutRight) => {
             (dir_at(-32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
         }
@@ -38268,9 +38455,7 @@ fn carried_ball_orbit_command(
             (dir_at(72.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
         }
         // A nutmeg pushes the ball straight through the gap — close and through.
-        Some(DribbleMoveKind::Nutmeg) => {
-            (dir_at(0.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
-        }
+        Some(DribbleMoveKind::Nutmeg) => (dir_at(0.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
         // Carry-forward, protect-ball, plain hold: keep the ball ahead of the body.
         _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
     };
@@ -38319,10 +38504,14 @@ fn time_on_ball_seconds(pressure: f64) -> f64 {
 /// proximity so a distant burst doesn't spike it. Drives run-vs-sprint pace decisions.
 fn granular_pressure_signal(observation: &SoccerPomdpObservation) -> f64 {
     let proximity = pressure_from_nearest_distance(observation.nearest_opponent_distance);
-    let closing = (observation.neural_extended.nearest_opponent_closing_rate_yps
+    let closing = (observation
+        .neural_extended
+        .nearest_opponent_closing_rate_yps
         / PRESSURE_RISING_REF_CLOSING_YPS)
         .clamp(0.0, 1.0);
-    let accel = (observation.neural_extended.nearest_opponent_closing_accel_yps2
+    let accel = (observation
+        .neural_extended
+        .nearest_opponent_closing_accel_yps2
         / GRANULAR_PRESSURE_REF_ACCEL_YPS2)
         .clamp(-1.0, 1.0);
     let engage = (1.0 - observation.nearest_opponent_distance / PRESSURE_RISING_ENGAGE_YARDS)
@@ -38392,7 +38581,9 @@ fn excessive_hold_pressure(observation: &SoccerPomdpObservation, dribbling: f64)
     // Fold rising pressure (a fast-closing defender) into the urgency so the allowed
     // hold window shrinks as the defender bears down — release before it's too late
     // instead of dwelling and being forced into a desperate pass.
-    let closing_fit = (observation.neural_extended.nearest_opponent_closing_rate_yps
+    let closing_fit = (observation
+        .neural_extended
+        .nearest_opponent_closing_rate_yps
         / RISING_PRESSURE_CLOSING_RATE_YPS)
         .clamp(0.0, 1.0);
     excessive_hold_pressure_from_parts(
@@ -38670,7 +38861,9 @@ fn speculative_long_shot_is_qualified(
     }
     // Distance discipline: 25 yds is fine; ~30 yds is only on if the keeper is out of
     // position; ~33+ yds is only on if the keeper is totally out of position.
-    let keeper_out = observation.opposing_goalkeeper_out_of_position.clamp(0.0, 1.0);
+    let keeper_out = observation
+        .opposing_goalkeeper_out_of_position
+        .clamp(0.0, 1.0);
     if distance > LONG_SHOT_KEEPER_DEPENDENT_YARDS {
         if keeper_out < LONG_SHOT_GK_TOTALLY_OUT {
             return false;
@@ -39374,17 +39567,16 @@ fn pass_quality_for_patience(observation: &SoccerPomdpObservation, flight: PassF
             + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.32
             + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.18)
             .clamp(0.0, 1.0),
-        PassFlight::Aerial | PassFlight::Scoop => (observation
-            .expected_aerial_pass_completion
-            .clamp(0.0, 1.0)
-            * 0.46
-            + observation
-                .best_aerial_pass_receiver_openness
+        PassFlight::Aerial | PassFlight::Scoop => {
+            (observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.46
+                + observation
+                    .best_aerial_pass_receiver_openness
+                    .clamp(0.0, 1.0)
+                    * 0.24
+                + observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.20
+                + (1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0)) * 0.10)
                 .clamp(0.0, 1.0)
-                * 0.24
-            + observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.20
-            + (1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0)) * 0.10)
-            .clamp(0.0, 1.0),
+        }
     }
 }
 
@@ -40472,9 +40664,7 @@ fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
         // A scoop LOOPS high despite being short and slow — that steep loft drops it over the
         // close defender's head. Apex UNIFORM in 9-15ft (3-5yd), seeded per-pass from the
         // launch tick so it's stable across the flight but varies shot to shot.
-        let seed = pass
-            .launch_tick
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         3.0 + unit * 2.0
@@ -40660,6 +40850,353 @@ fn pass_speed_yps_from_power(
     let mph =
         floor + power.clamp(0.0, 1.0) * (ceiling - floor) + skill_power * 4.0 + aerial_power_bonus;
     mph_to_yps(mph.clamp(3.0, ceiling + 4.0))
+}
+
+const DISCRETIZED_KICK_SPEED_BUCKETS: u8 = 10;
+const DISCRETIZED_KICK_DIRECTION_BUCKETS: u8 = 36;
+const DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES: f64 = 10.0;
+const DISCRETIZED_KICK_CURVE_MIN_DISTANCE_YARDS: f64 = 10.0;
+const DISCRETIZED_KICK_CURVE_MIN_SPEED_MPH: f64 = 18.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscretizedKickCurve {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+impl DiscretizedKickCurve {
+    fn lateral_sign(self) -> f64 {
+        match self {
+            DiscretizedKickCurve::None => 0.0,
+            DiscretizedKickCurve::Left => 1.0,
+            DiscretizedKickCurve::Right => -1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscretizedKickElevation {
+    #[default]
+    Floor,
+    Aerial,
+    Chip,
+    Scoop,
+}
+
+impl DiscretizedKickElevation {
+    fn from_pass_flight(flight: PassFlight) -> Self {
+        match flight {
+            PassFlight::Floor => DiscretizedKickElevation::Floor,
+            PassFlight::Aerial => DiscretizedKickElevation::Aerial,
+            PassFlight::Scoop => DiscretizedKickElevation::Scoop,
+        }
+    }
+
+    fn release_altitude_yards(self) -> f64 {
+        match self {
+            DiscretizedKickElevation::Floor => 0.0,
+            DiscretizedKickElevation::Aerial
+            | DiscretizedKickElevation::Chip
+            | DiscretizedKickElevation::Scoop => BALL_ROLLING_ALTITUDE_YARDS + 0.04,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscretizedKickAction {
+    pub speed_bucket: u8,
+    pub direction_bucket: u8,
+    #[serde(default)]
+    pub curve: DiscretizedKickCurve,
+    #[serde(default)]
+    pub elevation: DiscretizedKickElevation,
+}
+
+impl DiscretizedKickAction {
+    pub fn new(
+        speed_bucket: u8,
+        direction_bucket: u8,
+        curve: DiscretizedKickCurve,
+        elevation: DiscretizedKickElevation,
+    ) -> Self {
+        DiscretizedKickAction {
+            speed_bucket: speed_bucket.min(DISCRETIZED_KICK_SPEED_BUCKETS - 1),
+            direction_bucket: direction_bucket % DISCRETIZED_KICK_DIRECTION_BUCKETS,
+            curve,
+            elevation,
+        }
+    }
+
+    pub fn from_power_direction(
+        power: f64,
+        direction: Vec2,
+        curve: DiscretizedKickCurve,
+        elevation: DiscretizedKickElevation,
+    ) -> Self {
+        Self::new(
+            discretized_kick_speed_bucket_for_power(power),
+            discretized_kick_direction_bucket_for_vector(direction),
+            curve,
+            elevation,
+        )
+    }
+
+    pub fn speed_power_center(self) -> f64 {
+        discretized_kick_power_for_bucket(self.speed_bucket, DiscretizedKickDither::none())
+    }
+
+    pub fn direction_degrees_center(self) -> f64 {
+        discretized_kick_direction_degrees(self.direction_bucket, DiscretizedKickDither::none())
+    }
+
+    pub fn direction(self) -> Vec2 {
+        discretized_kick_direction_for_bucket(self.direction_bucket, DiscretizedKickDither::none())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscretizedKickDither {
+    pub speed_power_offset: f64,
+    pub direction_degrees_offset: f64,
+}
+
+impl DiscretizedKickDither {
+    pub fn none() -> Self {
+        DiscretizedKickDither {
+            speed_power_offset: 0.0,
+            direction_degrees_offset: 0.0,
+        }
+    }
+
+    fn sample(rng: &mut SeededRandom) -> Self {
+        DiscretizedKickDither {
+            speed_power_offset: triangular_sample(rng) * 0.5
+                / f64::from(DISCRETIZED_KICK_SPEED_BUCKETS),
+            direction_degrees_offset: triangular_sample(rng)
+                * DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES
+                * 0.5,
+        }
+    }
+
+    fn sanitized(self) -> Self {
+        let half_power_bucket = 0.5 / f64::from(DISCRETIZED_KICK_SPEED_BUCKETS);
+        let half_direction_bucket = DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES * 0.5;
+        DiscretizedKickDither {
+            speed_power_offset: if self.speed_power_offset.is_finite() {
+                self.speed_power_offset
+                    .clamp(-half_power_bucket, half_power_bucket)
+            } else {
+                0.0
+            },
+            direction_degrees_offset: if self.direction_degrees_offset.is_finite() {
+                self.direction_degrees_offset
+                    .clamp(-half_direction_bucket, half_direction_bucket)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct KickReleaseSpec {
+    origin: Vec2,
+    intended_target: Vec2,
+    speed_yps: f64,
+    curve: DiscretizedKickCurve,
+    curve_bend_yards: f64,
+    elevation: DiscretizedKickElevation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LoweredKickRelease {
+    launch_target: Vec2,
+    intended_target: Vec2,
+    velocity: Vec2,
+    curl_acceleration: Vec2,
+    altitude_yards: f64,
+    speed_yps: f64,
+}
+
+fn discretized_kick_speed_bucket_for_power(power: f64) -> u8 {
+    if !power.is_finite() {
+        return 0;
+    }
+    (power.clamp(0.0, 0.999_999) * f64::from(DISCRETIZED_KICK_SPEED_BUCKETS)) as u8
+}
+
+fn discretized_kick_power_for_bucket(speed_bucket: u8, dither: DiscretizedKickDither) -> f64 {
+    let bucket = speed_bucket.min(DISCRETIZED_KICK_SPEED_BUCKETS - 1);
+    let center = (f64::from(bucket) + 0.5) / f64::from(DISCRETIZED_KICK_SPEED_BUCKETS);
+    (center + dither.sanitized().speed_power_offset).clamp(0.0, 1.0)
+}
+
+fn discretized_kick_direction_bucket_for_vector(direction: Vec2) -> u8 {
+    let dir = direction.normalized();
+    if dir.len() <= 1e-9 {
+        return 0;
+    }
+    discretized_kick_direction_bucket_for_degrees(dir.y.atan2(dir.x).to_degrees())
+}
+
+fn discretized_kick_direction_bucket_for_degrees(degrees: f64) -> u8 {
+    let degrees = if degrees.is_finite() {
+        degrees.rem_euclid(360.0)
+    } else {
+        0.0
+    };
+    ((degrees / DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES).round() as i32)
+        .rem_euclid(i32::from(DISCRETIZED_KICK_DIRECTION_BUCKETS)) as u8
+}
+
+fn discretized_kick_direction_degrees(direction_bucket: u8, dither: DiscretizedKickDither) -> f64 {
+    (f64::from(direction_bucket % DISCRETIZED_KICK_DIRECTION_BUCKETS)
+        * DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES
+        + dither.sanitized().direction_degrees_offset)
+        .rem_euclid(360.0)
+}
+
+fn discretized_kick_direction_for_bucket(
+    direction_bucket: u8,
+    dither: DiscretizedKickDither,
+) -> Vec2 {
+    let radians = discretized_kick_direction_degrees(direction_bucket, dither).to_radians();
+    Vec2::new(radians.cos(), radians.sin()).normalized()
+}
+
+fn discretized_kick_curve_allowed(distance_yards: f64, speed_yps: f64) -> bool {
+    distance_yards.is_finite()
+        && distance_yards >= DISCRETIZED_KICK_CURVE_MIN_DISTANCE_YARDS
+        && speed_yps.is_finite()
+        && speed_yps >= mph_to_yps(DISCRETIZED_KICK_CURVE_MIN_SPEED_MPH)
+}
+
+fn masked_discretized_kick_curve(
+    curve: DiscretizedKickCurve,
+    distance_yards: f64,
+    speed_yps: f64,
+) -> DiscretizedKickCurve {
+    if curve == DiscretizedKickCurve::None
+        || discretized_kick_curve_allowed(distance_yards, speed_yps)
+    {
+        curve
+    } else {
+        DiscretizedKickCurve::None
+    }
+}
+
+fn kick_release(spec: KickReleaseSpec) -> LoweredKickRelease {
+    kick_release_with_pitch_bounds(spec, None)
+}
+
+fn kick_release_clamped_to_pitch(
+    spec: KickReleaseSpec,
+    field_width_yards: f64,
+    field_length_yards: f64,
+) -> LoweredKickRelease {
+    kick_release_with_pitch_bounds(spec, Some((field_width_yards, field_length_yards)))
+}
+
+fn kick_release_with_pitch_bounds(
+    spec: KickReleaseSpec,
+    pitch_bounds: Option<(f64, f64)>,
+) -> LoweredKickRelease {
+    let origin = finite_vec2(spec.origin, Vec2::zero());
+    let mut intended_target = finite_vec2(spec.intended_target, origin + Vec2::new(1.0, 0.0));
+    if intended_target.distance(origin) <= 1e-9 {
+        intended_target = origin + Vec2::new(1.0, 0.0);
+    }
+    if let Some((field_width, field_length)) = pitch_bounds {
+        intended_target = intended_target.clamp_to_pitch(field_width, field_length);
+    }
+    let speed_yps = if spec.speed_yps.is_finite() {
+        spec.speed_yps.max(0.0)
+    } else {
+        0.0
+    };
+    let intended_dir = (intended_target - origin).normalized();
+    let bend_yards = if spec.curve_bend_yards.is_finite() {
+        spec.curve_bend_yards.abs().clamp(0.0, 8.0)
+    } else {
+        0.0
+    };
+    let curve_sign = spec.curve.lateral_sign();
+    let lateral = Vec2::new(-intended_dir.y, intended_dir.x);
+    let launch_target = if curve_sign.abs() > 0.0 && bend_yards > 1e-9 {
+        intended_target + lateral * curve_sign * bend_yards
+    } else {
+        intended_target
+    };
+    let launch_target = if let Some((field_width, field_length)) = pitch_bounds {
+        launch_target.clamp_to_pitch(field_width, field_length)
+    } else {
+        launch_target
+    };
+    let launch_dir = (launch_target - origin).normalized();
+    let velocity = launch_dir * speed_yps;
+    let curl_acceleration = if curve_sign.abs() > 0.0 && bend_yards > 1e-9 {
+        curl_acceleration_for_path(
+            origin,
+            launch_target,
+            intended_target,
+            speed_yps,
+            bend_yards,
+        )
+    } else {
+        Vec2::zero()
+    };
+    LoweredKickRelease {
+        launch_target,
+        intended_target,
+        velocity,
+        curl_acceleration,
+        altitude_yards: spec.elevation.release_altitude_yards(),
+        speed_yps,
+    }
+}
+
+fn lower_discretized_kick_release(
+    origin: Vec2,
+    action: DiscretizedKickAction,
+    min_speed_yps: f64,
+    max_speed_yps: f64,
+    reference_distance_yards: f64,
+    curve_bend_yards: f64,
+    dither: DiscretizedKickDither,
+) -> LoweredKickRelease {
+    let power = discretized_kick_power_for_bucket(action.speed_bucket, dither);
+    let min_speed = if min_speed_yps.is_finite() {
+        min_speed_yps.max(0.0)
+    } else {
+        0.0
+    };
+    let max_speed = if max_speed_yps.is_finite() {
+        max_speed_yps.max(min_speed)
+    } else {
+        min_speed
+    };
+    let speed_yps = min_speed + (max_speed - min_speed) * power;
+    let distance = if reference_distance_yards.is_finite() {
+        reference_distance_yards.max(0.1)
+    } else {
+        20.0
+    };
+    let direction = discretized_kick_direction_for_bucket(action.direction_bucket, dither);
+    let curve = masked_discretized_kick_curve(action.curve, distance, speed_yps);
+    kick_release(KickReleaseSpec {
+        origin,
+        intended_target: origin + direction * distance,
+        speed_yps,
+        curve,
+        curve_bend_yards,
+        elevation: action.elevation,
+    })
 }
 
 fn modulated_pass_speed_yps(
@@ -41430,8 +41967,7 @@ fn goalkeeper_save_probability_from_traits(
     let keeper_top_speed = top_speed_yps_from_score(skills.top_speed).max(1.0);
     let movement_reach =
         (acceleration_reach + velocity_reach).min(keeper_top_speed * available_move_time);
-    let height_reach =
-        (height_inches_from_score(skills.height) - 66.0).max(0.0) / INCHES_PER_YARD;
+    let height_reach = (height_inches_from_score(skills.height) - 66.0).max(0.0) / INCHES_PER_YARD;
     let reachable_radius = 1.05 + reaction * 0.85 + movement_reach + height_reach;
     // Reach is measured against the SHOT'S PATH (perpendicular distance), NOT the keeper's
     // distance to the goal-line crossing. A keeper standing in the ball's lane saves it
@@ -41488,13 +42024,13 @@ fn goalkeeper_save_probability_from_traits(
     // full baseline; a beaten or screened one saves less.
     let _ = (distance_save_bonus, clear_long_shot_bonus);
     let distance_baseline = goalkeeper_distance_save_baseline(shot_distance);
-    let coverage = (0.55 + reaction * 0.35 + angle_cut_score * 0.12 + rush_bonus
-        + clean_sightline * 0.10
-        - reach_penalty * 0.45
-        - speed_penalty
-        - reaction_penalty
-        - screened_penalty)
-        .clamp(0.15, 1.0);
+    let coverage =
+        (0.55 + reaction * 0.35 + angle_cut_score * 0.12 + rush_bonus + clean_sightline * 0.10
+            - reach_penalty * 0.45
+            - speed_penalty
+            - reaction_penalty
+            - screened_penalty)
+            .clamp(0.15, 1.0);
     // Distance buys reaction time: a shot from ~40yd gives the keeper ~1.5-2s to
     // read it and get set, so positioning/reach/reaction (the coverage term)
     // should stop dragging the calibrated baseline down at range. Blend coverage
@@ -41506,8 +42042,7 @@ fn goalkeeper_save_probability_from_traits(
     // sailing into an open net. Scale the rescue by how close the keeper is to the lane
     // (1 when set in the lane, 0 when beaten), so a beaten keeper concedes the long shot.
     let in_lane_fraction = (1.0 - reach_penalty.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    let long_range_fraction =
-        ((shot_distance - 22.0) / 16.0).clamp(0.0, 1.0) * in_lane_fraction;
+    let long_range_fraction = ((shot_distance - 22.0) / 16.0).clamp(0.0, 1.0) * in_lane_fraction;
     let effective_coverage = coverage + (1.0 - coverage) * long_range_fraction;
     let base = (distance_baseline * effective_coverage).clamp(0.0, 0.995);
     // Proximity reach-save: a ball crossing within ~1 yard of the keeper (either
@@ -41591,9 +42126,7 @@ fn goalkeeper_catch_probability_after_save(
     } else {
         goal_width
     };
-    let near_keeper_fit = (1.0
-        - keeper_to_crossing / (goal_width * 0.72).max(0.1))
-    .clamp(0.0, 1.0);
+    let near_keeper_fit = (1.0 - keeper_to_crossing / (goal_width * 0.72).max(0.1)).clamp(0.0, 1.0);
     let short_medium_fit = if shot_distance <= 32.0 {
         (1.0 - (shot_distance - 18.0).abs() / 22.0).clamp(0.0, 1.0)
     } else {
@@ -41809,7 +42342,8 @@ fn nearest_ball_controller_for_segment(
                 // floor is high (faster passes still get controlled cleanly).
                 let sweet_spot_yps = mph_to_yps(13.0);
                 let speed_offset = (pass.launch_speed_yps - sweet_spot_yps).abs();
-                let speed_control = (1.18 - (speed_offset / 22.0).clamp(0.0, 0.42)).clamp(0.80, 1.18);
+                let speed_control =
+                    (1.18 - (speed_offset / 22.0).clamp(0.0, 0.42)).clamp(0.80, 1.18);
                 control_radius *= gait_control * speed_control;
                 pass_reception_score_bonus += -0.18 + openness * 0.50 + pass.passer_skill * 0.16;
             } else if p.team == pass.team {
@@ -43022,8 +43556,7 @@ fn metabolic_power_demand_w(skills: &SkillProfile, speed_yps: f64, accel_yps2: f
     // Clamp to the physical single-frame speed ceiling so a transient solver velocity
     // spike can't fabricate a huge demand and spuriously drain W′. (`max` over NaN
     // returns the finite operand, so a non-finite speed sanitises to 0.)
-    let v_mps =
-        speed_yps.max(0.0).min(SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS) * METERS_PER_YARD;
+    let v_mps = speed_yps.max(0.0).min(SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS) * METERS_PER_YARD;
     let a_mps2 = (accel_yps2.abs() * METERS_PER_YARD).min(ACCEL_MAGNITUDE_CAP_MPS2);
     let run_power = mass_kg * RUN_ENERGY_COST_J_PER_KG_M * v_mps;
     let accel_power = mass_kg * a_mps2 * v_mps * ACCEL_POWER_COEFF;
@@ -43130,7 +43663,9 @@ fn pressure_release_signal(observation: &SoccerPomdpObservation) -> f64 {
         .max(observation.immediate_dispossession_risk);
     // Rising pressure: a defender closing fast (high closing rate) shrinks the window
     // quickly, so treat it as urgent even before raw pressure has peaked — get rid of it.
-    let closing_fit = (observation.neural_extended.nearest_opponent_closing_rate_yps
+    let closing_fit = (observation
+        .neural_extended
+        .nearest_opponent_closing_rate_yps
         / RISING_PRESSURE_CLOSING_RATE_YPS)
         .clamp(0.0, 1.0);
     ((base.max(closing_fit * 0.9) - 0.34) / 0.48).clamp(0.0, 1.0)
@@ -43361,6 +43896,151 @@ fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAg
         }
     }
     players
+}
+
+#[cfg(test)]
+mod discretized_kick_scaffold_tests {
+    use super::*;
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+
+    #[test]
+    fn discretized_kick_buckets_snap_power_and_absolute_direction() {
+        let north = Vec2::new(0.0, 1.0);
+        let west = Vec2::new(-1.0, 0.0);
+
+        assert_eq!(discretized_kick_speed_bucket_for_power(-1.0), 0);
+        assert_eq!(discretized_kick_speed_bucket_for_power(0.0), 0);
+        assert_eq!(discretized_kick_speed_bucket_for_power(0.56), 5);
+        assert_eq!(discretized_kick_speed_bucket_for_power(1.0), 9);
+        assert_eq!(discretized_kick_direction_bucket_for_vector(north), 9);
+        assert_eq!(discretized_kick_direction_bucket_for_vector(west), 18);
+        assert_eq!(discretized_kick_direction_bucket_for_degrees(356.0), 0);
+        assert_eq!(discretized_kick_direction_bucket_for_degrees(354.0), 35);
+
+        let action = DiscretizedKickAction::from_power_direction(
+            0.56,
+            west,
+            DiscretizedKickCurve::Right,
+            DiscretizedKickElevation::Floor,
+        );
+        assert_eq!(action.speed_bucket, 5);
+        assert_eq!(action.direction_bucket, 18);
+        assert_eq!(action.curve, DiscretizedKickCurve::Right);
+        assert_eq!(action.direction_degrees_center(), 180.0);
+    }
+
+    #[test]
+    fn discretized_kick_dither_stays_inside_bucket() {
+        let mut rng = SeededRandom::new(42);
+        for _ in 0..128 {
+            let dither = DiscretizedKickDither::sample(&mut rng);
+            assert!(dither.speed_power_offset.abs() <= 0.050_000_1);
+            assert!(dither.direction_degrees_offset.abs() <= 5.000_001);
+            let power = discretized_kick_power_for_bucket(4, dither);
+            assert!((0.40..=0.50).contains(&power));
+        }
+
+        let sanitized = DiscretizedKickDither {
+            speed_power_offset: 9.0,
+            direction_degrees_offset: -99.0,
+        }
+        .sanitized();
+        assert_eq!(sanitized.speed_power_offset, 0.05);
+        assert_eq!(sanitized.direction_degrees_offset, -5.0);
+    }
+
+    #[test]
+    fn lower_discretized_kick_release_masks_short_slow_curve() {
+        let action = DiscretizedKickAction::new(
+            0,
+            9,
+            DiscretizedKickCurve::Left,
+            DiscretizedKickElevation::Floor,
+        );
+        let release = lower_discretized_kick_release(
+            Vec2::new(50.0, 50.0),
+            action,
+            0.0,
+            mph_to_yps(12.0),
+            8.0,
+            2.0,
+            DiscretizedKickDither::none(),
+        );
+
+        assert_eq!(release.launch_target, release.intended_target);
+        assert_eq!(release.curl_acceleration, Vec2::zero());
+        assert_eq!(release.altitude_yards, 0.0);
+    }
+
+    #[test]
+    fn lower_discretized_kick_release_curves_and_sets_altitude() {
+        let action = DiscretizedKickAction::new(
+            9,
+            9,
+            DiscretizedKickCurve::Left,
+            DiscretizedKickElevation::Aerial,
+        );
+        let origin = Vec2::new(50.0, 40.0);
+        let release = lower_discretized_kick_release(
+            origin,
+            action,
+            mph_to_yps(20.0),
+            mph_to_yps(50.0),
+            30.0,
+            2.0,
+            DiscretizedKickDither::none(),
+        );
+
+        assert!(release.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+        assert!(release.curl_acceleration.len() > 0.0);
+        assert!(release.launch_target.x < release.intended_target.x);
+        assert_close(release.launch_target.y, origin.y + 30.0, 1e-9);
+        assert_close(release.velocity.len(), release.speed_yps, 1e-9);
+    }
+
+    #[test]
+    fn kick_release_lowers_uncurled_target_without_changing_direction() {
+        let release = kick_release(KickReleaseSpec {
+            origin: Vec2::zero(),
+            intended_target: Vec2::new(10.0, 0.0),
+            speed_yps: 5.0,
+            curve: DiscretizedKickCurve::None,
+            curve_bend_yards: 3.0,
+            elevation: DiscretizedKickElevation::from_pass_flight(PassFlight::Scoop),
+        });
+
+        assert_eq!(release.launch_target, Vec2::new(10.0, 0.0));
+        assert_eq!(release.intended_target, Vec2::new(10.0, 0.0));
+        assert_eq!(release.velocity, Vec2::new(5.0, 0.0));
+        assert_eq!(release.curl_acceleration, Vec2::zero());
+        assert!(release.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+    }
+
+    #[test]
+    fn kick_release_can_clamp_curved_launch_target_to_pitch() {
+        let release = kick_release_clamped_to_pitch(
+            KickReleaseSpec {
+                origin: Vec2::new(1.0, 10.0),
+                intended_target: Vec2::new(1.0, 30.0),
+                speed_yps: mph_to_yps(35.0),
+                curve: DiscretizedKickCurve::Left,
+                curve_bend_yards: 4.0,
+                elevation: DiscretizedKickElevation::Floor,
+            },
+            100.0,
+            100.0,
+        );
+
+        assert_eq!(release.launch_target.x, 0.0);
+        assert_eq!(release.intended_target, Vec2::new(1.0, 30.0));
+        assert!(release.curl_acceleration.len() > 0.0);
+    }
 }
 
 #[cfg(test)]

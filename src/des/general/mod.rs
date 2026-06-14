@@ -2,7 +2,7 @@
 //! code imports, plus the local soccer modules.
 
 pub use des_engine::des::general::{
-    des_base, general, hungarian, ip_mip_des, lp, lp_des, neural_network, prng,
+    des_base, general, hungarian, ip_mip_des, lp, lp_des, neural_network, prng, qp,
 };
 
 pub mod soccer;

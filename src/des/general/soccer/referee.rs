@@ -298,4 +298,3 @@ pub struct AssistantOffsideLineSnapshot {
     pub effective_line_y: f64,
     pub players_beyond_line: Vec<usize>,
 }
-

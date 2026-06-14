@@ -3838,7 +3838,10 @@ mod tests {
         assert_eq!(league.len(), 2);
         assert!(generations.contains(&1), "high-exploit member must survive");
         assert!(generations.contains(&3), "fresh member must be retained");
-        assert!(!generations.contains(&2), "weakest sparring partner is evicted");
+        assert!(
+            !generations.contains(&2),
+            "weakest sparring partner is evicted"
+        );
     }
 
     #[test]

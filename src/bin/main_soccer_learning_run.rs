@@ -9,6 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
@@ -32,7 +33,6 @@ use soccer_engine::des::soccer_learning::{
 use soccer_engine::des::soccer_learning_pg::{
     SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
 };
-use serde::Serialize;
 use uuid::Uuid;
 
 const DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS: usize = 2;
@@ -898,7 +898,11 @@ impl EvolutionSearchSample {
 fn process_rss_mb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|pages| pages.parse::<u64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|pages| pages.parse::<u64>().ok())
+        })
         .map(|pages| pages.saturating_mul(4096) / (1024 * 1024))
         .unwrap_or(0)
 }
