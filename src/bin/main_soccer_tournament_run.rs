@@ -41,6 +41,9 @@ use soccer_engine::des::soccer_learning_pg::SoccerLearningPgStore;
 use uuid::Uuid;
 
 const DEFAULT_EXPERIMENT_SLUG: &str = "soccer-nightly-tournament";
+/// Upper bound on parallel match workers — each holds a live SoccerMatch sim, so this caps
+/// peak memory/threads regardless of the env value or the host core count.
+const MAX_TOURNAMENT_THREADS: usize = 256;
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var(key)
@@ -187,7 +190,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let seed = env_u32("SOCCER_TOURNAMENT_SEED", 20_260_613);
     let mode = parse_learning_mode(env_string("SOCCER_TOURNAMENT_LEARNING_MODE"));
-    let match_seconds = env_f64("SOCCER_TOURNAMENT_MATCH_SECONDS", TOURNAMENT_DEFAULT_MATCH_SECONDS);
+    // Clamp to a sane positive range: 0/negative would make `total_ticks()` zero (a no-op
+    // match silently recorded as 0-0), and the engine already caps the top at 24h anyway.
+    let match_seconds =
+        env_f64("SOCCER_TOURNAMENT_MATCH_SECONDS", TOURNAMENT_DEFAULT_MATCH_SECONDS)
+            .clamp(1.0, 86_400.0);
     let seed_fraction = env_f64("SOCCER_TOURNAMENT_SEED_FRACTION", 0.5);
     let promote = env_bool("SOCCER_TOURNAMENT_PROMOTE", true);
     let slug = env_string("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| DEFAULT_EXPERIMENT_SLUG.to_string());
@@ -201,7 +208,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-        });
+        })
+        // Hard cap: each worker runs a full SoccerMatch sim, so an absurd value (typo'd
+        // env, or a many-hundred-core box) must not spawn a thread/OOM storm.
+        .clamp(1, MAX_TOURNAMENT_THREADS);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = match_seconds;

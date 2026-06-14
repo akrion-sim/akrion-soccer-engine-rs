@@ -41049,19 +41049,54 @@ fn goalkeeper_save_probability_from_traits(
     goal_width: f64,
     sightline_screen_probability: f64,
 ) -> f64 {
+    let keeper_position = finite_vec2(keeper_position, Vec2::zero());
+    let keeper_velocity = finite_vec2(keeper_velocity, Vec2::zero());
+    let shooter_position = finite_vec2(shooter_position, keeper_position);
+    let shot_crossing = finite_vec2(shot_crossing, shooter_position);
+    let shot_speed = if shot_speed.is_finite() && shot_speed > 0.0 {
+        shot_speed
+    } else {
+        1.0
+    };
+    let goal_width = if goal_width.is_finite() && goal_width > 0.0 {
+        goal_width
+    } else {
+        DEFAULT_GOAL_WIDTH_YARDS
+    };
+    let keeper_fatigue = if keeper_fatigue.is_finite() {
+        keeper_fatigue.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let sightline_screen_probability = if sightline_screen_probability.is_finite() {
+        sightline_screen_probability.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let reaction = ability01(skills.goalkeeping) * 0.48
         + ability01(skills.defending) * 0.18
         + ability01(skills.first_touch) * 0.20
         + ability01(skills.acceleration) * 0.14;
     let reaction_time = goalkeeper_reaction_time_seconds(skills, keeper_fatigue);
     let shot_distance = shooter_position.distance(shot_crossing);
+    let shot_distance = if shot_distance.is_finite() {
+        shot_distance.max(0.0)
+    } else {
+        0.0
+    };
     let shot_travel_time = shot_distance / shot_speed.max(1.0);
     let available_move_time = (shot_travel_time - reaction_time).max(0.0);
     let acceleration_reach = 0.5
         * acceleration_yps2_from_score(skills.acceleration)
         * available_move_time
         * available_move_time;
-    let velocity_reach = keeper_velocity.len() * available_move_time * 0.34;
+    let keeper_velocity_speed = keeper_velocity.len();
+    let keeper_velocity_speed = if keeper_velocity_speed.is_finite() {
+        keeper_velocity_speed
+    } else {
+        0.0
+    };
+    let velocity_reach = keeper_velocity_speed * available_move_time * 0.34;
     // A keeper cannot relocate its body faster than its TOP SPEED (~23mph ≈ 10yps): cap the
     // movement reach at top_speed × time. A 40-60mph shot (≈18-26yps) gives so little time
     // that a 23mph keeper simply cannot get across to a ball struck away from it — so those
@@ -41076,14 +41111,24 @@ fn goalkeeper_save_probability_from_traits(
     // whatever its depth off the line; the old crossing-distance measure wrongly punished a
     // correctly-positioned keeper for being a few yards off its line, so shots sailed
     // "through" a keeper that was actually right behind the ball.
-    let line_t = segment_projection_factor(shooter_position, shot_crossing, keeper_position);
     let lateral_to_lane =
         segment_distance_to_point(shooter_position, shot_crossing, keeper_position);
+    let lateral_to_lane = if lateral_to_lane.is_finite() {
+        lateral_to_lane.max(0.0)
+    } else {
+        goal_width
+    };
     let reach_gap = (lateral_to_lane - reachable_radius).max(0.0);
-    let reach_penalty = (reach_gap / (goal_width * 0.72)).clamp(0.0, 1.5);
+    let reach_penalty = (reach_gap / (goal_width * 0.72).max(0.1)).clamp(0.0, 1.5);
     let speed_penalty = (shot_speed / mph_to_yps(60.0)).clamp(0.0, 1.0) * 0.12;
     let reaction_penalty = if shot_travel_time <= reaction_time {
         ((reaction_time - shot_travel_time) / reaction_time.max(1e-6)).clamp(0.0, 1.0) * 0.22
+    } else {
+        0.0
+    };
+    let line_t = segment_projection_factor(shooter_position, shot_crossing, keeper_position);
+    let line_t = if line_t.is_finite() {
+        line_t.clamp(0.0, 1.0)
     } else {
         0.0
     };
@@ -41094,16 +41139,21 @@ fn goalkeeper_save_probability_from_traits(
         0.0
     };
     let rush_dir = (shooter_position - keeper_position).normalized();
-    let rush_speed = dot(keeper_velocity, rush_dir).max(0.0);
+    let rush_speed = dot(keeper_velocity, rush_dir);
+    let rush_speed = if rush_speed.is_finite() {
+        rush_speed.max(0.0)
+    } else {
+        0.0
+    };
     let rush_bonus =
         (rush_speed / top_speed_yps_from_score(skills.top_speed).max(1.0)).clamp(0.0, 1.0) * 0.08;
-    let clean_sightline = (1.0 - sightline_screen_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let clean_sightline = 1.0 - sightline_screen_probability;
     // The further out the shot, the more time the keeper has to read and reach
     // it — long-range efforts (aerial or ground) are saved far more often.
     let distance_save_bonus = ((shot_distance - 14.0) / 40.0).clamp(0.0, 1.0) * 0.24;
     let clear_long_shot_bonus =
         clean_sightline * ((shot_distance - 24.0) / 38.0).clamp(0.0, 1.0) * 0.10;
-    let screened_penalty = sightline_screen_probability.clamp(0.0, 1.0) * 0.16;
+    let screened_penalty = sightline_screen_probability * 0.16;
     // Distance is the primary save driver, calibrated to the target curve
     // (≈64% @20yd, 80% @25, 88% @30, 96% @40, →1 by ~55yd; low up close so close
     // shots beat the keeper). The keeper's COVERAGE (positioning/reach/sightline/
