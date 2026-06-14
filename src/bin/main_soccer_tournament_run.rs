@@ -67,7 +67,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
 
 fn env_bool(key: &str, default: bool) -> bool {
     match env_string(key) {
-        Some(value) => matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Some(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         None => default,
     }
 }
@@ -76,9 +79,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 fn parse_learning_mode(raw: Option<String>) -> TournamentLearningMode {
     match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
         Some("frozen") => TournamentLearningMode::Frozen,
-        Some("frozen_opponent") | Some("frozen-opponent") => {
-            TournamentLearningMode::FrozenOpponent
-        }
+        Some("frozen_opponent") | Some("frozen-opponent") => TournamentLearningMode::FrozenOpponent,
         _ => TournamentLearningMode::BiLearning,
     }
 }
@@ -92,7 +93,8 @@ fn build_entrants(
     seed_snapshot: Option<SoccerNeuralNetworkSnapshot>,
     seed_fraction: f64,
 ) -> Vec<TournamentTeam> {
-    let seeded_count = ((format.team_count as f64) * seed_fraction.clamp(0.0, 1.0)).round() as usize;
+    let seeded_count =
+        ((format.team_count as f64) * seed_fraction.clamp(0.0, 1.0)).round() as usize;
     let seeded_count = seeded_count.min(format.team_count);
     (0..format.team_count)
         .map(|id| {
@@ -199,10 +201,14 @@ fn promote_salvaged_brain(
     config: &MatchConfig,
 ) -> Result<String, String> {
     let policy_version_id = Uuid::new_v4().to_string();
-    let label = format!("tournament-salvage/gen{generation}/{}", &policy_version_id[..8]);
+    let label = format!(
+        "tournament-salvage/gen{generation}/{}",
+        &policy_version_id[..8]
+    );
     let options = SoccerQPolicyOptions::default();
     let policies = SoccerTeamQPolicies::new(options.clone());
-    let search_metadata = serde_json::json!({ "tournament": { "salvage": true, "fitness": fitness } });
+    let search_metadata =
+        serde_json::json!({ "tournament": { "salvage": true, "fitness": fitness } });
     store.insert_policy_version_with_id_and_neural_network_and_search_metadata(
         &policy_version_id,
         experiment_id,
@@ -233,12 +239,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mode = parse_learning_mode(env_string("SOCCER_TOURNAMENT_LEARNING_MODE"));
     // Clamp to a sane positive range: 0/negative would make `total_ticks()` zero (a no-op
     // match silently recorded as 0-0), and the engine already caps the top at 24h anyway.
-    let match_seconds =
-        env_f64("SOCCER_TOURNAMENT_MATCH_SECONDS", TOURNAMENT_DEFAULT_MATCH_SECONDS)
-            .clamp(1.0, 86_400.0);
+    let match_seconds = env_f64(
+        "SOCCER_TOURNAMENT_MATCH_SECONDS",
+        TOURNAMENT_DEFAULT_MATCH_SECONDS,
+    )
+    .clamp(1.0, 86_400.0);
     let seed_fraction = env_f64("SOCCER_TOURNAMENT_SEED_FRACTION", 0.5);
     let promote = env_bool("SOCCER_TOURNAMENT_PROMOTE", true);
-    let slug = env_string("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| DEFAULT_EXPERIMENT_SLUG.to_string());
+    let slug =
+        env_string("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| DEFAULT_EXPERIMENT_SLUG.to_string());
     // Parallelism: independent fixtures (groups, and matches within a knockout round)
     // play concurrently. Default to the machine's parallelism; results are identical
     // to a serial run regardless of thread count.
@@ -280,7 +289,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut seed_snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
 
     if let Some(store) = store.as_mut() {
-        let eid = store.ensure_experiment(&slug, "Soccer nightly learning tournament", &promote_config)?;
+        let eid = store.ensure_experiment(
+            &slug,
+            "Soccer nightly learning tournament",
+            &promote_config,
+        )?;
         match store.load_latest_active_policy_metadata(&eid)? {
             Some(metadata) => {
                 parent_policy_version_id = Some(metadata.id.clone());
@@ -308,8 +321,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let group_count = format.team_count / format.group_size.max(1);
     let per_group_matches = format.group_size * format.group_size.saturating_sub(1) / 2
         * if format.double_round_robin { 2 } else { 1 };
-    let knockout_matches = format.knockout_team_count().saturating_sub(1)
-        + usize::from(format.third_place_match);
+    let knockout_matches =
+        format.knockout_team_count().saturating_sub(1) + usize::from(format.third_place_match);
     let matches_total = group_count * per_group_matches + knockout_matches;
     let tournament_date = env_string("SOCCER_RUN_ID").unwrap_or_else(|| format!("seed-{seed}"));
     let learning_mode_label = format!("{mode:?}");
@@ -318,12 +331,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     // plays — a worker panic or a killed pod leaves a durable record + standings + brains.
     let mut tournament_db_id: Option<i64> = None;
     if let (Some(store), Some(eid)) = (store.as_mut(), experiment_id.as_ref()) {
-        match store.start_tournament(eid, &tournament_date, seed, &learning_mode_label, &format, matches_total) {
+        match store.start_tournament(
+            eid,
+            &tournament_date,
+            seed,
+            &learning_mode_label,
+            &format,
+            matches_total,
+        ) {
             Ok(id) => {
                 tournament_db_id = Some(id);
                 println!("tournament_db_started db_id={id} matches_total={matches_total}");
             }
-            Err(err) => eprintln!("tournament_db_start_failed (continuing without persistence): {err}"),
+            Err(err) => {
+                eprintln!("tournament_db_start_failed (continuing without persistence): {err}")
+            }
         }
     }
 
@@ -348,7 +370,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
             if reports.len() > persisted_matches {
-                match store.record_tournament_matches(db_id, &reports[persisted_matches..], persisted_matches) {
+                match store.record_tournament_matches(
+                    db_id,
+                    &reports[persisted_matches..],
+                    persisted_matches,
+                ) {
                     Ok(()) => persisted_matches = reports.len(),
                     Err(err) => eprintln!("tournament_persist_matches_failed: {err}"),
                 }
@@ -367,7 +393,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
         {
             let fitness = team_brain_fitness(team);
-            if best_salvage.as_ref().map_or(true, |(best, _)| fitness > *best) {
+            if best_salvage
+                .as_ref()
+                .map_or(true, |(best, _)| fitness > *best)
+            {
                 if let Some(neural) = &team.brain.neural {
                     best_salvage = Some((fitness, neural.clone()));
                 }
@@ -380,13 +409,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(err) => {
             eprintln!("tournament_failed error={err} persisted_matches={persisted_matches}");
             if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
-                let _ = store.finish_tournament(db_id, "failed", None, None, None, started.elapsed().as_secs_f64());
+                let _ = store.finish_tournament(
+                    db_id,
+                    "failed",
+                    None,
+                    None,
+                    None,
+                    started.elapsed().as_secs_f64(),
+                );
             }
             // Salvage: promote the strongest brain seen so the run's learning isn't discarded.
             if promote {
-                if let (Some(store), Some(eid), Some((fitness, neural))) =
-                    (store.as_mut(), experiment_id.as_ref(), best_salvage.as_ref())
-                {
+                if let (Some(store), Some(eid), Some((fitness, neural))) = (
+                    store.as_mut(),
+                    experiment_id.as_ref(),
+                    best_salvage.as_ref(),
+                ) {
                     let generation = parent_generation.saturating_add(1).max(0);
                     match promote_salvaged_brain(
                         store,
@@ -474,7 +512,10 @@ mod tests {
 
     #[test]
     fn learning_mode_parses_with_bilearning_default() {
-        assert_eq!(parse_learning_mode(None), TournamentLearningMode::BiLearning);
+        assert_eq!(
+            parse_learning_mode(None),
+            TournamentLearningMode::BiLearning
+        );
         assert_eq!(
             parse_learning_mode(Some("frozen".to_string())),
             TournamentLearningMode::Frozen
@@ -500,9 +541,12 @@ mod tests {
         // With a snapshot, exactly round(team_count * fraction) teams are seeded.
         let snapshot = SoccerNeuralNetworkSnapshot::default();
         let seeded = build_entrants(&format, 7, Some(snapshot), 0.25);
-        let seeded_count = seeded.iter().filter(|team| team.brain.neural.is_some()).count();
+        let seeded_count = seeded
+            .iter()
+            .filter(|team| team.brain.neural.is_some())
+            .count();
         assert_eq!(seeded_count, 32); // 128 * 0.25
-        // Ids are unique (Tournament::new requires it).
+                                      // Ids are unique (Tournament::new requires it).
         let mut ids: Vec<usize> = seeded.iter().map(|team| team.id).collect();
         ids.sort_unstable();
         ids.dedup();

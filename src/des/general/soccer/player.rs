@@ -227,6 +227,102 @@ pub struct PlayerAgent {
     pub decision_confidence: f64,
 }
 
+const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
+const MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS: f64 = 6.0;
+
+fn player_mdp_mpc_comparison_trace(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action_target: &Option<AgentActionTargetTrace>,
+    action_label: &str,
+) -> Option<SoccerMdpMpcComparisonTrace> {
+    let guidance = snapshot.formation_lp_guidance_for(player.id)?;
+    if !guidance.local_mpc_guidance {
+        return None;
+    }
+    let mdp_target = action_target.as_ref().and_then(|target| target.point);
+    let mpc_target = guidance.target;
+    let current = snapshot
+        .player_position(player.id)
+        .unwrap_or(player.position)
+        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+    let target_delta_yards = mdp_target
+        .map(|target| target.distance(mpc_target))
+        .unwrap_or(0.0);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let mdp_velocity = mdp_target
+        .map(|target| (target - current) / dt)
+        .unwrap_or(Vec2::zero());
+    let velocity_delta_yps = (mdp_velocity - guidance.target_velocity).len();
+    let label = normalize_soccer_action_label(action_label);
+    let semantic_mismatch = mdp_target.is_none()
+        || snapshot.ball.holder == Some(player.id)
+        || player.role == PlayerRole::Goalkeeper
+        || matches!(
+            label,
+            "shoot"
+                | "pass"
+                | "pass1"
+                | "aerial-pass"
+                | "aerial-pass1"
+                | "clearance"
+                | "route-one"
+                | "tackle"
+                | "control-touch"
+        );
+    let blend_eligible = !semantic_mismatch
+        && target_delta_yards.is_finite()
+        && target_delta_yards <= MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS
+        && matches!(
+            label,
+            "support-shape"
+                | "support-roam"
+                | "check-to-ball"
+                | "wide-outlet"
+                | "overlap-run"
+                | "run-in-behind"
+                | "shot-creation-run"
+                | "support-push-up"
+                | "defend"
+                | "hold"
+                | "recover"
+                | "move"
+        );
+    let blended_target = if blend_eligible {
+        mdp_target.map(|target| {
+            ((target + mpc_target) * 0.5)
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+        })
+    } else {
+        None
+    };
+    let deviation_recorded = target_delta_yards >= MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS
+        || velocity_delta_yps >= 1.0
+        || semantic_mismatch;
+    let decision = if blend_eligible {
+        "blend-continuous-candidate"
+    } else if semantic_mismatch {
+        "reject-blend-semantic-mismatch"
+    } else {
+        "record-deviation-only"
+    };
+
+    Some(SoccerMdpMpcComparisonTrace {
+        player_id: player.id,
+        action: action_label.to_string(),
+        mdp_target,
+        mpc_target: Some(mpc_target),
+        blended_target,
+        target_delta_yards: finite_metric(target_delta_yards),
+        velocity_delta_yps: finite_metric(velocity_delta_yps),
+        mdp_confidence: player.decision_confidence.clamp(0.0, 1.0),
+        mpc_guidance_present: true,
+        blend_eligible,
+        deviation_recorded,
+        decision: decision.to_string(),
+    })
+}
+
 impl PlayerAgent {
     pub(crate) fn record_position_history(&mut self) {
         self.position_history.push_back(self.position);
@@ -439,7 +535,8 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        let crowded_dribble_damp = (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
+        let crowded_dribble_damp =
+            (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
         // The flip side: when a defender is inside 2 yds AND a receiver is open, lift
         // passing so the carrier releases the ball before the gap closes. Gated on an
         // open outlet so a crowded carrier with no pass isn't pushed into a giveaway.
@@ -459,7 +556,7 @@ impl PlayerAgent {
             * (1.0 - open_forward_outlet * 0.34).clamp(0.58, 1.0)
             * dribble_into_opponent_penalty
             * crowded_dribble_damp)
-        .clamp(0.02, 1.36);
+            .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
             * fatigue_dribble
             * patient_dribble_lift
@@ -475,12 +572,14 @@ impl PlayerAgent {
         let central_defender_forward_blocked = is_central_defender
             && observation.forward_dribble_space_yards
                 < CENTRAL_DEFENDER_FORWARD_DRIBBLE_MIN_SPACE_YARDS;
-        let carry_forward_min_space = if observation.yards_to_goal <= DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL {
-            1.2
-        } else {
-            DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS
-        };
-        let carry_forward_legal = (observation.forward_dribble_space_yards >= carry_forward_min_space
+        let carry_forward_min_space =
+            if observation.yards_to_goal <= DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL {
+                1.2
+            } else {
+                DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS
+            };
+        let carry_forward_legal = (observation.forward_dribble_space_yards
+            >= carry_forward_min_space
             || goalmouth_carry_forced)
             && !goal_attack_shot_required
             && !central_defender_forward_blocked;
@@ -1294,7 +1393,11 @@ impl PlayerAgent {
             if pressure >= 0.45 && pass_quality >= 0.5 {
                 let dominance = (pressure * pass_quality).clamp(0.0, 1.0);
                 let first_time_floor = (0.40 + dominance * 0.50).clamp(0.40, 0.92);
-                ensure_min_legal_option_probability(&mut options, "first-time-pass", first_time_floor);
+                ensure_min_legal_option_probability(
+                    &mut options,
+                    "first-time-pass",
+                    first_time_floor,
+                );
                 let control_multiplier = (1.0 - dominance * 0.85).clamp(0.10, 1.0);
                 scale_legal_option_score(&mut options, control_label, control_multiplier);
             }
@@ -1302,7 +1405,10 @@ impl PlayerAgent {
         normalize_action_options(options)
     }
 
-    pub(crate) fn support_action_options(&self, snapshot: &WorldSnapshot) -> Vec<AgentActionOptionTrace> {
+    pub(crate) fn support_action_options(
+        &self,
+        snapshot: &WorldSnapshot,
+    ) -> Vec<AgentActionOptionTrace> {
         self.support_action_context(snapshot).options
     }
 
@@ -1635,7 +1741,10 @@ impl PlayerAgent {
         options
     }
 
-    pub(crate) fn immediate_defensive_steal_target(&self, snapshot: &WorldSnapshot) -> Option<usize> {
+    pub(crate) fn immediate_defensive_steal_target(
+        &self,
+        snapshot: &WorldSnapshot,
+    ) -> Option<usize> {
         if self.role == PlayerRole::Goalkeeper {
             return None;
         }
@@ -1762,6 +1871,10 @@ impl PlayerAgent {
         action_label: impl Into<String>,
     ) -> AgentDecisionTrace {
         let scheduled_index = snapshot.scheduled_player_index(self.id);
+        let action_label = action_label.into();
+        let action_target = self.action_target_trace(action, snapshot);
+        let mdp_mpc_comparison =
+            player_mdp_mpc_comparison_trace(snapshot, self, &action_target, &action_label);
         AgentDecisionTrace {
             mdp_state,
             observation,
@@ -1769,8 +1882,9 @@ impl PlayerAgent {
             operation_order,
             scheduled_index,
             action_options,
-            action_target: self.action_target_trace(action, snapshot),
-            action: action_label.into(),
+            action_target,
+            mdp_mpc_comparison,
+            action: action_label,
         }
     }
 
@@ -1886,7 +2000,9 @@ impl PlayerAgent {
         if let Some(planned_release) = snapshot.active_set_play_release_for(self.id, restart_label)
         {
             let release_legal = match &planned_release.0 {
-                SoccerAction::Pass { target_player, .. } => goal_kick_receiver_legal(*target_player),
+                SoccerAction::Pass { target_player, .. } => {
+                    goal_kick_receiver_legal(*target_player)
+                }
                 _ => true,
             };
             if release_legal {
@@ -2345,8 +2461,7 @@ impl PlayerAgent {
                 // A loose ball is, by definition, in nobody's possession. (An
                 // opponent's ball at the feet is handled by the steal logic below.)
                 if snapshot.ball.holder.is_none() {
-                    let target =
-                        self.control_touch_target_for_goal_context(snapshot, &observation);
+                    let target = self.control_touch_target_for_goal_context(snapshot, &observation);
                     let action = SoccerAction::ControlTouch { target };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
@@ -4796,4 +4911,3 @@ pub struct SoccerLearnedPlan {
     pub target_player: Option<usize>,
     pub target_point: Option<Vec2>,
 }
-

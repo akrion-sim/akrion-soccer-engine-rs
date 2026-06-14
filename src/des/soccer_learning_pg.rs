@@ -17,12 +17,12 @@ use crate::des::general::soccer::{
     SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team,
     SOCCER_MOMENT_EMBEDDING_DIM,
 };
+use crate::des::general::tournament::{MatchReport, TournamentFormat, TournamentTeam};
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
     SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
-use crate::des::general::tournament::{MatchReport, TournamentFormat, TournamentTeam};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -62,7 +62,6 @@ pub struct SoccerLearningPgCompletedRunRetentionPrune {
     pub deleted_runs: u64,
     pub deleted_delta_rows: u64,
 }
-
 
 const POSTGRES_MAX_QUERY_PARAMETERS: usize = 65_535;
 const SOCCER_COMPLETED_RUN_HEADER_PARAMETER_COUNT: usize = 22;
@@ -1989,55 +1988,55 @@ impl SoccerLearningPgStore {
             }
 
             for row in &rows {
-            let team: String = row.get(0);
-            let entry_kind: String = row.get(1);
-            let state_key_json: Value = row.get(2);
-            let state: SoccerQStateKey = serde_json::from_value(state_key_json)
-                .map_err(|err| format!("decode soccer policy state key: {err}"))?;
-            let action: String = row.get(3);
-            let target_fine_cell_id: i32 = row.get(4);
-            let target_tactical_cell_id: i32 = row.get(5);
-            let target_macro_cell_id: i32 = row.get(6);
-            let target_root_cell_id: i32 = row.get(7);
-            let value_micros: i64 = row.get(8);
-            let visits_i32: i32 = row.get(9);
-            let visits = visits_i32.max(0) as u32;
-            let value = soccer_learning_from_micros(value_micros);
-            match (team.as_str(), entry_kind.as_str()) {
-                ("home", "action") => home_entries.push(SoccerQEntry {
-                    state,
-                    action,
-                    value,
-                    visits,
-                }),
-                ("away", "action") => away_entries.push(SoccerQEntry {
-                    state,
-                    action,
-                    value,
-                    visits,
-                }),
-                ("home", "target") => home_targets.push(SoccerQTargetEntry {
-                    state,
-                    action,
-                    target_fine_cell_id: target_fine_cell_id.max(0) as usize,
-                    target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
-                    target_macro_cell_id: target_macro_cell_id.max(0) as usize,
-                    target_root_cell_id: target_root_cell_id.max(0) as usize,
-                    value,
-                    visits,
-                }),
-                ("away", "target") => away_targets.push(SoccerQTargetEntry {
-                    state,
-                    action,
-                    target_fine_cell_id: target_fine_cell_id.max(0) as usize,
-                    target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
-                    target_macro_cell_id: target_macro_cell_id.max(0) as usize,
-                    target_root_cell_id: target_root_cell_id.max(0) as usize,
-                    value,
-                    visits,
-                }),
-                _ => {}
-            }
+                let team: String = row.get(0);
+                let entry_kind: String = row.get(1);
+                let state_key_json: Value = row.get(2);
+                let state: SoccerQStateKey = serde_json::from_value(state_key_json)
+                    .map_err(|err| format!("decode soccer policy state key: {err}"))?;
+                let action: String = row.get(3);
+                let target_fine_cell_id: i32 = row.get(4);
+                let target_tactical_cell_id: i32 = row.get(5);
+                let target_macro_cell_id: i32 = row.get(6);
+                let target_root_cell_id: i32 = row.get(7);
+                let value_micros: i64 = row.get(8);
+                let visits_i32: i32 = row.get(9);
+                let visits = visits_i32.max(0) as u32;
+                let value = soccer_learning_from_micros(value_micros);
+                match (team.as_str(), entry_kind.as_str()) {
+                    ("home", "action") => home_entries.push(SoccerQEntry {
+                        state,
+                        action,
+                        value,
+                        visits,
+                    }),
+                    ("away", "action") => away_entries.push(SoccerQEntry {
+                        state,
+                        action,
+                        value,
+                        visits,
+                    }),
+                    ("home", "target") => home_targets.push(SoccerQTargetEntry {
+                        state,
+                        action,
+                        target_fine_cell_id: target_fine_cell_id.max(0) as usize,
+                        target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
+                        target_macro_cell_id: target_macro_cell_id.max(0) as usize,
+                        target_root_cell_id: target_root_cell_id.max(0) as usize,
+                        value,
+                        visits,
+                    }),
+                    ("away", "target") => away_targets.push(SoccerQTargetEntry {
+                        state,
+                        action,
+                        target_fine_cell_id: target_fine_cell_id.max(0) as usize,
+                        target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
+                        target_macro_cell_id: target_macro_cell_id.max(0) as usize,
+                        target_root_cell_id: target_root_cell_id.max(0) as usize,
+                        value,
+                        visits,
+                    }),
+                    _ => {}
+                }
             }
 
             // A short page means the last row of the version has been read.
@@ -2074,7 +2073,6 @@ impl SoccerLearningPgStore {
             )?,
         })
     }
-
 }
 
 fn insert_completed_run_in_transaction(
@@ -3135,9 +3133,7 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
     .map_err(|err| format!("ensure soccer tournament tables: {err}"))
 }
 
-fn ensure_soccer_moment_embedding_tables(
-    tx: &mut postgres::Transaction<'_>,
-) -> Result<(), String> {
+fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
     tx.batch_execute(&format!(
         r#"
         create extension if not exists vector;
@@ -3677,8 +3673,16 @@ fn soccer_learning_pg_error_is_transient(err: &postgres::Error) -> bool {
         None => true,
         Some(db_error) => matches!(
             db_error.code().code(),
-            "53300" | "53400" | "57P01" | "57P02" | "57P03" | "08000" | "08003" | "08006"
-                | "08001" | "08004"
+            "53300"
+                | "53400"
+                | "57P01"
+                | "57P02"
+                | "57P03"
+                | "08000"
+                | "08003"
+                | "08006"
+                | "08001"
+                | "08004"
         ),
     }
 }
@@ -3810,8 +3814,14 @@ mod tests {
         ];
         let (attack, defense) = soccer_moment_neighbors_attack_defense(&neighbors);
         assert!((0.0..=1.0).contains(&attack) && (0.0..=1.0).contains(&defense));
-        assert!(attack > 0.5, "favourable attacking neighbour should lift attack: {attack}");
-        assert!(defense > 0.5, "favourable defending neighbour should lift defense: {defense}");
+        assert!(
+            attack > 0.5,
+            "favourable attacking neighbour should lift attack: {attack}"
+        );
+        assert!(
+            defense > 0.5,
+            "favourable defending neighbour should lift defense: {defense}"
+        );
 
         // No neighbours / unfavourable outcomes ⇒ zero signal.
         assert_eq!(soccer_moment_neighbors_attack_defense(&[]), (0.0, 0.0));
@@ -3823,7 +3833,10 @@ mod tests {
             tick: 1,
             distance: 0.0,
         }];
-        assert_eq!(soccer_moment_neighbors_attack_defense(&unfavourable), (0.0, 0.0));
+        assert_eq!(
+            soccer_moment_neighbors_attack_defense(&unfavourable),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
@@ -3865,23 +3878,31 @@ mod tests {
     #[test]
     fn soccer_learning_pg_relaxes_only_on_explicit_opt_out() {
         // Non-authenticating sslmodes opt out.
-        assert!(!soccer_learning_pg_should_verify_certificates_with_override(
-            "postgres://u:p@host/db?sslmode=disable",
-            false
-        ));
-        assert!(!soccer_learning_pg_should_verify_certificates_with_override(
-            "postgres://u:p@host/db?sslmode=prefer",
-            false
-        ));
-        assert!(!soccer_learning_pg_should_verify_certificates_with_override(
-            "postgres://u:p@host/db?sslmode=allow",
-            false
-        ));
+        assert!(
+            !soccer_learning_pg_should_verify_certificates_with_override(
+                "postgres://u:p@host/db?sslmode=disable",
+                false
+            )
+        );
+        assert!(
+            !soccer_learning_pg_should_verify_certificates_with_override(
+                "postgres://u:p@host/db?sslmode=prefer",
+                false
+            )
+        );
+        assert!(
+            !soccer_learning_pg_should_verify_certificates_with_override(
+                "postgres://u:p@host/db?sslmode=allow",
+                false
+            )
+        );
         // The insecure escape hatch overrides everything, including require.
-        assert!(!soccer_learning_pg_should_verify_certificates_with_override(
-            "postgres://u:p@host/db?sslmode=require",
-            true
-        ));
+        assert!(
+            !soccer_learning_pg_should_verify_certificates_with_override(
+                "postgres://u:p@host/db?sslmode=require",
+                true
+            )
+        );
     }
 
     #[test]
@@ -3899,12 +3920,8 @@ mod tests {
 -----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
         let blocks = split_pem_certificates(pem);
         assert_eq!(blocks.len(), 2);
-        assert!(blocks[0]
-            .windows(4)
-            .any(|window| window == b"AAAA"));
-        assert!(blocks[1]
-            .windows(4)
-            .any(|window| window == b"BBBB"));
+        assert!(blocks[0].windows(4).any(|window| window == b"AAAA"));
+        assert!(blocks[1].windows(4).any(|window| window == b"BBBB"));
     }
 
     #[test]

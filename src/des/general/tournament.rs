@@ -530,7 +530,11 @@ impl Tournament {
             tb.record
                 .points()
                 .cmp(&ta.record.points())
-                .then(tb.record.goal_difference().cmp(&ta.record.goal_difference()))
+                .then(
+                    tb.record
+                        .goal_difference()
+                        .cmp(&ta.record.goal_difference()),
+                )
                 .then(tb.record.goals_for.cmp(&ta.record.goals_for))
                 .then_with(|| {
                     let h2h_a = head_to_head_points(head_to_head, a, b);
@@ -641,7 +645,8 @@ impl Tournament {
                     .goal_difference();
                 // Widen to i64 before subtracting: goal_difference() is i32 and accumulates
                 // across the whole run, so a pathological score can't overflow the subtraction.
-                let bias = ((i64::from(home_gd) - i64::from(away_gd)) as f64 / 16.0).clamp(-0.6, 0.6);
+                let bias =
+                    ((i64::from(home_gd) - i64::from(away_gd)) as f64 / 16.0).clamp(-0.6, 0.6);
                 let winner = if rng.biased_coin(bias) {
                     ctx.home_id
                 } else {
@@ -675,13 +680,7 @@ impl Tournament {
                         away_id,
                     );
                     let outcome = self.play_match(runner, &ctx)?;
-                    self.commit_match(
-                        &ctx,
-                        outcome,
-                        None,
-                        Some(&mut head_to_head),
-                        &mut reports,
-                    );
+                    self.commit_match(&ctx, outcome, None, Some(&mut head_to_head), &mut reports);
                 }
             }
         }
@@ -708,8 +707,7 @@ impl Tournament {
             let mut losers = Vec::with_capacity(remaining / 2);
             for (match_index, pair) in current.chunks(2).enumerate() {
                 let (home_id, away_id) = (pair[0], pair[1]);
-                let ctx =
-                    self.match_context(stage, round_index, match_index, home_id, away_id);
+                let ctx = self.match_context(stage, round_index, match_index, home_id, away_id);
                 let outcome = self.play_match(runner, &ctx)?;
                 let (winner, shootout) = self.knockout_winner(&ctx, &outcome, &mut rng);
                 let loser = if winner == home_id { away_id } else { home_id };
@@ -905,12 +903,16 @@ impl Tournament {
             for (ctx, outcome) in wave.iter().zip(outcomes) {
                 self.commit_match(ctx, outcome, None, Some(&mut head_to_head), &mut reports);
             }
-            on_progress(&TournamentProgress::new(
-                reports.len(),
-                matches_total,
-                format!("Group round {}", round_index + 1),
-                started.elapsed(),
-            ), &reports, &self.teams);
+            on_progress(
+                &TournamentProgress::new(
+                    reports.len(),
+                    matches_total,
+                    format!("Group round {}", round_index + 1),
+                    started.elapsed(),
+                ),
+                &reports,
+                &self.teams,
+            );
         }
 
         let (group_tables, bracket) = self.group_tables_and_bracket(&groups, &head_to_head);
@@ -942,7 +944,11 @@ impl Tournament {
             let mut losers = Vec::with_capacity(remaining / 2);
             for (ctx, outcome) in wave.iter().zip(outcomes) {
                 let (winner, shootout) = self.knockout_winner(ctx, &outcome, &mut rng);
-                let loser = if winner == ctx.home_id { ctx.away_id } else { ctx.home_id };
+                let loser = if winner == ctx.home_id {
+                    ctx.away_id
+                } else {
+                    ctx.home_id
+                };
                 self.commit_match(ctx, outcome, shootout, None, &mut reports);
                 winners.push(winner);
                 losers.push(loser);
@@ -952,12 +958,16 @@ impl Tournament {
             }
             current = winners;
             round_index += 1;
-            on_progress(&TournamentProgress::new(
-                reports.len(),
-                matches_total,
-                stage.label(),
-                started.elapsed(),
-            ), &reports, &self.teams);
+            on_progress(
+                &TournamentProgress::new(
+                    reports.len(),
+                    matches_total,
+                    stage.label(),
+                    started.elapsed(),
+                ),
+                &reports,
+                &self.teams,
+            );
         }
         let champion_id = *current
             .first()
@@ -982,12 +992,16 @@ impl Tournament {
             let (winner, shootout) = self.knockout_winner(&ctx, &outcome, &mut rng);
             self.commit_match(&ctx, outcome, shootout, None, &mut reports);
             third_place_id = Some(winner);
-            on_progress(&TournamentProgress::new(
-                reports.len(),
-                matches_total,
-                "Third-place play-off".to_string(),
-                started.elapsed(),
-            ), &reports, &self.teams);
+            on_progress(
+                &TournamentProgress::new(
+                    reports.len(),
+                    matches_total,
+                    "Third-place play-off".to_string(),
+                    started.elapsed(),
+                ),
+                &reports,
+                &self.teams,
+            );
         }
 
         Ok(TournamentReport {
@@ -1166,9 +1180,7 @@ fn stage_seed_salt(stage: TournamentStage) -> u32 {
         TournamentStage::Group => 0x0000_0001,
         TournamentStage::ThirdPlace => 0x0000_0002,
         TournamentStage::Final => 0x0000_0003,
-        TournamentStage::Knockout { remaining } => {
-            0x1000_0000u32.wrapping_add(remaining as u32)
-        }
+        TournamentStage::Knockout { remaining } => 0x1000_0000u32.wrapping_add(remaining as u32),
     }
 }
 
@@ -1524,7 +1536,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for round in &legs {
             for &(home, away) in round {
-                let key = if home < away { (home, away) } else { (away, home) };
+                let key = if home < away {
+                    (home, away)
+                } else {
+                    (away, home)
+                };
                 assert!(seen.insert(key), "pairing {key:?} scheduled twice");
             }
         }
@@ -1633,7 +1649,10 @@ mod tests {
             .unwrap();
 
         assert!(callbacks > 0, "callback should fire per wave");
-        assert!(monotonic, "reports must equal matches_played and never shrink");
+        assert!(
+            monotonic,
+            "reports must equal matches_played and never shrink"
+        );
         assert!(team_counts_ok, "every callback sees the full team list");
         // The final callback sees every match the report holds.
         assert_eq!(max_reports, report.match_count());
@@ -1677,7 +1696,11 @@ mod tests {
         let standings = |r: &TournamentReport| {
             r.group_tables
                 .iter()
-                .flat_map(|t| t.standings.iter().map(|s| (s.team_id, s.record.points(), s.advanced)))
+                .flat_map(|t| {
+                    t.standings
+                        .iter()
+                        .map(|s| (s.team_id, s.record.points(), s.advanced))
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(standings(&seq_report), standings(&par_report));

@@ -13,6 +13,7 @@ use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use serde_json::{json, Value};
 use soccer_engine::des::general::soccer::{
     MatchConfig, SoccerQPolicyOptions, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamQPolicies,
@@ -25,7 +26,6 @@ use soccer_engine::des::soccer_learning::{
     SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::SoccerLearningPgStore;
-use serde_json::{json, Value};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]

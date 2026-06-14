@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     train_soccer_set_play_restarts_with_events, MatchConfig, SoccerNeuralBlendConfig,
     SoccerNeuralBlendMode, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
@@ -18,7 +19,6 @@ use soccer_engine::des::soccer_learning::{
     SoccerPostgresPolicyRefreshCheck, SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::SoccerLearningPgStore;
-use serde::Serialize;
 
 const DEFAULT_SOCCER_SET_PLAY_POSTGRES_TACTICAL_LEARNING_AUTHORITATIVE: bool = true;
 
