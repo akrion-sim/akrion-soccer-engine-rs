@@ -57,6 +57,7 @@ fn test_decision_trace(
         scheduled_index: None,
         action_options: single_action_option(action),
         action_target: None,
+        mdp_mpc_comparison: None,
         action: action.to_string(),
     }
 }
@@ -8061,6 +8062,15 @@ fn local_mpc_refines_off_ball_guidance_with_budget() {
         "one-player-per-team MPC budget should refine at most two rows, got {}",
         mpc_guidance.len()
     );
+    assert!(
+        mpc_guidance.iter().any(|guidance| guidance.team == Team::Home)
+            && mpc_guidance.iter().any(|guidance| guidance.team == Team::Away),
+        "local MPC should refine one home and one away player when both team brains are active: {:?}",
+        mpc_guidance
+            .iter()
+            .map(|guidance| (guidance.team, guidance.player_id))
+            .collect::<Vec<_>>()
+    );
     assert!(mpc_guidance.iter().all(|guidance| {
         guidance.player_id != holder
             && refreshed
@@ -8086,6 +8096,290 @@ fn local_mpc_refines_off_ball_guidance_with_budget() {
             .any(|operation| operation == "solve-local-mpc"),
         "central brain operation order should expose the MPC solve: {:?}",
         central_decision.operation_order
+    );
+    let traced_player_id = mpc_guidance
+        .iter()
+        .find(|guidance| guidance.team == Team::Home)
+        .map(|guidance| guidance.player_id)
+        .expect("home MPC-guided player");
+    let traced_player = sim
+        .players
+        .iter_mut()
+        .find(|player| player.id == traced_player_id)
+        .expect("MPC-guided player agent");
+    let _intent = traced_player.run_time_step(&refreshed, None, None, &mut mulberry32(22_716));
+    let comparison = traced_player
+        .last_decision
+        .as_ref()
+        .and_then(|decision| decision.mdp_mpc_comparison.as_ref())
+        .expect("player decision should compare MDP/POMDP target with MPC guidance");
+    assert!(comparison.mpc_guidance_present);
+    assert_eq!(comparison.player_id, traced_player_id);
+    assert!(comparison.mpc_target.is_some());
+    assert!(comparison.target_delta_yards.is_finite());
+    if comparison.blend_eligible {
+        assert!(
+            comparison.blended_target.is_some(),
+            "continuous compatible deviations should expose the average/blend candidate"
+        );
+    } else {
+        assert!(
+            comparison.blended_target.is_none(),
+            "semantic mismatches should be traced but not averaged"
+        );
+    }
+}
+
+#[test]
+fn local_mpc_whole_field_context_uses_player_and_ball_kinematics() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        learning_enabled: false,
+        learning_logging_enabled: false,
+        formation_lp_enabled: true,
+        local_mpc_enabled: false,
+        max_human_players: 0,
+        seed: 22_720,
+        ..Default::default()
+    });
+    sim.ball.holder = Some(6);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.players[6].position = sim.ball.position;
+
+    let before = WorldSnapshot::from_match(&sim);
+    sim.central_brain
+        .run_time_step(&before, &mut mulberry32(22_721));
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let guidance = snapshot
+        .formation_lp_guidance
+        .iter()
+        .find(|guidance| {
+            guidance.team == Team::Home
+                && guidance.player_id != 6
+                && snapshot.players.iter().any(|player| {
+                    player.id == guidance.player_id && player.role != PlayerRole::Goalkeeper
+                })
+        })
+        .expect("home off-ball LP guidance")
+        .clone();
+    let player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == guidance.player_id)
+        .expect("guided player");
+    let (width, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let current = finite_pitch_point(guidance.current, width, length, player.position);
+    let velocity = finite_vec2(player.velocity, guidance.target_velocity);
+    let target = finite_pitch_point(guidance.target, width, length, current);
+    let speed_cap = player_top_speed_yps(player.role, &player.skills)
+        .max(guidance.recommended_speed_yps)
+        .max(velocity.len())
+        .clamp(0.5, 20.0);
+    let desired_velocity = limit_vec2_len(
+        if guidance.target_velocity.len() > 1e-9 {
+            guidance.target_velocity
+        } else {
+            (target - current) / dt
+        },
+        speed_cap,
+    );
+    let open_context = soccer_local_mpc_whole_field_context(
+        &snapshot,
+        player,
+        current,
+        velocity,
+        target,
+        desired_velocity,
+        dt,
+        speed_cap,
+        width,
+        length,
+    );
+
+    let mut crowded = snapshot.clone();
+    let blocker_id = crowded
+        .players
+        .iter()
+        .find(|other| other.team != player.team && other.role != PlayerRole::Goalkeeper)
+        .map(|other| other.id)
+        .expect("opponent blocker");
+    if let Some(blocker) = crowded
+        .players
+        .iter_mut()
+        .find(|other| other.id == blocker_id)
+    {
+        blocker.position = (target - Vec2::new(1.0, 0.0)).clamp_to_pitch(width, length);
+        blocker.velocity = Vec2::new(12.0, 0.0);
+        blocker.acceleration = Vec2::new(8.0, 0.0);
+    }
+    let crowded_player = crowded
+        .players
+        .iter()
+        .find(|candidate| candidate.id == player.id)
+        .expect("crowded guided player");
+    let crowded_context = soccer_local_mpc_whole_field_context(
+        &crowded,
+        crowded_player,
+        current,
+        velocity,
+        target,
+        desired_velocity,
+        dt,
+        speed_cap,
+        width,
+        length,
+    );
+    assert!(
+        crowded_context.position_weight_bonus > open_context.position_weight_bonus,
+        "projected opponent position/velocity/acceleration should raise MPC context pressure"
+    );
+    assert!(
+        crowded_context.target.distance(target) > open_context.target.distance(target) + 0.05,
+        "projected opponent kinematics should move the MPC target away from the raw LP target"
+    );
+
+    let mut ball_crowded = snapshot.clone();
+    ball_crowded.ball.holder = None;
+    ball_crowded.ball.position = (target + Vec2::new(0.8, 0.0)).clamp_to_pitch(width, length);
+    ball_crowded.ball.velocity = Vec2::new(-10.0, 0.0);
+    ball_crowded.ball.acceleration = Vec2::new(-6.0, 0.0);
+    let ball_player = ball_crowded
+        .players
+        .iter()
+        .find(|candidate| candidate.id == player.id)
+        .expect("ball-context guided player");
+    let ball_context = soccer_local_mpc_whole_field_context(
+        &ball_crowded,
+        ball_player,
+        current,
+        velocity,
+        target,
+        desired_velocity,
+        dt,
+        speed_cap,
+        width,
+        length,
+    );
+    assert!(
+        ball_context.position_weight_bonus > open_context.position_weight_bonus,
+        "ball position/velocity/acceleration should contribute to MPC context pressure"
+    );
+    assert!(
+        ball_context.target.distance(target) > open_context.target.distance(target) + 0.05,
+        "ball kinematics should move the MPC target away from the raw LP target"
+    );
+}
+
+#[test]
+fn local_mpc_planar_obstacles_cover_players_and_ball_kinematics() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        learning_enabled: false,
+        learning_logging_enabled: false,
+        formation_lp_enabled: true,
+        local_mpc_enabled: false,
+        max_human_players: 0,
+        seed: 22_722,
+        ..Default::default()
+    });
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    let player_id = snapshot
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("controlled player");
+    let opponent_id = snapshot
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("opponent obstacle");
+    let (width, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let half_dt2 = 0.5 * dt * dt;
+
+    let obstacle_position = Vec2::new(31.0, 44.0);
+    let obstacle_velocity = Vec2::new(3.5, -4.0);
+    let obstacle_acceleration = Vec2::new(6.0, 2.5);
+    if let Some(opponent) = snapshot
+        .players
+        .iter_mut()
+        .find(|player| player.id == opponent_id)
+    {
+        opponent.position = obstacle_position;
+        opponent.velocity = obstacle_velocity;
+        opponent.acceleration = obstacle_acceleration;
+    }
+    snapshot.ball.holder = None;
+    snapshot.ball.position = Vec2::new(62.0, 33.0);
+    snapshot.ball.velocity = Vec2::new(-8.0, 5.0);
+    snapshot.ball.acceleration = Vec2::new(-5.0, 3.0);
+
+    let player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("controlled player snapshot");
+    let obstacles = soccer_local_mpc_planar_obstacles(&snapshot, player, dt, width, length);
+    assert_eq!(
+        obstacles.len(),
+        snapshot.players.len(),
+        "MPC should model every other player plus the ball as moving obstacles"
+    );
+
+    let expected_opponent_center = finite_pitch_point(
+        obstacle_position + obstacle_velocity * dt + obstacle_acceleration * half_dt2,
+        width,
+        length,
+        obstacle_position,
+    );
+    let expected_opponent_velocity =
+        limit_vec2_len(obstacle_velocity + obstacle_acceleration * dt, 24.0);
+    let opponent_obstacle = obstacles
+        .iter()
+        .find(|obstacle| {
+            Vec2::new(obstacle.center[0], obstacle.center[1]).distance(expected_opponent_center)
+                < 1e-9
+        })
+        .expect("opponent obstacle should use projected position");
+    assert!(
+        Vec2::new(opponent_obstacle.velocity[0], opponent_obstacle.velocity[1])
+            .distance(expected_opponent_velocity)
+            < 1e-9,
+        "opponent obstacle velocity should include acceleration over the tick"
+    );
+    assert!(
+        opponent_obstacle.weight > 12.0,
+        "moving/accelerating opponent should carry extra obstacle pressure"
+    );
+
+    let expected_ball_center = finite_pitch_point(
+        snapshot.ball.position
+            + snapshot.ball.velocity * dt
+            + snapshot.ball.acceleration * half_dt2,
+        width,
+        length,
+        snapshot.ball.position,
+    );
+    let expected_ball_velocity = limit_vec2_len(
+        snapshot.ball.velocity + snapshot.ball.acceleration * dt,
+        32.0,
+    );
+    let ball_obstacle = obstacles
+        .iter()
+        .find(|obstacle| {
+            (obstacle.radius - 0.85).abs() < 1e-9
+                && Vec2::new(obstacle.center[0], obstacle.center[1]).distance(expected_ball_center)
+                    < 1e-9
+        })
+        .expect("ball obstacle should use projected ball kinematics");
+    assert!(
+        Vec2::new(ball_obstacle.velocity[0], ball_obstacle.velocity[1])
+            .distance(expected_ball_velocity)
+            < 1e-9,
+        "ball obstacle velocity should include acceleration over the tick"
     );
 }
 
@@ -11242,6 +11536,63 @@ fn assistant_referees_stay_off_pitch_and_in_assigned_halves() {
         .expect("far assistant offside line");
     assert_eq!(near_line.flank, AssistantFlank::Near);
     assert_eq!(far_line.flank, AssistantFlank::Far);
+}
+
+#[test]
+fn official_agents_use_their_own_local_mpc_when_enabled() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        formation_lp_enabled: false,
+        local_mpc_enabled: true,
+        max_human_players: 0,
+        ..Default::default()
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut center_ref = OfficialAgent::new(
+        22,
+        OfficialKind::CenterReferee,
+        Vec2::new(snapshot.field_width * 0.5, snapshot.field_length * 0.5),
+    );
+    let mut near_assistant = OfficialAgent::new(
+        23,
+        OfficialKind::AssistantRefereeNear,
+        Vec2::new(
+            -ASSISTANT_REF_TOUCHLINE_OFFSET_YARDS,
+            snapshot.field_length * 0.25,
+        ),
+    );
+    let mut rng = SeededRandom::new(303);
+
+    center_ref.run_time_step(&snapshot, &mut rng);
+    near_assistant.run_time_step(&snapshot, &mut rng);
+
+    for official in [&center_ref, &near_assistant] {
+        let decision = official
+            .last_decision
+            .as_ref()
+            .expect("official decision trace");
+        assert!(decision.local_mpc_guidance);
+        assert_eq!(decision.local_mpc_status, "optimal");
+        assert!(decision.local_mpc_objective.is_finite());
+        assert!(decision
+            .operation_order
+            .iter()
+            .any(|operation| operation == "solve-local-mpc"));
+        assert!(
+            decision.local_mpc_target_delta_yards.is_finite(),
+            "official MPC should expose a finite target delta"
+        );
+    }
+    assert!(
+        (near_assistant.position.x + ASSISTANT_REF_TOUCHLINE_OFFSET_YARDS).abs() < 1e-9,
+        "assistant MPC must preserve touchline duty-zone bounds: {:?}",
+        near_assistant.position
+    );
+    assert!(
+        (0.0..=snapshot.field_length * 0.5).contains(&near_assistant.position.y),
+        "assistant MPC must preserve assigned-half bounds: {:?}",
+        near_assistant.position
+    );
 }
 
 #[test]
@@ -30999,7 +31350,7 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
-    assert_eq!(SOCCER_NEURAL_FEATURE_DIM, 159);
+    assert_eq!(SOCCER_NEURAL_FEATURE_DIM, 160);
     assert_eq!(SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE, 153);
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -31051,6 +31402,14 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(
         features[SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE] > 0.0,
         "the value head should see sustained teammate-overlap pressure"
+    );
+    let mut mpc_transition = transition;
+    mpc_transition.tactical_trace.local_mpc_guidance = true;
+    let mpc_features = soccer_neural_transition_features(&mpc_transition);
+    assert_eq!(
+        mpc_features[SOCCER_NEURAL_FEATURE_DIM - 1],
+        1.0,
+        "the value/actor heads should see the MPC-refinement bit as a distinct feature"
     );
 }
 
@@ -33567,6 +33926,7 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             scheduled_index: None,
             action_options: single_action_option("pass"),
             action_target: Some(action_target),
+            mdp_mpc_comparison: None,
             action: "pass".to_string(),
         };
         soccer_transition_reward(

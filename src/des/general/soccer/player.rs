@@ -227,6 +227,102 @@ pub struct PlayerAgent {
     pub decision_confidence: f64,
 }
 
+const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
+const MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS: f64 = 6.0;
+
+fn player_mdp_mpc_comparison_trace(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action_target: &Option<AgentActionTargetTrace>,
+    action_label: &str,
+) -> Option<SoccerMdpMpcComparisonTrace> {
+    let guidance = snapshot.formation_lp_guidance_for(player.id)?;
+    if !guidance.local_mpc_guidance {
+        return None;
+    }
+    let mdp_target = action_target.as_ref().and_then(|target| target.point);
+    let mpc_target = guidance.target;
+    let current = snapshot
+        .player_position(player.id)
+        .unwrap_or(player.position)
+        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+    let target_delta_yards = mdp_target
+        .map(|target| target.distance(mpc_target))
+        .unwrap_or(0.0);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let mdp_velocity = mdp_target
+        .map(|target| (target - current) / dt)
+        .unwrap_or(Vec2::zero());
+    let velocity_delta_yps = (mdp_velocity - guidance.target_velocity).len();
+    let label = normalize_soccer_action_label(action_label);
+    let semantic_mismatch = mdp_target.is_none()
+        || snapshot.ball.holder == Some(player.id)
+        || player.role == PlayerRole::Goalkeeper
+        || matches!(
+            label,
+            "shoot"
+                | "pass"
+                | "pass1"
+                | "aerial-pass"
+                | "aerial-pass1"
+                | "clearance"
+                | "route-one"
+                | "tackle"
+                | "control-touch"
+        );
+    let blend_eligible = !semantic_mismatch
+        && target_delta_yards.is_finite()
+        && target_delta_yards <= MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS
+        && matches!(
+            label,
+            "support-shape"
+                | "support-roam"
+                | "check-to-ball"
+                | "wide-outlet"
+                | "overlap-run"
+                | "run-in-behind"
+                | "shot-creation-run"
+                | "support-push-up"
+                | "defend"
+                | "hold"
+                | "recover"
+                | "move"
+        );
+    let blended_target = if blend_eligible {
+        mdp_target.map(|target| {
+            ((target + mpc_target) * 0.5)
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+        })
+    } else {
+        None
+    };
+    let deviation_recorded = target_delta_yards >= MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS
+        || velocity_delta_yps >= 1.0
+        || semantic_mismatch;
+    let decision = if blend_eligible {
+        "blend-continuous-candidate"
+    } else if semantic_mismatch {
+        "reject-blend-semantic-mismatch"
+    } else {
+        "record-deviation-only"
+    };
+
+    Some(SoccerMdpMpcComparisonTrace {
+        player_id: player.id,
+        action: action_label.to_string(),
+        mdp_target,
+        mpc_target: Some(mpc_target),
+        blended_target,
+        target_delta_yards: finite_metric(target_delta_yards),
+        velocity_delta_yps: finite_metric(velocity_delta_yps),
+        mdp_confidence: player.decision_confidence.clamp(0.0, 1.0),
+        mpc_guidance_present: true,
+        blend_eligible,
+        deviation_recorded,
+        decision: decision.to_string(),
+    })
+}
+
 impl PlayerAgent {
     pub(crate) fn record_position_history(&mut self) {
         self.position_history.push_back(self.position);
@@ -1775,6 +1871,10 @@ impl PlayerAgent {
         action_label: impl Into<String>,
     ) -> AgentDecisionTrace {
         let scheduled_index = snapshot.scheduled_player_index(self.id);
+        let action_label = action_label.into();
+        let action_target = self.action_target_trace(action, snapshot);
+        let mdp_mpc_comparison =
+            player_mdp_mpc_comparison_trace(snapshot, self, &action_target, &action_label);
         AgentDecisionTrace {
             mdp_state,
             observation,
@@ -1782,8 +1882,9 @@ impl PlayerAgent {
             operation_order,
             scheduled_index,
             action_options,
-            action_target: self.action_target_trace(action, snapshot),
-            action: action_label.into(),
+            action_target,
+            mdp_mpc_comparison,
+            action: action_label,
         }
     }
 

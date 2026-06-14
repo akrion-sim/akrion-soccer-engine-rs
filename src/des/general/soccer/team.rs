@@ -2296,6 +2296,14 @@ struct SoccerLocalMpcCandidate {
     priority: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SoccerLocalMpcWholeFieldContext {
+    pub(crate) target: Vec2,
+    pub(crate) desired_velocity: Vec2,
+    pub(crate) position_weight_bonus: f64,
+    pub(crate) velocity_weight_bonus: f64,
+}
+
 fn soccer_local_mpc_candidate_priority(
     snapshot: &WorldSnapshot,
     guidance: &SoccerFormationLpPlayerGuidance,
@@ -2318,6 +2326,185 @@ fn soccer_local_mpc_candidate_priority(
         + guidance.pair_error_yards * 0.28
         + recovery_bonus;
     (urgency.is_finite() && urgency > 0.10).then_some(urgency)
+}
+
+pub(crate) fn soccer_local_mpc_whole_field_context(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    current: Vec2,
+    velocity: Vec2,
+    target: Vec2,
+    desired_velocity: Vec2,
+    dt: f64,
+    speed_cap: f64,
+    width: f64,
+    length: f64,
+) -> SoccerLocalMpcWholeFieldContext {
+    let half_dt2 = 0.5 * dt * dt;
+    let mut target_influence = Vec2::zero();
+    let mut velocity_influence = Vec2::zero();
+    let mut context_pressure = 0.0;
+    let self_direction = if (target - current).len() > 1e-6 {
+        (target - current).normalized()
+    } else if velocity.len() > 1e-6 {
+        velocity.normalized()
+    } else {
+        Vec2::new(0.0, player.team.attack_dir())
+    };
+
+    for other in &snapshot.players {
+        let other_position = finite_pitch_point(other.position, width, length, current);
+        let other_velocity = finite_vec2(other.velocity, Vec2::zero());
+        let other_acceleration = finite_vec2(other.acceleration, Vec2::zero());
+        let projected = finite_pitch_point(
+            other_position + other_velocity * dt + other_acceleration * half_dt2,
+            width,
+            length,
+            other_position,
+        );
+        if other.id == player.id {
+            velocity_influence += other_acceleration * (0.04 * dt);
+            continue;
+        }
+
+        let gap = target - projected;
+        let distance = gap.len();
+        let direction = if distance > 1e-6 {
+            gap / distance
+        } else {
+            self_direction
+        };
+        let same_team = other.team == player.team;
+        let base_radius = if same_team { 3.2 } else { 4.2 };
+        let holder_bonus = if snapshot.ball.holder == Some(other.id) {
+            1.35
+        } else {
+            0.0
+        };
+        let influence_radius = base_radius + holder_bonus;
+        if distance < influence_radius {
+            let closing_speed = (other_velocity - desired_velocity).len().clamp(0.0, 14.0);
+            let acceleration_pressure = other_acceleration.len().clamp(0.0, 12.0);
+            let team_weight = if same_team { 0.95 } else { 1.35 };
+            let pressure = ((influence_radius - distance) / influence_radius).clamp(0.0, 1.0)
+                * team_weight
+                * (1.0 + closing_speed / 32.0 + acceleration_pressure / 40.0);
+            target_influence += direction * pressure * 2.4;
+            velocity_influence += direction * pressure * 0.85;
+            context_pressure += pressure;
+        }
+    }
+
+    let ball_position = finite_pitch_point(snapshot.ball.position, width, length, target);
+    let ball_velocity = finite_vec2(snapshot.ball.velocity, Vec2::zero());
+    let ball_acceleration = finite_vec2(snapshot.ball.acceleration, Vec2::zero());
+    let ball_projected = finite_pitch_point(
+        ball_position + ball_velocity * dt + ball_acceleration * half_dt2,
+        width,
+        length,
+        ball_position,
+    );
+    let ball_gap = target - ball_projected;
+    let ball_distance = ball_gap.len();
+    if snapshot.ball.holder != Some(player.id) && ball_distance < 3.4 {
+        let direction = if ball_distance > 1e-6 {
+            ball_gap / ball_distance
+        } else {
+            self_direction * -1.0
+        };
+        let pressure = ((3.4 - ball_distance) / 3.4).clamp(0.0, 1.0)
+            * (1.0 + ball_velocity.len().clamp(0.0, 24.0) / 36.0)
+            * (1.0 + ball_acceleration.len().clamp(0.0, 24.0) / 48.0);
+        target_influence += direction * pressure * 1.8;
+        velocity_influence += direction * pressure * 0.65;
+        context_pressure += pressure;
+    }
+
+    let target = (target + limit_vec2_len(target_influence, 4.5)).clamp_to_pitch(width, length);
+    let desired_velocity =
+        limit_vec2_len(desired_velocity + velocity_influence, speed_cap.max(0.5));
+    SoccerLocalMpcWholeFieldContext {
+        target,
+        desired_velocity,
+        position_weight_bonus: context_pressure.clamp(0.0, 5.0),
+        velocity_weight_bonus: (context_pressure * 0.35).clamp(0.0, 2.0),
+    }
+}
+
+pub(crate) fn soccer_local_mpc_planar_obstacles(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    dt: f64,
+    width: f64,
+    length: f64,
+) -> Vec<PlanarObstacle> {
+    let half_dt2 = 0.5 * dt * dt;
+    let mut obstacles = Vec::with_capacity(snapshot.players.len().saturating_add(1));
+    for other in &snapshot.players {
+        if other.id == player.id {
+            continue;
+        }
+        let position = finite_pitch_point(other.position, width, length, player.position);
+        let velocity = finite_vec2(other.velocity, Vec2::zero());
+        let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+        let center = finite_pitch_point(
+            position + velocity * dt + acceleration * half_dt2,
+            width,
+            length,
+            position,
+        );
+        let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 24.0);
+        let same_team = other.team == player.team;
+        let holder_bonus = if snapshot.ball.holder == Some(other.id) {
+            0.55
+        } else {
+            0.0
+        };
+        let role_radius_bonus = match other.role {
+            PlayerRole::Goalkeeper => 0.20,
+            PlayerRole::Defender => 0.10,
+            PlayerRole::Midfielder => 0.05,
+            PlayerRole::Forward => 0.0,
+        };
+        let radius = if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
+        let kinematic_pressure = 1.0
+            + velocity.len().clamp(0.0, 16.0) / 48.0
+            + acceleration.len().clamp(0.0, 14.0) / 56.0;
+        let weight = if same_team { 7.0 } else { 12.0 } * kinematic_pressure
+            + if snapshot.ball.holder == Some(other.id) {
+                4.0
+            } else {
+                0.0
+            };
+        obstacles.push(PlanarObstacle {
+            center: [center.x, center.y],
+            velocity: [obstacle_velocity.x, obstacle_velocity.y],
+            radius,
+            weight,
+        });
+    }
+
+    let ball_position = finite_pitch_point(snapshot.ball.position, width, length, player.position);
+    let ball_velocity = finite_vec2(snapshot.ball.velocity, Vec2::zero());
+    let ball_acceleration = finite_vec2(snapshot.ball.acceleration, Vec2::zero());
+    let ball_center = finite_pitch_point(
+        ball_position + ball_velocity * dt + ball_acceleration * half_dt2,
+        width,
+        length,
+        ball_position,
+    );
+    let ball_obstacle_velocity = limit_vec2_len(ball_velocity + ball_acceleration * dt, 32.0);
+    let ball_weight = 4.5
+        + ball_velocity.len().clamp(0.0, 28.0) / 7.0
+        + ball_acceleration.len().clamp(0.0, 28.0) / 14.0;
+    obstacles.push(PlanarObstacle {
+        center: [ball_center.x, ball_center.y],
+        velocity: [ball_obstacle_velocity.x, ball_obstacle_velocity.y],
+        radius: 0.85,
+        weight: ball_weight,
+    });
+
+    obstacles
 }
 
 fn soccer_local_mpc_refined_guidance(
@@ -2343,6 +2530,20 @@ fn soccer_local_mpc_refined_guidance(
         .max(velocity.len())
         .clamp(0.5, 20.0);
     let desired_velocity = limit_vec2_len(desired_velocity, speed_cap);
+    let whole_field_context = soccer_local_mpc_whole_field_context(
+        snapshot,
+        player,
+        current,
+        velocity,
+        target,
+        desired_velocity,
+        dt,
+        speed_cap,
+        width,
+        length,
+    );
+    let target = whole_field_context.target;
+    let desired_velocity = whole_field_context.desired_velocity;
     let accel_cap = acceleration_yps2_from_score(player.skills.acceleration)
         .max(guidance.recommended_acceleration_yps2.min(12.0))
         .clamp(2.5, 12.0);
@@ -2354,54 +2555,52 @@ fn soccer_local_mpc_refined_guidance(
         return None;
     }
 
-    let pos_base = current + velocity * dt;
     let half_dt2 = 0.5 * dt * dt;
-    let pos_weight = 8.0 + guidance.pressure_weight * 6.0 + guidance.pair_error_yards.min(6.0);
-    let vel_weight = 1.25 + guidance.speed_match_weight * 3.0;
-    let accel_ref_weight = 0.20;
-    let effort_weight = 0.10;
-    let fallback_accel = limit_vec2_len(guidance.target_acceleration, accel_cap);
-    let q_diag = 2.0
-        * (pos_weight * half_dt2 * half_dt2
-            + vel_weight * dt * dt
-            + accel_ref_weight
-            + effort_weight);
-    if !q_diag.is_finite() || q_diag <= 1e-9 {
-        return None;
-    }
-    let c_x = 2.0
-        * (pos_weight * half_dt2 * (pos_base.x - target.x)
-            + vel_weight * dt * (velocity.x - desired_velocity.x)
-            - accel_ref_weight * fallback_accel.x);
-    let c_y = 2.0
-        * (pos_weight * half_dt2 * (pos_base.y - target.y)
-            + vel_weight * dt * (velocity.y - desired_velocity.y)
-            - accel_ref_weight * fallback_accel.y);
-    let qp = QuadraticProgram {
-        q: vec![vec![q_diag, 0.0], vec![0.0, q_diag]],
-        c: vec![c_x, c_y],
-        a_ub: None,
-        b_ub: None,
-        a_eq: None,
-        b_eq: None,
-        lb: Some(vec![Some(lb_x), Some(lb_y)]),
-        ub: Some(vec![Some(ub_x), Some(ub_y)]),
-        var_names: Some(vec![
-            format!("player_{}_ax", guidance.player_id),
-            format!("player_{}_ay", guidance.player_id),
-        ]),
-    };
-    let sol = solve_qp_active_set(
-        &qp,
-        QPOptions {
-            tol: 1e-7,
-            max_active_sets: 64,
-        },
+    let pos_weight = 8.0
+        + guidance.pressure_weight * 6.0
+        + guidance.pair_error_yards.min(6.0)
+        + whole_field_context.position_weight_bonus;
+    let vel_weight =
+        1.25 + guidance.speed_match_weight * 3.0 + whole_field_context.velocity_weight_bonus;
+    let horizon = (2.25 / dt).round().clamp(8.0, 45.0) as usize;
+    let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5).clamp(0.70, 1.0);
+    let mut controller = PlanarPointMassMpc::new(PlanarMpcConfig {
+        horizon,
+        dt,
+        q_pos: pos_weight,
+        q_vel: vel_weight,
+        qf_pos: pos_weight * 3.0,
+        qf_vel: vel_weight * 2.0,
+        r: 0.10,
+        a_max: accel_cap,
+        iters: (horizon.saturating_mul(5)).clamp(48, 160),
+        obstacle_decay_per_step,
+    })
+    .ok()?;
+    let reference = PlanarReference::through(
+        [target.x, target.y],
+        [desired_velocity.x, desired_velocity.y],
     );
-    if sol.status != QPStatus::Optimal || sol.x.len() < 2 {
+    let obstacles = soccer_local_mpc_planar_obstacles(snapshot, player, dt, width, length);
+    let planned_acceleration = controller.control_with_obstacles(
+        PlanarState {
+            pos: [current.x, current.y],
+            vel: [velocity.x, velocity.y],
+        },
+        &[reference],
+        &obstacles,
+    );
+    let planned_acceleration = Vec2::new(planned_acceleration[0], planned_acceleration[1]);
+    if !planned_acceleration.x.is_finite() || !planned_acceleration.y.is_finite() {
         return None;
     }
-    let acceleration = limit_vec2_len(Vec2::new(sol.x[0], sol.x[1]), accel_cap);
+    let acceleration = limit_vec2_len(
+        Vec2::new(
+            planned_acceleration.x.clamp(lb_x, ub_x),
+            planned_acceleration.y.clamp(lb_y, ub_y),
+        ),
+        accel_cap,
+    );
     if !acceleration.x.is_finite() || !acceleration.y.is_finite() {
         return None;
     }

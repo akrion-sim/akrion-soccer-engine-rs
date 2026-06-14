@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use crate::des::general::des_base::neural_network::NeuralNetworkLike;
 use crate::des::general::general::fisher_yates_shuffle;
 use crate::des::general::lp::{solve_lp_clarabel, LPBasisWarmStart, LPProblem, LPStatus, Sense};
+use crate::des::general::mpc_point_mass::{
+    PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
+};
 use crate::des::general::neural_network::{
     ActivationName, DenseLayerConfig, FeedForwardNetwork, RandomNetworkSpec,
 };
@@ -1842,7 +1845,7 @@ const ADVERSARIAL_EMBEDDING_MIN_SCORE: f32 = 0.72;
 const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
-const SOCCER_NEURAL_FEATURE_DIM: usize = 159;
+const SOCCER_NEURAL_FEATURE_DIM: usize = 160;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3500,6 +3503,33 @@ pub struct AgentActionTargetTrace {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SoccerMdpMpcComparisonTrace {
+    pub player_id: usize,
+    pub action: String,
+    #[serde(default)]
+    pub mdp_target: Option<Vec2>,
+    #[serde(default)]
+    pub mpc_target: Option<Vec2>,
+    #[serde(default)]
+    pub blended_target: Option<Vec2>,
+    #[serde(default)]
+    pub target_delta_yards: f64,
+    #[serde(default)]
+    pub velocity_delta_yps: f64,
+    #[serde(default)]
+    pub mdp_confidence: f64,
+    #[serde(default)]
+    pub mpc_guidance_present: bool,
+    #[serde(default)]
+    pub blend_eligible: bool,
+    #[serde(default)]
+    pub deviation_recorded: bool,
+    #[serde(default)]
+    pub decision: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SoccerNearestDefenderContext {
     #[serde(default)]
     pub player_id: usize,
@@ -3609,6 +3639,8 @@ pub struct AgentDecisionTrace {
     pub action_options: Vec<AgentActionOptionTrace>,
     #[serde(default)]
     pub action_target: Option<AgentActionTargetTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mdp_mpc_comparison: Option<SoccerMdpMpcComparisonTrace>,
     pub action: String,
 }
 
@@ -27836,6 +27868,10 @@ fn soccer_neural_transition_features_with_action(
                 .nearest_opponent_closing_accel_yps2
                 / 12.0,
         ),
+        // MPC refinement (index 159, appended): distinct from generic formation-LP
+        // guidance so the neural value/actor heads can learn when constrained local
+        // control, not just team-shape LP, influenced the sample.
+        soccer_neural_bool(transition.tactical_trace.local_mpc_guidance),
     ];
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
@@ -34372,6 +34408,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 scheduled_index: None,
                 action_options: single_action_option(&action),
                 action_target,
+                mdp_mpc_comparison: None,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);

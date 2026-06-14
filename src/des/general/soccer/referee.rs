@@ -53,6 +53,14 @@ pub struct OfficialDecisionTrace {
     #[serde(default)]
     pub offside_line_y: Option<f64>,
     #[serde(default)]
+    pub local_mpc_guidance: bool,
+    #[serde(default)]
+    pub local_mpc_status: String,
+    #[serde(default)]
+    pub local_mpc_objective: f64,
+    #[serde(default)]
+    pub local_mpc_target_delta_yards: f64,
+    #[serde(default)]
     pub operation_order: Vec<String>,
 }
 
@@ -151,31 +159,67 @@ impl OfficialAgent {
             snapshot.field_width,
             snapshot.field_length,
         );
-        let desired = (target - self.position).normalized() * 6.1;
-        self.velocity = approach_velocity(self.velocity, desired, 5.2, snapshot.dt_seconds);
-        self.acceleration = if snapshot.dt_seconds > 0.0 {
-            (self.velocity - previous_velocity) / snapshot.dt_seconds
+        let local_mpc_step = if snapshot.local_mpc_enabled {
+            official_local_mpc_step(self, snapshot, target)
         } else {
-            Vec2::zero()
+            None
         };
-        self.jerk = if snapshot.dt_seconds > 0.0 {
-            (self.acceleration - previous_acceleration) / snapshot.dt_seconds
+        let local_mpc_guidance = local_mpc_step.is_some();
+        let local_mpc_objective = local_mpc_step
+            .as_ref()
+            .map(|step| step.objective)
+            .unwrap_or(0.0);
+        let local_mpc_target_delta_yards = local_mpc_step
+            .as_ref()
+            .map(|step| step.position.distance(target))
+            .unwrap_or(0.0);
+        if let Some(step) = local_mpc_step {
+            self.position = step.position;
+            self.velocity = step.velocity;
+            self.acceleration = step.acceleration;
+            self.jerk = if snapshot.dt_seconds > 0.0 {
+                (self.acceleration - previous_acceleration) / snapshot.dt_seconds
+            } else {
+                Vec2::zero()
+            };
         } else {
-            Vec2::zero()
-        };
-        self.position += self.velocity * snapshot.dt_seconds;
-        self.position = official_position_bounds(
-            self.kind,
-            self.position,
-            snapshot.field_width,
-            snapshot.field_length,
-        );
+            let desired = (target - self.position).normalized() * 6.1;
+            self.velocity = approach_velocity(self.velocity, desired, 5.2, snapshot.dt_seconds);
+            self.acceleration = if snapshot.dt_seconds > 0.0 {
+                (self.velocity - previous_velocity) / snapshot.dt_seconds
+            } else {
+                Vec2::zero()
+            };
+            self.jerk = if snapshot.dt_seconds > 0.0 {
+                (self.acceleration - previous_acceleration) / snapshot.dt_seconds
+            } else {
+                Vec2::zero()
+            };
+            self.position += self.velocity * snapshot.dt_seconds;
+            self.position = official_position_bounds(
+                self.kind,
+                self.position,
+                snapshot.field_width,
+                snapshot.field_length,
+            );
+        }
         let scheduled_index = snapshot.scheduled_official_index(self.id);
         let action = match self.kind {
             OfficialKind::CenterReferee => "track-center-of-play",
             OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => {
                 "track-offside-line"
             }
+        };
+        let mut operation_order =
+            official_agent_operation_order(snapshot.tick, self.id, self.kind, scheduled_index);
+        let local_mpc_status = if local_mpc_guidance {
+            operation_order.push("solve-local-mpc".to_string());
+            "optimal"
+        } else if snapshot.local_mpc_enabled {
+            operation_order.push("fallback-local-mpc".to_string());
+            "fallback"
+        } else {
+            "disabled"
         };
         self.last_decision = Some(OfficialDecisionTrace {
             tick: snapshot.tick,
@@ -185,14 +229,193 @@ impl OfficialAgent {
             target,
             scheduled_index,
             offside_line_y: offside_line.as_ref().map(|line| line.effective_line_y),
-            operation_order: official_agent_operation_order(
-                snapshot.tick,
-                self.id,
-                self.kind,
-                scheduled_index,
-            ),
+            local_mpc_guidance,
+            local_mpc_status: local_mpc_status.to_string(),
+            local_mpc_objective,
+            local_mpc_target_delta_yards,
+            operation_order,
         });
         self.record_position_history();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OfficialLocalMpcStep {
+    position: Vec2,
+    velocity: Vec2,
+    acceleration: Vec2,
+    objective: f64,
+}
+
+fn official_local_mpc_step(
+    official: &OfficialAgent,
+    snapshot: &WorldSnapshot,
+    target: Vec2,
+) -> Option<OfficialLocalMpcStep> {
+    let (width, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let current = official_position_bounds(official.kind, official.position, width, length);
+    let current_velocity = finite_vec2(official.velocity, Vec2::zero());
+    let target = official_position_bounds(official.kind, target, width, length);
+    let speed_cap = match official.kind {
+        OfficialKind::CenterReferee => 6.8,
+        OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => 6.2,
+    };
+    let accel_cap = match official.kind {
+        OfficialKind::CenterReferee => 5.4,
+        OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => 4.8,
+    };
+    let (min_x, max_x, min_y, max_y) =
+        official_local_mpc_position_bounds(official.kind, width, length);
+    let (lb_x, ub_x) = official_local_mpc_axis_bounds(
+        current.x,
+        current_velocity.x,
+        dt,
+        min_x,
+        max_x,
+        accel_cap,
+        speed_cap,
+    )?;
+    let (lb_y, ub_y) = official_local_mpc_axis_bounds(
+        current.y,
+        current_velocity.y,
+        dt,
+        min_y,
+        max_y,
+        accel_cap,
+        speed_cap,
+    )?;
+    if lb_x > ub_x || lb_y > ub_y {
+        return None;
+    }
+
+    let half_dt2 = 0.5 * dt * dt;
+    let pos_base = current + current_velocity * dt;
+    let desired_velocity = limit_vec2_len((target - current) / dt, speed_cap);
+    let pos_weight = match official.kind {
+        OfficialKind::CenterReferee => 8.0,
+        OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => 10.0,
+    };
+    let vel_weight = 1.35;
+    let accel_ref_weight = 0.18;
+    let effort_weight = 0.16;
+    let previous_acceleration = limit_vec2_len(official.acceleration, accel_cap);
+    let q_diag = 2.0
+        * (pos_weight * half_dt2 * half_dt2
+            + vel_weight * dt * dt
+            + accel_ref_weight
+            + effort_weight);
+    if !q_diag.is_finite() || q_diag <= 1e-9 {
+        return None;
+    }
+    let c_x = 2.0
+        * (pos_weight * half_dt2 * (pos_base.x - target.x)
+            + vel_weight * dt * (current_velocity.x - desired_velocity.x)
+            - accel_ref_weight * previous_acceleration.x);
+    let c_y = 2.0
+        * (pos_weight * half_dt2 * (pos_base.y - target.y)
+            + vel_weight * dt * (current_velocity.y - desired_velocity.y)
+            - accel_ref_weight * previous_acceleration.y);
+    let qp = QuadraticProgram {
+        q: vec![vec![q_diag, 0.0], vec![0.0, q_diag]],
+        c: vec![c_x, c_y],
+        a_ub: None,
+        b_ub: None,
+        a_eq: None,
+        b_eq: None,
+        lb: Some(vec![Some(lb_x), Some(lb_y)]),
+        ub: Some(vec![Some(ub_x), Some(ub_y)]),
+        var_names: Some(vec![
+            format!("official_{}_ax", official.id),
+            format!("official_{}_ay", official.id),
+        ]),
+    };
+    let solution = solve_qp_active_set(
+        &qp,
+        QPOptions {
+            tol: 1e-7,
+            max_active_sets: 64,
+        },
+    );
+    if solution.status != QPStatus::Optimal || solution.x.len() < 2 {
+        return None;
+    }
+    let mut acceleration = limit_vec2_len(Vec2::new(solution.x[0], solution.x[1]), accel_cap);
+    let mut velocity = limit_vec2_len(current_velocity + acceleration * dt, speed_cap);
+    if matches!(
+        official.kind,
+        OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar
+    ) {
+        acceleration.x = 0.0;
+        velocity.x = 0.0;
+    }
+    let position = official_position_bounds(
+        official.kind,
+        current + current_velocity * dt + acceleration * half_dt2,
+        width,
+        length,
+    );
+    if !position.x.is_finite()
+        || !position.y.is_finite()
+        || !velocity.x.is_finite()
+        || !velocity.y.is_finite()
+        || !acceleration.x.is_finite()
+        || !acceleration.y.is_finite()
+    {
+        return None;
+    }
+
+    Some(OfficialLocalMpcStep {
+        position,
+        velocity,
+        acceleration,
+        objective: finite_metric(solution.objective),
+    })
+}
+
+fn official_local_mpc_position_bounds(
+    kind: OfficialKind,
+    field_width: f64,
+    field_length: f64,
+) -> (f64, f64, f64, f64) {
+    match kind {
+        OfficialKind::CenterReferee => (0.0, field_width, 0.0, field_length),
+        OfficialKind::AssistantRefereeNear => {
+            let x = assistant_ref_touchline_x(kind, field_width);
+            (x, x, 0.0, field_length * 0.5)
+        }
+        OfficialKind::AssistantRefereeFar => {
+            let x = assistant_ref_touchline_x(kind, field_width);
+            (x, x, field_length * 0.5, field_length)
+        }
+    }
+}
+
+fn official_local_mpc_axis_bounds(
+    position: f64,
+    velocity: f64,
+    dt: f64,
+    min_position: f64,
+    max_position: f64,
+    accel_cap: f64,
+    speed_cap: f64,
+) -> Option<(f64, f64)> {
+    let mut lower = -accel_cap;
+    let mut upper = accel_cap;
+    if dt > 1e-9 {
+        lower = lower.max((-speed_cap - velocity) / dt);
+        upper = upper.min((speed_cap - velocity) / dt);
+    }
+    let half_dt2 = 0.5 * dt * dt;
+    if half_dt2 > 1e-12 {
+        let base = position + velocity * dt;
+        lower = lower.max((min_position - base) / half_dt2);
+        upper = upper.min((max_position - base) / half_dt2);
+    }
+    if lower.is_finite() && upper.is_finite() && lower <= upper {
+        Some((lower, upper))
+    } else {
+        None
     }
 }
 
