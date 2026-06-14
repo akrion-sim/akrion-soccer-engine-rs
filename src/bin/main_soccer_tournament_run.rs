@@ -181,6 +181,47 @@ fn promote_champion(
     Ok(policy_version_id)
 }
 
+/// Fitness of a single competitor's evolving brain (same league-points-then-GD basis as the
+/// champion), used to pick the strongest brain to salvage if the run fails before a champion.
+fn team_brain_fitness(team: &TournamentTeam) -> f64 {
+    team.record.points() as f64 + team.record.goal_difference() as f64 * 0.1
+}
+
+/// Promote a salvaged neural snapshot (the strongest brain seen before a failure) as the new
+/// active policy version, so a crashed/aborted tournament still banks the night's learning.
+fn promote_salvaged_brain(
+    store: &mut SoccerLearningPgStore,
+    experiment_id: &str,
+    parent_policy_version_id: Option<&str>,
+    generation: i32,
+    neural: &SoccerNeuralNetworkSnapshot,
+    fitness: f64,
+    config: &MatchConfig,
+) -> Result<String, String> {
+    let policy_version_id = Uuid::new_v4().to_string();
+    let label = format!("tournament-salvage/gen{generation}/{}", &policy_version_id[..8]);
+    let options = SoccerQPolicyOptions::default();
+    let policies = SoccerTeamQPolicies::new(options.clone());
+    let search_metadata = serde_json::json!({ "tournament": { "salvage": true, "fitness": fitness } });
+    store.insert_policy_version_with_id_and_neural_network_and_search_metadata(
+        &policy_version_id,
+        experiment_id,
+        parent_policy_version_id,
+        generation,
+        &label,
+        "merge",
+        SOCCER_POLICY_STATUS_ACTIVE,
+        config,
+        options.clone(),
+        options.clone(),
+        &policies,
+        fitness,
+        Some(neural),
+        Some(&search_metadata),
+    )?;
+    Ok(policy_version_id)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
 
@@ -262,6 +303,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("tournament_seed postgres=absent (all-fresh field, promotion skipped)");
     }
 
+    // Total fixtures (group round-robins + knockout + third place) — matches the engine's
+    // own count, so the header records progress as `matches_played / match_count`.
+    let group_count = format.team_count / format.group_size.max(1);
+    let per_group_matches = format.group_size * format.group_size.saturating_sub(1) / 2
+        * if format.double_round_robin { 2 } else { 1 };
+    let knockout_matches = format.knockout_team_count().saturating_sub(1)
+        + usize::from(format.third_place_match);
+    let matches_total = group_count * per_group_matches + knockout_matches;
+    let tournament_date = env_string("SOCCER_RUN_ID").unwrap_or_else(|| format!("seed-{seed}"));
+    let learning_mode_label = format!("{mode:?}");
+
+    // Create the tournament header NOW (status='running') so the bracket persists as it
+    // plays — a worker panic or a killed pod leaves a durable record + standings + brains.
+    let mut tournament_db_id: Option<i64> = None;
+    if let (Some(store), Some(eid)) = (store.as_mut(), experiment_id.as_ref()) {
+        match store.start_tournament(eid, &tournament_date, seed, &learning_mode_label, &format, matches_total) {
+            Ok(id) => {
+                tournament_db_id = Some(id);
+                println!("tournament_db_started db_id={id} matches_total={matches_total}");
+            }
+            Err(err) => eprintln!("tournament_db_start_failed (continuing without persistence): {err}"),
+        }
+    }
+
     let teams = build_entrants(&format, seed, seed_snapshot, seed_fraction);
     let tournament = Tournament::new(teams, format, mode, seed)?;
     let runner = EngineMatchRunner::new(runner_config);
@@ -269,7 +334,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // optional wall-clock deadline + a per-wave progress callback. The CronJob
     // enforces the hard 2am–7am stop via activeDeadlineSeconds, so no app-level
     // deadline is passed here; progress is logged for schedule calibration.
-    let report = tournament.run_parallel(&runner, threads, None, |progress| {
+    // Persist each wave AS IT COMMITS (matches + per-team brain checkpoints) and track the
+    // strongest brain in memory, so a failure mid-bracket salvages the night's learning.
+    let mut persisted_matches: usize = 0;
+    let mut best_salvage: Option<(f64, SoccerNeuralNetworkSnapshot)> = None;
+    let run_result = tournament.run_parallel(&runner, threads, None, |progress, reports, teams| {
         println!(
             "tournament_progress stage={:?} played={} total={} elapsed_secs={:.1}",
             progress.stage_label,
@@ -277,7 +346,67 @@ fn main() -> Result<(), Box<dyn Error>> {
             progress.matches_total,
             progress.elapsed.as_secs_f64(),
         );
-    })?;
+        if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
+            if reports.len() > persisted_matches {
+                match store.record_tournament_matches(db_id, &reports[persisted_matches..], persisted_matches) {
+                    Ok(()) => persisted_matches = reports.len(),
+                    Err(err) => eprintln!("tournament_persist_matches_failed: {err}"),
+                }
+            }
+            if let Err(err) = store.checkpoint_tournament_team_brains(db_id, teams) {
+                eprintln!("tournament_persist_brains_failed: {err}");
+            }
+        }
+        if let Some(team) = teams
+            .iter()
+            .filter(|team| team.brain.neural.is_some())
+            .max_by(|a, b| {
+                team_brain_fitness(a)
+                    .partial_cmp(&team_brain_fitness(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            let fitness = team_brain_fitness(team);
+            if best_salvage.as_ref().map_or(true, |(best, _)| fitness > *best) {
+                if let Some(neural) = &team.brain.neural {
+                    best_salvage = Some((fitness, neural.clone()));
+                }
+            }
+        }
+    });
+
+    let report = match run_result {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("tournament_failed error={err} persisted_matches={persisted_matches}");
+            if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
+                let _ = store.finish_tournament(db_id, "failed", None, None, None, started.elapsed().as_secs_f64());
+            }
+            // Salvage: promote the strongest brain seen so the run's learning isn't discarded.
+            if promote {
+                if let (Some(store), Some(eid), Some((fitness, neural))) =
+                    (store.as_mut(), experiment_id.as_ref(), best_salvage.as_ref())
+                {
+                    let generation = parent_generation.saturating_add(1).max(0);
+                    match promote_salvaged_brain(
+                        store,
+                        eid,
+                        parent_policy_version_id.as_deref(),
+                        generation,
+                        neural,
+                        *fitness,
+                        &promote_config,
+                    ) {
+                        Ok(id) => println!(
+                            "tournament_salvage_promoted policy_version={id} generation={generation} fitness={fitness:.3}"
+                        ),
+                        Err(e) => eprintln!("tournament_salvage_promote_failed: {e}"),
+                    }
+                }
+            }
+            return Err(err.into());
+        }
+    };
 
     let champion = report.champion();
     println!(
@@ -310,6 +439,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         } else {
             println!("tournament_promote skipped=true reason=no_postgres");
+        }
+    }
+
+    // Finalize the header as completed (champion = winning entrant slot).
+    if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
+        if let Err(err) = store.finish_tournament(
+            db_id,
+            "completed",
+            Some(report.champion_id),
+            Some(report.runner_up_id),
+            report.third_place_id,
+            started.elapsed().as_secs_f64(),
+        ) {
+            eprintln!("tournament_finish_failed: {err}");
         }
     }
 

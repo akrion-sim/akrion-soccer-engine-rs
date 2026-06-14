@@ -861,7 +861,7 @@ impl Tournament {
         runner: &R,
         max_parallelism: usize,
         deadline: Option<std::time::Instant>,
-        mut on_progress: impl FnMut(&TournamentProgress),
+        mut on_progress: impl FnMut(&TournamentProgress, &[MatchReport], &[TournamentTeam]),
     ) -> Result<TournamentReport, String>
     where
         R: TournamentMatchRunner + Clone + Send,
@@ -910,7 +910,7 @@ impl Tournament {
                 matches_total,
                 format!("Group round {}", round_index + 1),
                 started.elapsed(),
-            ));
+            ), &reports, &self.teams);
         }
 
         let (group_tables, bracket) = self.group_tables_and_bracket(&groups, &head_to_head);
@@ -957,7 +957,7 @@ impl Tournament {
                 matches_total,
                 stage.label(),
                 started.elapsed(),
-            ));
+            ), &reports, &self.teams);
         }
         let champion_id = *current
             .first()
@@ -987,7 +987,7 @@ impl Tournament {
                 matches_total,
                 "Third-place play-off".to_string(),
                 started.elapsed(),
-            ));
+            ), &reports, &self.teams);
         }
 
         Ok(TournamentReport {
@@ -1621,7 +1621,7 @@ mod tests {
         let (seed_b, par) = make();
         let par_runner = StrengthMatchRunner::from_teams(&seed_b);
         let par_report = par
-            .run_parallel(&par_runner, 8, None, |_| {})
+            .run_parallel(&par_runner, 8, None, |_, _, _| {})
             .expect("parallel run");
 
         assert_eq!(seq_report.champion_id, par_report.champion_id);

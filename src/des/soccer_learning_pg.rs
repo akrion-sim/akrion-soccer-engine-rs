@@ -22,7 +22,7 @@ use crate::des::soccer_learning::{
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
     SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
-use crate::des::general::tournament::TournamentReport;
+use crate::des::general::tournament::{MatchReport, TournamentFormat, TournamentTeam};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -62,6 +62,7 @@ pub struct SoccerLearningPgCompletedRunRetentionPrune {
     pub deleted_runs: u64,
     pub deleted_delta_rows: u64,
 }
+
 
 const POSTGRES_MAX_QUERY_PARAMETERS: usize = 65_535;
 const SOCCER_COMPLETED_RUN_HEADER_PARAMETER_COUNT: usize = 22;
@@ -622,88 +623,103 @@ impl SoccerLearningPgStore {
     /// A transaction-scoped advisory lock keyed by `(experiment, date)` serializes
     /// concurrent writers so two nightly runs for the same date can't interleave —
     /// the second blocks until the first commits, then writes its own row.
-    pub fn persist_tournament(
+    /// Create a tournament header at START (status='running', champion unknown) and return
+    /// its id, so progress can be persisted AS THE BRACKET PLAYS (a crash then leaves a
+    /// durable record instead of nothing). Serializes nightly runs for the same
+    /// (experiment, date) via an advisory lock held only for the header insert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_tournament(
         &mut self,
         experiment_id: &str,
         tournament_date: &str,
         seed: u32,
-        wall_time_seconds: f64,
-        report: &TournamentReport,
+        learning_mode: &str,
+        format: &TournamentFormat,
+        match_total: usize,
     ) -> Result<i64, String> {
         self.ensure_connected()?;
-        // Schema in its own COMMITTED tx so the tables exist even on a cold DB.
-        {
-            let mut tx = self
-                .client
-                .transaction()
-                .map_err(|err| format!("begin tournament schema tx: {err}"))?;
-            ensure_soccer_tournament_tables(&mut tx)?;
-            tx.commit()
-                .map_err(|err| format!("commit tournament schema: {err}"))?;
-        }
-
         let format_json = json!({
-            "teamCount": report.format.team_count,
-            "groupSize": report.format.group_size,
-            "advancersPerGroup": report.format.advancers_per_group,
-            "doubleRoundRobin": report.format.double_round_robin,
-            "thirdPlaceMatch": report.format.third_place_match,
+            "teamCount": format.team_count,
+            "groupSize": format.group_size,
+            "advancersPerGroup": format.advancers_per_group,
+            "doubleRoundRobin": format.double_round_robin,
+            "thirdPlaceMatch": format.third_place_match,
         });
         let mut tx = self
             .client
             .transaction()
-            .map_err(|err| format!("begin tournament insert tx: {err}"))?;
-
-        // Serialize nightly runs for the same (experiment, date). Auto-released on
-        // commit/rollback.
+            .map_err(|err| format!("begin tournament start tx: {err}"))?;
+        ensure_soccer_tournament_tables(&mut tx)?;
+        // Serialize concurrent nightly runs for the same (experiment, date).
         tx.execute(
             "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
             &[&experiment_id, &tournament_date],
         )
         .map_err(|err| format!("acquire tournament advisory lock: {err}"))?;
-
-        let third_place = report.third_place_id.map(|id| id as i32);
         let tournament_id: i64 = tx
             .query_one(
                 r#"
                 insert into des_soccer_tournaments
                   (experiment_id, tournament_date, seed, learning_mode, format,
-                   team_count, match_count, champion_team_id, runner_up_team_id,
-                   third_place_team_id, wall_time_seconds, status)
-                values
-                  ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'completed')
+                   team_count, match_count, status)
+                values ($1::text::uuid, $2, $3, $4, $5, $6, $7, 'running')
                 returning id
                 "#,
                 &[
                     &experiment_id,
                     &tournament_date,
-                    &(seed as i64),
-                    &format!("{:?}", report.learning_mode),
+                    &i64::from(seed),
+                    &learning_mode,
                     &format_json,
-                    &(report.format.team_count as i32),
-                    &(report.match_count() as i32),
-                    &(report.champion_id as i32),
-                    &(report.runner_up_id as i32),
-                    &third_place,
-                    &wall_time_seconds,
+                    &(format.team_count as i32),
+                    &(match_total as i32),
                 ],
             )
             .map_err(|err| format!("insert tournament header: {err}"))?
             .get(0);
+        tx.commit()
+            .map_err(|err| format!("commit tournament header: {err}"))?;
+        Ok(tournament_id)
+    }
 
-        for (match_index, m) in report.matches.iter().enumerate() {
-            let shootout = m.shootout_winner.map(|id| id as i32);
-            tx.execute(
+    /// Persist a batch of just-played matches (idempotent via ON CONFLICT) and refresh
+    /// matches_played. `index_offset` is the flat match index of `matches[0]` within the
+    /// bracket (the caller passes the count already persisted), so re-running a wave is a
+    /// no-op rather than a duplicate.
+    pub fn record_tournament_matches(
+        &mut self,
+        tournament_id: i64,
+        matches: &[MatchReport],
+        index_offset: usize,
+    ) -> Result<(), String> {
+        if matches.is_empty() {
+            return Ok(());
+        }
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin tournament-matches tx: {err}"))?;
+        let stmt = tx
+            .prepare(
                 r#"
                 insert into des_soccer_tournament_matches
                   (tournament_id, match_index, stage, home_team_id, away_team_id,
                    home_goals, away_goals, shootout_winner_team_id,
                    home_training_steps, away_training_steps)
                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                on conflict (tournament_id, match_index) do nothing
                 "#,
+            )
+            .map_err(|err| format!("prepare tournament-match insert: {err}"))?;
+        for (offset, m) in matches.iter().enumerate() {
+            let match_index = (index_offset + offset) as i32;
+            let shootout = m.shootout_winner.map(|id| id as i32);
+            tx.execute(
+                &stmt,
                 &[
                     &tournament_id,
-                    &(match_index as i32),
+                    &match_index,
                     &m.stage.label(),
                     &(m.home_id as i32),
                     &(m.away_id as i32),
@@ -716,8 +732,64 @@ impl SoccerLearningPgStore {
             )
             .map_err(|err| format!("insert tournament match {match_index}: {err}"))?;
         }
+        tx.execute(
+            r#"
+            update des_soccer_tournaments
+            set matches_played = (
+                  select count(*) from des_soccer_tournament_matches
+                  where tournament_id = $1
+                ),
+                updated_at = now()
+            where id = $1
+            "#,
+            &[&tournament_id],
+        )
+        .map_err(|err| format!("update tournament matches_played: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("commit tournament matches: {err}"))?;
+        Ok(())
+    }
 
-        for team in &report.teams {
+    /// Checkpoint each team's evolving brain (record + neural snapshot) — upserted so the
+    /// row reflects the latest wave. After a crash, the best of these is the salvageable
+    /// policy (and `load_latest_tournament_team_brains` warm-starts the next run from them).
+    pub fn checkpoint_tournament_team_brains(
+        &mut self,
+        tournament_id: i64,
+        teams: &[TournamentTeam],
+    ) -> Result<(), String> {
+        if teams.is_empty() {
+            return Ok(());
+        }
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin team-brains tx: {err}"))?;
+        let stmt = tx
+            .prepare(
+                r#"
+                insert into des_soccer_tournament_team_brains
+                  (tournament_id, team_id, team_name, seed, matches_learned,
+                   training_steps, played, wins, draws, losses, goals_for,
+                   goals_against, neural_snapshot, updated_at)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+                on conflict (tournament_id, team_id) do update set
+                  team_name = excluded.team_name,
+                  matches_learned = excluded.matches_learned,
+                  training_steps = excluded.training_steps,
+                  played = excluded.played,
+                  wins = excluded.wins,
+                  draws = excluded.draws,
+                  losses = excluded.losses,
+                  goals_for = excluded.goals_for,
+                  goals_against = excluded.goals_against,
+                  neural_snapshot = excluded.neural_snapshot,
+                  updated_at = now()
+                "#,
+            )
+            .map_err(|err| format!("prepare team-brain upsert: {err}"))?;
+        for team in teams {
             let neural_json = match &team.brain.neural {
                 Some(snapshot) => {
                     validate_soccer_neural_network_snapshot_for_pg(snapshot)?;
@@ -729,13 +801,7 @@ impl SoccerLearningPgStore {
                 None => None,
             };
             tx.execute(
-                r#"
-                insert into des_soccer_tournament_team_brains
-                  (tournament_id, team_id, team_name, seed, matches_learned,
-                   training_steps, played, wins, draws, losses, goals_for,
-                   goals_against, neural_snapshot)
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                "#,
+                &stmt,
                 &[
                     &tournament_id,
                     &(team.id as i32),
@@ -752,12 +818,48 @@ impl SoccerLearningPgStore {
                     &neural_json,
                 ],
             )
-            .map_err(|err| format!("insert team {} brain: {err}", team.id))?;
+            .map_err(|err| format!("upsert team {} brain: {err}", team.id))?;
         }
-
         tx.commit()
-            .map_err(|err| format!("commit tournament: {err}"))?;
-        Ok(tournament_id)
+            .map_err(|err| format!("commit team brains: {err}"))?;
+        Ok(())
+    }
+
+    /// Finalize the header: status (completed/failed/aborted) + champion + finish time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_tournament(
+        &mut self,
+        tournament_id: i64,
+        status: &str,
+        champion_team_id: Option<usize>,
+        runner_up_team_id: Option<usize>,
+        third_place_team_id: Option<usize>,
+        wall_time_seconds: f64,
+    ) -> Result<(), String> {
+        self.ensure_connected()?;
+        let champion = champion_team_id.map(|id| id as i32);
+        let runner_up = runner_up_team_id.map(|id| id as i32);
+        let third = third_place_team_id.map(|id| id as i32);
+        self.client
+            .execute(
+                r#"
+                update des_soccer_tournaments
+                set status = $2, champion_team_id = $3, runner_up_team_id = $4,
+                    third_place_team_id = $5, wall_time_seconds = $6,
+                    updated_at = now(), finished_at = now()
+                where id = $1
+                "#,
+                &[
+                    &tournament_id,
+                    &status,
+                    &champion,
+                    &runner_up,
+                    &third,
+                    &wall_time_seconds,
+                ],
+            )
+            .map_err(|err| format!("finish tournament: {err}"))?;
+        Ok(())
     }
 
     /// Warm-start brains for the next tournament: each team's final neural snapshot
@@ -1972,6 +2074,7 @@ impl SoccerLearningPgStore {
             )?,
         })
     }
+
 }
 
 fn insert_completed_run_in_transaction(
@@ -2977,13 +3080,16 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
           learning_mode text not null,
           format jsonb not null,
           team_count integer not null,
-          match_count integer not null,
-          champion_team_id integer not null,
-          runner_up_team_id integer not null,
+          match_count integer not null default 0,
+          matches_played integer not null default 0,
+          champion_team_id integer,
+          runner_up_team_id integer,
           third_place_team_id integer,
           wall_time_seconds double precision,
-          status text not null default 'completed',
-          created_at timestamptz not null default now()
+          status text not null default 'running',
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now(),
+          finished_at timestamptz
         );
         create index if not exists des_soccer_tournaments_experiment_idx
           on des_soccer_tournaments (experiment_id, created_at desc);
@@ -3001,6 +3107,7 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
           shootout_winner_team_id integer,
           home_training_steps bigint not null,
           away_training_steps bigint not null,
+          recorded_at timestamptz not null default now(),
           unique (tournament_id, match_index)
         );
 
@@ -3020,6 +3127,7 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
           goals_for integer not null,
           goals_against integer not null,
           neural_snapshot jsonb,
+          updated_at timestamptz not null default now(),
           unique (tournament_id, team_id)
         );
         "#,
