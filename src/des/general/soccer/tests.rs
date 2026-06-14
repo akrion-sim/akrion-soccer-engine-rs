@@ -17375,6 +17375,74 @@
     }
 
     #[test]
+    fn turnover_window_penalty_requeues_recent_losing_team_actions_with_recency_decay() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(0);
+        let base = SoccerLearningTransition {
+            tick: 0,
+            player_id: 0,
+            team: Team::Home,
+            role: sim.players[0].role,
+            state: snapshot.mdp_state_for_player(0),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "carry".to_string(),
+            action_target: None,
+            decision_context: SoccerDecisionContext::default(),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.0,
+            next_state: snapshot.mdp_state_for_player(0),
+            next_observation: observation.clone(),
+            done: false,
+        };
+        let make = |tick: u64, team: Team, player_id: usize| SoccerLearningTransition {
+            tick,
+            team,
+            player_id,
+            ..base.clone()
+        };
+
+        // "Now" is tick 100. Seed the window with Home (the team about to lose it) and Away
+        // transitions, plus one Home transition OLDER than the 5s window (tick 10).
+        sim.tick = 100;
+        sim.turnover_penalty_history.push_back(make(10, Team::Home, 0)); // out of window
+        sim.turnover_penalty_history.push_back(make(40, Team::Home, 1)); // in window, older
+        sim.turnover_penalty_history.push_back(make(70, Team::Away, 2)); // wrong team
+        sim.turnover_penalty_history.push_back(make(95, Team::Home, 3)); // in window, recent
+
+        sim.penalize_turnover_window(Team::Home);
+
+        // Only the two in-window Home transitions are re-queued for training.
+        assert_eq!(sim.deferred_reward_transitions.len(), 2);
+        assert!(sim
+            .deferred_reward_transitions
+            .iter()
+            .all(|t| t.team == Team::Home && t.reward < 0.0));
+        assert!(sim
+            .deferred_reward_transitions
+            .iter()
+            .all(|t| t.tick == 40 || t.tick == 95));
+        // Recency decay: the more recent action (tick 95) is penalized harder than the older
+        // one (tick 40), and neither the out-of-window nor the Away transition appears.
+        let pen = |tick: u64| {
+            sim.deferred_reward_transitions
+                .iter()
+                .find(|t| t.tick == tick)
+                .map(|t| t.reward)
+                .expect("penalized transition present")
+        };
+        assert!(pen(95) < pen(40), "recent action should be penalized more: {} vs {}", pen(95), pen(40));
+
+        // A second turnover signal on the same tick is de-duped (no double penalty).
+        sim.penalize_turnover_window(Team::Home);
+        assert_eq!(sim.deferred_reward_transitions.len(), 2);
+    }
+
+    #[test]
     fn learning_episode_records_transition_per_player_per_tick() {
         let dataset = run_learning_episode(MatchConfig {
             duration_seconds: 0.2,
