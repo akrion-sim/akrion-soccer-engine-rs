@@ -1659,6 +1659,27 @@ mod tests {
     }
 
     #[test]
+    fn parallel_run_aborts_before_work_when_deadline_has_passed() {
+        let teams = fresh_teams(4, 313);
+        let seed_teams = teams.clone();
+        let tournament =
+            Tournament::new(teams, small_format(), TournamentLearningMode::Frozen, 313).unwrap();
+        let runner = StrengthMatchRunner::from_teams(&seed_teams);
+        let mut callbacks = 0usize;
+        let result =
+            tournament.run_parallel(&runner, 2, Some(std::time::Instant::now()), |_, _, _| {
+                callbacks += 1;
+            });
+
+        assert!(result.is_err(), "expired deadline should abort");
+        assert_eq!(callbacks, 0, "callback must not fire before any wave");
+        assert_eq!(
+            result.unwrap_err(),
+            "tournament deadline reached after 0/7 matches"
+        );
+    }
+
+    #[test]
     fn parallel_run_matches_sequential_run_exactly() {
         // run_parallel batches matches into team-disjoint waves, so it must crown
         // the identical bracket the sequential run does — champion, podium, group

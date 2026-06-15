@@ -25,10 +25,11 @@
 //!   SOCCER_TOURNAMENT_SEED_FRACTION  (0..=1, default 0.5 — share of teams seeded from PG)
 //!   SOCCER_TOURNAMENT_PROMOTE        (bool, default true)
 //!   SOCCER_TOURNAMENT_LOCK_KEY       (default SOCCER_EXPERIMENT_SLUG)
+//!   SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS (f64, default 0/off)
 //!   SOCCER_EXPERIMENT_SLUG           (default "soccer-nightly-tournament")
 
 use std::error::Error;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
     MatchConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerTeamQPolicies,
@@ -270,6 +271,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     .clamp(1.0, 86_400.0);
     let seed_fraction = env_f64("SOCCER_TOURNAMENT_SEED_FRACTION", 0.5);
     let promote = env_bool("SOCCER_TOURNAMENT_PROMOTE", true);
+    let soft_deadline_seconds =
+        env_f64("SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS", 0.0).clamp(0.0, 86_400.0);
     let slug =
         env_string("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| DEFAULT_EXPERIMENT_SLUG.to_string());
     // Parallelism: independent fixtures (groups, and matches within a knockout round)
@@ -293,7 +296,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let options = SoccerQPolicyOptions::default();
 
     println!(
-        "tournament_start teams={} groups={} knockout={} mode={:?} seed={} match_seconds={:.1} seed_fraction={:.2} threads={} promote={}",
+        "tournament_start teams={} groups={} knockout={} mode={:?} seed={} match_seconds={:.1} seed_fraction={:.2} threads={} promote={} soft_deadline_seconds={:.1}",
         format.team_count,
         format.group_count(),
         format.knockout_team_count(),
@@ -303,6 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         seed_fraction,
         threads,
         promote,
+        soft_deadline_seconds,
     );
 
     // Optional Postgres: seed from the latest active policy and promote the champion.
@@ -392,55 +396,62 @@ fn main() -> Result<(), Box<dyn Error>> {
     let runner = EngineMatchRunner::new(runner_config);
     // Engine API (HEAD line): run_parallel borrows the runner and takes an
     // optional wall-clock deadline + a per-wave progress callback. The CronJob
-    // enforces the hard 2am–7am stop via activeDeadlineSeconds, so no app-level
-    // deadline is passed here; progress is logged for schedule calibration.
+    // still enforces the hard 2am-7am stop via activeDeadlineSeconds, but an
+    // app-level soft deadline lets the normal failure/salvage path finish first.
     // Persist each wave AS IT COMMITS (matches + per-team brain checkpoints) and track the
     // strongest brain in memory, so a failure mid-bracket salvages the night's learning.
     let mut persisted_matches: usize = 0;
     let mut best_salvage: Option<(f64, SoccerNeuralNetworkSnapshot)> = None;
-    let run_result = tournament.run_parallel(&runner, threads, None, |progress, reports, teams| {
-        println!(
-            "tournament_progress stage={:?} played={} total={} elapsed_secs={:.1}",
-            progress.stage_label,
-            progress.matches_played,
-            progress.matches_total,
-            progress.elapsed.as_secs_f64(),
-        );
-        if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
-            if reports.len() > persisted_matches {
-                match store.record_tournament_matches(
-                    db_id,
-                    &reports[persisted_matches..],
-                    persisted_matches,
-                ) {
-                    Ok(()) => persisted_matches = reports.len(),
-                    Err(err) => eprintln!("tournament_persist_matches_failed: {err}"),
+    let run_deadline = (soft_deadline_seconds > 0.0)
+        .then(|| started + Duration::from_secs_f64(soft_deadline_seconds));
+    let run_result = tournament.run_parallel(
+        &runner,
+        threads,
+        run_deadline,
+        |progress, reports, teams| {
+            println!(
+                "tournament_progress stage={:?} played={} total={} elapsed_secs={:.1}",
+                progress.stage_label,
+                progress.matches_played,
+                progress.matches_total,
+                progress.elapsed.as_secs_f64(),
+            );
+            if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
+                if reports.len() > persisted_matches {
+                    match store.record_tournament_matches(
+                        db_id,
+                        &reports[persisted_matches..],
+                        persisted_matches,
+                    ) {
+                        Ok(()) => persisted_matches = reports.len(),
+                        Err(err) => eprintln!("tournament_persist_matches_failed: {err}"),
+                    }
+                }
+                if let Err(err) = store.checkpoint_tournament_team_brains(db_id, teams) {
+                    eprintln!("tournament_persist_brains_failed: {err}");
                 }
             }
-            if let Err(err) = store.checkpoint_tournament_team_brains(db_id, teams) {
-                eprintln!("tournament_persist_brains_failed: {err}");
-            }
-        }
-        if let Some(team) = teams
-            .iter()
-            .filter(|team| team.brain.neural.is_some())
-            .max_by(|a, b| {
-                team_brain_fitness(a)
-                    .partial_cmp(&team_brain_fitness(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        {
-            let fitness = team_brain_fitness(team);
-            if best_salvage
-                .as_ref()
-                .map_or(true, |(best, _)| fitness > *best)
+            if let Some(team) = teams
+                .iter()
+                .filter(|team| team.brain.neural.is_some())
+                .max_by(|a, b| {
+                    team_brain_fitness(a)
+                        .partial_cmp(&team_brain_fitness(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
             {
-                if let Some(neural) = &team.brain.neural {
-                    best_salvage = Some((fitness, neural.clone()));
+                let fitness = team_brain_fitness(team);
+                if best_salvage
+                    .as_ref()
+                    .map_or(true, |(best, _)| fitness > *best)
+                {
+                    if let Some(neural) = &team.brain.neural {
+                        best_salvage = Some((fitness, neural.clone()));
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     let report = match run_result {
         Ok(report) => report,

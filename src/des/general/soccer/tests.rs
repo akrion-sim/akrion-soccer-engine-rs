@@ -1784,8 +1784,18 @@ fn pass_lane_clearance_catches_a_defender_drifting_into_the_lane() {
     // (a) Clear lane: defender parked well off it and not moving.
     sim.players[opp].position = Vec2::new(48.0, 67.0);
     sim.players[opp].velocity = Vec2::zero();
-    let clear = WorldSnapshot::from_match(&sim).pass_lane_clearance(from, to, Team::Away, radius, ball_speed);
-    assert_eq!(clear, (true, true), "an idle defender 8 yd off the lane is fully clear");
+    let clear = WorldSnapshot::from_match(&sim).pass_lane_clearance(
+        from,
+        to,
+        Team::Away,
+        radius,
+        ball_speed,
+    );
+    assert_eq!(
+        clear,
+        (true, true),
+        "an idle defender 8 yd off the lane is fully clear"
+    );
 
     // (b) Drifting in: 3 yd off the corridor NOW (static check says clear), sprinting
     // toward it so it arrives before the ball passes its point.
@@ -24577,6 +24587,12 @@ fn live_gameplay_defaults_keep_learning_threaded_and_bounded() {
     assert!(config.learning_logging_enabled);
     assert!(config.full_game_learning_enabled);
     assert!(config.formation_lp_enabled);
+    assert!(config.local_mpc_enabled);
+    assert_eq!(
+        config.local_mpc_max_players_per_team,
+        DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM
+    );
+    assert!(config.local_mpc_max_players_per_team <= SOCCER_MATCH_TEAM_PLAYER_COUNT);
     assert!(config.neural_learning.enabled);
     assert_eq!(
         config.neural_learning.backend,

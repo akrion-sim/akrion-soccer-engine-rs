@@ -5,7 +5,8 @@
 # clusters that intentionally want a second, staggered tournament lane.
 #
 # Unlike the continuous self-play Deployment, this is a CronJob: one run per night,
-# Forbid overlap, and a hard activeDeadline a little under 5 hours.
+# Forbid overlap, and a hard activeDeadline plus a runner-level soft deadline
+# that lets learning state be salvaged before Kubernetes kills an overrun.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -25,7 +26,7 @@ spec:
   failedJobsHistoryLimit: 5
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 17400  # 4h50m hard cap (2:00 -> ~6:50 Central), well before 7am
+      activeDeadlineSeconds: 18000  # 5h hard cap (2:00 -> 7:00 Central)
       backoffLimit: 0              # a missed night is fine; don't thrash retries
       ttlSecondsAfterFinished: 86400
       template:
@@ -61,9 +62,8 @@ spec:
                   # main_soccer_tournament_run lives in the soccer_engine repo and
                   # depends on discrete-event-system.rs as a SIBLING (its
                   # `des_engine = { path = "../discrete-event-system.rs" }`), so clone
-                  # both into a common parent. The /tmp build cache (hostPath) is
-                  # reused night-to-night, turning the cold clone+rebuild into a fast
-                  # incremental one and avoiding a rustc cold-start CPU stampede.
+                  # both into a common parent. /tmp is a per-pod emptyDir so the
+                  # non-root build works on any node without hostPath ownership drift.
                   run_prefix="${SOCCER_TOURNAMENT_RUN_PREFIX:-dd-soccer-tournament}"
                   soccer_repo="${SOCCER_SOURCE_REPO:-https://github.com/ORESoftware/soccer-sim-game-engine.rs.git}"
                   soccer_ref="${SOCCER_SOURCE_REF:-main}"
@@ -119,8 +119,10 @@ spec:
                     secretKeyRef:
                       name: dd-remote-rest-api-secrets
                       key: RDS_DATABASE_URL
+                - name: SOCCER_PG_TLS_INSECURE
+                  value: "1"
                 - name: SOCCER_EXPERIMENT_SLUG
-                  value: nightly-soccer-tournament
+                  value: soccer-nightly-tournament
                 # Same key across clusters if this template is intentionally
                 # unsuspended; otherwise the active nightly manifest owns it.
                 - name: SOCCER_TOURNAMENT_LOCK_KEY
@@ -138,6 +140,12 @@ spec:
                   value: bilearning
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
                   value: "3600"
+                # Soft cap is measured from binary start, after clone/build; with
+                # the current ~4-5m build this leaves roughly 5m before the hard
+                # job cap for failure marking, lock release, salvage promotion,
+                # and pod termination.
+                - name: SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
+                  value: "17400"
                 # Parallel matches. Each match is an independent in-pod SoccerMatch
                 # (inline neural, deterministic); keep this within the pod's CPU/mem.
                 - name: SOCCER_TOURNAMENT_THREADS
@@ -158,10 +166,7 @@ spec:
                 - name: tmp
                   mountPath: /tmp
           volumes:
-            # Persist the build cache (git checkouts + cargo registry + target) on
-            # the node so each night's build is incremental. DirectoryOrCreate keeps
-            # it portable across clusters (the dir need not pre-exist on the node).
+            # Per-pod emptyDir avoids root-owned hostPath cache failures under the
+            # non-root securityContext. The active nightly job uses the same shape.
             - name: tmp
-              hostPath:
-                path: /var/cache/dd-soccer-tournament
-                type: DirectoryOrCreate
+              emptyDir: {}

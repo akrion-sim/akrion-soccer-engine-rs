@@ -16,15 +16,15 @@
 # SOCCER_TOURNAMENT_THREADS worker threads. Keep this at 2 by default so AWS EC2
 # and Hetzner nodes can run overnight learning without crowding other pods. Results
 # are byte-identical to a serial run regardless of thread count (verified by the
-# parallel_run_is_byte_identical_to_serial test). With T=2 the 256-match
-# World-Cup-style format's critical path is roughly 113 "match-times"; at the
+# parallel_run_matches_sequential_run_exactly test). With T=2 the 256-match
+# World-Cup-style format's critical path is roughly 129 "match-times"; at the
 # measured neural-on throughput (~137 engine-ticks/sec, dt=0.2):
-#   match_seconds  ticks/match  wall/match  ~113 match-times (T=2)
-#      3600 (60m)    18000        ~131s       ~4.1h   <- default, within 2am-7am
-#      5400 (90m)    27000        ~197s       ~6.2h   <- does not fit this cap
-# activeDeadlineSeconds hard-kills an overrun, so keep 60-minute matches unless
-# the cluster has measured spare capacity. Cross-POD fan-out / global fixture
-# leases should be added before trying to coordinate more than one active cluster.
+#   match_seconds  ticks/match  wall/match  ~129 match-times (T=2)
+#      3600 (60m)    18000        ~131s       ~4.7h   <- default, narrow fit
+#      5400 (90m)    27000        ~197s       ~7.1h   <- does not fit this cap
+# activeDeadlineSeconds hard-kills an overrun. SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
+# stops between fixture waves first so the runner can persist failure state and
+# salvage the best brain before Kubernetes kills the pod.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -153,9 +153,15 @@ spec:
                 # tournament lease, so total active match workers stay at 2.
                 - name: SOCCER_TOURNAMENT_LOCK_KEY
                   value: soccer-nightly-tournament
-                # 60-min matches -> ~4.1h at T=2 (see the budget table in the header).
+                # 60-min matches -> ~4.7h at T=2 before clone/build (see header).
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
                   value: "3600"
+                # Soft cap is measured from binary start, after clone/build; with
+                # the current ~4-5m build this leaves roughly 5m before the hard
+                # job cap for failure marking, lock release, salvage promotion,
+                # and pod termination.
+                - name: SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
+                  value: "17400"
                 # Parallel workers - keep == the CPU limit below. Each worker runs one
                 # full SoccerMatch at a time.
                 - name: SOCCER_TOURNAMENT_THREADS
@@ -198,7 +204,7 @@ spec:
             # emptyDir receives the pod's fsGroup (1000) so it is writable on ANY
             # node in ANY cluster, and it drops the restricted-PSA hostPath warning.
             # Trade-off: a cold clone+build every night (~4-5 min) instead of an
-            # incremental one — negligible inside the 5h window that is otherwise
-            # ~4h of matches.
+            # incremental one — acceptable but not free inside the 5h window that
+            # is otherwise ~4.7h of matches.
             - name: tmp
               emptyDir: {}
