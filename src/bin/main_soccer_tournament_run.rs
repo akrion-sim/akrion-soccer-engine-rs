@@ -35,11 +35,12 @@ use soccer_engine::des::general::soccer::{
     MatchConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerTeamQPolicies,
 };
 use soccer_engine::des::general::tournament::{
-    EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, Tournament, TournamentFormat,
-    TournamentLearningMode, TournamentReport, TournamentTeam, TOURNAMENT_DEFAULT_MATCH_SECONDS,
+    EngineMatchRunner, EngineMatchRunnerConfig, GenomeRng, SoccerTeamGenome, TeamBrain, Tournament,
+    TournamentFormat, TournamentLearningMode, TournamentReport, TournamentTeam,
+    TOURNAMENT_DEFAULT_MATCH_SECONDS,
 };
 use soccer_engine::des::soccer_learning::SOCCER_POLICY_STATUS_ACTIVE;
-use soccer_engine::des::soccer_learning_pg::SoccerLearningPgStore;
+use soccer_engine::des::soccer_learning_pg::{SoccerLearningPgStore, TournamentElite};
 use uuid::Uuid;
 
 const DEFAULT_EXPERIMENT_SLUG: &str = "soccer-nightly-tournament";
@@ -252,11 +253,13 @@ fn sample_team_options(base: &SoccerQPolicyOptions, rng: &mut DiversityRng) -> S
 fn build_entrants(
     format: &TournamentFormat,
     seed: u32,
-    parents: &[SoccerNeuralNetworkSnapshot],
+    net_parents: &[SoccerNeuralNetworkSnapshot],
+    genome_parents: &[SoccerTeamGenome],
     seed_fraction: f64,
 ) -> Vec<TournamentTeam> {
     let diversity = env_bool("SOCCER_TOURNAMENT_DIVERSITY", true);
     let mutation_scale = env_f64("SOCCER_TOURNAMENT_MUTATION_SCALE", 0.03).max(0.0);
+    let genome_mutation_rate = env_f64("SOCCER_TOURNAMENT_GENOME_MUTATION", 0.1).clamp(0.0, 1.0);
     let base_options = SoccerQPolicyOptions::default();
     let seeded_count = (((format.team_count as f64) * seed_fraction.clamp(0.0, 1.0)).round()
         as usize)
@@ -267,14 +270,14 @@ fn build_entrants(
             let mut rng =
                 DiversityRng::new((seed as u64) ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
-            let neural = if id < seeded_count && !parents.is_empty() {
+            let neural = if id < seeded_count && !net_parents.is_empty() {
                 let net = if !diversity {
-                    parents[0].clone()
-                } else if parents.len() == 1 {
-                    mutate_neural(parents[0].clone(), &mut rng, mutation_scale)
+                    net_parents[0].clone()
+                } else if net_parents.len() == 1 {
+                    mutate_neural(net_parents[0].clone(), &mut rng, mutation_scale)
                 } else {
-                    let a = &parents[(rng.next_u64() as usize) % parents.len()];
-                    let b = &parents[(rng.next_u64() as usize) % parents.len()];
+                    let a = &net_parents[(rng.next_u64() as usize) % net_parents.len()];
+                    let b = &net_parents[(rng.next_u64() as usize) % net_parents.len()];
                     mutate_neural(crossover_neural(a, b, &mut rng), &mut rng, mutation_scale)
                 };
                 Some(net)
@@ -288,9 +291,36 @@ fn build_entrants(
                 base_options.clone()
             };
 
+            // Tactical genome: hybridize the elite genomes when we have a pool,
+            // mutate a lone parent, or roll a fresh random style on a cold start.
+            let genome = if !diversity {
+                SoccerTeamGenome::default()
+            } else {
+                let mut grng = GenomeRng::new(
+                    (seed as u64).rotate_left(32)
+                        ^ (id as u64).wrapping_mul(0x2545_F491_4F6C_DD1D),
+                );
+                match genome_parents.len() {
+                    0 => SoccerTeamGenome::random(&mut grng),
+                    1 => {
+                        let mut g = genome_parents[0].clone();
+                        g.mutate(&mut grng, genome_mutation_rate);
+                        g
+                    }
+                    n => {
+                        let a = &genome_parents[grng.index(n)];
+                        let b = &genome_parents[grng.index(n)];
+                        let mut g = SoccerTeamGenome::crossover(a, b, &mut grng);
+                        g.mutate(&mut grng, genome_mutation_rate);
+                        g
+                    }
+                }
+            };
+
             let brain = TeamBrain {
                 neural,
                 options,
+                genome,
                 ..TeamBrain::default()
             };
 
@@ -514,8 +544,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut parent_policy_version_id: Option<String> = None;
     let mut parent_generation: i32 = -1;
     let mut seed_snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
-    // The generational breeding pool: the previous tournament's top-N finishers.
-    let mut elite_pool: Vec<SoccerNeuralNetworkSnapshot> = Vec::new();
+    // The generational breeding pool: the previous tournament's top-N finishers
+    // (their neural snapshots + tactical genomes).
+    let mut elite_pool: Vec<TournamentElite> = Vec::new();
     let elite_pool_size = env_string("SOCCER_TOURNAMENT_ELITE_POOL")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value >= 1)
@@ -603,24 +634,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Parent pool for seeding: the previous tournament's top-N elites (true
-    // generational crossover) when available, else the single active policy
-    // (mutated descendants), else empty (a cold, fresh field).
-    let (parents, field_fraction) = if !elite_pool.is_empty() {
+    // generational crossover of nets AND genomes) when available, else the single
+    // active policy (mutated descendants), else empty (a cold, fresh field).
+    let (net_parents, genome_parents, field_fraction) = if !elite_pool.is_empty() {
         // The whole 128-team field is hybridized from the elite pool by default
         // (SOCCER_TOURNAMENT_HYBRID_FRACTION, 1.0); lower it to keep fresh explorers.
         let hybrid_fraction = env_f64("SOCCER_TOURNAMENT_HYBRID_FRACTION", 1.0);
-        (elite_pool, hybrid_fraction)
+        let nets: Vec<SoccerNeuralNetworkSnapshot> =
+            elite_pool.iter().map(|e| e.neural.clone()).collect();
+        let genomes: Vec<SoccerTeamGenome> =
+            elite_pool.iter().filter_map(|e| e.genome.clone()).collect();
+        (nets, genomes, hybrid_fraction)
     } else {
-        (seed_snapshot.into_iter().collect(), seed_fraction)
+        (
+            seed_snapshot.into_iter().collect(),
+            Vec::new(),
+            seed_fraction,
+        )
     };
-    let teams = build_entrants(&format, seed, &parents, field_fraction);
+    let teams = build_entrants(&format, seed, &net_parents, &genome_parents, field_fraction);
     println!(
-        "tournament_field parents={} field_fraction={:.2} seeding={}",
-        parents.len(),
+        "tournament_field net_parents={} genome_parents={} field_fraction={:.2} seeding={}",
+        net_parents.len(),
+        genome_parents.len(),
         field_fraction,
-        if parents.len() >= 2 {
+        if net_parents.len() >= 2 {
             "elite_crossover_hybridize"
-        } else if parents.len() == 1 {
+        } else if net_parents.len() == 1 {
             "single_parent_mutate"
         } else {
             "cold_fresh"
@@ -844,13 +884,13 @@ mod tests {
     fn entrant_field_matches_format_and_honors_seed_fraction() {
         let format = TournamentFormat::default();
         // No parents ⇒ all fresh regardless of fraction.
-        let fresh = build_entrants(&format, 7, &[], 0.75);
+        let fresh = build_entrants(&format, 7, &[], &[], 0.75);
         assert_eq!(fresh.len(), format.team_count);
         assert!(fresh.iter().all(|team| team.brain.neural.is_none()));
 
         // With one parent, exactly round(team_count * fraction) teams are seeded.
         let snapshot = SoccerNeuralNetworkSnapshot::default();
-        let seeded = build_entrants(&format, 7, std::slice::from_ref(&snapshot), 0.25);
+        let seeded = build_entrants(&format, 7, std::slice::from_ref(&snapshot), &[], 0.25);
         let seeded_count = seeded
             .iter()
             .filter(|team| team.brain.neural.is_some())
@@ -915,11 +955,14 @@ mod tests {
         // both their nets and their sampled hyperparameters.
         let format = TournamentFormat::default();
         let parent = sample_snapshot(0.5);
-        let field = build_entrants(&format, 123, std::slice::from_ref(&parent), 1.0);
+        let field = build_entrants(&format, 123, std::slice::from_ref(&parent), &[], 1.0);
         let n0 = field[0].brain.neural.as_ref().unwrap();
         let n1 = field[1].brain.neural.as_ref().unwrap();
         assert_ne!(n0.layers[0].weights, n1.layers[0].weights);
         assert_ne!(field[0].brain.options.gamma, field[1].brain.options.gamma);
+        // Genomes are diversified per team too (cold pool ⇒ random styles).
+        assert!(field.iter().any(|t| t.brain.genome.formation != field[0].brain.genome.formation)
+            || field.iter().map(|t| t.brain.genome.press_urgency).collect::<Vec<_>>().windows(2).any(|w| w[0] != w[1]));
     }
 
     #[test]
@@ -929,7 +972,7 @@ mod tests {
         let format = TournamentFormat::default();
         let pool: Vec<SoccerNeuralNetworkSnapshot> =
             (0..16).map(|i| sample_snapshot(i as f64)).collect();
-        let field = build_entrants(&format, 55, &pool, 1.0);
+        let field = build_entrants(&format, 55, &pool, &[], 1.0);
         let child = field[3].brain.neural.as_ref().unwrap();
         assert!(child
             .layers

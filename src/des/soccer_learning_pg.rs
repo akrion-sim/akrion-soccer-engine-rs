@@ -17,13 +17,23 @@ use crate::des::general::soccer::{
     SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team,
     SOCCER_MOMENT_EMBEDDING_DIM,
 };
-use crate::des::general::tournament::{MatchReport, TournamentFormat, TournamentTeam};
+use crate::des::general::tournament::{
+    MatchReport, SoccerTeamGenome, TournamentFormat, TournamentTeam,
+};
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
     SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
 use std::collections::HashMap;
+
+/// One elite finisher from the breeding pool: its final neural snapshot plus its
+/// tactical genome (`None` for rows persisted before genomes shipped).
+#[derive(Clone, Debug)]
+pub struct TournamentElite {
+    pub neural: SoccerNeuralNetworkSnapshot,
+    pub genome: Option<SoccerTeamGenome>,
+}
 
 #[derive(Clone, Debug)]
 pub struct SoccerLearningPgPolicyVersion {
@@ -801,8 +811,8 @@ impl SoccerLearningPgStore {
                 insert into des_soccer_tournament_team_brains
                   (tournament_id, team_id, team_name, seed, matches_learned,
                    training_steps, played, wins, draws, losses, goals_for,
-                   goals_against, neural_snapshot, updated_at)
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+                   goals_against, neural_snapshot, genome, updated_at)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
                 on conflict (tournament_id, team_id) do update set
                   team_name = excluded.team_name,
                   matches_learned = excluded.matches_learned,
@@ -814,6 +824,7 @@ impl SoccerLearningPgStore {
                   goals_for = excluded.goals_for,
                   goals_against = excluded.goals_against,
                   neural_snapshot = excluded.neural_snapshot,
+                  genome = excluded.genome,
                   updated_at = now()
                 "#,
             )
@@ -829,6 +840,8 @@ impl SoccerLearningPgStore {
                 }
                 None => None,
             };
+            let genome_json = serde_json::to_value(&team.brain.genome)
+                .map_err(|err| format!("serialize team {} genome: {err}", team.id))?;
             tx.execute(
                 &stmt,
                 &[
@@ -845,6 +858,7 @@ impl SoccerLearningPgStore {
                     &(team.record.goals_for as i32),
                     &(team.record.goals_against as i32),
                     &neural_json,
+                    &genome_json,
                 ],
             )
             .map_err(|err| format!("upsert team {} brain: {err}", team.id))?;
@@ -947,7 +961,7 @@ impl SoccerLearningPgStore {
         &mut self,
         experiment_id: &str,
         limit: usize,
-    ) -> Result<Vec<SoccerNeuralNetworkSnapshot>, String> {
+    ) -> Result<Vec<TournamentElite>, String> {
         self.ensure_connected()?;
         {
             let mut tx = self
@@ -963,7 +977,7 @@ impl SoccerLearningPgStore {
             .client
             .query(
                 r#"
-                select b.neural_snapshot
+                select b.neural_snapshot, b.genome
                 from des_soccer_tournament_team_brains b
                 where b.tournament_id = (
                   select id from des_soccer_tournaments
@@ -987,7 +1001,15 @@ impl SoccerLearningPgStore {
             let snapshot: SoccerNeuralNetworkSnapshot = serde_json::from_value(snapshot_json)
                 .map_err(|err| format!("decode elite brain: {err}"))?;
             validate_soccer_neural_network_snapshot_for_pg(&snapshot)?;
-            pool.push(snapshot);
+            // Genome is nullable (rows persisted before the genome shipped have
+            // none) — decode best-effort so a missing/old genome never blocks the
+            // breeding pool.
+            let genome_json: Option<Value> = row.get(1);
+            let genome = genome_json.and_then(|value| serde_json::from_value(value).ok());
+            pool.push(TournamentElite {
+                neural: snapshot,
+                genome,
+            });
         }
         Ok(pool)
     }
@@ -3210,9 +3232,14 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
           goals_for integer not null,
           goals_against integer not null,
           neural_snapshot jsonb,
+          genome jsonb,
           updated_at timestamptz not null default now(),
           unique (tournament_id, team_id)
         );
+        -- Heritable tactical genome (added after the table shipped); idempotent so
+        -- pre-existing prod tables gain the column without a separate migration.
+        alter table des_soccer_tournament_team_brains
+          add column if not exists genome jsonb;
         "#,
     )
     .map_err(|err| format!("ensure soccer tournament tables: {err}"))
