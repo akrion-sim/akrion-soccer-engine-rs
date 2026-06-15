@@ -499,6 +499,36 @@ impl SoccerLearningPgStore {
         Ok(())
     }
 
+    /// Try to hold a session-level Postgres advisory lock for a whole tournament run.
+    ///
+    /// This is intentionally not transaction-scoped: AWS and Hetzner CronJobs can
+    /// both fire at 2am, but only the session that owns this lock should proceed
+    /// to run matches. The lock releases automatically if the process exits or the
+    /// database connection drops.
+    pub fn try_acquire_tournament_run_lock(&mut self, key: &str) -> Result<bool, String> {
+        self.ensure_connected()?;
+        let row = self
+            .client
+            .query_one(
+                "select pg_try_advisory_lock(hashtext('des-soccer-tournament-run'), hashtext($1))",
+                &[&key],
+            )
+            .map_err(|err| format!("acquire tournament run advisory lock: {err}"))?;
+        Ok(row.get(0))
+    }
+
+    pub fn release_tournament_run_lock(&mut self, key: &str) -> Result<bool, String> {
+        self.ensure_connected()?;
+        let row = self
+            .client
+            .query_one(
+                "select pg_advisory_unlock(hashtext('des-soccer-tournament-run'), hashtext($1))",
+                &[&key],
+            )
+            .map_err(|err| format!("release tournament run advisory lock: {err}"))?;
+        Ok(row.get(0))
+    }
+
     fn build_tls_connector(database_url: &str) -> Result<MakeTlsConnector, String> {
         let mut tls_builder = TlsConnector::builder();
         if soccer_learning_pg_should_verify_certificates(database_url) {

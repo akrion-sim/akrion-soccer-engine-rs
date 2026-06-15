@@ -12,24 +12,19 @@
 #   * activeDeadlineSeconds: 18000 (5h) — HARD 7am stop; the Job is killed if it
 #     overruns, so a slow/stuck run can never bleed into the day.
 #
-# Runtime budget: the bracket runs INDEPENDENT fixtures in parallel on
-# SOCCER_TOURNAMENT_THREADS worker threads (all 32 groups concurrently; each
-# knockout round's matches concurrently — barrier between rounds). Results are
-# byte-identical to a serial run regardless of thread count (verified by the
-# parallel_run_is_byte_identical_to_serial test). With T=8 the 256-match World-Cup
-# format's critical path is ~35 "match-times" (group stage ceil(32/8)*6 ≈ 24 +
-# knockout ≈ 11). MEASURED neural-on throughput is ~137 engine-ticks/sec (~7x
-# slower than bare Q — critic training is the cost). At dt 0.2, T=8:
-#   match_seconds  ticks/match  wall/match  ~35 match-times (T=8)
-#      3600 (60m)    18000        ~131s       ~1.3h   <- default, big margin
-#      5400 (90m)    27000        ~197s       ~1.9h   <- full match, still fits
-# Raise SOCCER_TOURNAMENT_THREADS (and the CPU limit) to shrink this further; T=16
-# roughly halves the group-stage critical path. activeDeadlineSeconds hard-kills an
-# overrun (losing the champion promotion), so keep margin and watch the
-# `tournament_complete ... elapsed_secs=` log; node throughput may differ from the
-# dev measurement above. Cross-POD fan-out (claiming fixtures across machines) is a
-# further follow-up needing the per-fixture/lease tournament schema — not required
-# while a single multi-core node finishes comfortably inside the window.
+# Runtime budget: the bracket runs independent fixtures in parallel on
+# SOCCER_TOURNAMENT_THREADS worker threads. Keep this at 2 by default so AWS EC2
+# and Hetzner nodes can run overnight learning without crowding other pods. Results
+# are byte-identical to a serial run regardless of thread count (verified by the
+# parallel_run_is_byte_identical_to_serial test). With T=2 the 256-match
+# World-Cup-style format's critical path is roughly 113 "match-times"; at the
+# measured neural-on throughput (~137 engine-ticks/sec, dt=0.2):
+#   match_seconds  ticks/match  wall/match  ~113 match-times (T=2)
+#      3600 (60m)    18000        ~131s       ~4.1h   <- default, within 2am-7am
+#      5400 (90m)    27000        ~197s       ~6.2h   <- does not fit this cap
+# activeDeadlineSeconds hard-kills an overrun, so keep 60-minute matches unless
+# the cluster has measured spare capacity. Cross-POD fan-out / global fixture
+# leases should be added before trying to coordinate more than one active cluster.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -127,7 +122,7 @@ spec:
                 - name: CARGO_HOME
                   value: /tmp/cargo
                 - name: CARGO_BUILD_JOBS
-                  value: "4"
+                  value: "2"
                 - name: CARGO_NET_RETRY
                   value: "5"
                 - name: RUST_BACKTRACE
@@ -147,13 +142,17 @@ spec:
                       key: RDS_DATABASE_URL
                 - name: SOCCER_EXPERIMENT_SLUG
                   value: soccer-nightly-tournament
-                # 60-min matches → ~1.3h at T=8 (see the budget table in the header).
+                # Same key in AWS + Hetzner: only one cluster owns the global
+                # tournament lease, so total active match workers stay at 2.
+                - name: SOCCER_TOURNAMENT_LOCK_KEY
+                  value: soccer-nightly-tournament
+                # 60-min matches -> ~4.1h at T=2 (see the budget table in the header).
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
                   value: "3600"
-                # Parallel workers — keep == the CPU limit below. Each worker runs one
+                # Parallel workers - keep == the CPU limit below. Each worker runs one
                 # full SoccerMatch at a time.
                 - name: SOCCER_TOURNAMENT_THREADS
-                  value: "8"
+                  value: "2"
                 - name: SOCCER_TOURNAMENT_LEARNING_MODE
                   value: bilearning
                 - name: SOCCER_TOURNAMENT_SEED_FRACTION
@@ -163,20 +162,18 @@ spec:
                 - name: SOCCER_TOURNAMENT_SEED
                   value: "20260613"
               resources:
-                # Low scheduling floor so the job fits on busy/oversubscribed
-                # nodes (both clusters run many other pods); it still bursts to the
-                # 8-CPU limit when the node is idle (e.g. 2am), so throughput is
-                # unchanged when capacity is free.
+                # Low scheduling floor so the job fits on busy nodes in both
+                # clusters. The CPU limit enforces the "2 games in parallel max"
+                # contract even if the node is otherwise idle.
                 requests:
-                  cpu: "2"
+                  cpu: "1"
                   memory: 4Gi
                 limits:
-                  # cpu == SOCCER_TOURNAMENT_THREADS (8). The tournament holds 128
-                  # neural brains + up to THREADS concurrent live matches — a few GB
-                  # in practice; 16Gi is ample and stays safely under the 32GB
-                  # Hetzner node RAM (and well under the 128GB AWS node).
-                  cpu: "8"
-                  memory: 16Gi
+                  # cpu == SOCCER_TOURNAMENT_THREADS (2). The tournament holds 128
+                  # neural brains + up to THREADS concurrent live matches; keep the
+                  # memory cap below half of a 32Gi Hetzner node.
+                  cpu: "2"
+                  memory: 12Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:

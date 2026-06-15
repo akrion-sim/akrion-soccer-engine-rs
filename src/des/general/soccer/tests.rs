@@ -31427,6 +31427,204 @@ fn positional_exception_relief_softens_close_spacing_only_for_live_tactical_reas
     );
 }
 
+#[test]
+fn defensive_tracking_relief_requires_risky_or_busy_handoff() {
+    let defender = 2;
+    let handoff_teammate = 3;
+    let holder = 17;
+    let runner = 20;
+    let secondary_runner = 21;
+    let tracked_runner = Vec2::new(40.8, 45.2);
+    let setup = |busy_handoff: bool| {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        park_players_except(
+            &mut sim,
+            &[defender, handoff_teammate, holder, runner, secondary_runner],
+        );
+        sim.players[defender].position = Vec2::new(39.5, 45.0);
+        sim.players[handoff_teammate].position = Vec2::new(40.5, 45.1);
+        sim.players[runner].position = tracked_runner;
+        sim.players[holder].position = Vec2::new(72.0, 86.0);
+        sim.players[secondary_runner].position = if busy_handoff {
+            Vec2::new(40.9, 45.0)
+        } else {
+            Vec2::new(72.0, 102.0)
+        };
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder].position;
+        sim.ball.last_touch_team = Some(Team::Away);
+        sim
+    };
+
+    let easy_handoff_obs = WorldSnapshot::from_match(&setup(false)).observation_for(defender);
+    assert!(
+        easy_handoff_obs.positional_shape_exception_relief < 0.12,
+        "a defender should not get tracking relief when a better teammate can safely take the mark"
+    );
+
+    let busy_handoff_obs = WorldSnapshot::from_match(&setup(true)).observation_for(defender);
+    assert!(
+        busy_handoff_obs.positional_shape_exception_relief > 0.35,
+        "tracking relief should apply when the better handoff teammate is already marking another runner"
+    );
+}
+
+#[test]
+fn positional_exception_relief_accounts_for_retention_cover_and_team_urgency() {
+    let mut retention = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 7;
+    let pressure_a = 17;
+    let pressure_b = 18;
+    park_players_except(&mut retention, &[holder, pressure_a, pressure_b]);
+    retention.players[holder].position = Vec2::new(40.0, 52.0);
+    retention.players[holder].velocity = Vec2::zero();
+    retention.players[holder].action_facing = FacingBucket::South;
+    retention.players[pressure_a].position = Vec2::new(39.0, 52.8);
+    retention.players[pressure_b].position = Vec2::new(41.2, 53.1);
+    retention.ball.holder = Some(holder);
+    retention.ball.position = retention.players[holder].position;
+    retention.ball.last_touch_team = Some(Team::Home);
+
+    let retention_snapshot = WorldSnapshot::from_match(&retention);
+    assert_eq!(
+        retention_snapshot
+            .ranked_visible_pass_targets(holder, 1)
+            .len(),
+        0,
+        "carrier should have no safe floor outlet in this shield-and-retain setup"
+    );
+    assert_eq!(
+        retention_snapshot
+            .ranked_visible_aerial_pass_targets(holder, 1)
+            .len(),
+        0,
+        "carrier should have no useful aerial outlet in this shield-and-retain setup"
+    );
+    let retention_obs = retention_snapshot.observation_for(holder);
+    assert!(
+        retention_obs.positional_shape_exception_relief > 0.35,
+        "pressured carrier with no floor/aerial outlet should get ball-retention shape relief"
+    );
+
+    let mut cover = SoccerMatch::default_11v11(MatchConfig::default());
+    let displaced = 2;
+    let covering = 3;
+    let away_holder = 17;
+    let displaced_slot = cover.players[displaced].home_position;
+    cover.players[displaced].position = Vec2::new(
+        displaced_slot.x,
+        displaced_slot.y + 24.0 * cover.players[displaced].team.attack_dir(),
+    );
+    cover.players[covering].position = displaced_slot;
+    cover.players[away_holder].position = Vec2::new(42.0, 78.0);
+    cover.ball.holder = Some(away_holder);
+    cover.ball.position = cover.players[away_holder].position;
+    cover.ball.last_touch_team = Some(Team::Away);
+
+    let cover_obs = WorldSnapshot::from_match(&cover).observation_for(covering);
+    assert!(
+        cover_obs.positional_shape_exception_relief > 0.25,
+        "defender/midfielder covering a displaced teammate's slot should get cover relief"
+    );
+
+    let mut attack_urgency = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 7;
+    let runner = 8;
+    let runner_home = attack_urgency.players[runner].home_position;
+    attack_urgency.players[holder].position = Vec2::new(40.0, 50.0);
+    attack_urgency.players[runner].position = Vec2::new(
+        runner_home.x,
+        runner_home.y + 30.0 * attack_urgency.players[runner].team.attack_dir(),
+    );
+    attack_urgency.ball.holder = Some(holder);
+    attack_urgency.ball.position = attack_urgency.players[holder].position;
+    attack_urgency.ball.last_touch_team = Some(Team::Home);
+
+    let calm_attack_obs = WorldSnapshot::from_match(&attack_urgency).observation_for(runner);
+    assert!(
+        calm_attack_obs.positional_shape_exception_relief < 0.12,
+        "forward shape drift should not be excused without a high-urgency home brain directive"
+    );
+    let mut urgent_attack_snapshot = WorldSnapshot::from_match(&attack_urgency);
+    urgent_attack_snapshot.home_directive.risk_tolerance = 0.98;
+    urgent_attack_snapshot
+        .home_directive
+        .attacking_overload_score = 0.96;
+    urgent_attack_snapshot
+        .home_directive
+        .neural_formation_attack_score = 0.94;
+    let urgent_attack_obs = urgent_attack_snapshot.observation_for(runner);
+    assert!(
+        urgent_attack_obs.positional_shape_exception_relief > 0.45,
+        "high offensive urgency should excuse committing numbers forward"
+    );
+
+    let mut away_attack_urgency = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 17;
+    let runner = 18;
+    let runner_home = away_attack_urgency.players[runner].home_position;
+    away_attack_urgency.players[holder].position = Vec2::new(40.0, 70.0);
+    away_attack_urgency.players[runner].position = Vec2::new(
+        runner_home.x,
+        runner_home.y + 30.0 * away_attack_urgency.players[runner].team.attack_dir(),
+    );
+    away_attack_urgency.ball.holder = Some(holder);
+    away_attack_urgency.ball.position = away_attack_urgency.players[holder].position;
+    away_attack_urgency.ball.last_touch_team = Some(Team::Away);
+
+    let calm_away_attack_obs =
+        WorldSnapshot::from_match(&away_attack_urgency).observation_for(runner);
+    assert!(
+        calm_away_attack_obs.positional_shape_exception_relief < 0.12,
+        "away forward shape drift should not be excused without a high-urgency away brain directive"
+    );
+    let mut urgent_away_attack_snapshot = WorldSnapshot::from_match(&away_attack_urgency);
+    urgent_away_attack_snapshot.away_directive.risk_tolerance = 0.98;
+    urgent_away_attack_snapshot
+        .away_directive
+        .attacking_overload_score = 0.96;
+    urgent_away_attack_snapshot
+        .away_directive
+        .neural_formation_attack_score = 0.94;
+    let urgent_away_attack_obs = urgent_away_attack_snapshot.observation_for(runner);
+    assert!(
+        urgent_away_attack_obs.positional_shape_exception_relief > 0.45,
+        "high away offensive urgency should excuse committing numbers forward"
+    );
+
+    let mut defense_urgency = SoccerMatch::default_11v11(MatchConfig::default());
+    let recovering = 2;
+    let away_holder = 17;
+    let recovering_home = defense_urgency.players[recovering].home_position;
+    let recovery_y =
+        recovering_home.y - 22.0 * defense_urgency.players[recovering].team.attack_dir();
+    defense_urgency.players[recovering].position = Vec2::new(
+        recovering_home.x,
+        recovery_y.clamp(4.0, defense_urgency.config.field_length_yards - 4.0),
+    );
+    defense_urgency.players[away_holder].position =
+        Vec2::new(recovering_home.x + 4.0, recovering_home.y + 34.0);
+    defense_urgency.ball.holder = Some(away_holder);
+    defense_urgency.ball.position = defense_urgency.players[away_holder].position;
+    defense_urgency.ball.last_touch_team = Some(Team::Away);
+
+    let calm_defense_obs = WorldSnapshot::from_match(&defense_urgency).observation_for(recovering);
+    assert!(
+        calm_defense_obs.positional_shape_exception_relief < 0.12,
+        "deep recovery shape drift should not be excused without a high-urgency home brain directive"
+    );
+    let mut urgent_defense_snapshot = WorldSnapshot::from_match(&defense_urgency);
+    urgent_defense_snapshot.home_directive.press_intensity = 0.97;
+    urgent_defense_snapshot
+        .home_directive
+        .neural_formation_defense_score = 0.95;
+    let urgent_defense_obs = urgent_defense_snapshot.observation_for(recovering);
+    assert!(
+        urgent_defense_obs.positional_shape_exception_relief > 0.35,
+        "high defensive urgency should excuse committing numbers back"
+    );
+}
+
 // Did the brain raise a "one of you move" notice for this specific pair?
 // (Parked players sit ~2 yd apart and trip their own notices, so always filter
 // to the pair under test rather than inspecting the whole notice list.)

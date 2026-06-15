@@ -24,6 +24,7 @@
 //!   SOCCER_TOURNAMENT_MATCH_SECONDS  (f64, default TOURNAMENT_DEFAULT_MATCH_SECONDS)
 //!   SOCCER_TOURNAMENT_SEED_FRACTION  (0..=1, default 0.5 — share of teams seeded from PG)
 //!   SOCCER_TOURNAMENT_PROMOTE        (bool, default true)
+//!   SOCCER_TOURNAMENT_LOCK_KEY       (default SOCCER_EXPERIMENT_SLUG)
 //!   SOCCER_EXPERIMENT_SLUG           (default "soccer-nightly-tournament")
 
 use std::error::Error;
@@ -72,6 +73,29 @@ fn env_bool(key: &str, default: bool) -> bool {
             "1" | "true" | "yes" | "on"
         ),
         None => default,
+    }
+}
+
+fn tournament_run_lock_key(raw: Option<String>, slug: &str) -> String {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slug.to_string())
+}
+
+fn release_tournament_run_lock_if_held(
+    store: &mut Option<SoccerLearningPgStore>,
+    held: bool,
+    key: &str,
+) {
+    if !held {
+        return;
+    }
+    if let Some(store) = store.as_mut() {
+        match store.release_tournament_run_lock(key) {
+            Ok(true) => println!("tournament_lock_released key={key}"),
+            Ok(false) => eprintln!("tournament_lock_release_not_held key={key}"),
+            Err(err) => eprintln!("tournament_lock_release_failed key={key} error={err}"),
+        }
     }
 }
 
@@ -283,6 +307,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Optional Postgres: seed from the latest active policy and promote the champion.
     let mut store = SoccerLearningPgStore::connect_from_env()?;
+    let tournament_lock_key =
+        tournament_run_lock_key(env_string("SOCCER_TOURNAMENT_LOCK_KEY"), &slug);
+    let mut tournament_lock_held = false;
+    if let Some(store) = store.as_mut() {
+        if store.try_acquire_tournament_run_lock(&tournament_lock_key)? {
+            tournament_lock_held = true;
+            println!("tournament_lock_acquired key={tournament_lock_key}");
+        } else {
+            println!(
+                "tournament_lock_busy key={tournament_lock_key} skipped=true reason=another_cluster_running"
+            );
+            return Ok(());
+        }
+    }
     let mut experiment_id: Option<String> = None;
     let mut parent_policy_version_id: Option<String> = None;
     let mut parent_generation: i32 = -1;
@@ -442,6 +480,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
+            release_tournament_run_lock_if_held(
+                &mut store,
+                tournament_lock_held,
+                &tournament_lock_key,
+            );
             return Err(err.into());
         }
     };
@@ -494,6 +537,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    release_tournament_run_lock_if_held(&mut store, tournament_lock_held, &tournament_lock_key);
+
     Ok(())
 }
 
@@ -527,6 +572,25 @@ mod tests {
         assert_eq!(
             parse_learning_mode(Some("nonsense".to_string())),
             TournamentLearningMode::BiLearning
+        );
+    }
+
+    #[test]
+    fn tournament_lock_key_defaults_to_slug_and_ignores_blank_override() {
+        assert_eq!(
+            tournament_run_lock_key(None, "soccer-nightly-tournament"),
+            "soccer-nightly-tournament"
+        );
+        assert_eq!(
+            tournament_run_lock_key(Some("   ".to_string()), "soccer-nightly-tournament"),
+            "soccer-nightly-tournament"
+        );
+        assert_eq!(
+            tournament_run_lock_key(
+                Some("global-nightly".to_string()),
+                "soccer-nightly-tournament"
+            ),
+            "global-nightly"
         );
     }
 
