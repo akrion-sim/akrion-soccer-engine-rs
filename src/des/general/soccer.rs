@@ -40763,15 +40763,30 @@ fn pass_target_quality_for_snapshot(
             + aerial_duel_skill_from_snapshot(target) * 0.16)
             .clamp(0.20, 0.88)
     } else {
-        let lane_open = if snapshot.clear_line(
+        // Movement-aware lane: a defender SITTING in the corridor blocks it now; a
+        // defender whose velocity carries them INTO the corridor before the ball
+        // passes their point is priced as a partial block. The old static check rated
+        // a lane "fully clear" whenever no defender was in it AT DECISION TIME, so the
+        // policy perceived a contested ball (a marker one step from the lane) as safe
+        // and recycled it straight to the other team under low pressure. Grading the
+        // closing defender into the completion estimate is the same fix already used
+        // in pass SELECTION (`pass_lane_clearance`), applied here to the policy-facing
+        // expected_completion / openness features so perception matches execution.
+        let (lane_clear_now, lane_clear_through_flight) = snapshot.pass_lane_clearance(
             passer_position,
             anticipated_target,
             passer.team.other(),
             2.5,
-        ) {
+            nominal_speed,
+        );
+        let lane_open = if !lane_clear_now {
+            0.24
+        } else if lane_clear_through_flight {
             1.0
         } else {
-            0.24
+            // Clear now but a defender drifts in mid-flight — a real interception risk
+            // the static check missed. Priced between blocked and clear (penalty, not veto).
+            0.55
         };
         (lane_open * 0.58 + receiver_openness * 0.28 + position_confidence * 0.14).clamp(0.10, 1.0)
     };

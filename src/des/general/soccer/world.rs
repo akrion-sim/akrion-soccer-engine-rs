@@ -20733,7 +20733,7 @@ impl WorldSnapshot {
     /// check (no defender in the corridor right now — the hard veto); `clear_through_flight`
     /// additionally rejects a defender whose velocity carries them INTO the corridor before
     /// the ball passes their point (used as a penalty, not a veto).
-    fn pass_lane_clearance(
+    pub(crate) fn pass_lane_clearance(
         &self,
         from: Vec2,
         to: Vec2,
