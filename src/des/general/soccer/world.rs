@@ -5,6 +5,7 @@
 //! snapshots, ball, and reward/learning helpers it drives.
 
 use super::*;
+use crate::des::general::soccer_genome::SoccerTeamGenome;
 
 pub struct SoccerMatch {
     pub config: MatchConfig,
@@ -36,6 +37,13 @@ pub struct SoccerMatch {
     /// evaluation pattern. Only meaningful alongside a dedicated per-team learner.
     pub(crate) home_neural_frozen: bool,
     pub(crate) away_neural_frozen: bool,
+    /// Per-team tactical genome (formation / press / pass / keeper style …). Both
+    /// default to the neutral genome, which reproduces the original genome-agnostic
+    /// behavior exactly; the tournament installs each side's evolved genome via
+    /// [`SoccerMatch::set_team_tactical_genome`] so engine consumers can bias play
+    /// by team. Each consumer reads it opt-in (see `genome_for`).
+    pub(crate) home_genome: SoccerTeamGenome,
+    pub(crate) away_genome: SoccerTeamGenome,
     /// How the trained value head couples into live action selection. `Off` by
     /// default, so play is unchanged unless a run opts in via `with_neural_blend`.
     pub(crate) neural_blend: SoccerNeuralBlendConfig,
@@ -84,6 +92,14 @@ pub struct SoccerMatch {
     /// once any other player touches it. (Held-restart already forces them to
     /// pass, so this is the explicit tracking/backstop.)
     pub(crate) restart_double_touch_guard: Option<usize>,
+    /// Law 16 outcome enforcement: while a goal kick is in progress the ball must LEAVE
+    /// the taking team's own penalty area before any teammate touches it. Holds
+    /// `(taking_team, retake_spot)`; cleared the instant the ball exits the box (the kick
+    /// is then legally in play). If a teammate brings the ball under control while it is
+    /// still inside the box, the goal kick is retaken. Backs up the decision-level guard
+    /// (which already steers the AI keeper to an out-of-box outlet) so the rule also holds
+    /// for human takers, deflections, and mishit short kicks.
+    pub(crate) goal_kick_must_clear_box: Option<(Team, Vec2)>,
     pub(crate) recent_learning_history: VecDeque<SoccerLearningTransition>,
     pub(crate) deferred_reward_transitions: Vec<SoccerLearningTransition>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
@@ -493,6 +509,8 @@ impl SoccerMatch {
             away_neural_learner: None,
             home_neural_frozen: false,
             away_neural_frozen: false,
+            home_genome: SoccerTeamGenome::default(),
+            away_genome: SoccerTeamGenome::default(),
             neural_blend: config.neural_blend,
             policy_head: None,
             world_model: None,
@@ -516,6 +534,7 @@ impl SoccerMatch {
             ball_stationary_ticks: 0,
             ball_stuck_anchor: Vec2::new(0.0, 0.0),
             restart_double_touch_guard: None,
+            goal_kick_must_clear_box: None,
             possession_progress_tracker: kickoff.map(|_| {
                 PossessionProgressTracker::new_at(
                     Team::Home,
@@ -715,6 +734,16 @@ impl SoccerMatch {
     /// frozen (served for predictions but never trained). Installing the away
     /// team's brain switches the match into per-team mode. A `None` snapshot
     /// starts that team from a fresh (untrained) net so it can learn from scratch.
+    /// Install a team's evolved tactical genome. Defaults to the neutral genome
+    /// (original behavior); the tournament calls this per side so engine consumers
+    /// can read team-specific style (the genome rides along on `WorldSnapshot`).
+    pub fn set_team_tactical_genome(&mut self, team: Team, genome: SoccerTeamGenome) {
+        match team {
+            Team::Home => self.home_genome = genome,
+            Team::Away => self.away_genome = genome,
+        }
+    }
+
     pub fn set_team_neural_brain(
         &mut self,
         team: Team,
@@ -6410,6 +6439,7 @@ impl SoccerMatch {
                     self.players[player_id].incoming_ball = None;
                     let offside = target_id
                         .and_then(|target| snapshot.pending_offside_for_pass(player_id, target));
+                    let offside_candidates = snapshot.offside_candidates_for_pass(player_id);
                     let receiver_position_at_launch = target_id.and_then(|target| {
                         snapshot.player_position(target).or_else(|| {
                             self.players
@@ -6442,6 +6472,7 @@ impl SoccerMatch {
                         receiver_position_at_launch,
                         receiver_velocity_at_launch,
                         offside,
+                        offside_candidates,
                     });
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
@@ -7973,31 +8004,63 @@ impl SoccerMatch {
         if !vec2_is_finite(previous_ball_position) || !vec2_is_finite(current_ball_position) {
             return None;
         }
-        let offside = self
-            .pending_pass
-            .as_ref()
-            .and_then(|pass| pass.offside.clone())?;
-        let target_position = self
-            .players
-            .iter()
-            .find(|player| player.id == offside.target)
-            .map(|player| player.position)?;
-        if !vec2_is_finite(target_position) {
-            return None;
-        }
         let max_projection = max_projection.clamp(0.0, 1.0);
-        let target_projection = segment_projection_factor(
-            previous_ball_position,
-            current_ball_position,
-            target_position,
-        );
-        let projection = previous_ball_position
-            + (current_ball_position - previous_ball_position) * target_projection;
-        let near_segment = target_projection <= max_projection
-            && target_position.distance(projection) <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
-        let near_current = max_projection >= 1.0 - 1e-9
-            && target_position.distance(current_ball_position) <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
-        (near_segment || near_current).then_some(offside)
+        // Assess EVERY attacker who was in an offside position at the moment of the pass,
+        // not just the intended target. The closest such player who comes within the
+        // interference radius of the ball (along its travelled segment, or at its current
+        // position) is the one penalised — they are the player becoming involved in play.
+        let mut best: Option<(f64, PendingOffside)> = None;
+        for offside in self.effective_offside_candidates() {
+            let Some(target_position) = self
+                .players
+                .iter()
+                .find(|player| player.id == offside.target)
+                .map(|player| player.position)
+            else {
+                continue;
+            };
+            if !vec2_is_finite(target_position) {
+                continue;
+            }
+            let target_projection = segment_projection_factor(
+                previous_ball_position,
+                current_ball_position,
+                target_position,
+            );
+            let projection = previous_ball_position
+                + (current_ball_position - previous_ball_position) * target_projection;
+            let segment_distance = target_position.distance(projection);
+            let near_segment =
+                target_projection <= max_projection && segment_distance <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
+            let current_distance = target_position.distance(current_ball_position);
+            let near_current = max_projection >= 1.0 - 1e-9
+                && current_distance <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
+            if !near_segment && !near_current {
+                continue;
+            }
+            let proximity = if near_segment {
+                segment_distance
+            } else {
+                current_distance
+            };
+            if best.as_ref().is_none_or(|(d, _)| proximity < *d) {
+                best = Some((proximity, offside));
+            }
+        }
+        best.map(|(_, offside)| offside)
+    }
+
+    /// The set of offside candidates carried by the live pending pass, used for enforcement.
+    /// Falls back to the single intended-target offside if no broader candidate list was
+    /// recorded (e.g. a pass constructed directly in a test).
+    fn effective_offside_candidates(&self) -> Vec<PendingOffside> {
+        let Some(pass) = self.pending_pass.as_ref() else {
+            return Vec::new();
+        };
+        if !pass.offside_candidates.is_empty() {
+            return pass.offside_candidates.clone();
+        }
+        pass.offside.clone().into_iter().collect()
     }
 
     pub(crate) fn call_pending_offside_interference_before_control_if_needed(
@@ -8053,16 +8116,17 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 self.ball.last_touch_team = Some(holder_team);
+                // Any attacker who was offside at the moment of the pass and is now the one
+                // controlling the ball is interfering with play — flag them, not only the
+                // pass's intended target.
                 if let Some(offside) = self
-                    .pending_pass
-                    .as_ref()
-                    .and_then(|pass| pass.offside.clone())
+                    .effective_offside_candidates()
+                    .into_iter()
+                    .find(|offside| offside.target == holder && offside.team == holder_team)
                 {
-                    if offside.target == holder && offside.team == holder_team {
-                        self.pending_pass = None;
-                        self.call_offside(offside);
-                        return;
-                    }
+                    self.pending_pass = None;
+                    self.call_offside(offside);
+                    return;
                 }
                 self.mark_ball_received(holder);
                 self.record_possession_touch(holder);
@@ -8482,6 +8546,14 @@ impl SoccerMatch {
             // The restart taker may not touch the ball twice in a row.
             self.restart_double_touch_guard = Some(holder_id);
         }
+        // Law 16: a goal kick must leave the penalty area before a teammate touches it.
+        // Arm the outcome guard (cleared the moment the ball exits the box; otherwise a
+        // teammate's in-box touch forces a retake).
+        self.goal_kick_must_clear_box = if matches!(restart.kind, BallRestartKind::GoalKick) {
+            Some((restart.awarded_team, restart.position))
+        } else {
+            None
+        };
         self.ball
             .record_decision(self.tick, restart_kind_action(restart.kind), None);
         self.shared_positions.sync_from_players_and_ball(
@@ -11798,6 +11870,14 @@ pub struct WorldSnapshot {
     #[serde(skip)]
     pub(crate) ranked_aerial_pass_cache:
         std::cell::RefCell<std::collections::HashMap<(usize, bool), Vec<usize>>>,
+    /// Per-team tactical genomes (constant for the whole match). Default = neutral
+    /// genome, so a genome-agnostic match is byte-identical to before; consumers
+    /// read style via [`WorldSnapshot::genome_for`]. `serde(default)` keeps older
+    /// serialized snapshots loadable.
+    #[serde(default)]
+    pub(crate) home_genome: SoccerTeamGenome,
+    #[serde(default)]
+    pub(crate) away_genome: SoccerTeamGenome,
     pub clock_seconds: f64,
     pub dt_seconds: f64,
     pub field_length: f64,
@@ -12435,6 +12515,8 @@ impl WorldSnapshot {
             tick: m.tick,
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            home_genome: m.home_genome.clone(),
+            away_genome: m.away_genome.clone(),
             clock_seconds: m.clock_seconds,
             dt_seconds: m.config.dt_seconds,
             field_length: m.config.field_length_yards,
@@ -12551,6 +12633,36 @@ impl WorldSnapshot {
         ))
     }
 
+    /// A midfielder OR forward who is carrying the ball and driving at the opponent's goal:
+    /// in the opponent half and advancing at pace (running/sprinting, or with clear recent
+    /// forward progress). This is the cue for the OTHER attacking mids and strikers to make
+    /// urgent, sprinting runs to find openings in the defence — the user's "more urgency".
+    /// Unlike [`Self::striker_holder_in_opponent_half`], it includes midfield carriers and
+    /// requires the carrier to actually be advancing, not merely holding the ball up.
+    pub(crate) fn attacking_carrier_driving_at_goal(&self, team: Team) -> Option<(usize, Vec2)> {
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team
+            || !matches!(holder.role, PlayerRole::Midfielder | PlayerRole::Forward)
+            || !position_in_opponent_half(team, self.ball.position, self.field_length)
+        {
+            return None;
+        }
+        let advancing_at_pace = matches!(
+            holder.movement_gait,
+            MovementGait::Run | MovementGait::Sprint
+        ) || self.player_forward_progress_over_seconds(holder, 1.0)
+            > ATTACKING_CARRIER_DRIVE_PROGRESS_YARDS;
+        if !advancing_at_pace {
+            return None;
+        }
+        Some((
+            holder_id,
+            self.player_position(holder_id)
+                .unwrap_or(self.ball.position),
+        ))
+    }
+
     fn opponent_striker_holder_in_attacking_half(&self, defending_team: Team) -> Option<Vec2> {
         self.striker_holder_in_opponent_half(defending_team.other())
             .map(|(_, position)| position)
@@ -12567,7 +12679,9 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn attacking_support_sprint_active(&self, team: Team) -> bool {
-        self.striker_holder_in_opponent_half(team).is_some() || self.team_speed_surge_active(team)
+        self.striker_holder_in_opponent_half(team).is_some()
+            || self.attacking_carrier_driving_at_goal(team).is_some()
+            || self.team_speed_surge_active(team)
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
@@ -15407,11 +15521,24 @@ impl WorldSnapshot {
     /// sides (nearest opponent ≥4yd) but on the FAR side of a defender standing in the direct
     /// lane. A ground/flat pass is blocked, so a high gentle scoop drops over the defender onto
     /// the teammate. Returns the most-open such teammate.
+    /// The tactical genome a team is playing with (neutral default until installed).
+    pub(crate) fn genome_for(&self, team: Team) -> &SoccerTeamGenome {
+        match team {
+            Team::Home => &self.home_genome,
+            Team::Away => &self.away_genome,
+        }
+    }
+
     pub(crate) fn scoop_pass_target_for(&self, player_id: usize) -> Option<usize> {
         if self.ball.holder != Some(player_id) {
             return None;
         }
         let me = self.players.iter().find(|p| p.id == player_id)?;
+        // Tactical genome (gene: use_scoop_pass): a team whose style forgoes the
+        // scoop never plays one. Default genome = true ⇒ original behavior.
+        if !self.genome_for(me.team).use_scoop_pass {
+            return None;
+        }
         let me_pos = self.player_snapshot_position(me);
         // The carrier must be relatively surrounded — a scoop is an escape from pressure.
         let crowd = self
@@ -16780,6 +16907,21 @@ impl WorldSnapshot {
         })
     }
 
+    /// Every teammate of the passer who is in an offside position at the moment the ball is
+    /// played — the full set of players the assistant must keep an eye on, not just the
+    /// intended receiver. Enforcement flags whichever of these first becomes involved in
+    /// play. Each candidate reuses the exact same geometry as `pending_offside_for_pass`.
+    pub(crate) fn offside_candidates_for_pass(&self, passer_id: usize) -> Vec<PendingOffside> {
+        let Some(passer) = self.players.iter().find(|p| p.id == passer_id) else {
+            return Vec::new();
+        };
+        self.players
+            .iter()
+            .filter(|p| p.team == passer.team && p.id != passer.id)
+            .filter_map(|target| self.pending_offside_for_pass(passer_id, target.id))
+            .collect()
+    }
+
     pub(crate) fn second_last_defender_line_for(&self, attacking_team: Team) -> Option<f64> {
         let mut defender_ys = self
             .players
@@ -16868,19 +17010,23 @@ impl WorldSnapshot {
             return None;
         }
         // A through-ball possession strategy with the holder able to release (low-to-
-        // medium pressure OR eye contact) makes attacking mids/strikers commit to the run
-        // every tick — actively breaking the offside trap — from a wider staging band,
-        // rather than the occasional cadence used in neutral build-up.
+        // medium pressure OR eye contact), OR a midfielder/striker carrying the ball and
+        // driving at goal, makes attacking mids/strikers commit to the run every tick —
+        // actively threatening the space in behind — from a wider staging band, rather than
+        // the occasional cadence used in neutral build-up. The carry-at-goal cue is what
+        // injects urgency when a teammate is running at the defence.
         let through_ball_invite = self.team_plays_through_ball(me.team)
             && self.holder_can_release_over_the_top(player_id);
+        let carrier_driving = self.attacking_carrier_driving_at_goal(me.team).is_some();
+        let urgent_run_invite = through_ball_invite || carrier_driving;
         let cadence = (self.tick + player_id as u64 * 17) % 41;
-        if cadence > 5 && !through_ball_invite {
+        if cadence > 5 && !urgent_run_invite {
             return None;
         }
         let current = self.player_snapshot_position(me);
         let line_y = self.second_last_defender_line_for(me.team)?;
         let staging_y = line_y - me.team.attack_dir() * 20.0;
-        let staging_tolerance = if through_ball_invite { 24.0 } else { 14.0 };
+        let staging_tolerance = if urgent_run_invite { 24.0 } else { 14.0 };
         if (current.y - staging_y).abs() > staging_tolerance {
             return None;
         }
@@ -16889,7 +17035,12 @@ impl WorldSnapshot {
             .holder
             .and_then(|holder| self.player_position(holder))
             .unwrap_or(self.ball.position);
-        let run_y = line_y + me.team.attack_dir() * 9.0;
+        // Stay onside: hold the staging run level with / just behind the second-last
+        // defender — timing the run — rather than standing in an offside position. The
+        // burst BEYOND the line happens once the ball is actually played in behind, which
+        // the pass-reception / loose-ball recovery movement handles (and which is legally
+        // onside because the ball is already played).
+        let run_y = line_y - me.team.attack_dir() * ONSIDE_RUN_HOLD_BUFFER_YARDS;
         let target = Vec2::new(
             (current.x * 0.76 + holder_position.x * 0.24).clamp(4.0, self.field_width - 4.0),
             run_y,

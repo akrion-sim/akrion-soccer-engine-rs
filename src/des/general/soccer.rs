@@ -1714,6 +1714,15 @@ const BALL_IN_BEHIND_MAX_FROM_GOAL_YARDS: f64 = 55.0;
 const IN_BEHIND_COVER_DISTANCE_YARDS: f64 = 6.0;
 const IN_BEHIND_SPRINT_PRESSURE: f64 = 0.45;
 const IN_BEHIND_GK_MAX_ADVANCE_YARDS: f64 = 16.0;
+/// A midfielder/striker carrier counts as "driving at goal" — the cue for other attackers
+/// to make urgent sprinting runs in behind — when, beyond running/sprinting gait, they have
+/// covered at least this many yards goalward in the last second (a deliberate forward carry,
+/// not a static or sideways hold).
+const ATTACKING_CARRIER_DRIVE_PROGRESS_YARDS: f64 = 2.0;
+/// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
+/// stays level/behind the line (timing the run) until the ball is actually played beyond it,
+/// rather than standing in an offside position.
+const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
 /// Over-the-top run trigger: minimum cos-angle between the holder's facing and the
 /// direction to the runner for "eye contact" (≈ within 60°) — the holder is looking up
 /// at the runner before they commit to breaking the line.
@@ -11442,7 +11451,15 @@ pub(crate) struct PendingPass {
     launch_speed_yps: f64,
     receiver_position_at_launch: Option<Vec2>,
     receiver_velocity_at_launch: Option<Vec2>,
+    /// Offside phase of the INTENDED target at the moment the ball was played (display /
+    /// snapshot). Enforcement uses `offside_candidates`, which assesses every attacker.
     offside: Option<PendingOffside>,
+    /// Every teammate of the passer who was in an offside position at the moment the ball
+    /// was played — not just the intended target. Whichever of them first interferes with
+    /// play (controls the ball, or comes within the interference radius of it) is flagged,
+    /// matching the Laws: any player in an offside position who becomes involved is
+    /// penalised, regardless of who the pass was "meant" for.
+    offside_candidates: Vec<PendingOffside>,
 }
 
 #[derive(Clone, Debug)]
@@ -37361,6 +37378,8 @@ fn tracking_frame_to_world_snapshot(
         tick: frame.tick,
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
+        away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         clock_seconds: frame.clock_seconds,
         dt_seconds: config.dt_seconds,
         field_length: config.field_length_yards,

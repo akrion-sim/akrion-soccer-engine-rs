@@ -6,5 +6,6 @@ pub use des_engine::des::general::{
 };
 
 pub mod soccer;
+pub mod soccer_genome;
 pub mod soccer_rotation;
 pub mod tournament;

@@ -1417,9 +1417,16 @@ impl PlayerAgent {
         let possession_team = snapshot.controlled_possession_team();
         let flank_policy_active =
             possession_team == Some(self.team) && directive.flank_attack_policy.is_flank();
+        // A striker holding up in the opponent half, OR a midfielder/striker carrying the
+        // ball and driving at goal, both pull the other attackers into roaming runs to find
+        // space in behind — the latter is the urgency cue for a teammate running at the
+        // defence (not just a settled forward).
         let striker_attack = snapshot
             .striker_holder_in_opponent_half(self.team)
-            .is_some();
+            .is_some()
+            || snapshot
+                .attacking_carrier_driving_at_goal(self.team)
+                .is_some();
         let shape_support_urgency = attacking_shape_support_urgency(snapshot, self.team);
         let holder_pressure_urgency = holder_pressure_support_urgency(snapshot, self.team);
         let support_urgency =
@@ -3928,12 +3935,15 @@ impl PlayerAgent {
                             > GOALKEEPER_LINE_RECOVERY_SPRINT_DISTANCE_YARDS
                 } else {
                     // Energy conservation: when the anaerobic reserve is low, only the PEAK
-                    // attacking moments (a run in behind, or urgent support for a pressured
-                    // holder) are worth a sprint — routine shape/support runs jog to save the
-                    // reserve for when it matters.
+                    // attacking moments (a run in behind, urgent support for a pressured
+                    // holder, or a teammate carrying the ball at goal) are worth a sprint —
+                    // routine shape/support runs jog to save the reserve for when it matters.
                     let peak_moment = holder_pressure_support_urgency(snapshot, self.team)
                         >= PRESSURED_SUPPORT_SPRINT_URGENCY
-                        || normalize_soccer_action_label(&action_label) == "run-in-behind";
+                        || normalize_soccer_action_label(&action_label) == "run-in-behind"
+                        || snapshot
+                            .attacking_carrier_driving_at_goal(self.team)
+                            .is_some();
                     let conserving = self.fatigue > SPRINT_CONSERVE_FATIGUE && !peak_moment;
                     !conserving
                         && (snapshot.attacking_support_sprint_active(self.team)

@@ -85,6 +85,7 @@ fn test_pending_pass(
         receiver_position_at_launch: Some(intended_target),
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
+        offside_candidates: Vec::new(),
     }
 }
 
@@ -9258,6 +9259,7 @@ fn unpressured_receiver_steps_toward_the_ball_to_control_it_early() {
         receiver_position_at_launch: Some(sim.players[receiver].position),
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
+        offside_candidates: Vec::new(),
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -9580,6 +9582,7 @@ fn off_ball_no_chance_player_drops_goalside_of_anticipated_ball() {
         receiver_position_at_launch: Some(Vec2::new(40.0, 60.0)),
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
+        offside_candidates: Vec::new(),
     });
     let snap = WorldSnapshot::from_match(&sim);
     // The brain wants to push upfield, ahead of where the ball is going.
@@ -18101,6 +18104,7 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         receiver_position_at_launch: Some(sim.players[9].position),
         receiver_velocity_at_launch: Some(sim.players[9].velocity),
         offside: None,
+        offside_candidates: Vec::new(),
     });
     sim.pending_shot = Some(PendingShot {
         team: Team::Home,
@@ -21543,6 +21547,7 @@ fn aerial_pass_interception_pressure_doubles_or_triples_near_landing() {
         receiver_position_at_launch: Some(Vec2::new(40.0, 104.0)),
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
+        offside_candidates: Vec::new(),
     };
     let aerial = PendingPass {
         flight: PassFlight::Aerial,
@@ -21588,6 +21593,7 @@ fn pass_interception_requires_defender_to_face_ball_path() {
         receiver_position_at_launch: Some(Vec2::new(40.0, 60.0)),
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
+        offside_candidates: Vec::new(),
     };
     let previous_ball_pos = Vec2::new(40.0, 50.0);
     let ball_pos = Vec2::new(40.0, 60.0);
@@ -21682,6 +21688,7 @@ fn aerial_cross_reception_exposes_first_touch_header_and_control_choices() {
         receiver_position_at_launch: Some(sim.players[receiver].position),
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
+        offside_candidates: Vec::new(),
     });
 
     sim.apply_ball_outcome(BallStepOutcome::Controlled {
@@ -30384,7 +30391,10 @@ fn teammate_touch_before_offside_runner_involvement_resets_pending_offside() {
     let receiving_teammate = 8;
     sim.players[passer].position = Vec2::new(40.0, 70.0);
     sim.players[runner].position = Vec2::new(42.0, 108.0);
-    sim.players[receiving_teammate].position = Vec2::new(40.0, 108.0);
+    // The teammate who intercepts the ball first must be ONSIDE (behind the second-last
+    // defender at y=96) for their touch to legitimately reset the phase — an offside
+    // teammate who got involved would itself be penalised (see the test below).
+    sim.players[receiving_teammate].position = Vec2::new(40.0, 90.0);
     for away in 11..22 {
         sim.players[away].position = Vec2::new(8.0 + away as f64, 82.0);
     }
@@ -30430,6 +30440,60 @@ fn teammate_touch_before_offside_runner_involvement_resets_pending_offside() {
     assert!(sim.pending_pass.is_none());
     assert_eq!(sim.ball.holder, Some(receiving_teammate));
     assert!(!sim.events.iter().any(|event| event.kind == "offside"));
+}
+
+#[test]
+fn non_target_attacker_in_offside_position_is_flagged_when_it_gets_involved() {
+    // Officiating hardening: the assistant assesses EVERY attacker who was in an offside
+    // position at the moment of the pass — not only the player the pass was "aimed" at.
+    // Here the pass is aimed at one runner, but a DIFFERENT attacker who was also in an
+    // offside position is the one who runs onto the ball: that player must be flagged.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 5;
+    let intended = 9;
+    let other_offside_attacker = 8;
+    sim.players[passer].position = Vec2::new(40.0, 70.0);
+    sim.players[intended].position = Vec2::new(48.0, 104.0);
+    // Both attackers are beyond the second-last defender (y=96) at the moment of the pass.
+    sim.players[other_offside_attacker].position = Vec2::new(34.0, 106.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(8.0 + away as f64, 82.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(42.0, 96.0);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.holder = Some(passer);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(intended),
+            power: 1.0,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+    // The non-target attacker was recorded as an offside candidate, not just the target.
+    assert!(sim
+        .pending_pass
+        .as_ref()
+        .is_some_and(|pass| pass
+            .offside_candidates
+            .iter()
+            .any(|offside| offside.target == other_offside_attacker)));
+
+    // The non-target offside attacker is the one who gets to the ball.
+    sim.ball.holder = None;
+    sim.apply_ball_outcome(BallStepOutcome::Controlled {
+        holder: other_offside_attacker,
+        holder_team: Team::Home,
+        possession_result: BallPossessionResult::PassCompleted(Team::Home),
+        untargeted_long_ball: None,
+    });
+
+    assert_eq!(sim.stats.offsides_home, 1);
+    assert!(sim.pending_pass.is_none());
+    assert!(sim.events.iter().any(|event| event.kind == "offside"));
 }
 
 #[test]
@@ -34485,6 +34549,7 @@ fn completed_pass_reward_reinforces_passer_anticipating_receiver_stride() {
         receiver_position_at_launch: Some(receiver_position),
         receiver_velocity_at_launch: Some(receiver_velocity),
         offside: None,
+        offside_candidates: Vec::new(),
     };
     let feet_pass = pending_for_target(receiver_position);
     let stride_pass = pending_for_target(stride_target);
@@ -35358,6 +35423,7 @@ fn off_target_pending_pass_receiver_sprints_to_ball() {
         receiver_position_at_launch: Some(sim.players[receiver].position),
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
+        offside_candidates: Vec::new(),
     });
     sim.players[12].position = Vec2::new(36.0, 64.0);
 
@@ -35433,6 +35499,7 @@ fn pressured_pending_pass_receiver_prioritizes_early_intercept_margin() {
             receiver_position_at_launch: Some(sim.players[receiver].position),
             receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
             offside: None,
+            offside_candidates: Vec::new(),
         });
         sim
     };
@@ -35499,6 +35566,7 @@ fn pressured_pending_pass_recovery_is_learned_as_rewarded_state_action() {
         receiver_position_at_launch: Some(sim.players[receiver].position),
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
+        offside_candidates: Vec::new(),
     });
 
     let before = WorldSnapshot::from_match(&sim);
@@ -43751,6 +43819,7 @@ fn a_pass_target_cannot_capture_the_ball_while_its_feet_are_out_of_reach() {
         receiver_position_at_launch: Some(Vec2::new(40.0, 42.0)),
         receiver_velocity_at_launch: Some(Vec2::new(0.0, 5.0)),
         offside: None,
+        offside_candidates: Vec::new(),
     };
     let got = nearest_ball_controller_for_segment(
         1,
