@@ -5,12 +5,16 @@
 # the real engine (neural-authoritative), and promotes the champion back as the
 # new active policy version — so each night builds on the last.
 #
-# Scheduling contract (the "2am → finish by 7am" the design called for):
+# Scheduling contract: START at 2am, run to COMPLETION even if it spills past 7am.
 #   * schedule "0 2 * * *" + spec.timeZone (k8s CronJobs are UTC unless timeZone
 #     is set; 2am LOCAL requires it).
 #   * concurrencyPolicy: Forbid — never overlap two tournaments.
-#   * activeDeadlineSeconds: 18000 (5h) — HARD 7am stop; the Job is killed if it
-#     overruns, so a slow/stuck run can never bleed into the day.
+#   * activeDeadlineSeconds: 28800 (8h) — NOT a 7am stop. The full 128-team /
+#     60-min / T=2 bracket needs ~5.25h, which overran the old 5h cap and was
+#     hard-killed at 7am every night (never promoting a champion; verified
+#     2026-06-15 DeadlineExceeded on both clusters). Per the owner's call we now
+#     let it finish past the window; 8h is only a backstop so a genuine HANG can't
+#     run into the next day / block the next night (Forbid would skip it).
 #
 # Runtime budget: the bracket runs independent fixtures in parallel on
 # SOCCER_TOURNAMENT_THREADS worker threads. Keep this at 2 by default so AWS EC2
@@ -43,9 +47,10 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # Hard 2am–7am stop (5h). Includes the ~4-5 min cold clone+build (the build
-      # dir is a per-pod emptyDir, not a node cache — see the volumes section).
-      activeDeadlineSeconds: 18000
+      # 8h backstop (NOT a 7am stop) — the bracket is allowed to finish past the
+      # 2am-7am window; this only guards against a true hang. Includes the ~4-5 min
+      # cold clone+build (the build dir is a per-pod emptyDir — see volumes below).
+      activeDeadlineSeconds: 28800
       backoffLimit: 1
       template:
         metadata:
