@@ -12791,6 +12791,169 @@ impl WorldSnapshot {
             .clamp(0.0, 0.60)
     }
 
+    fn ball_retention_no_outlet_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
+        if self.ball.holder != Some(player.id)
+            || self
+                .controlled_possession_team()
+                .or_else(|| self.possession_team())
+                != Some(player.team)
+        {
+            return 0.0;
+        }
+        let current = self.player_snapshot_position(player);
+        let target_fit = (1.0
+            - current.distance(target) / BALL_RETENTION_RELIEF_NO_OUTLET_RADIUS_YARDS)
+            .clamp(0.0, 1.0);
+        if target_fit <= 0.0 {
+            return 0.0;
+        }
+        let nearest_opponent_distance = self.nearest_opponent_distance_at(player.team, current);
+        let pressure = pressure_from_nearest_distance(nearest_opponent_distance);
+        let floor_options = self.ranked_visible_pass_targets(player.id, 1).len();
+        let aerial_options = self.ranked_visible_aerial_pass_targets(player.id, 1).len();
+        let release_valves = self.ball_retention_release_valve_count(
+            player,
+            current,
+            nearest_opponent_distance,
+            pressure,
+        );
+        let outlet_shortage =
+            ((2.0 - (floor_options + aerial_options) as f64 - release_valves as f64 * 0.75) / 2.0)
+                .clamp(0.0, 1.0);
+        if outlet_shortage <= 0.0 {
+            return 0.0;
+        }
+        let blocked_forward =
+            (1.0 - self.forward_dribble_space_yards(player.id) / 8.0).clamp(0.0, 1.0);
+        (target_fit
+            * outlet_shortage
+            * (0.26
+                + pressure * 0.26
+                + blocked_forward * 0.18
+                + ability01(player.skills.dribbling) * 0.10))
+            .clamp(0.0, 0.68)
+    }
+
+    fn ball_retention_release_valve_count(
+        &self,
+        player: &PlayerSnapshot,
+        current: Vec2,
+        nearest_opponent_distance: f64,
+        pressure: f64,
+    ) -> usize {
+        if !pass_origin_in_own_half(player.team, current, self.field_length) {
+            return 0;
+        }
+        let yards_to_own_goal = (player.team.other().goal_y(self.field_length) - current.y).abs();
+        let clearance_available =
+            matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender)
+                && (nearest_opponent_distance <= CLEARANCE_MAX_OPPONENT_DISTANCE_YARDS
+                    || yards_to_own_goal <= 20.0
+                    || pressure >= 0.55);
+        let route_one_available = matches!(
+            player.role,
+            PlayerRole::Goalkeeper | PlayerRole::Defender | PlayerRole::Midfielder
+        ) && (pressure >= 0.35
+            || self.route_one_target_for(player.id).is_some());
+        clearance_available as usize + route_one_available as usize
+    }
+
+    fn teammate_cover_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
+        if !matches!(player.role, PlayerRole::Defender | PlayerRole::Midfielder) {
+            return 0.0;
+        }
+        let directive = self.tactical_directive(player.team);
+        let possession = self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team());
+        let urgency = if possession == Some(player.team.other()) {
+            directive
+                .press_intensity
+                .max(directive.adversarial_embedding_defense_score)
+                .max(directive.neural_formation_defense_score)
+                .clamp(0.0, 1.0)
+        } else if possession == Some(player.team) {
+            directive
+                .attacking_overload_score
+                .max(directive.risk_tolerance)
+                .max(directive.neural_formation_attack_score)
+                .clamp(0.0, 1.0)
+                * 0.65
+        } else {
+            0.35
+        };
+        self.players
+            .iter()
+            .filter(|teammate| teammate.team == player.team && teammate.id != player.id)
+            .filter(|teammate| {
+                matches!(teammate.role, PlayerRole::Defender | PlayerRole::Midfielder)
+            })
+            .map(|teammate| {
+                let displaced = self
+                    .player_snapshot_position(teammate)
+                    .distance(teammate.home_position);
+                let displaced_fit =
+                    ((displaced - TEAMMATE_COVER_RELIEF_DISPLACED_YARDS) / 14.0).clamp(0.0, 1.0);
+                let slot_fit = (1.0
+                    - target.distance(teammate.home_position)
+                        / TEAMMATE_COVER_RELIEF_HOME_SLOT_RADIUS_YARDS)
+                    .clamp(0.0, 1.0);
+                let role_fit = match (player.role, teammate.role) {
+                    (a, b) if a == b => 1.0,
+                    (PlayerRole::Midfielder, PlayerRole::Defender) => 0.78,
+                    (PlayerRole::Defender, PlayerRole::Midfielder) => 0.64,
+                    _ => 0.0,
+                };
+                displaced_fit * slot_fit * role_fit * (0.28 + urgency * 0.32)
+            })
+            .fold(0.0_f64, f64::max)
+            .clamp(0.0, 0.62)
+    }
+
+    fn team_urgency_shape_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
+        if player.role == PlayerRole::Goalkeeper {
+            return 0.0;
+        }
+        let directive = self.tactical_directive(player.team);
+        let possession = self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team());
+        let attack_dir = player.team.attack_dir();
+        let commit_denominator = (TEAM_URGENCY_SHAPE_RELIEF_FULL_COMMIT_YARDS
+            - TEAM_URGENCY_SHAPE_RELIEF_MIN_COMMIT_YARDS)
+            .max(1.0);
+        let forward_commit = (((target.y - player.home_position.y) * attack_dir
+            - TEAM_URGENCY_SHAPE_RELIEF_MIN_COMMIT_YARDS)
+            / commit_denominator)
+            .clamp(0.0, 1.0);
+        let recovery_commit = (((player.home_position.y - target.y) * attack_dir
+            - TEAM_URGENCY_SHAPE_RELIEF_MIN_COMMIT_YARDS)
+            / commit_denominator)
+            .clamp(0.0, 1.0);
+        if possession == Some(player.team) {
+            let urgency = directive
+                .risk_tolerance
+                .max(directive.attacking_overload_score)
+                .max(directive.adversarial_embedding_attack_score)
+                .max(directive.neural_formation_attack_score)
+                .clamp(0.0, 1.0);
+            let urgency_fit = ((urgency - 0.68) / 0.32).clamp(0.0, 1.0);
+            (forward_commit * urgency_fit * 0.54).clamp(0.0, 0.54)
+        } else if possession == Some(player.team.other()) {
+            let urgency = directive
+                .press_intensity
+                .max(directive.adversarial_embedding_defense_score)
+                .max(directive.neural_formation_defense_score)
+                .clamp(0.0, 1.0);
+            let urgency_fit = ((urgency - 0.68) / 0.32).clamp(0.0, 1.0);
+            let goal_side_fit =
+                (((self.ball.position.y - target.y) * attack_dir) / 24.0).clamp(0.0, 1.0);
+            (recovery_commit.max(goal_side_fit * 0.72) * urgency_fit * 0.58).clamp(0.0, 0.58)
+        } else {
+            0.0
+        }
+    }
+
     pub(crate) fn positional_shape_exception_relief_for_player_target(
         &self,
         player: &PlayerSnapshot,
@@ -12798,6 +12961,9 @@ impl WorldSnapshot {
     ) -> f64 {
         self.offensive_high_speed_run_relief(player, target)
             .max(self.defensive_tracking_relief(player, target))
+            .max(self.ball_retention_no_outlet_relief(player, target))
+            .max(self.teammate_cover_relief(player, target))
+            .max(self.team_urgency_shape_relief(player, target))
     }
 
     fn defensive_tracking_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
@@ -12809,45 +12975,124 @@ impl WorldSnapshot {
         {
             return 0.0;
         }
-        let Some(holder_id) = self.ball.holder else {
-            return 0.0;
-        };
-        let Some(holder) = self
-            .players
+        self.players
             .iter()
-            .find(|candidate| candidate.id == holder_id && candidate.team == player.team.other())
-        else {
-            return 0.0;
-        };
-        let holder_position = self.player_snapshot_position(holder);
+            .filter(|opponent| opponent.team == player.team.other())
+            .filter_map(|opponent| {
+                self.defensive_tracking_relief_for_opponent(player, target, opponent)
+            })
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn defensive_tracking_relief_for_opponent(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        opponent: &PlayerSnapshot,
+    ) -> Option<f64> {
+        let opponent_position = self.player_snapshot_position(opponent);
+        let context_fit = self.defensive_tracking_opponent_context_fit(opponent, opponent_position);
+        if context_fit <= 0.0 {
+            return None;
+        }
         let current = self.player_snapshot_position(player);
-        let current_distance = current.distance(holder_position);
-        let target_distance = target.distance(holder_position);
+        let current_distance = current.distance(opponent_position);
+        let target_distance = target.distance(opponent_position);
         if current_distance > DEFENSIVE_TRACKING_RELIEF_RADIUS_YARDS
             || target_distance > DEFENSIVE_TRACKING_RELIEF_TARGET_RADIUS_YARDS
         {
-            return 0.0;
+            return None;
         }
         let player_tracking_distance = current_distance.min(target_distance);
         let player_tracking_score =
             defensive_tracking_marker_score(player, player_tracking_distance);
-        let teammate_has_better_marker_claim = self.players.iter().any(|candidate| {
-            candidate.team == player.team
-                && candidate.id != player.id
-                && matches!(
+        let teammate_has_easy_handoff_claim = self.players.iter().any(|candidate| {
+            if candidate.team != player.team
+                || candidate.id == player.id
+                || !matches!(
                     candidate.role,
                     PlayerRole::Defender | PlayerRole::Midfielder
                 )
-                && defensive_tracking_marker_score(
-                    candidate,
-                    self.player_snapshot_position(candidate)
-                        .distance(holder_position),
-                ) > player_tracking_score + 1e-9
+            {
+                return false;
+            }
+            let candidate_position = self.player_snapshot_position(candidate);
+            if self.defensive_tracking_teammate_has_other_mark(
+                candidate,
+                opponent.id,
+                candidate_position,
+            ) {
+                return false;
+            }
+            defensive_tracking_marker_score(
+                candidate,
+                candidate_position.distance(opponent_position),
+            ) > player_tracking_score + DEFENSIVE_TRACKING_HANDOFF_SCORE_MARGIN
         });
-        if teammate_has_better_marker_claim {
+        if teammate_has_easy_handoff_claim {
+            return None;
+        }
+        Some(
+            ((0.48 + ability01(player.skills.defensive_tracking) * 0.34) * context_fit)
+                .clamp(0.0, 0.82),
+        )
+    }
+
+    fn defensive_tracking_opponent_context_fit(
+        &self,
+        opponent: &PlayerSnapshot,
+        opponent_position: Vec2,
+    ) -> f64 {
+        if self.ball.holder == Some(opponent.id) {
+            return 1.0;
+        }
+        if opponent.role == PlayerRole::Goalkeeper {
             return 0.0;
         }
-        (0.48 + ability01(player.skills.defensive_tracking) * 0.34).clamp(0.0, 0.82)
+        let attacking_half_fit: f64 =
+            if position_in_opponent_half(opponent.team, opponent_position, self.field_length) {
+                0.78
+            } else {
+                0.0
+            };
+        let goal_threat_fit = (1.0
+            - (opponent.team.goal_y(self.field_length) - opponent_position.y).abs() / 42.0)
+            .clamp(0.0, 1.0)
+            * 0.88;
+        let role_fit = match opponent.role {
+            PlayerRole::Forward => 1.0,
+            PlayerRole::Midfielder => 0.82,
+            PlayerRole::Defender => 0.42,
+            PlayerRole::Goalkeeper => 0.0,
+        };
+        let advanced_fit = attacking_half_fit.max(goal_threat_fit);
+        let near_ball_fit = (1.0 - (opponent_position.distance(self.ball.position) - 5.0) / 28.0)
+            .clamp(0.0, 1.0)
+            * advanced_fit;
+        let context_fit = near_ball_fit.max(advanced_fit) * role_fit;
+        if context_fit >= 0.35 {
+            context_fit
+        } else {
+            0.0
+        }
+    }
+
+    fn defensive_tracking_teammate_has_other_mark(
+        &self,
+        marker: &PlayerSnapshot,
+        tracked_opponent_id: usize,
+        marker_position: Vec2,
+    ) -> bool {
+        self.players
+            .iter()
+            .filter(|opponent| opponent.team == marker.team.other())
+            .filter(|opponent| opponent.id != tracked_opponent_id)
+            .any(|opponent| {
+                let distance = marker_position.distance(self.player_snapshot_position(opponent));
+                distance <= DEFENSIVE_TRACKING_HANDOFF_BUSY_OPPONENT_RADIUS_YARDS
+                    && defensive_tracking_marker_score(marker, distance)
+                        >= DEFENSIVE_TRACKING_HANDOFF_BUSY_MARK_SCORE
+            })
     }
 
     pub(crate) fn role_line_deviation_yards_for_target(

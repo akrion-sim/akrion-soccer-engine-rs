@@ -1,16 +1,11 @@
-# Nightly 128-team soccer LEARNING tournament.
+# Legacy nightly 128-team soccer learning tournament manifest.
 #
-# Runs once a night, 2:00am America/Chicago, and must finish well before 7am. The
-# default bracket is ~256 matches whose critical path is only ~10 "waves", so the
-# job is compute-bound, not deadline-bound: `main_soccer_tournament_run` plays many
-# matches in parallel (SOCCER_TOURNAMENT_PARALLELISM), warm-starts each team's brain
-# from the previous night's result in Postgres, and persists the evolved brains +
-# full bracket back (des_soccer_tournaments / _matches / _team_brains).
+# Suspended by default so it cannot double-run alongside
+# dd-soccer-tournament-nightly. Keep this only as a compatible template for
+# clusters that intentionally want a second, staggered tournament lane.
 #
 # Unlike the continuous self-play Deployment, this is a CronJob: one run per night,
-# Forbid overlap, and a hard activeDeadline a little under 5 hours. The app stops
-# itself ~5min before that (SOCCER_TOURNAMENT_DEADLINE_SECONDS) so it flushes
-# Postgres instead of being SIGKILLed mid-write.
+# Forbid overlap, and a hard activeDeadline a little under 5 hours.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -23,6 +18,7 @@ metadata:
 spec:
   schedule: "0 2 * * *"
   timeZone: America/Chicago        # field (not hardcoded UTC) so DST never drifts the start
+  suspend: true                    # canonical active job is dd-soccer-tournament-nightly
   concurrencyPolicy: Forbid        # never overlap nights
   startingDeadlineSeconds: 1800    # if the controller was down at 2am, still start within 30m
   successfulJobsHistoryLimit: 5
@@ -103,7 +99,7 @@ spec:
                 - name: CARGO_HOME
                   value: /tmp/cargo
                 - name: CARGO_BUILD_JOBS
-                  value: "8"
+                  value: "2"
                 - name: CARGO_NET_RETRY
                   value: "5"
                 - name: RUST_BACKTRACE
@@ -123,8 +119,12 @@ spec:
                     secretKeyRef:
                       name: dd-remote-rest-api-secrets
                       key: RDS_DATABASE_URL
-                - name: SOCCER_TOURNAMENT_EXPERIMENT
+                - name: SOCCER_EXPERIMENT_SLUG
                   value: nightly-soccer-tournament
+                # Same key across clusters if this template is intentionally
+                # unsuspended; otherwise the active nightly manifest owns it.
+                - name: SOCCER_TOURNAMENT_LOCK_KEY
+                  value: soccer-nightly-tournament
                 # --- tournament shape + learning ---
                 - name: SOCCER_TOURNAMENT_TEAMS
                   value: "128"
@@ -134,25 +134,21 @@ spec:
                   value: "2"
                 - name: SOCCER_TOURNAMENT_THIRD_PLACE
                   value: "true"
-                - name: SOCCER_TOURNAMENT_MODE
+                - name: SOCCER_TOURNAMENT_LEARNING_MODE
                   value: bilearning
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
-                  value: "120"
+                  value: "3600"
                 # Parallel matches. Each match is an independent in-pod SoccerMatch
                 # (inline neural, deterministic); keep this within the pod's CPU/mem.
-                - name: SOCCER_TOURNAMENT_PARALLELISM
-                  value: "8"
-                # Graceful stop ~4h45m in — before activeDeadlineSeconds (4h50m) so
-                # the process flushes Postgres instead of being SIGKILLed.
-                - name: SOCCER_TOURNAMENT_DEADLINE_SECONDS
-                  value: "17100"
+                - name: SOCCER_TOURNAMENT_THREADS
+                  value: "2"
               resources:
                 requests:
-                  cpu: "4"
-                  memory: 8Gi
+                  cpu: "1"
+                  memory: 4Gi
                 limits:
-                  cpu: "16"
-                  memory: 48Gi
+                  cpu: "2"
+                  memory: 12Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
