@@ -2912,6 +2912,18 @@ impl SoccerMatch {
         near_goal_line && central
     }
 
+    /// True if `p` is inside `team`'s OWN 18-yard penalty area (the box in front of the goal
+    /// they defend): Home defends the y=0 end, Away the y=field_length end. Mirrors the
+    /// identically-named [`WorldSnapshot`] helper, used for Law 16 goal-kick enforcement.
+    pub(crate) fn point_in_own_penalty_area(&self, team: Team, p: Vec2) -> bool {
+        let central = (p.x - self.config.field_width_yards * 0.5).abs() <= 22.0;
+        let near_own_line = match team {
+            Team::Home => p.y <= 18.0,
+            Team::Away => p.y >= self.config.field_length_yards - 18.0,
+        };
+        central && near_own_line
+    }
+
     /// Advances the territory-spacing clocks from the settled end-of-tick positions
     /// and, for any pair that has overstayed its grace window, marks the
     /// worse-positioned player to vacate. Read by
@@ -8134,7 +8146,12 @@ impl SoccerMatch {
                 // Law 16: if a goal kick is still pending and the ball is being controlled
                 // while still inside the box, it never left the area on the first touch —
                 // retake the goal kick rather than allowing the illegal short reception.
-                let control_position = self.player_position(holder).unwrap_or(self.ball.position);
+                let control_position = self
+                    .players
+                    .iter()
+                    .find(|player| player.id == holder)
+                    .map(|player| player.position)
+                    .unwrap_or(self.ball.position);
                 if self.enforce_goal_kick_clearance_on_control(control_position) {
                     return;
                 }
@@ -9956,7 +9973,7 @@ impl SoccerMatch {
     /// still inside the box the guard stays armed; the retake itself is triggered at the
     /// moment a player brings the ball under control inside the box (see
     /// [`Self::enforce_goal_kick_clearance_on_control`]).
-    fn update_goal_kick_clearance(&mut self) {
+    pub(crate) fn update_goal_kick_clearance(&mut self) {
         if let Some((team, _)) = self.goal_kick_must_clear_box {
             if !self.point_in_own_penalty_area(team, self.ball.position) {
                 self.goal_kick_must_clear_box = None;

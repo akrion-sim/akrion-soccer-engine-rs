@@ -38321,6 +38321,133 @@ fn kickoff_arms_no_double_touch_guard_and_clears_on_another_touch() {
 }
 
 #[test]
+fn restart_taker_double_touch_guard_armed_for_throw_in_and_goal_kick() {
+    // The no-double-touch guard must arm on EVERY restart kind taken through the central
+    // restart path — throw-ins and goal kicks included, not just kickoffs.
+    for kind in [BallRestartKind::ThrowIn, BallRestartKind::GoalKick] {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let spot = match kind {
+            BallRestartKind::GoalKick => Vec2::new(40.0, 6.0),
+            _ => Vec2::new(0.0, 60.0),
+        };
+        sim.apply_restart(BallRestart {
+            kind,
+            awarded_team: Team::Home,
+            position: spot,
+        });
+        let taker = sim.ball.holder.expect("restart taker");
+        assert_eq!(
+            sim.restart_double_touch_guard,
+            Some(taker),
+            "guard should arm for {kind:?}"
+        );
+        // The taker re-touching does not clear it; another player's touch does.
+        sim.record_possession_touch(taker);
+        assert_eq!(sim.restart_double_touch_guard, Some(taker));
+        let other = sim
+            .players
+            .iter()
+            .find(|p| p.id != taker)
+            .map(|p| p.id)
+            .expect("another player");
+        sim.record_possession_touch(other);
+        assert_eq!(sim.restart_double_touch_guard, None);
+    }
+}
+
+#[test]
+fn goal_kick_controlled_inside_the_box_is_retaken() {
+    // Law 16: the ball must leave the penalty area on the first touch. A goal kick brought
+    // under control by a teammate while STILL inside the box did not clear the area, so it
+    // is retaken (the outcome backstop, independent of how the keeper was steered).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(40.0, 6.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::GoalKick,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    assert_eq!(sim.goal_kick_must_clear_box, Some((Team::Home, spot)));
+    assert_eq!(sim.stats.goal_kicks_home, 1);
+
+    // The kick is released and a teammate brings it under control INSIDE the box.
+    let in_box = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.id != keeper)
+        .map(|p| p.id)
+        .expect("home teammate");
+    sim.players[in_box].position = Vec2::new(sim.config.field_width_yards * 0.5, 9.0);
+    sim.ball.holder = None;
+    sim.apply_ball_outcome(BallStepOutcome::Controlled {
+        holder: in_box,
+        holder_team: Team::Home,
+        possession_result: BallPossessionResult::PassCompleted(Team::Home),
+        untargeted_long_ball: None,
+    });
+
+    // Retaken: the keeper holds again and the must-clear guard is re-armed.
+    assert_eq!(sim.ball.holder, Some(keeper));
+    assert_eq!(sim.goal_kick_must_clear_box, Some((Team::Home, spot)));
+    assert_eq!(sim.stats.goal_kicks_home, 2);
+}
+
+#[test]
+fn goal_kick_controlled_outside_the_box_is_legal_and_clears_the_guard() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(40.0, 6.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::GoalKick,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let outlet = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.id != keeper)
+        .map(|p| p.id)
+        .expect("home teammate");
+    // Received OUTSIDE the box (y=30 is beyond the 18-yard line).
+    sim.players[outlet].position = Vec2::new(sim.config.field_width_yards * 0.5, 30.0);
+    sim.ball.holder = None;
+    sim.apply_ball_outcome(BallStepOutcome::Controlled {
+        holder: outlet,
+        holder_team: Team::Home,
+        possession_result: BallPossessionResult::PassCompleted(Team::Home),
+        untargeted_long_ball: None,
+    });
+
+    // Legal: no retake, the guard is retired, the outlet keeps the ball.
+    assert_eq!(sim.ball.holder, Some(outlet));
+    assert_eq!(sim.goal_kick_must_clear_box, None);
+    assert_eq!(sim.stats.goal_kicks_home, 1);
+}
+
+#[test]
+fn goal_kick_guard_clears_the_instant_the_ball_leaves_the_box() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(40.0, 6.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::GoalKick,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+    assert_eq!(sim.goal_kick_must_clear_box, Some((Team::Home, spot)));
+
+    // Ball still inside the box: guard stays armed.
+    sim.ball.position = Vec2::new(40.0, 12.0);
+    sim.update_goal_kick_clearance();
+    assert_eq!(sim.goal_kick_must_clear_box, Some((Team::Home, spot)));
+
+    // Ball clears the 18-yard line: the kick is legally in play, guard retires.
+    sim.ball.position = Vec2::new(40.0, 24.0);
+    sim.update_goal_kick_clearance();
+    assert_eq!(sim.goal_kick_must_clear_box, None);
+}
+
+#[test]
 fn held_restart_pushes_encroaching_opponents_back_ten_yards() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let spot = Vec2::new(40.0, 60.0);
