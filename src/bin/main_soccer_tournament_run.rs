@@ -109,24 +109,191 @@ fn parse_learning_mode(raw: Option<String>) -> TournamentLearningMode {
     }
 }
 
-/// Build the entrant field. The first `round(team_count * seed_fraction)` teams
-/// inherit the seed neural snapshot (exploit the current best); the rest start
-/// fresh (explore). With no seed snapshot the whole field is fresh.
+/// Deterministic per-team RNG (splitmix64) so a given tournament seed reproduces
+/// the exact same diversified field — diversity must not break reproducibility.
+struct DiversityRng {
+    state: u64,
+}
+
+impl DiversityRng {
+    fn new(seed: u64) -> Self {
+        DiversityRng {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in [0, 1).
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+    /// Standard normal via Box–Muller.
+    fn gaussian(&mut self) -> f64 {
+        let u1 = self.unit().max(1e-12);
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+    fn coin(&mut self) -> bool {
+        self.next_u64() & 1 == 1
+    }
+}
+
+/// Recompute the cached parameter count + L2 norm after editing weights so the
+/// snapshot's bookkeeping stays consistent with its layers.
+fn refresh_snapshot_norm(snapshot: &mut SoccerNeuralNetworkSnapshot) {
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    for layer in &snapshot.layers {
+        for row in &layer.weights {
+            for weight in row {
+                sum_sq += weight * weight;
+                count += 1;
+            }
+        }
+        for bias in &layer.biases {
+            sum_sq += bias * bias;
+            count += 1;
+        }
+    }
+    snapshot.parameter_count = count;
+    snapshot.l2_norm = sum_sq.sqrt();
+}
+
+/// Add per-weight Gaussian noise so a descendant explores a basin near its parent.
+fn mutate_neural(
+    mut snapshot: SoccerNeuralNetworkSnapshot,
+    rng: &mut DiversityRng,
+    scale: f64,
+) -> SoccerNeuralNetworkSnapshot {
+    if scale <= 0.0 {
+        return snapshot;
+    }
+    for layer in &mut snapshot.layers {
+        for row in &mut layer.weights {
+            for weight in row.iter_mut() {
+                *weight += rng.gaussian() * scale;
+            }
+        }
+        for bias in &mut layer.biases {
+            *bias += rng.gaussian() * scale;
+        }
+    }
+    refresh_snapshot_norm(&mut snapshot);
+    snapshot
+}
+
+/// Uniform crossover: each weight is taken from one parent or the other. Parents
+/// must share architecture; on any shape mismatch parent `a` wins that slot (so a
+/// heterogeneous pool degrades to cloning rather than panicking).
+fn crossover_neural(
+    a: &SoccerNeuralNetworkSnapshot,
+    b: &SoccerNeuralNetworkSnapshot,
+    rng: &mut DiversityRng,
+) -> SoccerNeuralNetworkSnapshot {
+    let mut child = a.clone();
+    for (li, layer) in child.layers.iter_mut().enumerate() {
+        let Some(bl) = b.layers.get(li) else { continue };
+        for (ri, row) in layer.weights.iter_mut().enumerate() {
+            for (ci, weight) in row.iter_mut().enumerate() {
+                if rng.coin() {
+                    if let Some(bw) = bl.weights.get(ri).and_then(|r| r.get(ci)) {
+                        *weight = *bw;
+                    }
+                }
+            }
+        }
+        for (bi, bias) in layer.biases.iter_mut().enumerate() {
+            if rng.coin() {
+                if let Some(bb) = bl.biases.get(bi) {
+                    *bias = *bb;
+                }
+            }
+        }
+    }
+    refresh_snapshot_norm(&mut child);
+    child
+}
+
+/// Sample per-team RL hyperparameters around the defaults so teams learn with
+/// different horizons / step sizes / exploration appetites — cheap behavioural
+/// diversity that holds even before the nets diverge.
+fn sample_team_options(base: &SoccerQPolicyOptions, rng: &mut DiversityRng) -> SoccerQPolicyOptions {
+    let mut options = base.clone();
+    options.alpha = (base.alpha * rng.range(0.6, 1.6)).clamp(1.0e-4, 1.0);
+    options.gamma = rng.range(0.95, 0.995);
+    options.exploration_epsilon = rng.range(0.02, 0.15);
+    options
+}
+
+/// Build the entrant field. A tournament of clones learns nothing, so every team
+/// is seeded with its OWN starting brain (deterministically, off the tournament
+/// seed + team id):
+///
+/// * `parents` empty            → all teams start from a fresh net (cold start),
+///   each with its own sampled hyperparameters.
+/// * `parents.len() == 1`       → the first `round(team_count * seed_fraction)`
+///   teams are independent MUTATED descendants of that parent (exploit the
+///   current best along different directions); the rest are fresh explorers.
+/// * `parents.len() >= 2`       → the generational case (last tournament's
+///   top-N elite pool): each seeded team is a CROSSOVER of two random parents
+///   plus mutation — a random hybrid of the previous generation's best finishers.
+///
+/// `SOCCER_TOURNAMENT_DIVERSITY=0` restores the old behaviour (seeded teams clone
+/// the first parent; all share default options). `SOCCER_TOURNAMENT_MUTATION_SCALE`
+/// (default 0.03) sets the per-weight noise.
 fn build_entrants(
     format: &TournamentFormat,
     seed: u32,
-    seed_snapshot: Option<SoccerNeuralNetworkSnapshot>,
+    parents: &[SoccerNeuralNetworkSnapshot],
     seed_fraction: f64,
 ) -> Vec<TournamentTeam> {
-    let seeded_count =
-        ((format.team_count as f64) * seed_fraction.clamp(0.0, 1.0)).round() as usize;
-    let seeded_count = seeded_count.min(format.team_count);
+    let diversity = env_bool("SOCCER_TOURNAMENT_DIVERSITY", true);
+    let mutation_scale = env_f64("SOCCER_TOURNAMENT_MUTATION_SCALE", 0.03).max(0.0);
+    let base_options = SoccerQPolicyOptions::default();
+    let seeded_count = (((format.team_count as f64) * seed_fraction.clamp(0.0, 1.0)).round()
+        as usize)
+        .min(format.team_count);
+
     (0..format.team_count)
         .map(|id| {
-            let brain = match (id < seeded_count).then(|| seed_snapshot.clone()).flatten() {
-                Some(snapshot) => TeamBrain::from_snapshot(snapshot),
-                None => TeamBrain::fresh(),
+            let mut rng =
+                DiversityRng::new((seed as u64) ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+
+            let neural = if id < seeded_count && !parents.is_empty() {
+                let net = if !diversity {
+                    parents[0].clone()
+                } else if parents.len() == 1 {
+                    mutate_neural(parents[0].clone(), &mut rng, mutation_scale)
+                } else {
+                    let a = &parents[(rng.next_u64() as usize) % parents.len()];
+                    let b = &parents[(rng.next_u64() as usize) % parents.len()];
+                    mutate_neural(crossover_neural(a, b, &mut rng), &mut rng, mutation_scale)
+                };
+                Some(net)
+            } else {
+                None
             };
+
+            let options = if diversity {
+                sample_team_options(&base_options, &mut rng)
+            } else {
+                base_options.clone()
+            };
+
+            let brain = TeamBrain {
+                neural,
+                options,
+                ..TeamBrain::default()
+            };
+
             TournamentTeam::new(
                 id,
                 format!("Team {:03}", id + 1),
@@ -409,7 +576,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let teams = build_entrants(&format, seed, seed_snapshot, seed_fraction);
+    // Phase 1: the parent pool is the single latest active policy (if any), so
+    // seeded teams are its mutated descendants. Phase 2 will replace this with the
+    // previous tournament's top-N elite finishers for true generational crossover.
+    let parents: Vec<SoccerNeuralNetworkSnapshot> = seed_snapshot.into_iter().collect();
+    let teams = build_entrants(&format, seed, &parents, seed_fraction);
     let tournament = Tournament::new(teams, format, mode, seed)?;
     let runner = EngineMatchRunner::new(runner_config);
     // Engine API (HEAD line): run_parallel borrows the runner and takes an
@@ -574,6 +745,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soccer_engine::des::general::soccer::SoccerNeuralLayerSnapshot;
 
     #[test]
     fn default_format_is_128_team_world_cup_shape() {
@@ -626,14 +798,14 @@ mod tests {
     #[test]
     fn entrant_field_matches_format_and_honors_seed_fraction() {
         let format = TournamentFormat::default();
-        // No snapshot ⇒ all fresh regardless of fraction.
-        let fresh = build_entrants(&format, 7, None, 0.75);
+        // No parents ⇒ all fresh regardless of fraction.
+        let fresh = build_entrants(&format, 7, &[], 0.75);
         assert_eq!(fresh.len(), format.team_count);
         assert!(fresh.iter().all(|team| team.brain.neural.is_none()));
 
-        // With a snapshot, exactly round(team_count * fraction) teams are seeded.
+        // With one parent, exactly round(team_count * fraction) teams are seeded.
         let snapshot = SoccerNeuralNetworkSnapshot::default();
-        let seeded = build_entrants(&format, 7, Some(snapshot), 0.25);
+        let seeded = build_entrants(&format, 7, std::slice::from_ref(&snapshot), 0.25);
         let seeded_count = seeded
             .iter()
             .filter(|team| team.brain.neural.is_some())
@@ -644,5 +816,81 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), format.team_count);
+    }
+
+    fn sample_snapshot(fill: f64) -> SoccerNeuralNetworkSnapshot {
+        let layer = SoccerNeuralLayerSnapshot {
+            activation: "relu".to_string(),
+            weights: vec![vec![fill, fill, fill], vec![fill, fill, fill]],
+            biases: vec![fill, fill],
+        };
+        let mut snapshot = SoccerNeuralNetworkSnapshot {
+            input_dim: 3,
+            output_dim: 2,
+            parameter_count: 0,
+            l2_norm: 0.0,
+            layers: vec![layer],
+        };
+        refresh_snapshot_norm(&mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn mutation_is_deterministic_and_perturbs_weights() {
+        let base = sample_snapshot(1.0);
+        let a = mutate_neural(base.clone(), &mut DiversityRng::new(42), 0.1);
+        let b = mutate_neural(base.clone(), &mut DiversityRng::new(42), 0.1);
+        // Same seed ⇒ identical mutation (the field stays reproducible).
+        assert_eq!(a.layers[0].weights, b.layers[0].weights);
+        // ...but the weights actually moved off the parent.
+        assert_ne!(a.layers[0].weights, base.layers[0].weights);
+        // Zero scale is a no-op.
+        let unchanged = mutate_neural(base.clone(), &mut DiversityRng::new(7), 0.0);
+        assert_eq!(unchanged.layers[0].weights, base.layers[0].weights);
+    }
+
+    #[test]
+    fn crossover_takes_each_weight_from_one_parent() {
+        let a = sample_snapshot(0.0);
+        let b = sample_snapshot(1.0);
+        let child = crossover_neural(&a, &b, &mut DiversityRng::new(99));
+        for row in &child.layers[0].weights {
+            for weight in row {
+                assert!(*weight == 0.0 || *weight == 1.0, "weight {weight} not from a parent");
+            }
+        }
+        // With opposite parents the child differs from both.
+        assert_ne!(child.layers[0].weights, a.layers[0].weights);
+        assert_ne!(child.layers[0].weights, b.layers[0].weights);
+    }
+
+    #[test]
+    fn diverse_seeding_gives_distinct_descendants() {
+        // Two seeded teams descended from the same single parent must differ — in
+        // both their nets and their sampled hyperparameters.
+        let format = TournamentFormat::default();
+        let parent = sample_snapshot(0.5);
+        let field = build_entrants(&format, 123, std::slice::from_ref(&parent), 1.0);
+        let n0 = field[0].brain.neural.as_ref().unwrap();
+        let n1 = field[1].brain.neural.as_ref().unwrap();
+        assert_ne!(n0.layers[0].weights, n1.layers[0].weights);
+        assert_ne!(field[0].brain.options.gamma, field[1].brain.options.gamma);
+    }
+
+    #[test]
+    fn crossover_field_hybridizes_an_elite_pool() {
+        // The generational case: a 16-strong elite pool ⇒ each seeded net is a
+        // crossover+mutation hybrid; teams are distinct and weights stay finite.
+        let format = TournamentFormat::default();
+        let pool: Vec<SoccerNeuralNetworkSnapshot> =
+            (0..16).map(|i| sample_snapshot(i as f64)).collect();
+        let field = build_entrants(&format, 55, &pool, 1.0);
+        let child = field[3].brain.neural.as_ref().unwrap();
+        assert!(child
+            .layers
+            .iter()
+            .all(|l| l.weights.iter().flatten().all(|w| w.is_finite())));
+        let other = field[4].brain.neural.as_ref().unwrap();
+        assert_ne!(child.layers[0].weights, other.layers[0].weights);
     }
 }
