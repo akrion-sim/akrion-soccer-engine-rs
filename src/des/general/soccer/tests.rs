@@ -3380,6 +3380,49 @@ fn completed_pass_reward_prioritizes_forward_progression() {
 }
 
 #[test]
+fn reward_shaping_values_retention_over_forcing_a_turnover() {
+    // The overnight learners must prefer KEEPING the ball to gambling it forward into a
+    // turnover. This locks in the rebalanced signal: a safe lateral ball is positively
+    // rewarded, a safe backward ball is only mildly discouraged (not punished), and either
+    // is hugely preferable to the turnover cost the learners apply on losing the ball.
+    let field_length = 120.0;
+    let lateral = completed_pass_reward(
+        Team::Home,
+        Vec2::new(40.0, 76.0),
+        Vec2::new(52.0, 76.2),
+        field_length,
+    );
+    let backward = completed_pass_reward(
+        Team::Home,
+        Vec2::new(40.0, 76.0),
+        Vec2::new(40.0, 66.0),
+        field_length,
+    );
+    // The total retroactive cost a turnover applies to the losing team (chain + window).
+    let turnover_cost = LOST_POSSESSION_CHAIN_PENALTY_POINTS + TURNOVER_WINDOW_PENALTY_POINTS;
+
+    assert!(
+        lateral > 0.0,
+        "a safe lateral retention pass must be rewarded, not near-worthless: {lateral}"
+    );
+    assert!(
+        backward > -2.0,
+        "a safe backward pass that KEEPS the ball must be only mildly discouraged: {backward}"
+    );
+    assert!(
+        turnover_cost >= 12.0,
+        "losing the ball must be the dominant cost so retention is learned: {turnover_cost}"
+    );
+    // Keeping the ball (even square/backward) must beat losing it by a wide margin, so the
+    // policy learns to retain rather than force a low-percentage forward ball.
+    assert!(
+        backward - (-turnover_cost) > 8.0 && lateral - (-turnover_cost) > 8.0,
+        "retaining possession must dominate a turnover: lateral={lateral} backward={backward} \
+         turnover_cost={turnover_cost}"
+    );
+}
+
+#[test]
 fn progressive_pass_escape_reward_rewards_breaking_the_pocket() {
     // A tap that leaves the ball inside the 3yd radius earns nothing.
     let in_pocket = test_pending_pass(

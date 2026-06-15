@@ -283,13 +283,16 @@ const POSSESSION_REGAIN_GRACE_TICKS: u64 = secs_to_ticks(0.5);
 /// ball (`protect-ball`): body between ball and defender ⇒ possession is forced
 /// ~80% of the time, but at the cost of progression (modelled elsewhere).
 const SHIELDED_HOLDER_TACKLE_SUCCESS_CAP: f64 = 0.20;
-/// A ball-carrier is ~50% better at retaining possession in a 1v1 than the raw
-/// skill-vs-skill steal odds imply — they protect it with their body, ride the
-/// challenge, and pick the moment. Applied as a multiplier on the defender's steal
-/// probability (both the hold-up contest and the open tackle), BEFORE the body-shield
-/// caps so an actively-shielding carrier is still driven to ~0. `1/1.5` ⇒ ~50% more
-/// retention (a steal that was 0.45 likely becomes ~0.30).
-const DRIBBLE_POSSESSION_RETENTION_FACTOR: f64 = 1.0 / 1.5;
+/// A ball-carrier is better at retaining possession in a 1v1 than the raw skill-vs-skill
+/// steal odds imply — they protect it with their body, ride the challenge, and pick the
+/// moment. Applied as a multiplier on the defender's steal probability (both the hold-up
+/// contest and the open tackle), BEFORE the body-shield caps so an actively-shielding
+/// carrier is still driven to ~0. The PRIMARY retention mechanism is the body-shield orbit
+/// (ball held on the far side of the body — see `carried_ball_orbit_command`), which now
+/// actually fires; this flat factor is the secondary, always-on edge. Kept modest so it
+/// doesn't tip the team into holding without progressing (the urgency-to-pass + win-the-ball
+/// burst behaviours are what keep retention from stalling attacks). ~25% fewer steals.
+const DRIBBLE_POSSESSION_RETENTION_FACTOR: f64 = 0.8;
 /// Geometric body-shield gate (see `carrier_shields_ball_from_defender`): when the
 /// carrier's body is between the ball and the defender and the defender is more
 /// than a yard off the ball, a *clean* steal is impossible (foul only).
@@ -616,12 +619,15 @@ const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 9.5;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 12.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
-// A completed back pass is a missed forward opportunity; penalize it outright so
-// the policy stops recycling possession backwards. Own-half back passes sit
-// nearer to our own goal and carry more turnover risk, so they sting more than a
-// recycle in the opponent half.
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 2.6;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 1.4;
+// A completed back pass KEEPS possession — it is far better than forcing a forward
+// ball into a turnover. It is only mildly discouraged (so the policy still prefers to
+// progress when it safely can), not punished, so the team learns to retain rather than
+// gamble. Sterile under-no-pressure recycling is still handled by the dedicated stagnant /
+// pointless-short-pass penalties; a smart back/lateral escape under pressure is REWARDED
+// (`PRESSURE_RELIEF_PASS_BONUS`). Own-half back passes sit nearer our goal so sting a touch
+// more. (Lowered from 2.6 / 1.4 to value ball retention and cut manufactured turnovers.)
+const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 1.0;
+const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 0.5;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 const COMPLETED_KILLER_PASS_BONUS_POINTS: f64 = 4.8;
@@ -872,7 +878,11 @@ const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
 // Losing the ball is a team failure, not just the dribbler's. When a defender wins
 // the ball, blame the recent possession chain: the player dispossessed eats the
 // largest share, and the previous one or two who built the move share the rest.
-const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 7.0;
+// Raised from 7.0: losing the ball is the single most-costly outcome short of conceding,
+// so the learners weight retention (completing passes, shielding the dribble) above forcing
+// a low-percentage forward ball. Combined with the softened back-pass penalties, this trains
+// "keep the ball" over "gamble it forward".
+const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 10.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 // Beyond the immediate possession-chain penalty above, a turnover also retroactively
 // penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
@@ -881,7 +891,7 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 // (`train_adversarial` + `policy.train`) and the neural value/critic models — nudge those
 // state→action pairs down. 5 s = 75 ticks at dt = 1/15.
 pub(crate) const TURNOVER_PENALTY_WINDOW_TICKS: u64 = 75;
-const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 3.0;
+const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 4.5;
 // Bound the re-queued work per turnover (newest, most-blameworthy transitions first) so a
 // flurry of turnovers can't back up the deferred-training queue.
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
@@ -12717,7 +12727,10 @@ fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f
         (PassDirectionBucket::Forward, false) => {
             COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward
         }
-        (PassDirectionBucket::Lateral, _) => 1.6,
+        // A completed lateral ball keeps possession and switches the angle of attack —
+        // a positive retention reward (raised from 1.6) so safe ball circulation is
+        // valued, not treated as near-worthless versus a risky forward ball.
+        (PassDirectionBucket::Lateral, _) => 2.6,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     }
