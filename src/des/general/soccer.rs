@@ -1775,6 +1775,10 @@ const GK_HANDLING_HOLD_LIMIT_SECONDS: f64 = 6.0;
 /// Hurried forced clearance speed (yds/s) when a keeper overruns the handling
 /// limit without distributing — a firm punt upfield, not a gentle drop.
 const GK_HANDLING_FORCED_CLEARANCE_YPS: f64 = 26.0;
+/// After a goal, hold a brief celebration (ball settling in the net, players
+/// reacting) before resetting to the kickoff, so the goal sequence completes on
+/// screen instead of cutting straight to centre.
+const GOAL_CELEBRATION_SECONDS: f64 = 2.5;
 // Reward weight for a pressured recovering defender's controllable back-pass to a more-open
 // keeper, scaled by keeper openness and the pressure on the passer (offsets the backward-pass
 // penalty so it's a real outlet only when genuinely warranted).
@@ -8276,8 +8280,11 @@ fn untargeted_long_ball_altitude_yards(
         return 0.0;
     }
     let carry_speed = flight.launch_speed_yps.max(current_speed_yps);
+    // Hoofed long balls were ballooning (up to ~14yd / 42ft of loft). Pull the apex down
+    // ~17% (was 3.8 + d*0.075 + carry*0.045, clamp 4.5..14.0) for a flatter, more driven
+    // trajectory that covers the ground quicker rather than hanging up in the air.
     let apex =
-        (3.8 + flight.distance_yards.max(0.0) * 0.075 + carry_speed * 0.045).clamp(4.5, 14.0);
+        (3.15 + flight.distance_yards.max(0.0) * 0.062 + carry_speed * 0.037).clamp(3.7, 11.6);
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
 
@@ -41208,9 +41215,11 @@ fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         3.0 + unit * 2.0
     } else {
-        // Flatter, more driven arc: long balls should be hit with pace, not floated.
-        // A 50-yard ball peaks around ~4 yds and a 30-yarder ~3 yds.
-        (1.8 + pass.distance_yards.max(0.0) * 0.045).clamp(2.2, 8.5)
+        // Flatter, more driven arc: long balls should be hit with pace, not floated. Apex
+        // pulled down ~20% (was 1.8 + d*0.045, clamp 2.2..8.5) so the trajectory is flatter
+        // and the ball spends less time climbing — a 50-yard ball now peaks ~3.3 yds and a
+        // 30-yarder ~2.5 yds.
+        (1.45 + pass.distance_yards.max(0.0) * 0.036).clamp(1.8, 6.8)
     };
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
@@ -41757,11 +41766,13 @@ fn modulated_pass_speed_yps(
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
     let base_time = if flight.is_aerial() {
-        // Long aerials were arriving driven-flat and OVERHIT by 20-40% — landing at the
-        // receiver but carrying on past them (to the opponent keeper / out of play). Give
-        // them more hang time so the launch speed is lower and the ball drops at the
-        // receiver's feet rather than rolling through.
-        (0.55 + distance / 40.0).clamp(0.72, 2.45)
+        // Aerials were floating: too much hang time made them loop slowly through the air and
+        // arrive late. A lofted/long ball is driven — it should cover the x-y distance with
+        // pace and get down to the receiver ~20-25% quicker. Hang time cut ~22% from the old
+        // calibration (0.55 + d/40, clamp 0.72..2.45) so the launch speed is correspondingly
+        // higher. (The arc still drops the ball at the target: altitude is a function of
+        // horizontal progress, not of time, so a faster ball lands at the same spot, sooner.)
+        (0.43 + distance / 51.0).clamp(0.56, 1.91)
     } else if is_cross {
         (0.68 + distance / 31.0).clamp(0.82, 2.65)
     } else {

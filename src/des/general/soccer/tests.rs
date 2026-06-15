@@ -38079,8 +38079,13 @@ fn aerial_pending_pass_skips_grass_resistance_on_launch_tick() {
     floor.integrate_ball();
     aerial.integrate_ball();
 
+    // The aerial ball is airborne on the launch tick and so skips most grass rolling
+    // resistance — it must retain clearly more speed than the grounded pass. The margin is
+    // modest because the lofted arc is deliberately flatter now (less early-flight altitude
+    // ⇒ a touch more grass contact on the very first tick), but the airborne ball still
+    // loses well under half the grass speed the floor ball does.
     assert!(
-        aerial.ball.velocity.len() > floor.ball.velocity.len() + 0.08,
+        aerial.ball.velocity.len() > floor.ball.velocity.len() + 0.04,
         "aerial pass should retain more speed on grass: aerial={} floor={}",
         aerial.ball.velocity.len(),
         floor.ball.velocity.len()
@@ -38413,6 +38418,10 @@ fn goal_restart_sets_center_kickoff_for_conceding_team() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
 
     sim.score_goal(Team::Home);
+    // Goals now hold a brief celebration before the kickoff; advance through it.
+    while sim.goal_celebration_remaining_ticks > 0 {
+        sim.run_time_step();
+    }
 
     let center = Vec2::new(
         sim.config.field_width_yards * 0.5,
@@ -38493,6 +38502,10 @@ fn sandbox_match_off_centre_ball_does_not_arm_opening_kickoff_guard() {
 fn kickoff_arms_no_double_touch_guard_and_clears_on_another_touch() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.score_goal(Team::Home);
+    // Goals now hold a brief celebration before the kickoff; advance through it.
+    while sim.goal_celebration_remaining_ticks > 0 {
+        sim.run_time_step();
+    }
     let taker = sim.ball.holder.expect("kickoff holder");
 
     // The kickoff taker may not touch the ball twice in a row.

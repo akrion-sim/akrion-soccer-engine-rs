@@ -48,6 +48,11 @@ pub struct SoccerMatch {
     /// episode began, or `None` when no keeper is handling. Drives the no-steal
     /// protection and the release time limit (`GK_HANDLING_HOLD_LIMIT_SECONDS`).
     pub(crate) gk_handling_since_clock: Option<f64>,
+    /// Ticks remaining in the post-goal celebration hold (0 = not celebrating).
+    /// While >0, play is frozen with the ball in the net; on reaching 0 the kickoff
+    /// is set up for `goal_celebration_kickoff_team` (the conceding side).
+    pub(crate) goal_celebration_remaining_ticks: u32,
+    pub(crate) goal_celebration_kickoff_team: Option<Team>,
     /// How the trained value head couples into live action selection. `Off` by
     /// default, so play is unchanged unless a run opts in via `with_neural_blend`.
     pub(crate) neural_blend: SoccerNeuralBlendConfig,
@@ -516,6 +521,8 @@ impl SoccerMatch {
             home_genome: SoccerTeamGenome::default(),
             away_genome: SoccerTeamGenome::default(),
             gk_handling_since_clock: None,
+            goal_celebration_remaining_ticks: 0,
+            goal_celebration_kickoff_team: None,
             neural_blend: config.neural_blend,
             policy_head: None,
             world_model: None,
@@ -3483,6 +3490,21 @@ impl SoccerMatch {
 
     pub fn run_time_step(&mut self) {
         if self.is_done() {
+            return;
+        }
+        // Post-goal celebration: freeze play with the ball in the net for a brief
+        // hold so the goal sequence completes on screen, then set up the kickoff.
+        // The game clock does not advance during the hold (it is a dead ball); the
+        // tick counter does, so the celebration still streams frames.
+        if self.goal_celebration_remaining_ticks > 0 {
+            self.goal_celebration_remaining_ticks -= 1;
+            self.tick += 1;
+            if self.goal_celebration_remaining_ticks == 0 {
+                if let Some(team) = self.goal_celebration_kickoff_team.take() {
+                    self.reset_after_goal(team);
+                }
+            }
+            super::inspect::record_frame(self);
             return;
         }
         self.stage_opening_kickoff_if_pending();
@@ -10324,7 +10346,12 @@ impl SoccerMatch {
             player_id: None,
             description: format!("{} goal", scoring_team.label()),
         });
-        self.reset_after_goal(scoring_team.other());
+        // Hold a brief celebration before the kickoff (the ball stays in the net)
+        // so the goal sequence completes on screen instead of cutting straight to
+        // centre. `run_time_step` performs the actual reset when the hold expires.
+        let dt = self.config.dt_seconds.max(1.0e-3);
+        self.goal_celebration_remaining_ticks = (GOAL_CELEBRATION_SECONDS / dt).ceil() as u32;
+        self.goal_celebration_kickoff_team = Some(scoring_team.other());
     }
 
     fn kickoff_team_for_half(&self, half_index: usize) -> Team {
