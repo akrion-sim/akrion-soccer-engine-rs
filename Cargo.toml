@@ -27,12 +27,11 @@ des_engine = { path = "../discrete-event-system.rs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-# Postgres-backed learning persistence (soccer_learning_pg). Non-optional for now
-# to land the extraction green; gated behind a feature in a follow-up so the
-# desktop-game / pure-sim build can drop the DB stack.
-postgres = { version = "0.19", features = ["with-serde_json-1"] }
-native-tls = "0.2"
-postgres-native-tls = "0.5"
+# Postgres-backed learning persistence is opt-in so desktop/pure-sim builds can
+# skip the DB + TLS stack.
+postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
+native-tls = { version = "0.2", optional = true }
+postgres-native-tls = { version = "0.5", optional = true }
 # Zero-copy shared-memory snapshot ring for the external live-state inspector
 # (src/des/general/soccer/inspect.rs + the `soccer_inspect` bin). Tiny, pure,
 # cross-platform (macOS dev + Linux cluster); writer maps MmapMut, readers Mmap.
@@ -40,7 +39,63 @@ memmap2 = "0.9"
 
 [features]
 default = []
+postgres-persistence = ["dep:postgres", "dep:native-tls", "dep:postgres-native-tls"]
+animation-tools = []
+planner = ["animation-tools"]
+streaming = ["planner"]
+rotation-demo = ["animation-tools"]
+live-server = []
 # Reserved for the agnostic-engine split (follow-up): the transport-agnostic web
 # request→reply bridge + HTML generators, and the legacy embedded socket server.
 web-bridge = []
 embedded-http-server = ["web-bridge"]
+
+[[bin]]
+name = "main_soccer_learning_server"
+path = "src/bin/main_soccer_learning_server.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "main_soccer_tournament_run"
+path = "src/bin/main_soccer_tournament_run.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "main_soccer_learning_run"
+path = "src/bin/main_soccer_learning_run.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "main_soccer_set_play_learning_run"
+path = "src/bin/main_soccer_set_play_learning_run.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "main_soccer_learning_queue"
+path = "src/bin/main_soccer_learning_queue.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "main_soccer_planner"
+path = "src/bin/main_soccer_planner.rs"
+required-features = ["planner"]
+
+[[bin]]
+name = "main_soccer_rotation"
+path = "src/bin/main_soccer_rotation.rs"
+required-features = ["rotation-demo"]
+
+[[bin]]
+name = "main_soccer_rotation_anim"
+path = "src/bin/main_soccer_rotation_anim.rs"
+required-features = ["rotation-demo"]
+
+[[bin]]
+name = "main_soccer_live"
+path = "src/bin/main_soccer_live.rs"
+required-features = ["live-server"]
+
+[[bin]]
+name = "main_soccer_live_5056"
+path = "src/bin/main_soccer_live_5056.rs"
+required-features = ["live-server"]
