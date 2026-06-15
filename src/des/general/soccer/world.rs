@@ -5899,8 +5899,9 @@ impl SoccerMatch {
             &self.players[defender_id].skills,
             &self.players[attacker_id].skills,
             DefenderDribbleResponse::HoldUp,
-        ) * dribble_dispossession_kind_multiplier(kind))
-        .clamp(0.02, 0.82);
+        ) * dribble_dispossession_kind_multiplier(kind)
+            * DRIBBLE_POSSESSION_RETENTION_FACTOR)
+            .clamp(0.02, 0.82);
         // A disoriented carrier (too much swivelling around the ball in a short window)
         // controls it less surely and is easier to dispossess.
         let attacker_dizziness = self.players[attacker_id]
@@ -6648,7 +6649,7 @@ impl SoccerMatch {
                         let mut success_probability = tackle_success_probability(
                             &self.players[player_id].skills,
                             &self.players[target_player].skills,
-                        );
+                        ) * DRIBBLE_POSSESSION_RETENTION_FACTOR;
                         // A disoriented carrier (over-swivelled around the ball) is easier
                         // to tackle cleanly.
                         let holder_dizziness = self.players[target_player]
@@ -7090,14 +7091,24 @@ impl SoccerMatch {
             .as_ref()
             .map(|decision| normalize_soccer_action_label(&decision.action))
             .and_then(dribble_move_kind_for_action_label);
-        let nearest_opponent_distance = self
+        let nearest_opponent = self
             .players
             .iter()
             .filter(|other| other.team != team)
-            .map(|other| other.position.distance(player_pos))
-            .fold(f64::INFINITY, f64::min);
-        let (desired_dir, desired_radius, allow_through, orbit_rate) =
-            carried_ball_orbit_command(facing_yaw, move_kind, nearest_opponent_distance);
+            .map(|other| (other.position, other.position.distance(player_pos)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let nearest_opponent_distance =
+            nearest_opponent.map(|(_, d)| d).unwrap_or(f64::INFINITY);
+        let nearest_opponent_dir = nearest_opponent.and_then(|(pos, _)| {
+            let to = pos - player_pos;
+            (to.len() > 1e-6).then(|| to.normalized())
+        });
+        let (desired_dir, desired_radius, allow_through, orbit_rate) = carried_ball_orbit_command(
+            facing_yaw,
+            move_kind,
+            nearest_opponent_distance,
+            nearest_opponent_dir,
+        );
         let field_width = self.config.field_width_yards;
         let field_length = self.config.field_length_yards;
         let tick = self.tick;
@@ -11043,12 +11054,18 @@ impl BallAgent {
     ) -> BallStepOutcome {
         if let Some(holder) = self.holder {
             if let Some(player) = context.players.iter().find(|player| player.id == holder) {
-                let nearest_opponent_distance = context
+                let nearest_opponent = context
                     .players
                     .iter()
                     .filter(|other| other.team != player.team)
-                    .map(|other| other.position.distance(player.position))
-                    .fold(f64::INFINITY, f64::min);
+                    .map(|other| (other.position, other.position.distance(player.position)))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let nearest_opponent_distance =
+                    nearest_opponent.map(|(_, d)| d).unwrap_or(f64::INFINITY);
+                let nearest_opponent_dir = nearest_opponent.and_then(|(pos, _)| {
+                    let to = pos - player.position;
+                    (to.len() > 1e-6).then(|| to.normalized())
+                });
                 let move_kind = player
                     .last_decision
                     .as_ref()
@@ -11059,6 +11076,7 @@ impl BallAgent {
                         player.facing_yaw,
                         move_kind,
                         nearest_opponent_distance,
+                        nearest_opponent_dir,
                     );
                 let player_pos = player.position;
                 let player_velocity = player.velocity;

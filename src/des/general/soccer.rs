@@ -283,6 +283,13 @@ const POSSESSION_REGAIN_GRACE_TICKS: u64 = secs_to_ticks(0.5);
 /// ball (`protect-ball`): body between ball and defender ⇒ possession is forced
 /// ~80% of the time, but at the cost of progression (modelled elsewhere).
 const SHIELDED_HOLDER_TACKLE_SUCCESS_CAP: f64 = 0.20;
+/// A ball-carrier is ~50% better at retaining possession in a 1v1 than the raw
+/// skill-vs-skill steal odds imply — they protect it with their body, ride the
+/// challenge, and pick the moment. Applied as a multiplier on the defender's steal
+/// probability (both the hold-up contest and the open tackle), BEFORE the body-shield
+/// caps so an actively-shielding carrier is still driven to ~0. `1/1.5` ⇒ ~50% more
+/// retention (a steal that was 0.45 likely becomes ~0.30).
+const DRIBBLE_POSSESSION_RETENTION_FACTOR: f64 = 1.0 / 1.5;
 /// Geometric body-shield gate (see `carrier_shields_ball_from_defender`): when the
 /// carrier's body is between the ball and the defender and the defender is more
 /// than a yard off the ball, a *clean* steal is impossible (foul only).
@@ -38850,6 +38857,9 @@ fn carried_ball_orbit_command(
     facing_yaw: f64,
     move_kind: Option<DribbleMoveKind>,
     nearest_opponent_distance: f64,
+    // Unit vector from the carrier TOWARD the nearest opponent (None if none/degenerate).
+    // Used to shield: the protected ball is held on the OPPOSITE side of the body.
+    nearest_opponent_dir: Option<Vec2>,
 ) -> (Vec2, f64, bool, f64) {
     let tightness = if nearest_opponent_distance.is_finite() {
         ((CARRY_TIGHT_CONTROL_RANGE_YARDS - nearest_opponent_distance)
@@ -38879,7 +38889,19 @@ fn carried_ball_orbit_command(
         }
         // A nutmeg pushes the ball straight through the gap — close and through.
         Some(DribbleMoveKind::Nutmeg) => (dir_at(0.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
-        // Carry-forward, protect-ball, plain hold: keep the ball ahead of the body.
+        // SHIELD: protecting the ball means keeping it on the FAR side of the body from the
+        // nearest defender — the carrier's body is the barrier between defender and ball,
+        // which is what `carrier_shields_ball_from_defender` rewards with a near-zero steal.
+        // Aim the ball directly away from that defender (tight, close control). With no
+        // defender to shield from, fall back to keeping it ahead of the body.
+        Some(DribbleMoveKind::ProtectBall) => {
+            let shield_dir = nearest_opponent_dir
+                .filter(|away| away.len() > 1e-6)
+                .map(|toward| toward.normalized() * -1.0)
+                .unwrap_or_else(|| dir_at(0.0));
+            (shield_dir, false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
+        }
+        // Carry-forward, plain hold: keep the ball ahead of the body.
         _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
     };
     (dir.normalized(), radius, allow_through, rate)

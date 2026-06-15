@@ -40584,6 +40584,80 @@ fn protect_ball_leads_ball_to_far_side_of_body() {
 }
 
 #[test]
+fn protect_ball_orbit_command_aims_the_ball_away_from_the_defender() {
+    // The continuous carried-ball orbit (what sets ball.position every tick) must, on
+    // protect-ball, point the ball to the FAR side of the body from the nearest defender.
+    let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
+    let to_defender = Vec2::new(1.0, 0.0); // defender is off to the carrier's +x
+    let (dir, _radius, _through, _rate) = carried_ball_orbit_command(
+        facing,
+        Some(DribbleMoveKind::ProtectBall),
+        1.6,
+        Some(to_defender),
+    );
+    assert!(
+        dot(dir, to_defender) < -0.5,
+        "protect-ball orbit must aim the ball opposite the defender: dir={dir:?}"
+    );
+    // With no defender to shield from, it falls back to keeping the ball ahead of the body.
+    let (ahead, _r, _t, _rt) =
+        carried_ball_orbit_command(facing, Some(DribbleMoveKind::ProtectBall), f64::INFINITY, None);
+    assert!(ahead.y > 0.9, "no defender → ball stays ahead of the body: {ahead:?}");
+}
+
+#[test]
+fn protect_ball_orbit_settles_into_a_body_shield() {
+    // Driving the orbit over several ticks, the protected ball swings to the far side of the
+    // body and the geometric shield gate (which gates dispossession to ~0) starts to hold.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 8usize;
+    let defender = 12usize;
+    park_players_except(&mut sim, &[carrier, defender]);
+    let carrier_pos = Vec2::new(40.0, 60.0);
+    sim.players[carrier].position = carrier_pos;
+    sim.players[carrier].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[defender].position = Vec2::new(42.0, 60.0); // 2yd to the carrier's +x
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(40.0, 61.0); // ball starts AHEAD of the body
+    sim.ball.reset_carry_orbit();
+    assert!(
+        !sim.carrier_shields_ball_from_defender(carrier, defender),
+        "ball ahead of the body is not yet shielding the side-on defender"
+    );
+
+    let to_defender = sim.players[defender].position - carrier_pos;
+    let (desired_dir, desired_radius, allow_through, orbit_rate) = carried_ball_orbit_command(
+        sim.players[carrier].facing_yaw,
+        Some(DribbleMoveKind::ProtectBall),
+        to_defender.len(),
+        Some(to_defender.normalized()),
+    );
+    let mut rng = SeededRandom::new(11);
+    for step in 0..30u64 {
+        let pos = sim.ball.advance_carried_ball_orbit(
+            step + 1,
+            carrier_pos,
+            desired_dir,
+            desired_radius,
+            allow_through,
+            orbit_rate,
+            sim.config.dt_seconds,
+            sim.config.field_width_yards,
+            sim.config.field_length_yards,
+            &mut rng,
+        );
+        sim.ball.position = pos;
+    }
+    assert!(
+        sim.carrier_shields_ball_from_defender(carrier, defender),
+        "after settling the orbit the body must shield the ball from the defender; \
+         ball={:?} carrier={carrier_pos:?} defender={:?}",
+        sim.ball.position,
+        sim.players[defender].position
+    );
+}
+
+#[test]
 fn dribble_move_kind_is_committed_within_window() {
     let window = DRIBBLE_COMMIT_WINDOW_TICKS;
     assert!(window >= 2, "commitment window should span multiple ticks");
@@ -43116,12 +43190,13 @@ fn carried_ball_orbit_holds_close_control_and_tightens_near_opponents() {
     // carrier's feet, tighter the nearer an opponent is.
     let facing = std::f64::consts::FRAC_PI_2; // faces +y
     let (_dir, loose_radius, _through, _rate) =
-        carried_ball_orbit_command(facing, None, f64::INFINITY);
+        carried_ball_orbit_command(facing, None, f64::INFINITY, None);
     assert!(
         (0.95..=1.05).contains(&loose_radius),
         "loose control radius should be ≈1yd in open space, got {loose_radius}"
     );
-    let (_dir, tight_radius, _through, _rate) = carried_ball_orbit_command(facing, None, 0.8);
+    let (_dir, tight_radius, _through, _rate) =
+        carried_ball_orbit_command(facing, None, 0.8, None);
     assert!(
         (0.25..0.45).contains(&tight_radius),
         "tight control radius should be ≈0.3yd with an opponent on top, got {tight_radius}"
