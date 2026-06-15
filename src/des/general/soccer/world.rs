@@ -3703,8 +3703,11 @@ impl SoccerMatch {
                     let intent_player_id = intent.player_id;
                     self.apply_player_intent(intent);
                     self.sync_held_ball_to_holder();
-                    // Hold opponents 10yd off the ball until a held restart is played.
+                    // Hold opponents off the ball until a held restart is played.
                     self.enforce_restart_keepout_for(intent_player_id);
+                    // Block a shielded-out defender at the carrier's body so it cannot
+                    // overlap the carrier / reach the ball through the body on screen.
+                    self.enforce_shield_body_barrier_for(intent_player_id);
                     field_intent_elapsed += phase_started.elapsed();
                 }
                 AgentScheduleKind::Official => {
@@ -5974,30 +5977,34 @@ impl SoccerMatch {
     }
 
     /// While a restart is held (the taker still has the ball and has not yet played
-    /// it), this returns the team that must be kept the 10yd keep-out distance from
-    /// the ball, plus the ball spot. `None` outside a held restart, and `None` for a
-    /// throw-in (exempt — its own shape handles the much shorter spacing).
-    fn held_restart_keepout(&self) -> Option<(Team, Vec2)> {
+    /// it), this returns the team that must be kept off the ball while the restart is
+    /// held, the ball spot, and the keep-out radius (10yd for kickoffs / free kicks /
+    /// corners / goal kicks per Laws 8/13/16; 2yd for throw-ins per Law 15). `None`
+    /// outside a held restart.
+    fn held_restart_keepout(&self) -> Option<(Team, Vec2, f64)> {
         let holder = self.ball.holder?;
         let label = self
             .ball
             .last_decision
             .as_ref()
             .and_then(|decision| restart_action_label(&decision.action))?;
-        if label == "throw-in" {
-            return None;
-        }
+        let radius = if label == "throw-in" {
+            THROW_IN_OPPONENT_KEEPOUT_YARDS
+        } else {
+            RESTART_OPPONENT_KEEPOUT_YARDS
+        };
         let restarting_team = self.players.get(holder)?.team;
-        Some((restarting_team.other(), self.ball.position))
+        Some((restarting_team.other(), self.ball.position, radius))
     }
 
-    /// Push a single player back out to the 10yd keep-out radius if it is an opponent
-    /// of the team taking a currently-held restart and has crept inside it. Called
-    /// each tick after the player moves, so opponents are held at the line until the
-    /// taker plays the ball (Laws 8/13/16). The defending keeper is exempt so it can
-    /// keep its goal-line position on a corner / short free kick near the byline.
+    /// Push a single player back out to the restart keep-out radius if it is an
+    /// opponent of the team taking a currently-held restart and has crept inside it
+    /// (10yd for most restarts, 2yd for throw-ins). Called each tick after the player
+    /// moves, so opponents are held at the line until the taker plays the ball (Laws
+    /// 8/13/15/16). The defending keeper is exempt so it can keep its goal-line
+    /// position on a corner / short free kick near the byline.
     pub(crate) fn enforce_restart_keepout_for(&mut self, player_id: usize) {
-        let Some((keepout_team, spot)) = self.held_restart_keepout() else {
+        let Some((keepout_team, spot, radius)) = self.held_restart_keepout() else {
             return;
         };
         if player_id >= self.players.len() || self.players[player_id].team != keepout_team {
@@ -6009,7 +6016,7 @@ impl SoccerMatch {
         let pos = self.players[player_id].position;
         let offset = pos - spot;
         let dist = offset.len();
-        if dist >= RESTART_OPPONENT_KEEPOUT_YARDS {
+        if dist >= radius {
             return;
         }
         let dir = if dist > 1e-6 {
@@ -6018,13 +6025,78 @@ impl SoccerMatch {
             // Degenerate: standing on the ball — retreat toward own goal.
             Vec2::new(0.0, -self.players[player_id].team.attack_dir())
         };
-        let target = (spot + dir * RESTART_OPPONENT_KEEPOUT_YARDS)
+        let target = (spot + dir * radius)
             .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
         let player = &mut self.players[player_id];
         player.position = target;
         // Kill inward momentum so they hold at the line instead of drifting back in.
         player.velocity = Vec2::zero();
         player.acceleration = Vec2::zero();
+    }
+
+    /// Physically block a shielded-out defender at the carrier's body so the animation
+    /// reflects the no-steal-through-the-body rule. When the carrier is shielding this
+    /// defender (its body is between the ball and the defender, and the ball is more
+    /// than a yard from the defender — see `carrier_shields_ball_from_defender`), the
+    /// defender cannot step inside the carrier's body ring: it is pushed radially back
+    /// out, so on screen it presses against the carrier's back instead of overlapping
+    /// the body and the ball orbiting on the far side. The defender may still run AROUND
+    /// to the ball's side — there the shield no longer holds (or the ball comes within a
+    /// yard) and a legal challenge resumes. Called each tick after the player moves,
+    /// mirroring `enforce_restart_keepout_for`. No-op during dead-ball set plays.
+    pub(crate) fn enforce_shield_body_barrier_for(&mut self, player_id: usize) {
+        if self.active_set_play.is_some() || player_id >= self.players.len() {
+            return;
+        }
+        let Some(carrier_id) = self.ball.holder else {
+            return;
+        };
+        if carrier_id == player_id || carrier_id >= self.players.len() {
+            return;
+        }
+        if self.players[carrier_id].team == self.players[player_id].team {
+            return;
+        }
+        // Only while the body is actually shielding this defender out (geometry + the
+        // 1yd ball gap). A defender goal-side, or with the ball within a yard, is not
+        // shielded and may challenge — no barrier then.
+        if !self.carrier_shields_ball_from_defender(carrier_id, player_id) {
+            return;
+        }
+        let carrier_pos = self.players[carrier_id].position;
+        let offset = self.players[player_id].position - carrier_pos;
+        let dist = offset.len();
+        if dist >= SHIELD_BODY_BARRIER_YARDS {
+            return;
+        }
+        // Push the defender out to the body ring along its own approach direction
+        // (fall back to the ball→defender side, i.e. away from the ball, if it is
+        // standing on the carrier).
+        let dir = if dist > 1e-6 {
+            offset / dist
+        } else {
+            let from_ball = carrier_pos - self.ball.position;
+            if from_ball.len() > 1e-6 {
+                from_ball.normalized()
+            } else {
+                Vec2::new(0.0, -self.players[player_id].team.attack_dir())
+            }
+        };
+        let target = (carrier_pos + dir * SHIELD_BODY_BARRIER_YARDS)
+            .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
+        let player = &mut self.players[player_id];
+        player.position = target;
+        // Cancel the component of momentum driving it into the body so it stays pressed
+        // against the carrier instead of jittering through.
+        let into_body = dir * -1.0;
+        let inward = player.velocity.dot(into_body);
+        if inward > 0.0 {
+            player.velocity = player.velocity - into_body * inward;
+        }
+        let inward_acc = player.acceleration.dot(into_body);
+        if inward_acc > 0.0 {
+            player.acceleration = player.acceleration - into_body * inward_acc;
+        }
     }
 
     pub(crate) fn apply_player_intent(&mut self, intent: PlayerIntent) {
@@ -20777,14 +20849,29 @@ impl WorldSnapshot {
         let mut clear_through_flight = true;
         for p in self.players.iter().filter(|p| p.team == defending_team) {
             let position = self.player_snapshot_position(p);
+            let perp_gap = segment_distance_to_point(from, to, position);
             // Already sitting in the corridor → blocked now (hard veto), short-circuit.
-            if segment_distance_to_point(from, to, position) <= radius {
+            if perp_gap <= radius {
                 return (false, false);
             }
-            // Where the defender will be when the ball reaches their nearest lane point.
+            // Can the defender REACH the corridor before the ball passes their nearest point?
+            // The ball arrives at that point in `t_ball`; in that time the defender can cover
+            // a lunge plus a (reaction-delayed) sprint. This mirrors the physics interception
+            // reach (`INTERCEPT_LUNGE_REACH + player_speed * t_ball` in
+            // `nearest_ball_controller_for_segment`), so the DECISION predicts the same
+            // cut-outs the SIMULATION makes — including a defender stationary/slow NOW that
+            // steps into a "currently open" lane moments later. The old check extrapolated
+            // current velocity only, so it never saw a reactive mid-lane interceptor and the
+            // policy kept playing balls that got picked off.
             let along = (position - from).dot(dir).clamp(0.0, lane_len);
-            let projected = position + p.velocity * (along / speed);
-            if segment_distance_to_point(from, to, projected) <= radius {
+            let t_ball = along / speed;
+            let sprint_speed = player_top_speed_yps(p.role, &p.skills)
+                * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                * MovementGait::Sprint.speed_multiplier();
+            let intercept_window = (t_ball - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+                .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+            let reach = INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * intercept_window;
+            if perp_gap <= radius + reach {
                 clear_through_flight = false;
             }
         }

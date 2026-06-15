@@ -87,6 +87,17 @@ const CONTROL_FIRST_TOUCH_SETTLE_MAX_STEP_YARDS: f64 = 1.4;
 // slow/stationary balls keep their normal (multi-tick) control behavior.
 const INTERCEPT_LUNGE_REACH_YARDS: f64 = 1.3;
 const KINEMATIC_GATE_MIN_BALL_SPEED_YPS: f64 = 10.0;
+// Reaction lag before a defender can commit to cutting out a pass that's just been played:
+// they must read it and start moving. Used by the movement-aware pass-lane check so it
+// predicts the same sprint-reach interceptions the physics resolver makes (a defender
+// stationary NOW but able to step into the lane), minus a beat for human reaction.
+const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
+// Cap on the interception sprint window. A defender only realistically steps into a lane in
+// the brief moment the ball is passing near them — they cannot read a pass and hold a perfect
+// perpendicular sprint for the WHOLE flight of a long ball. Without this cap, a far-along lane
+// point (large ball-time-to-arrival) hands a distant defender a huge reach (sprint × seconds),
+// flagging defenders 25+ yd off the lane. Bounds the reach to a believable step-in radius.
+const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
 // A ball flying overhead can only be contacted by players who can get up to it:
 // a standing reach plus a jump scaled by aerial ability. Higher balls fly over
 // grounded players (the correct "aerial pass passed through" behavior).
@@ -281,6 +292,13 @@ const SHIELDED_HOLDER_TACKLE_SUCCESS_CAP: f64 = 0.20;
 /// than a yard".
 const SHIELD_DEFENDER_OPPOSITE_DOT: f64 = 0.30;
 const SHIELD_DEFENDER_BALL_GAP_YARDS: f64 = 1.0;
+/// Physical body radius the shielding carrier presents to a shielded-out defender: a
+/// defender held off by the body (see `carrier_shields_ball_from_defender`) cannot
+/// step inside this ring around the carrier, so the animation shows it pressed against
+/// the carrier's back rather than overlapping the body and the orbiting ball. Only the
+/// barrier the body itself makes — the defender may still circle to the ball's side
+/// (where the shield no longer holds and the steal becomes legal again).
+const SHIELD_BODY_BARRIER_YARDS: f64 = 0.75;
 /// Carrier goalward speed (yards/sec) above which the nearest defender engages
 /// instead of containing. ~5 yps ≈ 10 mph — a run/sprint, not a walk/jog, so
 /// slow carriers are still jockeyed while fast ones get contested.
@@ -1448,9 +1466,11 @@ const STRIKER_ONSIDE_BUFFER_YARDS: f64 = 1.25;
 const DEAD_BALL_ONSIDE_BUFFER_YARDS: f64 = 1.0;
 // Distance (yards) opponents of the restarting team must keep from the ball while
 // a restart is held and not yet played — Laws 8/13/16 (kickoff, free kick, corner,
-// goal kick all use 9.15m ≈ 10yd). Throw-ins are exempt (they have their own much
-// shorter spacing). Enforced every tick until the taker plays the ball.
+// goal kick all use 9.15m ≈ 10yd). Enforced every tick until the taker plays the ball.
 const RESTART_OPPONENT_KEEPOUT_YARDS: f64 = 10.0;
+// Throw-ins use a much shorter keep-out: Law 15 holds opponents 2yd (≈2m) off the
+// thrower until the ball is in play.
+const THROW_IN_OPPONENT_KEEPOUT_YARDS: f64 = 2.0;
 // Fouls disabled: foul probability is multiplied by this so it is ~0.
 const FOUL_PROBABILITY_SCALE: f64 = 0.000_001;
 // Goal geometry: a real goal is 8 ft (= 8/3 yd) tall under the crossbar and 24 ft
@@ -26346,18 +26366,25 @@ struct SoccerNeuralLearningWorker {
 }
 
 impl SoccerNeuralLearningWorker {
-    fn cancel_and_join(&mut self) {
+    /// Signal the worker to stop and DETACH it — never block the caller on the join.
+    /// Setting `cancel` and dropping the command sender disconnects the channel, so a
+    /// worker parked on `recv()` wakes immediately and a worker mid-`Train` bails after its
+    /// current batch (it checks `cancel` between batches). The thread then exits on its own
+    /// and the OS reclaims it. Joining here used to cost ~45-67ms on whatever thread dropped
+    /// the learner — e.g. the HTTP thread handling a "New Match" reset, which tears down the
+    /// old match (and its learner) mid-training. Detaching keeps New Match snappy; the old
+    /// worker winds down in the background within one batch.
+    fn signal_shutdown(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.sender.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Drop the handle (detach) rather than joining — the worker is already winding down.
+        self.handle.take();
     }
 }
 
 impl Drop for SoccerNeuralLearningWorker {
     fn drop(&mut self) {
-        self.cancel_and_join();
+        self.signal_shutdown();
     }
 }
 
@@ -29058,13 +29085,19 @@ impl SoccerRealtimeSession {
             .as_ref()
             .and_then(|_| self.maybe_auto_save_policy_at_episode_boundary());
         let previous_assignments = self.sim.controller_assignments();
+        // MOVE the learned policies out of the outgoing match into the new one rather than
+        // cloning them and then dropping the originals. Both the clone and the drop are
+        // O(policy size), which grows as the tabular Q / shared policy fill during play —
+        // so "New Match" got slower the longer a session ran. Taking them by value leaves
+        // the old match's policy slots empty, so dropping it is cheap. (When preservation
+        // is off we leave them in place and they're freed with the old match as before.)
         let team_policies = request
             .preserve_team_policy
-            .then(|| self.sim.team_policies.clone())
+            .then(|| self.sim.team_policies.take())
             .flatten();
         let learned_policy = request
             .preserve_shared_policy
-            .then(|| self.sim.learned_policy.clone())
+            .then(|| self.sim.learned_policy.take())
             .flatten();
         let preserved_team_policy = team_policies.is_some();
         let preserved_shared_policy = learned_policy.is_some();

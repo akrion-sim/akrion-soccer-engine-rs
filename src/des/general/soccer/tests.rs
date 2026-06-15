@@ -23054,7 +23054,7 @@ fn neural_threaded_stats_account_for_coalesced_worker_results() {
 }
 
 #[test]
-fn neural_threaded_worker_cancel_join_closes_training_channel() {
+fn neural_threaded_worker_shutdown_closes_training_channel() {
     let config = SoccerNeuralLearningConfig {
         enabled: true,
         backend: SoccerNeuralLearningBackend::Threaded,
@@ -23087,7 +23087,9 @@ fn neural_threaded_worker_cancel_join_closes_training_channel() {
             snapshot_after_train: true,
         })
         .expect("queue training");
-    worker.cancel_and_join();
+    // Signals cancel + drops the sender (closing the channel) and detaches the thread —
+    // we assert the observable teardown (sender/handle cleared), not a blocking join.
+    worker.signal_shutdown();
 
     assert!(worker.sender.is_none());
     assert!(worker.handle.is_none());
@@ -38234,7 +38236,7 @@ fn held_restart_pushes_encroaching_opponents_back_ten_yards() {
 }
 
 #[test]
-fn throw_in_is_exempt_from_ten_yard_keepout() {
+fn throw_in_holds_opponents_two_yards_off_the_ball() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let spot = Vec2::new(0.0, 60.0);
     sim.apply_restart(BallRestart {
@@ -38250,14 +38252,73 @@ fn throw_in_is_exempt_from_ten_yard_keepout() {
         .find(|p| p.team == Team::Away && Some(p.id) != keeper)
         .map(|p| p.id)
         .expect("away outfielder");
-    let near = spot + Vec2::new(3.0, 0.0);
-    sim.players[opponent].position = near;
 
+    // An opponent crowding to within ~1yd of the throw is pushed out to 2yd (Law 15),
+    // NOT the full 10yd a kickoff/free-kick/corner/goal-kick demands.
+    sim.players[opponent].position = spot + Vec2::new(1.0, 0.2);
     sim.enforce_restart_keepout_for(opponent);
+    let dist = sim.players[opponent].position.distance(spot);
+    assert!(
+        (dist - THROW_IN_OPPONENT_KEEPOUT_YARDS).abs() < 1e-6,
+        "throw-in opponent should be held exactly 2yd off the ball, got {dist}"
+    );
 
+    // An opponent already beyond 2yd (but inside 10yd) is left alone — the long
+    // keep-out does not apply to throw-ins.
+    let near = spot + Vec2::new(4.0, 0.0);
+    sim.players[opponent].position = near;
+    sim.enforce_restart_keepout_for(opponent);
     assert_eq!(
         sim.players[opponent].position, near,
-        "throw-ins keep their own short spacing — no 10yd keep-out"
+        "throw-in keep-out is only 2yd — a defender 4yd away is not pushed back"
+    );
+}
+
+#[test]
+fn corner_kick_holds_opponents_ten_yards_off_the_ball() {
+    // Focused check that a corner (a held restart for the attacking team) engages the
+    // full 10yd keep-out, not just free kicks.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(0.0, 0.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::CornerKick,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+
+    // The taker (attacker) holds the ball; the keep-out applies to the DEFENDERS.
+    let taker = sim.ball.holder.expect("corner taker holds the ball");
+    assert_eq!(sim.players[taker].team, Team::Home);
+
+    let keeper = sim.goalkeeper_for(Team::Away);
+    let defender = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && Some(p.id) != keeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    // A defender crowds to ~4yd from the corner flag.
+    sim.players[defender].position = spot + Vec2::new(3.0, 2.5);
+    sim.enforce_restart_keepout_for(defender);
+    let dist = sim.players[defender].position.distance(spot);
+    assert!(
+        dist >= RESTART_OPPONENT_KEEPOUT_YARDS - 1e-6,
+        "a defender must be held 10yd off a corner, got {dist}"
+    );
+
+    // The corner taker's own teammate is never pushed away.
+    let teammate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && sim.ball.holder != Some(p.id))
+        .map(|p| p.id)
+        .expect("home teammate");
+    let near = spot + Vec2::new(5.0, 1.0);
+    sim.players[teammate].position = near;
+    sim.enforce_restart_keepout_for(teammate);
+    assert_eq!(
+        sim.players[teammate].position, near,
+        "the attacking team is not subject to its own corner keep-out"
     );
 }
 
@@ -42986,6 +43047,66 @@ fn body_shielded_carrier_denies_a_clean_steal_to_a_defender_behind() {
     assert!(
         !sim.carrier_shields_ball_from_defender(carrier, defender),
         "a defender within a yard of the ball is not shielded out"
+    );
+}
+
+#[test]
+fn shielded_defender_is_blocked_at_the_carrier_body_for_the_animation() {
+    // The steal is denied logically; the animation must also reflect it — a shielded-out
+    // defender cannot overlap the carrier's body (which would render as it standing on the
+    // ball). It is pushed back out to the body ring.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home)
+        .unwrap()
+        .id;
+    let defender = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .unwrap()
+        .id;
+
+    // Carrier at midfield, ball pushed ~1.2yd in front (toward +y); defender tries to
+    // bury itself in the carrier's back from behind (~0.2yd off the body, ~1.4yd off ball).
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(40.0, 61.2);
+    sim.players[defender].position = Vec2::new(40.0, 59.8);
+    sim.players[defender].velocity = Vec2::new(0.0, 4.0); // driving forward into the body
+    assert!(sim.carrier_shields_ball_from_defender(carrier, defender));
+
+    sim.enforce_shield_body_barrier_for(defender);
+
+    let gap = sim.players[defender].position.distance(sim.players[carrier].position);
+    assert!(
+        gap >= SHIELD_BODY_BARRIER_YARDS - 1e-6,
+        "a shielded defender must be held at the carrier's body ring, got {gap}"
+    );
+    // It stays on its own (back) side of the carrier — not teleported past to the ball.
+    assert!(
+        sim.players[defender].position.y < sim.players[carrier].position.y,
+        "the barrier keeps the defender behind the body, not through it"
+    );
+    // Forward momentum into the body is cancelled so it presses, not jitters through.
+    assert!(
+        sim.players[defender].velocity.y <= 1e-6,
+        "into-body momentum should be removed at the barrier"
+    );
+
+    // A defender goal-side (in front, near the ball) is NOT shielded — no barrier, it can
+    // sit right on the carrier to contest.
+    sim.players[defender].position = Vec2::new(40.0, 60.2);
+    sim.players[defender].velocity = Vec2::zero();
+    assert!(!sim.carrier_shields_ball_from_defender(carrier, defender));
+    sim.enforce_shield_body_barrier_for(defender);
+    assert_eq!(
+        sim.players[defender].position,
+        Vec2::new(40.0, 60.2),
+        "an unshielded defender is not pushed off the carrier"
     );
 }
 
