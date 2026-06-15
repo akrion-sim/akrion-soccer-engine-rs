@@ -123,6 +123,14 @@ pub struct SoccerTeamGenome {
     pub sweeper_keeper: bool,
     /// First-defender engagement style.
     pub defender_engagement: DefenderEngagement,
+    /// When a DEFENDER is in possession: the extra standoff (yards) to keep from
+    /// the nearest opponent before being pressured into a decision. Defenders on
+    /// the ball should hold a safer cushion than an attacker would.
+    pub defender_on_ball_opponent_distance: f64,
+    /// When a DEFENDER is in possession: how urgently to release the ball, in
+    /// `[0,1]` (higher = pass sooner). Defenders should move it on quicker rather
+    /// than carry it into pressure.
+    pub defender_on_ball_pass_urgency: f64,
 }
 
 fn formation_anchors(formation: TeamFormation) -> Vec<PositionAnchor> {
@@ -176,17 +184,58 @@ impl Default for SoccerTeamGenome {
             use_scoop_pass: true,
             sweeper_keeper: false,
             defender_engagement: DefenderEngagement::Press,
+            defender_on_ball_opponent_distance: 3.0,
+            defender_on_ball_pass_urgency: 0.5,
         }
     }
 }
 
 impl SoccerTeamGenome {
-    /// Clamp every gene back into a legal range (after random/crossover/mutate),
-    /// keeping anchors on the grid and `min <= max` for the defensive line.
-    fn sanitize(&mut self) {
+    /// Clamp every gene back into a legal range, keeping anchors on the grid and
+    /// `min <= max` for the defensive line. Public + idempotent so it can also
+    /// repair genomes decoded from Postgres (which may be corrupt, out of range,
+    /// or pre-date a field) before they reach the engine or the GA.
+    pub fn sanitize(&mut self) {
+        // Exactly 11 slots (keeper + 10 outfield) so positional consumers can index
+        // anchors safely; repair a wrong-length vec from the current formation.
+        if self.anchors.len() != 11 {
+            self.anchors = formation_anchors(self.formation);
+        }
         for anchor in &mut self.anchors {
             anchor.lane = anchor.lane.min(PITCH_GENOME_LANES - 1);
             anchor.row = anchor.row.min(PITCH_GENOME_ROWS - 1);
+        }
+        // Replace any non-finite numeric gene with its neutral default so a bad DB
+        // row can never inject NaN/inf into positioning math.
+        let neutral = SoccerTeamGenome::default();
+        if !self.def_line_min_dist_from_ball.is_finite() {
+            self.def_line_min_dist_from_ball = neutral.def_line_min_dist_from_ball;
+        }
+        if !self.def_line_max_dist_from_ball.is_finite() {
+            self.def_line_max_dist_from_ball = neutral.def_line_max_dist_from_ball;
+        }
+        if !self.mid_gap_from_back4_own_half.is_finite() {
+            self.mid_gap_from_back4_own_half = neutral.mid_gap_from_back4_own_half;
+        }
+        if !self.mid_gap_from_back4_opp_half.is_finite() {
+            self.mid_gap_from_back4_opp_half = neutral.mid_gap_from_back4_opp_half;
+        }
+        if !self.press_urgency.is_finite() {
+            self.press_urgency = neutral.press_urgency;
+        }
+        if !self.pass_willingness_under_pressure.is_finite() {
+            self.pass_willingness_under_pressure = neutral.pass_willingness_under_pressure;
+        }
+        for weight in &mut self.pass_distance_priority {
+            if !weight.is_finite() {
+                *weight = 1.0;
+            }
+        }
+        if !self.defender_on_ball_opponent_distance.is_finite() {
+            self.defender_on_ball_opponent_distance = neutral.defender_on_ball_opponent_distance;
+        }
+        if !self.defender_on_ball_pass_urgency.is_finite() {
+            self.defender_on_ball_pass_urgency = neutral.defender_on_ball_pass_urgency;
         }
         self.def_line_min_dist_from_ball = self.def_line_min_dist_from_ball.clamp(1.0, 40.0);
         self.def_line_max_dist_from_ball = self
@@ -202,6 +251,9 @@ impl SoccerTeamGenome {
         if self.pass_distance_priority.iter().all(|w| *w <= 0.0) {
             self.pass_distance_priority = [1.0; 5];
         }
+        self.defender_on_ball_opponent_distance =
+            self.defender_on_ball_opponent_distance.clamp(0.0, 12.0);
+        self.defender_on_ball_pass_urgency = self.defender_on_ball_pass_urgency.clamp(0.0, 1.0);
     }
 
     /// A fresh, randomly-styled team genome (cold-start diversity).
@@ -243,6 +295,8 @@ impl SoccerTeamGenome {
             } else {
                 DefenderEngagement::Press
             },
+            defender_on_ball_opponent_distance: rng.range(1.5, 7.0),
+            defender_on_ball_pass_urgency: rng.unit(),
         };
         genome.sanitize();
         genome
@@ -313,6 +367,16 @@ impl SoccerTeamGenome {
             } else {
                 b.defender_engagement
             },
+            defender_on_ball_opponent_distance: pick(
+                a.defender_on_ball_opponent_distance,
+                b.defender_on_ball_opponent_distance,
+                rng,
+            ),
+            defender_on_ball_pass_urgency: pick(
+                a.defender_on_ball_pass_urgency,
+                b.defender_on_ball_pass_urgency,
+                rng,
+            ),
         };
         genome.sanitize();
         genome
@@ -359,6 +423,12 @@ impl SoccerTeamGenome {
             if rng.chance(rate) {
                 *weight += rng.range(-0.2, 0.2);
             }
+        }
+        if rng.chance(rate) {
+            self.defender_on_ball_opponent_distance += rng.range(-1.5, 1.5);
+        }
+        if rng.chance(rate) {
+            self.defender_on_ball_pass_urgency += rng.range(-0.15, 0.15);
         }
         if rng.chance(rate) {
             self.striker_press_synchronized = !self.striker_press_synchronized;
@@ -429,6 +499,29 @@ mod tests {
             back.def_line_max_dist_from_ball,
             child.def_line_max_dist_from_ball
         );
+    }
+
+    #[test]
+    fn sanitize_repairs_a_corrupt_or_out_of_range_genome() {
+        // Simulates a bad/old Postgres row reaching the engine.
+        let mut g = SoccerTeamGenome::default();
+        g.anchors.clear(); // wrong slot count
+        g.press_urgency = f64::NAN;
+        g.def_line_max_dist_from_ball = f64::INFINITY;
+        g.defender_on_ball_opponent_distance = -5.0;
+        g.defender_on_ball_pass_urgency = 9.0;
+        g.pass_distance_priority = [f64::NAN, 0.0, 0.0, 0.0, 0.0];
+        g.sanitize();
+        assert_eq!(g.anchors.len(), 11);
+        assert!((0.0..=1.0).contains(&g.press_urgency));
+        assert!(g.def_line_max_dist_from_ball.is_finite());
+        assert!(g.def_line_max_dist_from_ball >= g.def_line_min_dist_from_ball);
+        assert!((0.0..=12.0).contains(&g.defender_on_ball_opponent_distance));
+        assert!((0.0..=1.0).contains(&g.defender_on_ball_pass_urgency));
+        assert!(g.pass_distance_priority.iter().all(|w| w.is_finite()));
+        for anchor in &g.anchors {
+            assert!(anchor.lane < PITCH_GENOME_LANES && anchor.row < PITCH_GENOME_ROWS);
+        }
     }
 
     #[test]
