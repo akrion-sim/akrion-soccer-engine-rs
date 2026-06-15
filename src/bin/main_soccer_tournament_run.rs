@@ -514,6 +514,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut parent_policy_version_id: Option<String> = None;
     let mut parent_generation: i32 = -1;
     let mut seed_snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
+    // The generational breeding pool: the previous tournament's top-N finishers.
+    let mut elite_pool: Vec<SoccerNeuralNetworkSnapshot> = Vec::new();
+    let elite_pool_size = env_string("SOCCER_TOURNAMENT_ELITE_POOL")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value >= 1)
+        .unwrap_or(16);
 
     if let Some(store) = store.as_mut() {
         let eid = store.ensure_experiment(
@@ -536,6 +542,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             None => {
                 println!("tournament_seed experiment={eid} no_active_policy=true (cold start)");
+            }
+        }
+        // Prefer the previous tournament's elite finishers as the breeding pool so
+        // each generation hybridizes the best of the last (a true GA), falling back
+        // to the single active policy / a cold field when none exists yet.
+        match store.load_latest_tournament_elite_neural_pool(&eid, elite_pool_size) {
+            Ok(pool) if !pool.is_empty() => {
+                println!(
+                    "tournament_elite_pool experiment={eid} size={} requested={elite_pool_size} source=last_completed_tournament",
+                    pool.len(),
+                );
+                elite_pool = pool;
+            }
+            Ok(_) => {
+                println!(
+                    "tournament_elite_pool experiment={eid} size=0 (no completed tournament yet)"
+                );
+            }
+            Err(err) => {
+                eprintln!("tournament_elite_pool_load_failed experiment={eid} error={err} (continuing without it)");
             }
         }
         experiment_id = Some(eid);
@@ -576,11 +602,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Phase 1: the parent pool is the single latest active policy (if any), so
-    // seeded teams are its mutated descendants. Phase 2 will replace this with the
-    // previous tournament's top-N elite finishers for true generational crossover.
-    let parents: Vec<SoccerNeuralNetworkSnapshot> = seed_snapshot.into_iter().collect();
-    let teams = build_entrants(&format, seed, &parents, seed_fraction);
+    // Parent pool for seeding: the previous tournament's top-N elites (true
+    // generational crossover) when available, else the single active policy
+    // (mutated descendants), else empty (a cold, fresh field).
+    let (parents, field_fraction) = if !elite_pool.is_empty() {
+        // The whole 128-team field is hybridized from the elite pool by default
+        // (SOCCER_TOURNAMENT_HYBRID_FRACTION, 1.0); lower it to keep fresh explorers.
+        let hybrid_fraction = env_f64("SOCCER_TOURNAMENT_HYBRID_FRACTION", 1.0);
+        (elite_pool, hybrid_fraction)
+    } else {
+        (seed_snapshot.into_iter().collect(), seed_fraction)
+    };
+    let teams = build_entrants(&format, seed, &parents, field_fraction);
+    println!(
+        "tournament_field parents={} field_fraction={:.2} seeding={}",
+        parents.len(),
+        field_fraction,
+        if parents.len() >= 2 {
+            "elite_crossover_hybridize"
+        } else if parents.len() == 1 {
+            "single_parent_mutate"
+        } else {
+            "cold_fresh"
+        },
+    );
     let tournament = Tournament::new(teams, format, mode, seed)?;
     let runner = EngineMatchRunner::new(runner_config);
     // Engine API (HEAD line): run_parallel borrows the runner and takes an

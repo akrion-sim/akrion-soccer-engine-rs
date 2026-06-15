@@ -937,6 +937,61 @@ impl SoccerLearningPgStore {
         Ok(brains)
     }
 
+    /// The breeding pool for the next generation: the top-`limit` finishers of
+    /// this experiment's most recently completed tournament, as an ordered Vec of
+    /// their final neural snapshots (best first). Finish is ranked by matches
+    /// advanced (a clean proxy for bracket depth — the champion plays the most),
+    /// then league points, then goal difference. Empty when no completed
+    /// tournament exists (callers fall back to the active policy / a cold field).
+    pub fn load_latest_tournament_elite_neural_pool(
+        &mut self,
+        experiment_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SoccerNeuralNetworkSnapshot>, String> {
+        self.ensure_connected()?;
+        {
+            let mut tx = self
+                .client
+                .transaction()
+                .map_err(|err| format!("begin tournament elite read schema tx: {err}"))?;
+            ensure_soccer_tournament_tables(&mut tx)?;
+            tx.commit()
+                .map_err(|err| format!("commit tournament elite read schema: {err}"))?;
+        }
+        let limit_i64 = limit.max(1) as i64;
+        let rows = self
+            .client
+            .query(
+                r#"
+                select b.neural_snapshot
+                from des_soccer_tournament_team_brains b
+                where b.tournament_id = (
+                  select id from des_soccer_tournaments
+                  where experiment_id = $1::text::uuid and status = 'completed'
+                  order by created_at desc, id desc
+                  limit 1
+                )
+                and b.neural_snapshot is not null
+                order by b.played desc,
+                         (b.wins * 3 + b.draws) desc,
+                         (b.goals_for - b.goals_against) desc,
+                         b.goals_for desc
+                limit $2
+                "#,
+                &[&experiment_id, &limit_i64],
+            )
+            .map_err(|err| format!("load tournament elite pool: {err}"))?;
+        let mut pool = Vec::with_capacity(rows.len());
+        for row in rows {
+            let snapshot_json: Value = row.get(0);
+            let snapshot: SoccerNeuralNetworkSnapshot = serde_json::from_value(snapshot_json)
+                .map_err(|err| format!("decode elite brain: {err}"))?;
+            validate_soccer_neural_network_snapshot_for_pg(&snapshot)?;
+            pool.push(snapshot);
+        }
+        Ok(pool)
+    }
+
     pub fn load_latest_active_policy(
         &mut self,
         experiment_id: &str,
