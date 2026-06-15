@@ -31684,6 +31684,71 @@ fn teammate_spacing_notice_fires_only_after_the_grace_window() {
 }
 
 #[test]
+fn committed_loose_ball_contesters_are_exempt_from_the_spacing_nudge() {
+    // Two teammates contesting a genuine 50/50 must BOTH be flagged as committed
+    // loose-ball chasers so the territory-spacing nudge leaves them alone. Without
+    // the exemption the yielder's run-at-the-ball gets pushed away from its partner
+    // (the ball sits between them), and the two orbit the loose ball without either
+    // reaching the trap radius — the live "circling but nobody claims it" bug.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let (a, b) = (2usize, 3usize); // two Home outfielders
+    let opp = 14usize; // an Away outfielder, on the ball to force a true 50/50
+    park_players_except(&mut sim, &[a, b, opp]);
+    sim.active_set_play = None;
+    sim.ball.holder = None;
+    sim.ball.velocity = Vec2::zero();
+    let drop = Vec2::new(40.5, 60.0);
+    sim.ball.position = drop;
+    sim.players[opp].position = Vec2::new(43.0, 60.0); // 2.5 yd off — inside shield radius
+
+    // Camp the pair 1 yd apart on the ball, past the grace window, so one is flagged
+    // to yield (proving the nudge WOULD fire absent the exemption).
+    camp_pair_for(
+        &mut sim,
+        a,
+        b,
+        Vec2::new(40.0, 60.0),
+        Vec2::new(41.0, 60.0),
+        4.5,
+    );
+    assert!(
+        pair_notice(&sim, a, b).is_some(),
+        "a sustained 1-yd overlap on the ball should still be flagged"
+    );
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.loose_ball_contester_count(
+            snapshot.players.iter().find(|p| p.id == a).unwrap(),
+            drop,
+        ),
+        2,
+        "an opponent on the drop makes this a genuine 50/50 worth two contesters"
+    );
+    assert!(
+        snapshot.is_committed_loose_ball_chaser(a),
+        "the closest contester is committed to the ball and must be spacing-exempt"
+    );
+    assert!(
+        snapshot.is_committed_loose_ball_chaser(b),
+        "the second 50/50 contester is committed too — neither should be nudged off"
+    );
+
+    // Once a teammate has CONTROL the same pair is no longer chasing: the carrier
+    // exemption already covers the holder, and the partner is policed normally.
+    sim.ball.holder = Some(a);
+    let held_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !held_snapshot.is_committed_loose_ball_chaser(a),
+        "a held ball is not a loose-ball chase"
+    );
+    assert!(
+        !held_snapshot.is_committed_loose_ball_chaser(b),
+        "with the ball controlled, the partner is subject to ordinary spacing again"
+    );
+}
+
+#[test]
 fn teammate_spacing_minimum_tightens_inside_the_box() {
     let (a, b) = (2usize, 3usize);
     // (a) 2.5 yd apart in open play violates the 3-yd minimum → flagged.
@@ -38001,6 +38066,143 @@ fn goal_restart_sets_center_kickoff_for_conceding_team() {
         .events
         .iter()
         .any(|event| event.kind == "kickoff" && event.team == Some(Team::Away)));
+}
+
+#[test]
+fn opening_kickoff_arms_no_double_touch_guard_on_first_match_step() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 5.0,
+        seed: 91,
+        ..Default::default()
+    });
+    // A pristine constructed match: the ball and the home kickoff taker are on the
+    // centre spot and nothing has been played yet, so no guard is armed.
+    let taker = sim.ball.holder.expect("opening kickoff holder");
+    assert_eq!(sim.restart_double_touch_guard, None);
+
+    // The first real match step lazily brings the opening kickoff under the
+    // no-double-touch rule (the taker may not be the next to control the ball).
+    sim.run_time_step();
+    assert_eq!(sim.restart_double_touch_guard, Some(taker));
+}
+
+#[test]
+fn sandbox_match_off_centre_ball_does_not_arm_opening_kickoff_guard() {
+    // Mirrors how decision/serialization fixtures stage their own scenarios: the ball
+    // is hijacked to a non-centre spot, so the pristine opening-kickoff pattern does
+    // not match and the lazy stage leaves the guard alone.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 5.0,
+        seed: 91,
+        ..Default::default()
+    });
+    sim.clear_controller_assignments();
+    let holder = 5;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 40.0);
+    sim.players[holder].position = sim.ball.position;
+
+    sim.run_time_step();
+
+    assert_eq!(sim.restart_double_touch_guard, None);
+}
+
+#[test]
+fn kickoff_arms_no_double_touch_guard_and_clears_on_another_touch() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.score_goal(Team::Home);
+    let taker = sim.ball.holder.expect("kickoff holder");
+
+    // The kickoff taker may not touch the ball twice in a row.
+    assert_eq!(sim.restart_double_touch_guard, Some(taker));
+
+    // ...and is forced to play it to a teammate (held restart), not dribble it away.
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(held_restart_action_for_snapshot(&snapshot, taker).is_some());
+
+    // The taker touching again does NOT clear their own guard.
+    sim.record_possession_touch(taker);
+    assert_eq!(sim.restart_double_touch_guard, Some(taker));
+
+    // Any other player's touch clears it — the no-double-touch rule is satisfied.
+    let other = sim
+        .players
+        .iter()
+        .find(|p| p.id != taker)
+        .map(|p| p.id)
+        .expect("another player");
+    sim.record_possession_touch(other);
+    assert_eq!(sim.restart_double_touch_guard, None);
+}
+
+#[test]
+fn held_restart_pushes_encroaching_opponents_back_ten_yards() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(40.0, 60.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::FreeKick,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+    assert_eq!(sim.ball.position, spot);
+
+    // An Away (defending) outfielder creeps to within ~3yd of the ball.
+    let keeper = sim.goalkeeper_for(Team::Away);
+    let opponent = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && Some(p.id) != keeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    sim.players[opponent].position = spot + Vec2::new(3.0, 1.0);
+
+    sim.enforce_restart_keepout_for(opponent);
+
+    let dist = sim.players[opponent].position.distance(spot);
+    assert!(
+        dist >= RESTART_OPPONENT_KEEPOUT_YARDS - 1e-6,
+        "encroaching opponent should be held 10yd off the ball, got {dist}"
+    );
+
+    // The taker's own teammate near the spot is never pushed away.
+    let teammate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && sim.ball.holder != Some(p.id))
+        .map(|p| p.id)
+        .expect("home teammate");
+    let near = spot + Vec2::new(2.0, 0.0);
+    sim.players[teammate].position = near;
+    sim.enforce_restart_keepout_for(teammate);
+    assert_eq!(sim.players[teammate].position, near);
+}
+
+#[test]
+fn throw_in_is_exempt_from_ten_yard_keepout() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let spot = Vec2::new(0.0, 60.0);
+    sim.apply_restart(BallRestart {
+        kind: BallRestartKind::ThrowIn,
+        awarded_team: Team::Home,
+        position: spot,
+    });
+
+    let keeper = sim.goalkeeper_for(Team::Away);
+    let opponent = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && Some(p.id) != keeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    let near = spot + Vec2::new(3.0, 0.0);
+    sim.players[opponent].position = near;
+
+    sim.enforce_restart_keepout_for(opponent);
+
+    assert_eq!(
+        sim.players[opponent].position, near,
+        "throw-ins keep their own short spacing — no 10yd keep-out"
+    );
 }
 
 #[test]

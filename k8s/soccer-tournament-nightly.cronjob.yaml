@@ -43,8 +43,8 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # Hard 2am–7am stop (5h). Includes build time; the warm hostPath cache keeps
-      # the incremental build to seconds after the first cold run.
+      # Hard 2am–7am stop (5h). Includes the ~4-5 min cold clone+build (the build
+      # dir is a per-pod emptyDir, not a node cache — see the volumes section).
       activeDeadlineSeconds: 18000
       backoffLimit: 1
       template:
@@ -140,6 +140,13 @@ spec:
                     secretKeyRef:
                       name: dd-remote-rest-api-secrets
                       key: RDS_DATABASE_URL
+                # RDS presents an Amazon RDS CA cert that isn't in the container's
+                # trust store, so a verifying TLS handshake fails with the opaque
+                # "error connecting to server". The continuous learner opts out the
+                # same way (encrypted but unauthenticated). Without this the nightly
+                # job dies at PG connect after 5 retries (verified 2026-06-14).
+                - name: SOCCER_PG_TLS_INSECURE
+                  value: "1"
                 - name: SOCCER_EXPERIMENT_SLUG
                   value: soccer-nightly-tournament
                 # Same key in AWS + Hetzner: only one cluster owns the global
@@ -183,9 +190,15 @@ spec:
                 - name: tmp
                   mountPath: /tmp
           volumes:
-            # Share the build cache with the continuous learner (same node-local
-            # hostPath) so the incremental build is seconds, not a ~5min cold rebuild.
+            # Per-pod emptyDir, NOT a node hostPath. A hostPath build cache only
+            # works on a node where the dir is already owned by uid 1000; on a
+            # multi-node cluster (Hetzner: 3 control-plane + 2 workers) the pod can
+            # land on a node where /var/cache is fresh + root-owned, and the uid-1000
+            # build then dies at `mkdir: Permission denied` before it ever compiles.
+            # emptyDir receives the pod's fsGroup (1000) so it is writable on ANY
+            # node in ANY cluster, and it drops the restricted-PSA hostPath warning.
+            # Trade-off: a cold clone+build every night (~4-5 min) instead of an
+            # incremental one — negligible inside the 5h window that is otherwise
+            # ~4h of matches.
             - name: tmp
-              hostPath:
-                path: /var/cache/dd-soccer-learning
-                type: DirectoryOrCreate
+              emptyDir: {}

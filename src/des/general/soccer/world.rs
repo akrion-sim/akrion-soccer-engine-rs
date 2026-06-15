@@ -3392,10 +3392,54 @@ impl SoccerMatch {
         }
     }
 
+    /// Arm the no-double-touch guard for the opening kickoff, lazily, on the first
+    /// tick of a real match. A freshly constructed match holds the ball on the centre
+    /// spot with the home kickoff taker and no recorded ball decision; we make sure
+    /// the opening kickoff obeys the same no-double-touch rule as every other restart
+    /// — once the taker plays it, they cannot be the next player to control it until a
+    /// teammate (or opponent) has touched it.
+    ///
+    /// Unlike the in-game kickoffs (after a goal, start of a half) this does NOT record
+    /// a "kickoff" decision, so the taker is not forced into a tick-0 held-restart
+    /// release: the opening kickoff plays out through the normal policy, while the guard
+    /// still forbids a double touch. Arming the guard is invisible unless the taker
+    /// actually tries to re-control a loose ball, so match-start dynamics are unchanged.
+    ///
+    /// Doing this lazily — rather than in the constructor — keeps decision/snapshot
+    /// sandbox tests untouched: they build a match and hijack the ball (a different
+    /// holder, the ball off the centre spot) without ever calling the match-level step,
+    /// so they never match the pristine opening-kickoff pattern below.
+    fn stage_opening_kickoff_if_pending(&mut self) {
+        if self.tick != 0
+            || self.ball.last_decision.is_some()
+            || self.restart_double_touch_guard.is_some()
+        {
+            return;
+        }
+        let Some(holder_id) = self.ball.holder else {
+            return;
+        };
+        let center = Vec2::new(
+            self.config.field_width_yards * 0.5,
+            self.config.field_length_yards * 0.5,
+        );
+        let ball_on_spot = self.ball.position.distance(center) <= 0.25;
+        let holder_on_spot = self
+            .players
+            .get(holder_id)
+            .is_some_and(|player| player.position.distance(center) <= 0.25);
+        if !ball_on_spot || !holder_on_spot {
+            return;
+        }
+        // The kickoff taker may not touch the ball twice in a row.
+        self.restart_double_touch_guard = Some(holder_id);
+    }
+
     pub fn run_time_step(&mut self) {
         if self.is_done() {
             return;
         }
+        self.stage_opening_kickoff_if_pending();
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
         let mut pre_field_snapshot_elapsed = Duration::from_secs(0);
@@ -3582,8 +3626,13 @@ impl SoccerMatch {
                         snapshot.discipline_intent_against_bunchball(intent)
                     };
                     // Territorial spacing: nudge a player the brain flagged as camped
-                    // on a teammate back toward open space / its own slot.
-                    let intent = if dd_soccer_disable_spacing_nudge() {
+                    // on a teammate back toward open space / its own slot. EXEMPT a
+                    // player committed to winning a live loose ball — on a 50/50 the
+                    // closest two teammates are deliberately sent to contest the SAME
+                    // ball, and nudging the yielder away from its partner pushes it off
+                    // the ball (the two then orbit it without either trapping it).
+                    let chasing_loose_ball = snapshot.is_committed_loose_ball_chaser(intent.player_id);
+                    let intent = if dd_soccer_disable_spacing_nudge() || chasing_loose_ball {
                         intent
                     } else {
                         snapshot.nudge_intent_for_teammate_spacing(intent)
@@ -3604,8 +3653,13 @@ impl SoccerMatch {
                     let intent = snapshot.offside_trap_cover_adjusted_intent(intent);
                     // Territory-spacing: if this player was told to vacate a teammate's
                     // space last tick, nudge it out of the minimum-spacing radius and
-                    // back toward its formation slot.
-                    let intent = self.teammate_spacing_disciplined_intent(intent);
+                    // back toward its formation slot. (Same loose-ball-chaser exemption
+                    // as the snapshot nudge above — both fire per tick.)
+                    let intent = if chasing_loose_ball {
+                        intent
+                    } else {
+                        self.teammate_spacing_disciplined_intent(intent)
+                    };
                     // Relational shape: nudge an off-ball mover toward its ideal offsets
                     // to its formation neighbours so the team covers ground as a unit.
                     let intent = self.relational_shape_disciplined_intent(intent);
@@ -5942,7 +5996,7 @@ impl SoccerMatch {
     /// each tick after the player moves, so opponents are held at the line until the
     /// taker plays the ball (Laws 8/13/16). The defending keeper is exempt so it can
     /// keep its goal-line position on a corner / short free kick near the byline.
-    fn enforce_restart_keepout_for(&mut self, player_id: usize) {
+    pub(crate) fn enforce_restart_keepout_for(&mut self, player_id: usize) {
         let Some((keepout_team, spot)) = self.held_restart_keepout() else {
             return;
         };
@@ -17300,13 +17354,13 @@ impl WorldSnapshot {
             .clamp_to_pitch(self.field_width, self.field_length)
     }
 
-    pub(crate) fn loose_ball_recovery_target_for(&self, player_id: usize) -> Vec2 {
-        if self.active_rebound_for_player(player_id).is_some() {
-            return self
-                .projected_loose_ball_target()
-                .unwrap_or(self.ball.position)
-                .clamp_to_pitch(self.field_width, self.field_length);
-        }
+    /// The point a designated retriever ATTACKS to win a loose ball — an early
+    /// interception point along the roll (cut harder when an opponent is bearing
+    /// down), or the projected landing of a deliberate long ball. This is the raw
+    /// contest point BEFORE the retriever/support-outlet split, so it is shared by
+    /// [`Self::loose_ball_recovery_target_for`] and the loose-ball-chaser predicate
+    /// ([`Self::is_committed_loose_ball_chaser`]).
+    pub(crate) fn loose_ball_contest_target_for(&self, player_id: usize) -> Vec2 {
         let projected = self
             .projected_loose_ball_target()
             .unwrap_or(self.ball.position);
@@ -17319,7 +17373,6 @@ impl WorldSnapshot {
         // route-one is meant to be run onto at its projected LANDING zone, so leave
         // that case targeting the projected point.
         let is_long_ball_flight = self.loose_untargeted_long_ball_team().is_some();
-        let mut target = projected;
         if !is_long_ball_flight {
             if let Some(me) = self.players.iter().find(|p| p.id == player_id) {
                 let cutoff = if self.nearest_opponent_distance_at(me.team, projected)
@@ -17329,10 +17382,41 @@ impl WorldSnapshot {
                 } else {
                     LOOSE_BALL_ATTACK_CUTOFF_FRACTION
                 };
-                target = self.ball.position + (projected - self.ball.position) * cutoff;
+                return self.ball.position + (projected - self.ball.position) * cutoff;
             }
         }
-        let target = target;
+        projected
+    }
+
+    /// True when `player_id` is one of the teammates COMMITTED to winning a live
+    /// loose ball this tick — the designated retriever, plus a second challenger on
+    /// a genuine 50/50 (see [`Self::loose_ball_contester_count`]). These players are
+    /// running AT the ball; the teammate-spacing nudge must leave them alone, exactly
+    /// as it leaves the carrier alone, or two contesters converging on the same loose
+    /// ball get pushed apart and orbit it without either reaching the trap radius.
+    pub(crate) fn is_committed_loose_ball_chaser(&self, player_id: usize) -> bool {
+        if self.ball.holder.is_some() || self.active_set_play.is_some() {
+            return false;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return false;
+        };
+        if me.role == PlayerRole::Goalkeeper {
+            return false;
+        }
+        let target = self.loose_ball_contest_target_for(player_id);
+        let contesters = self.loose_ball_contester_count(me, target);
+        self.is_among_closest_loose_ball_retrievers(player_id, target, contesters)
+    }
+
+    pub(crate) fn loose_ball_recovery_target_for(&self, player_id: usize) -> Vec2 {
+        if self.active_rebound_for_player(player_id).is_some() {
+            return self
+                .projected_loose_ball_target()
+                .unwrap_or(self.ball.position)
+                .clamp_to_pitch(self.field_width, self.field_length);
+        }
+        let target = self.loose_ball_contest_target_for(player_id);
         let Some(player) = self.players.iter().find(|player| player.id == player_id) else {
             return target;
         };
