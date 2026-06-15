@@ -976,6 +976,10 @@ impl SoccerMatch {
         if let Some(holder_id) = kickoff {
             self.mark_ball_received(holder_id);
             self.record_possession_touch(holder_id);
+            // The kickoff taker may not touch the ball twice in a row: they must
+            // play it to a teammate (held-restart release) before touching again.
+            // Set AFTER record_possession_touch, which would otherwise clear it.
+            self.restart_double_touch_guard = Some(holder_id);
         }
         self.ball.record_decision(self.tick, "kickoff", None);
         self.pending_pass = None;
@@ -3642,8 +3646,11 @@ impl SoccerMatch {
                         }
                         None => None,
                     };
+                    let intent_player_id = intent.player_id;
                     self.apply_player_intent(intent);
                     self.sync_held_ball_to_holder();
+                    // Hold opponents 10yd off the ball until a held restart is played.
+                    self.enforce_restart_keepout_for(intent_player_id);
                     field_intent_elapsed += phase_started.elapsed();
                 }
                 AgentScheduleKind::Official => {
@@ -5910,6 +5917,60 @@ impl SoccerMatch {
         if amount > 0.0 {
             self.record_reward_event(player_id, -amount);
         }
+    }
+
+    /// While a restart is held (the taker still has the ball and has not yet played
+    /// it), this returns the team that must be kept the 10yd keep-out distance from
+    /// the ball, plus the ball spot. `None` outside a held restart, and `None` for a
+    /// throw-in (exempt — its own shape handles the much shorter spacing).
+    fn held_restart_keepout(&self) -> Option<(Team, Vec2)> {
+        let holder = self.ball.holder?;
+        let label = self
+            .ball
+            .last_decision
+            .as_ref()
+            .and_then(|decision| restart_action_label(&decision.action))?;
+        if label == "throw-in" {
+            return None;
+        }
+        let restarting_team = self.players.get(holder)?.team;
+        Some((restarting_team.other(), self.ball.position))
+    }
+
+    /// Push a single player back out to the 10yd keep-out radius if it is an opponent
+    /// of the team taking a currently-held restart and has crept inside it. Called
+    /// each tick after the player moves, so opponents are held at the line until the
+    /// taker plays the ball (Laws 8/13/16). The defending keeper is exempt so it can
+    /// keep its goal-line position on a corner / short free kick near the byline.
+    fn enforce_restart_keepout_for(&mut self, player_id: usize) {
+        let Some((keepout_team, spot)) = self.held_restart_keepout() else {
+            return;
+        };
+        if player_id >= self.players.len() || self.players[player_id].team != keepout_team {
+            return;
+        }
+        if self.goalkeeper_for(keepout_team) == Some(player_id) {
+            return;
+        }
+        let pos = self.players[player_id].position;
+        let offset = pos - spot;
+        let dist = offset.len();
+        if dist >= RESTART_OPPONENT_KEEPOUT_YARDS {
+            return;
+        }
+        let dir = if dist > 1e-6 {
+            offset / dist
+        } else {
+            // Degenerate: standing on the ball — retreat toward own goal.
+            Vec2::new(0.0, -self.players[player_id].team.attack_dir())
+        };
+        let target = (spot + dir * RESTART_OPPONENT_KEEPOUT_YARDS)
+            .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
+        let player = &mut self.players[player_id];
+        player.position = target;
+        // Kill inward momentum so they hold at the line instead of drifting back in.
+        player.velocity = Vec2::zero();
+        player.acceleration = Vec2::zero();
     }
 
     pub(crate) fn apply_player_intent(&mut self, intent: PlayerIntent) {
@@ -9982,6 +10043,10 @@ impl SoccerMatch {
         if let Some(holder_id) = kickoff {
             self.mark_ball_received(holder_id);
             self.record_possession_touch(holder_id);
+            // The kickoff taker may not touch the ball twice in a row: they must
+            // play it to a teammate (held-restart release) before touching again.
+            // Set AFTER record_possession_touch, which would otherwise clear it.
+            self.restart_double_touch_guard = Some(holder_id);
         }
         self.ball.record_decision(self.tick, "kickoff", None);
         self.pending_pass = None;
@@ -10056,6 +10121,10 @@ impl SoccerMatch {
         if let Some(holder_id) = kickoff {
             self.mark_ball_received(holder_id);
             self.record_possession_touch(holder_id);
+            // The kickoff taker may not touch the ball twice in a row: they must
+            // play it to a teammate (held-restart release) before touching again.
+            // Set AFTER record_possession_touch, which would otherwise clear it.
+            self.restart_double_touch_guard = Some(holder_id);
         }
         self.ball.record_decision(self.tick, "kickoff", None);
         self.pending_pass = None;
@@ -15611,21 +15680,41 @@ impl WorldSnapshot {
                         <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 aim_point_and_anticipation
                     .filter(|(aim_point, _)| {
-                        // In the final third, a FORWARD ball to a contested receiver is no
+                        // Near the opponent goal, a FORWARD ball to a contested receiver is no
                         // longer hard-vetoed just because a defender wins the race to the
-                        // (often aggressively LED) reception point. Near the opponent goal a
-                        // contested reception is worth the risk, so the race outcome is PRICED
-                        // into the score (the reception-congestion penalty, already relaxed in
-                        // the final third) instead of being used to HIDE the option — the same
-                        // treatment the threaded/"killer" ball already gets. Without this the
-                        // only "uncontested" option in a congested final third is a ball
-                        // backward, so a holder under rising hold-urgency recycles backwards
-                        // (or is dispossessed) instead of playing a brave forward pass.
-                        let final_third_forward = forward > 1.25
-                            && (me.team.goal_y(self.field_length) - aim_point.y).abs()
-                                <= self.field_length / 3.0;
+                        // (often aggressively LED) reception point. A contested reception there
+                        // is worth the risk, so the race outcome is PRICED into the score (the
+                        // reception-congestion penalty, already relaxed in the final third)
+                        // instead of being used to HIDE the option — the same treatment the
+                        // threaded/"killer" ball gets. Without this the only "uncontested"
+                        // option in a congested final third is a ball backward, so a holder
+                        // under rising hold-urgency recycles backwards (or is dispossessed)
+                        // instead of playing a brave forward pass.
+                        //
+                        // The relaxation is SMOOTH, not a cliff at the 1/3 line: the required
+                        // race margin tapers from the full requirement down to zero as the aim
+                        // point advances, reaching full relaxation inside the final third and
+                        // easing in over a band just outside it. A forward pass keeps its
+                        // hard race veto in the build-up half and loses it gradually as play
+                        // progresses goalward.
+                        let forward_pass = forward > 1.25;
+                        let race_won = if forward_pass {
+                            let aim_yards_to_goal =
+                                (me.team.goal_y(self.field_length) - aim_point.y).abs();
+                            let final_third_line = self.field_length / 3.0;
+                            let relax = ((final_third_line
+                                + FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS
+                                - aim_yards_to_goal)
+                                / FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS)
+                                .clamp(0.0, 1.0);
+                            let margin = PASS_RECEPTION_OPPONENT_TIME_MARGIN * (1.0 - relax);
+                            opponent_time_to_point >= ball_time_to_point * margin
+                                || opponent_time_to_current >= ball_time_to_current * margin
+                        } else {
+                            reception_won
+                        };
                         (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && (!require_reception_won || reception_won || final_third_forward)
+                            && (!require_reception_won || race_won)
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()

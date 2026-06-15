@@ -818,6 +818,12 @@ const RECEPTION_CONGESTION_PENALTY: f64 = 3.0;
 // Even in the final third, a pass to a tightly-marked receiver keeps at least this
 // fraction of the congestion penalty (a defender on the man is a likely turnover).
 const FINAL_THIRD_CONGESTION_FLOOR: f64 = 0.35;
+// The forward-pass reception-RACE veto (a defender reaching the reception point first) is
+// relaxed near goal so contested final-third balls aren't hidden — but SMOOTHLY, not as a
+// cliff at the 1/3 line. The required race margin is fully waived once the aim point is inside
+// the final third and ramps back to the normal requirement over this band just OUTSIDE the
+// line, so the relaxation eases in through the middle third instead of switching on abruptly.
+const FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS: f64 = 14.0;
 // Weight of the optimal-pass-length tiebreaker (peaks in the 8-12yd sweet spot).
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_MIN_YARDS: f64 = 8.0;
@@ -1442,6 +1448,11 @@ const SPRINT_MIN_SPEED_MPH: f64 = 22.0;
 const SPRINT_MAX_SPEED_MPH: f64 = 25.0;
 const STRIKER_ONSIDE_BUFFER_YARDS: f64 = 1.25;
 const DEAD_BALL_ONSIDE_BUFFER_YARDS: f64 = 1.0;
+// Distance (yards) opponents of the restarting team must keep from the ball while
+// a restart is held and not yet played — Laws 8/13/16 (kickoff, free kick, corner,
+// goal kick all use 9.15m ≈ 10yd). Throw-ins are exempt (they have their own much
+// shorter spacing). Enforced every tick until the taker plays the ball.
+const RESTART_OPPONENT_KEEPOUT_YARDS: f64 = 10.0;
 // Fouls disabled: foul probability is multiplied by this so it is ~0.
 const FOUL_PROBABILITY_SCALE: f64 = 0.000_001;
 // Goal geometry: a real goal is 8 ft (= 8/3 yd) tall under the crossbar and 24 ft
