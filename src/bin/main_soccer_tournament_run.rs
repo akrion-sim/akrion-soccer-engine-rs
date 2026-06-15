@@ -256,8 +256,26 @@ fn promote_salvaged_brain(
 fn main() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
 
-    // Fixed 128-team default format (32 groups of 4, top-2 → 64-team knockout).
-    let format = TournamentFormat::default();
+    // Tournament shape: defaults to the 128-team format (32 groups of 4, top-2 →
+    // 64-team knockout) but each field is env-overridable so a smaller bracket can
+    // be run on demand (e.g. SOCCER_TOURNAMENT_TEAMS=24 SOCCER_TOURNAMENT_GROUP_SIZE=3
+    // SOCCER_TOURNAMENT_ADVANCERS=1 → 8 groups of 3, top-1 → 8-team knockout).
+    // validate() still enforces a power-of-two knockout field, so a bad combination
+    // fails fast with a clear message instead of producing a lopsided bracket.
+    let default_format = TournamentFormat::default();
+    let format = TournamentFormat {
+        team_count: env_string("SOCCER_TOURNAMENT_TEAMS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_format.team_count),
+        group_size: env_string("SOCCER_TOURNAMENT_GROUP_SIZE")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_format.group_size),
+        advancers_per_group: env_string("SOCCER_TOURNAMENT_ADVANCERS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_format.advancers_per_group),
+        double_round_robin: env_bool("SOCCER_TOURNAMENT_DOUBLE_RR", default_format.double_round_robin),
+        third_place_match: env_bool("SOCCER_TOURNAMENT_THIRD_PLACE", default_format.third_place_match),
+    };
     format.validate()?;
 
     let seed = env_u32("SOCCER_TOURNAMENT_SEED", 20_260_613);
