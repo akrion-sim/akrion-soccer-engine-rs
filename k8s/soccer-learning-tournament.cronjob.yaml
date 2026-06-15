@@ -91,7 +91,7 @@ spec:
                   cd "${soccer_dir}"
                   echo "tournament_build soccer=$(git rev-parse HEAD) des=$(git -C "${des_dir}" rev-parse HEAD)"
 
-                  /usr/local/cargo/bin/cargo build --release --bin main_soccer_tournament_run
+                  /usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_tournament_run
                   exec "${CARGO_TARGET_DIR}/release/main_soccer_tournament_run"
               env:
                 - name: HOME

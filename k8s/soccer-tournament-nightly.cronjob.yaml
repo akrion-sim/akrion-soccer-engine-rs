@@ -111,7 +111,7 @@ spec:
                   cd "${soccer}"
                   echo "soccer_commit=$(git rev-parse HEAD) engine_commit=$(git -C "${engine}" rev-parse HEAD)"
                   echo "tournament_build_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                  /usr/local/cargo/bin/cargo build --release --bin main_soccer_tournament_run
+                  /usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_tournament_run
 
                   export SOCCER_RUN_ID="${run_prefix}-$(date -u +%Y%m%dT%H%M%SZ)"
                   echo "tournament_run_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) run_id=${SOCCER_RUN_ID}"

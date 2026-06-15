@@ -108,7 +108,7 @@ spec:
               echo "source_commit_actual=${actual_commit}"
               export SOCCER_SOURCE_COMMIT="${actual_commit}"
 
-              /usr/local/cargo/bin/cargo build --release --bin main_soccer_learning_run
+              /usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_learning_run
               touch "${ready_file}"
 
               cycle=0
