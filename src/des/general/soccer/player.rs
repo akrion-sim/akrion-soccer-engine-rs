@@ -1761,6 +1761,13 @@ impl PlayerAgent {
             .iter()
             .find(|player| player.id == holder && player.team == self.team.other())?;
         let holder_position = snapshot.player_snapshot_position(holder_player);
+        // Can't steal from a goalkeeper holding the ball in his own box — it is in
+        // his hands (he is bound only by the handling time limit instead).
+        if holder_player.role == PlayerRole::Goalkeeper
+            && snapshot.point_in_own_penalty_area(holder_player.team, holder_position)
+        {
+            return None;
+        }
         let distance = self.position.distance(holder_position);
         if distance > DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS {
             return None;

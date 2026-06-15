@@ -44,6 +44,10 @@ pub struct SoccerMatch {
     /// by team. Each consumer reads it opt-in (see `genome_for`).
     pub(crate) home_genome: SoccerTeamGenome,
     pub(crate) away_genome: SoccerTeamGenome,
+    /// Clock (seconds) when the defending keeper's current in-hands handling
+    /// episode began, or `None` when no keeper is handling. Drives the no-steal
+    /// protection and the release time limit (`GK_HANDLING_HOLD_LIMIT_SECONDS`).
+    pub(crate) gk_handling_since_clock: Option<f64>,
     /// How the trained value head couples into live action selection. `Off` by
     /// default, so play is unchanged unless a run opts in via `with_neural_blend`.
     pub(crate) neural_blend: SoccerNeuralBlendConfig,
@@ -511,6 +515,7 @@ impl SoccerMatch {
             away_neural_frozen: false,
             home_genome: SoccerTeamGenome::default(),
             away_genome: SoccerTeamGenome::default(),
+            gk_handling_since_clock: None,
             neural_blend: config.neural_blend,
             policy_head: None,
             world_model: None,
@@ -4049,6 +4054,10 @@ impl SoccerMatch {
                 soccer_live_duration_ms(full_game_learning_elapsed),
             );
         }
+        // Keeper handling clock: with the holder/ball settled for the tick, start /
+        // clear the in-hands no-steal timer and force a clearance once a keeper
+        // overruns the handling time limit.
+        self.update_keeper_handling();
         // Publish this tick's fully-advanced state to the zero-copy inspector ring
         // (no-op unless SOCCER_INSPECT=1). External tools read it without the
         // server serialising everything to I/O every tick.
@@ -5741,6 +5750,70 @@ impl SoccerMatch {
         defender.position.distance(ball) > SHIELD_DEFENDER_BALL_GAP_YARDS
     }
 
+    /// The defending goalkeeper currently holding the ball IN HIS HANDS — the
+    /// holder is his team's keeper and he is inside his own penalty area. While
+    /// this holds the ball cannot be tackled/stolen; he must release within
+    /// `GK_HANDLING_HOLD_LIMIT_SECONDS`. Returns the keeper's player id.
+    pub(crate) fn keeper_handling_holder(&self) -> Option<usize> {
+        let holder = self.ball.holder?;
+        let keeper = self.players.iter().find(|player| player.id == holder)?;
+        if keeper.role != PlayerRole::Goalkeeper {
+            return None;
+        }
+        if !self.point_in_own_penalty_area(keeper.team, keeper.position) {
+            return None;
+        }
+        Some(holder)
+    }
+
+    /// Per-tick maintenance of the keeper-handling clock: start it when a keeper
+    /// gathers the ball in his box, clear it when he is no longer handling, and
+    /// force a clearance once he overruns the handling time limit. Called once at
+    /// the end of every tick.
+    pub(crate) fn update_keeper_handling(&mut self) {
+        match self.keeper_handling_holder() {
+            Some(keeper_id) => {
+                let since = *self
+                    .gk_handling_since_clock
+                    .get_or_insert(self.clock_seconds);
+                if self.clock_seconds - since >= GK_HANDLING_HOLD_LIMIT_SECONDS {
+                    self.force_keeper_release(keeper_id);
+                    self.gk_handling_since_clock = None;
+                }
+            }
+            None => self.gk_handling_since_clock = None,
+        }
+    }
+
+    /// A keeper who overruns the handling limit without distributing is forced to
+    /// hurriedly clear the ball upfield (a firm punt), losing it to open play.
+    fn force_keeper_release(&mut self, keeper_id: usize) {
+        let Some(keeper) = self.players.iter().find(|player| player.id == keeper_id) else {
+            return;
+        };
+        let team = keeper.team;
+        let from = keeper.position;
+        let attack_dir = team.attack_dir();
+        self.ball.holder = None;
+        self.ball.position = from;
+        self.ball.velocity = Vec2::new(0.0, attack_dir * GK_HANDLING_FORCED_CLEARANCE_YPS);
+        self.ball.altitude_yards = 0.0;
+        self.ball.curl_acceleration = Vec2::zero();
+        self.ball.last_touch_team = Some(team);
+        self.pending_pass = None;
+        self.pending_shot = None;
+        self.events.push(MatchEvent {
+            tick: self.tick,
+            clock_seconds: self.clock_seconds,
+            kind: "gk_handling_timeout_clearance".to_string(),
+            team: Some(team),
+            player_id: Some(keeper_id),
+            description: format!(
+                "keeper held the ball beyond {GK_HANDLING_HOLD_LIMIT_SECONDS:.0}s and was forced to clear"
+            ),
+        });
+    }
+
     pub(crate) fn complete_defensive_dispossession(
         &mut self,
         defender_id: usize,
@@ -5753,6 +5826,12 @@ impl SoccerMatch {
         if self.players[defender_id].team == self.players[attacker_id].team
             || self.ball.holder != Some(attacker_id)
         {
+            return;
+        }
+        // A goalkeeper holding the ball IN HIS HANDS (inside his own penalty area)
+        // cannot be tackled or dispossessed — it is in his hands. He is instead
+        // bound by the handling time limit (see `update_keeper_handling`).
+        if self.keeper_handling_holder() == Some(attacker_id) {
             return;
         }
         let defender_team = self.players[defender_id].team;
@@ -17688,6 +17767,56 @@ impl WorldSnapshot {
     /// [`Self::loose_ball_recovery_target_for`] and the loose-ball-chaser predicate
     /// ([`Self::is_committed_loose_ball_chaser`]).
     pub(crate) fn loose_ball_contest_target_for(&self, player_id: usize) -> Vec2 {
+        // A ground pass still IN FLIGHT is contested on its LANE: an opponent of the passer
+        // near the ball's path steps to the nearest point on it to cut the ball out, instead
+        // of trailing the ball's stale current spot. `projected_loose_ball_target` bails while
+        // a pass is pending, so without this a defender a yard or two off the trajectory is
+        // told to chase where the ball already WAS and "lets it roll" past — the live bug
+        // where nearby players never make the effort to intercept a ground pass.
+        //
+        // Only an OPPONENT of the passer is diverted: the passing team's off-ball players keep
+        // their support shape (they must not jump in front of their own intended receiver, who
+        // meets the ball via `pending_pass_reception_target_for` and never reaches this path).
+        // The step-in is gated by the SAME reach model the physics resolver uses (mirrors
+        // `pass_lane_clearance` / `nearest_ball_controller_for_segment`): the defender commits
+        // only when they can reach their nearest point on the lane before the ball passes it,
+        // so the decision predicts exactly the cut-outs the simulation allows and a defender
+        // too far off the lane is never dragged out of shape.
+        if let Some(pass) = self.pending_pass.as_ref() {
+            if self.ball.holder.is_none() && !pass.flight.is_aerial() {
+                if let Some(me) = self.players.iter().find(|p| p.id == player_id) {
+                    if me.team != pass.team && me.role != PlayerRole::Goalkeeper {
+                        let from = self.ball.position;
+                        let to = pass.intended_target;
+                        let lane = to - from;
+                        let lane_len = lane.len();
+                        if lane_len > 1e-3 {
+                            let dir = lane * (1.0 / lane_len);
+                            let me_pos = self.player_snapshot_position(me);
+                            let along = (me_pos - from).dot(dir).clamp(0.0, lane_len);
+                            if along > 1e-3 {
+                                let lane_point = from + dir * along;
+                                let perp_gap = me_pos.distance(lane_point);
+                                let speed = self.ball.velocity.len().max(1.0);
+                                let t_ball = along / speed;
+                                let sprint_speed = player_top_speed_yps(me.role, &me.skills)
+                                    * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+                                    * MovementGait::Sprint.speed_multiplier();
+                                let intercept_window = (t_ball
+                                    - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+                                    .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+                                let reach =
+                                    INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * intercept_window;
+                                if perp_gap <= reach {
+                                    return lane_point
+                                        .clamp_to_pitch(self.field_width, self.field_length);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let projected = self
             .projected_loose_ball_target()
             .unwrap_or(self.ball.position);
@@ -20964,6 +21093,83 @@ impl WorldSnapshot {
         self.shape_guarded_movement_point(player_id, proposed, fallback_candidates, home, roam)
     }
 
+    /// Lateral keep-out from the ball carrier's forward driving lane. Returns
+    /// `target` shoved sideways to the edge of the carrier's lane when (a) a
+    /// teammate (not this player) is carrying the ball, (b) that carrier is NOT
+    /// under pressure, (c) the carrier is driving goalward, and (d) `target`
+    /// sits inside the narrow corridor directly ahead of the carrier. Otherwise
+    /// returns `target` unchanged. This stops an off-ball teammate from running
+    /// straight into the path the carrier is dribbling into — unless the carrier
+    /// is pressured and actually needs a short outlet in that lane.
+    fn off_carrier_lane_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
+        if player.role == PlayerRole::Goalkeeper {
+            return target;
+        }
+        let Some(holder_id) = self.ball.holder else {
+            return target;
+        };
+        if holder_id == player.id {
+            return target;
+        }
+        let Some(holder) = self.players.iter().find(|p| p.id == holder_id) else {
+            return target;
+        };
+        if holder.team != player.team {
+            return target;
+        }
+        let carrier_pos = self.player_snapshot_position(holder);
+        // Pressured carrier: allow teammates into the lane to offer a short outlet.
+        if self.nearest_opponent_distance_at(holder.team, carrier_pos)
+            <= CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS
+        {
+            return target;
+        }
+        let attack = holder.team.attack_dir();
+        // Driving direction: the carrier's own motion when moving with intent,
+        // otherwise straight at the opponent goal. Must carry a goalward
+        // component — there is no forward lane to protect behind a carrier
+        // facing his own goal.
+        let velocity = self.player_velocity(holder.id).unwrap_or(holder.velocity);
+        let goalward = Vec2::new(self.field_width * 0.5, holder.team.goal_y(self.field_length))
+            - carrier_pos;
+        let drive_dir = if velocity.len() > 1.5 && velocity.y * attack > 0.0 {
+            velocity.normalized()
+        } else {
+            goalward.normalized()
+        };
+        if drive_dir.len() <= 1e-6 || drive_dir.y * attack <= 0.0 {
+            return target;
+        }
+        // Decompose the target relative to the carrier into along-/across-lane.
+        let rel = target - carrier_pos;
+        let longitudinal = rel.dot(drive_dir);
+        if longitudinal <= 0.0 || longitudinal > CARRIER_LANE_KEEPOUT_LENGTH_YARDS {
+            return target;
+        }
+        let along = drive_dir * longitudinal;
+        let across = rel - along;
+        if across.len() >= CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS {
+            return target;
+        }
+        // Inside the corridor: push out sideways to its edge, keeping the same
+        // depth. `perp` is the driving line rotated 90°; keep the side the target
+        // is already on, defaulting to the side with more space when dead-centre.
+        let perp = Vec2::new(-drive_dir.y, drive_dir.x);
+        let side = if across.dot(perp).abs() > 1e-6 {
+            across.dot(perp).signum()
+        } else {
+            let left = carrier_pos + along + perp * CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS;
+            let right = carrier_pos + along - perp * CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS;
+            if self.space_score_at(left, player.team) >= self.space_score_at(right, player.team) {
+                1.0
+            } else {
+                -1.0
+            }
+        };
+        (carrier_pos + along + perp * (side * CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS))
+            .clamp_to_pitch(self.field_width, self.field_length)
+    }
+
     pub(crate) fn shape_guarded_movement_point(
         &self,
         player_id: usize,
@@ -21020,11 +21226,12 @@ impl WorldSnapshot {
         } else {
             0.10
         };
-        if best_score > proposed_score + fallback_margin {
+        let chosen = if best_score > proposed_score + fallback_margin {
             best
         } else {
             proposed
-        }
+        };
+        self.off_carrier_lane_target(player, chosen)
     }
 
     pub(crate) fn space_score_at(&self, p: Vec2, team: Team) -> f64 {
