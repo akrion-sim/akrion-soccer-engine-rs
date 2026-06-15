@@ -3791,6 +3791,9 @@ impl SoccerMatch {
             self.clock_seconds,
         );
         self.clear_finished_set_play_if_needed();
+        // Law 16: once the goal kick has left the penalty area it is legally in play —
+        // retire the must-clear-the-box guard (runs every tick, independent of learning).
+        self.update_goal_kick_clearance();
         // Body rotation / dizziness / rotational-and-involvement energy run every
         // tick on the final positions (independent of learning).
         self.update_player_facing_dizziness_energy();
@@ -8128,6 +8131,13 @@ impl SoccerMatch {
                     self.call_offside(offside);
                     return;
                 }
+                // Law 16: if a goal kick is still pending and the ball is being controlled
+                // while still inside the box, it never left the area on the first touch —
+                // retake the goal kick rather than allowing the illegal short reception.
+                let control_position = self.player_position(holder).unwrap_or(self.ball.position);
+                if self.enforce_goal_kick_clearance_on_control(control_position) {
+                    return;
+                }
                 self.mark_ball_received(holder);
                 self.record_possession_touch(holder);
                 self.record_duel_rewards(holder);
@@ -9939,6 +9949,40 @@ impl SoccerMatch {
         self.teammate_proximity_seconds
             .retain(|_, seconds| *seconds > 1e-3);
         self.teammate_spacing_notices = notices;
+    }
+
+    /// Law 16 (per tick): the goal kick is legally in play the instant the ball leaves the
+    /// taking team's penalty area, so retire the must-clear guard then. While the ball is
+    /// still inside the box the guard stays armed; the retake itself is triggered at the
+    /// moment a player brings the ball under control inside the box (see
+    /// [`Self::enforce_goal_kick_clearance_on_control`]).
+    fn update_goal_kick_clearance(&mut self) {
+        if let Some((team, _)) = self.goal_kick_must_clear_box {
+            if !self.point_in_own_penalty_area(team, self.ball.position) {
+                self.goal_kick_must_clear_box = None;
+            }
+        }
+    }
+
+    /// Law 16 (on a controlling touch): if a goal kick is still pending (the ball never left
+    /// the penalty area) and a player has just brought it under control while it is inside
+    /// the box, the ball did not leave the area on the first touch — retake the goal kick.
+    /// `control_position` is where the ball was brought under control. Returns `true` if a
+    /// retake was awarded (the caller must stop processing the touch).
+    fn enforce_goal_kick_clearance_on_control(&mut self, control_position: Vec2) -> bool {
+        let Some((team, spot)) = self.goal_kick_must_clear_box else {
+            return false;
+        };
+        if !self.point_in_own_penalty_area(team, control_position) {
+            // Brought under control outside the box — the kick is legally in play.
+            self.goal_kick_must_clear_box = None;
+            return false;
+        }
+        // Controlled while still inside the box: an illegal short/second touch before the
+        // ball left the area. Retake (this re-arms the guard for the fresh attempt).
+        self.pending_pass = None;
+        self.apply_restart_with_label(BallRestartKind::GoalKick, team, spot, "goal-kick");
+        return true;
     }
 
     fn update_offside_lingering_rewards(&mut self, after: &WorldSnapshot) {
