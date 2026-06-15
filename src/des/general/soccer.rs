@@ -772,16 +772,6 @@ const OWN_BOX_ACROSS_GOAL_PENALTY: f64 = 3.8;
 // … UNLESS the lane is highly uncontested (no opponent within this of the pass lane), i.e. a
 // clean switch from one side of the box to the other.
 const OWN_BOX_ACROSS_GOAL_SAFE_LANE_YARDS: f64 = 6.0;
-// "Gift pass" guard. An opponent ambling under ~4 mph is comfortably set and will trivially
-// collect any ball played straight at them: passing directly to such a player (on the
-// trajectory, or arriving at their feet) is the lowest-skill turnover there is. A pass whose
-// path runs through, or whose reception point sits on, a SLOW opponent is collapsed toward a
-// near-zero completion so the ranker (and the holder's pass-vs-hold decision) avoids it,
-// driving the direct-to-opponent rate toward zero.
-const SLOW_OPPONENT_MAX_SPEED_YPS: f64 = 1.96; // ~4 mph
-const GIFT_PASS_LANE_RADIUS_YARDS: f64 = 2.1;
-const GIFT_PASS_ENDPOINT_RADIUS_YARDS: f64 = 3.2;
-const GIFT_PASS_QUALITY_FLOOR: f64 = 0.02;
 // Per-yard reward for a forward pass to an OPEN receiver (openness 0..1 × forward yards, capped
 // at 24yd). Biases pass selection toward playing forward to the most-open player.
 const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
@@ -40622,54 +40612,6 @@ struct PassTargetQuality {
     stride_fit: f64,
 }
 
-/// Multiplier in [GIFT_PASS_QUALITY_FLOOR, 1.0]: collapses toward the floor when a SLOW
-/// (< ~4 mph) opponent sits on the pass trajectory (`include_lane`) or at the reception
-/// point -- i.e. the ball would be played straight to a set defender. Returns 1.0 when no
-/// such opponent is in the way. The slower/more dead-centre the opponent, the harder the
-/// collapse. Goalkeepers are exempt (a pass arriving at the keeper is handled elsewhere).
-fn slow_opponent_gift_factor(
-    snapshot: &WorldSnapshot,
-    passer: &PlayerSnapshot,
-    passer_position: Vec2,
-    anticipated_target: Vec2,
-    include_lane: bool,
-) -> f64 {
-    let mut worst = 1.0_f64;
-    for opponent in snapshot.players.iter().filter(|p| p.team != passer.team) {
-        if opponent.role == PlayerRole::Goalkeeper {
-            continue;
-        }
-        let speed = snapshot
-            .player_velocity(opponent.id)
-            .unwrap_or(opponent.velocity)
-            .len();
-        if speed >= SLOW_OPPONENT_MAX_SPEED_YPS {
-            continue;
-        }
-        let position = snapshot
-            .player_position(opponent.id)
-            .unwrap_or(opponent.position);
-        let endpoint_dist = position.distance(anticipated_target);
-        let at_endpoint = endpoint_dist <= GIFT_PASS_ENDPOINT_RADIUS_YARDS;
-        let lane_dist = if include_lane {
-            distance_to_segment(position, passer_position, anticipated_target)
-        } else {
-            f64::INFINITY
-        };
-        let in_lane = lane_dist <= GIFT_PASS_LANE_RADIUS_YARDS;
-        if !at_endpoint && !in_lane {
-            continue;
-        }
-        // The closer the set opponent is to the line/endpoint, the more certain the gift.
-        let endpoint_prox = (1.0 - endpoint_dist / GIFT_PASS_ENDPOINT_RADIUS_YARDS).clamp(0.0, 1.0);
-        let lane_prox = (1.0 - lane_dist / GIFT_PASS_LANE_RADIUS_YARDS).clamp(0.0, 1.0);
-        let proximity = endpoint_prox.max(lane_prox);
-        let factor = (1.0 - proximity).clamp(GIFT_PASS_QUALITY_FLOOR, 1.0);
-        worst = worst.min(factor);
-    }
-    return worst;
-}
-
 fn pass_target_quality_for_snapshot(
     snapshot: &WorldSnapshot,
     passer: &PlayerSnapshot,
@@ -40745,7 +40687,13 @@ fn pass_target_quality_for_snapshot(
     let position_confidence = snapshot
         .player_position_confidence_for_point(passer.id, target_position)
         .unwrap_or(0.0);
-    let lane = if flight.is_aerial() {
+    // Lane clearance is a MULTIPLICATIVE situational gate — "can the ball physically
+    // traverse to the receiver" — kept separate from how desirable the target is. A
+    // defender physically in the corridor blocks the ball regardless of how open the
+    // receiver is downfield, so the block must override target desirability rather than
+    // being averaged against it (an additive lane term let an open receiver rescue a
+    // blocked lane, reading a ball straight through a set defender as ~0.6 "safe").
+    let lane_clearance = if flight.is_aerial() {
         let nearest_interceptor = snapshot
             .players
             .iter()
@@ -40779,16 +40727,17 @@ fn pass_target_quality_for_snapshot(
             2.5,
             nominal_speed,
         );
-        let lane_open = if !lane_clear_now {
-            0.24
+        if !lane_clear_now {
+            // Defender in the corridor now: the ball would have to pass through them.
+            // Genuinely low — whether they actually cut it out is left to the simulation.
+            0.30
         } else if lane_clear_through_flight {
             1.0
         } else {
             // Clear now but a defender drifts in mid-flight — a real interception risk
             // the static check missed. Priced between blocked and clear (penalty, not veto).
-            0.55
-        };
-        (lane_open * 0.58 + receiver_openness * 0.28 + position_confidence * 0.14).clamp(0.10, 1.0)
+            0.65
+        }
     };
     let distance_fit = if flight.is_aerial() {
         (1.0 - (distance - 32.0).abs() / 58.0).clamp(0.24, 1.0)
@@ -40796,23 +40745,36 @@ fn pass_target_quality_for_snapshot(
         (1.0 - (distance - 18.0).abs() / 42.0).clamp(0.20, 1.0)
     };
     let pressure_adjustment = 0.80 + receiver_openness * 0.20;
-    // Never hand the ball to a set defender: collapse completion when a slow (<4 mph)
-    // opponent is on the trajectory (floor only) or at the reception point (any flight).
-    let gift_factor = slow_opponent_gift_factor(
-        snapshot,
-        passer,
-        passer_position,
-        anticipated_target,
-        !flight.is_aerial(),
-    );
-    let expected_completion = (0.10
-        + pass_skill * 0.38
-        + lane * 0.22
-        + receiver_openness * 0.18
-        + distance_fit * 0.08
-        + stride_fit * 0.08)
-        * pressure_adjustment
-        * gift_factor;
+    // The actual completion is resolved by the SIMULATION (who reaches the rolling ball
+    // first — `nearest_ball_controller_for_segment`), never by this scalar. So this
+    // decision-time estimate is a PRODUCT of independent factors, each a proxy for part of
+    // that physics outcome: target desirability (below) × lane clearance (can the ball get
+    // there) × pass precision (skill tightens the release) × pressure. Multiplicative — not
+    // additive — so a blocked lane or a marked receiver each pulls the whole estimate down
+    // and can't be papered over by another term being high.
+    //
+    // Skill enters ONLY as the precision multiplier here; its real influence is at the MDP
+    // decision (policy/value weighting) and the MPC / execution-noise layer
+    // (`noisy_pass_target_*`, `modulated_pass_speed_yps`). We deliberately do NOT collapse
+    // the estimate for a slow defender sitting on the line (the old "gift factor"):
+    // predicting a CERTAIN interception is as unreliable as predicting a certain completion —
+    // whether a sharp/quick opponent actually cuts the ball out is left to the simulation
+    // (the lane-clearance gate already prices a defender in the corridor). Previously
+    // `pass_skill` was the single largest ADDITIVE term (`* 0.38`); with every player at max
+    // skill that was a flat ~0.38 inflation that compressed the open-vs-contested signal and
+    // made a contested ball read as safe — i.e. it pre-determined the outcome from skill.
+    //
+    // Target desirability if the ball gets there: how open the receiver is, the pass
+    // distance, how well it's played into the runner's stride, and how sure we are of the
+    // target's location.
+    let target_quality = 0.16
+        + receiver_openness * 0.42
+        + distance_fit * 0.24
+        + stride_fit * 0.08
+        + position_confidence * 0.10;
+    let pass_precision = 0.80 + pass_skill * 0.20;
+    let expected_completion =
+        target_quality * lane_clearance * pass_precision * pressure_adjustment;
     PassTargetQuality {
         receiver_openness,
         stride_fit,
@@ -40849,6 +40811,40 @@ fn best_pass_target_quality_for_snapshot(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or_default()
+}
+
+/// Best pass-into-stride ANTICIPATION available across `targets`, independent of which
+/// target offers the highest completion. The observation bins this separately from
+/// completion (a safe square ball and an into-stride runner are different signals), so it
+/// must not be read off the single best-completion target — otherwise a safer static outlet
+/// hides the fact that a runner could be played into space.
+fn best_pass_stride_fit_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    player_position: Vec2,
+    targets: &[usize],
+    flight: PassFlight,
+) -> f64 {
+    targets
+        .iter()
+        .filter_map(|target_id| {
+            let target = snapshot.players.iter().find(|p| p.id == *target_id)?;
+            let target_position = snapshot
+                .player_position(target.id)
+                .unwrap_or(target.position);
+            Some(
+                pass_target_quality_for_snapshot(
+                    snapshot,
+                    player,
+                    player_position,
+                    target,
+                    target_position,
+                    flight,
+                )
+                .stride_fit,
+            )
+        })
+        .fold(0.0_f64, f64::max)
 }
 
 fn pass_execution_skill(skills: &SkillProfile, flight: PassFlight, is_cross: bool) -> f64 {

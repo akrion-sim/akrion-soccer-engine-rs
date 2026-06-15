@@ -14624,6 +14624,31 @@ impl WorldSnapshot {
         } else {
             PassTargetQuality::default()
         };
+        // Best into-stride anticipation available — binned SEPARATELY from completion, so a
+        // safer static outlet (which may win on completion) doesn't hide a runner who could
+        // be played into space. (Not read off the best-completion target.)
+        let best_floor_pass_stride_fit = if has_ball {
+            best_pass_stride_fit_for_snapshot(
+                self,
+                me,
+                me_position,
+                &visible_pass_targets,
+                PassFlight::Floor,
+            )
+        } else {
+            0.0
+        };
+        let best_aerial_pass_stride_fit = if has_ball {
+            best_pass_stride_fit_for_snapshot(
+                self,
+                me,
+                me_position,
+                &visible_aerial_pass_targets,
+                PassFlight::Aerial,
+            )
+        } else {
+            0.0
+        };
         let aerial_pass_bypass_score = if has_ball {
             aerial_pass_bypass_score_for_snapshot(
                 self,
@@ -15086,8 +15111,8 @@ impl WorldSnapshot {
             floor_pass_lane_score,
             best_pass_receiver_openness: best_floor_pass_quality.receiver_openness,
             best_aerial_pass_receiver_openness: best_aerial_pass_quality.receiver_openness,
-            best_pass_stride_fit: best_floor_pass_quality.stride_fit,
-            best_aerial_pass_stride_fit: best_aerial_pass_quality.stride_fit,
+            best_pass_stride_fit: best_floor_pass_stride_fit,
+            best_aerial_pass_stride_fit: best_aerial_pass_stride_fit,
             expected_pass_completion: best_floor_pass_quality.expected_completion,
             expected_aerial_pass_completion: best_aerial_pass_quality.expected_completion,
             aerial_pass_bypass_score,

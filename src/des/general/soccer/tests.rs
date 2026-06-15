@@ -1759,6 +1759,62 @@ fn summary_only_autonomous_match_records_shot_liveness_without_frames() {
 }
 
 #[test]
+fn pass_lane_clearance_catches_a_defender_drifting_into_the_lane() {
+    // The floor-pass completion estimate (pass_target_quality_for_snapshot) now grades
+    // its lane with the movement-aware `pass_lane_clearance` instead of the static
+    // `clear_line`. This guards the underlying mechanism: a defender sitting OUTSIDE the
+    // corridor at decision time but whose velocity carries them INTO it before the ball
+    // arrives must register as "not clear through flight" — exactly what the old static
+    // check (still used for `clear_line`) misses and what produced "the pass went
+    // straight to the other team under low pressure".
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_207,
+        ..Default::default()
+    });
+    let opp = 14usize; // an Away outfielder used as the lane defender
+    park_players_except(&mut sim, &[opp]);
+    sim.ball.last_touch_team = Some(Team::Home);
+    // A 15-yd floor pass straight up the pitch.
+    let from = Vec2::new(40.0, 60.0);
+    let to = Vec2::new(40.0, 75.0);
+    let ball_speed = 17.0;
+    let radius = 2.5;
+
+    // (a) Clear lane: defender parked well off it and not moving.
+    sim.players[opp].position = Vec2::new(48.0, 67.0);
+    sim.players[opp].velocity = Vec2::zero();
+    let clear = WorldSnapshot::from_match(&sim).pass_lane_clearance(from, to, Team::Away, radius, ball_speed);
+    assert_eq!(clear, (true, true), "an idle defender 8 yd off the lane is fully clear");
+
+    // (b) Drifting in: 3 yd off the corridor NOW (static check says clear), sprinting
+    // toward it so it arrives before the ball passes its point.
+    sim.players[opp].position = Vec2::new(43.0, 68.0);
+    sim.players[opp].velocity = Vec2::new(-8.0, 0.0);
+    let drift_snap = WorldSnapshot::from_match(&sim);
+    assert!(
+        drift_snap.clear_line(from, to, Team::Away, radius),
+        "the OLD static check is fooled — defender is 3 yd off the lane right now"
+    );
+    assert_eq!(
+        drift_snap.pass_lane_clearance(from, to, Team::Away, radius, ball_speed),
+        (true, false),
+        "the movement-aware check must flag the closing defender (clear now, not through flight)"
+    );
+
+    // (c) Parked squarely in the lane: blocked outright by both checks.
+    sim.players[opp].position = Vec2::new(40.5, 68.0);
+    sim.players[opp].velocity = Vec2::zero();
+    let block_snap = WorldSnapshot::from_match(&sim);
+    assert!(!block_snap.clear_line(from, to, Team::Away, radius));
+    assert_eq!(
+        block_snap.pass_lane_clearance(from, to, Team::Away, radius, ball_speed),
+        (false, false),
+        "a defender in the corridor is blocked now and through flight"
+    );
+}
+
+#[test]
 fn final_third_pressure_exposes_killer_pass_option() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -40545,7 +40601,13 @@ fn unpressured_holder_with_clean_pass_throws_fewer_feints() {
 }
 
 #[test]
-fn pass_straight_to_a_slow_opponent_is_treated_as_a_gift() {
+fn pass_through_a_defender_in_the_lane_is_down_weighted() {
+    // A defender physically in the passing corridor is a SITUATIONAL block: completion is
+    // pulled down hard (the lane-clearance gate is multiplicative, so an open receiver
+    // downfield can't rescue it) — but it is NOT collapsed to a near-zero "gift", and we no
+    // longer special-case a slow vs fast defender on the line. Whether the defender actually
+    // cuts the ball out is left to the simulation. What the ESTIMATE must capture: a clear
+    // lane >> a defender drifting into it > a defender already sitting in it.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 26_140,
@@ -40575,29 +40637,30 @@ fn pass_straight_to_a_slow_opponent_is_treated_as_a_gift() {
             .expected_completion
     };
 
-    // Set defender (barely moving) parked dead in the passing lane = a gift.
+    // Defender parked dead in the passing lane = a ball straight through them.
     sim.players[blocker].position = Vec2::new(40.0, 49.0);
     sim.players[blocker].velocity = Vec2::zero();
-    let gift = completion(&sim);
+    let blocked = completion(&sim);
 
-    // Same slow defender, but off to the side (not in the lane / endpoint) = fine.
+    // Same defender, off to the side (not in the corridor) = clear lane.
     sim.players[blocker].position = Vec2::new(62.0, 49.0);
+    sim.players[blocker].velocity = Vec2::zero();
     let clear = completion(&sim);
 
-    // Back in the lane but sprinting across it = not the same dead gift.
-    sim.players[blocker].position = Vec2::new(40.0, 49.0);
-    sim.players[blocker].velocity = Vec2::new(7.0, 0.0);
-    let moving = completion(&sim);
+    // Currently 3yd off the lane but SPRINTING into it: priced between clear and blocked.
+    sim.players[blocker].position = Vec2::new(43.0, 49.0);
+    sim.players[blocker].velocity = Vec2::new(-8.0, 0.0);
+    let drifting = completion(&sim);
 
     assert!(
-        gift < clear * 0.5,
-        "a floor pass straight through a set (<4mph) defender must be heavily \
-             down-weighted: gift={gift} clear={clear}"
+        blocked < clear * 0.5,
+        "a floor pass straight through a defender in the corridor must be heavily \
+             down-weighted by the lane gate: blocked={blocked} clear={clear}"
     );
     assert!(
-        moving > gift,
-        "a fast defender crossing the lane is not the same dead gift as a set one: \
-             moving={moving} gift={gift}"
+        drifting > blocked && drifting < clear,
+        "a defender drifting into the lane is worse than a clear lane but not as bad as one \
+             already sitting in it: clear={clear} drifting={drifting} blocked={blocked}"
     );
 }
 
@@ -43181,7 +43244,10 @@ fn a_defender_inside_two_yards_shifts_the_carrier_toward_passing() {
                 .fold(0.0_f64, f64::max)
         };
         let pass_top = top(&|l: &str| l == "killer-pass" || l.starts_with("pass"));
-        let dribble_top = top(&|l: &str| l == "dribble" || l.starts_with("carry"));
+        // The `dribble` action (beat/retain under pressure) is the clean expression of the
+        // crowding response. `carry-forward` is gated by forward SPACE, not lateral crowding,
+        // so it isn't a reliable proxy for "dribbling" here and is excluded.
+        let dribble_top = top(&|l: &str| l == "dribble");
         assert!(
             dribble_top > 0.0 && pass_top > 0.0,
             "expected scored options"
