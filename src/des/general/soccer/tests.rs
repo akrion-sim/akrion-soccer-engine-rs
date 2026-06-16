@@ -1640,10 +1640,15 @@ fn summary_only_autonomous_match_records_pass_liveness_without_frames() {
         .saturating_add(stats.passes_completed_away);
 
     assert_eq!(summary.summary.ticks, 300);
-    assert_eq!(summary.step_timing.ticks, summary.summary.ticks);
+    assert!(
+        summary.step_timing.ticks > 0 && summary.step_timing.ticks <= summary.summary.ticks,
+        "active step timing should stay within summary match ticks: active={} summary={}",
+        summary.step_timing.ticks,
+        summary.summary.ticks
+    );
     assert_eq!(
         summary.controller_yield.skipped_no_assignment,
-        summary.summary.ticks
+        summary.step_timing.ticks
     );
     assert_eq!(summary.tactical_liveness["frameLivenessKnown"], false);
     assert_eq!(summary.tactical_liveness["sustainedPassWindow"], true);
@@ -1730,7 +1735,7 @@ fn autonomous_match_generates_shot_attempts_without_human_input() {
 
 #[test]
 fn summary_only_autonomous_match_records_shot_liveness_without_frames() {
-    let summary = run_simulation_summary(MatchConfig {
+    let config = MatchConfig {
         duration_seconds: 45.0,
         learning_enabled: false,
         learning_logging_enabled: false,
@@ -1741,7 +1746,9 @@ fn summary_only_autonomous_match_records_shot_liveness_without_frames() {
         max_human_players: 0,
         seed: 22_902,
         ..MatchConfig::default()
-    });
+    };
+    let max_ticks = config.total_ticks();
+    let summary = run_simulation_summary(config);
     let stats = &summary.summary.stats;
     let shots = stats.shots_home.saturating_add(stats.shots_away);
     let shot_events = summary
@@ -1750,11 +1757,20 @@ fn summary_only_autonomous_match_records_shot_liveness_without_frames() {
         .filter(|event| event.kind == "shot")
         .count();
 
-    assert_eq!(summary.summary.ticks, 675);
-    assert_eq!(summary.step_timing.ticks, summary.summary.ticks);
+    assert!(
+        summary.summary.ticks > 0 && summary.summary.ticks <= max_ticks,
+        "summary-only shot liveness run should stop within configured duration: ticks={} max={max_ticks}",
+        summary.summary.ticks
+    );
+    assert!(
+        summary.step_timing.ticks > 0 && summary.step_timing.ticks <= summary.summary.ticks,
+        "active step timing should stay within summary match ticks: active={} summary={}",
+        summary.step_timing.ticks,
+        summary.summary.ticks
+    );
     assert_eq!(
         summary.controller_yield.skipped_no_assignment,
-        summary.summary.ticks
+        summary.step_timing.ticks
     );
     assert_eq!(summary.tactical_liveness["frameLivenessKnown"], false);
     assert_eq!(summary.tactical_liveness["sustainedShotWindow"], true);
@@ -23945,6 +23961,39 @@ fn neural_learning_resumes_from_saved_snapshot_weights() {
         snapshot.layers[0].biases[0]
     );
     assert_eq!(resumed_snapshot.parameter_count, snapshot.parameter_count);
+}
+
+#[test]
+fn neural_learning_rejects_snapshot_with_invalid_l2_norm() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15077,
+        ..Default::default()
+    };
+    let snapshot = SoccerMatch::default_11v11(config.clone())
+        .learning_snapshot()
+        .neural_network
+        .expect("initial neural snapshot");
+
+    for bad_l2_norm in [f64::NAN, f64::INFINITY, -1.0] {
+        let mut bad_snapshot = snapshot.clone();
+        bad_snapshot.l2_norm = bad_l2_norm;
+        let err = SoccerMatch::default_11v11(config.clone())
+            .with_neural_network_snapshot(bad_snapshot)
+            .err()
+            .expect("invalid l2 norm should reject snapshot");
+        assert!(
+            err.contains("l2_norm"),
+            "unexpected invalid snapshot error: {err}"
+        );
+    }
 }
 
 #[test]

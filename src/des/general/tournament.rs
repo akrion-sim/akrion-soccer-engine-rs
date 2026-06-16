@@ -1304,10 +1304,11 @@ fn advanced_brain(brain: &TeamBrain, learned: bool) -> TeamBrain {
 // Real engine runner: drives the 2D SoccerMatch with per-team neural brains
 // ---------------------------------------------------------------------------
 
-/// Default simulated match length for tournament fixtures (seconds). Shorter than
-/// the 10-minute live-demo length so a multi-hundred-match bracket is tractable as
-/// a batch job; tune via [`EngineMatchRunnerConfig`].
-pub const TOURNAMENT_DEFAULT_MATCH_SECONDS: f64 = 120.0;
+/// Default simulated match length for tournament fixtures (seconds). Tournament
+/// matches run as fast as the CPU allows, so this targets 20 minutes of soccer
+/// while remaining practical for overnight batch evaluation; tune via
+/// [`EngineMatchRunnerConfig`].
+pub const TOURNAMENT_DEFAULT_MATCH_SECONDS: f64 = 20.0 * 60.0;
 
 /// Configuration for the real, simulated match runner.
 #[derive(Clone, Debug)]
@@ -1476,6 +1477,22 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn engine_runner_defaults_to_twenty_simulated_minutes() {
+        let config = EngineMatchRunnerConfig::default();
+
+        assert_eq!(TOURNAMENT_DEFAULT_MATCH_SECONDS, 20.0 * 60.0);
+        assert_eq!(
+            config.base.duration_seconds,
+            TOURNAMENT_DEFAULT_MATCH_SECONDS
+        );
+        assert_eq!(
+            config.base.dt_seconds,
+            crate::des::general::soccer::DEFAULT_DT_SECONDS
+        );
+        assert_eq!(config.base.total_ticks(), 18_000);
     }
 
     fn small_format() -> TournamentFormat {

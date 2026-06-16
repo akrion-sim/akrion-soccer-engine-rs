@@ -1690,6 +1690,15 @@ pub fn policy_lp_relaxed(problem: &SoccerProblem) -> LPRelaxedScheduleResult {
         problem.num_positions,
         problem.num_periods,
     );
+    let expected_variables = p_count * k * t_count;
+    if !soccer_lp_solution_is_roundable(&sol.x, sol.objective, expected_variables) {
+        panic!(
+            "soccer LP relaxation returned malformed optimal solution: x_len={} expected_vars={} objective={}",
+            sol.x.len(),
+            expected_variables,
+            sol.objective
+        );
+    }
     // Marginal "player p on field in period t" = Σ_pos x_{p,pos,t}.
     let mut on_field_marg: Vec<Vec<f64>> = Vec::new();
     for t in 0..t_count {
@@ -1746,6 +1755,14 @@ pub fn policy_lp_relaxed(problem: &SoccerProblem) -> LPRelaxedScheduleResult {
         solver: sol.solver,
         iters: sol.iters.unwrap_or(0),
     }
+}
+
+fn soccer_lp_solution_is_roundable(x: &[f64], objective: f64, expected_variables: usize) -> bool {
+    objective.is_finite()
+        && x.len() >= expected_variables
+        && x.iter()
+            .take(expected_variables)
+            .all(|value| value.is_finite())
 }
 
 // -----------------------------------------------------------------------------
@@ -3191,6 +3208,22 @@ mod tests {
         assert_eq!(sol.status, LPStatus::Optimal, "message={:?}", sol.message);
         assert_eq!(sol.solver, "internal");
         assert!((sol.objective - 4.0).abs() < 1e-6, "z={}", sol.objective);
+    }
+
+    #[test]
+    fn soccer_lp_rounding_rejects_malformed_optimal_vectors() {
+        assert!(soccer_lp_solution_is_roundable(&[0.0, 0.5, 1.0], 1.5, 3));
+        assert!(!soccer_lp_solution_is_roundable(&[0.0, 0.5], 1.5, 3));
+        assert!(!soccer_lp_solution_is_roundable(
+            &[0.0, f64::NAN, 1.0],
+            1.5,
+            3
+        ));
+        assert!(!soccer_lp_solution_is_roundable(
+            &[0.0, 0.5, 1.0],
+            f64::INFINITY,
+            3
+        ));
     }
 
     #[test]

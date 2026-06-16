@@ -409,8 +409,10 @@ fn validate_soccer_neural_network_snapshot_for_pg(
     if snapshot.layers.is_empty() {
         return Err("soccer neural network snapshot must contain layers".to_string());
     }
-    if !snapshot.l2_norm.is_finite() {
-        return Err("soccer neural network snapshot l2_norm must be finite".to_string());
+    if !snapshot.l2_norm.is_finite() || snapshot.l2_norm < 0.0 {
+        return Err(
+            "soccer neural network snapshot l2_norm must be finite and non-negative".to_string(),
+        );
     }
     let mut expected_input_dim = snapshot.input_dim;
     let mut parameter_count = 0usize;
@@ -4121,6 +4123,15 @@ mod tests {
             decoded_weights.formation_lp_alignment_weight,
             tactical_learning.formation_lp_alignment_weight
         );
+    }
+
+    #[test]
+    fn policy_version_metrics_rejects_negative_neural_snapshot_norm() {
+        let mut snapshot = tiny_neural_snapshot();
+        snapshot.l2_norm = -0.1;
+        let err = soccer_policy_version_metrics("evolution", 1.0, Some(&snapshot), None, None)
+            .expect_err("negative neural snapshot norm should be rejected");
+        assert!(err.contains("l2_norm"), "unexpected error: {err}");
     }
 
     #[test]

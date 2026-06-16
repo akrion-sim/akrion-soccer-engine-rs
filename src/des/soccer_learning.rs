@@ -2413,8 +2413,11 @@ fn weighted_tactical_evolution_summary(
     let mut weighted_summary = SoccerTacticalLearningSummary::default();
     let mut total_weight = 0.0;
     for (summary, fitness) in parents {
-        let weight = fitness.max(options.elite_weight_floor).max(0.0);
-        if weight <= 0.0 {
+        if !tactical_evolution_summary_is_finite(summary) {
+            continue;
+        }
+        let weight = tactical_genome_parent_weight(*fitness, options);
+        if !weight.is_finite() || weight <= 0.0 {
             continue;
         }
         total_weight += weight;
@@ -2441,6 +2444,16 @@ fn weighted_tactical_evolution_summary(
     weighted_summary.mean_defense_ball_gap_score /= total_weight;
     weighted_summary.mean_defense_role_press_score /= total_weight;
     Some(weighted_summary)
+}
+
+fn tactical_evolution_summary_is_finite(summary: &SoccerTacticalLearningSummary) -> bool {
+    summary.mean_attack_width_score.is_finite()
+        && summary.mean_attack_flank_lane_score.is_finite()
+        && summary.mean_attack_spacing_score.is_finite()
+        && summary.mean_defense_contract_score.is_finite()
+        && summary.mean_defense_spacing_score.is_finite()
+        && summary.mean_defense_ball_gap_score.is_finite()
+        && summary.mean_defense_role_press_score.is_finite()
 }
 
 fn weighted_soccer_tactical_genome_centroid(
@@ -4830,6 +4843,44 @@ mod tests {
             soccer_tactical_search_pressure(&poor_shape)
                 > soccer_tactical_search_pressure(&healthy) + 0.45
         );
+    }
+
+    #[test]
+    fn tactical_weighted_evolution_summary_skips_corrupt_parents() {
+        let good = SoccerTacticalLearningSummary {
+            mean_attack_width_score: 0.25,
+            mean_attack_flank_lane_score: 0.35,
+            mean_attack_spacing_score: 0.45,
+            mean_defense_contract_score: 0.55,
+            mean_defense_spacing_score: 0.65,
+            mean_defense_ball_gap_score: 0.75,
+            mean_defense_role_press_score: 0.85,
+            ..Default::default()
+        };
+        let mut corrupt = good.clone();
+        corrupt.mean_attack_width_score = f64::NAN;
+        let options = SoccerEvolutionOptions {
+            elite_weight_floor: 0.0,
+            ..SoccerEvolutionOptions::default()
+        };
+
+        let weighted =
+            weighted_tactical_evolution_summary(&[(&corrupt, 100.0), (&good, 1.0)], options)
+                .expect("finite parent should survive corrupt parent");
+        assert_eq!(
+            weighted.mean_attack_width_score,
+            good.mean_attack_width_score
+        );
+        assert_eq!(
+            weighted.mean_defense_role_press_score,
+            good.mean_defense_role_press_score
+        );
+        assert!(tactical_evolution_summary_is_finite(&weighted));
+        assert!(weighted_tactical_evolution_summary(
+            &[(&corrupt, 100.0), (&good, f64::NAN)],
+            options
+        )
+        .is_none());
     }
 
     #[test]

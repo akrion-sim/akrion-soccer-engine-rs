@@ -27238,6 +27238,9 @@ fn build_soccer_neural_network_from_snapshot(
             snapshot.output_dim
         ));
     }
+    if !snapshot.l2_norm.is_finite() || snapshot.l2_norm < 0.0 {
+        return Err("soccer neural snapshot l2_norm must be finite and non-negative".to_string());
+    }
     if snapshot.layers.is_empty() {
         return Err("soccer neural snapshot must contain at least one layer".to_string());
     }
