@@ -278,16 +278,19 @@ mod tests {
         assert_eq!(cfg.http_worker_threads, 4);
         assert_eq!(cfg.match_config.dt_seconds, DEFAULT_DT_SECONDS);
         assert_eq!(cfg.match_config.duration_seconds, DEFAULT_DURATION_SECONDS);
-        assert_eq!(cfg.match_config.total_ticks(), 6_000);
+        assert_eq!(cfg.match_config.total_ticks(), 9_000);
         assert!(cfg.match_config.learning_enabled);
         assert!(!cfg.match_config.learning_logging_enabled);
         assert!(cfg.match_config.neural_learning.enabled);
-        assert_eq!(cfg.policy_autoload_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.policy_autoload_max_bytes, 768 * 1024 * 1024);
         assert_eq!(
             cfg.match_config.neural_learning.backend,
             SoccerNeuralLearningBackend::Threaded
         );
-        assert!(!cfg.match_config.adversarial_embedding_exploitation_enabled);
+        assert!(cfg.match_config.mpc.tier2_player_enabled);
+        assert!(cfg.match_config.mpc.reconcile_enabled);
+        assert!(cfg.match_config.mpc.field_aware_enabled);
+        assert!(cfg.match_config.adversarial_embedding_exploitation_enabled);
         assert!(!cfg.match_config.full_game_learning_enabled);
     }
 

@@ -387,6 +387,14 @@ mod team_strategy_mode_tests {
     }
 
     #[test]
+    fn formation_lp_realtime_budget_is_at_most_five_ms() {
+        assert!(
+            SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS <= 5_000,
+            "formation LP budget must stay under the realtime 5ms contract"
+        );
+    }
+
+    #[test]
     fn strategy_labels_are_unique_and_shapes_are_sane() {
         let mut labels = HashSet::new();
         for strat in TeamAttackStrategy::ALL {

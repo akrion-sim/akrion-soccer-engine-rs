@@ -124,6 +124,18 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(default)
+}
+
 /// `process.env.MIP_LP_ALGO` (a `LPRelaxationAlgorithm` string) → enum.
 fn parse_lp_algorithm(s: &str) -> LpRelaxationAlgorithm {
     use ConcreteLpRelaxationAlgorithm as C;
@@ -284,8 +296,9 @@ fn run_with_defaults(defaults: &SoccerRunDefaults) {
     let mip_time_limit_ms = env_f64("MIP_TIME_LIMIT_MS", 30_000.0);
     let mip_max_nodes = env_usize("MIP_MAX_NODES", 5_000);
     let mip_lp_algorithm = parse_lp_algorithm(
-        &std::env::var("MIP_LP_ALGO").unwrap_or_else(|_| "internal-simplex".to_string()),
+        &std::env::var("MIP_LP_ALGO").unwrap_or_else(|_| "auto".to_string()),
     );
+    let mip_allow_external_solvers = env_bool("MIP_ALLOW_EXTERNAL_SOLVERS", true);
 
     // Roster / match shape (all overridable so the same model serves 11-, 12-,
     // or 13-player squads, different match lengths, formations, and a tunable
@@ -340,6 +353,7 @@ fn run_with_defaults(defaults: &SoccerRunDefaults) {
         max_nodes: Some(mip_max_nodes),
         max_ticks: Some(100.max(mip_max_nodes * 8)),
         lp_algorithm: Some(mip_lp_algorithm),
+        allow_external_solvers: Some(mip_allow_external_solvers),
         ..Default::default()
     };
     let mut mip_latest: Option<SoccerIPMIPPolicyResult> = None;
@@ -530,12 +544,13 @@ fn run_with_defaults(defaults: &SoccerRunDefaults) {
                     String::new()
                 };
                 println!(
-                    "#   IP/MIP status={}, gap={}, nodes={}, lpSolves={}, lpUsage={}, elapsed={}ms, incumbent={}{}",
+                    "#   IP/MIP status={}, gap={}, nodes={}, lpSolves={}, lpUsage={}, avgLp={}ms, elapsed={}ms, incumbent={}{}",
                     latest.mip.status.as_str(),
                     to_exponential(latest.mip.gap, 2),
                     latest.mip.nodes_explored,
                     latest.mip.lp_solves,
                     usage_str,
+                    format!("{:.2}", latest.mip.performance.avg_lp_solver_ms),
                     jn(latest.mip.elapsed_ms),
                     latest.mip.incumbent_source.as_deref().unwrap_or("none"),
                     fallback
