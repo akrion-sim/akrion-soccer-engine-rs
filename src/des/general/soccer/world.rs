@@ -20958,10 +20958,40 @@ impl WorldSnapshot {
         } else {
             point
         };
+        let point = self.apply_attacking_forward_intent_floor(me, point);
         SupportMovementTarget {
             point,
             action_label,
         }
+    }
+
+    /// No-retreat on the attack: while we hold the ball at or past halfway, an off-ball
+    /// offensive-minded mid/forward does not get sent net-backward (a small tolerance
+    /// preserves micro-shape). Keeps attackers threatening the goal rather than drifting
+    /// away from it — the only thing that should pull them back is losing the ball.
+    fn apply_attacking_forward_intent_floor(&self, me: &PlayerSnapshot, point: Vec2) -> Vec2 {
+        if self.possession_team() != Some(me.team)
+            || !matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            || me.preferences.offensive_mindedness < me.preferences.defensive_mindedness
+        {
+            return point;
+        }
+        let attack = me.team.attack_dir();
+        if (self.ball.position.y - self.field_length * 0.5) * attack
+            < ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS
+        {
+            return point;
+        }
+        let current = self.player_snapshot_position(me);
+        let backward = (current.y - point.y) * attack;
+        if backward > ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS {
+            return Vec2::new(
+                point.x,
+                current.y - attack * ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS,
+            )
+            .clamp_to_pitch(self.field_width, self.field_length);
+        }
+        point
     }
 
     /// Clamp a defender's target forward-position to the back-four line band:

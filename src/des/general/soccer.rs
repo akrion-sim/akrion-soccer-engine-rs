@@ -1765,6 +1765,15 @@ const FORWARD_MOMENTUM_CARRY_PROGRESS_YARDS: f64 = 1.0;
 const FORWARD_MOMENTUM_LONG_BALL_YARDS: f64 = 22.0;
 /// ...and it must travel at least this far goalward (not a square/back long ball).
 const FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS: f64 = 12.0;
+// Forward intent: an off-ball attacker on the attack keeps threatening the goal — he does
+// not drift backward unless we lose the ball. While we hold possession with the ball at or
+// past halfway, an offensive-minded mid/forward's support point may not move them net
+// backward beyond a small tolerance.
+/// The ball must be at least this far into our attacking half (measured from halfway) for
+/// the no-retreat floor to apply — in our own half, dropping to receive is still valid.
+const ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS: f64 = 0.0;
+/// At most this much backward give is allowed (preserves micro-shape adjustments).
+const ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS: f64 = 1.5;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.

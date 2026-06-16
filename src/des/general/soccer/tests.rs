@@ -57299,3 +57299,148 @@ fn neural_snapshot_sidecar_round_trips_independently_of_tabular_artifact() {
 
     let _ = std::fs::remove_file(&sidecar_path);
 }
+
+// --- Wall pass / one-two (give-and-go) -----------------------------------------
+
+/// Set up a Home attack in the opponent half with a beatable man in front of the
+/// carrier, a free side-on wall, and onside space to run into.
+fn wall_pass_scenario() -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.tick = 30;
+    sim.clock_seconds = 12.0;
+    let carrier = 6;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(40.0, 80.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[carrier].position = sim.ball.position;
+    // Side-on wall, onside.
+    sim.players[7].position = Vec2::new(30.0, 83.0);
+    // Away keeper deep; man-to-beat just ahead of the carrier; the rest form a line
+    // at y = 95 (so the second-last-defender line sits there and everything in front
+    // is onside).
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(42.0, 85.0);
+    for (k, away) in (13..22).enumerate() {
+        sim.players[away].position = Vec2::new(20.0 + k as f64 * 6.0, 95.0);
+    }
+    sim
+}
+
+#[test]
+fn wall_pass_available_with_beatable_man_and_free_wall() {
+    let sim = wall_pass_scenario();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .wall_pass_option_for(6)
+        .expect("a wall pass should be on");
+    // The burst run gains ground toward goal and stays onside (behind the line at 95).
+    assert!(
+        (plan.return_target.y - 80.0) * Team::Home.attack_dir() >= WALL_PASS_MIN_RUN_GAIN_YARDS,
+        "return target should gain ground: {plan:?}"
+    );
+    assert!(
+        plan.return_target.y <= 95.0 - ONSIDE_RUN_HOLD_BUFFER_YARDS + 1e-6,
+        "return target must stay onside: {plan:?}"
+    );
+    assert!(plan.quality > 0.0, "plan should have positive quality: {plan:?}");
+}
+
+#[test]
+fn wall_pass_unavailable_in_own_half() {
+    let mut sim = wall_pass_scenario();
+    // Drop the whole attack back into our own half.
+    sim.ball.position = Vec2::new(40.0, 40.0);
+    sim.players[6].position = sim.ball.position;
+    sim.players[7].position = Vec2::new(30.0, 43.0);
+    sim.players[12].position = Vec2::new(42.0, 45.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.wall_pass_option_for(6).is_none(),
+        "a wall pass is an attacking-half tool, not a build-out from our own half"
+    );
+}
+
+#[test]
+fn wall_pass_unavailable_without_a_man_to_beat() {
+    let mut sim = wall_pass_scenario();
+    // No opponent in front of the carrier — push every away player deep.
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(40.0, 112.0 + (away - 11) as f64 * 0.4);
+    }
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.wall_pass_option_for(6).is_none(),
+        "no beatable man in front means there is no one-two to play"
+    );
+}
+
+#[test]
+fn one_two_run_target_is_onside_and_lapses_after_timeout() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.clock_seconds = 20.0;
+    let runner = 9;
+    let wall = 7;
+    sim.ball.holder = Some(wall);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[wall].position = Vec2::new(35.0, 84.0);
+    sim.players[runner].position = Vec2::new(40.0, 82.0);
+    // Away line at 95 so the onside cap clamps a too-greedy stored target back.
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    for (k, away) in (12..22).enumerate() {
+        sim.players[away].position = Vec2::new(20.0 + k as f64 * 5.0, 95.0);
+    }
+    // Live commitment with a deliberately offside stored target (y = 110).
+    sim.players[runner].one_two = Some(OneTwoRun {
+        wall_partner: wall,
+        launch_clock_seconds: sim.clock_seconds - 0.4,
+        return_target: Vec2::new(40.0, 110.0),
+    });
+    let live = WorldSnapshot::from_match(&sim);
+    let target = live
+        .one_two_run_target_for(runner)
+        .expect("a live commitment should produce a burst target");
+    assert!(
+        target.y <= 95.0 - ONSIDE_RUN_HOLD_BUFFER_YARDS + 1e-6,
+        "burst target must be re-clamped onside: {target:?}"
+    );
+
+    // Age the commitment past the time-out: the run lapses.
+    sim.players[runner].one_two = Some(OneTwoRun {
+        wall_partner: wall,
+        launch_clock_seconds: sim.clock_seconds - (WALL_PASS_RUN_TTL_SECONDS + 1.0),
+        return_target: Vec2::new(40.0, 92.0),
+    });
+    let stale = WorldSnapshot::from_match(&sim);
+    assert!(
+        stale.one_two_run_target_for(runner).is_none(),
+        "a commitment past its time-out should no longer drive a run"
+    );
+}
+
+#[test]
+fn wall_partner_returns_first_time_to_committed_runner() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.clock_seconds = 8.0;
+    let runner = 9;
+    let wall = 7;
+    sim.ball.holder = Some(wall);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[wall].position = Vec2::new(35.0, 84.0);
+    sim.players[runner].position = Vec2::new(38.0, 90.0);
+    // Away deep so the runner is onside and the return lane is clean.
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    for (k, away) in (12..22).enumerate() {
+        sim.players[away].position = Vec2::new(20.0 + k as f64 * 5.0, 100.0);
+    }
+    sim.players[runner].one_two = Some(OneTwoRun {
+        wall_partner: wall,
+        launch_clock_seconds: sim.clock_seconds - 0.2,
+        return_target: Vec2::new(40.0, 96.0),
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.wall_return_pass_target_for(wall),
+        Some(runner),
+        "the wall should return the ball first-time to the committed runner"
+    );
+}
