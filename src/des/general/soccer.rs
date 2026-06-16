@@ -1755,10 +1755,59 @@ const IN_BEHIND_GK_MAX_ADVANCE_YARDS: f64 = 16.0;
 /// covered at least this many yards goalward in the last second (a deliberate forward carry,
 /// not a static or sideways hold).
 const ATTACKING_CARRIER_DRIVE_PROGRESS_YARDS: f64 = 2.0;
+// Forward attacking momentum: the cue that pulls MORE off-ball attackers into forward
+// runs (and lifts them to a sprint) — the ball is being driven forward at the carrier's
+// feet, or a long / aerial ball is in flight toward our attack.
+/// Minimum goalward progress over the recent window for a running carrier to count as
+/// "driving the ball forward at his feet".
+const FORWARD_MOMENTUM_CARRY_PROGRESS_YARDS: f64 = 1.0;
+/// A pass at least this long counts as a long ball worth chasing forward in numbers.
+const FORWARD_MOMENTUM_LONG_BALL_YARDS: f64 = 22.0;
+/// ...and it must travel at least this far goalward (not a square/back long ball).
+const FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS: f64 = 12.0;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
 const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
+// Wall-pass / one-two (give-and-go) geometry. A wall pass lays the ball off to a side-on
+// teammate and bursts past the man-to-beat into the onside space behind them; the wall
+// returns it first-time, led into the run. These seed the combination; the appetite to
+// attempt it (and the actual outcome) is emergent.
+/// The man-to-beat must sit within this many yards GOALSIDE/ahead of the carrier.
+const WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS: f64 = 7.0;
+/// ...and within this lateral band of the carrier (he is in front, not out wide).
+const WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS: f64 = 4.5;
+/// ...and no further than this from the carrier (close enough that beating him matters).
+const WALL_PASS_MAN_TO_BEAT_RANGE_YARDS: f64 = 7.0;
+/// The burst run breaks into the channel this far to the side of the carrier.
+const WALL_PASS_RUN_CHANNEL_YARDS: f64 = 5.0;
+/// ...and this far forward (before the onside cap clamps it back behind the line).
+const WALL_PASS_RUN_FORWARD_YARDS: f64 = 12.0;
+/// The run must net at least this much ground toward goal to be worth attempting.
+const WALL_PASS_MIN_RUN_GAIN_YARDS: f64 = 6.0;
+/// Distance band carrier→wall for the lay-off (too short = no combination, too long =
+/// not a one-two).
+const WALL_PASS_GIVE_MIN_YARDS: f64 = 5.0;
+const WALL_PASS_GIVE_MAX_YARDS: f64 = 16.0;
+/// The wall must not sit deeper than this behind the carrier (negative = slightly behind
+/// is allowed — a give back to a supporting runner — but not a backward escape ball).
+const WALL_PASS_GIVE_MIN_FORWARD_YARDS: f64 = -5.0;
+/// Corridor half-width used to test the give and return lanes are clean.
+const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
+/// The wall needs at least this much space to turn the ball around first-time.
+const WALL_PASS_PARTNER_MIN_SPACE_YARDS: f64 = 2.0;
+/// A one-two commitment lapses this many seconds after the give if the return never comes.
+const WALL_PASS_RUN_TTL_SECONDS: f64 = 1.8;
+/// Base appetite to attempt an available wall pass (scaled by quality, pressure, skill,
+/// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare.
+const WALL_PASS_BASE_APPETITE: f64 = 0.30;
+/// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
+/// looking to combine — lift the appetite hard.
+const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
+/// Goal-proximity reference: appetite to combine ramps up inside this distance to goal.
+const WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS: f64 = 40.0;
+/// Firm-but-controlled power for the lay-off give (skill adds a little).
+const WALL_PASS_GIVE_POWER: f64 = 0.58;
 /// Over-the-top run trigger: minimum cos-angle between the holder's facing and the
 /// direction to the runner for "eye contact" (≈ within 60°) — the holder is looking up
 /// at the runner before they commit to breaking the line.
@@ -1794,6 +1843,13 @@ const GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS: f64 = 0.25;
 /// ball, rushing through a covering defender who was ~99% going to win it (a real
 /// flaw: collisions / own-goals). In a contested 50/50 the keeper still commits.
 const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
+/// The keeper EXECUTES its positioning strategy (line height / angle / sweep) via
+/// the MPC layer too, over a wider range than an outfield presser (it tracks the
+/// ball from its line), so it joins the MPC active subset whenever the ball is
+/// within this radius. MPC is gated off by default, so this is inert until a run
+/// enables it (`local_mpc_enabled`), then it gives the keeper smooth,
+/// acceleration-limited control to its strategy target.
+const GK_MPC_ACTIVE_RADIUS_YARDS: f64 = 40.0;
 // A pressured recovering defender may play it back to the keeper, but only a controllable
 // 8-40yd ball: shorter is pointless, longer risks an incomplete pass across our own area.
 const GK_BACKPASS_MIN_YARDS: f64 = 8.0;
@@ -7901,6 +7957,7 @@ fn is_attacking_support_action_label(action: &str) -> bool {
             | "overlap-run"
             | "support-push-up"
             | "support-screen"
+            | "one-two-run"
     )
 }
 

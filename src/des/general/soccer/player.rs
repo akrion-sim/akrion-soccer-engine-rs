@@ -175,6 +175,36 @@ impl Default for AgentPreferences {
     }
 }
 
+/// A live one-two / wall-pass commitment carried by the player who just played the
+/// "give" pass. It marks them as the runner in a give-and-go: having laid the ball
+/// off to `wall_partner`, they immediately burst forward into `return_target` (the
+/// onside space past the man they are combining around — the "go"), expecting a
+/// first-time return into that run. Set when the carrier elects the one-two, read
+/// by the runner's off-ball movement (to sprint the threaded run) and by the wall
+/// partner (to play the first-time return led into the run). Cleared on receipt,
+/// on a turnover, or after a short time-out if the return never comes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OneTwoRun {
+    /// The teammate the ball was laid off to (the "wall").
+    pub wall_partner: usize,
+    /// Match clock when the give pass was played; drives the time-out.
+    pub launch_clock_seconds: f64,
+    /// The onside space ahead/past the man-to-beat that the runner attacks.
+    pub return_target: Vec2,
+}
+
+/// A viable wall-pass the carrier can elect right now: lay the ball off to
+/// `wall_partner` (the "give"), then burst into `return_target` (the "go").
+/// `quality` in [0, 1] scores how good the combination is (lane to the wall, space
+/// to run into, how beatable the man is) and drives the appetite to attempt it.
+#[derive(Clone, Copy, Debug)]
+pub struct WallPassPlan {
+    pub wall_partner: usize,
+    pub return_target: Vec2,
+    pub quality: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerAgent {
@@ -225,6 +255,10 @@ pub struct PlayerAgent {
     /// speed) and proaction-vs-reaction. Recomputed each decision in `run_time_step`.
     #[serde(default = "default_unit_confidence")]
     pub decision_confidence: f64,
+    /// Active one-two commitment after this player has played the "give" pass — see
+    /// [`OneTwoRun`]. `None` when not engaged in a give-and-go.
+    #[serde(default)]
+    pub one_two: Option<OneTwoRun>,
 }
 
 const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
@@ -1470,7 +1504,8 @@ impl PlayerAgent {
             .is_some()
             || snapshot
                 .attacking_carrier_driving_at_goal(self.team)
-                .is_some();
+                .is_some()
+            || snapshot.forward_attacking_momentum(self.team);
         let shape_support_urgency = attacking_shape_support_urgency(snapshot, self.team);
         let holder_pressure_urgency = holder_pressure_support_urgency(snapshot, self.team);
         let support_urgency =
@@ -3013,6 +3048,42 @@ impl PlayerAgent {
         }
 
         if has_ball {
+            // WALL RETURN (the "two" of a one-two): we are the wall and a teammate has
+            // just laid the ball off and burst past his man. Return it first-time, led
+            // into his onside run, rather than settling on the ball — this is the whole
+            // point of the give-and-go and is played near-reliably (skill-gated so a poor
+            // first touch can break down). Fires only when a live commitment names us, so
+            // it costs nothing when no one-two is in progress.
+            if let Some(runner) = snapshot.wall_return_pass_target_for(self.id) {
+                let return_reliability = (0.70
+                    + ability01(self.skills.first_touch) * 0.20
+                    + ability01(self.skills.passing) * 0.10)
+                    .clamp(0.0, 0.97);
+                if rng.next_float()
+                    < time_window_probability(return_reliability, snapshot.dt_seconds)
+                {
+                    let action = SoccerAction::Pass {
+                        target_player: Some(runner),
+                        power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
+                        flight: PassFlight::Floor,
+                    };
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state.clone(),
+                        observation.clone(),
+                        belief.clone(),
+                        vec!["wall-return".to_string()],
+                        single_action_option("wall-return"),
+                        &action,
+                        "wall-return",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
+            }
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.striker_hold_up_flank_target_for(self.id);
@@ -3151,6 +3222,66 @@ impl PlayerAgent {
                         single_action_option("scoop-pass"),
                         &action,
                         "scoop-pass",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
+            }
+            // WALL PASS (one-two / give-and-go): with a beatable man in front, a free
+            // side-on teammate, and onside space to run into, lay the ball off and burst
+            // past him — a combination to a shot is usually the better route than going it
+            // alone. Genuinely tried (not rare): appetite scales with the quality of the
+            // combination, with pressure on the carrier (relief + penetration), and with
+            // goal proximity, and is lifted hard when the team's active maneuver IS a
+            // give-and-go / one-two. On commit, the give is played AND this player takes on
+            // the runner role (the "go"), bursting onside to receive the first-time return.
+            if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
+                let give_and_go_strategy = matches!(
+                    directive.attack_strategy,
+                    TeamAttackStrategy::GiveAndGoCentral
+                        | TeamAttackStrategy::OneTwoLeftRelease
+                        | TeamAttackStrategy::OneTwoRightRelease
+                        | TeamAttackStrategy::CentralDoubleOneTwo
+                );
+                let goal_proximity = (1.0
+                    - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
+                        .clamp(0.0, 1.0))
+                .clamp(0.0, 1.0);
+                let wall_appetite = (WALL_PASS_BASE_APPETITE
+                    * self.preferences.pass_bias.clamp(0.4, 1.0)
+                    * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
+                    * (0.5 + plan.quality)
+                    * (1.0 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.9)
+                    * (1.0 + goal_proximity * 0.8)
+                    * if give_and_go_strategy {
+                        WALL_PASS_STRATEGY_APPETITE_BOOST
+                    } else {
+                        1.0
+                    })
+                .clamp(0.0, 0.92);
+                if rng.next_float() < time_window_probability(wall_appetite, snapshot.dt_seconds) {
+                    let action = SoccerAction::Pass {
+                        target_player: Some(plan.wall_partner),
+                        power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
+                        flight: PassFlight::Floor,
+                    };
+                    self.one_two = Some(OneTwoRun {
+                        wall_partner: plan.wall_partner,
+                        launch_clock_seconds: snapshot.clock_seconds,
+                        return_target: plan.return_target,
+                    });
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state.clone(),
+                        observation.clone(),
+                        belief.clone(),
+                        vec!["wall-pass".to_string()],
+                        single_action_option("wall-pass"),
+                        &action,
+                        "wall-pass",
                     ));
                     return PlayerIntent {
                         player_id: self.id,
@@ -3672,7 +3803,9 @@ impl PlayerAgent {
 
         let possession_team = snapshot.controlled_possession_team();
         let mut order_names = Vec::new();
-        let action_options;
+        // Initialized empty so every decision path is definitely-assigned (one of the
+        // branches below overwrites it); a path that doesn't just records no options.
+        let mut action_options: Vec<AgentActionOptionTrace> = Vec::new();
         // Mechanism 5: set when the off-ball target was lifted upfield far enough to
         // warrant a sprint (run, not jog) into the space ahead. Read by the sprint
         // resolver below for the "defend"/"hold" off-ball moves.
@@ -3681,7 +3814,18 @@ impl PlayerAgent {
         // player's own long/heavy touch with an opponent bearing down) — read by the
         // sprint resolver below so the chase is a sprint, not a jog.
         let mut loose_ball_pressured_sprint = false;
-        let (action, action_label) = if possession_team == Some(self.team) {
+        let (action, action_label) = if let Some(burst_target) = (possession_team
+            == Some(self.team))
+        .then(|| snapshot.one_two_run_target_for(self.id))
+        .flatten()
+        {
+            // THE "GO": this player just played the give in a one-two and is bursting
+            // onside past his man to receive the first-time return. This threaded run
+            // overrides ordinary support shape and is sprinted (see the sprint resolver).
+            action_options = single_action_option("one-two-run");
+            order_names.push("one-two-run".to_string());
+            (SoccerAction::MoveTo(burst_target), "one-two-run".to_string())
+        } else if possession_team == Some(self.team) {
             let support_context = self.support_action_context(snapshot);
             action_options = support_context.options.clone();
             let support_order = weighted_fisher_yates_order(
@@ -3992,7 +4136,10 @@ impl PlayerAgent {
                     // routine shape/support runs jog to save the reserve for when it matters.
                     let peak_moment = holder_pressure_support_urgency(snapshot, self.team)
                         >= PRESSURED_SUPPORT_SPRINT_URGENCY
-                        || normalize_soccer_action_label(&action_label) == "run-in-behind"
+                        || matches!(
+                            normalize_soccer_action_label(&action_label),
+                            "run-in-behind" | "one-two-run"
+                        )
                         || snapshot
                             .attacking_carrier_driving_at_goal(self.team)
                             .is_some();
@@ -4009,6 +4156,7 @@ impl PlayerAgent {
                                     | "shot-creation-run"
                                     | "overlap-run"
                                     | "support-push-up"
+                                    | "one-two-run"
                             ))
                         && matches!(self.role, PlayerRole::Midfielder | PlayerRole::Forward)
                         && self.position.distance(*target) > 3.5

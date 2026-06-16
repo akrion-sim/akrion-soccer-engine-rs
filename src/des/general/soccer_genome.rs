@@ -119,8 +119,19 @@ pub struct SoccerTeamGenome {
     pub pass_distance_priority: [f64; 5],
     /// Allow scooped / lofted passes.
     pub use_scoop_pass: bool,
-    /// Keeper plays as a sweeper-keeper (high starting position).
-    pub sweeper_keeper: bool,
+    /// Goalkeeper resting line height, `[0,1]`: 0 = hug the goal-line (max reaction
+    /// time), 1 = a high sweeper-keeper line. 0.5 is neutral (a balanced
+    /// "no-man's-land" line). Together with `gk_commit_aggression` this spans the
+    /// four keeper strategies (goal-line / off-line angle-closing / no-man's-land /
+    /// sweeper) as an evolvable 2-D style space. `serde(default)` so genomes
+    /// persisted before this field (e.g. older `sweeper_keeper` rows) still load.
+    #[serde(default = "default_neutral_gk_gene")]
+    pub gk_line_height: f64,
+    /// Goalkeeper commitment aggression, `[0,1]`: 0 = reaction-first (stay, let
+    /// defenders win loose balls, hold the angle), 1 = aggressive (come out to
+    /// close angles, charge 50/50s). 0.5 is neutral.
+    #[serde(default = "default_neutral_gk_gene")]
+    pub gk_commit_aggression: f64,
     /// First-defender engagement style.
     pub defender_engagement: DefenderEngagement,
     /// When a DEFENDER is in possession: the extra standoff (yards) to keep from
@@ -131,6 +142,11 @@ pub struct SoccerTeamGenome {
     /// `[0,1]` (higher = pass sooner). Defenders should move it on quicker rather
     /// than carry it into pressure.
     pub defender_on_ball_pass_urgency: f64,
+}
+
+/// Neutral default for the keeper-strategy genes (serde fallback for older genomes).
+fn default_neutral_gk_gene() -> f64 {
+    0.5
 }
 
 fn formation_anchors(formation: TeamFormation) -> Vec<PositionAnchor> {
@@ -182,7 +198,8 @@ impl Default for SoccerTeamGenome {
             pass_willingness_under_pressure: 0.5,
             pass_distance_priority: [1.0, 1.0, 1.0, 1.0, 1.0],
             use_scoop_pass: true,
-            sweeper_keeper: false,
+            gk_line_height: 0.5,
+            gk_commit_aggression: 0.5,
             defender_engagement: DefenderEngagement::Press,
             defender_on_ball_opponent_distance: 3.0,
             defender_on_ball_pass_urgency: 0.5,
@@ -254,6 +271,30 @@ impl SoccerTeamGenome {
         self.defender_on_ball_opponent_distance =
             self.defender_on_ball_opponent_distance.clamp(0.0, 12.0);
         self.defender_on_ball_pass_urgency = self.defender_on_ball_pass_urgency.clamp(0.0, 1.0);
+        if !self.gk_line_height.is_finite() {
+            self.gk_line_height = 0.5;
+        }
+        if !self.gk_commit_aggression.is_finite() {
+            self.gk_commit_aggression = 0.5;
+        }
+        self.gk_line_height = self.gk_line_height.clamp(0.0, 1.0);
+        self.gk_commit_aggression = self.gk_commit_aggression.clamp(0.0, 1.0);
+    }
+
+    /// The dominant keeper strategy this genome leans toward, for logging/insight.
+    pub fn gk_strategy_label(&self) -> &'static str {
+        let high_line = self.gk_line_height >= 0.66;
+        let low_line = self.gk_line_height <= 0.33;
+        let aggressive = self.gk_commit_aggression >= 0.6;
+        if high_line && aggressive {
+            "sweeper"
+        } else if low_line && aggressive {
+            "off-line-angle-closing"
+        } else if low_line {
+            "goal-line-max-reaction"
+        } else {
+            "no-mans-land-balanced"
+        }
     }
 
     /// A fresh, randomly-styled team genome (cold-start diversity).
@@ -289,7 +330,8 @@ impl SoccerTeamGenome {
                 rng.unit(),
             ],
             use_scoop_pass: rng.coin(),
-            sweeper_keeper: rng.coin(),
+            gk_line_height: rng.unit(),
+            gk_commit_aggression: rng.unit(),
             defender_engagement: if rng.coin() {
                 DefenderEngagement::Contain
             } else {
@@ -361,7 +403,8 @@ impl SoccerTeamGenome {
             ),
             pass_distance_priority: priority,
             use_scoop_pass: pick_b(a.use_scoop_pass, b.use_scoop_pass, rng),
-            sweeper_keeper: pick_b(a.sweeper_keeper, b.sweeper_keeper, rng),
+            gk_line_height: pick(a.gk_line_height, b.gk_line_height, rng),
+            gk_commit_aggression: pick(a.gk_commit_aggression, b.gk_commit_aggression, rng),
             defender_engagement: if rng.coin() {
                 a.defender_engagement
             } else {
@@ -437,7 +480,10 @@ impl SoccerTeamGenome {
             self.use_scoop_pass = !self.use_scoop_pass;
         }
         if rng.chance(rate) {
-            self.sweeper_keeper = !self.sweeper_keeper;
+            self.gk_line_height += rng.range(-0.15, 0.15);
+        }
+        if rng.chance(rate) {
+            self.gk_commit_aggression += rng.range(-0.15, 0.15);
         }
         if rng.chance(rate) {
             self.defender_engagement = match self.defender_engagement {
@@ -476,13 +522,13 @@ mod tests {
         let a = SoccerTeamGenome {
             formation: TeamFormation::F433,
             use_scoop_pass: true,
-            sweeper_keeper: false,
+            gk_line_height: 0.1,
             ..SoccerTeamGenome::default()
         };
         let b = SoccerTeamGenome {
             formation: TeamFormation::F442,
             use_scoop_pass: false,
-            sweeper_keeper: true,
+            gk_line_height: 0.9,
             press_urgency: 0.9,
             ..SoccerTeamGenome::default()
         };
@@ -490,7 +536,7 @@ mod tests {
         assert!(
             child.use_scoop_pass == a.use_scoop_pass || child.use_scoop_pass == b.use_scoop_pass
         );
-        assert!(child.sweeper_keeper == a.sweeper_keeper || child.sweeper_keeper == b.sweeper_keeper);
+        assert!(child.gk_line_height == a.gk_line_height || child.gk_line_height == b.gk_line_height);
         let json = serde_json::to_value(&child).expect("genome serializes");
         let back: SoccerTeamGenome = serde_json::from_value(json).expect("genome deserializes");
         assert_eq!(back.formation, child.formation);

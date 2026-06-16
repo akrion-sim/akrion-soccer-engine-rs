@@ -3488,6 +3488,29 @@ impl SoccerMatch {
         self.restart_double_touch_guard = Some(holder_id);
     }
 
+    /// Expire stale one-two commitments at the top of the tick. A runner who has
+    /// regained the ball (received the return or otherwise), a turnover to the
+    /// opponent, or a return that never came within the time-out all end the
+    /// give-and-go. A loose ball mid-combination (the give or return in flight) is
+    /// left untouched so the run stays live until it resolves.
+    fn maintain_one_two_commitments(&mut self) {
+        let holder = self.ball.holder;
+        let holder_team = holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .map(|p| p.team);
+        let clock = self.clock_seconds;
+        for player in self.players.iter_mut() {
+            if let Some(one_two) = player.one_two {
+                let turnover = holder_team.is_some() && holder_team != Some(player.team);
+                let regained = holder == Some(player.id);
+                let timed_out = clock - one_two.launch_clock_seconds > WALL_PASS_RUN_TTL_SECONDS;
+                if turnover || regained || timed_out {
+                    player.one_two = None;
+                }
+            }
+        }
+    }
+
     pub fn run_time_step(&mut self) {
         if self.is_done() {
             return;
@@ -3508,6 +3531,7 @@ impl SoccerMatch {
             return;
         }
         self.stage_opening_kickoff_if_pending();
+        self.maintain_one_two_commitments();
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
         let mut pre_field_snapshot_elapsed = Duration::from_secs(0);
@@ -7364,11 +7388,17 @@ impl SoccerMatch {
         let Some(player) = self.players.get(player_id) else {
             return false;
         };
-        if player.role == PlayerRole::Goalkeeper {
-            return false;
-        }
         let radius = self.config.mpc.active_radius_yards.max(0.0);
-        player.position.distance(self.ball.position) <= radius
+        // The keeper now EXECUTES its positioning strategy (line height / angle /
+        // sweep) through MPC as well, over a wider activation range than an outfield
+        // presser since it tracks the ball from its line. (MPC is gated off by
+        // default, so this is inert until a run enables it.)
+        let effective_radius = if player.role == PlayerRole::Goalkeeper {
+            radius.max(GK_MPC_ACTIVE_RADIUS_YARDS)
+        } else {
+            radius
+        };
+        player.position.distance(self.ball.position) <= effective_radius
     }
 
     pub(crate) fn mpc_field_obstacles(
@@ -12940,10 +12970,44 @@ impl WorldSnapshot {
         })
     }
 
+    /// True when the team has clear forward attacking momentum the off-ball runners
+    /// should commit to in numbers: our carrier is driving the ball forward at his feet
+    /// (any role, any third — wherever the ball is being carried at pace), OR a long /
+    /// aerial ball is in flight toward our attack. This is the cue that pulls more
+    /// attackers into forward runs and lifts them to a sprint, so the carrier is not left
+    /// to go it alone and the long ball is chased down in numbers.
+    pub(crate) fn forward_attacking_momentum(&self, team: Team) -> bool {
+        if let Some(holder) = self
+            .ball
+            .holder
+            .and_then(|id| self.players.iter().find(|p| p.id == id))
+        {
+            if holder.team == team
+                && matches!(holder.movement_gait, MovementGait::Run | MovementGait::Sprint)
+                && self.player_forward_progress_over_seconds(holder, 0.6)
+                    > FORWARD_MOMENTUM_CARRY_PROGRESS_YARDS
+            {
+                return true;
+            }
+        }
+        if let Some(pass) = self.pending_pass.as_ref() {
+            if pass.team == team {
+                let forward = (pass.intended_target.y - pass.origin.y) * team.attack_dir();
+                if (pass.flight.is_aerial() || pass.distance_yards >= FORWARD_MOMENTUM_LONG_BALL_YARDS)
+                    && forward >= FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn attacking_support_sprint_active(&self, team: Team) -> bool {
         self.striker_holder_in_opponent_half(team).is_some()
             || self.attacking_carrier_driving_at_goal(team).is_some()
             || self.team_speed_surge_active(team)
+            || self.forward_attacking_momentum(team)
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
@@ -14395,13 +14459,11 @@ impl WorldSnapshot {
         // Cap how far off the line the keeper drifts so it stays INSIDE the 18-yard box
         // (depth ≤ 16yd) rather than sweeping out to the edge on every shift of the ball.
         let raw_depth = (3.5 + ball_pressure * 12.5 + holder_pressure * 4.2).clamp(3.5, 16.0);
-        // Genome: a sweeper-keeper holds a ~2yd higher line (readier to step out). The
-        // neutral default genome leaves this unchanged.
-        let raw_depth = if self.genome_for(team).sweeper_keeper {
-            (raw_depth + 2.0).min(18.0)
-        } else {
-            raw_depth
-        };
+        // Genome `gk_line_height` shifts the resting line ±~4yd around the default
+        // (0 = hug the goal-line for max reaction, 0.5 = neutral, 1 = a high sweeper
+        // line); the neutral default leaves it unchanged.
+        let line_height = self.genome_for(team).gk_line_height;
+        let raw_depth = (raw_depth + (line_height - 0.5) * 8.0).clamp(2.0, 18.0);
         let depth = raw_depth.min((ball_distance - 0.85).max(0.0));
         let target = goal + to_ball.normalized() * depth;
         // Keep it laterally within the penalty area too — it shouldn't follow a wide ball
@@ -17306,7 +17368,11 @@ impl WorldSnapshot {
         let through_ball_invite = self.team_plays_through_ball(me.team)
             && self.holder_can_release_over_the_top(player_id);
         let carrier_driving = self.attacking_carrier_driving_at_goal(me.team).is_some();
-        let urgent_run_invite = through_ball_invite || carrier_driving;
+        // A ball being driven forward at the carrier's feet, or a long/aerial ball in
+        // flight, is also an urgent invitation to break in behind — commit the run rather
+        // than holding the staging cadence.
+        let urgent_run_invite =
+            through_ball_invite || carrier_driving || self.forward_attacking_momentum(me.team);
         let cadence = (self.tick + player_id as u64 * 17) % 41;
         if cadence > 5 && !urgent_run_invite {
             return None;
@@ -17485,6 +17551,188 @@ impl WorldSnapshot {
             .map(|(id, _)| id)
     }
 
+    /// A viable wall-pass (one-two) the carrier can play right now: lay the ball off to a
+    /// side-on teammate (the "wall"), then burst past the man-to-beat into the onside space
+    /// behind them. Returns the partner, the onside run target, and a [0, 1] quality scoring
+    /// the lane to the wall, the space to run into, and how beatable the man is. `None` when
+    /// there is no genuine combination on — this is the appetite gate the carrier reads.
+    pub(crate) fn wall_pass_option_for(&self, carrier_id: usize) -> Option<WallPassPlan> {
+        let carrier = self.players.iter().find(|p| p.id == carrier_id)?;
+        if self.ball.holder != Some(carrier_id)
+            || self.possession_team() != Some(carrier.team)
+            || carrier.role == PlayerRole::Goalkeeper
+        {
+            return None;
+        }
+        let attack_dir = carrier.team.attack_dir();
+        let carrier_pos = self.player_snapshot_position(carrier);
+        // A wall pass is an attacking-half penetration tool — combine to break a line,
+        // not to play out from our own half.
+        if !position_in_opponent_half(carrier.team, carrier_pos, self.field_length) {
+            return None;
+        }
+        // The man to beat: the nearest goalside opponent sitting in front of the carrier,
+        // close enough that running a teammate's return around them actually beats someone.
+        let (_, man_pos, man_dist) = self.nearest_opponent_at(carrier.team, carrier_pos)?;
+        let man_ahead = (man_pos.y - carrier_pos.y) * attack_dir;
+        if man_ahead < -1.0
+            || man_ahead > WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS
+            || (man_pos.x - carrier_pos.x).abs() > WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS
+            || man_dist > WALL_PASS_MAN_TO_BEAT_RANGE_YARDS
+        {
+            return None;
+        }
+        // Onside cap for the burst run: hold the run no further upfield than just behind
+        // the second-last defender (legality is still policed by offside officiating when
+        // the wall actually plays the ball).
+        let onside_cap_y = self
+            .second_last_defender_line_for(carrier.team)
+            .map(|y| y - attack_dir * ONSIDE_RUN_HOLD_BUFFER_YARDS);
+        // Channel to attack: away from where the man-to-beat is shading, into the space
+        // the defender vacates as the carrier spins off them.
+        let channel_sign = if man_pos.x >= carrier_pos.x { -1.0 } else { 1.0 };
+        let mut return_target = Vec2::new(
+            carrier_pos.x + channel_sign * WALL_PASS_RUN_CHANNEL_YARDS,
+            carrier_pos.y + attack_dir * WALL_PASS_RUN_FORWARD_YARDS,
+        );
+        if let Some(cap_y) = onside_cap_y {
+            if (return_target.y - cap_y) * attack_dir > 0.0 {
+                return_target.y = cap_y;
+            }
+        }
+        let return_target = return_target.clamp_to_pitch(self.field_width, self.field_length);
+        // The burst must actually gain ground toward goal to be worth a one-two.
+        if (return_target.y - carrier_pos.y) * attack_dir < WALL_PASS_MIN_RUN_GAIN_YARDS {
+            return None;
+        }
+        // Pick the best wall: a side-on teammate with a clean give lane, free enough to lay
+        // it off first-time, and from whom the return into the run is open.
+        self.players
+            .iter()
+            .filter(|p| {
+                p.team == carrier.team && p.id != carrier_id && p.role != PlayerRole::Goalkeeper
+            })
+            .filter_map(|partner| {
+                let partner_pos = self.player_snapshot_position(partner);
+                let give = partner_pos - carrier_pos;
+                let give_dist = give.len();
+                if give_dist < WALL_PASS_GIVE_MIN_YARDS || give_dist > WALL_PASS_GIVE_MAX_YARDS {
+                    return None;
+                }
+                // The wall sits to the side / just ahead — not deep behind the carrier.
+                if give.y * attack_dir < WALL_PASS_GIVE_MIN_FORWARD_YARDS {
+                    return None;
+                }
+                // Clean lay-off lane (the man-to-beat must not be sitting on the give).
+                if !self.clear_line(
+                    carrier_pos,
+                    partner_pos,
+                    carrier.team.other(),
+                    WALL_PASS_LANE_RADIUS_YARDS,
+                ) {
+                    return None;
+                }
+                // The wall is onside to receive the give and free enough to turn it
+                // around first-time.
+                if self.pending_offside_for_pass(carrier_id, partner.id).is_some() {
+                    return None;
+                }
+                let partner_space = self.nearest_opponent_distance_at(partner.team, partner_pos);
+                if partner_space < WALL_PASS_PARTNER_MIN_SPACE_YARDS {
+                    return None;
+                }
+                // The return into the run must be open from the wall's feet.
+                if !self.clear_line(
+                    partner_pos,
+                    return_target,
+                    carrier.team.other(),
+                    WALL_PASS_LANE_RADIUS_YARDS,
+                ) {
+                    return None;
+                }
+                let run_space =
+                    (self.space_score_at(return_target, carrier.team) / 12.0).clamp(0.0, 1.0);
+                let man_beatable =
+                    (1.0 - (man_dist / WALL_PASS_MAN_TO_BEAT_RANGE_YARDS)).clamp(0.0, 1.0);
+                let partner_open =
+                    ((partner_space - WALL_PASS_PARTNER_MIN_SPACE_YARDS) / 4.0).clamp(0.0, 1.0);
+                let quality =
+                    (run_space * 0.42 + man_beatable * 0.34 + partner_open * 0.24).clamp(0.0, 1.0);
+                Some(WallPassPlan {
+                    wall_partner: partner.id,
+                    return_target,
+                    quality,
+                })
+            })
+            .max_by(|a, b| a.quality.partial_cmp(&b.quality).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// The onside burst target for a player who has just played the give in a one-two —
+    /// the "go". Re-clamps the stored run target to the live defensive line so the run
+    /// threads forward while staying onside. `None` once the commitment should lapse
+    /// (possession lost, the runner has the ball again, or the return never came).
+    pub(crate) fn one_two_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        let one_two = me.one_two?;
+        if self.possession_team() != Some(me.team)
+            || self.ball.holder == Some(player_id)
+            || self.clock_seconds - one_two.launch_clock_seconds > WALL_PASS_RUN_TTL_SECONDS
+        {
+            return None;
+        }
+        let attack_dir = me.team.attack_dir();
+        let mut target = one_two.return_target;
+        if let Some(line_y) = self.second_last_defender_line_for(me.team) {
+            let cap_y = line_y - attack_dir * ONSIDE_RUN_HOLD_BUFFER_YARDS;
+            if (target.y - cap_y) * attack_dir > 0.0 {
+                target.y = cap_y;
+            }
+        }
+        Some(target.clamp_to_pitch(self.field_width, self.field_length))
+    }
+
+    /// When this player has just received the give in a one-two, the runner to return the
+    /// ball to first-time — the pass leads naturally into their forward burst. Returns the
+    /// runner id when a teammate holds a live commitment naming this player as the wall and
+    /// the return is legal (the runner is onside). `None` otherwise.
+    pub(crate) fn wall_return_pass_target_for(&self, wall_partner_id: usize) -> Option<usize> {
+        let wall = self.players.iter().find(|p| p.id == wall_partner_id)?;
+        if self.ball.holder != Some(wall_partner_id)
+            || self.possession_team() != Some(wall.team)
+        {
+            return None;
+        }
+        let wall_pos = self.player_snapshot_position(wall);
+        let attack_dir = wall.team.attack_dir();
+        self.players
+            .iter()
+            .filter(|runner| runner.team == wall.team && runner.id != wall_partner_id)
+            .filter_map(|runner| {
+                let one_two = runner.one_two?;
+                if one_two.wall_partner != wall_partner_id
+                    || self.clock_seconds - one_two.launch_clock_seconds > WALL_PASS_RUN_TTL_SECONDS
+                {
+                    return None;
+                }
+                // Never release into an offside runner.
+                if self.pending_offside_for_pass(wall_partner_id, runner.id).is_some() {
+                    return None;
+                }
+                let runner_pos = self.player_snapshot_position(runner);
+                let forward = (runner_pos.y - wall_pos.y) * attack_dir;
+                let lane_open = self.clear_line(
+                    wall_pos,
+                    runner_pos,
+                    wall.team.other(),
+                    WALL_PASS_LANE_RADIUS_YARDS,
+                );
+                let score = forward + if lane_open { 4.0 } else { 0.0 };
+                Some((runner.id, score))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id)
+    }
+
     pub(crate) fn check_to_ball_target_for(&self, player_id: usize, home: Vec2) -> Option<Vec2> {
         let me = self.players.iter().find(|p| p.id == player_id)?;
         if self.possession_team() != Some(me.team)
@@ -17648,9 +17896,15 @@ impl WorldSnapshot {
             // caused collisions / own-goals and was a real flaw. Defer ONLY to a
             // teammate who reaches it clearly before BOTH the keeper and any opponent
             // (a safe, uncontested win); in a contested 50/50 the keeper still commits.
-            let teammate_clearly_wins = teammate_time + GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS
-                < gk_time
-                && teammate_time + GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS < opponent_time;
+            // Genome `gk_commit_aggression` scales how readily he commits: an
+            // aggressive keeper needs the teammate to beat it by a larger margin
+            // before backing off (commits more); a passive keeper defers sooner.
+            // Neutral (0.5) keeps the base margins.
+            let margin_scale = 0.5 + self.genome_for(gk.team).gk_commit_aggression;
+            let defer_margin = GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS * margin_scale;
+            let over_opp_margin = GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS * margin_scale;
+            let teammate_clearly_wins = teammate_time + defer_margin < gk_time
+                && teammate_time + over_opp_margin < opponent_time;
             return !teammate_clearly_wins;
         }
         // Out of the box the keeper only sweeps with ~99% certainty: arrive in ≤65% of
