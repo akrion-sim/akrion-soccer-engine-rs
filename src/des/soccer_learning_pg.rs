@@ -12,10 +12,10 @@ use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::des::general::soccer::{
-    MatchConfig, SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
-    SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team,
-    SOCCER_MOMENT_EMBEDDING_DIM,
+    MatchConfig, PlayerRole, SoccerConfigMomentInsert, SoccerMomentEmbeddingInsert,
+    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey,
+    SoccerQTargetEntry, SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights,
+    SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM, SOCCER_MOMENT_EMBEDDING_DIM,
 };
 use crate::des::general::tournament::{
     MatchReport, SoccerTeamGenome, TournamentFormat, TournamentTeam,
@@ -1299,6 +1299,21 @@ impl SoccerLearningPgStore {
         );
 
         if status == "active" {
+            // Serialize active-policy promotions PER EXPERIMENT so the
+            // archive-old-active + insert-new-active pair is atomic against any
+            // other promoter (a concurrent tournament run, the continuous learner,
+            // a second replica). Without it, under READ COMMITTED two promoters can
+            // each archive the other's not-yet-committed active and both insert,
+            // leaving TWO rows at status='active'. This transaction-scoped lock is
+            // auto-released on commit/rollback and only contends writers promoting
+            // the SAME experiment (different experiments hash to different keys, so
+            // the common single-writer path sees zero contention). Every promoter
+            // funnels through this function, so locking here covers them all.
+            tx.execute(
+                "select pg_advisory_xact_lock(hashtext('des-soccer-policy-active-promote'), hashtext($1))",
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions
@@ -1565,6 +1580,145 @@ impl SoccerLearningPgStore {
             .collect())
     }
 
+    /// Persist whole-field **configuration moments** (the retrieval corpus): one
+    /// row per captured ball-carrier decision, carrying the config embedding (for
+    /// ANN search), the raw canonical features (for an exact permutation re-score),
+    /// the decision taken, and the outcome (immediate reward + n-step return).
+    /// Embeddings whose width != [`SOCCER_MOMENT_EMBEDDING_DIM`] are rejected.
+    /// Returns the number of rows written.
+    pub fn insert_config_moments(
+        &mut self,
+        run_id: Option<&str>,
+        experiment_id: Option<&str>,
+        moments: &[SoccerConfigMomentInsert],
+    ) -> Result<usize, String> {
+        if moments.is_empty() {
+            return Ok(0);
+        }
+        for moment in moments {
+            if moment.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+                return Err(format!(
+                    "config moment embedding has {} dims, expected {SOCCER_MOMENT_EMBEDDING_DIM}",
+                    moment.embedding.len()
+                ));
+            }
+        }
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin config moment transaction: {err}"))?;
+        ensure_soccer_config_moment_tables(&mut tx)?;
+        // Chunked multi-row insert: 9 params per row plus the 2 shared run/experiment
+        // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
+        // 65535-parameter ceiling.
+        for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
+            let teams: Vec<&'static str> =
+                chunk.iter().map(|m| soccer_team_label(m.team)).collect();
+            let ticks: Vec<i64> = chunk.iter().map(|m| checked_i64(m.tick)).collect();
+            let roles: Vec<&'static str> =
+                chunk.iter().map(|m| soccer_role_label(m.role)).collect();
+            let rewards: Vec<i64> = chunk
+                .iter()
+                .map(|m| soccer_learning_to_micros(m.reward))
+                .collect();
+            let returns: Vec<i64> = chunk
+                .iter()
+                .map(|m| soccer_learning_to_micros(m.nstep_return))
+                .collect();
+            let values: Vec<Option<i64>> = chunk
+                .iter()
+                .map(|m| m.value.map(soccer_learning_to_micros))
+                .collect();
+            let embeddings: Vec<String> =
+                chunk.iter().map(|m| pg_vector_text(&m.embedding)).collect();
+            let features: Vec<Vec<f32>> =
+                chunk.iter().map(|m| sanitize_features(&m.features)).collect();
+            let sql = format!(
+                "insert into des_soccer_config_moments \
+                 (run_id, experiment_id, team, tick, role, action, reward_micros, \
+                  nstep_return_micros, value_micros, embedding, features) \
+                 values {}",
+                config_moment_values_clause(chunk.len())
+            );
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&run_id, &experiment_id];
+            for (i, moment) in chunk.iter().enumerate() {
+                params.push(&teams[i]);
+                params.push(&ticks[i]);
+                params.push(&roles[i]);
+                params.push(&moment.action);
+                params.push(&rewards[i]);
+                params.push(&returns[i]);
+                params.push(&values[i]);
+                params.push(&embeddings[i]);
+                params.push(&features[i]);
+            }
+            tx.execute(&sql, &params)
+                .map_err(|err| format!("insert soccer config moments: {err}"))?;
+        }
+        tx.commit()
+            .map_err(|err| format!("commit soccer config moments: {err}"))?;
+        Ok(moments.len())
+    }
+
+    /// Approximate-nearest-neighbour retrieval over stored configuration moments
+    /// by cosine distance to `query` (the live config embedding). Optionally
+    /// restrict to one `team`. Returns up to `limit` neighbours nearest-first,
+    /// each with its decision, outcome, raw features (for re-score), and distance.
+    /// This is the "find the N closest configurations" step.
+    pub fn search_nearest_config_moments(
+        &mut self,
+        query: &[f64],
+        limit: usize,
+        team: Option<Team>,
+    ) -> Result<Vec<SoccerConfigMomentNeighbor>, String> {
+        if query.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            return Err(format!(
+                "config moment query has {} dims, expected {SOCCER_MOMENT_EMBEDDING_DIM}",
+                query.len()
+            ));
+        }
+        {
+            let mut tx = self
+                .client
+                .transaction()
+                .map_err(|err| format!("begin config moment search schema tx: {err}"))?;
+            ensure_soccer_config_moment_tables(&mut tx)?;
+            tx.commit()
+                .map_err(|err| format!("commit config moment search schema: {err}"))?;
+        }
+        let limit = limit.clamp(1, 1000) as i64;
+        let query_text = pg_vector_text(query);
+        let team_filter = team.map(soccer_team_label);
+        let rows = self
+            .client
+            .query(
+                "select team, role, action, reward_micros, nstep_return_micros, value_micros, \
+                 tick, features, (embedding <=> $1::vector) as distance \
+                 from des_soccer_config_moments \
+                 where ($2::text is null or team = $2) \
+                 order by embedding <=> $1::vector \
+                 limit $3",
+                &[&query_text, &team_filter, &limit],
+            )
+            .map_err(|err| format!("search soccer config moments: {err}"))?;
+        Ok(rows
+            .iter()
+            .map(|row| SoccerConfigMomentNeighbor {
+                team: row.get::<_, String>(0),
+                role: row.get::<_, String>(1),
+                action: row.get::<_, String>(2),
+                reward: soccer_learning_from_micros(row.get::<_, i64>(3)),
+                nstep_return: soccer_learning_from_micros(row.get::<_, i64>(4)),
+                value: row
+                    .get::<_, Option<i64>>(5)
+                    .map(soccer_learning_from_micros),
+                tick: row.get::<_, i64>(6),
+                features: row.get::<_, Vec<f32>>(7),
+                distance: row.get::<_, f64>(8),
+            })
+            .collect())
+    }
+
     pub fn insert_completed_runs(
         &mut self,
         experiment_id: &str,
@@ -1823,6 +1977,21 @@ impl SoccerLearningPgStore {
         );
 
         if status == "active" {
+            // Serialize active-policy promotions PER EXPERIMENT so the
+            // archive-old-active + insert-new-active pair is atomic against any
+            // other promoter (a concurrent tournament run, the continuous learner,
+            // a second replica). Without it, under READ COMMITTED two promoters can
+            // each archive the other's not-yet-committed active and both insert,
+            // leaving TWO rows at status='active'. This transaction-scoped lock is
+            // auto-released on commit/rollback and only contends writers promoting
+            // the SAME experiment (different experiments hash to different keys, so
+            // the common single-writer path sees zero contention). Every promoter
+            // funnels through this function, so locking here covers them all.
+            tx.execute(
+                "select pg_advisory_xact_lock(hashtext('des-soccer-policy-active-promote'), hashtext($1))",
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions
@@ -3254,6 +3423,111 @@ fn ensure_soccer_tournament_tables(tx: &mut postgres::Transaction<'_>) -> Result
     .map_err(|err| format!("ensure soccer tournament tables: {err}"))
 }
 
+/// One retrieved neighbour from [`SoccerLearningPgStore::search_nearest_config_moments`].
+#[derive(Clone, Debug)]
+pub struct SoccerConfigMomentNeighbor {
+    pub team: String,
+    pub role: String,
+    pub action: String,
+    pub reward: f64,
+    /// Discounted n-step outcome return stored with the moment.
+    pub nstep_return: f64,
+    /// Critic value of the neighbour (`None` if stored untrained).
+    pub value: Option<f64>,
+    pub tick: i64,
+    /// Raw canonical config features for an exact permutation re-score.
+    pub features: Vec<f32>,
+    /// Cosine distance to the query (0 = identical, 1 = orthogonal, 2 = opposite).
+    pub distance: f64,
+}
+
+fn soccer_role_label(role: PlayerRole) -> &'static str {
+    match role {
+        PlayerRole::Goalkeeper => "goalkeeper",
+        PlayerRole::Defender => "defender",
+        PlayerRole::Midfielder => "midfielder",
+        PlayerRole::Forward => "forward",
+    }
+}
+
+/// Scrub non-finite feature components to 0 so the `real[]` cast never fails and
+/// retrieval geometry stays well-defined.
+fn sanitize_features(features: &[f32]) -> Vec<f32> {
+    features
+        .iter()
+        .map(|&f| if f.is_finite() { f } else { 0.0 })
+        .collect()
+}
+
+/// Max config moments per multi-row insert. Each row binds 9 params plus the 2
+/// shared run/experiment ids, so 256 rows = 2306 params — well under the ceiling.
+const CONFIG_MOMENT_INSERT_CHUNK_ROWS: usize = 256;
+
+/// Build the `values (...),(...)` clause for a chunked config-moment insert.
+/// `$1`/`$2` are the shared run_id/experiment_id reused by every row; each row's
+/// 9 columns start at `$3 + 9*i`. Kept separate so the placeholder/offset
+/// arithmetic is unit-tested without a live database.
+fn config_moment_values_clause(rows: usize) -> String {
+    let mut clause = String::new();
+    for i in 0..rows {
+        if i > 0 {
+            clause.push(',');
+        }
+        let base = 3 + i * 9;
+        let _ = write!(
+            clause,
+            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${},${},${}::vector,${})",
+            base,
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8
+        );
+    }
+    clause
+}
+
+/// Schema for persisted configuration moments — the retrieval corpus. Mirrors the
+/// moment-embedding table but adds the role, the n-step outcome return, and the
+/// raw `features real[]` (the canonical per-player floats kept for an exact
+/// permutation re-score). `vector(dim)` width is [`SOCCER_MOMENT_EMBEDDING_DIM`].
+fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
+    tx.batch_execute(&format!(
+        r#"
+        create extension if not exists vector;
+        create table if not exists des_soccer_config_moments (
+          id uuid primary key default gen_random_uuid(),
+          run_id uuid,
+          experiment_id uuid,
+          team varchar(8) not null,
+          tick bigint not null,
+          role varchar(16) not null,
+          action varchar(64) not null,
+          reward_micros bigint not null,
+          nstep_return_micros bigint not null,
+          value_micros bigint,
+          embedding vector({dim}) not null,
+          features real[] not null,
+          created_at timestamptz not null default now(),
+          constraint des_soccer_config_moments_team_chk check (team in ('home','away')),
+          constraint des_soccer_config_moments_features_len_chk
+            check (array_length(features, 1) = {features})
+        );
+        create index if not exists des_soccer_config_moments_hnsw
+          on des_soccer_config_moments using hnsw (embedding vector_cosine_ops);
+        create index if not exists des_soccer_config_moments_run_idx
+          on des_soccer_config_moments (run_id);
+        "#,
+        dim = SOCCER_MOMENT_EMBEDDING_DIM,
+        features = CONFIG_FEATURE_DIM
+    ))
+    .map_err(|err| format!("ensure soccer config moment tables: {err}"))
+}
+
 fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
     tx.batch_execute(&format!(
         r#"
@@ -3890,6 +4164,23 @@ mod tests {
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + MOMENT_EMBEDDING_INSERT_CHUNK_ROWS * 6;
+        assert!(params < 65535, "chunk uses {params} params");
+    }
+
+    #[test]
+    fn config_moment_values_clause_offsets_and_param_limit() {
+        assert_eq!(config_moment_values_clause(0), "");
+        assert_eq!(
+            config_moment_values_clause(1),
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11)"
+        );
+        assert_eq!(
+            config_moment_values_clause(2),
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11),\
+             ($1::text::uuid,$2::text::uuid,$12,$13,$14,$15,$16,$17,$18,$19::vector,$20)"
+        );
+        // A full chunk must stay under Postgres's 65535 bound-parameter limit.
+        let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 9;
         assert!(params < 65535, "chunk uses {params} params");
     }
 

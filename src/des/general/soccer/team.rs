@@ -366,6 +366,46 @@ mod team_strategy_mode_tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// The real formation LP — the sparse interior-point (Clarabel) solve in
+    /// `solve_exact_formation_lp` — must clear the live realtime budget: under
+    /// 5 ms per tick, so it can nudge formation shape every tick rather than
+    /// degrading to the heuristic fallback. We solve a real match configuration a
+    /// few times (warming the symbolic factorisation) and require the best solve
+    /// to come in optimal and under 5 ms.
+    #[test]
+    fn formation_lp_ipm_solves_under_five_milliseconds() {
+        let sim = crate::des::general::soccer::SoccerMatch::default_11v11(
+            crate::des::general::soccer::MatchConfig::default(),
+        );
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let directive = snapshot.home_directive.clone();
+
+        let mut brain = SoccerFormationLpBrain::new(Team::Home);
+        let weights = soccer_formation_lp_objective_weights(&snapshot, Team::Home, &directive);
+        let slots = soccer_formation_lp_slot_inputs(&snapshot, Team::Home, &directive, &weights);
+        brain.update_problem_for_tick(&snapshot, &directive, &weights, &slots);
+
+        let mut best_micros = u128::MAX;
+        let mut any_optimal = false;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let solution = brain.solve_exact_formation_lp();
+            let micros = started.elapsed().as_micros();
+            best_micros = best_micros.min(micros);
+            any_optimal |= solution.status == LPStatus::Optimal;
+        }
+        assert!(any_optimal, "interior-point formation LP should reach optimality");
+        // The <5ms realtime budget is an optimized-build guarantee; a debug build's
+        // unoptimized linear algebra is ~20-50x slower, so only enforce the bound
+        // when optimizations are on (the configuration that actually runs live).
+        #[cfg(not(debug_assertions))]
+        assert!(
+            best_micros < 5_000,
+            "IPM formation solve must be <5ms (best was {best_micros}us)"
+        );
+        let _ = best_micros;
+    }
+
     #[test]
     fn defines_thirty_plus_attack_and_fifteen_plus_defense_modes() {
         // Team-level strategy catalogue: ~30-50 modes total (attack + defense).
@@ -904,8 +944,8 @@ fn soccer_lp_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn soccer_formation_lp_internal_simplex_enabled() -> bool {
-    std::env::var("SOCCER_FORMATION_LP_INTERNAL_SIMPLEX")
+fn soccer_env_flag_on(name: &str) -> bool {
+    std::env::var(name)
         .map(|value| {
             matches!(
                 value.as_str(),
@@ -913,6 +953,18 @@ fn soccer_formation_lp_internal_simplex_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Run the real interior-point formation LP each tick (instead of the heuristic
+/// fallback). `SOCCER_FORMATION_LP_IPM` is the current, accurate name — the solve
+/// is a sparse interior-point (Clarabel), not the legacy dense simplex — and
+/// `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` is kept as a back-compat alias. The
+/// solve clears the <5ms realtime budget in optimized builds (see
+/// `formation_lp_ipm_solves_under_five_milliseconds`); the circuit breaker in
+/// `solve_tick` still guards against any pathological tick.
+fn soccer_formation_lp_internal_simplex_enabled() -> bool {
+    soccer_env_flag_on("SOCCER_FORMATION_LP_IPM")
+        || soccer_env_flag_on("SOCCER_FORMATION_LP_INTERNAL_SIMPLEX")
 }
 
 fn soccer_formation_lp_budgeted_fallback_solution() -> crate::des::general::lp::LPSolution {

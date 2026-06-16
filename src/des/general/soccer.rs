@@ -44,6 +44,8 @@ mod team;
 pub use team::*;
 mod world;
 pub use world::*;
+mod config_vector;
+pub use config_vector::*;
 mod inspect;
 pub use inspect::*;
 
@@ -1373,6 +1375,18 @@ const TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY: f64 = 16.0;
 const CARRIER_LANE_KEEPOUT_LENGTH_YARDS: f64 = 12.0;
 const CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS: f64 = 2.5;
 const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
+// Defensive goal-side recovery. When the opponent has possession — INCLUDING while
+// their pass is in flight (no holder; `possession_team` falls back to last-touch) —
+// every non-pressing outfielder must be on the own-goal side of the ball, i.e. on
+// the segment between the ball and our own goal. An off-ball target that sits
+// upfield of the ball (between ball and the opponent goal) is pulled back along the
+// ball->own-goal axis until it is at least `MIN` yds goal-side, capped at `MAX_PULL`
+// yds of correction per evaluation so a high striker recovers progressively rather
+// than teleporting. Only the player's depth along that axis is corrected; lateral
+// offset is preserved so the back line keeps its width. The nearest outfielder to
+// the ball (the primary presser) is exempt — someone still closes the ball down.
+const DEFENSIVE_GOAL_SIDE_MIN_YARDS: f64 = 1.5;
+const DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS: f64 = 10.0;
 // Territorial spacing discipline. "Cover territory" is a fundamental of both
 // attacking and defending: two teammates in the same small patch add no value.
 // Players are expected to keep at least this much space between them — but this
@@ -1971,6 +1985,9 @@ const SOCCER_POLICY_PROBABILITY_SUMMARY_SCAN_CAP: usize = 2500;
 // Beyond this it stops scanning (the best of a large bounded sample is plenty for a prior), so
 // the lookup is O(1)-bounded regardless of table size.
 const SOCCER_LEARNED_LOOKUP_SCAN_CAP: usize = 48;
+/// How many tabular candidates the retrieval prior re-ranks over. Small: the
+/// prior nudges among the policy's already-plausible actions, not the long tail.
+const SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT: usize = 12;
 // Long-match memory hygiene: when a team Q-table grows past the high-water mark,
 // slough the least-visited entries back down to the low-water mark (keeping the
 // most-visited, best-learned states). Hysteresis avoids pruning every step.
@@ -2010,6 +2027,9 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.
+// 5ms is the realtime target: the sparse interior-point solve comes in well under
+// it in optimized builds, so this is a guardrail against pathological ticks, not
+// the common case (see `formation_lp_ipm_solves_under_five_milliseconds`).
 const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 5_000;
 const SOCCER_FORMATION_LP_MIN_ITER: usize = 800;
 const SOCCER_FORMATION_LP_ITER_RECOVER_STEP: usize = 1_500;
@@ -6520,6 +6540,59 @@ impl SoccerQPolicy {
         let state = SoccerQStateKey::from_parts(mdp_state, observation, player.team, player.role);
         self.best_action_filtered_hierarchical_relaxed(&state, |action| {
             learned_action_label_is_legal(action, snapshot, player_id)
+        })
+    }
+
+    /// As [`Self::best_action_for_state_observation`], but biased by a **retrieval
+    /// action prior** (action → bounded favourability), scaled by `weight`. The
+    /// chosen action is `argmax_a [ Q(s,a) + weight · prior(a) ]` over the legal
+    /// tabular candidates. When `prior` is `None`/empty or `weight == 0` this
+    /// delegates to the unbiased path verbatim, so play is byte-identical unless a
+    /// caller opts in. The prior only re-weights existing candidates — it never
+    /// introduces new actions, so it cannot perturb any RNG draw.
+    fn best_action_for_state_observation_with_prior(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+    ) -> Option<String> {
+        let Some((prior, weight)) = prior.filter(|(p, w)| !p.is_empty() && *w != 0.0) else {
+            return self
+                .best_action_for_state_observation(snapshot, player_id, mdp_state, observation);
+        };
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let state = SoccerQStateKey::from_parts(mdp_state, observation, player.team, player.role);
+        let ranked = self.ranked_action_values_filtered_hierarchical(
+            &state,
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT,
+            |action| learned_action_label_is_legal(action, snapshot, player_id),
+        );
+        let scored = ranked
+            .iter()
+            .filter(|candidate| candidate.legal)
+            .max_by(|a, b| {
+                let sa = a.value
+                    + weight
+                        * prior
+                            .get(normalize_soccer_action_label(&a.label))
+                            .copied()
+                            .unwrap_or(0.0);
+                let sb = b.value
+                    + weight
+                        * prior
+                            .get(normalize_soccer_action_label(&b.label))
+                            .copied()
+                            .unwrap_or(0.0);
+                sa.total_cmp(&sb).then_with(|| a.visits.cmp(&b.visits))
+            })
+            .map(|candidate| candidate.label.clone());
+        // If the exact-context scan found no legal candidate, fall back to the
+        // relaxed unbiased path so the prior never *loses* a decision the baseline
+        // would have made.
+        scored.or_else(|| {
+            self.best_action_for_state_observation(snapshot, player_id, mdp_state, observation)
         })
     }
 
@@ -11183,6 +11256,69 @@ impl SoccerMpcReconcileStats {
     }
 }
 
+fn default_retrieval_top_k() -> usize {
+    100
+}
+fn default_retrieval_outcome_gamma() -> f64 {
+    0.95
+}
+fn default_retrieval_outcome_horizon() -> usize {
+    40
+}
+fn default_retrieval_prior_weight() -> f64 {
+    0.5
+}
+
+/// Configuration for the retrieval-guided decision pipeline: capturing whole-field
+/// configuration moments (the 22-player + ball [`SoccerConfigVector`] plus the
+/// decision taken and its outcome) for cross-game vector search, and — at decision
+/// time — folding retrieved neighbours' decisions into the MDP/POMDP action
+/// ranking as a bounded prior. Everything is **off by default**, so play is
+/// byte-identical until a consumer opts in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerRetrievalConfig {
+    /// Capture per-tick **carrier** config-moments (config vector + decision)
+    /// onto the learning transitions so they can be persisted for retrieval.
+    /// Off ⇒ no capture, no per-tick cost, identical play.
+    #[serde(default)]
+    pub capture_enabled: bool,
+    /// At decision time, fold retrieved neighbour decisions into the action
+    /// ranking as a bounded additive prior. Off ⇒ the policy decides unchanged.
+    #[serde(default)]
+    pub decision_prior_enabled: bool,
+    /// Neighbours fetched per retrieval query ("find the N closest configs").
+    #[serde(default = "default_retrieval_top_k")]
+    pub top_k: usize,
+    /// Discount γ for the n-step outcome return stored with each moment.
+    #[serde(default = "default_retrieval_outcome_gamma")]
+    pub outcome_gamma: f64,
+    /// Horizon (this player's future transitions) for the n-step outcome return.
+    #[serde(default = "default_retrieval_outcome_horizon")]
+    pub outcome_horizon: usize,
+    /// Bounded weight of the retrieval prior added to normalised action values.
+    #[serde(default = "default_retrieval_prior_weight")]
+    pub prior_weight: f64,
+    /// Refine the top neighbours with a Hungarian player-alignment re-rank
+    /// (permutation-exact distance) before aggregating. Off ⇒ cosine order only.
+    #[serde(default)]
+    pub hungarian_realign: bool,
+}
+
+impl Default for SoccerRetrievalConfig {
+    fn default() -> Self {
+        SoccerRetrievalConfig {
+            capture_enabled: false,
+            decision_prior_enabled: false,
+            top_k: default_retrieval_top_k(),
+            outcome_gamma: default_retrieval_outcome_gamma(),
+            outcome_horizon: default_retrieval_outcome_horizon(),
+            prior_weight: default_retrieval_prior_weight(),
+            hungarian_realign: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchConfig {
@@ -11240,6 +11376,10 @@ pub struct MatchConfig {
     /// default; see [`SoccerMpcConfig`].
     #[serde(default)]
     pub mpc: SoccerMpcConfig,
+    /// Retrieval-guided decision pipeline (vector search over whole-field
+    /// configuration moments). Off by default; see [`SoccerRetrievalConfig`].
+    #[serde(default)]
+    pub retrieval: SoccerRetrievalConfig,
     #[serde(default = "default_adversarial_embedding_exploitation_enabled")]
     pub adversarial_embedding_exploitation_enabled: bool,
     #[serde(default = "default_adversarial_moment_memory_limit")]
@@ -11278,6 +11418,7 @@ impl Default for MatchConfig {
             neural_learning: SoccerNeuralLearningConfig::default(),
             neural_blend: SoccerNeuralBlendConfig::default(),
             mpc: SoccerMpcConfig::default(),
+            retrieval: SoccerRetrievalConfig::default(),
             adversarial_embedding_exploitation_enabled: true,
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
             max_human_players: 4,
@@ -14487,15 +14628,10 @@ fn soccer_goal_credit_transition_score(
             let speed = (context.actor_velocity.len() / 8.5).clamp(0.0, 1.0);
             let defender_stress = (1.0 - defender_space) * pressure.max(0.25);
             // Taking a man on / dribbling under defender stress is only a credited positive
-            // for the most-advanced players (the three furthest forward, `teammates_ahead`
-            // 0..=2); for a deeper carrier the same act is a penalty, so the learners stop
-            // valuing deep players dribbling into pressure.
-            let advanced_dribbler_fit = match obs.teammates_ahead {
-                0 => 1.0,
-                1 => 0.74,
-                2 => 0.48,
-                _ => 0.0,
-            };
+            // for the most-advanced players (the three furthest forward); for a deeper
+            // carrier the same act is a penalty, so the learners stop valuing deep players
+            // dribbling into pressure. Same rank→appetite curve as the live policy.
+            let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(obs.teammates_ahead);
             0.34 + (obs.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0) * 0.86
                 + obs.open_space_score.clamp(0.0, 1.0) * 0.34
                 + target_forward.max(0.0) * 0.42
@@ -16490,20 +16626,25 @@ fn defensive_role_press_signal(
 }
 
 fn defensive_goal_side_reward(team: Team, player_position: Vec2, snapshot: &WorldSnapshot) -> f64 {
-    let Some(attacker_position) = snapshot
+    // Engage whenever the opponent has possession — including while their pass is in
+    // flight (no holder), which is exactly the transition window where recovering
+    // goal-side matters most. `possession_team` falls back to `last_touch_team`.
+    if snapshot.possession_team() != Some(team.other()) {
+        return 0.0;
+    }
+    // Threat reference along the goal axis: the carrier if there is one, else the ball.
+    let attacker_y = snapshot
         .ball
         .holder
         .and_then(|holder| snapshot.players.iter().find(|p| p.id == holder))
         .filter(|holder| holder.team == team.other())
         .and_then(|holder| snapshot.player_position(holder.id))
-    else {
-        return 0.0;
-    };
+        .map(|pos| pos.y)
+        .unwrap_or(snapshot.ball.position.y);
     let own_goal_y = team.other().goal_y(snapshot.field_length);
     let goal_side_of_ball =
         goal_side_between_y(player_position.y, snapshot.ball.position.y, own_goal_y);
-    let goal_side_of_attacker =
-        goal_side_between_y(player_position.y, attacker_position.y, own_goal_y);
+    let goal_side_of_attacker = goal_side_between_y(player_position.y, attacker_y, own_goal_y);
     match (goal_side_of_ball, goal_side_of_attacker) {
         (true, true) => 0.24,
         (true, false) | (false, true) => -0.12,
@@ -30604,6 +30745,75 @@ impl SoccerLiveHttpBridge {
     }
 }
 
+/// How often the live server re-checks Postgres for a newer learned policy (seconds).
+/// `0` disables the background refresh (startup load only). Default 60s.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_refresh_seconds() -> u64 {
+    std::env::var("SOCCER_LIVE_POLICY_PG_REFRESH_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(60)
+}
+
+/// The learning experiment slug the live server pulls its policy from — must match the
+/// experiment the cluster learner writes to (e.g. `soccer-self-play-k8s-overnight`).
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_experiment_slug() -> String {
+    std::env::var("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|_| "soccer-self-play".to_string())
+}
+
+// ── Postgres → live-server policy bridge ───────────────────────────────────────────────
+// Built only with the `postgres-persistence` feature. When `SOCCER_DATABASE_URL` is set the
+// live server loads the latest ACTIVE learned policy (tabular Q + neural net) for the
+// configured experiment at startup, and a background thread hot-swaps it whenever the cluster
+// learner publishes a newer version — so :5055 always reflects the overnight learning. With
+// the feature off (or no DB url) these are no-ops and the server falls back to the local file.
+
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_connect_for_policy(
+    config: &MatchConfig,
+) -> Result<Option<(crate::des::soccer_learning_pg::SoccerLearningPgStore, String)>, String> {
+    use crate::des::soccer_learning_pg::SoccerLearningPgStore;
+    let Some(mut store) = SoccerLearningPgStore::connect_from_env()? else {
+        return Ok(None); // no SOCCER_DATABASE_URL → file-only
+    };
+    let slug = soccer_live_pg_experiment_slug();
+    let experiment_id = store.ensure_experiment(&slug, &slug, config)?;
+    Ok(Some((store, experiment_id)))
+}
+
+/// Fetch the latest active policy version from Postgres. This is the EXPENSIVE step (the DB
+/// round-trip plus deserialising up to a few hundred-K tabular Q entries), so it is kept
+/// OUT of any session lock — the caller installs the result separately while holding the
+/// lock only for the cheap struct swap. Returns `None` when the experiment has no active
+/// policy yet.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_fetch_latest_pg_policy(
+    store: &mut crate::des::soccer_learning_pg::SoccerLearningPgStore,
+    experiment_id: &str,
+) -> Result<Option<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion>, String> {
+    let options = SoccerQPolicyOptions::default();
+    store.load_latest_active_policy(experiment_id, options.clone(), options)
+}
+
+/// Install an already-fetched policy version into `sim` (the cheap, lock-held step): move the
+/// tabular team policies in and rebuild the neural net from its snapshot. Returns
+/// `(generation, updated_at_micros)` so callers can dedupe newer publishes. Does NO I/O, so
+/// it holds the session lock for only the struct swap.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_install_pg_policy(
+    sim: &mut SoccerMatch,
+    version: crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion,
+) -> (i32, i64) {
+    let stamp = (version.generation, version.updated_at_micros);
+    sim.set_team_policies(version.policies);
+    if let Some(net) = version.neural_network {
+        // A malformed/mismatched net is non-fatal — keep the tabular policy.
+        let _ = sim.set_neural_network_snapshot(net);
+    }
+    stamp
+}
+
 impl SoccerLiveServer {
     pub fn new(config: SoccerLiveServerConfig) -> Self {
         let mut session = SoccerRealtimeSession::new(config.match_config.clone());
@@ -30700,6 +30910,38 @@ impl SoccerLiveServer {
                     .record_error(format!("read neural snapshot: {err}")),
             }
         }
+        // Postgres is the source of truth when configured: load the cluster learner's latest
+        // ACTIVE policy at startup, OVERRIDING the local-file autoload above so :5055 reflects
+        // the overnight learning. No-op (file stays) when built without postgres-persistence,
+        // when SOCCER_DATABASE_URL is unset, or when the DB is unreachable.
+        #[cfg(feature = "postgres-persistence")]
+        {
+            match soccer_live_pg_connect_for_policy(&session.sim.config) {
+                Ok(Some((mut store, experiment_id))) => {
+                    match soccer_live_fetch_latest_pg_policy(&mut store, &experiment_id) {
+                        Ok(Some(version)) => {
+                            let (generation, _) =
+                                soccer_live_install_pg_policy(&mut session.sim, version);
+                            println!(
+                                "# soccer-live: loaded learned policy gen {generation} from postgres (experiment {experiment_id})"
+                            );
+                        }
+                        Ok(None) => {
+                            println!(
+                                "# soccer-live: no active postgres policy for experiment {experiment_id}; using local file"
+                            );
+                        }
+                        Err(err) => session
+                            .policy_autosave
+                            .record_error(format!("postgres policy load: {err}")),
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => session
+                    .policy_autosave
+                    .record_error(format!("postgres policy connect: {err}")),
+            }
+        }
         let input_queue = session.input_queue();
         let controller_input_router = session.controller_input_router();
         SoccerLiveServer {
@@ -30717,6 +30959,81 @@ impl SoccerLiveServer {
     pub fn run(self) -> std::io::Result<()> {
         let listener = TcpListener::bind((self.config.host.as_str(), self.config.port))?;
         println!("# Live soccer UI: {}", self.local_url());
+        // Keep the live policy in lock-step with the cluster learner: a background thread polls
+        // Postgres and hot-swaps the policy whenever a newer ACTIVE version is published. The
+        // policy is queried per-decision, so swapping it between ticks is safe.
+        #[cfg(feature = "postgres-persistence")]
+        {
+            let refresh_seconds = soccer_live_pg_refresh_seconds();
+            if refresh_seconds > 0 {
+                let session = Arc::clone(&self.session);
+                let config = {
+                    let guard = soccer_mutex_lock(&session, "soccer_live_session");
+                    guard.sim.config.clone()
+                };
+                let _ = thread::Builder::new()
+                    .name("soccer-live-pg-policy-refresh".to_string())
+                    .spawn(move || {
+                        // `None` until the first successful connect. A transient failure (RDS
+                        // briefly down at boot, or the connection later dropping unrecoverably)
+                        // is RETRIED on the next tick rather than killing the refresher — so the
+                        // live policy still catches up once Postgres is reachable again.
+                        let mut connected:
+                            Option<(crate::des::soccer_learning_pg::SoccerLearningPgStore, String)> =
+                            None;
+                        let mut last_seen: Option<i64> = None;
+                        loop {
+                            thread::sleep(std::time::Duration::from_secs(refresh_seconds));
+                            if connected.is_none() {
+                                match soccer_live_pg_connect_for_policy(&config) {
+                                    Ok(Some(pair)) => connected = Some(pair),
+                                    Ok(None) => return, // no DB url — never will be; stop the thread
+                                    Err(err) => {
+                                        eprintln!("# soccer-live: pg refresh connect failed (will retry): {err}");
+                                        continue;
+                                    }
+                                }
+                            }
+                            let Some((store, experiment_id)) = connected.as_mut() else {
+                                continue;
+                            };
+                            // Cheap metadata probe first (no lock); only do the full fetch on a
+                            // newer publish.
+                            let updated_at = match store.load_latest_active_policy_metadata(experiment_id)
+                            {
+                                Ok(Some(meta)) if last_seen != Some(meta.updated_at_micros) => {
+                                    meta.updated_at_micros
+                                }
+                                Ok(_) => continue, // unchanged or no active policy
+                                Err(err) => {
+                                    eprintln!("# soccer-live: pg refresh probe failed (will retry): {err}");
+                                    continue; // store auto-reconnects via ensure_connected next tick
+                                }
+                            };
+                            // Fetch the full policy WITHOUT the session lock (the slow part: DB +
+                            // deserialise), then take the lock only to swap the structs in — so a
+                            // refresh never stalls the HTTP workers on a DB round-trip.
+                            match soccer_live_fetch_latest_pg_policy(store, experiment_id) {
+                                Ok(Some(version)) => {
+                                    let (generation, installed) = {
+                                        let mut guard =
+                                            soccer_mutex_lock(&session, "soccer_live_session");
+                                        soccer_live_install_pg_policy(&mut guard.sim, version)
+                                    };
+                                    last_seen = Some(installed.max(updated_at));
+                                    println!(
+                                        "# soccer-live: refreshed to learned policy gen {generation} from postgres"
+                                    );
+                                }
+                                Ok(None) => last_seen = Some(updated_at),
+                                Err(err) => eprintln!(
+                                    "# soccer-live: pg refresh load failed (will retry): {err}"
+                                ),
+                            }
+                        }
+                    });
+            }
+        }
         let worker_count = live_http_worker_threads(self.config.http_worker_threads);
         let queue_capacity = live_http_worker_queue_capacity(worker_count);
         let (stream_tx, stream_rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
@@ -39188,6 +39505,21 @@ fn pressure_rising_signal(observation: &SoccerPomdpObservation) -> f64 {
     let proximity = (1.0 - observation.nearest_opponent_distance / PRESSURE_RISING_ENGAGE_YARDS)
         .clamp(0.0, 1.0);
     return (closing01 * proximity).clamp(0.0, 1.0);
+}
+
+/// Positional "take-a-man-on" appetite from forward rank. `teammates_ahead` counts
+/// outfield team-mates closer to the opponent goal, so 0..=2 are the three most-forward
+/// players on the team — the only ones for whom dribbling INTO pressure should be
+/// worthwhile. The appetite fades from rank 1 (none ahead) to rank 3 and is zero for
+/// anyone deeper, who should move the ball rather than carry it into the tackle. Single
+/// source of truth so the live policy and the learning-reward shaping cannot drift apart.
+pub(crate) fn advanced_dribbler_fit_from_rank(teammates_ahead: usize) -> f64 {
+    match teammates_ahead {
+        0 => 1.0,
+        1 => 0.74,
+        2 => 0.48,
+        _ => 0.0,
+    }
 }
 
 fn dribble_hold_base_seconds(dribbling: f64) -> f64 {
