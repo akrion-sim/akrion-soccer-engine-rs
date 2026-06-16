@@ -3662,7 +3662,7 @@ mod tests {
     #[test]
     fn continuous_manifest_marks_ready_only_after_release_build() {
         assert_continuous_manifest_contains(
-            "/usr/local/cargo/bin/cargo build --release --bin main_soccer_learning_run",
+            "/usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_learning_run",
         );
         assert_continuous_manifest_contains("touch \"${ready_file}\"");
         assert_continuous_manifest_contains("readinessProbe:");
