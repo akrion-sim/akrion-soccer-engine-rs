@@ -51047,7 +51047,7 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
     sim.players[attacker].skills.shooting = 8.2;
     sim.players[attacker].skills.right_foot_shot_power = 8.1;
     sim.players[attacker].skills.left_foot_shot_power = 7.4;
-    sim.players[outlet].position = Vec2::new(48.0, 102.0);
+    sim.players[outlet].position = Vec2::new(64.0, 78.0);
     sim.players[keeper].position = Vec2::new(39.0, 116.0);
     sim.players[keeper].skills.goalkeeping = 4.8;
     sim.ball.holder = Some(attacker);
@@ -51058,6 +51058,14 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(attacker);
     assert!(must_shoot_near_goal(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(!goal_attack_shot_can_yield_to_support(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(goal_attack_shot_blocks_alternatives(
         &observation,
         sim.players[attacker].role
     ));
@@ -51088,7 +51096,7 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
 }
 
 #[test]
-fn first_touch_midfielder_inside_twenty_five_must_shoot() {
+fn first_touch_midfielder_inside_twenty_five_can_use_nearby_support() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 2228,
@@ -51134,22 +51142,46 @@ fn first_touch_midfielder_inside_twenty_five_must_shoot() {
         &observation,
         sim.players[attacker].role
     ));
-    assert!(!snapshot.ranked_visible_pass_targets(attacker, 3).is_empty());
+    assert!(goal_attack_shot_can_yield_to_support(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(!goal_attack_shot_blocks_alternatives(
+        &observation,
+        sim.players[attacker].role
+    ));
+    let pass_targets = snapshot.ranked_visible_pass_targets(attacker, 3);
+    assert!(!pass_targets.is_empty());
 
     for seed in 0..80 {
         let mut player = sim.players[attacker].clone();
         let mut rng = mulberry32(25_000 + seed);
         let intent = player.run_time_step(&snapshot, None, None, &mut rng);
         assert!(
-            matches!(intent.action, SoccerAction::Shoot { .. }),
-            "first-touch midfielder inside 25 should shoot, seed {seed}, got {:?}",
+            matches!(
+                intent.action,
+                SoccerAction::Shoot { .. }
+                    | SoccerAction::Pass { .. }
+                    | SoccerAction::ControlTouch { .. }
+            ),
+            "first-touch midfielder with nearby support should keep normal first-touch choices open, seed {seed}, got {:?}",
             intent.action
         );
-        let decision = player.last_decision.expect("first-touch shot decision");
-        assert!(matches!(
-            decision.action.as_str(),
-            "first-time-shot" | "first-time-header"
-        ));
+        let decision = player.last_decision.expect("first-touch decision");
+        assert!(
+            !decision
+                .operation_order
+                .iter()
+                .any(|operation| operation == "must-shoot"),
+            "nearby support should bypass the hard first-touch must-shoot gate: {decision:?}"
+        );
+        assert!(
+            decision
+                .action_options
+                .iter()
+                .any(|option| option.label == "first-time-pass" && option.legal),
+            "nearby support should keep first-time pass legal: {decision:?}"
+        );
     }
 }
 
@@ -53480,6 +53512,138 @@ fn threaded_goal_lane_can_override_forced_shot_gate() {
             .iter()
             .any(|operation| operation == "must-shoot"),
         "clean inside-20 decision should record the hard must-shoot gate: {clean_decision:?}"
+    );
+}
+
+#[test]
+fn far_required_shot_with_nearby_support_keeps_alternatives_open() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_242,
+        ..Default::default()
+    });
+    let attacker = 8;
+    let outlet = 7;
+    let keeper = 11;
+    park_players_except(&mut sim, &[attacker, outlet, keeper]);
+    sim.players[attacker].role = PlayerRole::Midfielder;
+    sim.players[attacker].position = Vec2::new(40.0, 96.0);
+    sim.players[attacker].velocity = Vec2::new(0.0, 2.6);
+    sim.players[attacker].skills.shooting = 7.4;
+    sim.players[attacker].skills.passing_completion_rate = 8.8;
+    sim.players[attacker].skills.passing = 8.6;
+    sim.players[attacker].skills.vision = 8.9;
+    sim.players[attacker].skills.decision_noise = 0.0;
+    sim.players[attacker].preferences.pass_bias = 1.0;
+    sim.players[attacker].preferences.dribble_bias = 1.0;
+    sim.players[attacker].preferences.shoot_bias = 0.72;
+    sim.players[outlet].position = Vec2::new(35.0, 96.0);
+    sim.players[outlet].velocity = Vec2::new(0.0, 1.0);
+    sim.players[outlet].skills.first_touch = 8.0;
+    sim.players[outlet].skills.passing_completion_rate = 8.2;
+    sim.players[keeper].position = Vec2::new(40.0, 116.0);
+    sim.players[keeper].skills.goalkeeping = 6.2;
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass_targets = snapshot.ranked_visible_pass_targets(attacker, 3);
+    assert!(
+        pass_targets.contains(&outlet),
+        "nearby teammate should be a visible outlet: {pass_targets:?}"
+    );
+    let observation = snapshot.observation_for(attacker);
+    assert!(observation.yards_to_goal > CLEAN_SHOT_MUST_SHOOT_YARDS);
+    assert!(observation.yards_to_goal <= TEAMMATE_MUST_SHOOT_YARDS);
+    assert!(goal_attack_shot_is_required(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(goal_attack_shot_can_yield_to_support(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(!goal_attack_shot_blocks_alternatives(
+        &observation,
+        sim.players[attacker].role
+    ));
+    assert!(learned_action_label_is_legal(
+        "carry-out-left",
+        &snapshot,
+        attacker
+    ));
+    assert!(learned_action_label_is_legal(
+        "carry-out-right",
+        &snapshot,
+        attacker
+    ));
+    assert_eq!(
+        near_goal_no_shot_penalty_points(&observation, sim.players[attacker].role),
+        0.0
+    );
+
+    let options = sim.players[attacker].possession_action_options(
+        &observation,
+        &snapshot.tactical_directive(Team::Home),
+        pass_targets.len(),
+        snapshot
+            .ranked_visible_aerial_pass_targets(attacker, 3)
+            .len(),
+        false,
+        sim.config.dt_seconds,
+        snapshot.field_width,
+    );
+    let shoot = options
+        .iter()
+        .find(|option| option.label == "shoot")
+        .expect("shoot option");
+    let pass1 = options
+        .iter()
+        .find(|option| option.label == "pass1")
+        .expect("pass1 option");
+    let carry_left = options
+        .iter()
+        .find(|option| option.label == "carry-out-left")
+        .expect("carry-out-left option");
+    let carry_right = options
+        .iter()
+        .find(|option| option.label == "carry-out-right")
+        .expect("carry-out-right option");
+    assert!(shoot.legal, "shot should remain available: {shoot:?}");
+    assert!(
+        pass1.legal && pass1.probability > 0.0,
+        "nearby support should keep a pass live: {pass1:?}"
+    );
+    assert!(
+        carry_left.legal || carry_right.legal,
+        "support-yield state should not hard-suppress carry-out: left={carry_left:?} right={carry_right:?}"
+    );
+
+    let mut player = sim.players[attacker].clone();
+    let _intent = player.run_time_step_with_context(
+        &snapshot,
+        snapshot.mdp_state_for_player(attacker),
+        observation,
+        None,
+        None,
+        &mut mulberry32(22_242),
+    );
+    let decision = player.last_decision.expect("decision trace");
+    assert!(
+        !decision
+            .operation_order
+            .iter()
+            .any(|operation| operation == "must-shoot"),
+        "nearby support from outside the clean-shot window should reach the policy instead of the hard must-shoot gate: {decision:?}"
+    );
+    assert!(
+        decision
+            .action_options
+            .iter()
+            .any(|option| option.label == "pass1" && option.legal),
+        "decision trace should expose the live support pass: {decision:?}"
     );
 }
 

@@ -463,6 +463,11 @@ const CLEAN_SHOT_MUST_SHOOT_YARDS: f64 = 20.0;
 const CLEAN_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.34;
 const CLEAN_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.32;
 const CLEAN_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.08;
+const SUPPORT_RELAX_FORCED_SHOT_MIN_YARDS: f64 = CLEAN_SHOT_MUST_SHOOT_YARDS;
+const SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS: f64 = 14.0;
+const SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY: f64 = 0.54;
+const SUPPORT_RELAX_FORCED_SHOT_MIN_AERIAL_QUALITY: f64 = 0.56;
+const SUPPORT_RELAX_FORCED_SHOT_MIN_OPENNESS: f64 = 0.50;
 const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 45.0;
 const SPECULATIVE_LONG_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.46;
 const SPECULATIVE_LONG_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.10;
@@ -39645,8 +39650,53 @@ fn goal_attack_shot_is_required(observation: &SoccerPomdpObservation, role: Play
     must_shoot_near_goal(observation, role) || striker_shot_window_is_qualified(observation, role)
 }
 
+fn goal_attack_shot_can_yield_to_support(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+) -> bool {
+    if role == PlayerRole::Goalkeeper
+        || !goal_attack_shot_is_required(observation, role)
+        || clean_twenty_yard_shot_is_qualified(observation, role)
+        || observation.yards_to_goal <= SUPPORT_RELAX_FORCED_SHOT_MIN_YARDS
+    {
+        return false;
+    }
+    let nearby_support = observation.open_support_outlets > 0
+        || observation.nearest_teammate_distance <= SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS
+        || observation.neural_extended.nearest_teammate_distance
+            <= SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS;
+    if !nearby_support {
+        return false;
+    }
+    let floor_quality = pass_quality_for_patience(observation, PassFlight::Floor);
+    let aerial_quality = pass_quality_for_patience(observation, PassFlight::Aerial);
+    let forward_support = observation.visible_forward_pass_options > 0
+        && observation.best_forward_pass_receiver_openness
+            >= SUPPORT_RELAX_FORCED_SHOT_MIN_OPENNESS
+        && observation.floor_pass_lane_score >= 0.44;
+    let floor_support = observation.visible_pass_options > 0
+        && floor_quality >= SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY;
+    let aerial_support = observation.visible_aerial_pass_options > 0
+        && aerial_quality >= SUPPORT_RELAX_FORCED_SHOT_MIN_AERIAL_QUALITY;
+    let threaded_support = observation.threaded_goal_pass_available
+        && threaded_goal_pass_quality_fit(observation)
+            >= SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY;
+    floor_support || forward_support || aerial_support || threaded_support
+}
+
+fn goal_attack_shot_blocks_alternatives(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+) -> bool {
+    goal_attack_shot_is_required(observation, role)
+        && !goal_attack_shot_can_yield_to_support(observation, role)
+}
+
 fn near_goal_no_shot_penalty_points(observation: &SoccerPomdpObservation, role: PlayerRole) -> f64 {
-    if role == PlayerRole::Goalkeeper || !must_shoot_near_goal(observation, role) {
+    if role == PlayerRole::Goalkeeper
+        || !must_shoot_near_goal(observation, role)
+        || goal_attack_shot_can_yield_to_support(observation, role)
+    {
         return 0.0;
     }
     let role_multiplier = match role {
@@ -40070,7 +40120,7 @@ fn final_third_killer_pass_preemption_probability(
     options: &[AgentActionOptionTrace],
 ) -> f64 {
     if !killer_pass_forced_by_goal_pressure(observation, role)
-        || (goal_attack_shot_is_required(observation, role)
+        || (goal_attack_shot_blocks_alternatives(observation, role)
             && !threaded_goal_pass_can_override_forced_shot(observation, role))
     {
         return 0.0;
@@ -40121,7 +40171,7 @@ fn near_goal_pass_release_multiplier(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> f64 {
-    if goal_attack_shot_is_required(observation, role) {
+    if goal_attack_shot_blocks_alternatives(observation, role) {
         0.08
     } else {
         1.0
@@ -43390,6 +43440,8 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
             _ => false,
         };
     }
+    let goal_attack_blocks_alternatives =
+        goal_attack_shot_blocks_alternatives(&observation, player.role);
     match action {
         "shoot" => {
             observation.has_ball
@@ -43403,7 +43455,7 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         "pass" => observation.has_ball && snapshot.best_visible_pass_target(player_id).is_some(),
         "killer-pass" => {
             observation.has_ball
-                && (!goal_attack_shot_is_required(&observation, player.role)
+                && (!goal_attack_blocks_alternatives
                     || threaded_goal_pass_can_override_forced_shot(&observation, player.role))
                 && snapshot
                     .killer_pass_target_for(
@@ -43421,7 +43473,7 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                 .unwrap_or(player.position);
             observation.has_ball
                 && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
-                && !goal_attack_shot_is_required(&observation, player.role)
+                && !goal_attack_blocks_alternatives
                 && !snapshot
                     .ranked_visible_pass_targets(player_id, 1)
                     .is_empty()
@@ -43432,7 +43484,7 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                 .unwrap_or(player.position);
             observation.has_ball
                 && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
-                && !goal_attack_shot_is_required(&observation, player.role)
+                && !goal_attack_blocks_alternatives
                 && !snapshot
                     .ranked_visible_aerial_pass_targets(player_id, 1)
                     .is_empty()
@@ -43454,7 +43506,9 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         "control-touch" => observation.has_ball && observation.first_touch_available,
         "dribble" | "carry-forward" => observation.has_ball,
         "carry-out-left" | "carry-out-right" => {
-            observation.has_ball && !goal_approach_forces_goalmouth_carry(&observation, player.role)
+            observation.has_ball
+                && !goal_attack_blocks_alternatives
+                && !goal_approach_forces_goalmouth_carry(&observation, player.role)
         }
         "protect-ball" => {
             observation.has_ball

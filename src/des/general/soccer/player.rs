@@ -404,7 +404,8 @@ impl PlayerAgent {
             .clamp(0.0, 1.25);
         let shot_block_penalty =
             (1.0 - observation.shot_block_probability.clamp(0.0, 1.0) * 0.58).clamp(0.30, 1.0);
-        let goal_attack_shot_required = goal_attack_shot_is_required(observation, self.role);
+        let goal_attack_shot_blocks_alternatives =
+            goal_attack_shot_blocks_alternatives(observation, self.role);
         let threaded_goal_pass_overrides_shot =
             threaded_goal_pass_can_override_forced_shot(observation, self.role);
         let close_shot_attempt =
@@ -468,7 +469,11 @@ impl PlayerAgent {
                 shooting,
             ))
             .max(striker_shot_bonus)
-            .max(if goal_attack_shot_required { 0.99 } else { 0.0 });
+            .max(if goal_attack_shot_blocks_alternatives {
+                0.99
+            } else {
+                0.0
+            });
         let fatigue_dribble = fatigue_dribble_multiplier(observation);
         let shot_creation_carry = shot_creation_carry_multiplier(observation);
         let patience_factor = low_pressure_patience_factor(observation);
@@ -614,7 +619,7 @@ impl PlayerAgent {
         let carry_forward_legal = (observation.forward_dribble_space_yards
             >= carry_forward_min_space
             || goalmouth_carry_forced)
-            && !goal_attack_shot_required
+            && !goal_attack_shot_blocks_alternatives
             && !central_defender_forward_blocked;
         let carry_forward_score = (patient_carry_score_base
             * (0.34 + patience_factor * 0.62 + poor_floor_pass * 0.36 + forward_space_fit * 0.34)
@@ -632,7 +637,7 @@ impl PlayerAgent {
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 })
         .clamp(0.01, 1.46);
         let carry_out_legal = observation.forward_dribble_space_yards >= 0.8
-            && !goal_attack_shot_required
+            && !goal_attack_shot_blocks_alternatives
             && !goalmouth_carry_forced;
         let carry_out_score = (patient_carry_score_base
             * (0.20
@@ -948,7 +953,7 @@ impl PlayerAgent {
             flank_cross_context_score(observation, self.position, field_width);
         let flank_cross_legal_context =
             flank_cross_context_is_legal(observation, self.position, field_width)
-                && !goal_attack_shot_required
+                && !goal_attack_shot_blocks_alternatives
                 && (!goalmouth_carry_forced || directive.flank_attack_policy.is_flank());
         let low_cross_score = (self.preferences.pass_bias
             * directive.pass_priority
@@ -1027,7 +1032,7 @@ impl PlayerAgent {
         // specific receiver). The generic score is computed over the reception-gated visible
         // set, which is empty through a blocked lane — exactly when the killer ball is wanted.
         let killer_pass_legal = threaded_goal_receiver_available
-            && (!goal_attack_shot_required || threaded_goal_pass_overrides_shot)
+            && (!goal_attack_shot_blocks_alternatives || threaded_goal_pass_overrides_shot)
             && observation.yards_to_goal <= KILLER_PASS_MAX_YARDS_TO_GOAL;
         let killer_pass_score = (self.preferences.pass_bias
             * directive.pass_priority
@@ -1193,7 +1198,7 @@ impl PlayerAgent {
             && hold_pressure >= 0.12
             && release_pressure >= 0.38
             && dribbling < NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF
-            && !goal_attack_shot_required
+            && !goal_attack_shot_blocks_alternatives
         {
             let release_floor = (0.20
                 + hold_pressure * 0.28
@@ -1257,7 +1262,7 @@ impl PlayerAgent {
             ensure_min_legal_option_probability(&mut options, "killer-pass", killer_floor);
         }
         if carry_forward_legal
-            && !goal_attack_shot_required
+            && !goal_attack_shot_blocks_alternatives
             && observation.yards_to_goal < observation.yards_to_own_goal
             && observation.yards_to_goal <= 58.0
             && observation.forward_dribble_space_yards >= 3.0
@@ -1322,7 +1327,7 @@ impl PlayerAgent {
                 + final_ball_goal_decision_fit * 0.10)
                 .clamp(
                     0.0,
-                    if goal_attack_shot_required {
+                    if goal_attack_shot_blocks_alternatives {
                         0.88
                     } else {
                         0.78
@@ -2568,7 +2573,7 @@ impl PlayerAgent {
         if has_ball && observation.first_touch_available {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let action_options = self.first_touch_action_options(&observation, pass_targets.len());
-            if goal_attack_shot_is_required(&observation, self.role) {
+            if goal_attack_shot_blocks_alternatives(&observation, self.role) {
                 let is_aerial = matches!(
                     observation.incoming_ball_kind,
                     IncomingBallKind::AerialCross | IncomingBallKind::AerialPass
@@ -2715,7 +2720,7 @@ impl PlayerAgent {
         }
 
         if has_ball
-            && goal_attack_shot_is_required(&observation, self.role)
+            && goal_attack_shot_blocks_alternatives(&observation, self.role)
             && !threaded_goal_pass_can_override_forced_shot(&observation, self.role)
         {
             let action = SoccerAction::Shoot {
@@ -2947,7 +2952,7 @@ impl PlayerAgent {
                             shooting_skill,
                         ))
                         .max(striker_shot_bonus);
-                    if !goal_attack_shot_is_required(&observation, self.role)
+                    if !goal_attack_shot_blocks_alternatives(&observation, self.role)
                         && rng.next_float()
                             >= time_window_probability(learned_shot_chance, snapshot.dt_seconds)
                     {
@@ -3548,6 +3553,7 @@ impl PlayerAgent {
                     )
                 } else if let Some(target) = forced_killer_pass_target.filter(|_| {
                     threaded_goal_pass_can_override_forced_shot(&observation, self.role)
+                        || goal_attack_shot_can_yield_to_support(&observation, self.role)
                 }) {
                     (
                         SoccerAction::Pass {
@@ -3557,7 +3563,7 @@ impl PlayerAgent {
                         },
                         "killer-pass".to_string(),
                     )
-                } else if goal_attack_shot_is_required(&observation, self.role)
+                } else if goal_attack_shot_blocks_alternatives(&observation, self.role)
                     || striker_shot_window_is_qualified(&observation, self.role)
                 {
                     (
@@ -4634,10 +4640,10 @@ impl PlayerAgent {
         // dribbling on: you do NOT carry into traffic when a man is open ahead.
         // (The heuristic possession scorer already prefers this; the learned
         // policy bypasses it, which is how the carrier ends up dribbling past an
-        // obviously open pass.) A genuinely-required shot still takes priority.
+        // obviously open pass.) A hard-blocking close shot still takes priority.
         if observation.best_pass_receiver_openness >= OPEN_OUTLET_RELEASE_OPENNESS
             && observation.expected_pass_completion >= OPEN_OUTLET_RELEASE_COMPLETION
-            && !goal_attack_shot_is_required(observation, self.role)
+            && !goal_attack_shot_blocks_alternatives(observation, self.role)
         {
             if let Some(target) = snapshot
                 .ranked_visible_pass_targets(self.id, 1)
@@ -4729,7 +4735,7 @@ impl PlayerAgent {
         }
 
         if shot_decision_is_qualified_for_role(observation, self.role)
-            && (goal_attack_shot_is_required(observation, self.role)
+            && (goal_attack_shot_blocks_alternatives(observation, self.role)
                 || observation.yards_to_goal <= TEAMMATE_MUST_SHOOT_YARDS)
         {
             return Some((
