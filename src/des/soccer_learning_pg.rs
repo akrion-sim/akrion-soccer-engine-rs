@@ -1538,6 +1538,10 @@ impl SoccerLearningPgStore {
                 query.len()
             ));
         }
+        // Reconnect if the session dropped since the last op — every other DB
+        // method does this first; without it a dropped connection fails hard here
+        // instead of transparently reconnecting.
+        self.ensure_connected()?;
         // Ensure the schema in a COMMITTED transaction (so the table actually
         // exists if nothing has been written yet) — the previous form dropped the
         // tx, silently rolling the `create table` back.
@@ -1677,6 +1681,9 @@ impl SoccerLearningPgStore {
                 query.len()
             ));
         }
+        // Reconnect if the session dropped since the last op (consistent with every
+        // other DB method) before opening the schema-ensure transaction.
+        self.ensure_connected()?;
         {
             let mut tx = self
                 .client

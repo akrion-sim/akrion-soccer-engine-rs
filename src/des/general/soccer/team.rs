@@ -394,6 +394,7 @@ mod team_strategy_mode_tests {
             best_micros = best_micros.min(micros);
             any_optimal |= solution.status == LPStatus::Optimal;
         }
+        eprintln!("[formation-lp-ipm] best solve = {best_micros}us");
         assert!(any_optimal, "interior-point formation LP should reach optimality");
         // The <5ms realtime budget is an optimized-build guarantee; a debug build's
         // unoptimized linear algebra is ~20-50x slower, so only enforce the bound
@@ -944,27 +945,36 @@ fn soccer_lp_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn soccer_env_flag_on(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
+/// Tri-state env flag: `Some(true/false)` when the var is set to a recognized
+/// on/off value, `None` when it is unset (so a caller can fall back to a default).
+fn soccer_env_flag_tristate(name: &str) -> Option<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim() {
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
+    }
 }
 
-/// Run the real interior-point formation LP each tick (instead of the heuristic
-/// fallback). `SOCCER_FORMATION_LP_IPM` is the current, accurate name — the solve
-/// is a sparse interior-point (Clarabel), not the legacy dense simplex — and
-/// `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` is kept as a back-compat alias. The
-/// solve clears the <5ms realtime budget in optimized builds (see
-/// `formation_lp_ipm_solves_under_five_milliseconds`); the circuit breaker in
-/// `solve_tick` still guards against any pathological tick.
+/// Whether to run the real interior-point formation LP each tick (instead of the
+/// heuristic fallback). The solve is a sparse interior-point (Clarabel), not the
+/// legacy dense simplex; `SOCCER_FORMATION_LP_IPM` is the accurate name and
+/// `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` is a back-compat alias. Either accepts
+/// an explicit on/off override.
+///
+/// **Default: ON in optimized builds, OFF in debug.** The solve clears the <5ms
+/// realtime budget when optimized (see `formation_lp_ipm_solves_under_five_milliseconds`),
+/// so live/release play gets continuous formation nudging for free. A debug build's
+/// unoptimized linear algebra is ~20-50x slower — it would blow the per-solve
+/// budget, trip the circuit breaker mid-match (nondeterministic), and slow the test
+/// suite — so debug defaults off and the suite stays fast and deterministic. The
+/// circuit breaker in `solve_tick` still guards against any pathological tick.
 fn soccer_formation_lp_internal_simplex_enabled() -> bool {
-    soccer_env_flag_on("SOCCER_FORMATION_LP_IPM")
-        || soccer_env_flag_on("SOCCER_FORMATION_LP_INTERNAL_SIMPLEX")
+    soccer_env_flag_tristate("SOCCER_FORMATION_LP_IPM")
+        .or_else(|| soccer_env_flag_tristate("SOCCER_FORMATION_LP_INTERNAL_SIMPLEX"))
+        .unwrap_or(!cfg!(debug_assertions))
 }
 
 fn soccer_formation_lp_budgeted_fallback_solution() -> crate::des::general::lp::LPSolution {
