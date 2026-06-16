@@ -394,6 +394,7 @@ mod team_strategy_mode_tests {
             best_micros = best_micros.min(micros);
             any_optimal |= solution.status == LPStatus::Optimal;
         }
+        eprintln!("[formation-lp-ipm] best solve = {best_micros}us");
         assert!(any_optimal, "interior-point formation LP should reach optimality");
         // The <5ms realtime budget is an optimized-build guarantee; a debug build's
         // unoptimized linear algebra is ~20-50x slower, so only enforce the bound
