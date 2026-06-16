@@ -611,14 +611,35 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        let crowded_dribble_damp =
-            (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
+        // Defenders keep a WIDER carrying cushion than the universal 2yd comfort gap:
+        // they should not dribble with an opponent closing inside ~4yd. This term is 0
+        // for non-defenders (their behaviour is unchanged) and 0 while the gap is still
+        // comfortable, rising to 1 as the opponent closes onto the ball — it damps a
+        // defender's dribbling and lifts passing EARLIER and harder than the universal
+        // 2yd response, so a defender releases before the press arrives.
+        let defender_carry_cushion = if self.role == PlayerRole::Defender {
+            DEFENDER_CARRY_CUSHION_YARDS
+        } else {
+            0.0
+        };
+        let defender_pressure_closing = if defender_carry_cushion > 0.0
+            && observation.nearest_opponent_distance.is_finite()
+        {
+            (1.0 - observation.nearest_opponent_distance / defender_carry_cushion).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let crowded_dribble_damp = (1.0
+            - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP
+            - defender_pressure_closing * DEFENDER_CARRY_CROWDED_DAMP)
+            .clamp(0.22, 1.0);
         // The flip side: when a defender is inside 2 yds AND a receiver is open, lift
         // passing so the carrier releases the ball before the gap closes. Gated on an
         // open outlet so a crowded carrier with no pass isn't pushed into a giveaway.
+        // The defender cushion adds extra lift as the gap closes inside ~4yd.
         let crowded_pass_lift = 1.0
-            + defender_crowding
-                * PASS_CROWDED_RELEASE_LIFT
+            + (defender_crowding * PASS_CROWDED_RELEASE_LIFT
+                + defender_pressure_closing * DEFENDER_CARRY_PASS_LIFT)
                 * observation.best_pass_receiver_openness.clamp(0.0, 1.0);
         // --- Positional dribble-risk appetite -----------------------------------------
         // Driving INTO pressure (taking a man on, carrying into traffic) is only worth the
@@ -639,8 +660,12 @@ impl PlayerAgent {
         // ...and a deep carrier should give the ball up sooner the longer that risk persists,
         // so the release (pass/shot) gets a positional urgency boost on top of the existing
         // hold-time model.
-        let deep_release_urgency =
-            (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
+        // A defender also gives the ball up sooner the further an opponent has closed
+        // inside its (wider) carrying cushion — rising pressure ⇒ rising urgency to pass.
+        let deep_release_urgency = (1.0
+            + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34
+            + defender_pressure_closing * DEFENDER_CARRY_RELEASE_URGENCY)
+            .clamp(1.0, 1.55);
         // Stack the positional/keeper release lifts onto the hold-time release model, but
         // cap the product so several "release sooner" signals firing at once (e.g. a
         // pressured keeper, who is also a deep carrier) can't blow the multiplier past a

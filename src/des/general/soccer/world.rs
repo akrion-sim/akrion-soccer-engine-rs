@@ -7862,16 +7862,23 @@ impl SoccerMatch {
             gait
         };
         // Locomotion momentum: a decision is instant, but the body carries the effort
-        // it has committed to. Upshifting (committing harder) and pulling up to a stop
-        // are free, but DOWNshifting to a still-moving lower gait is held off until the
-        // committed gait has been carried for the dwell — this is what stops a player
-        // sprinting one tick, running the next, sprinting again (see `commit_gait`).
-        // Dwell is accumulated per movement step from `dt` rather than read off the
-        // match clock, so it is correct however the mover is driven (one step per tick
-        // in live play; the clock need not advance between calls).
+        // it has committed to — it can't oscillate sprint↔run tick-to-tick. Once an
+        // effort tier is entered it is held for the dwell before changing, EXCEPT a
+        // pull-up to a stop or an explosive emergency reaction (chase / flat-out
+        // recovery / loose-ball scramble / an incoming pass to attack / a counterbreak)
+        // which are never delayed. Dwell is accumulated per movement step from `dt`
+        // rather than read off the match clock, so it is correct however the mover is
+        // driven (one step per tick in live play; the clock need not advance between
+        // calls). See `commit_gait`.
+        let gait_emergency = chased
+            || on_break
+            || attack_support
+            || loose_ball_attack
+            || incoming_pass
+            || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD;
         let previous_gait = self.players[player_id].movement_gait;
         let gait_held_seconds = self.players[player_id].locomotion.gait_held_seconds;
-        let gait = commit_gait(previous_gait, gait, gait_held_seconds);
+        let gait = commit_gait(previous_gait, gait, gait_held_seconds, gait_emergency);
         // A turn-and-run to keep up with a fast attacker (chase / flat-out recovery)
         // bypasses the heading-reversal lock so the change of direction is never
         // delayed; ordinary play keeps its directional momentum.
@@ -20910,6 +20917,57 @@ impl WorldSnapshot {
         distance.clamp(DRIBBLE_MIN_TOUCH_YARDS, cap)
     }
 
+    /// Bends a DEFENDER's carry direction away from the nearest opponent to preserve a
+    /// wider cushion (see [`DEFENDER_CARRY_CUSHION_YARDS`]). Returns `base_direction`
+    /// unchanged for non-defenders, for shield/nutmeg moves (which encode their own
+    /// opponent-relative geometry), inside the final third (more risk is allowed there),
+    /// or when no opponent is inside the cushion. The closer the opponent inside the
+    /// cushion, the harder the carry bends away.
+    fn defender_carry_cushion_direction(
+        &self,
+        player: &PlayerSnapshot,
+        current: Vec2,
+        base_direction: Vec2,
+        kind: DribbleMoveKind,
+        nearest_defender: Option<(usize, Vec2, f64)>,
+    ) -> Vec2 {
+        let base_direction = base_direction.normalized();
+        if base_direction.len() <= 1e-6 || player.role != PlayerRole::Defender {
+            return base_direction;
+        }
+        if matches!(
+            dribble_final_cut_kind(kind),
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg
+        ) {
+            return base_direction;
+        }
+        // In the final attacking third a defender that has carried that far may take the
+        // extra risk; the wider cushion is a defensive/build-up discipline. `goal_y` is
+        // the attacking goal, so this is the distance to the goal being attacked.
+        let yards_to_goal = (player.team.goal_y(self.field_length) - current.y).abs();
+        if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL {
+            return base_direction;
+        }
+        let Some((_, defender_pos, defender_distance)) = nearest_defender else {
+            return base_direction;
+        };
+        if defender_distance >= DEFENDER_CARRY_CUSHION_YARDS {
+            return base_direction;
+        }
+        let away = current - defender_pos;
+        if away.len() <= 1e-6 {
+            return base_direction;
+        }
+        let away = away.normalized();
+        let closing = (1.0 - defender_distance / DEFENDER_CARRY_CUSHION_YARDS).clamp(0.0, 1.0);
+        let bend = (0.25 + closing * 0.55).clamp(0.0, 0.85);
+        let blended = base_direction * (1.0 - bend) + away * bend;
+        if blended.len() <= 1e-6 {
+            return base_direction;
+        }
+        blended.normalized()
+    }
+
     fn carry_forward_direction_for(&self, player: &PlayerSnapshot, current: Vec2) -> Vec2 {
         let straight = Vec2::new(0.0, player.team.attack_dir());
         let goal = Vec2::new(
@@ -20970,6 +21028,11 @@ impl WorldSnapshot {
             _ => touch.direction_for_team(me.team),
         };
         let direction = self.attacking_dribble_goal_drive_direction(me, current, direction, kind);
+        // Defenders carrying the ball bend the carry AWAY from a closing opponent to keep
+        // a wider cushion (3-4yd) rather than dribbling toward the press; attackers are
+        // exempt (they may take a man on). Inert when no opponent is inside the cushion.
+        let direction =
+            self.defender_carry_cushion_direction(me, current, direction, kind, nearest_defender);
         let mut target = current + direction * touch.distance_yards;
         if let Some((_, defender_position, defender_distance)) = nearest_defender {
             if kind == DribbleMoveKind::Nutmeg && defender_distance <= 5.6 {

@@ -384,6 +384,11 @@ pub struct GroupStanding {
     pub name: String,
     pub record: TeamRecord,
     pub advanced: bool,
+    /// True when this team is level on points, goal difference, and goals for
+    /// with an adjacent team in the final table, so its slot was settled by a
+    /// tiebreaker (head-to-head or the lot) rather than outright on the pitch.
+    /// Lets callers see/flag close calls — especially at the advancement cut.
+    pub decided_by_tiebreaker: bool,
 }
 
 /// One group's final table (already ranked best-first).
@@ -564,12 +569,31 @@ impl Tournament {
                         .cmp(&ta.record.goal_difference()),
                 )
                 .then(tb.record.goals_for.cmp(&ta.record.goals_for))
+                // FIFA tiebreakers among the level teams, applied pairwise:
+                // head-to-head points, then head-to-head goal difference, then
+                // head-to-head goals scored. These settle the slot on the pitch
+                // before any artificial lot is drawn.
                 .then_with(|| {
                     let h2h_a = head_to_head_points(head_to_head, a, b);
                     let h2h_b = head_to_head_points(head_to_head, b, a);
                     h2h_b.cmp(&h2h_a)
                 })
-                // Stable, deterministic final fallback: lower seed wins the slot.
+                .then_with(|| {
+                    let gd_a = head_to_head_goal_difference(head_to_head, a, b);
+                    let gd_b = head_to_head_goal_difference(head_to_head, b, a);
+                    gd_b.cmp(&gd_a)
+                })
+                .then_with(|| {
+                    let gf_a = head_to_head_goals_for(head_to_head, a, b);
+                    let gf_b = head_to_head_goals_for(head_to_head, b, a);
+                    gf_b.cmp(&gf_a)
+                })
+                // All sporting criteria are exhausted: settle the slot with a
+                // deterministic "drawing of lots" — the higher-seeded (stronger
+                // pre-tournament) team takes it, with team id as a final unique
+                // guarantee. This makes the comparator a TOTAL order, so every
+                // group resolves to exactly `advancers_per_group` clear advancers
+                // with no remaining ties.
                 .then(ta.seed.cmp(&tb.seed))
                 .then(ta.id.cmp(&tb.id))
         });
@@ -822,16 +846,30 @@ impl Tournament {
         for (group_index, group) in groups.iter().enumerate() {
             let ranked = self.rank_group(group, head_to_head);
             let advancers = self.format.advancers_per_group;
+            // A slot was settled by a tiebreaker if the team is level on points,
+            // goal difference, and goals for with the team directly above or below
+            // it — only head-to-head or the lot then separates them.
+            let level_with = |a: usize, b: usize| {
+                let ra = self.teams[self.team_index(a)].record;
+                let rb = self.teams[self.team_index(b)].record;
+                ra.points() == rb.points()
+                    && ra.goal_difference() == rb.goal_difference()
+                    && ra.goals_for == rb.goals_for
+            };
             let standings = ranked
                 .iter()
                 .enumerate()
                 .map(|(position, &team_id)| {
                     let team = &self.teams[self.team_index(team_id)];
+                    let tied_above = position > 0 && level_with(team_id, ranked[position - 1]);
+                    let tied_below = position + 1 < ranked.len()
+                        && level_with(team_id, ranked[position + 1]);
                     GroupStanding {
                         team_id,
                         name: team.name.clone(),
                         record: team.record,
                         advanced: position < advancers,
+                        decided_by_tiebreaker: tied_above || tied_below,
                     }
                 })
                 .collect();
@@ -1235,6 +1273,38 @@ fn head_to_head_result_points(scored: u32, conceded: u32) -> u32 {
         std::cmp::Ordering::Equal => 1,
         std::cmp::Ordering::Less => 0,
     }
+}
+
+/// Goal difference `team` earned in its head-to-head meetings with `opponent`.
+fn head_to_head_goal_difference(
+    head_to_head: &HashMap<(usize, usize), (u32, u32)>,
+    team: usize,
+    opponent: usize,
+) -> i32 {
+    let mut diff = 0i32;
+    if let Some(&(scored, conceded)) = head_to_head.get(&(team, opponent)) {
+        diff += scored as i32 - conceded as i32;
+    }
+    if let Some(&(opp_scored, team_scored)) = head_to_head.get(&(opponent, team)) {
+        diff += team_scored as i32 - opp_scored as i32;
+    }
+    diff
+}
+
+/// Goals `team` scored in its head-to-head meetings with `opponent`.
+fn head_to_head_goals_for(
+    head_to_head: &HashMap<(usize, usize), (u32, u32)>,
+    team: usize,
+    opponent: usize,
+) -> u32 {
+    let mut goals = 0u32;
+    if let Some(&(scored, _conceded)) = head_to_head.get(&(team, opponent)) {
+        goals += scored;
+    }
+    if let Some(&(_opp_scored, team_scored)) = head_to_head.get(&(opponent, team)) {
+        goals += team_scored;
+    }
+    goals
 }
 
 // ---------------------------------------------------------------------------
@@ -1680,6 +1750,116 @@ mod tests {
         assert!(report.third_place_id.is_some());
 
         // Champion actually won the final (no shootout loss credited).
+        let final_match = report
+            .matches
+            .iter()
+            .rev()
+            .find(|m| matches!(m.stage, TournamentStage::Knockout { remaining: 2 }))
+            .expect("a final was played");
+        assert_eq!(final_match.winner_id(), Some(report.champion_id));
+    }
+
+    /// Forces every match to the same drawn score, so groups end completely level
+    /// and every knockout tie goes to a shootout — the worst case for "produce a
+    /// clear winner".
+    #[derive(Clone)]
+    struct AllDrawsRunner;
+
+    impl TournamentMatchRunner for AllDrawsRunner {
+        fn play(
+            &mut self,
+            ctx: &TournamentMatchContext,
+            home: &TeamBrain,
+            away: &TeamBrain,
+        ) -> Result<MatchOutcome, String> {
+            Ok(MatchOutcome {
+                home_goals: 1,
+                away_goals: 1,
+                home_brain: advanced_brain(home, ctx.home_learns),
+                away_brain: advanced_brain(away, ctx.away_learns),
+                home_training_steps: usize::from(ctx.home_learns),
+                away_training_steps: usize::from(ctx.away_learns),
+            })
+        }
+    }
+
+    #[test]
+    fn all_level_groups_still_advance_exactly_two_deterministically() {
+        // Every group match is a 1-1 draw, so all four teams in each group are
+        // level on points, goal difference, and goals for. The tiebreaker cascade
+        // (head-to-head → lot) must still yield a clean, repeatable top two.
+        let run_once = || {
+            let teams = fresh_teams(128, 7);
+            let tournament = Tournament::new(
+                teams,
+                TournamentFormat::default(),
+                TournamentLearningMode::Frozen,
+                7,
+            )
+            .unwrap();
+            tournament.run(&mut AllDrawsRunner).expect("tournament runs")
+        };
+        let report = run_once();
+
+        for table in &report.group_tables {
+            assert_eq!(table.standings.len(), 4);
+            // Exactly two advance, no more, no fewer.
+            assert_eq!(table.standings.iter().filter(|s| s.advanced).count(), 2);
+            // Every group team is fully level here, so the cut was a tiebreaker.
+            for standing in &table.standings {
+                assert!(
+                    standing.decided_by_tiebreaker,
+                    "all-level group should flag tiebreaker-decided slots"
+                );
+            }
+        }
+
+        // The lot is a deterministic function of the field, so the same advancers
+        // come out every run.
+        let advancers = |r: &TournamentReport| -> Vec<usize> {
+            let mut ids: Vec<usize> = r
+                .group_tables
+                .iter()
+                .flat_map(|t| t.standings.iter().filter(|s| s.advanced).map(|s| s.team_id))
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(advancers(&report), advancers(&run_once()));
+    }
+
+    #[test]
+    fn all_drawn_knockout_still_crowns_single_champion_via_shootout() {
+        // Every knockout tie is level, so each must be settled by a shootout and
+        // the bracket must still fold to exactly one champion.
+        let teams = fresh_teams(128, 11);
+        let tournament = Tournament::new(
+            teams,
+            TournamentFormat::default(),
+            TournamentLearningMode::Frozen,
+            11,
+        )
+        .unwrap();
+        let report = tournament.run(&mut AllDrawsRunner).expect("tournament runs");
+
+        // Exactly one champion, distinct runner-up and third place.
+        assert!(report.team(report.champion_id).is_some());
+        assert_ne!(report.champion_id, report.runner_up_id);
+        assert!(report.third_place_id.is_some());
+
+        // Every knockout match finished level, so each carries a shootout winner,
+        // and the recorded winner is always one of the two contestants.
+        for m in report
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, TournamentStage::Knockout { .. }))
+        {
+            let sw = m.shootout_winner.expect("level knockout must go to a shootout");
+            assert!(sw == m.home_id || sw == m.away_id);
+            assert_eq!(m.winner_id(), Some(sw));
+        }
+
+        // The champion is whoever won the final's shootout.
         let final_match = report
             .matches
             .iter()

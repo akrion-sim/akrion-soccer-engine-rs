@@ -11476,6 +11476,9 @@ fn support_and_defensive_movement_face_ball_unless_fast_run_requires_turning() {
     sim.ball.position = Vec2::new(40.0, 40.0);
     sim.players[player].position = Vec2::new(40.0, 60.0);
     sim.players[player].velocity = Vec2::zero();
+    // Fresh stationary start for this sub-scenario (matches the velocity reset): from
+    // a standstill the gait commitment lets a player set off into a sprint at once.
+    sim.players[player].movement_gait = MovementGait::Stand;
     sim.move_player_towards(player, Vec2::new(40.0, 82.0), true);
     assert_eq!(sim.players[player].movement_gait, MovementGait::Sprint);
     assert_eq!(
@@ -11483,6 +11486,51 @@ fn support_and_defensive_movement_face_ball_unless_fast_run_requires_turning() {
             FacingBucket::South,
             "a full sprint away from the ball is one of the few cases where body facing follows the run"
         );
+}
+
+#[test]
+fn gait_commitment_damps_a_flip_flopping_sprint_decision() {
+    // Regression for the locomotion-commitment hardening: even when the decision
+    // layer flip-flops the sprint flag EVERY tick (the pathological worst case), the
+    // gait can change effort tier no more than about once per commitment dwell, not
+    // every tick. Without the commitment this loop produces a gait change on all 60
+    // ticks (Sprint, Run, Sprint, Run, …); with it, the gait is held in dwell-long
+    // blocks. We assert a comfortable upper bound (dwell ≈ 3 ticks at 1/15 s ⇒ at most
+    // ~20 changes) that is far below the un-damped 60.
+    let dt = 1.0 / 15.0;
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: dt,
+        duration_seconds: 5.0,
+        seed: 4242,
+        ..Default::default()
+    });
+    let p = 9;
+    park_players_except(&mut sim, &[p]);
+    sim.players[p].position = Vec2::new(10.0, 30.0);
+    sim.players[p].velocity = Vec2::zero();
+    sim.players[p].movement_gait = MovementGait::Stand;
+    sim.ball.holder = Some(p);
+    let target = Vec2::new(10.0, 95.0); // far, straight ahead — open-space traversal
+    let ticks = 60;
+    let mut tier_changes = 0;
+    let mut prev_tier = sim.players[p].movement_gait.effort_tier();
+    for i in 0..ticks {
+        sim.ball.position = sim.players[p].position; // keep carrying, no reception override
+        sim.move_player_towards(p, target, i % 2 == 0);
+        let t = sim.players[p].movement_gait.effort_tier();
+        if t != prev_tier {
+            tier_changes += 1;
+            prev_tier = t;
+        }
+    }
+    assert!(
+        tier_changes <= 22,
+        "alternating sprint flag should be damped to ~1 change per dwell, got {tier_changes} over {ticks} ticks"
+    );
+    assert!(
+        tier_changes >= 1,
+        "the player should still actually move/transition, not freeze"
+    );
 }
 
 #[test]
@@ -41939,6 +41987,68 @@ fn carry_forward_in_goal_approach_bends_toward_goal() {
     assert!(
         target.y < snapshot.field_length - 20.0,
         "approach carry should create a shooting lane before the endline: target={target:?}"
+    );
+}
+
+#[test]
+fn deep_defender_carry_bends_away_from_a_closing_opponent() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4471,
+        ..Default::default()
+    });
+    let holder = 9;
+    park_players_except(&mut sim, &[holder]);
+    // Deep in our own half (well outside the final third) so the wider defender
+    // carrying cushion applies.
+    sim.players[holder].role = PlayerRole::Defender;
+    sim.players[holder].position = Vec2::new(40.0, 30.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 7.0;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    // An opponent closing front-right, inside the ~4yd cushion.
+    let opponent = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let opponent_pos = Vec2::new(42.0, 31.5);
+    sim.players[opponent].position = opponent_pos;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let touch = DribbleTouchDecision::new(0, 4.8);
+    let target = snapshot.dribble_move_target_for_touch(
+        holder,
+        sim.players[holder].home_position,
+        DribbleMoveKind::CarryForward,
+        touch,
+    );
+    let straight = Vec2::new(origin.x, origin.y + touch.distance_yards);
+
+    assert!(
+        target.distance(opponent_pos) > straight.distance(opponent_pos) + 0.5,
+        "deep defender should bend the carry AWAY from the closing opponent: \
+         origin={origin:?} target={target:?} straight={straight:?} opp={opponent_pos:?}"
+    );
+
+    // Control: a forward in the identical situation is allowed to carry straight on
+    // (take a man on) — the wider cushion is a defender-only discipline.
+    sim.players[holder].role = PlayerRole::Forward;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let fwd_target = snapshot.dribble_move_target_for_touch(
+        holder,
+        sim.players[holder].home_position,
+        DribbleMoveKind::CarryForward,
+        touch,
+    );
+    assert!(
+        (fwd_target.distance(opponent_pos) - straight.distance(opponent_pos)).abs() < 0.25,
+        "forward carry should be unaffected by the defender cushion: \
+         fwd_target={fwd_target:?} straight={straight:?}"
     );
 }
 
