@@ -989,7 +989,8 @@ impl SoccerLearningPgStore {
                 order by b.played desc,
                          (b.wins * 3 + b.draws) desc,
                          (b.goals_for - b.goals_against) desc,
-                         b.goals_for desc
+                         b.goals_for desc,
+                         b.team_id asc
                 limit $2
                 "#,
                 &[&experiment_id, &limit_i64],
@@ -1003,9 +1004,15 @@ impl SoccerLearningPgStore {
             validate_soccer_neural_network_snapshot_for_pg(&snapshot)?;
             // Genome is nullable (rows persisted before the genome shipped have
             // none) — decode best-effort so a missing/old genome never blocks the
-            // breeding pool.
+            // breeding pool, and sanitize so a corrupt/out-of-range persisted genome
+            // can't reach the engine or the GA.
             let genome_json: Option<Value> = row.get(1);
-            let genome = genome_json.and_then(|value| serde_json::from_value(value).ok());
+            let genome = genome_json
+                .and_then(|value| serde_json::from_value::<SoccerTeamGenome>(value).ok())
+                .map(|mut g| {
+                    g.sanitize();
+                    g
+                });
             pool.push(TournamentElite {
                 neural: snapshot,
                 genome,

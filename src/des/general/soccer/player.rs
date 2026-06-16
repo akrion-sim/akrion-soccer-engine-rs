@@ -480,7 +480,7 @@ impl PlayerAgent {
             * (floor_pass_quality.max(aerial_pass_quality * 0.86) + open_support_fit * 0.18))
             .clamp(0.0, 1.0);
         let hold_penalty_multiplier = dribble_hold_score_multiplier(observation, dribbling);
-        let hold_release_multiplier = release_after_hold_multiplier(observation, dribbling);
+        let mut hold_release_multiplier = release_after_hold_multiplier(observation, dribbling);
         let poor_floor_pass = (1.0 - floor_pass_quality).clamp(0.0, 1.0);
         let forward_space_fit = (observation.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0);
         let patient_dribble_lift = (1.0
@@ -544,17 +544,50 @@ impl PlayerAgent {
             + defender_crowding
                 * PASS_CROWDED_RELEASE_LIFT
                 * observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+        // --- Positional dribble-risk appetite -----------------------------------------
+        // Driving INTO pressure (taking a man on, carrying into traffic) is only worth the
+        // risk for the most-advanced players. `teammates_ahead` counts outfield team-mates
+        // closer to the opponent goal, so 0..=2 are the three most-forward players on the
+        // team; the appetite fades from rank 1 (none ahead) to rank 3 and is zero for anyone
+        // deeper, who should move the ball rather than dribble into the tackle.
+        let advanced_dribbler_fit = match observation.teammates_ahead {
+            0 => 1.0,
+            1 => 0.74,
+            2 => 0.48,
+            _ => 0.0,
+        };
+        // How risky a dribble is right now: real pressure, a defender on top of the ball, or
+        // a live chance of being dispossessed.
+        let dribble_risk = pressure_urgency
+            .max(observation.perceived_pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(defender_crowding)
+            .clamp(0.0, 1.0);
+        // Deep carriers pay an escalating penalty for dribbling while at risk; the three
+        // most-forward players keep their full take-on appetite (fit = 1 ⇒ no damp).
+        let deep_pressure_dribble_damp =
+            (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.62).clamp(0.40, 1.0);
+        // ...and a deep carrier should give the ball up sooner the longer that risk persists,
+        // so the release (pass/shot) gets a positional urgency boost on top of the existing
+        // hold-time model.
+        let deep_release_urgency =
+            (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
+        hold_release_multiplier *= deep_release_urgency;
         let pre_fatigue_dribble_score = (self.preferences.dribble_bias
             * (0.62 + dribbling * 0.48)
             * directive.carry_priority
             * (0.70 + (observation.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0) * 0.58)
             * shot_creation_carry
             * striker_carry_boost
-            * (1.0 + offensive_urgency * 0.30 + pressure_urgency * 0.20)
+            // The pressure-driven dribble lift ("take him on now") only applies to the
+            // most-advanced players; for everyone else mounting pressure must not make
+            // dribbling MORE attractive.
+            * (1.0 + offensive_urgency * 0.30 + pressure_urgency * 0.20 * advanced_dribbler_fit)
             * (1.0 - pressured_release_signal * open_support_fit * 0.18).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.30).clamp(0.62, 1.0)
             * (1.0 - open_forward_outlet * 0.34).clamp(0.58, 1.0)
             * dribble_into_opponent_penalty
+            * deep_pressure_dribble_damp
             * crowded_dribble_damp)
             .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
@@ -591,6 +624,9 @@ impl PlayerAgent {
             * (1.0 + goal_attack * 0.30)
             * (1.0 - pressure * 0.24).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.44).clamp(0.50, 1.0)
+            // Carrying forward INTO pressure is the worst option for a deep player — damp it
+            // hard for anyone outside the three most-forward when there's real risk ahead.
+            * (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.40).clamp(0.45, 1.0)
             // Own-half retention: risky forward dribbling is de-emphasised in our own
             // half (more so when pressured) in favour of keeping the ball.
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 })
@@ -604,7 +640,10 @@ impl PlayerAgent {
                 + poor_floor_pass * 0.30
                 + (1.0 - observation.best_pass_receiver_openness.clamp(0.0, 1.0)) * 0.20)
             * (1.0 - goalmouth_carry_bias * 0.52 - goal_attack * 0.34).clamp(0.30, 1.0)
-            * (1.0 - pressured_good_outlet * 0.36).clamp(0.55, 1.0))
+            * (1.0 - pressured_good_outlet * 0.36).clamp(0.55, 1.0)
+            // Escaping pressure sideways / out is exactly what a pressured deep carrier SHOULD
+            // do (dribble OUT of trouble, not into it) — lift it relative to carrying forward.
+            * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50))
         .clamp(0.01, 0.92);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
@@ -1761,6 +1800,13 @@ impl PlayerAgent {
             .iter()
             .find(|player| player.id == holder && player.team == self.team.other())?;
         let holder_position = snapshot.player_snapshot_position(holder_player);
+        // Can't steal from a goalkeeper holding the ball in his own box — it is in
+        // his hands (he is bound only by the handling time limit instead).
+        if holder_player.role == PlayerRole::Goalkeeper
+            && snapshot.point_in_own_penalty_area(holder_player.team, holder_position)
+        {
+            return None;
+        }
         let distance = self.position.distance(holder_position);
         if distance > DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS {
             return None;

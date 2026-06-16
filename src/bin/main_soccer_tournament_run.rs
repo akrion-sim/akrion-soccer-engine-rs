@@ -147,20 +147,28 @@ impl DiversityRng {
     }
 }
 
-/// Recompute the cached parameter count + L2 norm after editing weights so the
-/// snapshot's bookkeeping stays consistent with its layers.
+/// Recompute the cached parameter count + L2 norm after editing weights, AND
+/// scrub any non-finite value to 0. Mutation/crossover must never emit a NaN/inf
+/// net: the persistence validator rejects non-finite weights (which would abort a
+/// whole checkpoint), and a NaN parent would otherwise poison every descendant.
 fn refresh_snapshot_norm(snapshot: &mut SoccerNeuralNetworkSnapshot) {
     let mut sum_sq = 0.0;
     let mut count = 0usize;
-    for layer in &snapshot.layers {
-        for row in &layer.weights {
-            for weight in row {
-                sum_sq += weight * weight;
+    for layer in &mut snapshot.layers {
+        for row in &mut layer.weights {
+            for weight in row.iter_mut() {
+                if !weight.is_finite() {
+                    *weight = 0.0;
+                }
+                sum_sq += *weight * *weight;
                 count += 1;
             }
         }
-        for bias in &layer.biases {
-            sum_sq += bias * bias;
+        for bias in layer.biases.iter_mut() {
+            if !bias.is_finite() {
+                *bias = 0.0;
+            }
+            sum_sq += *bias * *bias;
             count += 1;
         }
     }
@@ -932,6 +940,25 @@ mod tests {
         // Zero scale is a no-op.
         let unchanged = mutate_neural(base.clone(), &mut DiversityRng::new(7), 0.0);
         assert_eq!(unchanged.layers[0].weights, base.layers[0].weights);
+    }
+
+    #[test]
+    fn net_ops_scrub_non_finite_weights() {
+        // A NaN/inf must never survive into a persisted net (the validator rejects
+        // them and a NaN parent would poison descendants).
+        let mut base = sample_snapshot(1.0);
+        base.layers[0].weights[0][0] = f64::NAN;
+        base.layers[0].biases[0] = f64::INFINITY;
+        let mutated = mutate_neural(base.clone(), &mut DiversityRng::new(3), 0.01);
+        let crossed = crossover_neural(&base, &base, &mut DiversityRng::new(4));
+        for net in [&mutated, &crossed] {
+            assert!(net.l2_norm.is_finite());
+            assert!(net
+                .layers
+                .iter()
+                .all(|l| l.weights.iter().flatten().all(|w| w.is_finite())
+                    && l.biases.iter().all(|b| b.is_finite())));
+        }
     }
 
     #[test]

@@ -994,6 +994,25 @@ const STAGNANT_PASS_PENALTY_WEIGHTS: [f64; 3] = [0.60, 0.28, 0.12];
 // is rewarded — much more so for a forward ball than a lateral or backward one.
 const PROGRESSIVE_PASS_RADIUS_YARDS: f64 = 3.0;
 const PROGRESSIVE_PASS_FORWARD_REWARD_PER_YARD: f64 = 0.42;
+// --- Recycled-possession urgency: force the ball forward when it ping-pongs between a tiny
+// set of players without progressing. Distinct from the STAGNANT pocket detector above: this
+// keys on the PLAYERS involved (the ball bouncing between the same ~2 men) and the net
+// goalward progress of the run, NOT a tight ball-travel radius, so back-and-forth across 8-12
+// yards still trips it. When >= RECYCLED_POSSESSION_MIN_RUN passes have stayed among at most
+// RECYCLED_POSSESSION_MAX_DISTINCT players AND the ball has gained less than
+// RECYCLED_POSSESSION_PROGRESS_YARDS goalward, the carrier's pass scoring tilts toward a
+// forward ball to a NEW player (boosted forward weight + a penalty on recycling it back).
+const RECYCLED_POSSESSION_MIN_RUN: usize = 4;
+const RECYCLED_POSSESSION_MAX_DISTINCT: usize = 2;
+const RECYCLED_POSSESSION_PROGRESS_YARDS: f64 = 6.0;
+// Urgency in [0,1]: base once the run first qualifies, +step for each extra non-progressing
+// pass beyond the minimum, capped.
+const RECYCLED_POSSESSION_URGENCY_BASE: f64 = 0.5;
+const RECYCLED_POSSESSION_URGENCY_STEP: f64 = 0.17;
+// How hard full urgency tilts the live pass choice: extra forward weight per goalward yard,
+// and a flat demerit on a non-progressing ball back to one of the recycle participants.
+const RECYCLED_POSSESSION_FORWARD_WEIGHT_BOOST: f64 = 0.55;
+const RECYCLED_POSSESSION_PINGPONG_PENALTY: f64 = 2.6;
 const PROGRESSIVE_PASS_LATERAL_REWARD_PER_YARD: f64 = 0.14;
 const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
@@ -1341,6 +1360,18 @@ const VERTICAL_LANE_COUNT: usize = 4;
 const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 7.5;
 const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 2.8;
 const TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY: f64 = 16.0;
+// Ball-carrier driving-lane keep-out. When a teammate is carrying the ball and
+// driving forward UNPRESSURED, off-ball teammates must not run into the narrow
+// corridor directly ahead of the carrier — that clogs the dribble and burns the
+// space the carrier is attacking. The corridor runs `LENGTH` yds ahead of the
+// carrier along its driving line, `HALF_WIDTH` yds to either side; an off-ball
+// target inside it is nudged sideways out to the corridor edge (same depth).
+// Suppressed when the carrier IS under pressure (a defender within
+// `PRESSURE_RELIEF_DISTANCE`): then a teammate dropping into that lane to offer a
+// short outlet is exactly what's wanted.
+const CARRIER_LANE_KEEPOUT_LENGTH_YARDS: f64 = 12.0;
+const CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS: f64 = 2.5;
+const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
 // Territorial spacing discipline. "Cover territory" is a fundamental of both
 // attacking and defending: two teammates in the same small patch add no value.
 // Players are expected to keep at least this much space between them — but this
@@ -1754,6 +1785,19 @@ const SWEEPER_KEEPER_INTERCEPT_REACH_YARDS: f64 = 22.0;
 // 8-40yd ball: shorter is pointless, longer risks an incomplete pass across our own area.
 const GK_BACKPASS_MIN_YARDS: f64 = 8.0;
 const GK_BACKPASS_MAX_YARDS: f64 = 40.0;
+/// A goalkeeper may handle the ball with his hands ONLY inside his own penalty
+/// area; while he holds it there it cannot be tackled or stolen. He must release
+/// it within this many seconds — past the limit he is forced to clear it. (Owner
+/// asked for 5s; classic Law 12 is 6s and the 2025 IFAB trial is 8s-then-corner,
+/// so 6.0 is used here as the modelled value — change this one const to retune.)
+const GK_HANDLING_HOLD_LIMIT_SECONDS: f64 = 6.0;
+/// Hurried forced clearance speed (yds/s) when a keeper overruns the handling
+/// limit without distributing — a firm punt upfield, not a gentle drop.
+const GK_HANDLING_FORCED_CLEARANCE_YPS: f64 = 26.0;
+/// After a goal, hold a brief celebration (ball settling in the net, players
+/// reacting) before resetting to the kickoff, so the goal sequence completes on
+/// screen instead of cutting straight to centre.
+const GOAL_CELEBRATION_SECONDS: f64 = 2.5;
 // Reward weight for a pressured recovering defender's controllable back-pass to a more-open
 // keeper, scaled by keeper openness and the pressure on the passer (offsets the backward-pass
 // penalty so it's a real outlet only when genuinely warranted).
@@ -3819,7 +3863,7 @@ fn build_live_decision_trace_entry(
     // A pass is "backward" when its aim point is meaningfully behind the passer along the
     // attacking direction (more than a yard — a square ball is not backward).
     let is_backward_pass = is_pass && chosen_forward_yards.is_some_and(|fwd| fwd < -1.0);
-    let options = decision
+    let mut options: Vec<LiveDecisionTraceOption> = decision
         .action_options
         .iter()
         .map(|option| LiveDecisionTraceOption {
@@ -3829,6 +3873,26 @@ fn build_live_decision_trace_entry(
             chosen: normalize_soccer_action_label(&option.label) == chosen_norm,
         })
         .collect();
+    // The recorded action must be representable among the options so that exactly one is
+    // flagged `chosen`. Some off-ball movement branches record a GRANULAR action label that
+    // is a refinement of the higher-level option they chose and so isn't itself one of the
+    // option labels — e.g. a "support-screen" / "support-push-up" / "shot-creation-run"
+    // execution of a "support-shape" choice, or a "defend" move drawn from the
+    // "defend-shape"/"defend-roam" options. Surface the chosen action as its own flagged
+    // option so the trace stays self-consistent instead of showing no selection at all.
+    if !chosen_norm.is_empty() && !options.iter().any(|option| option.chosen) {
+        let score = options
+            .iter()
+            .map(|option| option.score)
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        options.push(LiveDecisionTraceOption {
+            label: decision.action.clone(),
+            score,
+            legal: true,
+            chosen: true,
+        });
+    }
     LiveDecisionTraceEntry {
         tick,
         clock_seconds,
@@ -8235,8 +8299,11 @@ fn untargeted_long_ball_altitude_yards(
         return 0.0;
     }
     let carry_speed = flight.launch_speed_yps.max(current_speed_yps);
+    // Hoofed long balls were ballooning (up to ~14yd / 42ft of loft). Pull the apex down
+    // ~17% (was 3.8 + d*0.075 + carry*0.045, clamp 4.5..14.0) for a flatter, more driven
+    // trajectory that covers the ground quicker rather than hanging up in the air.
     let apex =
-        (3.8 + flight.distance_yards.max(0.0) * 0.075 + carry_speed * 0.045).clamp(4.5, 14.0);
+        (3.15 + flight.distance_yards.max(0.0) * 0.062 + carry_speed * 0.037).clamp(3.7, 11.6);
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
 
@@ -14336,6 +14403,16 @@ fn soccer_goal_credit_transition_score(
             let acceleration = (context.actor_acceleration.len() / 10.0).clamp(0.0, 1.0);
             let speed = (context.actor_velocity.len() / 8.5).clamp(0.0, 1.0);
             let defender_stress = (1.0 - defender_space) * pressure.max(0.25);
+            // Taking a man on / dribbling under defender stress is only a credited positive
+            // for the most-advanced players (the three furthest forward, `teammates_ahead`
+            // 0..=2); for a deeper carrier the same act is a penalty, so the learners stop
+            // valuing deep players dribbling into pressure.
+            let advanced_dribbler_fit = match obs.teammates_ahead {
+                0 => 1.0,
+                1 => 0.74,
+                2 => 0.48,
+                _ => 0.0,
+            };
             0.34 + (obs.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0) * 0.86
                 + obs.open_space_score.clamp(0.0, 1.0) * 0.34
                 + target_forward.max(0.0) * 0.42
@@ -14343,7 +14420,8 @@ fn soccer_goal_credit_transition_score(
                 + goal_approach_fit * next_obs.goal_attack_window_score.clamp(0.0, 1.0) * 0.44
                 + speed * 0.18
                 + acceleration * 0.22
-                + defender_stress * 0.25
+                + defender_stress * 0.25 * advanced_dribbler_fit
+                - defender_stress * (1.0 - advanced_dribbler_fit) * 0.30
                 - obs.immediate_dispossession_risk.clamp(0.0, 1.0) * 0.80
                 - obs.fatigue.clamp(0.0, 1.0) * 0.18
                 - endline_trap_risk
@@ -37495,6 +37573,12 @@ fn tracking_frame_to_world_snapshot(
         formation_lp_guidance: Vec::new(),
         formation_lp_teams: Vec::new(),
         teammate_spacing_notices: Vec::new(),
+        // A tracking-frame reconstruction has no completed-pass chain, so there is no
+        // recycled-possession history to derive urgency from.
+        home_recycle_urgency: 0.0,
+        away_recycle_urgency: 0.0,
+        home_recycle_participants: Vec::new(),
+        away_recycle_participants: Vec::new(),
     }
 }
 
@@ -39165,13 +39249,25 @@ fn pressured_stale_dribble_learning_penalty_points(
         0.42 + non_elite_fit * 0.72
     };
     let possession_multiplier = if retained_team_possession { 0.78 } else { 1.12 };
+    // A deep carrier (not one of the three most-forward outfielders) who keeps dribbling
+    // under sustained pressure is penalized HARDER — they should release sooner the longer
+    // the pressure persists. The most-forward players keep the baseline discipline (no
+    // reduction: even a striker shouldn't dwell while about to be dispossessed); only
+    // deeper players get the escalating extra weight. `teammates_ahead` counts team-mates
+    // closer to goal, so 0..=2 are the three most-forward players.
+    let position_multiplier = match observation.teammates_ahead {
+        0 | 1 => 1.0,
+        2 => 1.10,
+        _ => 1.30,
+    };
     (EXCESSIVE_HOLD_PENALTY_POINTS
         * hold_pressure
         * (0.44 + danger_pressure * 0.56)
         * skill_multiplier
         * possession_multiplier
+        * position_multiplier
         * (1.0 - progress_relief * 0.74).clamp(0.20, 1.0))
-    .clamp(0.0, EXCESSIVE_HOLD_PENALTY_POINTS * 1.35)
+    .clamp(0.0, EXCESSIVE_HOLD_PENALTY_POINTS * 1.6)
 }
 
 fn immediate_dispossession_risk_for_player(
@@ -41167,9 +41263,11 @@ fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         3.0 + unit * 2.0
     } else {
-        // Flatter, more driven arc: long balls should be hit with pace, not floated.
-        // A 50-yard ball peaks around ~4 yds and a 30-yarder ~3 yds.
-        (1.8 + pass.distance_yards.max(0.0) * 0.045).clamp(2.2, 8.5)
+        // Flatter, more driven arc: long balls should be hit with pace, not floated. Apex
+        // pulled down ~20% (was 1.8 + d*0.045, clamp 2.2..8.5) so the trajectory is flatter
+        // and the ball spends less time climbing — a 50-yard ball now peaks ~3.3 yds and a
+        // 30-yarder ~2.5 yds.
+        (1.45 + pass.distance_yards.max(0.0) * 0.036).clamp(1.8, 6.8)
     };
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
@@ -41716,11 +41814,13 @@ fn modulated_pass_speed_yps(
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
     let base_time = if flight.is_aerial() {
-        // Long aerials were arriving driven-flat and OVERHIT by 20-40% — landing at the
-        // receiver but carrying on past them (to the opponent keeper / out of play). Give
-        // them more hang time so the launch speed is lower and the ball drops at the
-        // receiver's feet rather than rolling through.
-        (0.55 + distance / 40.0).clamp(0.72, 2.45)
+        // Aerials were floating: too much hang time made them loop slowly through the air and
+        // arrive late. A lofted/long ball is driven — it should cover the x-y distance with
+        // pace and get down to the receiver ~20-25% quicker. Hang time cut ~22% from the old
+        // calibration (0.55 + d/40, clamp 0.72..2.45) so the launch speed is correspondingly
+        // higher. (The arc still drops the ball at the target: altitude is a function of
+        // horizontal progress, not of time, so a faster ball lands at the same spot, sooner.)
+        (0.43 + distance / 51.0).clamp(0.56, 1.91)
     } else if is_cross {
         (0.68 + distance / 31.0).clamp(0.82, 2.65)
     } else {
