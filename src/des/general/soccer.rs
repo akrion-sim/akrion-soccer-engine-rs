@@ -2027,7 +2027,10 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.
-const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 10_000;
+// 5ms is the realtime target: the sparse interior-point solve comes in well under
+// it in optimized builds, so this is a guardrail against pathological ticks, not
+// the common case (see `formation_lp_ipm_solves_under_five_milliseconds`).
+const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 5_000;
 const SOCCER_FORMATION_LP_MIN_ITER: usize = 800;
 const SOCCER_FORMATION_LP_ITER_RECOVER_STEP: usize = 1_500;
 // Consecutive over-budget solves before the circuit trips to the heuristic fallback.
