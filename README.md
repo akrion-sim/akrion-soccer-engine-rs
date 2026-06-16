@@ -52,6 +52,8 @@ or unset, is **off**.
 | `DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP` | Disable the defensive line push-up. |
 | `DD_SOCCER_DISABLE_FORMATION_STAGGER` | Disable formation staggering. |
 | `SOCCER_FORMATION_LP_INTERNAL_SIMPLEX` | Run the exact per-tick formation solve (Clarabel interior-point). **Default OFF**: the realtime tick skips the solve and uses a fast heuristic-anchor fallback. (Name is a fossil — the enabled solver is Clarabel/IPM, not a simplex.) |
+| `LP_SOLVER` | Override the soccer-rotation LP-relaxation backend. When unset, the rotation policy tries local HiGHS dual simplex first and falls back to the internal simplex if the fast path is unavailable. |
+| `MIP_LP_ALGO` / `MIP_ALLOW_EXTERNAL_SOLVERS` | Select the IP/MIP LP-relaxation backend. The rotation demo defaults to `auto` with external solvers allowed; set `MIP_ALLOW_EXTERNAL_SOLVERS=0` to force in-house fallback behavior. |
 | `SOCCER_LP_DEBUG` / `SOCCER_SHOW_LP_BOUND` / `SOCCER_GOAL_DEBUG` | Extra LP / goal diagnostics. |
 
 ### Learning / Postgres / artifacts

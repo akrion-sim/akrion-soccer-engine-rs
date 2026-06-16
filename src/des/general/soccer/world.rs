@@ -7,6 +7,8 @@
 use super::*;
 use crate::des::general::soccer_genome::SoccerTeamGenome;
 
+const SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE: f64 = 2.0;
+
 pub struct SoccerMatch {
     pub config: MatchConfig,
     pub tick: u64,
@@ -153,6 +155,7 @@ pub struct SoccerMatch {
     pub(crate) teammate_spacing_yield: HashMap<usize, usize>,
     pub(crate) defensive_clear_hold_trackers: HashMap<Team, DefensiveClearAndHoldTracker>,
     pub(crate) adversarial_moment_memory: VecDeque<SoccerMomentWindow>,
+    pub(crate) retrieved_action_prior_cache: std::cell::RefCell<SoccerRetrievedActionPriorCache>,
     pub(crate) last_agent_schedule: Vec<AgentScheduleEntry>,
     pub(crate) controller_yield_stats: ControllerYieldStats,
     pub(crate) step_timing_stats: SoccerStepTimingStats,
@@ -302,6 +305,66 @@ pub(crate) enum SoccerPlayerDecisionTimingContext {
     Loose,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SoccerRetrievedActionPriorCacheSlot {
+    loaded: bool,
+    priors: Option<HashMap<String, f64>>,
+}
+
+impl SoccerRetrievedActionPriorCacheSlot {
+    fn get(&self) -> Option<Option<HashMap<String, f64>>> {
+        self.loaded.then(|| self.priors.clone())
+    }
+
+    fn store(&mut self, priors: Option<HashMap<String, f64>>) {
+        self.loaded = true;
+        self.priors = priors;
+    }
+
+    fn clear(&mut self) {
+        self.loaded = false;
+        self.priors = None;
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SoccerRetrievedActionPriorCache {
+    tick: Option<u64>,
+    home: SoccerRetrievedActionPriorCacheSlot,
+    away: SoccerRetrievedActionPriorCacheSlot,
+}
+
+impl SoccerRetrievedActionPriorCache {
+    fn reset_for_tick(&mut self, tick: u64) {
+        if self.tick == Some(tick) {
+            return;
+        }
+        self.tick = Some(tick);
+        self.home.clear();
+        self.away.clear();
+    }
+
+    fn slot(&self, team: Team) -> &SoccerRetrievedActionPriorCacheSlot {
+        match team {
+            Team::Home => &self.home,
+            Team::Away => &self.away,
+        }
+    }
+
+    fn slot_mut(&mut self, team: Team) -> &mut SoccerRetrievedActionPriorCacheSlot {
+        match team {
+            Team::Home => &mut self.home,
+            Team::Away => &mut self.away,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tick = None;
+        self.home.clear();
+        self.away.clear();
+    }
+}
+
 impl SoccerStepTimingStats {
     fn record(&mut self, sample: SoccerStepTimingStats) {
         self.ticks = self.ticks.saturating_add(sample.ticks);
@@ -389,6 +452,286 @@ impl SoccerStepTimingStats {
         } else {
             0.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieved_action_priors_use_matching_whole_field_moment_shapes() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        assert_eq!(
+            feature_vector.len(),
+            SOCCER_MOMENT_FEATURE_FRAME_SAMPLES * SOCCER_MOMENT_FEATURES_PER_FRAME
+        );
+
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+        let summary = SoccerMomentSummary {
+            id: "matching-shape-pass".to_string(),
+            label: "current_shape".to_string(),
+            team: Team::Home,
+            player_id: Some(0),
+            event_tick: sim.tick,
+            start_tick: sim.tick,
+            end_tick: sim.tick,
+            goal_delta_ticks: 0,
+            frame_count: 1,
+            action_count: 1,
+            feature_vector_len: feature_vector.len(),
+            bucket,
+        };
+        sim.remember_adversarial_moment_window(SoccerMomentWindow {
+            summary,
+            actions: vec![SoccerMomentActionMarker {
+                tick: sim.tick,
+                player_id: 0,
+                action: "pass".to_string(),
+                target_player: Some(1),
+                reward: SOCCER_MOMENT_REPLAY_PASS_REWARD,
+            }],
+            frames: vec![frame],
+            embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+            feature_vector,
+        });
+
+        let priors = sim
+            .retrieved_action_priors_for_team(Team::Home)
+            .expect("matching moment should produce action priors");
+        assert!(
+            priors.get("pass").copied().unwrap_or(0.0) > 0.0,
+            "matched 22-player-plus-ball shape should reward the retrieved pass action: {priors:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_action_priors_scan_beyond_first_three_matching_moments() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+
+        for idx in 0..4 {
+            let action = if idx == 3 { "shoot" } else { "hold" };
+            sim.remember_adversarial_moment_window(SoccerMomentWindow {
+                summary: SoccerMomentSummary {
+                    id: format!("matching-shape-{idx:02}-{action}"),
+                    label: "current_shape".to_string(),
+                    team: Team::Home,
+                    player_id: Some(0),
+                    event_tick: sim.tick,
+                    start_tick: sim.tick,
+                    end_tick: sim.tick,
+                    goal_delta_ticks: 0,
+                    frame_count: 1,
+                    action_count: 1,
+                    feature_vector_len: feature_vector.len(),
+                    bucket: bucket.clone(),
+                },
+                actions: vec![SoccerMomentActionMarker {
+                    tick: sim.tick,
+                    player_id: 0,
+                    action: action.to_string(),
+                    target_player: None,
+                    reward: SOCCER_MOMENT_REPLAY_SHOT_REWARD,
+                }],
+                frames: vec![frame.clone()],
+                embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+                feature_vector: feature_vector.clone(),
+            });
+        }
+
+        let priors = sim
+            .retrieved_action_priors_for_team(Team::Home)
+            .expect("matching moments should produce action priors");
+        assert!(
+            priors.get("shoot").copied().unwrap_or(0.0) > 0.0,
+            "top-100 decision memory should include the fourth matching action: {priors:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_action_priors_do_not_survive_same_tick_disable() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+        sim.remember_adversarial_moment_window(SoccerMomentWindow {
+            summary: SoccerMomentSummary {
+                id: "matching-shape-pass".to_string(),
+                label: "current_shape".to_string(),
+                team: Team::Home,
+                player_id: Some(0),
+                event_tick: sim.tick,
+                start_tick: sim.tick,
+                end_tick: sim.tick,
+                goal_delta_ticks: 0,
+                frame_count: 1,
+                action_count: 1,
+                feature_vector_len: feature_vector.len(),
+                bucket,
+            },
+            actions: vec![SoccerMomentActionMarker {
+                tick: sim.tick,
+                player_id: 0,
+                action: "pass".to_string(),
+                target_player: Some(1),
+                reward: SOCCER_MOMENT_REPLAY_PASS_REWARD,
+            }],
+            frames: vec![frame],
+            embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+            feature_vector,
+        });
+
+        assert!(sim.retrieved_action_priors_for_team(Team::Home).is_some());
+        sim.config.adversarial_embedding_exploitation_enabled = false;
+        assert!(
+            sim.retrieved_action_priors_for_team(Team::Home).is_none(),
+            "same-tick runtime disable must not reuse cached retrieval priors"
+        );
+    }
+
+    #[test]
+    fn retrieved_action_priors_do_not_survive_zero_memory_limit() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+        sim.remember_adversarial_moment_window(SoccerMomentWindow {
+            summary: SoccerMomentSummary {
+                id: "matching-shape-memory-limit".to_string(),
+                label: "current_shape".to_string(),
+                team: Team::Home,
+                player_id: Some(0),
+                event_tick: sim.tick,
+                start_tick: sim.tick,
+                end_tick: sim.tick,
+                goal_delta_ticks: 0,
+                frame_count: 1,
+                action_count: 1,
+                feature_vector_len: feature_vector.len(),
+                bucket,
+            },
+            actions: vec![SoccerMomentActionMarker {
+                tick: sim.tick,
+                player_id: 0,
+                action: "pass".to_string(),
+                target_player: Some(1),
+                reward: SOCCER_MOMENT_REPLAY_PASS_REWARD,
+            }],
+            frames: vec![frame],
+            embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+            feature_vector,
+        });
+
+        assert!(sim.retrieved_action_priors_for_team(Team::Home).is_some());
+        sim.config.adversarial_embedding_memory_limit = 0;
+        assert!(
+            sim.retrieved_action_priors_for_team(Team::Home).is_none(),
+            "same-tick zero memory limit must not reuse cached retrieval priors"
+        );
+    }
+
+    #[test]
+    fn adversarial_moment_memory_replaces_duplicate_ids_for_action_priors() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+        let summary = SoccerMomentSummary {
+            id: "duplicate-shape".to_string(),
+            label: "current_shape".to_string(),
+            team: Team::Home,
+            player_id: Some(0),
+            event_tick: sim.tick,
+            start_tick: sim.tick,
+            end_tick: sim.tick,
+            goal_delta_ticks: 0,
+            frame_count: 1,
+            action_count: 1,
+            feature_vector_len: feature_vector.len(),
+            bucket,
+        };
+
+        for (action, reward) in [
+            ("pass", SOCCER_MOMENT_REPLAY_PASS_REWARD),
+            ("shoot", SOCCER_MOMENT_REPLAY_SHOT_REWARD),
+        ] {
+            sim.remember_adversarial_moment_window(SoccerMomentWindow {
+                summary: summary.clone(),
+                actions: vec![SoccerMomentActionMarker {
+                    tick: sim.tick,
+                    player_id: 0,
+                    action: action.to_string(),
+                    target_player: None,
+                    reward,
+                }],
+                frames: vec![frame.clone()],
+                embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+                feature_vector: feature_vector.clone(),
+            });
+        }
+
+        assert_eq!(sim.adversarial_moment_memory_len(), 1);
+        let priors = sim
+            .retrieved_action_priors_for_team(Team::Home)
+            .expect("newer duplicate moment should produce action priors");
+        assert!(
+            priors.get("shoot").copied().unwrap_or(0.0) > 0.0,
+            "newer duplicate moment should replace the stale action: {priors:?}"
+        );
+        assert!(
+            !priors.contains_key("pass"),
+            "stale duplicate action should not survive replacement: {priors:?}"
+        );
+    }
+
+    #[test]
+    fn retrieved_action_priors_ignore_non_finite_rewards() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
+        let frame = tracking_frame_from_match(&sim);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), Team::Home, &sim.config);
+        let bucket = soccer_moment_bucket_key("current_shape", Team::Home, &frame, &sim.config);
+        sim.remember_adversarial_moment_window(SoccerMomentWindow {
+            summary: SoccerMomentSummary {
+                id: "matching-shape-bad-reward".to_string(),
+                label: "current_shape".to_string(),
+                team: Team::Home,
+                player_id: Some(0),
+                event_tick: sim.tick,
+                start_tick: sim.tick,
+                end_tick: sim.tick,
+                goal_delta_ticks: 0,
+                frame_count: 1,
+                action_count: 1,
+                feature_vector_len: feature_vector.len(),
+                bucket,
+            },
+            actions: vec![SoccerMomentActionMarker {
+                tick: sim.tick,
+                player_id: 0,
+                action: "pass".to_string(),
+                target_player: Some(1),
+                reward: f64::NAN,
+            }],
+            frames: vec![frame],
+            embedder_version: SOCCER_MOMENT_EMBEDDER_VERSION.to_string(),
+            feature_vector,
+        });
+
+        assert!(
+            sim.retrieved_action_priors_for_team(Team::Home).is_none(),
+            "non-finite historical rewards must not become neutral retrieval priors"
+        );
     }
 }
 
@@ -585,6 +928,9 @@ impl SoccerMatch {
             teammate_spacing_yield: HashMap::new(),
             defensive_clear_hold_trackers: HashMap::new(),
             adversarial_moment_memory: VecDeque::new(),
+            retrieved_action_prior_cache: std::cell::RefCell::new(
+                SoccerRetrievedActionPriorCache::default(),
+            ),
             last_agent_schedule: Vec::new(),
             controller_yield_stats: ControllerYieldStats::default(),
             step_timing_stats: SoccerStepTimingStats::default(),
@@ -832,7 +1178,11 @@ impl SoccerMatch {
             return;
         }
         let limit = self.sanitized_adversarial_moment_memory_limit();
+        let moment_id = window.summary.id.trim();
         if limit == 0 || window.feature_vector.is_empty() {
+            return;
+        }
+        if moment_id.is_empty() {
             return;
         }
         if window.embedder_version != SOCCER_MOMENT_EMBEDDER_VERSION
@@ -840,10 +1190,13 @@ impl SoccerMatch {
         {
             return;
         }
+        self.adversarial_moment_memory
+            .retain(|existing| existing.summary.id.trim() != moment_id);
         self.adversarial_moment_memory.push_back(window);
         while self.adversarial_moment_memory.len() > limit {
             self.adversarial_moment_memory.pop_front();
         }
+        self.retrieved_action_prior_cache.get_mut().clear();
     }
 
     fn remember_adversarial_moment_records(&mut self, records: &[SoccerMomentStorageRecord]) {
@@ -855,6 +1208,7 @@ impl SoccerMatch {
     fn adversarial_embedding_exploitation_active(&self) -> bool {
         self.config.learning_enabled
             && self.config.adversarial_embedding_exploitation_enabled
+            && self.sanitized_adversarial_moment_memory_limit() > 0
             && !self.adversarial_moment_memory.is_empty()
     }
 
@@ -920,6 +1274,97 @@ impl SoccerMatch {
         } else {
             Some(signals)
         }
+    }
+
+    fn retrieved_action_priors_for_team(&self, team: Team) -> Option<HashMap<String, f64>> {
+        if !self.adversarial_embedding_exploitation_active() {
+            self.retrieved_action_prior_cache.borrow_mut().clear();
+            return None;
+        }
+
+        let tick = self.tick;
+        if let Some(priors) = {
+            let mut cache = self.retrieved_action_prior_cache.borrow_mut();
+            cache.reset_for_tick(tick);
+            cache.slot(team).get()
+        } {
+            return priors;
+        }
+
+        let priors = self.compute_retrieved_action_priors_for_team(team);
+        {
+            let mut cache = self.retrieved_action_prior_cache.borrow_mut();
+            cache.reset_for_tick(tick);
+            cache.slot_mut(team).store(priors.clone());
+        }
+        priors
+    }
+
+    fn compute_retrieved_action_priors_for_team(&self, team: Team) -> Option<HashMap<String, f64>> {
+        let index =
+            SoccerMomentVectorIndex::from_window_iter(self.adversarial_moment_memory.iter());
+        if index.status().entries == 0 {
+            return None;
+        }
+
+        let frame = tracking_frame_from_match(self);
+        let feature_vector =
+            soccer_moment_feature_vector(std::slice::from_ref(&frame), team, &self.config);
+        if feature_vector.is_empty() {
+            return None;
+        }
+        let bucket = soccer_moment_bucket_key("current_shape", team, &frame, &self.config);
+        let response = index.search(&SoccerMomentIndexSearchRequest {
+            bucket,
+            feature_vector,
+            limit: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_SEARCH_LIMIT,
+            max_candidates: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_MAX_CANDIDATES
+                .min(self.adversarial_moment_memory.len().max(1)),
+            bucket_radius: ADVERSARIAL_EMBEDDING_BUCKET_RADIUS,
+            same_label_only: false,
+        });
+
+        let mut weighted: HashMap<String, (f64, f64)> = HashMap::new();
+        for hit in response.results {
+            if hit.score < ADVERSARIAL_EMBEDDING_MIN_SCORE {
+                continue;
+            }
+            let similarity = ((hit.score - ADVERSARIAL_EMBEDDING_MIN_SCORE)
+                / (1.0 - ADVERSARIAL_EMBEDDING_MIN_SCORE))
+                .clamp(0.0, 1.0) as f64;
+            if similarity <= 1e-9 {
+                continue;
+            }
+            let Some(window) = self
+                .adversarial_moment_memory
+                .iter()
+                .find(|window| window.summary.id == hit.summary.id)
+            else {
+                continue;
+            };
+            for marker in &window.actions {
+                let action = normalize_soccer_action_label(&marker.action).to_string();
+                if action.is_empty() {
+                    continue;
+                }
+                if !marker.reward.is_finite() {
+                    continue;
+                }
+                let outcome = (marker.reward / SOCCER_MOMENT_REPLAY_SHOT_REWARD).clamp(-1.0, 1.0);
+                let entry = weighted.entry(action).or_insert((0.0, 0.0));
+                entry.0 += similarity * outcome;
+                entry.1 += similarity;
+            }
+        }
+
+        let priors = weighted
+            .into_iter()
+            .filter_map(|(action, (sum, weight))| {
+                (weight > 1e-9)
+                    .then_some((action, (sum / weight) * SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE))
+            })
+            .collect::<HashMap<_, _>>();
+        (!priors.is_empty()).then_some(priors)
     }
 
     /// NN → LP coupling. Scores each team's most-recent transition with the
@@ -1747,6 +2192,9 @@ impl SoccerMatch {
         request: SoccerLearningRuntimeRequest,
     ) -> Result<SoccerLearningRuntimeResponse, String> {
         if let Some(enabled) = request.learning_enabled {
+            if self.config.learning_enabled != enabled {
+                self.retrieved_action_prior_cache.get_mut().clear();
+            }
             self.config.learning_enabled = enabled;
             if !enabled {
                 self.config.neural_learning.enabled = false;
@@ -1928,23 +2376,35 @@ impl SoccerMatch {
     ) -> Option<String> {
         let blend = self.neural_blend;
         let value_active = blend.mode != SoccerNeuralBlendMode::Off;
-        let actor_active = blend.actor_critic && self.policy_head.is_some();
-        if !value_active && !actor_active {
+        let actor_requested = blend.actor_critic && self.policy_head.is_some();
+        let retrieval_priors = self.retrieved_action_priors_for_team(team);
+        let retrieval_active = retrieval_priors
+            .as_ref()
+            .is_some_and(|priors| !priors.is_empty());
+        if !value_active && !actor_requested && !retrieval_active {
             return None;
         }
-        // Decisions are scored by the deciding player's own team brain.
-        let learner = self.neural_learner_for(team)?;
-        if !learner.has_prediction_network() {
-            return None;
-        }
+        // Decisions are scored by the deciding player's own team brain. Retrieval
+        // can still rerank tabular candidates before the neural learner is warm.
+        let learner = if value_active || actor_requested {
+            self.neural_learner_for(team)
+                .filter(|learner| learner.has_prediction_network())
+        } else {
+            None
+        };
+        let actor_active = actor_requested && learner.is_some();
         // Value-blend weight (ramped); 0 when the value blend is off or still cold.
         let lambda = if value_active {
-            blend.effective_lambda(learner.training_steps(), learner.average_loss())
+            learner
+                .map(|learner| {
+                    blend.effective_lambda(learner.training_steps(), learner.average_loss())
+                })
+                .unwrap_or(0.0)
         } else {
             0.0
         };
-        if lambda <= 0.0 && !actor_active {
-            // Value head not ready and no actor — let the tabular path decide.
+        if lambda <= 0.0 && !actor_active && !retrieval_active {
+            // Value head not ready and no actor/retrieval prior: let tabular decide.
             return None;
         }
         let (_state, ranked) = policy.ranked_action_values_for_snapshot(
@@ -1991,6 +2451,7 @@ impl SoccerMatch {
         };
 
         let mut neural_q = |label: &str| -> Option<f64> {
+            let learner = learner?;
             base.action = label.to_string();
             let features = soccer_neural_transition_features(&base);
             learner.predict_value(&features).map(|v| v * target_scale)
@@ -2003,6 +2464,13 @@ impl SoccerMatch {
                     .unwrap_or(0.0),
                 None => 0.0,
             }
+        };
+        let retrieval_bonus = |label: &str| -> f64 {
+            retrieval_priors
+                .as_ref()
+                .and_then(|priors| priors.get(normalize_soccer_action_label(label)))
+                .copied()
+                .unwrap_or(0.0)
         };
 
         let mut best_label: Option<&str> = None;
@@ -2033,7 +2501,8 @@ impl SoccerMatch {
                 }
             };
             // Actor bias: nudge toward the family the learned policy prefers.
-            let score = value_score + policy_bonus(&candidate.label);
+            let score =
+                value_score + policy_bonus(&candidate.label) + retrieval_bonus(&candidate.label);
             if score > best_score {
                 best_score = score;
                 best_label = Some(candidate.label.as_str());

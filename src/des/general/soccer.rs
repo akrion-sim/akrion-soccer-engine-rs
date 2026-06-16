@@ -2055,6 +2055,8 @@ const DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT: usize = 64;
 const MAX_ADVERSARIAL_MOMENT_MEMORY_LIMIT: usize = 512;
 const ADVERSARIAL_EMBEDDING_SEARCH_LIMIT: usize = 3;
 const ADVERSARIAL_EMBEDDING_MAX_CANDIDATES: usize = 96;
+const ADVERSARIAL_EMBEDDING_ACTION_PRIOR_SEARCH_LIMIT: usize = 100;
+const ADVERSARIAL_EMBEDDING_ACTION_PRIOR_MAX_CANDIDATES: usize = 512;
 const ADVERSARIAL_EMBEDDING_BUCKET_RADIUS: u32 = 8;
 const ADVERSARIAL_EMBEDDING_MIN_SCORE: f32 = 0.72;
 const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
@@ -2426,7 +2428,7 @@ fn default_soccer_neural_target_scale() -> f64 {
 }
 
 fn default_moment_vector_search_k() -> usize {
-    5
+    100
 }
 
 fn default_moment_vector_search_include_recent() -> bool {
@@ -11481,6 +11483,12 @@ impl MatchConfig {
                 mode: SoccerNeuralBlendMode::Additive,
                 actor_critic: true,
                 ..SoccerNeuralBlendConfig::default()
+            },
+            mpc: SoccerMpcConfig {
+                tier2_player_enabled: true,
+                reconcile_enabled: true,
+                field_aware_enabled: true,
+                ..SoccerMpcConfig::default()
             },
             adversarial_embedding_exploitation_enabled: true,
             max_human_players: 4,
@@ -24836,9 +24844,9 @@ pub struct SoccerMomentIndexSearchRequest {
 impl SoccerMomentIndexSearchRequest {
     fn limit(&self) -> usize {
         if self.limit == 0 {
-            5
+            100
         } else {
-            self.limit.min(50)
+            self.limit.min(100)
         }
     }
 
@@ -25905,9 +25913,11 @@ impl Default for SoccerLiveServerConfig {
         // Keep the formation-LP brain on for the live demo: it solves the
         // whole-field configuration (all players + ball) each tick and feeds its
         // per-player guidance into the observation/neural features, which is the
-        // context the MDP/neural policy needs to make better decisions.
+        // context the MDP/neural policy needs to make better decisions. Keep the
+        // whole-field vector-search path enabled too; it stays inert until moment
+        // memory is loaded, then acts as a bounded action prior for matching shapes.
         match_config.formation_lp_enabled = true;
-        match_config.adversarial_embedding_exploitation_enabled = false;
+        match_config.adversarial_embedding_exploitation_enabled = true;
         SoccerLiveServerConfig {
             host: "127.0.0.1".to_string(),
             port: 5055,
@@ -26393,7 +26403,7 @@ fn soccer_moment_vector_search_k(k: usize) -> usize {
     if k == 0 {
         default_moment_vector_search_k()
     } else {
-        k.min(50)
+        k.min(100)
     }
 }
 

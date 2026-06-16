@@ -43,7 +43,9 @@ use crate::des::general::ip_mip_des::{
     solve_ipmip_with_des, BranchRule, ConcreteLpRelaxationAlgorithm, ConstraintNode, IPMIPProblem,
     IPMIPSolution, IPMIPSolveOptions, LpRelaxationAlgorithm, NodeSelection, VariableNode,
 };
-use crate::des::general::lp::{solve_lp, LPProblem, LPStatus, LpSolverOptions, Sense};
+use crate::des::general::lp::{
+    solve_lp, solve_lp_external, ExternalSolverOptions, LPProblem, LPStatus, LpSolverOptions, Sense,
+};
 use crate::des::general::prng::mulberry32;
 use crate::des::shared::capabilities::RandomSource;
 use crate::des::shared::transform::Transform;
@@ -1674,10 +1676,45 @@ impl<'a> Transform<&'a SoccerProblem, LPRelaxedScheduleResult> for PolicyLPRelax
     }
 }
 
+fn solve_soccer_rotation_lp(lp: &LPProblem) -> crate::des::general::lp::LPSolution {
+    if std::env::var("LP_SOLVER")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return solve_lp(lp, &LpSolverOptions::default());
+    }
+
+    let fast = solve_lp_external(
+        lp,
+        &ExternalSolverOptions {
+            method: Some("highs-ds".to_string()),
+            ..Default::default()
+        },
+    );
+    if fast.status == LPStatus::Optimal {
+        return fast;
+    }
+
+    let mut fallback = solve_lp(lp, &LpSolverOptions::default());
+    let fast_message = fast
+        .message
+        .unwrap_or_else(|| fast.status.as_str().to_string());
+    let prefix = fallback
+        .message
+        .take()
+        .map(|message| format!("{message}; "))
+        .unwrap_or_default();
+    fallback.message = Some(format!(
+        "{prefix}highs-ds fast path unavailable, fell back to {}: {fast_message}",
+        fallback.solver
+    ));
+    fallback
+}
+
 /// Solve the LP relaxation and round it with fairness-aware per-period Hungarian.
 pub fn policy_lp_relaxed(problem: &SoccerProblem) -> LPRelaxedScheduleResult {
     let lp = build_soccer_lp(problem);
-    let sol = solve_lp(&lp, &LpSolverOptions::default());
+    let sol = solve_soccer_rotation_lp(&lp);
     if sol.status != LPStatus::Optimal {
         panic!(
             "soccer LP relaxation failed: {} — {}",
@@ -2524,6 +2561,7 @@ pub struct SoccerIPMIPPolicyOptions {
     pub max_ticks: Option<usize>,
     pub lp_max_iters: Option<usize>,
     pub lp_algorithm: Option<LpRelaxationAlgorithm>,
+    pub allow_external_solvers: Option<bool>,
     pub max_cut_rounds: Option<usize>,
     pub node_selection: Option<NodeSelection>,
     pub branch_rule: Option<BranchRule>,
@@ -2562,6 +2600,17 @@ impl<'a> Transform<&'a SoccerProblem, SoccerIPMIPPolicyResult> for PolicyIPMIPFe
     }
 }
 
+fn soccer_lp_algorithm_uses_external(algorithm: LpRelaxationAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        LpRelaxationAlgorithm::Concrete(
+            ConcreteLpRelaxationAlgorithm::ExternalHighs
+                | ConcreteLpRelaxationAlgorithm::ExternalHighsDs
+                | ConcreteLpRelaxationAlgorithm::ExternalHighsIpm
+        )
+    )
+}
+
 /// Solve the rotation IP/MIP, decode an incumbent, falling back to the exact MDP.
 pub fn policy_ipmip_feasible(
     problem: &SoccerProblem,
@@ -2569,14 +2618,19 @@ pub fn policy_ipmip_feasible(
 ) -> SoccerIPMIPPolicyResult {
     let model = build_soccer_ipmip(problem);
     let max_nodes = opts.max_nodes.unwrap_or(5_000);
+    let lp_algorithm = opts.lp_algorithm.unwrap_or(LpRelaxationAlgorithm::Concrete(
+        ConcreteLpRelaxationAlgorithm::InternalSimplex,
+    ));
     let solver_options = IPMIPSolveOptions {
         time_limit_ms: Some(opts.time_limit_ms.unwrap_or(30_000.0)),
         max_nodes: Some(max_nodes),
         max_ticks: Some(opts.max_ticks.unwrap_or_else(|| 100.max(max_nodes * 8))),
         lp_max_iters: Some(opts.lp_max_iters.unwrap_or(6_000)),
-        lp_algorithm: Some(opts.lp_algorithm.unwrap_or(LpRelaxationAlgorithm::Concrete(
-            ConcreteLpRelaxationAlgorithm::InternalSimplex,
-        ))),
+        lp_algorithm: Some(lp_algorithm),
+        allow_external_solvers: Some(
+            opts.allow_external_solvers
+                .unwrap_or_else(|| soccer_lp_algorithm_uses_external(lp_algorithm)),
+        ),
         max_cut_rounds: Some(opts.max_cut_rounds.unwrap_or(0)),
         node_selection: Some(opts.node_selection.unwrap_or(NodeSelection::BestBound)),
         branch_rule: Some(opts.branch_rule.unwrap_or(BranchRule::MostFractional)),
