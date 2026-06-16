@@ -1985,6 +1985,9 @@ const SOCCER_POLICY_PROBABILITY_SUMMARY_SCAN_CAP: usize = 2500;
 // Beyond this it stops scanning (the best of a large bounded sample is plenty for a prior), so
 // the lookup is O(1)-bounded regardless of table size.
 const SOCCER_LEARNED_LOOKUP_SCAN_CAP: usize = 48;
+/// How many tabular candidates the retrieval prior re-ranks over. Small: the
+/// prior nudges among the policy's already-plausible actions, not the long tail.
+const SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT: usize = 12;
 // Long-match memory hygiene: when a team Q-table grows past the high-water mark,
 // slough the least-visited entries back down to the low-water mark (keeping the
 // most-visited, best-learned states). Hysteresis avoids pruning every step.
@@ -6532,6 +6535,59 @@ impl SoccerQPolicy {
         let state = SoccerQStateKey::from_parts(mdp_state, observation, player.team, player.role);
         self.best_action_filtered_hierarchical_relaxed(&state, |action| {
             learned_action_label_is_legal(action, snapshot, player_id)
+        })
+    }
+
+    /// As [`Self::best_action_for_state_observation`], but biased by a **retrieval
+    /// action prior** (action → bounded favourability), scaled by `weight`. The
+    /// chosen action is `argmax_a [ Q(s,a) + weight · prior(a) ]` over the legal
+    /// tabular candidates. When `prior` is `None`/empty or `weight == 0` this
+    /// delegates to the unbiased path verbatim, so play is byte-identical unless a
+    /// caller opts in. The prior only re-weights existing candidates — it never
+    /// introduces new actions, so it cannot perturb any RNG draw.
+    fn best_action_for_state_observation_with_prior(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+    ) -> Option<String> {
+        let Some((prior, weight)) = prior.filter(|(p, w)| !p.is_empty() && *w != 0.0) else {
+            return self
+                .best_action_for_state_observation(snapshot, player_id, mdp_state, observation);
+        };
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let state = SoccerQStateKey::from_parts(mdp_state, observation, player.team, player.role);
+        let ranked = self.ranked_action_values_filtered_hierarchical(
+            &state,
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT,
+            |action| learned_action_label_is_legal(action, snapshot, player_id),
+        );
+        let scored = ranked
+            .iter()
+            .filter(|candidate| candidate.legal)
+            .max_by(|a, b| {
+                let sa = a.value
+                    + weight
+                        * prior
+                            .get(normalize_soccer_action_label(&a.label))
+                            .copied()
+                            .unwrap_or(0.0);
+                let sb = b.value
+                    + weight
+                        * prior
+                            .get(normalize_soccer_action_label(&b.label))
+                            .copied()
+                            .unwrap_or(0.0);
+                sa.total_cmp(&sb).then_with(|| a.visits.cmp(&b.visits))
+            })
+            .map(|candidate| candidate.label.clone());
+        // If the exact-context scan found no legal candidate, fall back to the
+        // relaxed unbiased path so the prior never *loses* a decision the baseline
+        // would have made.
+        scored.or_else(|| {
+            self.best_action_for_state_observation(snapshot, player_id, mdp_state, observation)
         })
     }
 

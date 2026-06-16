@@ -339,6 +339,62 @@ pub struct SoccerConfigMomentInsert {
     pub features: Vec<f32>,
 }
 
+/// A feature-independent view of one retrieved neighbour, so the prior aggregator
+/// lives in the (PG-free) engine and the postgres-backed caller just maps its
+/// `SoccerConfigMomentNeighbor` rows into this shape.
+#[derive(Clone, Debug)]
+pub struct SoccerRetrievalNeighborView {
+    pub action: String,
+    /// Cosine distance to the live query (0 = identical … 2 = opposite).
+    pub distance: f64,
+    /// Discounted n-step outcome return stored with the neighbour.
+    pub nstep_return: f64,
+    /// Critic value of the neighbour, if any.
+    pub value: Option<f64>,
+}
+
+/// Reduce retrieved neighbours into a per-action **prior** over decisions: for each
+/// distinct action, a similarity-weighted average of how favourably that decision
+/// turned out in similar past configurations, squashed to `[-1, 1]`. This is the
+/// "look up matching moments, see what decisions were made and how they worked
+/// out, then bias toward the good ones" step. The result is later added (scaled by
+/// a bounded weight) to the policy's action values — it never introduces new
+/// candidate actions, so it cannot perturb RNG draws.
+pub fn soccer_retrieval_action_prior(
+    neighbors: &[SoccerRetrievalNeighborView],
+) -> std::collections::HashMap<String, f64> {
+    use std::collections::HashMap;
+    // (similarity-weighted favourability sum, weight sum) per action.
+    let mut acc: HashMap<String, (f64, f64)> = HashMap::new();
+    for n in neighbors {
+        let similarity = (1.0 - n.distance).clamp(0.0, 1.0);
+        if similarity <= f64::EPSILON {
+            continue;
+        }
+        // Outcome signal: prefer the realised n-step return, fall back to the
+        // critic value, then the immediate reward proxy embedded in the return.
+        let outcome = if n.nstep_return.is_finite() && n.nstep_return != 0.0 {
+            n.nstep_return
+        } else {
+            n.value.unwrap_or(0.0)
+        };
+        let favourability = outcome.tanh(); // squash to (-1, 1)
+        let action = normalize_soccer_action_label(&n.action).to_string();
+        let entry = acc.entry(action).or_insert((0.0, 0.0));
+        entry.0 += similarity * favourability;
+        entry.1 += similarity;
+    }
+    acc.into_iter()
+        .filter_map(|(action, (sum, weight))| {
+            if weight > 0.0 {
+                Some((action, (sum / weight).clamp(-1.0, 1.0)))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Cosine similarity between two raw config feature vectors (lengths may differ;
 /// the shorter is treated as zero-padded). Used to rank/aggregate retrieved
 /// neighbours by closeness to the live configuration.
@@ -519,6 +575,50 @@ mod tests {
             assert_eq!(m.features.len(), CONFIG_FEATURE_DIM);
             assert!(m.reward.is_finite() && m.nstep_return.is_finite());
             assert!(!m.action.is_empty());
+        }
+    }
+
+    #[test]
+    fn retrieval_action_prior_weights_favourable_decisions() {
+        let neighbors = vec![
+            // Very similar, decision worked out well → strong positive prior.
+            SoccerRetrievalNeighborView {
+                action: "shoot".to_string(),
+                distance: 0.02,
+                nstep_return: 3.0,
+                value: None,
+            },
+            // Very similar, same decision, also good → reinforces.
+            SoccerRetrievalNeighborView {
+                action: "shoot".to_string(),
+                distance: 0.05,
+                nstep_return: 2.0,
+                value: None,
+            },
+            // Similar, decision went badly → negative prior.
+            SoccerRetrievalNeighborView {
+                action: "pass-back".to_string(),
+                distance: 0.10,
+                nstep_return: -2.5,
+                value: None,
+            },
+            // Orthogonal (distance ≥ 1) → ignored.
+            SoccerRetrievalNeighborView {
+                action: "dribble".to_string(),
+                distance: 1.2,
+                nstep_return: 5.0,
+                value: None,
+            },
+        ];
+        let prior = soccer_retrieval_action_prior(&neighbors);
+        assert!(prior["shoot"] > 0.5, "favourable shoot prior: {:?}", prior);
+        assert!(prior["pass-back"] < 0.0, "bad outcome ⇒ negative prior");
+        assert!(
+            !prior.contains_key("dribble"),
+            "orthogonal neighbours contribute nothing"
+        );
+        for v in prior.values() {
+            assert!((-1.0..=1.0).contains(v), "prior stays bounded");
         }
     }
 

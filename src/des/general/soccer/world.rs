@@ -90,6 +90,12 @@ pub struct SoccerMatch {
     /// decision + n-step outcome in [`SoccerMatch::config_moments`]. Empty (zero
     /// cost) when capture is off.
     pub(crate) episode_config_captures: Vec<SoccerConfigCapture>,
+    /// Per-team retrieval action prior (action label → bounded favourability in
+    /// `[-1, 1]`), set by the retrieval consumer from neighbours of the current
+    /// configuration. Folded into the tabular action ranking, scaled by
+    /// `config.retrieval.prior_weight`, only when `decision_prior_enabled`. Empty
+    /// ⇒ no effect (byte-identical play). See [`SoccerMatch::set_retrieval_action_prior`].
+    pub(crate) retrieval_action_prior: HashMap<Team, HashMap<String, f64>>,
     pub(crate) full_game_learning_applied: bool,
     pub(crate) full_game_learning_replay_transitions: usize,
     pub(crate) possession_chain: VecDeque<usize>,
@@ -545,6 +551,7 @@ impl SoccerMatch {
             reward_events: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
+            retrieval_action_prior: HashMap::new(),
             full_game_learning_applied: false,
             full_game_learning_replay_transitions: 0,
             possession_chain,
@@ -1797,6 +1804,17 @@ impl SoccerMatch {
         observation: &SoccerPomdpObservation,
     ) -> Option<SoccerLearnedPlan> {
         let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        // Retrieval action prior for this player's team (empty/None unless the
+        // consumer installed one and `decision_prior_enabled`). `Option<(&map, w)>`
+        // is `Copy`, so the same prior is shared by both decision branches below.
+        let retrieval_prior = if self.config.retrieval.decision_prior_enabled {
+            self.retrieval_action_prior
+                .get(&player.team)
+                .filter(|map| !map.is_empty())
+                .map(|map| (map, self.config.retrieval.prior_weight))
+        } else {
+            None
+        };
         if let Some(team_policies) = &self.team_policies {
             let policy = team_policies.policy(player.team);
             if let Some(action) = self
@@ -1813,11 +1831,12 @@ impl SoccerMatch {
                     )
                 })
                 .or_else(|| {
-                    policy.best_action_for_state_observation(
+                    policy.best_action_for_state_observation_with_prior(
                         snapshot,
                         player_id,
                         mdp_state,
                         observation,
+                        retrieval_prior,
                     )
                 })
             {
@@ -1840,11 +1859,12 @@ impl SoccerMatch {
                 )
             })
             .or_else(|| {
-                learned_policy.best_action_for_state_observation(
+                learned_policy.best_action_for_state_observation_with_prior(
                     snapshot,
                     player_id,
                     mdp_state,
                     observation,
+                    retrieval_prior,
                 )
             })
             .map(|action| {
@@ -2477,6 +2497,33 @@ impl SoccerMatch {
     /// — the realised MDP value of their decision — so a retrieval consumer can
     /// rank neighbours by how the same decision actually worked out, not just by
     /// similarity.
+    /// Install (or clear) the per-team retrieval **action prior** — the result of
+    /// looking up neighbours of the current configuration and aggregating their
+    /// decisions/outcomes (see [`soccer_retrieval_action_prior`]). Takes effect
+    /// only while `config.retrieval.decision_prior_enabled`; an empty map clears
+    /// the team's prior. This is how the (postgres-backed) retrieval consumer
+    /// feeds "what worked in similar configs" into the live decision.
+    pub fn set_retrieval_action_prior(
+        &mut self,
+        team: Team,
+        prior: std::collections::HashMap<String, f64>,
+    ) {
+        if prior.is_empty() {
+            self.retrieval_action_prior.remove(&team);
+        } else {
+            self.retrieval_action_prior.insert(team, prior);
+        }
+    }
+
+    /// The canonical config **query embedding** for `team`'s current state — the
+    /// vector to feed `search_nearest_config_moments` ("find the N closest
+    /// configurations"). Built from a fresh snapshot, so the retrieval consumer
+    /// can call it at whatever cadence it chooses.
+    pub fn retrieval_query_embedding(&self, team: Team) -> Vec<f64> {
+        let snapshot = WorldSnapshot::from_match(self);
+        SoccerConfigVector::from_snapshot(&snapshot, team).embedding()
+    }
+
     pub fn config_moments(&self) -> Vec<SoccerConfigMomentInsert> {
         if self.episode_config_captures.is_empty() {
             return Vec::new();
