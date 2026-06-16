@@ -403,6 +403,14 @@ pub fn build_problem_from_request(req: &PlannerRequest) -> Result<SoccerProblem,
                 banned_positions[pl.id][*pos] = true;
             }
         }
+        for (score_idx, score) in pl.position_scores.iter().enumerate() {
+            if !score.is_finite() {
+                return Err(format!(
+                    "{} position score {score_idx} must be finite before LP/MDP planning",
+                    pl.name
+                ));
+            }
+        }
         for pos in 0..num_positions {
             let score = pl
                 .position_scores
@@ -431,6 +439,20 @@ pub fn build_problem_from_request(req: &PlannerRequest) -> Result<SoccerProblem,
         }
         if s.position >= num_positions || s.partner_position >= num_positions {
             return Err("synergy references an unknown position".into());
+        }
+        for (name, value) in [
+            ("scoreWith", Some(s.score_with)),
+            ("scoreWithout", Some(s.score_without)),
+            ("partnerScoreWith", s.partner_score_with),
+            ("partnerScoreWithout", s.partner_score_without),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "synergy {name} must be finite before LP/MDP planning"
+                    ));
+                }
+            }
         }
         synergy_rules.extend(synergy_to_rules(s));
     }
@@ -1578,5 +1600,27 @@ mod tests {
         req.max_subs_per_game = 140;
         let err = build_problem_from_request(&req).unwrap_err();
         assert!(err.contains("can count at most 119 substitutions"), "{err}");
+    }
+
+    #[test]
+    fn planner_rejects_non_finite_position_scores_before_lp_build() {
+        let mut req = default_planner_request();
+        req.players[0].position_scores[0] = f64::NAN;
+
+        let err = build_problem_from_request(&req).unwrap_err();
+
+        assert!(err.contains("position score"), "{err}");
+        assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn planner_rejects_non_finite_synergy_scores_before_lp_build() {
+        let mut req = default_planner_request();
+        req.synergies[0].score_with = f64::INFINITY;
+
+        let err = build_problem_from_request(&req).unwrap_err();
+
+        assert!(err.contains("synergy scoreWith"), "{err}");
+        assert!(err.contains("finite"), "{err}");
     }
 }

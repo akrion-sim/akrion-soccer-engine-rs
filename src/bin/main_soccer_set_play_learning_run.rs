@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Error as IoError, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,9 @@ use soccer_engine::des::soccer_learning::{
     soccer_neural_network_snapshot_fingerprint,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_policy_refresh_decision,
     soccer_tactical_learning_weights_fingerprint, soccer_team_q_policies_fingerprint,
-    SoccerPostgresPolicyRefreshCheck, SOCCER_POLICY_STATUS_ACTIVE,
+    validate_soccer_neural_learning_config_for_learning_run,
+    validate_soccer_q_policy_options_for_learning_run, SoccerPostgresPolicyRefreshCheck,
+    SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::SoccerLearningPgStore;
 
@@ -303,6 +305,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             SoccerNeuralLearningConfig::default().lp_coupling_enabled,
         )?,
     };
+    validate_soccer_neural_learning_config_for_learning_run(&config.neural_learning)
+        .map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
     let options = SoccerQPolicyOptions {
         alpha: env_parse("SOCCER_Q_ALPHA", SoccerQPolicyOptions::default().alpha)?,
         gamma: env_parse("SOCCER_Q_GAMMA", SoccerQPolicyOptions::default().gamma)?,
@@ -311,6 +315,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             SoccerQPolicyOptions::default().exploration_epsilon,
         )?,
     };
+    validate_soccer_q_policy_options_for_learning_run(&options)
+        .map_err(|err| IoError::new(ErrorKind::InvalidData, err))?;
 
     let mut pg_store = SoccerLearningPgStore::connect_from_env()?;
     let mut pg_experiment_id = None::<String>;

@@ -4321,7 +4321,8 @@ impl SoccerMatch {
                     // closest two teammates are deliberately sent to contest the SAME
                     // ball, and nudging the yielder away from its partner pushes it off
                     // the ball (the two then orbit it without either trapping it).
-                    let chasing_loose_ball = snapshot.is_committed_loose_ball_chaser(intent.player_id);
+                    let chasing_loose_ball =
+                        snapshot.is_committed_loose_ball_chaser(intent.player_id);
                     let intent = if dd_soccer_disable_spacing_nudge() || chasing_loose_ball {
                         intent
                     } else {
@@ -4536,8 +4537,7 @@ impl SoccerMatch {
                                 player_id: holder,
                                 team: carrier.team,
                                 role: carrier.role,
-                                action: normalize_soccer_action_label(&carrier.action)
-                                    .to_string(),
+                                action: normalize_soccer_action_label(&carrier.action).to_string(),
                                 features,
                             });
                         }
@@ -6883,8 +6883,10 @@ impl SoccerMatch {
             // Degenerate: standing on the ball — retreat toward own goal.
             Vec2::new(0.0, -self.players[player_id].team.attack_dir())
         };
-        let target = (spot + dir * radius)
-            .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
+        let target = (spot + dir * radius).clamp_to_pitch(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
         let player = &mut self.players[player_id];
         player.position = target;
         // Kill inward momentum so they hold at the line instead of drifting back in.
@@ -6940,8 +6942,10 @@ impl SoccerMatch {
                 Vec2::new(0.0, -self.players[player_id].team.attack_dir())
             }
         };
-        let target = (carrier_pos + dir * SHIELD_BODY_BARRIER_YARDS)
-            .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
+        let target = (carrier_pos + dir * SHIELD_BODY_BARRIER_YARDS).clamp_to_pitch(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
         let player = &mut self.players[player_id];
         player.position = target;
         // Cancel the component of momentum driving it into the body so it stays pressed
@@ -8000,8 +8004,7 @@ impl SoccerMatch {
             .filter(|other| other.team != team)
             .map(|other| (other.position, other.position.distance(player_pos)))
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let nearest_opponent_distance =
-            nearest_opponent.map(|(_, d)| d).unwrap_or(f64::INFINITY);
+        let nearest_opponent_distance = nearest_opponent.map(|(_, d)| d).unwrap_or(f64::INFINITY);
         let nearest_opponent_dir = nearest_opponent.and_then(|(pos, _)| {
             let to = pos - player_pos;
             (to.len() > 1e-6).then(|| to.normalized())
@@ -8908,8 +8911,8 @@ impl SoccerMatch {
             let projection = previous_ball_position
                 + (current_ball_position - previous_ball_position) * target_projection;
             let segment_distance = target_position.distance(projection);
-            let near_segment =
-                target_projection <= max_projection && segment_distance <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
+            let near_segment = target_projection <= max_projection
+                && segment_distance <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
             let current_distance = target_position.distance(current_ball_position);
             let near_current = max_projection >= 1.0 - 1e-9
                 && current_distance <= OFFSIDE_INTERFERENCE_RADIUS_YARDS;
@@ -13654,7 +13657,10 @@ impl WorldSnapshot {
             .and_then(|id| self.players.iter().find(|p| p.id == id))
         {
             if holder.team == team
-                && matches!(holder.movement_gait, MovementGait::Run | MovementGait::Sprint)
+                && matches!(
+                    holder.movement_gait,
+                    MovementGait::Run | MovementGait::Sprint
+                )
                 && self.player_forward_progress_over_seconds(holder, 0.6)
                     > FORWARD_MOMENTUM_CARRY_PROGRESS_YARDS
             {
@@ -13664,7 +13670,8 @@ impl WorldSnapshot {
         if let Some(pass) = self.pending_pass.as_ref() {
             if pass.team == team {
                 let forward = (pass.intended_target.y - pass.origin.y) * team.attack_dir();
-                if (pass.flight.is_aerial() || pass.distance_yards >= FORWARD_MOMENTUM_LONG_BALL_YARDS)
+                if (pass.flight.is_aerial()
+                    || pass.distance_yards >= FORWARD_MOMENTUM_LONG_BALL_YARDS)
                     && forward >= FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS
                 {
                     return true;
@@ -17205,9 +17212,11 @@ impl WorldSnapshot {
                     || opponent_time_to_current
                         >= ball_time_to_current * PASS_RECEPTION_OPPONENT_TIME_MARGIN;
                 // A defender actually in the corridor now, or a SET interceptor in the
-                // lane, still hard-vetoes. A defender merely DRIFTING into the lane no
-                // longer vetoes — that's carried as a penalty (below) so a brave forward
-                // ball to an open runner stays possible instead of being forced square.
+                // lane, still hard-vetoes. A defender merely DRIFTING into the lane is
+                // only risk-priced for the threaded/killer candidate set; ordinary
+                // visible pass options require the lane to remain clear through flight,
+                // except when a real forward runner is escaping a marker into much more
+                // open future space.
                 //
                 // Crucially, the lane is checked against the LED reception point, which is
                 // pushed ahead of a runner and can overshoot into a deep defender even when
@@ -17249,7 +17258,7 @@ impl WorldSnapshot {
                     && self.nearest_opponent_distance_at(me.team, position)
                         <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 aim_point_and_anticipation
-                    .filter(|(aim_point, _)| {
+                    .filter(|(aim_point, anticipation_clear)| {
                         // Near the opponent goal, a FORWARD ball to a contested receiver is no
                         // longer hard-vetoed just because a defender wins the race to the
                         // (often aggressively LED) reception point. A contested reception there
@@ -17283,8 +17292,45 @@ impl WorldSnapshot {
                         } else {
                             reception_won
                         };
+                        let lane_risk_tolerated = if require_reception_won && !*anticipation_clear {
+                            let receiver_velocity =
+                                self.player_velocity(p.id).unwrap_or(p.velocity);
+                            let receiver_forward_velocity =
+                                receiver_velocity.y * me.team.attack_dir();
+                            let receiver_forward_run =
+                                (anticipated_position.y - position.y) * me.team.attack_dir();
+                            let current_openness = pass_receiver_openness_for_snapshots(
+                                &self.players,
+                                me.team,
+                                position,
+                            );
+                            let future_openness = pass_receiver_openness_for_snapshots(
+                                &self.players,
+                                me.team,
+                                anticipated_position,
+                            );
+                            let runner_escaping_marker = receiver_forward_velocity >= 2.4
+                                && receiver_forward_run >= 4.0
+                                && future_openness >= current_openness + 0.45
+                                && future_openness >= 0.58;
+                            let aim_yards_to_goal =
+                                (me.team.goal_y(self.field_length) - aim_point.y).abs();
+                            let carrier_yards_to_goal =
+                                (me.team.goal_y(self.field_length) - me_position.y).abs();
+                            let final_third_goal_thread = forward_pass
+                                && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                                && aim_yards_to_goal <= self.field_length / 3.0
+                                && carrier_yards_to_goal - aim_yards_to_goal >= 8.0
+                                && receiver_forward_velocity >= 1.0;
+                            runner_escaping_marker || final_third_goal_thread
+                        } else {
+                            false
+                        };
+                        let lane_clear_through_flight =
+                            !require_reception_won || *anticipation_clear || lane_risk_tolerated;
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || race_won)
+                            && lane_clear_through_flight
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
@@ -17302,8 +17348,8 @@ impl WorldSnapshot {
             .map(|p| {
                 let (p, position, pass_point, anticipation_clear) = p;
                 // Defender drifting into the lane (clear now, not for the whole flight):
-                // a penalty, not a veto — an open forward option can still win, but a safer
-                // ball is preferred when the scores are close.
+                // a penalty for the threaded/killer candidate set. Ordinary visible pass
+                // options were already vetoed above when `require_reception_won` is true.
                 let anticipation_penalty = if anticipation_clear { 0.0 } else { 2.4 };
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let dist = me_position.distance(position);
@@ -18283,7 +18329,11 @@ impl WorldSnapshot {
             .map(|y| y - attack_dir * ONSIDE_RUN_HOLD_BUFFER_YARDS);
         // Channel to attack: away from where the man-to-beat is shading, into the space
         // the defender vacates as the carrier spins off them.
-        let channel_sign = if man_pos.x >= carrier_pos.x { -1.0 } else { 1.0 };
+        let channel_sign = if man_pos.x >= carrier_pos.x {
+            -1.0
+        } else {
+            1.0
+        };
         let mut return_target = Vec2::new(
             carrier_pos.x + channel_sign * WALL_PASS_RUN_CHANNEL_YARDS,
             carrier_pos.y + attack_dir * WALL_PASS_RUN_FORWARD_YARDS,
@@ -18327,7 +18377,10 @@ impl WorldSnapshot {
                 }
                 // The wall is onside to receive the give and free enough to turn it
                 // around first-time.
-                if self.pending_offside_for_pass(carrier_id, partner.id).is_some() {
+                if self
+                    .pending_offside_for_pass(carrier_id, partner.id)
+                    .is_some()
+                {
                     return None;
                 }
                 let partner_space = self.nearest_opponent_distance_at(partner.team, partner_pos);
@@ -18357,7 +18410,11 @@ impl WorldSnapshot {
                     quality,
                 })
             })
-            .max_by(|a, b| a.quality.partial_cmp(&b.quality).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.quality
+                    .partial_cmp(&b.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// The onside burst target for a player who has just played the give in a one-two —
@@ -18390,9 +18447,7 @@ impl WorldSnapshot {
     /// the return is legal (the runner is onside). `None` otherwise.
     pub(crate) fn wall_return_pass_target_for(&self, wall_partner_id: usize) -> Option<usize> {
         let wall = self.players.iter().find(|p| p.id == wall_partner_id)?;
-        if self.ball.holder != Some(wall_partner_id)
-            || self.possession_team() != Some(wall.team)
-        {
+        if self.ball.holder != Some(wall_partner_id) || self.possession_team() != Some(wall.team) {
             return None;
         }
         let wall_pos = self.player_snapshot_position(wall);
@@ -18408,7 +18463,10 @@ impl WorldSnapshot {
                     return None;
                 }
                 // Never release into an offside runner.
-                if self.pending_offside_for_pass(wall_partner_id, runner.id).is_some() {
+                if self
+                    .pending_offside_for_pass(wall_partner_id, runner.id)
+                    .is_some()
+                {
                     return None;
                 }
                 let runner_pos = self.player_snapshot_position(runner);
@@ -22292,8 +22350,10 @@ impl WorldSnapshot {
         // component — there is no forward lane to protect behind a carrier
         // facing his own goal.
         let velocity = self.player_velocity(holder.id).unwrap_or(holder.velocity);
-        let goalward = Vec2::new(self.field_width * 0.5, holder.team.goal_y(self.field_length))
-            - carrier_pos;
+        let goalward = Vec2::new(
+            self.field_width * 0.5,
+            holder.team.goal_y(self.field_length),
+        ) - carrier_pos;
         let drive_dir = if velocity.len() > 1.5 && velocity.y * attack > 0.0 {
             velocity.normalized()
         } else {
@@ -22379,7 +22439,8 @@ impl WorldSnapshot {
         }
         // Pull toward at least `MIN` yds goal-side, but no more than `MAX_PULL` of
         // correction per evaluation; clamp_to_pitch keeps it short of the goal line.
-        let deficit = (DEFENSIVE_GOAL_SIDE_MIN_YARDS - along).min(DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS);
+        let deficit =
+            (DEFENSIVE_GOAL_SIDE_MIN_YARDS - along).min(DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS);
         (target + axis * deficit).clamp_to_pitch(self.field_width, self.field_length)
     }
 
