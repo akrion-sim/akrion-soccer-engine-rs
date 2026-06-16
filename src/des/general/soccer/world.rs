@@ -7861,6 +7861,21 @@ impl SoccerMatch {
         } else {
             gait
         };
+        // Locomotion momentum: a decision is instant, but the body carries the effort
+        // it has committed to. Upshifting (committing harder) and pulling up to a stop
+        // are free, but DOWNshifting to a still-moving lower gait is held off until the
+        // committed gait has been carried for the dwell — this is what stops a player
+        // sprinting one tick, running the next, sprinting again (see `commit_gait`).
+        // Dwell is accumulated per movement step from `dt` rather than read off the
+        // match clock, so it is correct however the mover is driven (one step per tick
+        // in live play; the clock need not advance between calls).
+        let previous_gait = self.players[player_id].movement_gait;
+        let gait_held_seconds = self.players[player_id].locomotion.gait_held_seconds;
+        let gait = commit_gait(previous_gait, gait, gait_held_seconds);
+        // A turn-and-run to keep up with a fast attacker (chase / flat-out recovery)
+        // bypasses the heading-reversal lock so the change of direction is never
+        // delayed; ordinary play keeps its directional momentum.
+        let heading_emergency = chased || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD;
         let fatigue_factor = fatigue_speed_factor(
             self.players[player_id].skills.stamina,
             self.players[player_id].fatigue,
@@ -7893,11 +7908,31 @@ impl SoccerMatch {
         // decision (logged, and averaged only when sensible). Inert — byte-identical
         // to the analytic path — when `tier2_player_enabled` is off.
         let desired = self.mpc_movement_desired_velocity(player_id, target, speed);
+        // Directional momentum: gentle steering is free, but a hard reversal (a
+        // cut-back, >90° off the committed heading) is locked for a short dwell so the
+        // player can't whip back and forth across ticks (see `commit_travel_heading`).
+        let commitment = self.players[player_id].locomotion;
+        let (desired, committed_heading, heading_held_seconds) = commit_travel_heading(
+            desired,
+            commitment.heading,
+            commitment.heading_held_seconds,
+            dt,
+            heading_emergency,
+        );
         let acceleration_factor =
             (0.62 + fatigue_factor * 0.38).clamp(0.45, 1.05) * proximity_urgency;
         let strength_to_weight_factor =
             strength_to_weight_acceleration_multiplier(&self.players[player_id].skills);
         let p = &mut self.players[player_id];
+        // Accumulate time-in-tier: reset on an effort-tier change, otherwise add this
+        // step's dt so the dwell measures how long the current gait has been carried.
+        p.locomotion.gait_held_seconds = if gait.effort_tier() != previous_gait.effort_tier() {
+            dt
+        } else {
+            gait_held_seconds + dt
+        };
+        p.locomotion.heading = committed_heading;
+        p.locomotion.heading_held_seconds = heading_held_seconds;
         p.movement_gait = gait;
         p.velocity = approach_velocity(
             p.velocity,

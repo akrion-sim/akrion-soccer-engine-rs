@@ -205,6 +205,27 @@ pub struct WallPassPlan {
     pub quality: f64,
 }
 
+/// Short-horizon locomotion commitment: the movement momentum/inertia that stops a
+/// player from issuing contradictory decisions tick-to-tick. A committed gait must be
+/// held a minimum dwell before it may be downshifted (you carry a sprint's momentum;
+/// you can't bleed it off instantly), and a committed travel heading must be held a
+/// minimum dwell before it may be reversed (you can't cut back on yourself instantly).
+/// Upshifting effort and gentle steering are always free — committing harder and
+/// bending a run are decisive, instantaneous acts; only the *reversal* of a
+/// commitment has inertia. See `commit_gait` / `commit_travel_heading`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocomotionCommitment {
+    /// Seconds the player has continuously held the current gait effort tier, summed
+    /// per movement step from `dt`. Reset when the tier changes; gates downshifts.
+    pub gait_held_seconds: f64,
+    /// Unit travel heading the player is committed to (`None` until first moving).
+    pub heading: Option<Vec2>,
+    /// Seconds since `heading` last changed sharply (a reversal), summed per step;
+    /// gates how soon the player may reverse direction again.
+    pub heading_held_seconds: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerAgent {
@@ -220,6 +241,9 @@ pub struct PlayerAgent {
     pub jerk: Vec2,
     #[serde(default)]
     pub movement_gait: MovementGait,
+    /// Locomotion momentum/commitment state (anti-jitter); see [`LocomotionCommitment`].
+    #[serde(default)]
+    pub locomotion: LocomotionCommitment,
     pub position_history: VecDeque<Vec2>,
     #[serde(default)]
     pub receive_facing: FacingBucket,

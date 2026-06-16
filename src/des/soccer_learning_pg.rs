@@ -511,6 +511,54 @@ impl SoccerLearningPgStore {
         Ok(())
     }
 
+    /// Run an **idempotent** database operation, retrying on a transient connection
+    /// drop (RDS failover, network blip, server restart) with the same bounded
+    /// exponential backoff as the initial connect, reconnecting between attempts.
+    ///
+    /// SAFETY — `op` is re-run verbatim after a failure, so it MUST be idempotent.
+    /// We retry ONLY when the session itself closed (`is_closed()` became true after
+    /// the failure); a constraint/logic/bad-input error leaves the connection
+    /// usable, so it is returned immediately and never looped. The one subtle case a
+    /// connection drop can hide is "the COMMIT succeeded on the server but the ack
+    /// was lost when the socket died" — re-running then re-applies the same rows, so
+    /// wrapped callers MUST use a stable key + `on conflict do nothing/update` (or a
+    /// `where id = …` update) so that re-apply is a no-op, never a duplicate. This is
+    /// why the server-id-generating inserts (`insert_completed_run`) are deliberately
+    /// NOT wrapped.
+    fn with_transient_retry<T>(
+        &mut self,
+        what: &str,
+        mut op: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let max_attempts = soccer_learning_pg_connect_max_attempts();
+        let mut attempt = 1u32;
+        loop {
+            self.ensure_connected()?;
+            match op(self) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    // A still-open connection means a real error (constraint, bad
+                    // input, statement timeout) — surface it, don't loop. Only a
+                    // dropped session is the safe, transient case to retry.
+                    if !self.client.is_closed() || attempt >= max_attempts {
+                        return Err(err);
+                    }
+                    let backoff = soccer_learning_pg_retry_backoff(attempt);
+                    eprintln!(
+                        "soccer-learning-pg: transient connection drop on {what} \
+                         (attempt {attempt}/{max_attempts}), reconnecting + retrying in {}ms: {err}",
+                        backoff.as_millis()
+                    );
+                    std::thread::sleep(backoff);
+                    // Rebuild now so the next attempt starts on a live session (the
+                    // loop-top ensure_connected is a backstop if this also fails).
+                    let _ = self.reconnect();
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
     /// Try to hold a session-level Postgres advisory lock for a whole tournament run.
     ///
     /// This is intentionally not transaction-scoped: AWS and Hetzner CronJobs can
@@ -736,6 +784,19 @@ impl SoccerLearningPgStore {
         if matches.is_empty() {
             return Ok(());
         }
+        // Idempotent (on conflict (tournament_id, match_index) do nothing, with
+        // stable keys), so transparently retry across a transient connection drop.
+        self.with_transient_retry("record tournament matches", |store| {
+            store.record_tournament_matches_inner(tournament_id, matches, index_offset)
+        })
+    }
+
+    fn record_tournament_matches_inner(
+        &mut self,
+        tournament_id: i64,
+        matches: &[MatchReport],
+        index_offset: usize,
+    ) -> Result<(), String> {
         self.ensure_connected()?;
         let mut tx = self
             .client
@@ -802,6 +863,19 @@ impl SoccerLearningPgStore {
         if teams.is_empty() {
             return Ok(());
         }
+        // Idempotent (on conflict (tournament_id, team_id) do update, stable keys),
+        // so retry across a transient drop — this persists the evolved brains, the
+        // run's whole learning payload, so resilience here matters most.
+        self.with_transient_retry("checkpoint tournament team brains", |store| {
+            store.checkpoint_tournament_team_brains_inner(tournament_id, teams)
+        })
+    }
+
+    fn checkpoint_tournament_team_brains_inner(
+        &mut self,
+        tournament_id: i64,
+        teams: &[TournamentTeam],
+    ) -> Result<(), String> {
         self.ensure_connected()?;
         let mut tx = self
             .client
@@ -873,6 +947,28 @@ impl SoccerLearningPgStore {
     /// Finalize the header: status (completed/failed/aborted) + champion + finish time.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_tournament(
+        &mut self,
+        tournament_id: i64,
+        status: &str,
+        champion_team_id: Option<usize>,
+        runner_up_team_id: Option<usize>,
+        third_place_team_id: Option<usize>,
+        wall_time_seconds: f64,
+    ) -> Result<(), String> {
+        // Idempotent same-value UPDATE keyed by id, so retry across a transient drop.
+        self.with_transient_retry("finish tournament", |store| {
+            store.finish_tournament_inner(
+                tournament_id,
+                status,
+                champion_team_id,
+                runner_up_team_id,
+                third_place_team_id,
+                wall_time_seconds,
+            )
+        })
+    }
+
+    fn finish_tournament_inner(
         &mut self,
         tournament_id: i64,
         status: &str,

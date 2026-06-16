@@ -347,16 +347,25 @@ mod tests {
 
     #[test]
     fn live_server_env_toggles_mpc_execution_stack() {
-        // Default: MPC off (byte-identical analytic path).
-        let off = live_server_config_from_lookup(|_| None);
+        // The live server runs the MPC execution stack (QP + field-aware + neural reconcile)
+        // by default; `SOCCER_LIVE_MPC` is the master toggle that can turn it OFF or back ON.
+        let default_on = live_server_config_from_lookup(|_| None);
+        assert!(default_on.match_config.mpc.tier2_player_enabled);
+        assert!(default_on.match_config.mpc.field_aware_enabled);
+        assert!(default_on.match_config.mpc.reconcile_enabled);
+
+        // SOCCER_LIVE_MPC=0 turns the whole stack off (analytic path).
+        let off_vars = BTreeMap::from([("SOCCER_LIVE_MPC", "0")]);
+        let off =
+            live_server_config_from_lookup(|name| off_vars.get(name).map(|value| value.to_string()));
         assert!(!off.match_config.mpc.tier2_player_enabled);
         assert!(!off.match_config.mpc.field_aware_enabled);
         assert!(!off.match_config.mpc.reconcile_enabled);
 
-        // SOCCER_LIVE_MPC=1 turns on the whole QP + field-aware + neural-reconcile stack.
-        let vars = BTreeMap::from([("SOCCER_LIVE_MPC", "1")]);
+        // SOCCER_LIVE_MPC=1 keeps the whole QP + field-aware + neural-reconcile stack on.
+        let on_vars = BTreeMap::from([("SOCCER_LIVE_MPC", "1")]);
         let on =
-            live_server_config_from_lookup(|name| vars.get(name).map(|value| value.to_string()));
+            live_server_config_from_lookup(|name| on_vars.get(name).map(|value| value.to_string()));
         assert!(on.match_config.mpc.tier2_player_enabled);
         assert!(on.match_config.mpc.field_aware_enabled);
         assert!(on.match_config.mpc.reconcile_enabled);

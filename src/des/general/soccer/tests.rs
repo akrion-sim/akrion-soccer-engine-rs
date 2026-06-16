@@ -38557,6 +38557,49 @@ fn low_hopping_ball_partially_feels_grass_resistance() {
 }
 
 #[test]
+fn lofted_pass_apex_is_capped_near_thirty_feet_and_scales_with_distance() {
+    // The peak height (apex) of an aerial pass is reached at the midpoint of the path,
+    // where sin(pi * 0.5) == 1, so sampling altitude there reads the apex directly.
+    let apex_for = |distance: f64| -> f64 {
+        let origin = Vec2::new(40.0, 10.0);
+        let target = Vec2::new(40.0, 10.0 + distance);
+        let mut pass = test_pending_pass(Team::Home, 6, 9, origin, target);
+        pass.flight = PassFlight::Aerial;
+        pass_ball_altitude_yards(&pass, origin + (target - origin) * 0.5)
+    };
+    let short = apex_for(15.0);
+    let long = apex_for(60.0);
+    let extreme = apex_for(120.0);
+    // Shorter lofted passes peak around ~20ft (SHORT_LOFT_APEX_YARDS).
+    assert!(
+        (short - SHORT_LOFT_APEX_YARDS).abs() < 1.2,
+        "short lofted pass should peak near ~20ft: got {short} yd"
+    );
+    // Longer balls arc higher with distance...
+    assert!(
+        long > short,
+        "longer lofted passes should arc higher: long={long} short={short}"
+    );
+    // ...but NOTHING ever balloons past the ~30ft (MAX_LOFT_APEX_YARDS) ceiling.
+    assert!(
+        long <= MAX_LOFT_APEX_YARDS + 1e-9,
+        "a long lofted pass must respect the ~30ft ceiling: {long} yd"
+    );
+    assert!(
+        extreme <= MAX_LOFT_APEX_YARDS + 1e-9,
+        "no lofted pass may exceed the ~30ft ceiling: {extreme} yd > {MAX_LOFT_APEX_YARDS}"
+    );
+    // A floor (non-aerial) pass has no loft at all.
+    let origin = Vec2::new(40.0, 10.0);
+    let target = Vec2::new(40.0, 55.0);
+    let floor = test_pending_pass(Team::Home, 6, 9, origin, target);
+    assert_eq!(
+        pass_ball_altitude_yards(&floor, origin + (target - origin) * 0.5),
+        0.0
+    );
+}
+
+#[test]
 fn aerial_pending_pass_skips_grass_resistance_on_launch_tick() {
     let heavy_grass_match = || {
         SoccerMatch::default_11v11(MatchConfig {

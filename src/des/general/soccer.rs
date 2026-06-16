@@ -137,6 +137,31 @@ const MOVING_FACING_MIN_SPEED_YPS: f64 = 1.2;
 // reverse spin in ~1.5 ticks — that produced the "facing flips 5+ times in 3 s"
 // flip-flop, since the cap was 20x too high to impose any real inertia.)
 const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 18.0;
+// --- Locomotion commitment (movement momentum / anti-jitter) ---------------------
+// A decision is instant, but a body has inertia: a player cannot commit to a sprint
+// one tick, drop to a run the next, sprint again, run again. Effort and travel
+// heading therefore carry a short commitment — once committed, *shedding* that
+// commitment (downshifting effort, reversing direction) is locked for a minimum
+// dwell. Committing HARDER is never locked: explosive acceleration and bending a
+// run are decisive, instantaneous acts; it is the reversal that has momentum. This
+// is the locomotion analogue of the body-yaw angular-acceleration cap above.
+//
+// A committed gait must be held at least this long before it may be DOWNSHIFTED to
+// a lower-effort gait (Sprint→Run, Run→Jog, …). Upshifting and coming to a stop are
+// always free. This is what kills the "sprint, run, sprint, run" tick-to-tick
+// flip-flop: each downshift out of the sprint is locked for the dwell, so the gait
+// cannot oscillate. ~0.2 s ≈ a few ticks at the default rate.
+const GAIT_DOWNSHIFT_COMMIT_SECONDS: f64 = 0.20;
+// A committed travel heading must be held at least this long before it may be
+// REVERSED (turned more sharply than the threshold below). Gentle steering — bending
+// a run, tracking a moving target, lateral adjustments — is always free; only a hard
+// change of direction (a cut-back) carries this commitment. ~0.1 s.
+const HEADING_REVERSAL_COMMIT_SECONDS: f64 = 0.10;
+// How sharp a heading change counts as a genuine "change of direction" (and is thus
+// gated by the dwell above): a turn of more than 90° off the committed heading, i.e.
+// the new heading has a non-positive projection onto the old one. Below 90° the
+// player is steering/correcting, not reversing, and is never locked.
+const HEADING_REVERSAL_COS_THRESHOLD: f64 = 0.0; // cos(90°)
 // Human-scale mass bounds (lbs) the physics smoke report holds players within.
 const PLAYER_MIN_WEIGHT_POUNDS: f64 = 90.0;
 const PLAYER_MAX_WEIGHT_POUNDS: f64 = 320.0;
@@ -501,6 +526,14 @@ const SHOT_SCREEN_IDEAL_MAX_YARDS: f64 = 3.0;
 const BALL_CURL_DECAY_PER_SECOND: f64 = 1.10;
 const MAX_BALL_CURL_YPS2: f64 = 7.6;
 const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
+// Hard ceiling on how high any lofted/aerial pass arcs. A lofted ball should never balloon
+// much past ~30ft (10yd) of altitude — only the longest balls reach it, with shorter ones
+// peaking nearer ~20ft (`SHORT_LOFT_APEX_YARDS`). Loft height is purely the vertical arc:
+// it is a function of horizontal progress along the path, NOT of time, and the ball is
+// fully airborne (identical drag) for any apex above `BALL_ROLLING_ALTITUDE_YARDS + 0.18`,
+// so capping the apex does not change x/y speed or time-to-destination — it is realism only.
+const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
+const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 // Stuck-ball ("rat's nest") watchdog. The ball only "escapes" the stuck zone — resetting
 // the watchdog — when it genuinely LEAVES the area (travels past this escape radius from
 // the anchor). A ball that merely shuffles, orbits, or ping-pongs inside the radius keeps
@@ -2947,6 +2980,24 @@ impl MovementGait {
             MovementGait::Jog => 0.62,
             MovementGait::Run => 0.90,
             MovementGait::Sprint => 1.12,
+        }
+    }
+
+    /// Coarse locomotor effort tier used by the commitment / momentum model. Higher
+    /// means more effort; backward and lateral variants sit with their forward
+    /// intensity peers (a back-jog is still jogging effort). The commitment layer
+    /// compares tiers to tell an upshift (free) from a downshift (held for a dwell).
+    fn effort_tier(self) -> u8 {
+        match self {
+            MovementGait::Stand => 0,
+            MovementGait::Walk | MovementGait::BackWalk => 1,
+            MovementGait::SideStep
+            | MovementGait::Jog
+            | MovementGait::BackJog
+            | MovementGait::Skip
+            | MovementGait::BackSkip => 2,
+            MovementGait::Run => 3,
+            MovementGait::Sprint => 4,
         }
     }
 
@@ -8459,11 +8510,12 @@ fn untargeted_long_ball_altitude_yards(
         return 0.0;
     }
     let carry_speed = flight.launch_speed_yps.max(current_speed_yps);
-    // Hoofed long balls were ballooning (up to ~14yd / 42ft of loft). Pull the apex down
-    // ~17% (was 3.8 + d*0.075 + carry*0.045, clamp 4.5..14.0) for a flatter, more driven
-    // trajectory that covers the ground quicker rather than hanging up in the air.
-    let apex =
-        (3.15 + flight.distance_yards.max(0.0) * 0.062 + carry_speed * 0.037).clamp(3.7, 11.6);
+    // Hoofed long balls were ballooning (the old 4.5..14.0yd / 13..42ft clamp). A typical
+    // long hoof now arcs ~22-26ft, hard-capped at the shared ~30ft (`MAX_LOFT_APEX_YARDS`)
+    // ceiling so it can never balloon past a lofted pass. Flatter/driven keeps the ground
+    // game quick; the cap is vertical realism only (x/y pace is independent of loft).
+    let apex = (3.15 + flight.distance_yards.max(0.0) * 0.062 + carry_speed * 0.037)
+        .clamp(3.7, MAX_LOFT_APEX_YARDS);
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
 
@@ -32056,6 +32108,32 @@ fn handle_live_soccer_request_inner(
                 "entries": entries,
             }))
         }
+        ("POST", "/api/decision-trace") | ("POST", "/api/decisions") => {
+            // Flip the "Pause & Analyze" capture ring on/off at runtime so it can be
+            // enabled without relaunching the server (and losing the live game). Body is
+            // optional `{"enabled": bool}`; an empty/absent body defaults to enabling it,
+            // since that's the common ask.
+            let enabled = if req.body.trim().is_empty() {
+                true
+            } else {
+                match serde_json::from_str::<serde_json::Value>(req.body) {
+                    Ok(value) => value.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                    Err(e) => {
+                        return LiveHttpResponse::error(
+                            400,
+                            "Bad Request",
+                            &format!("parse decision-trace toggle: {e}"),
+                        )
+                    }
+                }
+            };
+            let mut guard = soccer_mutex_lock(session, "soccer_live_session");
+            guard.sim.set_decision_trace_capture(enabled);
+            LiveHttpResponse::json(&serde_json::json!({
+                "ok": true,
+                "captureEnabled": guard.sim.decision_trace_capture_enabled(),
+            }))
+        }
         ("GET", "/api/inspect") => {
             // On-demand live-state inspection (pull). Serialises ONLY the slice
             // asked for via the query string, e.g.
@@ -39173,6 +39251,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         acceleration: player.acceleration,
         jerk: player.jerk,
         movement_gait: player.movement_gait,
+        locomotion: LocomotionCommitment::default(),
         position_history,
         receive_facing: player.receive_facing,
         action_facing: player.action_facing,
@@ -41740,11 +41819,14 @@ fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         3.0 + unit * 2.0
     } else {
-        // Flatter, more driven arc: long balls should be hit with pace, not floated. Apex
-        // pulled down ~20% (was 1.8 + d*0.045, clamp 2.2..8.5) so the trajectory is flatter
-        // and the ball spends less time climbing — a 50-yard ball now peaks ~3.3 yds and a
-        // 30-yarder ~2.5 yds.
-        (1.45 + pass.distance_yards.max(0.0) * 0.036).clamp(1.8, 6.8)
+        // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
+        // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
+        // longest balls — never higher. Slope is set so a ~15yd loft ≈ 20ft and a ~60yd
+        // loft ≈ 30ft. The arc is purely vertical realism: x/y pace is unchanged (loft is a
+        // function of horizontal progress, not time), so a higher arc still arrives just as
+        // fast.
+        (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + pass.distance_yards.max(0.0) * 0.074)
+            .clamp(5.0, MAX_LOFT_APEX_YARDS)
     };
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
 }
@@ -44022,6 +44104,78 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
     }
 }
 
+/// Apply the downshift-dwell commitment to a freshly-decided gait, modelling
+/// locomotor momentum. Upshifting to more effort, holding the same tier, and coming
+/// to a stop are always honoured immediately (committing harder / pulling up are
+/// decisive acts). A downshift to a *still-moving* lower-effort gait is held off
+/// until the current gait has been carried for [`GAIT_DOWNSHIFT_COMMIT_SECONDS`], so
+/// effort cannot oscillate tick-to-tick (the "sprint, run, sprint, run" jitter). See
+/// the constant's comment for the rationale.
+fn commit_gait(prev: MovementGait, desired: MovementGait, held_seconds: f64) -> MovementGait {
+    if desired == prev {
+        return desired;
+    }
+    let prev_tier = prev.effort_tier();
+    let next_tier = desired.effort_tier();
+    // Upshift or same tier: free. Coming to a halt (Stand): free.
+    if next_tier >= prev_tier || next_tier == 0 {
+        return desired;
+    }
+    // Genuine downshift to a still-moving gait: only once the dwell has elapsed.
+    if held_seconds >= GAIT_DOWNSHIFT_COMMIT_SECONDS {
+        desired
+    } else {
+        prev
+    }
+}
+
+/// Apply the heading-reversal commitment to a desired velocity, modelling momentum
+/// in the direction of travel. Gentle steering (≤90° off the committed heading) is
+/// always honoured and continuously updates the committed heading. A sharp change of
+/// direction (>90°, a cut-back) is locked until the committed heading has been held
+/// for [`HEADING_REVERSAL_COMMIT_SECONDS`]; while locked, the player keeps travelling
+/// along the committed heading at the decided speed instead of reversing on a dime.
+/// `emergency` (being chased, or a flat-out defensive recovery) bypasses the lock so
+/// a turn-and-run to keep up is never delayed. `held_seconds` is the time already
+/// spent on the committed heading and `dt` this step's duration; the dwell is
+/// accumulated per step rather than read off a clock, so it is correct however the
+/// mover is driven. Returns the (possibly redirected) desired velocity, the updated
+/// committed heading, and the updated time-held.
+fn commit_travel_heading(
+    desired: Vec2,
+    committed_heading: Option<Vec2>,
+    held_seconds: f64,
+    dt: f64,
+    emergency: bool,
+) -> (Vec2, Option<Vec2>, f64) {
+    let speed = desired.len();
+    if speed <= 1e-6 {
+        // Not travelling: preserve the committed heading (so a momentary pause doesn't
+        // wipe the line the player will resume along) and keep accumulating hold time.
+        return (desired, committed_heading, held_seconds + dt);
+    }
+    let new_dir = desired / speed;
+    match committed_heading {
+        None => (desired, Some(new_dir), dt),
+        Some(heading) => {
+            let is_reversal = heading.dot(new_dir) < HEADING_REVERSAL_COS_THRESHOLD;
+            let locked =
+                is_reversal && !emergency && held_seconds < HEADING_REVERSAL_COMMIT_SECONDS;
+            if locked {
+                // Hold the committed line at the decided speed; keep accumulating hold
+                // time so the lock releases once the dwell is satisfied.
+                (heading * speed, Some(heading), held_seconds + dt)
+            } else if is_reversal {
+                // Accept the reversal and restart the dwell on the new heading.
+                (desired, Some(new_dir), dt)
+            } else {
+                // Gentle steering: slide the committed heading along, keep the clock.
+                (desired, Some(new_dir), held_seconds + dt)
+            }
+        }
+    }
+}
+
 fn classify_movement_gait(team: Team, to_target: Vec2, sprint: bool, chased: bool) -> MovementGait {
     let distance = to_target.len();
     if distance < 0.18 {
@@ -44970,6 +45124,7 @@ fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAg
                 acceleration: Vec2::zero(),
                 jerk: Vec2::zero(),
                 movement_gait: MovementGait::Stand,
+                locomotion: LocomotionCommitment::default(),
                 position_history: VecDeque::from([pos]),
                 receive_facing: FacingBucket::Unknown,
                 action_facing: default_team_facing(team),
@@ -44990,6 +45145,125 @@ fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAg
         }
     }
     players
+}
+
+#[cfg(test)]
+mod locomotion_commitment_tests {
+    use super::*;
+
+    #[test]
+    fn effort_tier_orders_gaits_by_intensity() {
+        assert!(MovementGait::Sprint.effort_tier() > MovementGait::Run.effort_tier());
+        assert!(MovementGait::Run.effort_tier() > MovementGait::Jog.effort_tier());
+        assert!(MovementGait::Jog.effort_tier() > MovementGait::Walk.effort_tier());
+        assert!(MovementGait::Walk.effort_tier() > MovementGait::Stand.effort_tier());
+        // Backward / lateral variants share their forward intensity peer's tier.
+        assert_eq!(
+            MovementGait::BackJog.effort_tier(),
+            MovementGait::Jog.effort_tier()
+        );
+        assert_eq!(
+            MovementGait::BackWalk.effort_tier(),
+            MovementGait::Walk.effort_tier()
+        );
+    }
+
+    #[test]
+    fn gait_upshift_and_same_tier_are_always_free() {
+        // Below the dwell, an upshift to more effort is honoured immediately.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.01),
+            MovementGait::Sprint
+        );
+        // Holding the same gait is a no-op.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0),
+            MovementGait::Sprint
+        );
+    }
+
+    #[test]
+    fn gait_downshift_is_locked_until_the_dwell_elapses() {
+        // The exact "sprint, run, sprint, run" case: a downshift out of the sprint
+        // before the dwell is refused — the player stays sprinting.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05),
+            MovementGait::Sprint
+        );
+        // Once the gait has been carried for the dwell, the downshift is allowed.
+        assert_eq!(
+            commit_gait(
+                MovementGait::Sprint,
+                MovementGait::Run,
+                GAIT_DOWNSHIFT_COMMIT_SECONDS + 0.01
+            ),
+            MovementGait::Run
+        );
+    }
+
+    #[test]
+    fn pulling_up_to_a_stop_is_always_allowed() {
+        // Coming to a halt is never locked, even straight from a flat-out sprint.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0),
+            MovementGait::Stand
+        );
+    }
+
+    #[test]
+    fn heading_first_move_commits_immediately() {
+        let (vel, heading, held) =
+            commit_travel_heading(Vec2::new(0.0, 5.0), None, 0.0, 0.1, false);
+        assert_eq!(vel, Vec2::new(0.0, 5.0));
+        assert!(heading.unwrap().distance(Vec2::new(0.0, 1.0)) < 1e-9);
+        assert!((held - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gentle_steering_is_free_and_keeps_accumulating_the_dwell() {
+        // ~45° turn (< the 90° reversal threshold): honoured, dwell keeps accruing.
+        let committed = Vec2::new(0.0, 1.0);
+        let desired = Vec2::new(5.0, 5.0); // 45° off, speed ~7.07
+        let (vel, heading, held) =
+            commit_travel_heading(desired, Some(committed), 1.0, 0.1, false);
+        assert!(vel.distance(desired) < 1e-9);
+        assert!(heading.unwrap().distance(desired.normalized()) < 1e-9);
+        assert!((held - 1.1).abs() < 1e-9, "gentle steer must not restart the dwell");
+    }
+
+    #[test]
+    fn sharp_reversal_is_locked_then_released_after_the_dwell() {
+        let committed = Vec2::new(0.0, 1.0);
+        let reversal = Vec2::new(0.0, -6.0); // 180° about-face, speed 6
+        // Held less than the dwell: travel is held on the committed line, at the
+        // decided speed, and the clock keeps accruing toward release.
+        let (vel, heading, held) =
+            commit_travel_heading(reversal, Some(committed), 0.05, 0.02, false);
+        assert!(vel.distance(Vec2::new(0.0, 6.0)) < 1e-9, "held on committed heading");
+        assert!(heading.unwrap().distance(committed) < 1e-9);
+        assert!((held - 0.07).abs() < 1e-9);
+        // Held past the dwell: the about-face is accepted and the dwell restarts.
+        let (vel, heading, held) = commit_travel_heading(
+            reversal,
+            Some(committed),
+            HEADING_REVERSAL_COMMIT_SECONDS + 0.01,
+            0.02,
+            false,
+        );
+        assert!(vel.distance(reversal) < 1e-9);
+        assert!(heading.unwrap().distance(Vec2::new(0.0, -1.0)) < 1e-9);
+        assert!((held - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn emergency_bypasses_the_reversal_lock() {
+        // A chase / flat-out recovery turn-and-run is never delayed.
+        let committed = Vec2::new(0.0, 1.0);
+        let reversal = Vec2::new(0.0, -6.0);
+        let (vel, _heading, _held) =
+            commit_travel_heading(reversal, Some(committed), 0.0, 0.1, true);
+        assert!(vel.distance(reversal) < 1e-9);
+    }
 }
 
 #[cfg(test)]
