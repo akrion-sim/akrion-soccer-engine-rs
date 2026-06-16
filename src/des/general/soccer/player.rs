@@ -4,6 +4,9 @@
 
 use super::*;
 
+const DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS: f64 = 4.0;
+const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillProfile {
@@ -600,47 +603,37 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        // Critical 2-yard spacing: how far the nearest defender (in ANY direction) has
-        // closed inside the 2-yard comfort gap. 0 at >=2 yds (no effect — the open-space
-        // regime is untouched), rising to 1 as the defender gets on top of the ball.
-        // Damps forward dribbling and lifts passing so the carrier releases sooner rather
-        // than letting the gap close below 2 yds.
+        // Critical spacing: most carriers react once the nearest defender gets inside
+        // the 2-yard floor; defenders on the ball should prefer a larger 3-4 yard buffer.
+        // The response stays soft: dribbling is damped and passing lifted rather than
+        // making carry options illegal.
+        let dribble_comfort_space_yards = if self.role == PlayerRole::Defender {
+            DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS
+        } else {
+            DRIBBLE_OPPONENT_MIN_SPACE_YARDS
+        };
         let defender_crowding = if observation.nearest_opponent_distance.is_finite() {
-            (1.0 - observation.nearest_opponent_distance / DRIBBLE_OPPONENT_MIN_SPACE_YARDS)
+            (1.0 - observation.nearest_opponent_distance / dribble_comfort_space_yards)
                 .clamp(0.0, 1.0)
         } else {
             0.0
         };
-        // Defenders keep a WIDER carrying cushion than the universal 2yd comfort gap:
-        // they should not dribble with an opponent closing inside ~4yd. This term is 0
-        // for non-defenders (their behaviour is unchanged) and 0 while the gap is still
-        // comfortable, rising to 1 as the opponent closes onto the ball — it damps a
-        // defender's dribbling and lifts passing EARLIER and harder than the universal
-        // 2yd response, so a defender releases before the press arrives.
-        let defender_carry_cushion = if self.role == PlayerRole::Defender {
-            DEFENDER_CARRY_CUSHION_YARDS
+        let crowded_dribble_damp =
+            (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
+        // The flip side: when a defender closes the spacing gap AND a receiver is open,
+        // lift passing so the carrier releases the ball before the gap collapses. For
+        // defenders in possession, a fast-closing opponent increases that release lift
+        // even before the gap has dropped below the 2-yard floor.
+        let open_outlet_fit = observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+        let defender_closing_pass_lift = if self.role == PlayerRole::Defender {
+            (1.0 + pressure_rising * DEFENDER_DRIBBLE_CLOSING_PASS_LIFT * open_outlet_fit)
+                .clamp(1.0, 1.42)
         } else {
-            0.0
+            1.0
         };
-        let defender_pressure_closing = if defender_carry_cushion > 0.0
-            && observation.nearest_opponent_distance.is_finite()
-        {
-            (1.0 - observation.nearest_opponent_distance / defender_carry_cushion).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let crowded_dribble_damp = (1.0
-            - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP
-            - defender_pressure_closing * DEFENDER_CARRY_CROWDED_DAMP)
-            .clamp(0.22, 1.0);
-        // The flip side: when a defender is inside 2 yds AND a receiver is open, lift
-        // passing so the carrier releases the ball before the gap closes. Gated on an
-        // open outlet so a crowded carrier with no pass isn't pushed into a giveaway.
-        // The defender cushion adds extra lift as the gap closes inside ~4yd.
-        let crowded_pass_lift = 1.0
-            + (defender_crowding * PASS_CROWDED_RELEASE_LIFT
-                + defender_pressure_closing * DEFENDER_CARRY_PASS_LIFT)
-                * observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+        let crowded_pass_lift = (1.0
+            + defender_crowding * PASS_CROWDED_RELEASE_LIFT * open_outlet_fit)
+            * defender_closing_pass_lift;
         // --- Positional dribble-risk appetite -----------------------------------------
         // Driving INTO pressure (taking a man on, carrying into traffic) is only worth the
         // risk for the most-advanced players — the three furthest forward. See
@@ -659,13 +652,10 @@ impl PlayerAgent {
             (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.62).clamp(0.40, 1.0);
         // ...and a deep carrier should give the ball up sooner the longer that risk persists,
         // so the release (pass/shot) gets a positional urgency boost on top of the existing
-        // hold-time model.
-        // A defender also gives the ball up sooner the further an opponent has closed
-        // inside its (wider) carrying cushion — rising pressure ⇒ rising urgency to pass.
-        let deep_release_urgency = (1.0
-            + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34
-            + defender_pressure_closing * DEFENDER_CARRY_RELEASE_URGENCY)
-            .clamp(1.0, 1.55);
+        // hold-time model. For defenders the wider comfort buffer already feeds this via
+        // `defender_crowding` → `dribble_risk`, so no extra term is needed here.
+        let deep_release_urgency =
+            (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
         // Stack the positional/keeper release lifts onto the hold-time release model, but
         // cap the product so several "release sooner" signals firing at once (e.g. a
         // pressured keeper, who is also a deep carrier) can't blow the multiplier past a

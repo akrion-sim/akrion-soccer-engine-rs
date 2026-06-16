@@ -439,17 +439,14 @@ const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // get on top of the ball. These weight that crowding response.
 const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
 const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
-// Defenders carrying the ball keep a WIDER cushion than the universal 2yd comfort
-// gap (`DRIBBLE_OPPONENT_MIN_SPACE_YARDS`): they should not dribble with an opponent
-// closing inside ~4yd. As that gap shrinks below the cushion a defender's dribbling
-// is damped earlier and harder, the carry bends AWAY from the nearest opponent to
-// restore separation, and the urgency to release (pass) rises sooner than for an
-// attacker (who is allowed to carry into tighter space / take a man on). This is on
-// TOP of the universal 2yd crowding response and is inert for non-defenders.
+// A defender carrying the ball keeps a WIDER cushion than the universal 2yd comfort
+// gap (`DRIBBLE_OPPONENT_MIN_SPACE_YARDS`): with an opponent closing inside ~4yd the
+// carry bends AWAY from the nearest opponent (see `defender_carry_cushion_direction`)
+// to restore separation rather than dribbling into the press. This is the active
+// movement half of the defender cushion; the decision half (damp dribbling / lift
+// passing as the gap closes) lives in the player decision via the widened
+// `DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS` crowding and `DEFENDER_DRIBBLE_CLOSING_PASS_LIFT`.
 const DEFENDER_CARRY_CUSHION_YARDS: f64 = 4.0;
-const DEFENDER_CARRY_CROWDED_DAMP: f64 = 0.55;
-const DEFENDER_CARRY_PASS_LIFT: f64 = 1.05;
-const DEFENDER_CARRY_RELEASE_URGENCY: f64 = 0.42;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;

@@ -26,9 +26,10 @@ use soccer_engine::des::soccer_learning::{
     soccer_postgres_policy_refresh_decision,
     soccer_should_flush_postgres_policy_versions_for_new_sim,
     soccer_should_refresh_postgres_for_new_sim, soccer_tactical_learning_weights_fingerprint,
-    soccer_team_q_policies_fingerprint, SoccerEvolutionOptions, SoccerLearningCompletedGame,
-    SoccerPostgresPolicyRefreshCheck, SoccerTacticalLearningGenomeParent,
-    SOCCER_POLICY_STATUS_ACTIVE,
+    soccer_team_q_policies_fingerprint, validate_soccer_evolution_options_for_learning_run,
+    validate_soccer_neural_learning_config_for_learning_run, SoccerEvolutionOptions,
+    SoccerLearningCompletedGame, SoccerPostgresPolicyRefreshCheck,
+    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::{
     SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
@@ -481,6 +482,11 @@ fn validate_soccer_q_policy_options_for_runner(
     }
     if !options.gamma.is_finite() || !(0.0..=1.0).contains(&options.gamma) {
         return Err(invalid_data("SOCCER_GAMMA must be finite and in [0, 1]").into());
+    }
+    if !options.exploration_epsilon.is_finite()
+        || !(0.0..=1.0).contains(&options.exploration_epsilon)
+    {
+        return Err(invalid_data("SOCCER_EXPLORATION_EPSILON must be finite and in [0, 1]").into());
     }
     Ok(())
 }
@@ -2328,6 +2334,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             default_evolution_options.seed as u32,
         )? as u64,
     };
+    validate_soccer_evolution_options_for_learning_run(&evolution_options).map_err(invalid_data)?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -2381,6 +2388,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         0.0
     };
     let neural_learning = env_neural_learning_config()?;
+    validate_soccer_neural_learning_config_for_learning_run(&neural_learning)
+        .map_err(invalid_data)?;
     let default_config = MatchConfig::default();
     let adversarial_embedding_exploitation_enabled = env_bool_alias(
         "SOCCER_ADVERSARIAL_EMBEDDING_EXPLOITATION_ENABLED",

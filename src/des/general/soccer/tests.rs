@@ -1880,6 +1880,69 @@ fn pass_lane_clearance_catches_a_defender_drifting_into_the_lane() {
 }
 
 #[test]
+fn visible_pass_targets_filter_defender_who_can_step_into_lane() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_208,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let receiver = 9usize;
+    let interceptor = 14usize;
+    park_players_except(&mut sim, &[passer, receiver, interceptor]);
+    sim.players[passer].position = Vec2::new(40.0, 60.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].action_facing = FacingBucket::South;
+    sim.players[passer].receive_facing = FacingBucket::South;
+    sim.players[passer].skills.passing_completion_rate = 8.4;
+    sim.players[passer].skills.passing = 8.4;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(40.0, 78.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[interceptor].position = Vec2::new(43.0, 68.0);
+    sim.players[interceptor].velocity = Vec2::new(-8.0, 0.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(snapshot.player_can_see_player(passer, receiver));
+    assert!(
+        snapshot.clear_line(
+            sim.players[passer].position,
+            sim.players[receiver].position,
+            Team::Away,
+            2.5
+        ),
+        "static lane is clear at decision time"
+    );
+    let nominal_speed = pass_speed_yps_from_power(
+        0.68,
+        PassFlight::Floor,
+        false,
+        &sim.players[passer].skills,
+    );
+    assert_eq!(
+        snapshot.pass_lane_clearance(
+            sim.players[passer].position,
+            sim.players[receiver].position,
+            Team::Away,
+            2.5,
+            nominal_speed,
+        ),
+        (true, false),
+        "movement-aware lane should catch the defender stepping into the pass"
+    );
+
+    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 11);
+    assert!(
+        !visible_targets.contains(&receiver),
+        "ordinary visible pass options must not expose a lane the defender can cut out: {visible_targets:?}"
+    );
+}
+
+#[test]
 fn final_third_pressure_exposes_killer_pass_option() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -44615,6 +44678,80 @@ fn a_defender_inside_two_yards_shifts_the_carrier_toward_passing() {
     assert!(
         dribble_crowded < dribble_open,
         "a defender inside 2yd must damp dribbling: crowded={dribble_crowded} open={dribble_open}"
+    );
+}
+
+#[test]
+fn defender_in_possession_keeps_three_to_four_yards_and_releases_as_gap_closes() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 4;
+    let receiver = 7;
+    park_players_except(&mut sim, &[holder, receiver]);
+    sim.players[holder].role = PlayerRole::Defender;
+    sim.players[holder].position = Vec2::new(40.0, 38.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].preferences.dribble_bias = 0.36;
+    sim.players[holder].preferences.pass_bias = 0.38;
+    sim.players[holder].skills.dribbling = 5.8;
+    sim.players[holder].skills.passing = 6.1;
+    sim.players[holder].skills.passing_completion_rate = 6.1;
+    sim.players[receiver].position = Vec2::new(46.0, 53.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let directive = snapshot.tactical_directive(Team::Home);
+    let base = snapshot.observation_for(holder);
+    let scores = |gap: f64, closing_rate: f64| {
+        let mut observation = base.clone();
+        observation.nearest_opponent_distance = gap;
+        observation
+            .neural_extended
+            .nearest_opponent_closing_rate_yps = closing_rate;
+        observation.perceived_pressure = 0.16;
+        observation.pressure_urgency = 0.14;
+        observation.immediate_dispossession_risk = 0.08;
+        observation.visible_pass_options = 1;
+        observation.visible_forward_pass_options = 1;
+        observation.open_support_outlets = 1;
+        observation.teammates_ahead = 6;
+        observation.forward_dribble_space_yards = 9.0;
+        observation.expected_pass_completion = 0.82;
+        observation.best_pass_receiver_openness = 0.84;
+        observation.floor_pass_lane_score = 0.82;
+        observation.yards_to_own_goal = 38.0;
+        observation.yards_to_goal = 82.0;
+        let options = sim.players[holder].possession_action_options(
+            &observation,
+            &directive,
+            1,
+            0,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        );
+        let pass = action_option_score(&options, "pass1");
+        let carry = action_option_score(&options, "dribble")
+            .max(action_option_score(&options, "carry-forward"));
+        (pass, carry)
+    };
+
+    let (open_pass, open_carry) = scores(5.5, 0.0);
+    let (soft_gap_pass, soft_gap_carry) = scores(3.25, 0.0);
+    let (closing_pass, closing_carry) = scores(3.25, 6.0);
+
+    assert!(
+        soft_gap_pass > open_pass * 1.08,
+        "a defender should already prefer release before the gap drops below 2yd: open={open_pass} soft_gap={soft_gap_pass}"
+    );
+    assert!(
+        soft_gap_carry < open_carry * 0.94,
+        "a defender should damp dribbling inside the 3-4yd comfort gap: open={open_carry} soft_gap={soft_gap_carry}"
+    );
+    assert!(
+        closing_pass / closing_carry > soft_gap_pass / soft_gap_carry + 0.18,
+        "closing pressure should increase defender pass urgency: closing={closing_pass}/{closing_carry} soft_gap={soft_gap_pass}/{soft_gap_carry}"
     );
 }
 

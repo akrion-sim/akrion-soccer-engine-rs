@@ -15,16 +15,18 @@ use serde_json::Value;
 
 use crate::des::general::prng::SeededRandom;
 use crate::des::general::soccer::{
-    MatchConfig, MatchSummary, SoccerMatch, SoccerNeuralNetworkSnapshot, SoccerQEntry,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
-    SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
-    SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team,
+    MatchConfig, MatchSummary, SoccerMatch, SoccerNeuralLearningConfig,
+    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
+    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
+    SoccerTeamQPolicies, Team,
 };
 use crate::des::shared::capabilities::RandomSource;
 
 pub const SOCCER_LEARNING_FIXED_SCALE: i64 = 1_000_000;
 pub const SOCCER_POLICY_STATUS_ACTIVE: &str = "active";
 pub const SOCCER_POLICY_STATUS_ARCHIVED: &str = "archived";
+pub const SOCCER_EVOLUTION_MAX_POPULATION_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -200,6 +202,132 @@ impl Default for SoccerEvolutionOptions {
             seed: 2026,
         }
     }
+}
+
+pub fn validate_soccer_evolution_options_for_learning_run(
+    options: &SoccerEvolutionOptions,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("mutationRate", options.mutation_rate),
+        ("crossoverRate", options.crossover_rate),
+        ("explorationRate", options.exploration_rate),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be finite and in [0, 1]"));
+        }
+    }
+    for (name, value) in [
+        ("mutationScale", options.mutation_scale),
+        ("explorationScale", options.exploration_scale),
+        ("eliteWeightFloor", options.elite_weight_floor),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("{name} must be finite and non-negative"));
+        }
+    }
+    if !(1..=SOCCER_EVOLUTION_MAX_POPULATION_SIZE).contains(&options.population_size) {
+        return Err(format!(
+            "populationSize must be in [1, {SOCCER_EVOLUTION_MAX_POPULATION_SIZE}]"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_soccer_q_policy_options_for_learning_run(
+    options: &SoccerQPolicyOptions,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("alpha", options.alpha),
+        ("gamma", options.gamma),
+        ("explorationEpsilon", options.exploration_epsilon),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be finite and in [0, 1]"));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_soccer_neural_learning_config_for_learning_run(
+    config: &SoccerNeuralLearningConfig,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("learningRate", config.learning_rate),
+        ("targetScale", config.target_scale),
+        ("targetClip", config.target_clip),
+        ("criticBaselineWeight", config.critic_baseline_weight),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("{name} must be finite"));
+        }
+    }
+    if !config.enabled {
+        return Ok(());
+    }
+    if config.learning_rate <= 0.0 {
+        return Err("learningRate must be positive when neural learning is enabled".to_string());
+    }
+    if config.batch_size == 0 {
+        return Err("batchSize must be at least 1 when neural learning is enabled".to_string());
+    }
+    if config.train_every_ticks == 0 {
+        return Err(
+            "trainEveryTicks must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if config.max_batches_per_tick == 0 {
+        return Err(
+            "maxBatchesPerTick must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if config.hidden_units < 2 {
+        return Err("hiddenUnits must be at least 2 when neural learning is enabled".to_string());
+    }
+    if config.target_scale <= 1e-9 {
+        return Err("targetScale must be positive when neural learning is enabled".to_string());
+    }
+    if config.max_pending_batches == 0 {
+        return Err(
+            "maxPendingBatches must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if config.replay_capacity == 0 {
+        return Err(
+            "replayCapacity must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if config.replay_samples_per_tick == 0 {
+        return Err(
+            "replaySamplesPerTick must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if config.target_clip <= 0.0 {
+        return Err("targetClip must be positive when neural learning is enabled".to_string());
+    }
+    if config.snapshot_every_batches == 0 {
+        return Err(
+            "snapshotEveryBatches must be at least 1 when neural learning is enabled".to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&config.critic_baseline_weight) {
+        return Err(
+            "criticBaselineWeight must be in [0, 1] when neural learning is enabled".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn soccer_evolution_population_size_for_learning_run(population_size: usize) -> usize {
+    population_size.clamp(1, SOCCER_EVOLUTION_MAX_POPULATION_SIZE)
+}
+
+fn normalize_soccer_evolution_options_for_learning_search(
+    mut options: SoccerEvolutionOptions,
+) -> Result<SoccerEvolutionOptions, String> {
+    options.population_size =
+        soccer_evolution_population_size_for_learning_run(options.population_size);
+    validate_soccer_evolution_options_for_learning_run(&options)?;
+    Ok(options)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -439,6 +567,8 @@ pub fn soccer_evolution_options_from_search_metadata(
         apply_soccer_evolution_search_preset(&mut options, preset, patch);
     }
     let Some(patch) = patch else {
+        options.population_size =
+            soccer_evolution_population_size_for_learning_run(options.population_size);
         return Some(options);
     };
     if let Some(value) = patch.mutation_rate.filter(|value| value.is_finite()) {
@@ -460,11 +590,13 @@ pub fn soccer_evolution_options_from_search_metadata(
         options.elite_weight_floor = value.max(0.0);
     }
     if let Some(value) = patch.population_size {
-        options.population_size = value.max(1);
+        options.population_size = soccer_evolution_population_size_for_learning_run(value);
     }
     if let Some(value) = patch.seed {
         options.seed = value;
     }
+    options.population_size =
+        soccer_evolution_population_size_for_learning_run(options.population_size);
     Some(options)
 }
 
@@ -1121,7 +1253,8 @@ pub fn evolve_soccer_team_policies(
     parents: &[(&SoccerTeamQPolicies, f64)],
     options: SoccerEvolutionOptions,
 ) -> Result<SoccerTeamQPolicies, String> {
-    let population_size = options.population_size.max(1);
+    let options = normalize_soccer_evolution_options_for_learning_search(options)?;
+    let population_size = options.population_size;
     let mut best = None::<(SoccerTeamQPolicies, f64)>;
     for candidate_index in 0..population_size {
         let mut candidate_options = options;
@@ -1235,6 +1368,9 @@ pub fn evolve_soccer_tactical_learning_weights(
     parents: &[(&SoccerTacticalLearningSummary, f64)],
     options: SoccerEvolutionOptions,
 ) -> SoccerTacticalLearningWeights {
+    let Ok(options) = normalize_soccer_evolution_options_for_learning_search(options) else {
+        return base.clone();
+    };
     let Some(weighted_summary) = weighted_tactical_evolution_summary(parents, options) else {
         return base.clone();
     };
@@ -1272,6 +1408,9 @@ pub fn evolve_soccer_tactical_learning_weights_from_genomes(
     parents: &[SoccerTacticalLearningGenomeParent<'_>],
     options: SoccerEvolutionOptions,
 ) -> SoccerTacticalLearningWeights {
+    let Ok(options) = normalize_soccer_evolution_options_for_learning_search(options) else {
+        return base.clone();
+    };
     let summary_parents = parents
         .iter()
         .map(|parent| (parent.summary, parent.fitness))
@@ -2367,6 +2506,8 @@ pub fn adapt_soccer_evolution_options_for_tactical_search(
     mut options: SoccerEvolutionOptions,
     summary: &SoccerTacticalLearningSummary,
 ) -> SoccerEvolutionOptions {
+    options.population_size =
+        soccer_evolution_population_size_for_learning_run(options.population_size);
     let pressure = soccer_tactical_search_pressure(summary);
     if pressure <= 1e-12 {
         return options;
@@ -3166,6 +3307,8 @@ where
 {
     let started = Instant::now();
     let mut config = config;
+    validate_soccer_q_policy_options_for_learning_run(&config.options)?;
+    validate_soccer_neural_learning_config_for_learning_run(&config.match_config.neural_learning)?;
     let parallel_games = config.parallel_games.clamp(1, 100);
     let (task_tx, task_rx) = mpsc::sync_channel::<SoccerLearningQueueTask>(parallel_games);
     let task_rx = Arc::new(Mutex::new(task_rx));
@@ -3220,6 +3363,14 @@ where
                     neural_network: &mut latest_neural_network,
                 }) {
                     first_error = Some(err);
+                    break;
+                }
+                if let Err(err) = validate_soccer_neural_learning_config_for_learning_run(
+                    &config.match_config.neural_learning,
+                ) {
+                    first_error = Some(format!(
+                        "soccer learning queue neural config invalid for episode {next_episode}: {err}"
+                    ));
                     break;
                 }
                 let starting_policies =
@@ -4113,6 +4264,98 @@ mod tests {
         assert!(options.crossover_rate >= 0.40);
         assert!(options.exploration_rate >= 0.05);
         assert!(options.exploration_scale >= 0.50);
+    }
+
+    #[test]
+    fn learning_run_validators_accept_enabled_neural_and_default_evolution() {
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            ..SoccerNeuralLearningConfig::default()
+        };
+
+        validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect("default enabled neural learning config should be valid");
+        validate_soccer_evolution_options_for_learning_run(&SoccerEvolutionOptions::default())
+            .expect("default evolution options should be valid");
+        validate_soccer_q_policy_options_for_learning_run(&SoccerQPolicyOptions::default())
+            .expect("default q-policy options should be valid");
+    }
+
+    #[test]
+    fn learning_run_validator_rejects_neural_values_that_would_sanitize_silently() {
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            batch_size: 0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("zero neural batch size should fail fast");
+
+        assert!(err.contains("batchSize"), "{err}");
+
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            target_scale: -1.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("negative neural target scale should fail fast");
+
+        assert!(err.contains("targetScale"), "{err}");
+    }
+
+    #[test]
+    fn learning_run_validator_rejects_q_policy_exploration_epsilon_drift() {
+        let options = SoccerQPolicyOptions {
+            exploration_epsilon: 1.25,
+            ..SoccerQPolicyOptions::default()
+        };
+
+        let err = validate_soccer_q_policy_options_for_learning_run(&options)
+            .expect_err("exploration epsilon above one should fail fast");
+
+        assert!(err.contains("explorationEpsilon"), "{err}");
+    }
+
+    #[test]
+    fn learning_run_validator_rejects_out_of_range_evolution_options() {
+        let bad_rate = SoccerEvolutionOptions {
+            mutation_rate: 1.25,
+            ..SoccerEvolutionOptions::default()
+        };
+        let err = validate_soccer_evolution_options_for_learning_run(&bad_rate)
+            .expect_err("mutation rate above one should fail");
+        assert!(err.contains("mutationRate"), "{err}");
+
+        let huge_population = SoccerEvolutionOptions {
+            population_size: SOCCER_EVOLUTION_MAX_POPULATION_SIZE + 1,
+            ..SoccerEvolutionOptions::default()
+        };
+        let err = validate_soccer_evolution_options_for_learning_run(&huge_population)
+            .expect_err("unbounded search population should fail");
+        assert!(err.contains("populationSize"), "{err}");
+    }
+
+    #[test]
+    fn evolution_metadata_caps_population_size_for_learning_run() {
+        let metadata = serde_json::json!({
+            "algorithm": "evolutionary-genetic-programming",
+            "options": {
+                "populationSize": SOCCER_EVOLUTION_MAX_POPULATION_SIZE + 99
+            }
+        });
+
+        let options = soccer_evolution_options_from_search_metadata(
+            Some(&metadata),
+            SoccerEvolutionOptions::default(),
+        )
+        .expect("postgres search metadata options");
+
+        assert_eq!(
+            options.population_size,
+            SOCCER_EVOLUTION_MAX_POPULATION_SIZE
+        );
     }
 
     #[test]
@@ -5559,6 +5802,79 @@ mod tests {
         assert!(saw_starting_batch);
         assert_eq!(report.completed_games, 1);
         assert_eq!(report.failed_games, 0);
+    }
+
+    #[test]
+    fn queue_rejects_starting_batch_neural_config_that_would_sanitize_silently() {
+        let options = SoccerQPolicyOptions::default();
+        let err = run_soccer_learning_queue_with_events(
+            SoccerLearningQueueRunnerConfig {
+                games: 1,
+                parallel_games: 1,
+                base_seed: 2001,
+                match_config: MatchConfig {
+                    duration_seconds: 0.0,
+                    half_duration_seconds: 0.0,
+                    learning_logging_enabled: false,
+                    max_human_players: 0,
+                    neural_learning: SoccerNeuralLearningConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                initial_neural_network: None,
+                neural_drain_timeout: Duration::from_millis(0),
+                options: options.clone(),
+                prune_action_entries_per_team: 0,
+                prune_target_entries_per_team: 0,
+                min_policy_visits: 0,
+            },
+            SoccerTeamQPolicies::new(options),
+            |event| {
+                if let SoccerLearningQueueEvent::StartingBatch { match_config, .. } = event {
+                    match_config.neural_learning.batch_size = 0;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("queue should reject invalid per-episode neural config");
+
+        assert!(err.contains("episode 0"), "{err}");
+        assert!(err.contains("batchSize"), "{err}");
+    }
+
+    #[test]
+    fn queue_rejects_invalid_q_policy_options_before_worker_start() {
+        let options = SoccerQPolicyOptions {
+            exploration_epsilon: f64::NAN,
+            ..SoccerQPolicyOptions::default()
+        };
+        let err = run_soccer_learning_queue_with_events(
+            SoccerLearningQueueRunnerConfig {
+                games: 1,
+                parallel_games: 1,
+                base_seed: 2003,
+                match_config: MatchConfig {
+                    duration_seconds: 0.0,
+                    half_duration_seconds: 0.0,
+                    learning_logging_enabled: false,
+                    max_human_players: 0,
+                    ..Default::default()
+                },
+                initial_neural_network: None,
+                neural_drain_timeout: Duration::from_millis(0),
+                options,
+                prune_action_entries_per_team: 0,
+                prune_target_entries_per_team: 0,
+                min_policy_visits: 0,
+            },
+            SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()),
+            |_| Ok(()),
+        )
+        .expect_err("queue should reject invalid q-policy options");
+
+        assert!(err.contains("explorationEpsilon"), "{err}");
     }
 
     #[test]

@@ -28,9 +28,11 @@ use soccer_engine::des::soccer_learning::{
     soccer_postgres_policy_refresh_decision, soccer_self_play_artifact_from_queue_report,
     soccer_should_flush_postgres_policy_versions_for_new_sim,
     soccer_should_refresh_postgres_for_new_sim, soccer_tactical_learning_weights_fingerprint,
-    soccer_team_q_policies_fingerprint, SoccerEvolutionOptions, SoccerLearningCompletedGame,
-    SoccerLearningQueueEvent, SoccerLearningQueueRunnerConfig, SoccerPostgresPolicyRefreshCheck,
-    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE,
+    soccer_team_q_policies_fingerprint, validate_soccer_evolution_options_for_learning_run,
+    validate_soccer_neural_learning_config_for_learning_run, SoccerEvolutionOptions,
+    SoccerLearningCompletedGame, SoccerLearningQueueEvent, SoccerLearningQueueRunnerConfig,
+    SoccerPostgresPolicyRefreshCheck, SoccerTacticalLearningGenomeParent,
+    SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::{
     SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
@@ -1146,6 +1148,11 @@ fn validate_queue_settings(
     if !options.gamma.is_finite() || !(0.0..=1.0).contains(&options.gamma) {
         return Err(invalid_data("SOCCER_GAMMA must be finite and in [0, 1]").into());
     }
+    if !options.exploration_epsilon.is_finite()
+        || !(0.0..=1.0).contains(&options.exploration_epsilon)
+    {
+        return Err(invalid_data("SOCCER_EXPLORATION_EPSILON must be finite and in [0, 1]").into());
+    }
     Ok(())
 }
 
@@ -1183,6 +1190,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let learning_interval_ticks = env_usize("SOCCER_LEARNING_INTERVAL_TICKS", 4)?;
     let seed = env_u32("SOCCER_SEED", 2026)?;
     let neural_learning = env_neural_learning_config()?;
+    validate_soccer_neural_learning_config_for_learning_run(&neural_learning)
+        .map_err(invalid_data)?;
     let neural_drain_timeout_ms = env_usize_alias(
         "SOCCER_QUEUE_NEURAL_DRAIN_TIMEOUT_MS",
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
@@ -1310,6 +1319,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             default_evolution_options.seed as u32,
         )? as u64,
     };
+    validate_soccer_evolution_options_for_learning_run(&evolution_options).map_err(invalid_data)?;
     let options = SoccerQPolicyOptions {
         alpha: env_f64("SOCCER_ALPHA", 0.20)?,
         gamma: env_f64("SOCCER_GAMMA", 0.96)?,
