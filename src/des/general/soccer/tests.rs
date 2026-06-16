@@ -36839,6 +36839,40 @@ fn goalkeeper_loose_ball_recovery_holds_ball_goal_line_until_collection_window()
 }
 
 #[test]
+fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let defender = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .expect("home defender")
+        .id;
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let target = Vec2::new(width * 0.5, 8.0); // a loose ball inside the home box
+    assert!(sim.point_in_own_penalty_area(Team::Home, target));
+    park_players_except(&mut sim, &[keeper, defender]);
+    sim.players[keeper].position = Vec2::new(width * 0.5, 1.0); // deep on his line
+
+    // A covering defender is right on the ball → clearly his → keeper must NOT charge.
+    sim.players[defender].position = target + Vec2::new(0.3, 0.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper must defer to a defender clearly winning the in-box loose ball"
+    );
+
+    // Pull the defender away → keeper is the favourite → it still commits (its box).
+    sim.players[defender].position = Vec2::new(width * 0.5, length - 5.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper must commit to the in-box loose ball when no teammate is winning it"
+    );
+}
+
+#[test]
 fn goalkeeper_loose_ball_hold_sprints_back_to_direct_line_when_off_position() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");

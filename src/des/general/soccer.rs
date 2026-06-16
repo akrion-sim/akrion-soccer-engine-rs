@@ -1781,6 +1781,14 @@ const OFFSIDE_TRAP_MAX_ONSIDE_DEPTH_YARDS: f64 = 14.0;
 /// Keeper sweep reach used to discount the cover drop: a through ball the keeper can come
 /// and intercept needs less covering from the back line.
 const SWEEPER_KEEPER_INTERCEPT_REACH_YARDS: f64 = 22.0;
+/// In his own box the keeper may come for a loose ball, but defers to a teammate
+/// who will reach it CLEARLY first — beating the keeper to it by this margin (s)...
+const GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS: f64 = 0.25;
+/// ...AND beating the nearest opponent to it by this margin (s) too, i.e. a safe,
+/// uncontested teammate win. Without this the keeper charged EVERY in-box loose
+/// ball, rushing through a covering defender who was ~99% going to win it (a real
+/// flaw: collisions / own-goals). In a contested 50/50 the keeper still commits.
+const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
 // A pressured recovering defender may play it back to the keeper, but only a controllable
 // 8-40yd ball: shorter is pointless, longer risks an incomplete pass across our own area.
 const GK_BACKPASS_MIN_YARDS: f64 = 8.0;
@@ -37443,6 +37451,7 @@ fn tracking_frame_to_world_snapshot(
                 last_decision: None,
                 learned_policy: None,
                 recent_reward: None,
+                one_two: None,
             }
         })
         .collect::<Vec<_>>();
@@ -38774,6 +38783,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         preferences: player.preferences.clone(),
         last_decision: None,
         decision_confidence: 1.0,
+        one_two: player.one_two,
     }
 }
 
@@ -44507,6 +44517,7 @@ fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAg
                 preferences,
                 last_decision: None,
                 decision_confidence: 1.0,
+                one_two: None,
             });
         }
     }

@@ -12057,6 +12057,10 @@ pub struct PlayerSnapshot {
     /// holder player so the UI shows it instead of "waiting").
     #[serde(default)]
     pub recent_reward: Option<f64>,
+    /// Live one-two / wall-pass commitment (mirrors [`PlayerAgent::one_two`]) so the
+    /// wall partner and the runner can read it from the shared snapshot.
+    #[serde(default)]
+    pub one_two: Option<OneTwoRun>,
 }
 
 /// "You are camped on a teammate — one of you should move." Produced by the match
@@ -12713,6 +12717,7 @@ impl WorldSnapshot {
                 },
                 learned_policy: None,
                 recent_reward: None,
+                one_two: p.one_two,
             })
             .collect::<Vec<_>>();
         let pending_pass = m.pending_pass.as_ref().map(|pass| {
@@ -14390,6 +14395,13 @@ impl WorldSnapshot {
         // Cap how far off the line the keeper drifts so it stays INSIDE the 18-yard box
         // (depth ≤ 16yd) rather than sweeping out to the edge on every shift of the ball.
         let raw_depth = (3.5 + ball_pressure * 12.5 + holder_pressure * 4.2).clamp(3.5, 16.0);
+        // Genome: a sweeper-keeper holds a ~2yd higher line (readier to step out). The
+        // neutral default genome leaves this unchanged.
+        let raw_depth = if self.genome_for(team).sweeper_keeper {
+            (raw_depth + 2.0).min(18.0)
+        } else {
+            raw_depth
+        };
         let depth = raw_depth.min((ball_distance - 0.85).max(0.0));
         let target = goal + to_ball.normalized() * depth;
         // Keep it laterally within the penalty area too — it shouldn't follow a wide ball
@@ -17614,9 +17626,6 @@ impl WorldSnapshot {
         let Some(gk) = self.players.iter().find(|p| p.id == keeper_id) else {
             return false;
         };
-        if self.point_in_own_penalty_area(gk.team, target) {
-            return true;
-        }
         let sprint_time = |p: &PlayerSnapshot| {
             let speed = (player_top_speed_yps(p.role, &p.skills)
                 * fatigue_speed_factor(p.skills.stamina, p.fatigue)
@@ -17632,8 +17641,20 @@ impl WorldSnapshot {
             .filter(|p| p.team == gk.team && p.id != keeper_id)
             .map(sprint_time)
             .fold(f64::INFINITY, f64::min);
-        // 99%-confident win over the opponent ≈ arriving in ≤65% of its time; and beat the
-        // nearest teammate to it by more than 0.5s (else hold the line, let the defender go).
+        if self.point_in_own_penalty_area(gk.team, target) {
+            // In his own box the keeper may come for a loose ball (and use his hands),
+            // BUT must NOT charge through a covering teammate who is the clear favourite
+            // to win it — rushing out when a defender is ~99% going to reach it first
+            // caused collisions / own-goals and was a real flaw. Defer ONLY to a
+            // teammate who reaches it clearly before BOTH the keeper and any opponent
+            // (a safe, uncontested win); in a contested 50/50 the keeper still commits.
+            let teammate_clearly_wins = teammate_time + GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS
+                < gk_time
+                && teammate_time + GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS < opponent_time;
+            return !teammate_clearly_wins;
+        }
+        // Out of the box the keeper only sweeps with ~99% certainty: arrive in ≤65% of
+        // the opponent's time AND beat the nearest teammate to it by more than 0.5s.
         gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time
     }
 
