@@ -13170,11 +13170,33 @@ impl WorldSnapshot {
         false
     }
 
+    /// Returns the carrier's id and position when our team holds the ball through an
+    /// outfield player who is effectively unpressured — the nearest opponent is more than
+    /// `UNCONTESTED_CARRIER_SPACE_YARDS` away, so no one is committed to a tackle. Unlike
+    /// `forward_attacking_momentum` / `attacking_carrier_driving_at_goal`, this does NOT
+    /// require the carrier to already be at a sprint: a teammate dribbling the ball in
+    /// space, even calmly, is exactly the moment off-ball mids/forwards should push up to
+    /// support — not hold shape or drift back. It is the cue that keeps support runners
+    /// advancing with a free carrier (and lifts them to a sprint to get there).
+    pub(crate) fn uncontested_carrier_advancing(&self, team: Team) -> Option<(usize, Vec2)> {
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team || holder.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        if self.nearest_opponent_distance_at(team, holder_pos) < UNCONTESTED_CARRIER_SPACE_YARDS {
+            return None;
+        }
+        Some((holder_id, holder_pos))
+    }
+
     pub(crate) fn attacking_support_sprint_active(&self, team: Team) -> bool {
         self.striker_holder_in_opponent_half(team).is_some()
             || self.attacking_carrier_driving_at_goal(team).is_some()
             || self.team_speed_surge_active(team)
             || self.forward_attacking_momentum(team)
+            || self.uncontested_carrier_advancing(team).is_some()
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
@@ -21128,6 +21150,11 @@ impl WorldSnapshot {
     /// offensive-minded mid/forward does not get sent net-backward (a small tolerance
     /// preserves micro-shape). Keeps attackers threatening the goal rather than drifting
     /// away from it — the only thing that should pull them back is losing the ball.
+    ///
+    /// When a teammate is carrying the ball UNPRESSURED, this also actively edges the
+    /// support point goalward (kept onside) and gives no backward ground at all, even from
+    /// our own half and before the carrier is at a sprint — so the free carrier is
+    /// supported forward in numbers rather than left to dribble alone.
     fn apply_attacking_forward_intent_floor(&self, me: &PlayerSnapshot, point: Vec2) -> Vec2 {
         if self.possession_team() != Some(me.team)
             || !matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder)
@@ -21136,19 +21163,48 @@ impl WorldSnapshot {
             return point;
         }
         let attack = me.team.attack_dir();
-        if (self.ball.position.y - self.field_length * 0.5) * attack
-            < ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS
+        let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
+        // In our own half a drop to receive is still valid — unless a teammate is carrying
+        // the ball unpressured, which is the cue to push up and support forward instead.
+        if !uncontested_support
+            && (self.ball.position.y - self.field_length * 0.5) * attack
+                < ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS
         {
             return point;
         }
         let current = self.player_snapshot_position(me);
+        let mut point = point;
+        if uncontested_support {
+            // Edge the support point goalward to push up with the free carrier, but never
+            // beyond the onside line — the burst in behind happens when the ball is
+            // actually played (handled by the reception / in-behind movement). Only apply
+            // the push when it is genuinely forward of where support was already headed.
+            let pushed_y = current.y + attack * UNCONTESTED_SUPPORT_PUSH_YARDS;
+            let mut forward_y = if (pushed_y - point.y) * attack > 0.0 {
+                pushed_y
+            } else {
+                point.y
+            };
+            if let Some(line_y) = self.second_last_defender_line_for(me.team) {
+                let onside_cap_y = line_y - attack * ONSIDE_RUN_HOLD_BUFFER_YARDS;
+                if (forward_y - onside_cap_y) * attack > 0.0 {
+                    forward_y = onside_cap_y;
+                }
+            }
+            if (forward_y - point.y) * attack > 0.0 {
+                point = Vec2::new(point.x, forward_y)
+                    .clamp_to_pitch(self.field_width, self.field_length);
+            }
+        }
+        let backward_tolerance = if uncontested_support {
+            0.0
+        } else {
+            ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS
+        };
         let backward = (current.y - point.y) * attack;
-        if backward > ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS {
-            return Vec2::new(
-                point.x,
-                current.y - attack * ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS,
-            )
-            .clamp_to_pitch(self.field_width, self.field_length);
+        if backward > backward_tolerance {
+            return Vec2::new(point.x, current.y - attack * backward_tolerance)
+                .clamp_to_pitch(self.field_width, self.field_length);
         }
         point
     }

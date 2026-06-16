@@ -1784,6 +1784,16 @@ const FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS: f64 = 12.0;
 const ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS: f64 = 0.0;
 /// At most this much backward give is allowed (preserves micro-shape adjustments).
 const ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS: f64 = 1.5;
+/// A teammate carrying the ball counts as unpressured — a cue to support forward in
+/// numbers — while the nearest opponent is at least this far from him, i.e. no one is
+/// close enough to commit a tackle. Unlike the pace-based momentum cues, this fires even
+/// for a carrier dribbling calmly in space, which is exactly when off-ball mids/forwards
+/// should be pushing up rather than holding shape or drifting back.
+const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
+/// While supporting an unpressured carrier, an off-ball attacker edges his support point
+/// up to this many yards ahead of his current position (capped onside) so he actively
+/// pushes up with the free carrier instead of standing still.
+const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 4.0;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
