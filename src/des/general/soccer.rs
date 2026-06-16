@@ -994,6 +994,25 @@ const STAGNANT_PASS_PENALTY_WEIGHTS: [f64; 3] = [0.60, 0.28, 0.12];
 // is rewarded — much more so for a forward ball than a lateral or backward one.
 const PROGRESSIVE_PASS_RADIUS_YARDS: f64 = 3.0;
 const PROGRESSIVE_PASS_FORWARD_REWARD_PER_YARD: f64 = 0.42;
+// --- Recycled-possession urgency: force the ball forward when it ping-pongs between a tiny
+// set of players without progressing. Distinct from the STAGNANT pocket detector above: this
+// keys on the PLAYERS involved (the ball bouncing between the same ~2 men) and the net
+// goalward progress of the run, NOT a tight ball-travel radius, so back-and-forth across 8-12
+// yards still trips it. When >= RECYCLED_POSSESSION_MIN_RUN passes have stayed among at most
+// RECYCLED_POSSESSION_MAX_DISTINCT players AND the ball has gained less than
+// RECYCLED_POSSESSION_PROGRESS_YARDS goalward, the carrier's pass scoring tilts toward a
+// forward ball to a NEW player (boosted forward weight + a penalty on recycling it back).
+const RECYCLED_POSSESSION_MIN_RUN: usize = 4;
+const RECYCLED_POSSESSION_MAX_DISTINCT: usize = 2;
+const RECYCLED_POSSESSION_PROGRESS_YARDS: f64 = 6.0;
+// Urgency in [0,1]: base once the run first qualifies, +step for each extra non-progressing
+// pass beyond the minimum, capped.
+const RECYCLED_POSSESSION_URGENCY_BASE: f64 = 0.5;
+const RECYCLED_POSSESSION_URGENCY_STEP: f64 = 0.17;
+// How hard full urgency tilts the live pass choice: extra forward weight per goalward yard,
+// and a flat demerit on a non-progressing ball back to one of the recycle participants.
+const RECYCLED_POSSESSION_FORWARD_WEIGHT_BOOST: f64 = 0.55;
+const RECYCLED_POSSESSION_PINGPONG_PENALTY: f64 = 2.6;
 const PROGRESSIVE_PASS_LATERAL_REWARD_PER_YARD: f64 = 0.14;
 const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
@@ -14384,6 +14403,16 @@ fn soccer_goal_credit_transition_score(
             let acceleration = (context.actor_acceleration.len() / 10.0).clamp(0.0, 1.0);
             let speed = (context.actor_velocity.len() / 8.5).clamp(0.0, 1.0);
             let defender_stress = (1.0 - defender_space) * pressure.max(0.25);
+            // Taking a man on / dribbling under defender stress is only a credited positive
+            // for the most-advanced players (the three furthest forward, `teammates_ahead`
+            // 0..=2); for a deeper carrier the same act is a penalty, so the learners stop
+            // valuing deep players dribbling into pressure.
+            let advanced_dribbler_fit = match obs.teammates_ahead {
+                0 => 1.0,
+                1 => 0.74,
+                2 => 0.48,
+                _ => 0.0,
+            };
             0.34 + (obs.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0) * 0.86
                 + obs.open_space_score.clamp(0.0, 1.0) * 0.34
                 + target_forward.max(0.0) * 0.42
@@ -14391,7 +14420,8 @@ fn soccer_goal_credit_transition_score(
                 + goal_approach_fit * next_obs.goal_attack_window_score.clamp(0.0, 1.0) * 0.44
                 + speed * 0.18
                 + acceleration * 0.22
-                + defender_stress * 0.25
+                + defender_stress * 0.25 * advanced_dribbler_fit
+                - defender_stress * (1.0 - advanced_dribbler_fit) * 0.30
                 - obs.immediate_dispossession_risk.clamp(0.0, 1.0) * 0.80
                 - obs.fatigue.clamp(0.0, 1.0) * 0.18
                 - endline_trap_risk
@@ -37543,6 +37573,12 @@ fn tracking_frame_to_world_snapshot(
         formation_lp_guidance: Vec::new(),
         formation_lp_teams: Vec::new(),
         teammate_spacing_notices: Vec::new(),
+        // A tracking-frame reconstruction has no completed-pass chain, so there is no
+        // recycled-possession history to derive urgency from.
+        home_recycle_urgency: 0.0,
+        away_recycle_urgency: 0.0,
+        home_recycle_participants: Vec::new(),
+        away_recycle_participants: Vec::new(),
     }
 }
 
@@ -39213,13 +39249,25 @@ fn pressured_stale_dribble_learning_penalty_points(
         0.42 + non_elite_fit * 0.72
     };
     let possession_multiplier = if retained_team_possession { 0.78 } else { 1.12 };
+    // A deep carrier (not one of the three most-forward outfielders) who keeps dribbling
+    // under sustained pressure is penalized HARDER — they should release sooner the longer
+    // the pressure persists. The most-forward players keep the baseline discipline (no
+    // reduction: even a striker shouldn't dwell while about to be dispossessed); only
+    // deeper players get the escalating extra weight. `teammates_ahead` counts team-mates
+    // closer to goal, so 0..=2 are the three most-forward players.
+    let position_multiplier = match observation.teammates_ahead {
+        0 | 1 => 1.0,
+        2 => 1.10,
+        _ => 1.30,
+    };
     (EXCESSIVE_HOLD_PENALTY_POINTS
         * hold_pressure
         * (0.44 + danger_pressure * 0.56)
         * skill_multiplier
         * possession_multiplier
+        * position_multiplier
         * (1.0 - progress_relief * 0.74).clamp(0.20, 1.0))
-    .clamp(0.0, EXCESSIVE_HOLD_PENALTY_POINTS * 1.35)
+    .clamp(0.0, EXCESSIVE_HOLD_PENALTY_POINTS * 1.6)
 }
 
 fn immediate_dispossession_risk_for_player(

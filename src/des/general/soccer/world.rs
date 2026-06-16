@@ -4642,6 +4642,67 @@ impl SoccerMatch {
         (best_run, worst_interceptability)
     }
 
+    /// Detect a possession that is being recycled between a tiny set of players without the
+    /// ball progressing goalward — the ball ping-ponging between the same ~2 men for 4+ passes
+    /// while staying "level" with them. Returns an urgency in [0,1] (0 = not recycled) plus the
+    /// set of players the run has bounced between, so the carrier's pass scoring can tilt toward
+    /// a forward ball to a NEW player and demote handing it straight back to a recycle partner.
+    ///
+    /// Unlike `trailing_stagnant_pass_run`, this is NOT a tight ball-travel pocket: a square ball
+    /// played 10 yards and immediately returned never "escapes the players", so this keys on the
+    /// distinct PLAYER set and the run's net goalward gain, catching wider back-and-forth that
+    /// the pocket detector misses.
+    pub(crate) fn recycled_possession_urgency(&self, team: Team) -> (f64, Vec<usize>) {
+        let mut entries: Vec<&CompletedPassChainEntry> = Vec::new();
+        for entry in self.completed_pass_chain.iter().rev() {
+            if entry.team != team {
+                break;
+            }
+            let age_seconds = self.clock_seconds - entry.clock_seconds;
+            if !(0.0..=PASS_CHAIN_MAX_CONTINUATION_SECONDS).contains(&age_seconds) {
+                break;
+            }
+            entries.push(entry);
+        }
+        // `entries` is most-recent first. Grow the trailing window while the distinct player set
+        // (each pass contributes its `from` and `to`) stays at or under the cap, and keep the
+        // largest qualifying window. A run of 4+ passes bouncing among <= 2 players whose net
+        // goalward gain is under the progress threshold is a recycled, non-progressing possession.
+        let attack_dir = team.attack_dir();
+        let mut best_run = 0;
+        let mut best_participants: Vec<usize> = Vec::new();
+        let mut participants: Vec<usize> = Vec::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            for id in [entry.from, entry.to] {
+                if !participants.contains(&id) {
+                    participants.push(id);
+                }
+            }
+            if participants.len() > RECYCLED_POSSESSION_MAX_DISTINCT {
+                break;
+            }
+            let run = idx + 1;
+            if run < RECYCLED_POSSESSION_MIN_RUN {
+                continue;
+            }
+            // Net goalward gain across this window: earliest origin -> most recent reception.
+            let anchor_y = entries[run - 1].origin.y;
+            let latest_y = entries[0].end.y;
+            let net_forward = (latest_y - anchor_y) * attack_dir;
+            if net_forward <= RECYCLED_POSSESSION_PROGRESS_YARDS {
+                best_run = run;
+                best_participants = participants.clone();
+            }
+        }
+        if best_run < RECYCLED_POSSESSION_MIN_RUN {
+            return (0.0, Vec::new());
+        }
+        let urgency = (RECYCLED_POSSESSION_URGENCY_BASE
+            + (best_run - RECYCLED_POSSESSION_MIN_RUN) as f64 * RECYCLED_POSSESSION_URGENCY_STEP)
+            .clamp(0.0, 1.0);
+        (urgency, best_participants)
+    }
+
     /// Penalize a sterile pocket-passing run that ends on the just-recorded pass. The penalty
     /// compounds with the length of the run and with how interceptable the balls were (a
     /// short ball that risked a turnover yet still didn't advance is the worst), distributed
@@ -12103,6 +12164,17 @@ pub struct WorldSnapshot {
     /// and the player observation. Empty in the common case.
     #[serde(default)]
     pub teammate_spacing_notices: Vec<TeammateSpacingNotice>,
+    /// Recycled-possession urgency per team (0 = not recycled), with the small set of players
+    /// the possession is ping-ponging between. Derived once from the match's completed-pass
+    /// chain at snapshot build; read by the pass scoring to force the ball forward.
+    #[serde(default)]
+    pub(crate) home_recycle_urgency: f64,
+    #[serde(default)]
+    pub(crate) away_recycle_urgency: f64,
+    #[serde(default)]
+    pub(crate) home_recycle_participants: Vec<usize>,
+    #[serde(default)]
+    pub(crate) away_recycle_participants: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12678,6 +12750,11 @@ impl WorldSnapshot {
         let mut ball = m.ball.to_state();
         ball.scheduled_index = schedule_index_lookup.ball();
 
+        let (home_recycle_urgency, home_recycle_participants) =
+            m.recycled_possession_urgency(Team::Home);
+        let (away_recycle_urgency, away_recycle_participants) =
+            m.recycled_possession_urgency(Team::Away);
+
         WorldSnapshot {
             tick: m.tick,
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -12729,6 +12806,19 @@ impl WorldSnapshot {
                 Vec::new()
             },
             teammate_spacing_notices: m.teammate_spacing_notices.clone(),
+            home_recycle_urgency,
+            away_recycle_urgency,
+            home_recycle_participants,
+            away_recycle_participants,
+        }
+    }
+
+    /// Recycled-possession urgency (0 = none) and the players the possession is bouncing
+    /// between, for `team`. See [`SoccerMatch::recycled_possession_urgency`].
+    pub(crate) fn recycle_urgency_for(&self, team: Team) -> (f64, &[usize]) {
+        match team {
+            Team::Home => (self.home_recycle_urgency, &self.home_recycle_participants),
+            Team::Away => (self.away_recycle_urgency, &self.away_recycle_participants),
         }
     }
 
@@ -16247,6 +16337,11 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Recycled-possession urgency: if this possession has bounced between the same ~2 players
+        // for 4+ passes without progressing goalward, tilt the scoring toward a forward ball to a
+        // NEW teammate (boosted forward weight below) and demote handing it straight back to one
+        // of the recycle partners. Computed once per decision.
+        let (recycle_urgency, recycle_participants) = self.recycle_urgency_for(me.team);
         // Playing out from the own box under pressure: shape the pass choice toward a safe wide
         // ball and away from tiny passes / square balls across the own goal.
         let own_box_pressured = self.point_in_own_penalty_area(me.team, me_position)
@@ -16460,7 +16555,20 @@ impl WorldSnapshot {
                     0.0
                 };
                 let lateral_penalty = if lateral { 0.85 } else { 0.0 };
-                let forward_weight = 0.22 + directive.risk_tolerance * 0.30;
+                // Recycled possession: lean harder on forward progress and demote handing the
+                // ball straight back to a recycle partner unless THIS pass actually breaks the
+                // ball forward past them (a genuine progression escapes the recycle).
+                let forward_weight = 0.22
+                    + directive.risk_tolerance * 0.30
+                    + recycle_urgency * RECYCLED_POSSESSION_FORWARD_WEIGHT_BOOST;
+                let recycle_pingpong_penalty = if recycle_urgency > 0.0
+                    && recycle_participants.contains(&p.id)
+                    && forward <= RECYCLED_POSSESSION_PROGRESS_YARDS
+                {
+                    recycle_urgency * RECYCLED_POSSESSION_PINGPONG_PENALTY
+                } else {
+                    0.0
+                };
                 let role_bonus = match p.role {
                     PlayerRole::Forward => 1.4,
                     PlayerRole::Midfielder => 1.05,
@@ -16531,6 +16639,7 @@ impl WorldSnapshot {
                 let score = forward * forward_weight + self.space_score_at(position, me.team)
                     - dist * 0.010
                     - support_fit * 0.020
+                    - recycle_pingpong_penalty
                     + confidence * 0.65
                     + role_bonus
                     + short_pass_preference

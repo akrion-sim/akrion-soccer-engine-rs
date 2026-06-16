@@ -3526,6 +3526,87 @@ fn stagnant_pass_run_penalizes_only_pocket_sequences() {
 }
 
 #[test]
+fn recycled_possession_urgency_fires_on_two_player_pingpong() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.clock_seconds = 30.0;
+    sim.tick = 300;
+    let team = Team::Home;
+
+    // The ball bounces between players 4 and 5 across several yards (so it is NOT a tight
+    // 2yd pocket) but never progresses goalward — a recycled, non-progressing possession.
+    let pingpong = [
+        (4usize, 5usize, Vec2::new(40.0, 40.0), Vec2::new(48.0, 41.0)),
+        (5, 4, Vec2::new(48.0, 41.0), Vec2::new(40.0, 40.5)),
+        (4, 5, Vec2::new(40.0, 40.5), Vec2::new(48.0, 42.0)),
+    ];
+    for (i, (from, to, origin, end)) in pingpong.iter().enumerate() {
+        sim.completed_pass_chain.push_back(CompletedPassChainEntry {
+            team,
+            from: *from,
+            to: *to,
+            direction: PassDirectionBucket::Lateral,
+            receiver_openness: 1.0,
+            target_forward_yards: 0.0,
+            origin: *origin,
+            end: *end,
+            tick: 280 + i as u64 * 5,
+            clock_seconds: 28.0 + i as f64 * 0.5,
+            continuation_rewarded: false,
+        });
+    }
+    // Three passes is below the 4-pass minimum -> no urgency yet.
+    let (urgency_three, _) = sim.recycled_possession_urgency(team);
+    assert_eq!(
+        urgency_three, 0.0,
+        "three recycle passes are below the minimum run"
+    );
+
+    // Fourth pass back to the same pair, still not progressing -> urgency fires on {4,5}.
+    sim.completed_pass_chain.push_back(CompletedPassChainEntry {
+        team,
+        from: 5,
+        to: 4,
+        direction: PassDirectionBucket::Lateral,
+        receiver_openness: 1.0,
+        target_forward_yards: 0.0,
+        origin: Vec2::new(48.0, 42.0),
+        end: Vec2::new(40.0, 41.0),
+        tick: 305,
+        clock_seconds: 30.0,
+        continuation_rewarded: false,
+    });
+    let (urgency, participants) = sim.recycled_possession_urgency(team);
+    assert!(
+        urgency > 0.0,
+        "4 non-progressing passes among 2 players raise urgency: urgency={urgency}"
+    );
+    assert!(
+        participants.contains(&4) && participants.contains(&5) && participants.len() == 2,
+        "urgency keys on the two recycle partners: {participants:?}"
+    );
+
+    // A forward ball that breaks the possession past the pair clears the urgency.
+    sim.completed_pass_chain.push_back(CompletedPassChainEntry {
+        team,
+        from: 4,
+        to: 7,
+        direction: PassDirectionBucket::Forward,
+        receiver_openness: 1.0,
+        target_forward_yards: 16.0,
+        origin: Vec2::new(40.0, 41.0),
+        end: Vec2::new(42.0, 58.0),
+        tick: 325,
+        clock_seconds: 31.0,
+        continuation_rewarded: false,
+    });
+    let (urgency_after_break, _) = sim.recycled_possession_urgency(team);
+    assert_eq!(
+        urgency_after_break, 0.0,
+        "a progressive ball to a new player clears recycle urgency: {urgency_after_break}"
+    );
+}
+
+#[test]
 fn completed_cross_reward_values_dangerous_scoring_channel_delivery() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let crosser = 8;
