@@ -32870,6 +32870,66 @@ fn defensive_target_guard_rejects_static_teammate_occupied_final_space() {
 }
 
 #[test]
+fn defending_pulls_off_ball_player_goal_side_of_ball_but_exempts_presser() {
+    // Away has the ball in Home's half; a Home outfielder caught UPFIELD of the ball
+    // (between the ball and the goal Home attacks) must be pulled back onto the own-goal
+    // side of it. The nearest Home outfielder to the ball — the presser — is exempt.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let away_holder = 17;
+    let presser = 6; // Home CM placed right on the ball -> closes it down, stays put.
+    let striker = 9; // Home ST caught high -> must recover goal-side.
+    park_players_except(&mut sim, &[away_holder, presser, striker]);
+    let ball = Vec2::new(40.0, 40.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = ball;
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.players[away_holder].position = ball;
+    sim.players[presser].position = Vec2::new(40.0, 39.0);
+    sim.players[striker].position = Vec2::new(45.0, 52.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // A proposed run that sits just upfield of the ball (not goal-side for Home, whose
+    // own goal is at y = 0).
+    let striker_proposed = Vec2::new(45.0, 44.0);
+    let striker_home = sim.players[striker].home_position;
+    let striker_guarded =
+        snapshot.shape_guarded_movement_point(striker, striker_proposed, &[], striker_home, true);
+    assert!(
+        striker_guarded.y <= ball.y - DEFENSIVE_GOAL_SIDE_MIN_YARDS + 1e-6,
+        "out-of-possession striker must be pulled to the own-goal side of the ball: \
+         guarded={striker_guarded:?} ball={ball:?}"
+    );
+
+    // The presser, given the same upfield proposal, is left free to engage the ball.
+    let presser_proposed = Vec2::new(40.0, 44.0);
+    let presser_home = sim.players[presser].home_position;
+    let presser_guarded =
+        snapshot.shape_guarded_movement_point(presser, presser_proposed, &[], presser_home, true);
+    assert!(
+        presser_guarded.y > ball.y,
+        "the primary presser must not be dragged goal-side: \
+         guarded={presser_guarded:?} ball={ball:?}"
+    );
+
+    // In possession (Home last touched), the override must be inert — no goal-side pull.
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot_pos = WorldSnapshot::from_match(&sim);
+    let striker_in_possession = snapshot_pos.shape_guarded_movement_point(
+        striker,
+        striker_proposed,
+        &[],
+        striker_home,
+        true,
+    );
+    assert!(
+        (striker_in_possession.y - striker_proposed.y).abs() < 1e-6,
+        "goal-side recovery must not fire when our own team has possession: \
+         guarded={striker_in_possession:?} proposed={striker_proposed:?}"
+    );
+}
+
+#[test]
 fn tactical_reward_penalizes_lane_swap_into_teammate_space() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let holder = 7;
@@ -42828,6 +42888,27 @@ fn non_elite_overheld_dribble_is_suppressed_under_pressure() {
             non_elite_release > elite_release + 0.80,
             "overheld non-elite carries should boost pass/clear release more than elite carries: non_elite={non_elite_release} elite={elite_release}"
         );
+}
+
+#[test]
+fn advanced_dribbler_fit_gates_take_on_appetite_to_the_three_most_forward() {
+    // The take-a-man-on / dribble-into-pressure appetite is reserved for the three
+    // most-forward outfielders (teammates_ahead 0..=2): full for the furthest forward,
+    // fading by rank, and zero for anyone deeper. Lock the shape (not the exact mid
+    // values) so the live policy and the learning-reward shaping can't silently drift.
+    assert_eq!(advanced_dribbler_fit_from_rank(0), 1.0);
+    assert!(advanced_dribbler_fit_from_rank(1) < advanced_dribbler_fit_from_rank(0));
+    assert!(advanced_dribbler_fit_from_rank(2) < advanced_dribbler_fit_from_rank(1));
+    assert!(
+        advanced_dribbler_fit_from_rank(2) > 0.0,
+        "the third-most-forward player keeps SOME appetite"
+    );
+    assert_eq!(
+        advanced_dribbler_fit_from_rank(3),
+        0.0,
+        "the fourth-most-forward (and deeper) gets no take-on appetite"
+    );
+    assert_eq!(advanced_dribbler_fit_from_rank(9), 0.0);
 }
 
 #[test]

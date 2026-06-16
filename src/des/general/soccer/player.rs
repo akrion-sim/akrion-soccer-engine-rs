@@ -598,16 +598,9 @@ impl PlayerAgent {
                 * observation.best_pass_receiver_openness.clamp(0.0, 1.0);
         // --- Positional dribble-risk appetite -----------------------------------------
         // Driving INTO pressure (taking a man on, carrying into traffic) is only worth the
-        // risk for the most-advanced players. `teammates_ahead` counts outfield team-mates
-        // closer to the opponent goal, so 0..=2 are the three most-forward players on the
-        // team; the appetite fades from rank 1 (none ahead) to rank 3 and is zero for anyone
-        // deeper, who should move the ball rather than dribble into the tackle.
-        let advanced_dribbler_fit = match observation.teammates_ahead {
-            0 => 1.0,
-            1 => 0.74,
-            2 => 0.48,
-            _ => 0.0,
-        };
+        // risk for the most-advanced players — the three furthest forward. See
+        // `advanced_dribbler_fit_from_rank` for the rank→appetite curve.
+        let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(observation.teammates_ahead);
         // How risky a dribble is right now: real pressure, a defender on top of the ball, or
         // a live chance of being dispossessed.
         let dribble_risk = pressure_urgency
@@ -624,7 +617,13 @@ impl PlayerAgent {
         // hold-time model.
         let deep_release_urgency =
             (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
-        hold_release_multiplier *= deep_release_urgency * keeper_release_under_pressure_lift;
+        // Stack the positional/keeper release lifts onto the hold-time release model, but
+        // cap the product so several "release sooner" signals firing at once (e.g. a
+        // pressured keeper, who is also a deep carrier) can't blow the multiplier past a
+        // sane ceiling. Downstream pass/shot caps re-clamp it too, so this is a guardrail.
+        hold_release_multiplier =
+            (hold_release_multiplier * deep_release_urgency * keeper_release_under_pressure_lift)
+                .clamp(1.0, 3.6);
         let pre_fatigue_dribble_score = (self.preferences.dribble_bias
             * (0.62 + dribbling * 0.48)
             * directive.carry_priority

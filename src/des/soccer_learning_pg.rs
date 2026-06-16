@@ -1299,6 +1299,21 @@ impl SoccerLearningPgStore {
         );
 
         if status == "active" {
+            // Serialize active-policy promotions PER EXPERIMENT so the
+            // archive-old-active + insert-new-active pair is atomic against any
+            // other promoter (a concurrent tournament run, the continuous learner,
+            // a second replica). Without it, under READ COMMITTED two promoters can
+            // each archive the other's not-yet-committed active and both insert,
+            // leaving TWO rows at status='active'. This transaction-scoped lock is
+            // auto-released on commit/rollback and only contends writers promoting
+            // the SAME experiment (different experiments hash to different keys, so
+            // the common single-writer path sees zero contention). Every promoter
+            // funnels through this function, so locking here covers them all.
+            tx.execute(
+                "select pg_advisory_xact_lock(hashtext('des-soccer-policy-active-promote'), hashtext($1))",
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions
@@ -1962,6 +1977,21 @@ impl SoccerLearningPgStore {
         );
 
         if status == "active" {
+            // Serialize active-policy promotions PER EXPERIMENT so the
+            // archive-old-active + insert-new-active pair is atomic against any
+            // other promoter (a concurrent tournament run, the continuous learner,
+            // a second replica). Without it, under READ COMMITTED two promoters can
+            // each archive the other's not-yet-committed active and both insert,
+            // leaving TWO rows at status='active'. This transaction-scoped lock is
+            // auto-released on commit/rollback and only contends writers promoting
+            // the SAME experiment (different experiments hash to different keys, so
+            // the common single-writer path sees zero contention). Every promoter
+            // funnels through this function, so locking here covers them all.
+            tx.execute(
+                "select pg_advisory_xact_lock(hashtext('des-soccer-policy-active-promote'), hashtext($1))",
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions

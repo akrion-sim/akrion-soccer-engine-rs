@@ -209,6 +209,21 @@ where
     ) {
         cfg.autoload_team_policy = autoload;
     }
+    // MPC execution layer: when enabled, the per-player projected-gradient QP
+    // (`PlanarPointMassMpc`) plans each active player's next-tick velocity, is made
+    // field-aware (other players + ball as moving keep-outs), and is reconciled/blended
+    // with the neural-policy velocity. Off by default (byte-identical); this master
+    // toggle turns the whole stack on so the QP + neural net actually drive execution.
+    if let Some(mpc) = env_bool(&lookup, "SOCCER_LIVE_MPC", "SOCCER_MPC_ENABLED") {
+        cfg.match_config.mpc.tier2_player_enabled = mpc;
+        cfg.match_config.mpc.field_aware_enabled = mpc;
+        cfg.match_config.mpc.reconcile_enabled = mpc;
+        if mpc {
+            println!(
+                "# soccer-live: MPC execution ENABLED — projected-gradient QP plans each active player's velocity (field-aware, reconciled with the neural policy)"
+            );
+        }
+    }
     if let Some(max_bytes) = env_nonnegative_u64(
         &lookup,
         "SOCCER_LIVE_POLICY_AUTOLOAD_MAX_BYTES",
@@ -278,7 +293,12 @@ mod tests {
         assert_eq!(cfg.http_worker_threads, 4);
         assert_eq!(cfg.match_config.dt_seconds, DEFAULT_DT_SECONDS);
         assert_eq!(cfg.match_config.duration_seconds, DEFAULT_DURATION_SECONDS);
-        assert_eq!(cfg.match_config.total_ticks(), 6_000);
+        // Derive the expected tick count from the default duration/dt (single period) rather
+        // than pinning a magic number, so a future duration/dt tweak doesn't falsely fail here.
+        assert_eq!(
+            cfg.match_config.total_ticks(),
+            (DEFAULT_DURATION_SECONDS / DEFAULT_DT_SECONDS).round() as u64,
+        );
         assert!(cfg.match_config.learning_enabled);
         assert!(!cfg.match_config.learning_logging_enabled);
         assert!(cfg.match_config.neural_learning.enabled);
@@ -320,6 +340,23 @@ mod tests {
             SoccerNeuralLearningBackend::Threaded
         );
         assert!(cfg.match_config.adversarial_embedding_exploitation_enabled);
+    }
+
+    #[test]
+    fn live_server_env_toggles_mpc_execution_stack() {
+        // Default: MPC off (byte-identical analytic path).
+        let off = live_server_config_from_lookup(|_| None);
+        assert!(!off.match_config.mpc.tier2_player_enabled);
+        assert!(!off.match_config.mpc.field_aware_enabled);
+        assert!(!off.match_config.mpc.reconcile_enabled);
+
+        // SOCCER_LIVE_MPC=1 turns on the whole QP + field-aware + neural-reconcile stack.
+        let vars = BTreeMap::from([("SOCCER_LIVE_MPC", "1")]);
+        let on =
+            live_server_config_from_lookup(|name| vars.get(name).map(|value| value.to_string()));
+        assert!(on.match_config.mpc.tier2_player_enabled);
+        assert!(on.match_config.mpc.field_aware_enabled);
+        assert!(on.match_config.mpc.reconcile_enabled);
     }
 
     #[test]
