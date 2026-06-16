@@ -84,6 +84,12 @@ pub struct SoccerMatch {
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
+    /// Per-tick whole-field configuration captures (ball carrier only) for the
+    /// retrieval corpus. Populated only when `config.retrieval.capture_enabled`;
+    /// joined with the transition stream by `(tick, player_id)` to attach the
+    /// decision + n-step outcome in [`SoccerMatch::config_moments`]. Empty (zero
+    /// cost) when capture is off.
+    pub(crate) episode_config_captures: Vec<SoccerConfigCapture>,
     pub(crate) full_game_learning_applied: bool,
     pub(crate) full_game_learning_replay_transitions: usize,
     pub(crate) possession_chain: VecDeque<usize>,
@@ -538,6 +544,7 @@ impl SoccerMatch {
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
             episode_learning_transitions: Vec::new(),
+            episode_config_captures: Vec::new(),
             full_game_learning_applied: false,
             full_game_learning_replay_transitions: 0,
             possession_chain,
@@ -2459,6 +2466,80 @@ impl SoccerMatch {
             .collect()
     }
 
+    /// Build the persisted **configuration moments** for the retrieval corpus:
+    /// one record per captured ball-carrier decision, with the whole-field
+    /// [`SoccerConfigVector`] embedding, the decision taken, and the outcome
+    /// (immediate MDP reward + discounted **n-step return** over that player's
+    /// subsequent transitions). Empty unless `config.retrieval.capture_enabled`
+    /// populated [`Self::episode_config_captures`] during the match.
+    ///
+    /// The n-step return follows the acting player's own future reward trajectory
+    /// — the realised MDP value of their decision — so a retrieval consumer can
+    /// rank neighbours by how the same decision actually worked out, not just by
+    /// similarity.
+    pub fn config_moments(&self) -> Vec<SoccerConfigMomentInsert> {
+        if self.episode_config_captures.is_empty() {
+            return Vec::new();
+        }
+        // Per-player ordered (tick, reward) timeline from the episode replay, so an
+        // n-step return can be summed forward from any captured tick.
+        let mut timelines: HashMap<usize, Vec<(u64, f64)>> = HashMap::new();
+        for transition in &self.episode_learning_transitions {
+            timelines
+                .entry(transition.player_id)
+                .or_default()
+                .push((transition.tick, finite_metric(transition.reward)));
+        }
+        for series in timelines.values_mut() {
+            series.sort_by_key(|(tick, _)| *tick);
+        }
+
+        let gamma = soccer_q_sanitized_gamma(self.config.retrieval.outcome_gamma);
+        let horizon = self.config.retrieval.outcome_horizon.max(1);
+
+        self.episode_config_captures
+            .iter()
+            .map(|capture| {
+                let timeline = timelines.get(&capture.player_id);
+                let immediate = timeline
+                    .and_then(|series| {
+                        series
+                            .iter()
+                            .find(|(tick, _)| *tick == capture.tick)
+                            .map(|(_, reward)| *reward)
+                    })
+                    .unwrap_or(0.0);
+                let nstep_return = timeline
+                    .map(|series| {
+                        let mut acc = 0.0;
+                        let mut discount = 1.0;
+                        for (_, reward) in series
+                            .iter()
+                            .filter(|(tick, _)| *tick >= capture.tick)
+                            .take(horizon)
+                        {
+                            acc += discount * reward;
+                            discount *= gamma;
+                        }
+                        acc
+                    })
+                    .unwrap_or(immediate);
+                let features_f64: Vec<f64> = capture.features.iter().map(|&f| f as f64).collect();
+                SoccerConfigMomentInsert {
+                    team: capture.team,
+                    tick: capture.tick,
+                    role: capture.role,
+                    action: capture.action.clone(),
+                    reward: immediate,
+                    nstep_return: finite_metric(nstep_return),
+                    value: None,
+                    embedding: soccer_moment_embedding(&features_f64),
+                    features: capture.features.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// State-only feature vector for the actor: the transition's features built
     /// with a **null action**, so the policy input is a pure function of state
     /// (the action-family channels are constant across candidates). Same builder
@@ -3916,6 +3997,35 @@ impl SoccerMatch {
                 if capture_full_game {
                     self.episode_learning_transitions
                         .extend(tick_transitions.iter().cloned());
+                }
+                // Retrieval corpus: capture the whole-field configuration for the
+                // ball carrier's decision this tick (≤1 per tick). The outcome
+                // (n-step return) is attached later by joining with the transition
+                // stream in `config_moments`. Gated off by default.
+                if self.config.retrieval.capture_enabled {
+                    if let Some(holder) = tick_start_snapshot.ball.holder {
+                        if let Some(carrier) =
+                            tick_transitions.iter().find(|t| t.player_id == holder)
+                        {
+                            let features = SoccerConfigVector::from_snapshot(
+                                &tick_start_snapshot,
+                                carrier.team,
+                            )
+                            .to_features()
+                            .iter()
+                            .map(|&f| f as f32)
+                            .collect();
+                            self.episode_config_captures.push(SoccerConfigCapture {
+                                tick: tick_start_snapshot.tick,
+                                player_id: holder,
+                                team: carrier.team,
+                                role: carrier.role,
+                                action: normalize_soccer_action_label(&carrier.action)
+                                    .to_string(),
+                                features,
+                            });
+                        }
+                    }
                 }
                 let phase_started = Instant::now();
                 self.remember_recent_learning_transitions(&tick_transitions);
@@ -21615,6 +21725,57 @@ impl WorldSnapshot {
             .clamp_to_pitch(self.field_width, self.field_length)
     }
 
+    /// Defensive goal-side recovery override: when our team is out of possession, pull
+    /// an off-ball target that has been caught upfield of the ball back onto the own-goal
+    /// side of it (the segment between the ball and our own goal). See the
+    /// `DEFENSIVE_GOAL_SIDE_*` constants for the geometry. This is the directive the
+    /// learned policy's `defensive_goal_side_reward` only ever nudged toward.
+    fn defensive_goal_side_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
+        if player.role == PlayerRole::Goalkeeper {
+            return target;
+        }
+        // Defending iff the opponent is the possession team. `possession_team` falls back
+        // to `last_touch_team`, so this stays true while their pass is in flight.
+        let opponent = player.team.other();
+        if self.possession_team() != Some(opponent) {
+            return target;
+        }
+        let ball = self.ball.position;
+        // The nearest outfield teammate to the ball is the primary presser — leave it free
+        // to close the ball down rather than dropping goal-side with everyone else.
+        let presser = self
+            .players
+            .iter()
+            .filter(|p| p.team == player.team && p.role != PlayerRole::Goalkeeper)
+            .min_by(|a, b| {
+                self.player_snapshot_position(a)
+                    .distance(ball)
+                    .partial_cmp(&self.player_snapshot_position(b).distance(ball))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.id);
+        if presser == Some(player.id) {
+            return target;
+        }
+        // Axis pointing from the ball toward our own goal. "Goal-side" = a positive
+        // projection along it (on the own-goal side of the ball).
+        let own_goal = Vec2::new(self.field_width * 0.5, opponent.goal_y(self.field_length));
+        let axis_vec = own_goal - ball;
+        let axis_len = axis_vec.len();
+        if axis_len <= 1e-6 {
+            return target;
+        }
+        let axis = axis_vec / axis_len;
+        let along = (target - ball).dot(axis);
+        if along >= DEFENSIVE_GOAL_SIDE_MIN_YARDS {
+            return target;
+        }
+        // Pull toward at least `MIN` yds goal-side, but no more than `MAX_PULL` of
+        // correction per evaluation; clamp_to_pitch keeps it short of the goal line.
+        let deficit = (DEFENSIVE_GOAL_SIDE_MIN_YARDS - along).min(DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS);
+        (target + axis * deficit).clamp_to_pitch(self.field_width, self.field_length)
+    }
+
     pub(crate) fn shape_guarded_movement_point(
         &self,
         player_id: usize,
@@ -21676,7 +21837,8 @@ impl WorldSnapshot {
         } else {
             proposed
         };
-        self.off_carrier_lane_target(player, chosen)
+        let chosen = self.off_carrier_lane_target(player, chosen);
+        self.defensive_goal_side_target(player, chosen)
     }
 
     pub(crate) fn space_score_at(&self, p: Vec2, team: Team) -> f64 {

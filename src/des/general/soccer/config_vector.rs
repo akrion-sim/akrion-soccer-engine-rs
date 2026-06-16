@@ -303,6 +303,70 @@ fn perspective_phase_code(phase: TacticalPhase, perspective: Team) -> f64 {
     }
 }
 
+/// A per-tick whole-field configuration capture (the ball carrier's decision),
+/// buffered during a match and later joined with the transition stream to attach
+/// the outcome. See [`SoccerMatch::config_moments`].
+#[derive(Clone, Debug)]
+pub struct SoccerConfigCapture {
+    pub tick: u64,
+    pub player_id: usize,
+    pub team: Team,
+    pub role: PlayerRole,
+    pub action: String,
+    /// Canonical raw config features ([`CONFIG_FEATURE_DIM`]) for this team.
+    pub features: Vec<f32>,
+}
+
+/// A persisted configuration moment for the retrieval corpus: the embedding (for
+/// ANN search), the raw features (for exact permutation re-score), the decision
+/// taken, and how it turned out. This is the "config + decision + outcome" unit.
+#[derive(Clone, Debug)]
+pub struct SoccerConfigMomentInsert {
+    pub team: Team,
+    pub tick: u64,
+    pub role: PlayerRole,
+    pub action: String,
+    /// Immediate MDP reward of the decision.
+    pub reward: f64,
+    /// Discounted n-step return over this player's subsequent transitions — "how
+    /// the decision turned out", in the same MDP value units the policy learns on.
+    pub nstep_return: f64,
+    /// Critic value of the moment (`None` when neural learning is off/untrained).
+    pub value: Option<f64>,
+    /// Fixed-width similarity vector (projected from `features`).
+    pub embedding: Vec<f64>,
+    /// Raw canonical features, kept for an exact Hungarian re-score on retrieval.
+    pub features: Vec<f32>,
+}
+
+/// Cosine similarity between two raw config feature vectors (lengths may differ;
+/// the shorter is treated as zero-padded). Used to rank/aggregate retrieved
+/// neighbours by closeness to the live configuration.
+pub fn soccer_config_feature_cosine(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for i in 0..n {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    // Account for tail energy so unequal lengths can't inflate similarity.
+    for &x in &a[n..] {
+        na += (x as f64) * (x as f64);
+    }
+    for &y in &b[n..] {
+        nb += (y as f64) * (y as f64);
+    }
+    if na <= 1e-12 || nb <= 1e-12 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +487,46 @@ mod tests {
         let cfg = SoccerConfigVector::from_snapshot(&snap, Team::Home);
         assert_eq!(cfg.to_features().len(), CONFIG_FEATURE_DIM);
         assert_eq!(cfg.embedding().len(), SOCCER_MOMENT_EMBEDDING_DIM);
+    }
+
+    /// Capturing config-moments during a match must, after the episode, yield
+    /// moment records whose decision + outcome (n-step return) are filled in from
+    /// the transition stream — and only when capture is enabled.
+    #[test]
+    fn config_moments_capture_and_outcome() {
+        // Off by default ⇒ nothing captured.
+        let mut off = SoccerMatch::default_11v11(MatchConfig::default());
+        for _ in 0..30 {
+            off.run_time_step();
+        }
+        assert!(
+            off.config_moments().is_empty(),
+            "no capture when retrieval.capture_enabled is false"
+        );
+
+        // On ⇒ carrier moments captured with finite outcomes and full-width features.
+        let mut cfg = MatchConfig::default();
+        cfg.retrieval.capture_enabled = true;
+        cfg.retrieval.outcome_horizon = 10;
+        let mut on = SoccerMatch::default_11v11(cfg);
+        for _ in 0..120 {
+            on.run_time_step();
+        }
+        let moments = on.config_moments();
+        assert!(!moments.is_empty(), "carrier decisions should be captured");
+        for m in &moments {
+            assert_eq!(m.embedding.len(), SOCCER_MOMENT_EMBEDDING_DIM);
+            assert_eq!(m.features.len(), CONFIG_FEATURE_DIM);
+            assert!(m.reward.is_finite() && m.nstep_return.is_finite());
+            assert!(!m.action.is_empty());
+        }
+    }
+
+    #[test]
+    fn config_feature_cosine_self_is_one() {
+        let snap = sample_snapshot();
+        let f = SoccerConfigVector::from_snapshot(&snap, Team::Home).to_features();
+        let f32v: Vec<f32> = f.iter().map(|&x| x as f32).collect();
+        assert!((soccer_config_feature_cosine(&f32v, &f32v) - 1.0).abs() < 1e-5);
     }
 }
