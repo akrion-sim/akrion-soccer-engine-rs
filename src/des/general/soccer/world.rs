@@ -749,7 +749,8 @@ impl SoccerMatch {
     /// Install a team's evolved tactical genome. Defaults to the neutral genome
     /// (original behavior); the tournament calls this per side so engine consumers
     /// can read team-specific style (the genome rides along on `WorldSnapshot`).
-    pub fn set_team_tactical_genome(&mut self, team: Team, genome: SoccerTeamGenome) {
+    pub fn set_team_tactical_genome(&mut self, team: Team, mut genome: SoccerTeamGenome) {
+        genome.sanitize();
         match team {
             Team::Home => self.home_genome = genome,
             Team::Away => self.away_genome = genome,
@@ -7089,9 +7090,10 @@ impl SoccerMatch {
         if player_id >= self.players.len() {
             return;
         }
-        // Hard flank guard (every phase, even when roaming/overlapping): a wing-back
-        // may tuck into the half-space but NEVER crosses to the opposite half of the
-        // pitch from their home flank — switching sides should be ~never.
+        // Wing-back lane discipline is a movement resistance, not a wall. A wide
+        // defender can cross the center when the chosen target really asks for it,
+        // but off-ball movement is compressed after the normal tuck-in zone so the
+        // GA/shape model pays for side-switching instead of having it forbidden.
         let target = {
             let me = &self.players[player_id];
             let width = self.config.field_width_yards;
@@ -7100,10 +7102,18 @@ impl SoccerMatch {
             if is_wing_back {
                 let half = width * 0.5;
                 let mut t = target;
+                let in_possession = self.controlled_possession_team_now() == Some(me.team);
+                let cross_retention = if in_possession { 0.58 } else { 0.36 };
                 if me.home_position.x < half {
-                    t.x = t.x.min(half + WINGBACK_CENTER_CROSS_LIMIT_YARDS);
+                    let soft_limit = half + WINGBACK_CENTER_CROSS_LIMIT_YARDS;
+                    if t.x > soft_limit {
+                        t.x = soft_limit + (t.x - soft_limit) * cross_retention;
+                    }
                 } else {
-                    t.x = t.x.max(half - WINGBACK_CENTER_CROSS_LIMIT_YARDS);
+                    let soft_limit = half - WINGBACK_CENTER_CROSS_LIMIT_YARDS;
+                    if t.x < soft_limit {
+                        t.x = soft_limit + (t.x - soft_limit) * cross_retention;
+                    }
                 }
                 t
             } else {
@@ -17890,12 +17900,20 @@ impl WorldSnapshot {
             .map(sprint_time)
             .fold(f64::INFINITY, f64::min);
         if self.point_in_own_penalty_area(gk.team, target) {
-            // In his own box the keeper may come for a loose ball (and use his hands),
-            // BUT must NOT charge through a covering teammate who is the clear favourite
-            // to win it — rushing out when a defender is ~99% going to reach it first
-            // caused collisions / own-goals and was a real flaw. Defer ONLY to a
-            // teammate who reaches it clearly before BOTH the keeper and any opponent
-            // (a safe, uncontested win); in a contested 50/50 the keeper still commits.
+            let keeper_can_handle = self
+                .ball
+                .last_touch_team
+                .map_or(true, |last| last != gk.team);
+            if !keeper_can_handle {
+                return gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time;
+            }
+            // In his own box the keeper may come for an opponent-touched loose ball
+            // and use his hands, BUT must NOT charge through a covering teammate who
+            // is the clear favourite to win it — rushing out when a defender is ~99%
+            // going to reach it first caused collisions / own-goals and was a real
+            // flaw. Defer ONLY to a teammate who reaches it clearly before BOTH the
+            // keeper and any opponent (a safe, uncontested win); in a contested 50/50
+            // the keeper still commits.
             // Genome `gk_commit_aggression` scales how readily he commits: an
             // aggressive keeper needs the teammate to beat it by a larger margin
             // before backing off (commits more); a passive keeper defers sooner.
@@ -18894,18 +18912,19 @@ impl WorldSnapshot {
         {
             return target;
         }
-        // Resolve the allowed band [min_gap, max_gap] for how far the line sits BEHIND
-        // the ball. The lower bound is enforced ALWAYS (even building up): the line
-        // never sits less than 2yd behind the ball — i.e. never level with or ahead
-        // of it — so 2yd <= gap <= 25yd holds in and out of possession.
+        let (genome_min_gap, genome_max_gap) = self.genome_for(me.team).defensive_line_band_yards();
+        let in_possession_max_gap = (genome_max_gap * DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
+            / DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
+            .clamp(genome_min_gap, genome_max_gap);
+        // Resolve the allowed band [min_gap, max_gap] for how far the line sits behind
+        // the ball. The genome permutes the hard standoff: neutral is 2..=25 yd,
+        // while tournament variants try min {1,2,3} and max {20,23,25,27,29}.
         let (min_gap, max_gap) = match self.controlled_possession_team() {
-            // In possession: press up to within 15yd, but stay >=2yd behind the ball.
-            Some(team) if team == me.team => (
-                DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS,
-                DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS,
-            ),
+            // In possession: keep the same push-up shape, scaled from the genome
+            // max so the neutral 25yd gene reproduces the historical 15yd cap.
+            Some(team) if team == me.team => (genome_min_gap, in_possession_max_gap),
             // Opponent has the ball upfield: sit OFF the ball (>=20yd grounded / >=15yd in transit),
-            // but never drop more than 30yd behind it either.
+            // but do not drop beyond the team's evolved maximum.
             Some(_) => {
                 let settled = self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
                     && self.ball.velocity.len() < DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS;
@@ -18914,13 +18933,10 @@ impl WorldSnapshot {
                 } else {
                     DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS
                 };
-                (lo, DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
+                (lo.min(genome_max_gap), genome_max_gap)
             }
-            // Loose ball (no possession): stay 2..=25yd behind it (not ahead).
-            None => (
-                DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS,
-                DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS,
-            ),
+            // Loose ball (no possession): stay inside the evolved standoff band.
+            None => (genome_min_gap, genome_max_gap),
         };
         // Shrink the cushion as the ball approaches our OWN goal: the line can never sit further
         // behind the ball than (ball-from-own-goal − SAFETY), flooring at 3yd. At the 18yd box
@@ -20292,20 +20308,6 @@ impl WorldSnapshot {
             target = goalmouth_target;
         }
 
-        // A keeper never dribbles the ball OUT of its own penalty area: clamp any carry
-        // target to the box (a yard inside the lines) so the keeper cannot leave the box
-        // with the ball at its feet.
-        if me.role == PlayerRole::Goalkeeper {
-            let center_x = self.field_width * 0.5;
-            let half_w = (22.0 - GOALKEEPER_BOX_CARRY_MARGIN_YARDS).max(0.0);
-            target.x = target.x.clamp(center_x - half_w, center_x + half_w);
-            let box_edge = (18.0 - GOALKEEPER_BOX_CARRY_MARGIN_YARDS).max(0.0);
-            match me.team {
-                Team::Home => target.y = target.y.min(box_edge),
-                Team::Away => target.y = target.y.max(self.field_length - box_edge),
-            }
-        }
-
         target.clamp_to_pitch(self.field_width, self.field_length)
     }
 
@@ -20994,13 +20996,11 @@ impl WorldSnapshot {
         point
     }
 
-    /// Clamp a defender's target forward-position to the back-four line band:
-    /// never more than the allowed gap behind where the ball is HEADED (15yd in
-    /// possession, 25yd otherwise; anchored to the kinematically-projected ball),
-    /// and never more than 5yd into the opponent half. Pulls the line UP to honour
-    /// "the back four's average never sits more than 25yd behind the ball, ever".
+    /// Clamp a defender's target forward-position to the team's evolved back-four
+    /// line band: min {1,2,3} yards behind the ball and max {20,23,25,27,29}
+    /// yards behind the headed ball, scaled tighter while in possession.
     fn defender_line_band_clamped_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
-        // The 2..=25yd band only applies when the ball is BEYOND the 8-yard line at
+        // The band only applies when the ball is BEYOND the 8-yard line at
         // either end: with the ball on/near a goal-line, "2yd behind it" would shove
         // the line off the end-line out of bounds — so leave the line alone there.
         let ball_y = self.ball.position.y;
@@ -21010,10 +21010,14 @@ impl WorldSnapshot {
             return compact_y;
         }
         let attack = me.team.attack_dir();
+        let (min_gap, genome_max_gap) = self.genome_for(me.team).defensive_line_band_yards();
+        let in_possession_max_gap = (genome_max_gap * DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
+            / DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
+            .clamp(min_gap, genome_max_gap);
         let mut max_gap = if self.controlled_possession_team() == Some(me.team) {
-            DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
+            in_possession_max_gap
         } else {
-            DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS
+            genome_max_gap
         };
         // Genuine ball-in-behind break: the line may legitimately drop deeper than
         // the nominal cap to avoid being played through (rather than camp the line
@@ -21023,10 +21027,10 @@ impl WorldSnapshot {
             max_gap += DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS
                 * defensive_line_break_threat_fit(line_gap);
         }
-        // Lower bound of the gap: never push to LESS than 2yd behind the ball (stay
-        // goal-side; don't pull level with / ahead of it). Upper bound: never more
-        // than `max_gap` behind where the ball is HEADED. And never more than 5yd
-        // into the opponent half. Net band: 2yd ≤ (behind ball) ≤ 25yd (+break).
+        // Lower bound of the gap: stay goal-side of the ball by this genome's
+        // selected min. Upper bound: no more than the genome max behind where the
+        // ball is headed, with the historical in-possession push-up preserved by
+        // scaling the max.
         let ball_fwd = self.ball.position.y * attack;
         let predicted_fwd = self
             .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
@@ -21036,7 +21040,7 @@ impl WorldSnapshot {
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
         let halfway_cap_fwd =
             own_goal_fwd + self.field_length * 0.5 + DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS;
-        let shallowest_fwd = (ball_fwd - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS).min(halfway_cap_fwd);
+        let shallowest_fwd = (ball_fwd - min_gap).min(halfway_cap_fwd);
         // Keep the band valid if the two bounds cross (e.g. ball very deep): the
         // "don't sit level" ceiling wins so the line never overruns the ball.
         let deepest_fwd = deepest_fwd.min(shallowest_fwd);

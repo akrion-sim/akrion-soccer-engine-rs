@@ -11462,6 +11462,51 @@ fn support_and_defensive_movement_face_ball_unless_fast_run_requires_turning() {
 }
 
 #[test]
+fn wing_back_crossing_home_flank_is_soft_resistance_not_a_wall() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        duration_seconds: 0.1,
+        seed: 2111,
+        ..Default::default()
+    });
+    let width = sim.config.field_width_yards;
+    let old_wall_x = width * 0.5 + WINGBACK_CENTER_CROSS_LIMIT_YARDS;
+    let wingback = sim
+        .players
+        .iter()
+        .find(|p| {
+            p.team == Team::Home
+                && p.role == PlayerRole::Defender
+                && p.home_position.x < width * 0.5
+        })
+        .expect("left-side home defender")
+        .id;
+    park_players_except(&mut sim, &[wingback]);
+    sim.players[wingback].position = Vec2::new(old_wall_x - 1.0, 60.0);
+    sim.players[wingback].velocity = Vec2::zero();
+    sim.ball.holder = Some(wingback);
+    sim.ball.position = sim.players[wingback].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let far_side_target = Vec2::new(width - 2.0, 60.0);
+    for _ in 0..60 {
+        sim.move_player_towards(wingback, far_side_target, true);
+        sim.ball.position = sim.players[wingback].position;
+    }
+
+    assert!(
+        sim.players[wingback].position.x > old_wall_x + 1.0,
+        "wing-back should be able to cross the old hard wall: pos={:?} wall={old_wall_x}",
+        sim.players[wingback].position
+    );
+    assert!(
+        sim.players[wingback].position.x < far_side_target.x,
+        "soft resistance should still keep a cross-flank run gradual: pos={:?} target={far_side_target:?}",
+        sim.players[wingback].position
+    );
+}
+
+#[test]
 fn off_ball_move_intent_trace_faces_ball_not_lateral_target() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         dt_seconds: 0.1,
@@ -36122,6 +36167,10 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
     let holder = 17;
+    let mut genome = crate::des::general::soccer_genome::SoccerTeamGenome::default();
+    genome.apply_defensive_line_band_permutation(14);
+    let (min_gap, max_gap) = genome.defensive_line_band_yards();
+    sim.set_team_tactical_genome(Team::Home, genome);
     sim.ball.holder = Some(holder);
     sim.ball.position = Vec2::new(40.0, 68.0);
     sim.ball.last_touch_team = Some(Team::Away);
@@ -36132,15 +36181,43 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
         snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
 
     assert!(
-        target.y < snapshot.ball.position.y - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS,
+        target.y <= snapshot.ball.position.y - min_gap + 1e-9,
         "defender target should stay goal-side of the ball: {target:?}"
     );
     assert!(
         snapshot.ball.position.y - target.y
-            <= DEFENSIVE_MAX_BEHIND_BALL_YARDS
-                + DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS
-                + 1e-9,
+            <= max_gap + DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS + 1e-9,
         "defender target should stay within the break-relaxed line band: {target:?}"
+    );
+}
+
+#[test]
+fn defensive_assignment_uses_permuted_genome_line_band() {
+    let target_y_for_band = |permutation_index: usize| {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let defender = 2;
+        let mut genome = crate::des::general::soccer_genome::SoccerTeamGenome::default();
+        genome.apply_defensive_line_band_permutation(permutation_index);
+        sim.set_team_tactical_genome(Team::Home, genome);
+        park_players_except(&mut sim, &[defender]);
+        sim.players[defender].home_position = Vec2::new(40.0, 4.0);
+        sim.players[defender].position = sim.players[defender].home_position;
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(40.0, 68.0);
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Away);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        snapshot
+            .defensive_assignment_for(defender, sim.players[defender].home_position, false)
+            .y
+    };
+
+    let high_line_y = target_y_for_band(0); // 1..20 yd band
+    let deeper_line_y = target_y_for_band(14); // 3..29 yd band
+    assert!(
+        high_line_y > deeper_line_y + 4.0,
+        "smaller evolved max gap should hold the line higher: high={high_line_y} deep={deeper_line_y}"
     );
 }
 
@@ -36848,12 +36925,20 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
         .expect("home defender")
         .id;
+    let threat = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .expect("away threat")
+        .id;
     let width = sim.config.field_width_yards;
     let length = sim.config.field_length_yards;
     let target = Vec2::new(width * 0.5, 8.0); // a loose ball inside the home box
     assert!(sim.point_in_own_penalty_area(Team::Home, target));
-    park_players_except(&mut sim, &[keeper, defender]);
+    park_players_except(&mut sim, &[keeper, defender, threat]);
     sim.players[keeper].position = Vec2::new(width * 0.5, 1.0); // deep on his line
+    sim.players[threat].position = Vec2::new(width - 6.0, length - 5.0);
+    sim.ball.last_touch_team = Some(Team::Away);
 
     // A covering defender is right on the ball → clearly his → keeper must NOT charge.
     sim.players[defender].position = target + Vec2::new(0.3, 0.0);
@@ -36869,6 +36954,24 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
     assert!(
         snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
         "keeper must commit to the in-box loose ball when no teammate is winning it"
+    );
+
+    // If the loose ball was touched last by his own team, the keeper cannot use
+    // hands. With an opponent near, the old automatic in-box claim must not fire.
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[threat].position = target + Vec2::new(2.0, 0.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper must not get an automatic hand-claim path after an own-team touch"
+    );
+
+    // The same geometry is claimable when the opponent touched it last.
+    sim.ball.last_touch_team = Some(Team::Away);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper may claim the same in-box loose ball when the opponent touched it last"
     );
 }
 
@@ -44497,7 +44600,7 @@ fn a_pressured_keeper_releases_and_never_dribbles_out_of_its_box() {
         .unwrap()
         .id;
     // Keeper on the ball near the top edge of its own box.
-    sim.players[gk].position = Vec2::new(40.0, 16.5);
+    sim.players[gk].position = Vec2::new(40.0, 17.6);
     sim.ball.holder = Some(gk);
     sim.ball.position = sim.players[gk].position;
     sim.ball.last_touch_team = Some(Team::Home);
@@ -44505,10 +44608,13 @@ fn a_pressured_keeper_releases_and_never_dribbles_out_of_its_box() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let directive = snapshot.tactical_directive(Team::Home);
 
-    // An opponent has closed inside 5yd: every dribble/carry/shield option must be
-    // illegal — the keeper must pass or clear.
+    // An opponent has closed inside 5yd: dribble/carry/shield stay legal, but the
+    // keeper's scoring should tilt hard toward release instead of banning feet.
     let mut obs = snapshot.observation_for(gk);
     obs.nearest_opponent_distance = 4.0;
+    obs.perceived_pressure = 0.9;
+    obs.pressure_urgency = 0.9;
+    obs.immediate_dispossession_risk = 0.65;
     let options = sim.players[gk].possession_action_options(
         &obs,
         &directive,
@@ -44530,14 +44636,45 @@ fn a_pressured_keeper_releases_and_never_dribbles_out_of_its_box() {
     ] {
         if let Some(o) = options.iter().find(|o| o.label == label) {
             assert!(
-                !o.legal,
-                "a keeper pressured inside 5yd must not have {label} as a legal option"
+                o.legal,
+                "a keeper pressured inside 5yd should keep {label} legal and let scoring carry the risk"
             );
         }
     }
 
-    // And even a carry target is clamped inside the box: a forward carry from the box
-    // edge cannot take the keeper (with the ball) out past the 18yd line.
+    let mut calm_obs = obs.clone();
+    calm_obs.nearest_opponent_distance = 12.0;
+    calm_obs.perceived_pressure = 0.05;
+    calm_obs.pressure_urgency = 0.05;
+    calm_obs.immediate_dispossession_risk = 0.05;
+    let calm_options = sim.players[gk].possession_action_options(
+        &calm_obs,
+        &directive,
+        2,
+        1,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    let pressured_release = action_option_score(&options, "pass1")
+        .max(action_option_score(&options, "clearance"))
+        .max(action_option_score(&options, "route-one"));
+    let pressured_carry = action_option_score(&options, "dribble")
+        .max(action_option_score(&options, "carry-forward"))
+        .max(action_option_score(&options, "protect-ball"));
+    let calm_release = action_option_score(&calm_options, "pass1")
+        .max(action_option_score(&calm_options, "clearance"))
+        .max(action_option_score(&calm_options, "route-one"));
+    let calm_carry = action_option_score(&calm_options, "dribble")
+        .max(action_option_score(&calm_options, "carry-forward"))
+        .max(action_option_score(&calm_options, "protect-ball"));
+    assert!(
+        pressured_release / pressured_carry > calm_release / calm_carry + 0.20,
+        "pressure should shift keeper choice toward release without banning carry: pressured={pressured_release}/{pressured_carry} calm={calm_release}/{calm_carry}"
+    );
+
+    // A forward carry target is no longer clamped inside the box; the score model
+    // owns the risk instead of making the move impossible.
     let target = snapshot.dribble_move_target_for_touch(
         gk,
         sim.players[gk].home_position,
@@ -44545,12 +44682,8 @@ fn a_pressured_keeper_releases_and_never_dribbles_out_of_its_box() {
         DribbleTouchDecision::default(),
     );
     assert!(
-        target.y <= 17.0 + 1e-6,
-        "a keeper's carry target must stay inside its own box (y<=17): {target:?}"
-    );
-    assert!(
-        (target.x - snapshot.field_width * 0.5).abs() <= 21.0 + 1e-6,
-        "a keeper's carry target must stay inside the box width: {target:?}"
+        target.y > 18.0,
+        "a keeper's forward carry target may leave its own box when the scorer accepts the risk: {target:?}"
     );
 }
 

@@ -418,11 +418,24 @@ impl PlayerAgent {
         // In our own half, retention (shielding / safe dribbling) takes priority over
         // risky attacking dribbling — keep the ball rather than forcing it forward.
         let own_half = observation.yards_to_own_goal < observation.yards_to_goal;
-        // A ball-carrying keeper under proximate pressure must RELEASE (pass / clear) —
-        // never dribble it, and certainly never carry it out of the box into a press.
-        let keeper_must_release = self.role == PlayerRole::Goalkeeper
+        // A ball-carrying keeper under proximate pressure should strongly prefer a
+        // release, but it is no longer illegal to carry with the feet. The risk is
+        // modeled as a score damp on carry/dribble options plus a lift to release
+        // options, so rare high-value carries can still survive the policy.
+        let keeper_release_pressure = if self.role == PlayerRole::Goalkeeper
             && observation.nearest_opponent_distance.is_finite()
-            && observation.nearest_opponent_distance <= GOALKEEPER_RELEASE_PRESSURE_RADIUS_YARDS;
+        {
+            ((GOALKEEPER_RELEASE_PRESSURE_RADIUS_YARDS + 3.0
+                - observation.nearest_opponent_distance)
+                / 3.0)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let keeper_carry_under_pressure_damp =
+            (1.0 - keeper_release_pressure * 0.88).clamp(0.10, 1.0);
+        let keeper_release_under_pressure_lift =
+            (1.0 + keeper_release_pressure * 0.34).clamp(1.0, 1.34);
         let offensive_urgency = observation.offensive_urgency.clamp(0.0, 1.0);
         let defensive_urgency = observation.defensive_urgency.clamp(0.0, 1.0);
         let decision_urgency = observation.decision_urgency.clamp(0.0, 1.0);
@@ -611,7 +624,7 @@ impl PlayerAgent {
         // hold-time model.
         let deep_release_urgency =
             (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
-        hold_release_multiplier *= deep_release_urgency;
+        hold_release_multiplier *= deep_release_urgency * keeper_release_under_pressure_lift;
         let pre_fatigue_dribble_score = (self.preferences.dribble_bias
             * (0.62 + dribbling * 0.48)
             * directive.carry_priority
@@ -632,7 +645,8 @@ impl PlayerAgent {
         let dribble_score = (pre_fatigue_dribble_score
             * fatigue_dribble
             * patient_dribble_lift
-            * hold_penalty_multiplier)
+            * hold_penalty_multiplier
+            * keeper_carry_under_pressure_damp)
             .clamp(0.02, 1.75);
         let patient_carry_score_base = (dribble_score * patient_carry_multiplier).clamp(0.02, 1.58);
         // Central defenders must stay back: they do NOT dribble the ball forward when
@@ -668,8 +682,9 @@ impl PlayerAgent {
             * (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.40).clamp(0.45, 1.0)
             // Own-half retention: risky forward dribbling is de-emphasised in our own
             // half (more so when pressured) in favour of keeping the ball.
-            * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 })
-        .clamp(0.01, 1.46);
+            * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 }
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.01, 1.46);
         let carry_out_legal = observation.forward_dribble_space_yards >= 0.8
             && !goal_attack_shot_blocks_alternatives
             && !goalmouth_carry_forced;
@@ -682,8 +697,9 @@ impl PlayerAgent {
             * (1.0 - pressured_good_outlet * 0.36).clamp(0.55, 1.0)
             // Escaping pressure sideways / out is exactly what a pressured deep carrier SHOULD
             // do (dribble OUT of trouble, not into it) — lift it relative to carrying forward.
-            * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50))
-        .clamp(0.01, 0.92);
+            * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50)
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.01, 0.92);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
         } else {
@@ -810,7 +826,8 @@ impl PlayerAgent {
                 // Rising pressure (a man bearing down) is exactly when you turn your
                 // body between him and the ball -- lift the shield's urgency hard.
                 + pressure_rising * 0.80
-                + (1.0 - observation.perceived_time_on_ball_seconds / 2.8).clamp(0.0, 1.0) * 0.24))
+                + (1.0 - observation.perceived_time_on_ball_seconds / 2.8).clamp(0.0, 1.0) * 0.24)
+            * keeper_carry_under_pressure_damp)
             .clamp(0.01, protect_ball_ceiling);
         // Calm on the ball: when a clean pass is on and the holder is NOT under real
         // heat, they should settle and pass rather than throw flashy feints / side-steps
@@ -833,7 +850,8 @@ impl PlayerAgent {
             * (1.0
                 + (1.0 - observation.forward_dribble_space_yards / 14.0).clamp(0.0, 1.0) * 0.24
                 + escape_urgency * 0.55)
-            * calm_pass_focus)
+            * calm_pass_focus
+            * keeper_carry_under_pressure_damp)
             .clamp(0.01, (0.82 + escape_urgency * 0.26).clamp(0.82, 1.08));
         let feint_legal =
             observation.nearest_opponent_distance <= 5.2 && pressure_urgency.max(pressure) >= 0.34;
@@ -844,53 +862,35 @@ impl PlayerAgent {
         let feint_score = (dribble_score
             * (0.22 + pressure_urgency * 0.66 + decision_urgency * 0.18)
             * (0.78 + dribbling * 0.28)
-            * calm_pass_focus)
+            * calm_pass_focus
+            * keeper_carry_under_pressure_damp)
             .clamp(0.01, 0.55);
         let hold_up_flank_score = ((self.preferences.dribble_bias
             * (0.46 + dribbling * 0.42 + ability01(self.skills.strength) * 0.18)
             * (0.74 + pressure * 0.18)
             * (1.0 + (1.0 - (pass_target_count as f64 / 2.0).clamp(0.0, 1.0)) * 0.28))
             * hold_penalty_multiplier
-            * (1.0 - pressured_good_outlet * 0.26).clamp(0.62, 1.0))
-        .clamp(0.03, 0.78);
+            * (1.0 - pressured_good_outlet * 0.26).clamp(0.62, 1.0)
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.03, 0.78);
         let mut options = vec![
             AgentActionOptionTrace::new("shoot", shot_score, shot_legal),
-            AgentActionOptionTrace::new("dribble", dribble_score, !keeper_must_release),
-            AgentActionOptionTrace::new(
-                "carry-forward",
-                carry_forward_score,
-                carry_forward_legal && !keeper_must_release,
-            ),
+            AgentActionOptionTrace::new("dribble", dribble_score, true),
+            AgentActionOptionTrace::new("carry-forward", carry_forward_score, carry_forward_legal),
             AgentActionOptionTrace::new(
                 "carry-out-left",
                 carry_out_left_score,
-                carry_out_left_legal && !keeper_must_release,
+                carry_out_left_legal,
             ),
             AgentActionOptionTrace::new(
                 "carry-out-right",
                 carry_out_right_score,
-                carry_out_right_legal && !keeper_must_release,
+                carry_out_right_legal,
             ),
-            AgentActionOptionTrace::new(
-                "protect-ball",
-                protect_ball_score,
-                protect_ball_legal && !keeper_must_release,
-            ),
-            AgentActionOptionTrace::new(
-                "side-step",
-                side_step_score,
-                side_step_legal && !keeper_must_release,
-            ),
-            AgentActionOptionTrace::new(
-                "fake-left-cut-right",
-                feint_score,
-                feint_legal && !keeper_must_release,
-            ),
-            AgentActionOptionTrace::new(
-                "fake-right-cut-left",
-                feint_score,
-                feint_legal && !keeper_must_release,
-            ),
+            AgentActionOptionTrace::new("protect-ball", protect_ball_score, protect_ball_legal),
+            AgentActionOptionTrace::new("side-step", side_step_score, side_step_legal),
+            AgentActionOptionTrace::new("fake-left-cut-right", feint_score, feint_legal),
+            AgentActionOptionTrace::new("fake-right-cut-left", feint_score, feint_legal),
             AgentActionOptionTrace::new(
                 "hold-up-flank",
                 hold_up_flank_score,

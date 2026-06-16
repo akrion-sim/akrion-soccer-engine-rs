@@ -265,12 +265,9 @@ const SHOT_SAVE_DEPTH_YARDS: f64 = 1.6;
 // ball — keeps it inside the ~44yd-wide penalty area (≈22yd half) with a small margin, so
 // it doesn't follow a wide ball out of the box.
 const GOALKEEPER_BOX_STAY_HALF_WIDTH_YARDS: f64 = 20.0;
-// A ball-carrying keeper must release (pass / clear) rather than dribble once an
-// opponent has closed inside this radius — never carry it into a press near goal.
+// A ball-carrying keeper strongly prefers release (pass / clear) once an opponent
+// has closed inside this radius; carrying stays legal but is heavily risk-damped.
 const GOALKEEPER_RELEASE_PRESSURE_RADIUS_YARDS: f64 = 5.0;
-// Keep a keeper's carry target this far inside the penalty-area lines, so it never
-// dribbles the ball out of its own box.
-const GOALKEEPER_BOX_CARRY_MARGIN_YARDS: f64 = 1.0;
 // How far a keeper can extend to a save in one tick beyond its run — a full dive reaches a
 // couple of yards. The keeper is moved to the save point only within this reach (run + dive),
 // never TELEPORTED across to it.
@@ -1029,18 +1026,17 @@ const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // 15yd if it's airborne or moving (in transit). The LP/formation nudge shifts the whole line to
 // restore the band.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
-// The line presses up to within this of the ball as the opponent marches in, but
-// never closer (it stays at least 2yd goal-side — it does not pull level with the
-// ball). Net hard band on the back four: 2yd ≤ behind ball ≤ 25yd (+ break extra).
+// Neutral genome defaults for the evolved back-four standoff band. Tournaments
+// permute the min over {1,2,3}yd and max over {20,23,25,27,29}yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
-// The 2..=25yd band is suspended when the ball is within this of either goal line
-// (a ball on the end-line can't have the line sit 2yd "behind" it without going
+// The back-four band is suspended when the ball is within this of either goal line
+// (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).
 const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 8.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 20.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 15.0;
-// When NOT in possession the line must also not sit MORE than this far behind the ball (don't
-// drop into a deep, passive block that cedes the whole pitch).
+// Neutral evolved maximum when not in possession; used as the scale anchor for
+// the tighter in-possession cap.
 const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 25.0;
 // Below this speed (and on the ground) the ball counts as "settled" → the wider 20yd cushion.
 const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
@@ -1539,8 +1535,8 @@ const CENTRE_BACK_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // Soft overshoot past the halfway+5 cap: the line may push further but with
 // diminishing returns, asymptoting ~this many yards beyond the cap.
 const CENTRE_BACK_OVERSHOOT_SOFT_YARDS: f64 = 4.0;
-// A wing-back may drift at most this far past the half-width before the hard flank
-// guard stops them — they can tuck into the half-space but never switch flanks.
+// A wing-back may drift this far past half-width before side-switch movement is
+// compressed; it is resistance, not a hard flank wall.
 const WINGBACK_CENTER_CROSS_LIMIT_YARDS: f64 = 6.0;
 // Kicking against your own momentum loses power (per unit of opposed motion), down
 // to a floor — a back-pedalling defender can't blast it upfield, only nudge/touch it.

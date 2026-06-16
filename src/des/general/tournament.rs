@@ -149,6 +149,19 @@ impl TeamBrain {
         TeamBrain::default()
     }
 
+    pub fn fresh_with_seed(seed: u32, permutation_index: usize) -> Self {
+        let mut rng = GenomeRng::new(
+            u64::from(seed).rotate_left(32)
+                ^ (permutation_index as u64).wrapping_mul(0x2545_F491_4F6C_DD1D),
+        );
+        let mut genome = SoccerTeamGenome::random(&mut rng);
+        genome.apply_defensive_line_band_permutation(permutation_index);
+        TeamBrain {
+            genome,
+            ..TeamBrain::default()
+        }
+    }
+
     pub fn from_snapshot(neural: SoccerNeuralNetworkSnapshot) -> Self {
         TeamBrain {
             neural: Some(neural),
@@ -162,7 +175,8 @@ impl TeamBrain {
 // Re-exported here so the GA/seeding call sites keep their `tournament::...` paths.
 pub use crate::des::general::soccer_genome::{
     DefenderEngagement, GenomeRng, GenomeRole, PositionAnchor, SoccerTeamGenome, TeamFormation,
-    PITCH_GENOME_LANES, PITCH_GENOME_ROWS,
+    DEF_LINE_BAND_PERMUTATION_COUNT, DEF_LINE_MAX_DISTANCE_CHOICES_YARDS,
+    DEF_LINE_MIN_DISTANCE_CHOICES_YARDS, PITCH_GENOME_LANES, PITCH_GENOME_ROWS,
 };
 
 /// Win/draw/loss + goals record, used for group standings and final reporting.
@@ -459,11 +473,12 @@ impl Tournament {
         format.validate()?;
         let teams = (0..format.team_count)
             .map(|id| {
+                let team_seed = seed.wrapping_add(id as u32).wrapping_mul(2_654_435_761);
                 TournamentTeam::new(
                     id,
                     format!("Team {:03}", id + 1),
-                    seed.wrapping_add(id as u32).wrapping_mul(2_654_435_761),
-                    TeamBrain::fresh(),
+                    team_seed,
+                    TeamBrain::fresh_with_seed(team_seed, id),
                 )
             })
             .collect();
@@ -1469,11 +1484,12 @@ mod tests {
     fn fresh_teams(count: usize, seed: u32) -> Vec<TournamentTeam> {
         (0..count)
             .map(|id| {
+                let team_seed = seed.wrapping_add(id as u32).wrapping_mul(2_654_435_761);
                 TournamentTeam::new(
                     id,
                     format!("Team {:03}", id + 1),
-                    seed.wrapping_add(id as u32).wrapping_mul(2_654_435_761),
-                    TeamBrain::fresh(),
+                    team_seed,
+                    TeamBrain::fresh_with_seed(team_seed, id),
                 )
             })
             .collect()
@@ -1541,6 +1557,33 @@ mod tests {
         assert_eq!(format.knockout_team_count(), 64);
         assert!(format.knockout_team_count().is_power_of_two());
         format.validate().expect("default format is valid");
+    }
+
+    #[test]
+    fn fresh_128_team_field_cycles_defensive_line_band_permutations() {
+        let tournament = Tournament::with_fresh_brains(
+            TournamentFormat::default(),
+            TournamentLearningMode::Frozen,
+            2026,
+        )
+        .unwrap();
+        let mut seen = std::collections::HashSet::new();
+
+        for (index, team) in tournament.teams.iter().enumerate() {
+            let band = team.brain.genome.defensive_line_band_yards();
+            assert_eq!(
+                band,
+                SoccerTeamGenome::defensive_line_band_for_permutation(index)
+            );
+            seen.insert((band.0 as i32, band.1 as i32));
+        }
+
+        assert_eq!(seen.len(), DEF_LINE_BAND_PERMUTATION_COUNT);
+        for min_gap in DEF_LINE_MIN_DISTANCE_CHOICES_YARDS {
+            for max_gap in DEF_LINE_MAX_DISTANCE_CHOICES_YARDS {
+                assert!(seen.contains(&(min_gap as i32, max_gap as i32)));
+            }
+        }
     }
 
     #[test]

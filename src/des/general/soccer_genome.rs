@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 /// these grid cells are the discrete state basis for the tabular / POMDP policy.
 pub const PITCH_GENOME_LANES: u8 = 12;
 pub const PITCH_GENOME_ROWS: u8 = 24;
+pub const DEF_LINE_MIN_DISTANCE_CHOICES_YARDS: [f64; 3] = [1.0, 2.0, 3.0];
+pub const DEF_LINE_MAX_DISTANCE_CHOICES_YARDS: [f64; 5] = [20.0, 23.0, 25.0, 27.0, 29.0];
+pub const DEF_LINE_BAND_PERMUTATION_COUNT: usize =
+    DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.len() * DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.len();
 
 /// Deterministic RNG (splitmix64) so a seed reproduces the same genome — genome
 /// diversity, like net diversity, must stay reproducible.
@@ -100,7 +104,8 @@ pub struct SoccerTeamGenome {
     pub formation: TeamFormation,
     /// 11 slots: keeper + 10 outfield, each with a grid-cell anchor.
     pub anchors: Vec<PositionAnchor>,
-    /// Back-four line: min / max standoff distance from the ball (yards).
+    /// Back-four line: min / max standoff distance from the ball (yards), selected
+    /// from the discrete GA search sets above.
     pub def_line_min_dist_from_ball: f64,
     pub def_line_max_dist_from_ball: f64,
     /// Midfield band's gap behind the back four, by field third (yards). A bigger
@@ -189,8 +194,8 @@ impl Default for SoccerTeamGenome {
         SoccerTeamGenome {
             formation: TeamFormation::F433,
             anchors: formation_anchors(TeamFormation::F433),
-            def_line_min_dist_from_ball: 6.0,
-            def_line_max_dist_from_ball: 18.0,
+            def_line_min_dist_from_ball: 2.0,
+            def_line_max_dist_from_ball: 25.0,
             mid_gap_from_back4_own_half: 8.0,
             mid_gap_from_back4_opp_half: 12.0,
             striker_press_synchronized: true,
@@ -254,10 +259,17 @@ impl SoccerTeamGenome {
         if !self.defender_on_ball_pass_urgency.is_finite() {
             self.defender_on_ball_pass_urgency = neutral.defender_on_ball_pass_urgency;
         }
-        self.def_line_min_dist_from_ball = self.def_line_min_dist_from_ball.clamp(1.0, 40.0);
-        self.def_line_max_dist_from_ball = self
-            .def_line_max_dist_from_ball
-            .clamp(self.def_line_min_dist_from_ball, 60.0);
+        self.def_line_min_dist_from_ball = nearest_choice(
+            self.def_line_min_dist_from_ball,
+            &DEF_LINE_MIN_DISTANCE_CHOICES_YARDS,
+            neutral.def_line_min_dist_from_ball,
+        );
+        self.def_line_max_dist_from_ball = nearest_choice(
+            self.def_line_max_dist_from_ball,
+            &DEF_LINE_MAX_DISTANCE_CHOICES_YARDS,
+            neutral.def_line_max_dist_from_ball,
+        )
+        .max(self.def_line_min_dist_from_ball);
         self.mid_gap_from_back4_own_half = self.mid_gap_from_back4_own_half.clamp(3.0, 30.0);
         self.mid_gap_from_back4_opp_half = self.mid_gap_from_back4_opp_half.clamp(3.0, 30.0);
         self.press_urgency = self.press_urgency.clamp(0.0, 1.0);
@@ -297,6 +309,38 @@ impl SoccerTeamGenome {
         }
     }
 
+    pub fn defensive_line_band_yards(&self) -> (f64, f64) {
+        let neutral = SoccerTeamGenome::default();
+        let min_gap = nearest_choice(
+            self.def_line_min_dist_from_ball,
+            &DEF_LINE_MIN_DISTANCE_CHOICES_YARDS,
+            neutral.def_line_min_dist_from_ball,
+        );
+        let max_gap = nearest_choice(
+            self.def_line_max_dist_from_ball,
+            &DEF_LINE_MAX_DISTANCE_CHOICES_YARDS,
+            neutral.def_line_max_dist_from_ball,
+        )
+        .max(min_gap);
+        (min_gap, max_gap)
+    }
+
+    pub fn defensive_line_band_for_permutation(index: usize) -> (f64, f64) {
+        let min_index = index % DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.len();
+        let max_index = (index / DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.len())
+            % DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.len();
+        (
+            DEF_LINE_MIN_DISTANCE_CHOICES_YARDS[min_index],
+            DEF_LINE_MAX_DISTANCE_CHOICES_YARDS[max_index],
+        )
+    }
+
+    pub fn apply_defensive_line_band_permutation(&mut self, index: usize) {
+        let (min_gap, max_gap) = Self::defensive_line_band_for_permutation(index);
+        self.def_line_min_dist_from_ball = min_gap;
+        self.def_line_max_dist_from_ball = max_gap;
+    }
+
     /// A fresh, randomly-styled team genome (cold-start diversity).
     pub fn random(rng: &mut GenomeRng) -> Self {
         let formation = if rng.coin() {
@@ -311,24 +355,17 @@ impl SoccerTeamGenome {
             anchor.lane = jitter_u8(anchor.lane, 1, rng);
             anchor.row = jitter_u8(anchor.row, 2, rng);
         }
-        let min_dist = rng.range(3.0, 12.0);
         let mut genome = SoccerTeamGenome {
             formation,
             anchors,
-            def_line_min_dist_from_ball: min_dist,
-            def_line_max_dist_from_ball: min_dist + rng.range(6.0, 24.0),
+            def_line_min_dist_from_ball: random_choice(&DEF_LINE_MIN_DISTANCE_CHOICES_YARDS, rng),
+            def_line_max_dist_from_ball: random_choice(&DEF_LINE_MAX_DISTANCE_CHOICES_YARDS, rng),
             mid_gap_from_back4_own_half: rng.range(5.0, 14.0),
             mid_gap_from_back4_opp_half: rng.range(8.0, 20.0),
             striker_press_synchronized: rng.coin(),
             press_urgency: rng.unit(),
             pass_willingness_under_pressure: rng.unit(),
-            pass_distance_priority: [
-                rng.unit(),
-                rng.unit(),
-                rng.unit(),
-                rng.unit(),
-                rng.unit(),
-            ],
+            pass_distance_priority: [rng.unit(), rng.unit(), rng.unit(), rng.unit(), rng.unit()],
             use_scoop_pass: rng.coin(),
             gk_line_height: rng.unit(),
             gk_commit_aggression: rng.unit(),
@@ -365,7 +402,11 @@ impl SoccerTeamGenome {
         let pick_b = |x: bool, y: bool, rng: &mut GenomeRng| if rng.coin() { x } else { y };
         let mut priority = [0.0; 5];
         for (i, slot) in priority.iter_mut().enumerate() {
-            *slot = pick(a.pass_distance_priority[i], b.pass_distance_priority[i], rng);
+            *slot = pick(
+                a.pass_distance_priority[i],
+                b.pass_distance_priority[i],
+                rng,
+            );
         }
         let mut genome = SoccerTeamGenome {
             formation,
@@ -445,10 +486,12 @@ impl SoccerTeamGenome {
             }
         }
         if rng.chance(rate) {
-            self.def_line_min_dist_from_ball += rng.range(-2.0, 2.0);
+            self.def_line_min_dist_from_ball =
+                random_choice(&DEF_LINE_MIN_DISTANCE_CHOICES_YARDS, rng);
         }
         if rng.chance(rate) {
-            self.def_line_max_dist_from_ball += rng.range(-3.0, 3.0);
+            self.def_line_max_dist_from_ball =
+                random_choice(&DEF_LINE_MAX_DISTANCE_CHOICES_YARDS, rng);
         }
         if rng.chance(rate) {
             self.mid_gap_from_back4_own_half += rng.range(-2.0, 2.0);
@@ -500,6 +543,30 @@ fn jitter_u8(value: u8, span: u8, rng: &mut GenomeRng) -> u8 {
     (value as i64 + delta).clamp(0, u8::MAX as i64) as u8
 }
 
+fn random_choice(choices: &[f64], rng: &mut GenomeRng) -> f64 {
+    choices
+        .get(rng.index(choices.len()))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+fn nearest_choice(value: f64, choices: &[f64], fallback: f64) -> f64 {
+    if choices.is_empty() {
+        return fallback;
+    }
+    let value = if value.is_finite() { value } else { fallback };
+    choices
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (value - *a)
+                .abs()
+                .partial_cmp(&(value - *b).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,9 +579,28 @@ mod tests {
         assert_eq!(a.press_urgency, a2.press_urgency);
         assert_eq!(a.anchors, a2.anchors);
         assert!(a.press_urgency != b.press_urgency || a.formation != b.formation);
+        assert!(DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.contains(&a.def_line_min_dist_from_ball));
+        assert!(DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.contains(&a.def_line_max_dist_from_ball));
         for anchor in &a.anchors {
             assert!(anchor.lane < PITCH_GENOME_LANES && anchor.row < PITCH_GENOME_ROWS);
         }
+    }
+
+    #[test]
+    fn defensive_line_band_permutation_cycles_all_discrete_combinations() {
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..DEF_LINE_BAND_PERMUTATION_COUNT {
+            let band = SoccerTeamGenome::defensive_line_band_for_permutation(index);
+            assert!(DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.contains(&band.0));
+            assert!(DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.contains(&band.1));
+            assert!(seen.insert((band.0 as i32, band.1 as i32)));
+        }
+
+        assert_eq!(seen.len(), DEF_LINE_BAND_PERMUTATION_COUNT);
+        assert_eq!(
+            SoccerTeamGenome::defensive_line_band_for_permutation(DEF_LINE_BAND_PERMUTATION_COUNT),
+            SoccerTeamGenome::defensive_line_band_for_permutation(0)
+        );
     }
 
     #[test]
@@ -536,7 +622,9 @@ mod tests {
         assert!(
             child.use_scoop_pass == a.use_scoop_pass || child.use_scoop_pass == b.use_scoop_pass
         );
-        assert!(child.gk_line_height == a.gk_line_height || child.gk_line_height == b.gk_line_height);
+        assert!(
+            child.gk_line_height == a.gk_line_height || child.gk_line_height == b.gk_line_height
+        );
         let json = serde_json::to_value(&child).expect("genome serializes");
         let back: SoccerTeamGenome = serde_json::from_value(json).expect("genome deserializes");
         assert_eq!(back.formation, child.formation);
@@ -562,6 +650,8 @@ mod tests {
         assert!((0.0..=1.0).contains(&g.press_urgency));
         assert!(g.def_line_max_dist_from_ball.is_finite());
         assert!(g.def_line_max_dist_from_ball >= g.def_line_min_dist_from_ball);
+        assert!(DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.contains(&g.def_line_min_dist_from_ball));
+        assert!(DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.contains(&g.def_line_max_dist_from_ball));
         assert!((0.0..=12.0).contains(&g.defender_on_ball_opponent_distance));
         assert!((0.0..=1.0).contains(&g.defender_on_ball_pass_urgency));
         assert!(g.pass_distance_priority.iter().all(|w| w.is_finite()));
@@ -579,6 +669,8 @@ mod tests {
         }
         assert!(g.press_urgency >= 0.0 && g.press_urgency <= 1.0);
         assert!(g.def_line_max_dist_from_ball >= g.def_line_min_dist_from_ball);
+        assert!(DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.contains(&g.def_line_min_dist_from_ball));
+        assert!(DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.contains(&g.def_line_max_dist_from_ball));
         for anchor in &g.anchors {
             assert!(anchor.lane < PITCH_GENOME_LANES && anchor.row < PITCH_GENOME_ROWS);
         }

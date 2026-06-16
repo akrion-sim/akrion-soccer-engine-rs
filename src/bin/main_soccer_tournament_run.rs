@@ -37,7 +37,7 @@ use soccer_engine::des::general::soccer::{
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, GenomeRng, SoccerTeamGenome, TeamBrain, Tournament,
     TournamentFormat, TournamentLearningMode, TournamentReport, TournamentTeam,
-    TOURNAMENT_DEFAULT_MATCH_SECONDS,
+    DEF_LINE_BAND_PERMUTATION_COUNT, TOURNAMENT_DEFAULT_MATCH_SECONDS,
 };
 use soccer_engine::des::soccer_learning::SOCCER_POLICY_STATUS_ACTIVE;
 use soccer_engine::des::soccer_learning_pg::{SoccerLearningPgStore, TournamentElite};
@@ -276,6 +276,10 @@ impl EntrantDiversitySettings {
 ///   top-N elite pool): each seeded team is a CROSSOVER of two random parents
 ///   plus mutation — a random hybrid of the previous generation's best finishers.
 ///
+/// With diversity enabled, the back-four line band is also cycled through the
+/// discrete GA search grid by team id, so every 128-team generation deliberately
+/// covers the 1/2/3 yard min choices crossed with 20/23/25/27/29 yard max choices.
+///
 /// `SOCCER_TOURNAMENT_DIVERSITY=0` restores the old behaviour (seeded teams clone
 /// the first parent; all share default options). `SOCCER_TOURNAMENT_MUTATION_SCALE`
 /// (default 0.03) sets the per-weight noise.
@@ -341,7 +345,7 @@ fn build_entrants_with_settings(
 
             // Tactical genome: hybridize the elite genomes when we have a pool,
             // mutate a lone parent, or roll a fresh random style on a cold start.
-            let genome = if !settings.enabled {
+            let mut genome = if !settings.enabled {
                 SoccerTeamGenome::default()
             } else {
                 let mut grng = GenomeRng::new(
@@ -363,6 +367,9 @@ fn build_entrants_with_settings(
                     }
                 }
             };
+            if settings.enabled {
+                genome.apply_defensive_line_band_permutation(id);
+            }
 
             let brain = TeamBrain {
                 neural,
@@ -954,6 +961,25 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), format.team_count);
+    }
+
+    #[test]
+    fn entrant_field_cycles_defensive_line_band_permutations() {
+        let format = TournamentFormat::default();
+        let field =
+            build_entrants_with_settings(&format, 7, &[], &[], 1.0, test_diversity_settings());
+        let mut seen = std::collections::HashSet::new();
+
+        for (index, team) in field.iter().enumerate() {
+            let band = team.brain.genome.defensive_line_band_yards();
+            assert_eq!(
+                band,
+                SoccerTeamGenome::defensive_line_band_for_permutation(index)
+            );
+            seen.insert((band.0 as i32, band.1 as i32));
+        }
+
+        assert_eq!(seen.len(), DEF_LINE_BAND_PERMUTATION_COUNT);
     }
 
     fn sample_snapshot(fill: f64) -> SoccerNeuralNetworkSnapshot {
