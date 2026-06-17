@@ -140,18 +140,19 @@ const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 18.0;
 // --- Locomotion commitment (movement momentum / anti-jitter) ---------------------
 // A decision is instant, but a body has inertia: a player cannot commit to a sprint
 // one tick, drop to a run the next, sprint again, run again. Effort and travel
-// heading therefore carry a short commitment — once committed, *shedding* that
-// commitment (downshifting effort, reversing direction) is locked for a minimum
-// dwell. Committing HARDER is never locked: explosive acceleration and bending a
-// run are decisive, instantaneous acts; it is the reversal that has momentum. This
-// is the locomotion analogue of the body-yaw angular-acceleration cap above.
+// heading therefore carry a short commitment — once a player settles into an effort
+// tier (or a travel heading) they hold it for a minimum dwell before changing it.
+// This is the locomotion analogue of the body-yaw angular-acceleration cap above.
 //
-// A committed gait must be held at least this long before it may be DOWNSHIFTED to
-// a lower-effort gait (Sprint→Run, Run→Jog, …). Upshifting and coming to a stop are
-// always free. This is what kills the "sprint, run, sprint, run" tick-to-tick
-// flip-flop: each downshift out of the sprint is locked for the dwell, so the gait
-// cannot oscillate. ~0.2 s ≈ a few ticks at the default rate.
-const GAIT_DOWNSHIFT_COMMIT_SECONDS: f64 = 0.20;
+// Once a gait effort tier is entered it is held at least this long before changing —
+// in EITHER direction — so effort cannot oscillate tick-to-tick ("sprint, run,
+// sprint, run"). Two things bypass the lock, because they are decisive acts a real
+// player performs without hesitation: pulling up to a full STOP (you can always brake
+// to a halt), and an EMERGENCY (an explosive reaction to a threat / a flat-out
+// recovery sprint). Note the dwell only bites when a gait was changed within the last
+// dwell window: a player who has held a gait a while (the common case) reacts to a
+// new decision immediately; only rapid successive changes are damped. ~0.2 s.
+const GAIT_COMMIT_SECONDS: f64 = 0.20;
 // A committed travel heading must be held at least this long before it may be
 // REVERSED (turned more sharply than the threshold below). Gentle steering — bending
 // a run, tracking a moving target, lateral adjustments — is always free; only a hard
@@ -438,6 +439,14 @@ const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
 const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
 const DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS: f64 = 4.0;
+// A defender carrying the ball keeps a WIDER cushion than the universal 2yd comfort
+// gap (`DRIBBLE_OPPONENT_MIN_SPACE_YARDS`): with an opponent closing inside ~4yd the
+// carry bends AWAY from the nearest opponent (see `defender_carry_cushion_direction`)
+// to restore separation rather than dribbling into the press. This is the active
+// movement half of the defender cushion; the decision half (damp dribbling / lift
+// passing as the gap closes) lives in the player decision via the widened
+// `DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS` crowding and `DEFENDER_DRIBBLE_CLOSING_PASS_LIFT`.
+const DEFENDER_CARRY_CUSHION_YARDS: f64 = 4.0;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
@@ -44120,25 +44129,32 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
     }
 }
 
-/// Apply the downshift-dwell commitment to a freshly-decided gait, modelling
-/// locomotor momentum. Upshifting to more effort, holding the same tier, and coming
-/// to a stop are always honoured immediately (committing harder / pulling up are
-/// decisive acts). A downshift to a *still-moving* lower-effort gait is held off
-/// until the current gait has been carried for [`GAIT_DOWNSHIFT_COMMIT_SECONDS`], so
-/// effort cannot oscillate tick-to-tick (the "sprint, run, sprint, run" jitter). See
-/// the constant's comment for the rationale.
-fn commit_gait(prev: MovementGait, desired: MovementGait, held_seconds: f64) -> MovementGait {
+/// Apply the gait-commitment dwell to a freshly-decided gait, modelling locomotor
+/// momentum. Once an effort tier is entered it is held for [`GAIT_COMMIT_SECONDS`]
+/// before changing in EITHER direction, so effort cannot oscillate tick-to-tick (the
+/// "sprint, run, sprint, run" jitter). Decisive acts bypass the lock: setting off from
+/// a standstill, pulling up to a full stop (you can always brake to a halt), and an
+/// `emergency` (an explosive reaction to a threat / flat-out recovery). The dwell thus
+/// governs only oscillation *between moving gaits*, and only bites within the window
+/// after a change: a gait held a while already satisfies it and switches immediately.
+fn commit_gait(
+    prev: MovementGait,
+    desired: MovementGait,
+    held_seconds: f64,
+    emergency: bool,
+) -> MovementGait {
     if desired == prev {
         return desired;
     }
-    let prev_tier = prev.effort_tier();
-    let next_tier = desired.effort_tier();
-    // Upshift or same tier: free. Coming to a halt (Stand): free.
-    if next_tier >= prev_tier || next_tier == 0 {
+    // Decisive acts performed without hesitation, never delayed: setting off from a
+    // standstill (`prev` is `Stand`), pulling up to a full stop (`desired` is `Stand`),
+    // and explosive emergency reactions. The dwell governs only oscillation *between
+    // moving gaits* (sprint↔run↔jog), which is the jitter we are damping.
+    if prev.effort_tier() == 0 || desired.effort_tier() == 0 || emergency {
         return desired;
     }
-    // Genuine downshift to a still-moving gait: only once the dwell has elapsed.
-    if held_seconds >= GAIT_DOWNSHIFT_COMMIT_SECONDS {
+    // Otherwise hold the committed moving tier until it has been carried for the dwell.
+    if held_seconds >= GAIT_COMMIT_SECONDS {
         desired
     } else {
         prev
@@ -44149,14 +44165,16 @@ fn commit_gait(prev: MovementGait, desired: MovementGait, held_seconds: f64) -> 
 /// in the direction of travel. Gentle steering (≤90° off the committed heading) is
 /// always honoured and continuously updates the committed heading. A sharp change of
 /// direction (>90°, a cut-back) is locked until the committed heading has been held
-/// for [`HEADING_REVERSAL_COMMIT_SECONDS`]; while locked, the player keeps travelling
-/// along the committed heading at the decided speed instead of reversing on a dime.
-/// `emergency` (being chased, or a flat-out defensive recovery) bypasses the lock so
-/// a turn-and-run to keep up is never delayed. `held_seconds` is the time already
-/// spent on the committed heading and `dt` this step's duration; the dwell is
-/// accumulated per step rather than read off a clock, so it is correct however the
-/// mover is driven. Returns the (possibly redirected) desired velocity, the updated
-/// committed heading, and the updated time-held.
+/// for [`HEADING_REVERSAL_COMMIT_SECONDS`]; while locked, the player *brakes* (decided
+/// velocity drops to zero so the accel-limiter sheds speed) rather than reversing on a
+/// dime — this is the plant-and-cut a real player makes for a >90° change, and it also
+/// means the lock never forces the body straight through a teammate it should have
+/// steered around. `emergency` (being chased, or a flat-out defensive recovery)
+/// bypasses the lock so a turn-and-run to keep up is never delayed. `held_seconds` is
+/// the time already spent on the committed heading and `dt` this step's duration; the
+/// dwell is accumulated per step rather than read off a clock, so it is correct
+/// however the mover is driven. Returns the (possibly braked) desired velocity, the
+/// updated committed heading, and the updated time-held.
 fn commit_travel_heading(
     desired: Vec2,
     committed_heading: Option<Vec2>,
@@ -44178,9 +44196,10 @@ fn commit_travel_heading(
             let locked =
                 is_reversal && !emergency && held_seconds < HEADING_REVERSAL_COMMIT_SECONDS;
             if locked {
-                // Hold the committed line at the decided speed; keep accumulating hold
-                // time so the lock releases once the dwell is satisfied.
-                (heading * speed, Some(heading), held_seconds + dt)
+                // Plant and brake: shed speed (accel-limiter does the actual decel)
+                // rather than carve the reverse on a dime. Keep the committed heading
+                // and accumulate hold time so the lock releases once the dwell is met.
+                (Vec2::zero(), Some(heading), held_seconds + dt)
             } else if is_reversal {
                 // Accept the reversal and restart the dwell on the new heading.
                 (desired, Some(new_dir), dt)
@@ -45185,33 +45204,35 @@ mod locomotion_commitment_tests {
     }
 
     #[test]
-    fn gait_upshift_and_same_tier_are_always_free() {
-        // Below the dwell, an upshift to more effort is honoured immediately.
+    fn gait_holding_same_tier_is_a_no_op() {
         assert_eq!(
-            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.01),
-            MovementGait::Sprint
-        );
-        // Holding the same gait is a no-op.
-        assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0),
+            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0, false),
             MovementGait::Sprint
         );
     }
 
     #[test]
-    fn gait_downshift_is_locked_until_the_dwell_elapses() {
-        // The exact "sprint, run, sprint, run" case: a downshift out of the sprint
-        // before the dwell is refused — the player stays sprinting.
+    fn gait_change_is_locked_in_both_directions_until_the_dwell() {
+        // The exact "sprint, run, sprint, run" case: a downshift before the dwell is
+        // refused — the player stays sprinting.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05),
+            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05, false),
             MovementGait::Sprint
         );
-        // Once the gait has been carried for the dwell, the downshift is allowed.
+        // And the symmetric half: bouncing straight back UP to a sprint before the
+        // dwell is refused too — this is what stops the half-rate oscillation that a
+        // downshift-only lock leaves behind.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.05, false),
+            MovementGait::Run
+        );
+        // Once the gait has been carried for the dwell, the change is allowed.
         assert_eq!(
             commit_gait(
                 MovementGait::Sprint,
                 MovementGait::Run,
-                GAIT_DOWNSHIFT_COMMIT_SECONDS + 0.01
+                GAIT_COMMIT_SECONDS + 0.01,
+                false
             ),
             MovementGait::Run
         );
@@ -45221,8 +45242,26 @@ mod locomotion_commitment_tests {
     fn pulling_up_to_a_stop_is_always_allowed() {
         // Coming to a halt is never locked, even straight from a flat-out sprint.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0),
+            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0, false),
             MovementGait::Stand
+        );
+    }
+
+    #[test]
+    fn emergency_bypasses_the_gait_lock() {
+        // An explosive reaction to a threat can spike effort instantly, dwell or not.
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::Sprint, 0.0, true),
+            MovementGait::Sprint
+        );
+    }
+
+    #[test]
+    fn setting_off_from_a_standstill_is_immediate() {
+        // Starting to move is decisive, not jitter — no dwell from rest.
+        assert_eq!(
+            commit_gait(MovementGait::Stand, MovementGait::Sprint, 0.0, false),
+            MovementGait::Sprint
         );
     }
 
@@ -45251,11 +45290,11 @@ mod locomotion_commitment_tests {
     fn sharp_reversal_is_locked_then_released_after_the_dwell() {
         let committed = Vec2::new(0.0, 1.0);
         let reversal = Vec2::new(0.0, -6.0); // 180° about-face, speed 6
-        // Held less than the dwell: travel is held on the committed line, at the
-        // decided speed, and the clock keeps accruing toward release.
+        // Held less than the dwell: the player plants and brakes (zero decided
+        // velocity), the committed heading is kept, and the clock accrues toward release.
         let (vel, heading, held) =
             commit_travel_heading(reversal, Some(committed), 0.05, 0.02, false);
-        assert!(vel.distance(Vec2::new(0.0, 6.0)) < 1e-9, "held on committed heading");
+        assert!(vel.len() < 1e-9, "plant-and-brake while the reversal is locked");
         assert!(heading.unwrap().distance(committed) < 1e-9);
         assert!((held - 0.07).abs() < 1e-9);
         // Held past the dwell: the about-face is accepted and the dwell restarts.

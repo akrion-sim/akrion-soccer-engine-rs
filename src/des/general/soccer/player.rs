@@ -642,7 +642,8 @@ impl PlayerAgent {
             (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.62).clamp(0.40, 1.0);
         // ...and a deep carrier should give the ball up sooner the longer that risk persists,
         // so the release (pass/shot) gets a positional urgency boost on top of the existing
-        // hold-time model.
+        // hold-time model. For defenders the wider comfort buffer already feeds this via
+        // `defender_crowding` → `dribble_risk`, so no extra term is needed here.
         let deep_release_urgency =
             (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.34).clamp(1.0, 1.45);
         // Stack the positional/keeper release lifts onto the hold-time release model, but
