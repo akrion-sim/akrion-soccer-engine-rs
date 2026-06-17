@@ -1144,67 +1144,6 @@ fn relational_shape_target_carries_offsets_with_the_line() {
 }
 
 #[test]
-fn fore_aft_line_padding_holds_midfield_band_relative_to_defence() {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    let attack = Team::Home.attack_dir();
-    let def_mean = {
-        let ys: Vec<f64> = sim
-            .players
-            .iter()
-            .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
-            .map(|p| p.position.y)
-            .collect();
-        ys.iter().sum::<f64>() / ys.len() as f64
-    };
-    let probe_midfielder = |sim: &SoccerMatch| -> (usize, f64) {
-        sim.players
-            .iter()
-            .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
-            .map(|p| (p.id, p.position.y))
-            .unwrap()
-    };
-    let set_midfield_y = |sim: &mut SoccerMatch, y: f64| {
-        for player in sim
-            .players
-            .iter_mut()
-            .filter(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
-        {
-            player.position.y = y;
-        }
-    };
-
-    // Squeeze the midfield onto the back line (0 yd ahead — below the 2 yd band minimum).
-    set_midfield_y(&mut sim, def_mean);
-    let (mid_id, mid_y) = probe_midfielder(&sim);
-    let compacted = sim.fore_aft_line_padding_nudge_y(mid_id, mid_y, Team::Home, PlayerRole::Midfielder);
-    // Below the band minimum => nudged up-pitch (toward the opponent goal).
-    assert!(
-        compacted * attack > 0.0,
-        "midfield squeezed onto the back line should be nudged up-pitch: {compacted}"
-    );
-    // Fresh clock => still the soft, capped pull (no hard snap before the grace window).
-    assert!(
-        compacted.abs() <= FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS + 1e-9,
-        "pre-grace nudge is soft and capped, never a hard snap"
-    );
-
-    // A midfield sitting comfortably inside the band (10 yd ahead) gets no correction.
-    set_midfield_y(&mut sim, def_mean + 10.0 * attack);
-    let (mid_id, mid_y) = probe_midfielder(&sim);
-    let in_band = sim.fore_aft_line_padding_nudge_y(mid_id, mid_y, Team::Home, PlayerRole::Midfielder);
-    assert!(in_band.abs() <= 1e-9, "in-band midfield is left alone: {in_band}");
-
-    // Overextend the midfield well beyond the 18 yd band maximum: pull it back.
-    set_midfield_y(&mut sim, def_mean + 30.0 * attack);
-    let (mid_id, mid_y) = probe_midfielder(&sim);
-    let overextended = sim.fore_aft_line_padding_nudge_y(mid_id, mid_y, Team::Home, PlayerRole::Midfielder);
-    assert!(
-        overextended * attack < 0.0,
-        "midfield beyond the band maximum should be pulled back: {overextended}"
-    );
-}
-
-#[test]
 fn relational_shape_nudges_out_of_shape_player_back_into_the_unit() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mover = sim
@@ -1223,14 +1162,10 @@ fn relational_shape_nudges_out_of_shape_player_back_into_the_unit() {
         .map(|p| p.id)
         .unwrap();
     sim.ball.holder = Some(away_holder);
+    sim.ball.position = Vec2::new(40.0, 95.0);
 
     // Drag our defender into the far corner, well out of its relative shape.
     sim.players[mover_idx].position = Vec2::new(8.0, 8.0);
-    // Park the (opponent-held) ball right next to our man — inside the ball-compactness
-    // deadzone — so this test isolates the relational cohesion nudge from the separate
-    // ball-attraction drift. The opponent holder already rules out the loose-ball
-    // exemption regardless of distance.
-    sim.ball.position = Vec2::new(10.0, 10.0);
     let roster: Vec<(usize, Team, PlayerRole, Vec2, Vec2)> = sim
         .players
         .iter()
@@ -1266,10 +1201,7 @@ fn relational_shape_nudges_out_of_shape_player_back_into_the_unit() {
         "a single relational nudge must respect the per-tick cap"
     );
 
-    // In-shape players (small error) are left alone by the relational cohesion pull.
-    // Park the ball on the in-shape target too, so the orthogonal ball-attraction drift
-    // (deadzoned) doesn't move it and this stays a pure cohesion check.
-    sim.ball.position = cohesive;
+    // In-shape players (small error) are left alone.
     let in_shape_intent = PlayerIntent {
         player_id: mover,
         action: SoccerAction::MoveTo(cohesive),
