@@ -2797,18 +2797,33 @@ pub(crate) fn annotate_formation_lp_role_line_errors(
         .iter()
         .map(|entry| (entry.player_id, entry.target))
         .collect::<HashMap<_, _>>();
+    let team_by_player = guidance
+        .iter()
+        .map(|entry| (entry.player_id, entry.team))
+        .collect::<HashMap<_, _>>();
+    let role_mean_fwd = |role: PlayerRole, team: Team| -> Option<f64> {
+        let attack_dir = team.attack_dir();
+        let mut total = 0.0;
+        let mut count = 0usize;
+        for (player_id, target) in &targets {
+            if role_by_player.get(player_id).copied() == Some(role)
+                && team_by_player.get(player_id).copied() == Some(team)
+            {
+                total += target.y * attack_dir;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| total / count as f64)
+    };
     for entry in guidance {
         let Some(role) = role_by_player.get(&entry.player_id).copied() else {
             entry.role_line_error_yards = 0.0;
             continue;
         };
         let tolerance = match role {
-            PlayerRole::Defender => DEFENDER_LINE_COHESION_TOLERANCE_YARDS,
-            PlayerRole::Midfielder => MIDFIELDER_LINE_COHESION_TOLERANCE_YARDS,
-            PlayerRole::Goalkeeper | PlayerRole::Forward => {
-                entry.role_line_error_yards = 0.0;
-                continue;
-            }
+            PlayerRole::Defender => Some(DEFENDER_LINE_COHESION_TOLERANCE_YARDS),
+            PlayerRole::Midfielder => Some(MIDFIELDER_LINE_COHESION_TOLERANCE_YARDS),
+            PlayerRole::Goalkeeper | PlayerRole::Forward => None,
         };
         let mut same_line_total_y = 0.0;
         let mut same_line_count = 0usize;
@@ -2821,12 +2836,38 @@ pub(crate) fn annotate_formation_lp_role_line_errors(
                 same_line_count += 1;
             }
         }
-        entry.role_line_error_yards = if same_line_count < 2 {
+        let same_line_error = if same_line_count < 2 {
             0.0
-        } else {
+        } else if let Some(tolerance) = tolerance {
             ((entry.target.y - same_line_total_y / same_line_count as f64).abs() - tolerance)
                 .max(0.0)
+        } else {
+            0.0
         };
+        let layer_error = match role {
+            PlayerRole::Midfielder => role_mean_fwd(PlayerRole::Defender, entry.team)
+                .zip(role_mean_fwd(PlayerRole::Midfielder, entry.team))
+                .map(|(def_mean, mid_mean)| {
+                    role_layer_gap_band_error_yards(
+                        mid_mean - def_mean,
+                        MID_AHEAD_OF_DEF_MIN_YARDS,
+                        MID_AHEAD_OF_DEF_MAX_YARDS,
+                    )
+                })
+                .unwrap_or(0.0),
+            PlayerRole::Forward => role_mean_fwd(PlayerRole::Midfielder, entry.team)
+                .zip(role_mean_fwd(PlayerRole::Forward, entry.team))
+                .map(|(mid_mean, fwd_mean)| {
+                    role_layer_gap_band_error_yards(
+                        fwd_mean - mid_mean,
+                        STRIKER_AHEAD_OF_MID_MIN_YARDS,
+                        STRIKER_AHEAD_OF_MID_MAX_YARDS,
+                    )
+                })
+                .unwrap_or(0.0),
+            _ => 0.0,
+        };
+        entry.role_line_error_yards = same_line_error.max(layer_error);
     }
 }
 
@@ -3982,7 +4023,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
     // spread, cohesive block. A proclivity, not a command: only violations are
     // nudged, and the result is just the LP's anchor target, balanced downstream.
     if std::env::var("DD_SOCCER_DISABLE_FORMATION_STAGGER").is_err() {
-        soccer_formation_lp_stagger_role_layers(&mut slots, team, width, length);
+        soccer_formation_lp_stagger_role_layers(&mut slots, team, width, length, dt);
     }
     slots
 }
@@ -3990,19 +4031,30 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
 /// Gentle, seed-valued staggering of the formation-LP anchors so the team keeps
 /// ideal *relative* role positions and travels up/down the pitch as a unit:
 /// midfielders ahead of defenders, forwards ahead of midfielders, and lateral
-/// spread within the back line and the midfield. Only *violations* are corrected,
-/// and only partway (a nudge toward the seed band, not a snap onto it), so a
-/// compliant shape is left untouched. Anchors are a soft LP target, so the LP
-/// still balances these against pressure, dynamics, and movement cost.
+/// spread within the back line and the midfield. Only *violations* are corrected:
+/// compressed lines step up, stretched lines drop back, and compliant shapes are
+/// left untouched. Anchors remain soft LP targets, with movement/reach constraints
+/// downstream deciding how much of the 3s/5s consistency correction can be executed.
 pub(crate) fn soccer_formation_lp_stagger_role_layers(
     slots: &mut [SoccerFormationLpSlotInput],
     team: Team,
     width: f64,
     length: f64,
+    dt_seconds: f64,
 ) {
     let attack_dir = team.attack_dir();
-    // Fraction of each deficit we correct per tick — keeps it a nudge.
-    const STAGGER_CORRECTION: f64 = 0.6;
+    let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(0.0);
+    const LATERAL_STAGGER_CORRECTION: f64 = 0.6;
+    let layer_shift = |gap: f64, min_gap: f64, max_gap: f64, horizon: f64| -> f64 {
+        let desired_gap = gap.clamp(min_gap, max_gap);
+        let delta = desired_gap - gap;
+        if delta.abs() <= 1e-6 {
+            0.0
+        } else {
+            let fraction = (3.0 * dt / horizon.max(1e-6)).clamp(0.0, 1.0);
+            delta * fraction
+        }
+    };
 
     let layer_mean = |slots: &[SoccerFormationLpSlotInput], role: PlayerRole| -> Option<f64> {
         let (sum, count) = slots
@@ -4024,8 +4076,13 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         layer_mean(slots, PlayerRole::Midfielder),
     ) {
         let gap = mid_mean - def_mean;
-        if gap < MID_AHEAD_OF_DEF_MIN_YARDS {
-            let lift = (MID_AHEAD_OF_DEF_MIN_YARDS - gap) * STAGGER_CORRECTION;
+        let lift = layer_shift(
+            gap,
+            MID_AHEAD_OF_DEF_MIN_YARDS,
+            MID_AHEAD_OF_DEF_MAX_YARDS,
+            MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS,
+        );
+        if lift.abs() > 1e-6 {
             for s in slots
                 .iter_mut()
                 .filter(|s| s.active && s.role == PlayerRole::Midfielder)
@@ -4040,8 +4097,13 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         layer_mean(slots, PlayerRole::Forward),
     ) {
         let gap = fwd_mean - mid_mean;
-        if gap < STRIKER_AHEAD_OF_MID_MIN_YARDS {
-            let lift = (STRIKER_AHEAD_OF_MID_MIN_YARDS - gap) * STAGGER_CORRECTION;
+        let lift = layer_shift(
+            gap,
+            STRIKER_AHEAD_OF_MID_MIN_YARDS,
+            STRIKER_AHEAD_OF_MID_MAX_YARDS,
+            STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS,
+        );
+        if lift.abs() > 1e-6 {
             for s in slots
                 .iter_mut()
                 .filter(|s| s.active && s.role == PlayerRole::Forward)
@@ -4057,13 +4119,13 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         slots,
         PlayerRole::Defender,
         BACKLINE_LATERAL_MIN_YARDS,
-        STAGGER_CORRECTION,
+        LATERAL_STAGGER_CORRECTION,
     );
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Midfielder,
         MIDLINE_LATERAL_MIN_YARDS,
-        STAGGER_CORRECTION,
+        LATERAL_STAGGER_CORRECTION,
     );
 
     for s in slots.iter_mut().filter(|s| s.active) {

@@ -4337,6 +4337,7 @@ impl SoccerMatch {
             SelfSpacing,
             RelationalShape,
             LaneGuard,
+            BallProximity,
         }
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
@@ -4570,9 +4571,10 @@ impl SoccerMatch {
                     // within 20yd in possession; sit >=20yd off (15yd in transit) when the
                     // opponent has the ball upfield.
                     let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
-                    // Hold the midfield line the right distance in front of the back four
-                    // (15-30yd centrally, tapering to 10-15yd in the outer fifths).
+                    // Hold the midfield line 2-18yd in front of the back four.
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
+                    // Hold the striker line 3-20yd in front of the midfield line.
+                    let intent = snapshot.forward_line_band_adjusted_intent(intent);
                     // While the ball is in transit, a player who can't get it drops goalside of
                     // where the ball is GOING (anticipated possession), not where it is now.
                     let intent = snapshot.goalside_anticipation_adjusted_intent(intent);
@@ -4598,6 +4600,7 @@ impl SoccerMatch {
                     }
                     cluster_b.push(SoftNudge::RelationalShape);
                     cluster_b.push(SoftNudge::LaneGuard);
+                    cluster_b.push(SoftNudge::BallProximity);
                     if tick_order_shuffle_enabled(&self.config) {
                         fisher_yates_shuffle(&mut cluster_b, &mut nudge_rng);
                     }
@@ -4612,6 +4615,9 @@ impl SoccerMatch {
                             }
                             SoftNudge::LaneGuard => {
                                 snapshot.teammate_lane_guard_adjusted_intent(intent)
+                            }
+                            SoftNudge::BallProximity => {
+                                snapshot.ball_proximity_adjusted_intent(intent)
                             }
                             _ => intent,
                         };
@@ -15163,7 +15169,7 @@ impl WorldSnapshot {
             })
     }
 
-    pub(crate) fn role_line_deviation_yards_for_target(
+    fn same_role_line_deviation_yards_for_target(
         &self,
         player: &PlayerSnapshot,
         target: Vec2,
@@ -15186,15 +15192,73 @@ impl WorldSnapshot {
         }
     }
 
+    fn role_layer_gap_error_yards_for_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        let attack_dir = player.team.attack_dir();
+        let role_mean_fwd = |role: PlayerRole| -> Option<f64> {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for teammate in self
+                .players
+                .iter()
+                .filter(|teammate| teammate.team == player.team && teammate.role == role)
+            {
+                let position = if teammate.id == player.id {
+                    target
+                } else {
+                    self.player_snapshot_position(teammate)
+                };
+                total += position.y * attack_dir;
+                count += 1;
+            }
+            (count > 0).then(|| total / count as f64)
+        };
+        match player.role {
+            PlayerRole::Midfielder => role_mean_fwd(PlayerRole::Defender)
+                .zip(role_mean_fwd(PlayerRole::Midfielder))
+                .map(|(def_mean, mid_mean)| {
+                    role_layer_gap_band_error_yards(
+                        mid_mean - def_mean,
+                        MID_AHEAD_OF_DEF_MIN_YARDS,
+                        MID_AHEAD_OF_DEF_MAX_YARDS,
+                    )
+                })
+                .unwrap_or(0.0),
+            PlayerRole::Forward => role_mean_fwd(PlayerRole::Midfielder)
+                .zip(role_mean_fwd(PlayerRole::Forward))
+                .map(|(mid_mean, fwd_mean)| {
+                    role_layer_gap_band_error_yards(
+                        fwd_mean - mid_mean,
+                        STRIKER_AHEAD_OF_MID_MIN_YARDS,
+                        STRIKER_AHEAD_OF_MID_MAX_YARDS,
+                    )
+                })
+                .unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+
+    pub(crate) fn role_line_deviation_yards_for_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        self.same_role_line_deviation_yards_for_target(player, target)
+            .max(self.role_layer_gap_error_yards_for_target(player, target))
+    }
+
     fn role_line_cohesion_error_yards_for_target(
         &self,
         player: &PlayerSnapshot,
         target: Vec2,
     ) -> f64 {
         let tolerance = match player.role {
-            PlayerRole::Defender => DEFENDER_LINE_COHESION_TOLERANCE_YARDS,
-            PlayerRole::Midfielder => MIDFIELDER_LINE_COHESION_TOLERANCE_YARDS,
-            PlayerRole::Goalkeeper | PlayerRole::Forward => return 0.0,
+            PlayerRole::Defender => Some(DEFENDER_LINE_COHESION_TOLERANCE_YARDS),
+            PlayerRole::Midfielder => Some(MIDFIELDER_LINE_COHESION_TOLERANCE_YARDS),
+            PlayerRole::Goalkeeper | PlayerRole::Forward => None,
         };
         let mut total_gap = 0.0;
         let mut max_gap: f64 = 0.0;
@@ -15207,11 +15271,15 @@ impl WorldSnapshot {
             max_gap = max_gap.max(gap);
             count += 1;
         }
-        if count < 2 {
-            return 0.0;
-        }
-        let blended_gap = total_gap / count as f64 * 0.70 + max_gap * 0.30;
-        (blended_gap - tolerance).max(0.0)
+        let same_line_error = if count < 2 {
+            0.0
+        } else if let Some(tolerance) = tolerance {
+            let blended_gap = total_gap / count as f64 * 0.70 + max_gap * 0.30;
+            (blended_gap - tolerance).max(0.0)
+        } else {
+            0.0
+        };
+        same_line_error.max(self.role_layer_gap_error_yards_for_target(player, target))
     }
 
     pub(crate) fn role_line_cohesion_score_for_player_target(
@@ -15239,6 +15307,8 @@ impl WorldSnapshot {
             (PlayerRole::Defender, false) => 0.088,
             (PlayerRole::Midfielder, true) => 0.014,
             (PlayerRole::Midfielder, false) => 0.056,
+            (PlayerRole::Forward, true) => 0.016,
+            (PlayerRole::Forward, false) => 0.046,
             _ => 0.0,
         };
         self.role_line_cohesion_error_yards_for_target(player, target)
@@ -15261,10 +15331,15 @@ impl WorldSnapshot {
             (PlayerRole::Defender, false) => 0.095,
             (PlayerRole::Midfielder, true) => 0.012,
             (PlayerRole::Midfielder, false) => 0.070,
+            (PlayerRole::Forward, true) => 0.018,
+            (PlayerRole::Forward, false) => 0.052,
             _ => 0.0,
         };
-        let deviation = self.role_line_deviation_yards_for_target(player, target);
-        (deviation - 5.5).max(0.0) * weight * (1.0 - relief.clamp(0.0, 0.80))
+        let same_line_deviation = self.same_role_line_deviation_yards_for_target(player, target);
+        let layer_gap_error = self.role_layer_gap_error_yards_for_target(player, target);
+        ((same_line_deviation - 5.5).max(0.0) + layer_gap_error * 1.65)
+            * weight
+            * (1.0 - relief.clamp(0.0, 0.80))
             + self.role_line_cohesion_penalty_for_player_target(player, target, relief)
     }
 
@@ -20994,6 +21069,175 @@ impl WorldSnapshot {
         })
     }
 
+    fn loose_ball_totally_uncontested_for_team(&self, team: Team, target: Vec2) -> bool {
+        if self.ball.holder.is_some() || !target.x.is_finite() || !target.y.is_finite() {
+            return false;
+        }
+        let mut own_best = f64::INFINITY;
+        let mut opponent_best = f64::INFINITY;
+        for player in self
+            .players
+            .iter()
+            .filter(|player| player.role != PlayerRole::Goalkeeper)
+        {
+            let arrival = loose_ball_arrival_time_seconds(self, player, target);
+            if player.team == team {
+                own_best = own_best.min(arrival);
+            } else {
+                opponent_best = opponent_best.min(arrival);
+            }
+        }
+        own_best.is_finite()
+            && opponent_best.is_finite()
+            && opponent_best - own_best
+                >= BALL_PROXIMITY_LOOSE_UNCONTESTED_ADVANTAGE_SECONDS
+            && self.nearest_opponent_distance_at(team, target)
+                >= BALL_PROXIMITY_LOOSE_UNCONTESTED_OPPONENT_RADIUS_YARDS
+    }
+
+    fn ball_proximity_candidate_respects_padding(
+        &self,
+        player: &PlayerSnapshot,
+        base: Vec2,
+        candidate: Vec2,
+        focus: Vec2,
+        ball_padding: f64,
+    ) -> bool {
+        if candidate.distance(focus) < ball_padding - 1e-6 {
+            return false;
+        }
+        let teammate_padding = if self.point_in_either_penalty_area(candidate) {
+            TEAMMATE_MIN_SPACING_BOX_YARDS
+        } else {
+            TEAMMATE_MIN_SPACING_YARDS
+        };
+        if self.nearest_teammate_distance_at(player.team, candidate, Some(player.id))
+            < teammate_padding
+        {
+            return false;
+        }
+        if self.possession_team() == Some(player.team)
+            && self.position_would_be_offside(player.team, candidate)
+        {
+            return false;
+        }
+        let base_layer_error = self.role_layer_gap_error_yards_for_target(player, base);
+        let candidate_layer_error = self.role_layer_gap_error_yards_for_target(player, candidate);
+        if candidate_layer_error
+            > base_layer_error + BALL_PROXIMITY_MAX_LINE_BAND_ERROR_INCREASE_YARDS
+        {
+            return false;
+        }
+        let line_clamped = match player.role {
+            PlayerRole::Defender => self.defensive_line_cushion_adjusted_target(player.id, candidate),
+            PlayerRole::Midfielder => self.midfield_line_band_adjusted_target(player.id, candidate),
+            PlayerRole::Forward => self.forward_line_band_adjusted_target(player.id, candidate),
+            PlayerRole::Goalkeeper => candidate,
+        };
+        line_clamped.distance(candidate) <= 0.75
+    }
+
+    pub(crate) fn ball_proximity_adjusted_target(
+        &self,
+        player_id: usize,
+        target: Vec2,
+    ) -> (Vec2, bool) {
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return (target, false);
+        }
+        let Some(me) = self.players.iter().find(|player| player.id == player_id) else {
+            return (target, false);
+        };
+        if me.role == PlayerRole::Goalkeeper
+            || me.controller_slot.is_some()
+            || self.ball.holder == Some(player_id)
+        {
+            return (target, false);
+        }
+        if self
+            .pending_pass
+            .as_ref()
+            .and_then(|pass| pass.target)
+            .is_some_and(|receiver| receiver == player_id)
+        {
+            return (target, false);
+        }
+
+        let loose = self.ball.holder.is_none();
+        let focus = if loose {
+            self.loose_ball_contest_target_for(player_id)
+        } else {
+            self.ball.position
+        };
+        if !focus.x.is_finite() || !focus.y.is_finite() {
+            return (target, false);
+        }
+        let target_distance = target.distance(focus);
+        let current_distance = self.player_snapshot_position(me).distance(focus);
+        let uncontested_loose = loose && self.loose_ball_totally_uncontested_for_team(me.team, focus);
+        let committed_loose_chaser = loose && self.is_committed_loose_ball_chaser(player_id);
+        let ball_padding = if loose {
+            if committed_loose_chaser {
+                BALL_PROXIMITY_MIN_PADDING_YARDS
+            } else if uncontested_loose {
+                BALL_PROXIMITY_UNCONTESTED_LOOSE_SUPPORT_PADDING_YARDS
+            } else {
+                BALL_PROXIMITY_CONTESTED_LOOSE_SUPPORT_PADDING_YARDS
+            }
+        } else {
+            BALL_PROXIMITY_MIN_PADDING_YARDS
+        };
+        if target_distance <= ball_padding + 0.05 || current_distance <= ball_padding {
+            return (target, false);
+        }
+        let to_focus = focus - target;
+        if to_focus.len() <= 1e-6 {
+            return (target, false);
+        }
+        let max_pull = if loose && !uncontested_loose {
+            BALL_PROXIMITY_CONTESTED_LOOSE_PULL_MAX_YARDS
+        } else {
+            BALL_PROXIMITY_PULL_MAX_YARDS
+        };
+        let desired_pull = (target_distance - ball_padding).min(max_pull);
+        if desired_pull <= 1e-6 {
+            return (target, false);
+        }
+        let dir = to_focus.normalized();
+        for fraction in [1.0, 0.75, 0.50, 0.25, 0.125] {
+            let candidate = (target + dir * desired_pull * fraction)
+                .clamp_to_pitch(self.field_width, self.field_length);
+            if candidate.distance(focus) >= target_distance - 0.05 {
+                continue;
+            }
+            if self.ball_proximity_candidate_respects_padding(
+                me,
+                target,
+                candidate,
+                focus,
+                ball_padding,
+            ) {
+                let gain = target_distance - candidate.distance(focus);
+                let sprint = loose
+                    && !uncontested_loose
+                    && gain >= BALL_PROXIMITY_SPRINT_MIN_GAIN_YARDS;
+                return (candidate, sprint);
+            }
+        }
+        (target, false)
+    }
+
+    fn ball_proximity_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+        if let SoccerAction::MoveTo(target) = intent.action {
+            let (adjusted, sprint) = self.ball_proximity_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.action = SoccerAction::MoveTo(adjusted);
+                intent.sprint = intent.sprint || sprint;
+            }
+        }
+        intent
+    }
+
     /// Keep the back four's AVERAGE position in its band relative to the ball (see the
     /// `DEFENSIVE_LINE_*` constants). For a defender's off-ball move, shifts its target along the
     /// attacking axis by the amount the line's average is outside the band, so the whole line
@@ -21152,11 +21396,9 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the midfield line's AVERAGE the right distance IN FRONT of the back four: a 15-30yd
-    /// band through the central 3/5 of the pitch that tapers linearly to 10-15yd in the outer 1/5
-    /// at each end (continuous, by the midfield's own length-wise position). Shifts a midfielder's
-    /// off-ball target along the attack axis by the line-average's deficit so the whole midfield
-    /// line steps up / drops back together while keeping its left-right shape.
+    /// Keep the midfield line's AVERAGE 2-18yd IN FRONT of the back four.
+    /// Every tick aims the line at the correction needed for consistency inside
+    /// the 3-second horizon, while accepting that physics/traffic may delay arrival.
     pub(crate) fn midfield_line_band_adjusted_target(
         &self,
         player_id: usize,
@@ -21176,11 +21418,11 @@ impl WorldSnapshot {
         }
         let attack_dir = me.team.attack_dir();
         let fwd = |p: Vec2| p.y * attack_dir;
-        let mids: Vec<Vec2> = self
+        let mids: Vec<(usize, Vec2)> = self
             .players
             .iter()
             .filter(|p| p.team == me.team && p.role == PlayerRole::Midfielder)
-            .map(|p| self.player_snapshot_position(p))
+            .map(|p| (p.id, self.player_snapshot_position(p)))
             .collect();
         let defs: Vec<f64> = self
             .players
@@ -21191,26 +21433,35 @@ impl WorldSnapshot {
         if mids.len() < 2 || defs.is_empty() {
             return target;
         }
-        let mid_avg_fwd = mids.iter().map(|p| fwd(*p)).sum::<f64>() / mids.len() as f64;
-        let mid_avg_y = mids.iter().map(|p| p.y).sum::<f64>() / mids.len() as f64;
+        let mid_avg_fwd = mids.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / mids.len() as f64;
         let def_avg_fwd = defs.iter().sum::<f64>() / defs.len() as f64;
         let gap = mid_avg_fwd - def_avg_fwd; // midfield in front of the defenders
-
-        // Band from the midfield's length-wise position: full width through the central 3/5,
-        // tapering linearly to the compact band across the outer 1/5 at each end.
-        let length = self.field_length.max(1.0);
-        let edge_dist = mid_avg_y.min(length - mid_avg_y).max(0.0);
-        let s = (edge_dist / (length / 5.0)).clamp(0.0, 1.0);
-        let min_gap = MIDFIELD_BAND_END_MIN_YARDS
-            + (MIDFIELD_BAND_MIDDLE_MIN_YARDS - MIDFIELD_BAND_END_MIN_YARDS) * s;
-        let max_gap = MIDFIELD_BAND_END_MAX_YARDS
-            + (MIDFIELD_BAND_MIDDLE_MAX_YARDS - MIDFIELD_BAND_END_MAX_YARDS) * s;
-        let desired_gap = gap.clamp(min_gap, max_gap);
-        if (desired_gap - gap).abs() < 1e-6 {
-            return target;
-        }
-        let delta = desired_gap - gap;
-        let adjusted_y = (target.y + delta * attack_dir).clamp(0.0, self.field_length);
+        let desired_gap = gap.clamp(MID_AHEAD_OF_DEF_MIN_YARDS, MID_AHEAD_OF_DEF_MAX_YARDS);
+        let current_delta = desired_gap - gap;
+        let current_fwd = fwd(self.player_snapshot_position(me));
+        let target_fwd = fwd(target);
+        let horizon = MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let adjusted_fwd = if current_delta.abs() > 1e-6 {
+            let correction_yps = current_delta / horizon;
+            current_fwd + correction_yps * horizon
+        } else {
+            let peer_sum_fwd = mids
+                .iter()
+                .filter(|(id, _)| *id != player_id)
+                .map(|(_, position)| fwd(*position))
+                .sum::<f64>();
+            let mid_count = mids.len() as f64;
+            let projected_avg_fwd = (peer_sum_fwd + target_fwd) / mid_count;
+            let projected_gap = projected_avg_fwd - def_avg_fwd;
+            let desired_projected_gap =
+                projected_gap.clamp(MID_AHEAD_OF_DEF_MIN_YARDS, MID_AHEAD_OF_DEF_MAX_YARDS);
+            let projected_delta = desired_projected_gap - projected_gap;
+            if projected_delta.abs() < 1e-6 {
+                return target;
+            }
+            target_fwd + projected_delta * mid_count
+        };
+        let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
         return Vec2::new(target.x, adjusted_y);
     }
 
@@ -21218,6 +21469,93 @@ impl WorldSnapshot {
     fn midfield_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+            }
+            intent.action = SoccerAction::MoveTo(adjusted);
+        }
+        return intent;
+    }
+
+    /// Keep the striker/forward line's AVERAGE 3-20yd IN FRONT of the midfield line.
+    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 5-second
+    /// consistency horizon so 2-3 forwards stay connected without snapping.
+    pub(crate) fn forward_line_band_adjusted_target(
+        &self,
+        player_id: usize,
+        target: Vec2,
+    ) -> Vec2 {
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return target;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return target;
+        };
+        if me.role != PlayerRole::Forward || me.controller_slot.is_some() {
+            return target;
+        }
+        if self.ball.holder == Some(player_id) {
+            return target;
+        }
+        let attack_dir = me.team.attack_dir();
+        let fwd = |p: Vec2| p.y * attack_dir;
+        let forwards: Vec<(usize, Vec2)> = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.role == PlayerRole::Forward)
+            .map(|p| (p.id, self.player_snapshot_position(p)))
+            .collect();
+        let mids: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.role == PlayerRole::Midfielder)
+            .map(|p| fwd(self.player_snapshot_position(p)))
+            .collect();
+        if forwards.is_empty() || mids.len() < 2 {
+            return target;
+        }
+        let fwd_avg = forwards.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / forwards.len() as f64;
+        let mid_avg = mids.iter().sum::<f64>() / mids.len() as f64;
+        let gap = fwd_avg - mid_avg;
+        let desired_gap =
+            gap.clamp(STRIKER_AHEAD_OF_MID_MIN_YARDS, STRIKER_AHEAD_OF_MID_MAX_YARDS);
+        let current_delta = desired_gap - gap;
+        let current_fwd = fwd(self.player_snapshot_position(me));
+        let target_fwd = fwd(target);
+        let horizon = STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let adjusted_fwd = if current_delta.abs() > 1e-6 {
+            let correction_yps = current_delta / horizon;
+            current_fwd + correction_yps * horizon
+        } else {
+            let peer_sum_fwd = forwards
+                .iter()
+                .filter(|(id, _)| *id != player_id)
+                .map(|(_, position)| fwd(*position))
+                .sum::<f64>();
+            let forward_count = forwards.len() as f64;
+            let projected_avg_fwd = (peer_sum_fwd + target_fwd) / forward_count;
+            let projected_gap = projected_avg_fwd - mid_avg;
+            let desired_projected_gap = projected_gap.clamp(
+                STRIKER_AHEAD_OF_MID_MIN_YARDS,
+                STRIKER_AHEAD_OF_MID_MAX_YARDS,
+            );
+            let projected_delta = desired_projected_gap - projected_gap;
+            if projected_delta.abs() < 1e-6 {
+                return target;
+            }
+            target_fwd + projected_delta * forward_count
+        };
+        let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
+        return Vec2::new(target.x, adjusted_y);
+    }
+
+    /// Applies [`Self::forward_line_band_adjusted_target`] to a decided off-ball move.
+    fn forward_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+        if let SoccerAction::MoveTo(target) = intent.action {
+            let adjusted = self.forward_line_band_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+            }
             intent.action = SoccerAction::MoveTo(adjusted);
         }
         return intent;

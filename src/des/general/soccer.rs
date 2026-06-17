@@ -1604,9 +1604,26 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // targeted) that shape the formation-LP anchors; the LP/learners refine them.
 // Forward layering (measured along the team's attack direction):
 const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 2.0;
+const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 18.0;
 const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 5.0;
+const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
+const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 6.5;
+const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 5.0;
+
+fn role_layer_gap_band_error_yards(gap_yards: f64, min_yards: f64, max_yards: f64) -> f64 {
+    if !gap_yards.is_finite() {
+        0.0
+    } else if gap_yards < min_yards {
+        min_yards - gap_yards
+    } else if gap_yards > max_yards {
+        gap_yards - max_yards
+    } else {
+        0.0
+    }
+}
+
 // Lateral spread within a line (adjacent players ordered by home-x): centre-backs
 // and centre-back-to-wing-back, and the midfield line.
 const BACKLINE_LATERAL_MIN_YARDS: f64 = 2.0;
@@ -1619,6 +1636,15 @@ const MIDLINE_LATERAL_IDEAL_YARDS: f64 = 5.0;
 // out of a sustained overlap, the other lightly penalises camping in one.
 const TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD: f64 = 0.06;
 const TEAMMATE_SPACING_OVERLAP_CAMP_PENALTY: f64 = 0.03;
+const BALL_PROXIMITY_MIN_PADDING_YARDS: f64 = 1.0;
+const BALL_PROXIMITY_PULL_MAX_YARDS: f64 = 2.8;
+const BALL_PROXIMITY_CONTESTED_LOOSE_PULL_MAX_YARDS: f64 = 7.5;
+const BALL_PROXIMITY_CONTESTED_LOOSE_SUPPORT_PADDING_YARDS: f64 = 2.5;
+const BALL_PROXIMITY_UNCONTESTED_LOOSE_SUPPORT_PADDING_YARDS: f64 = 6.0;
+const BALL_PROXIMITY_LOOSE_UNCONTESTED_OPPONENT_RADIUS_YARDS: f64 = 12.0;
+const BALL_PROXIMITY_LOOSE_UNCONTESTED_ADVANTAGE_SECONDS: f64 = 1.25;
+const BALL_PROXIMITY_MAX_LINE_BAND_ERROR_INCREASE_YARDS: f64 = 0.10;
+const BALL_PROXIMITY_SPRINT_MIN_GAIN_YARDS: f64 = 1.5;
 const OFFENSIVE_OVERLAP_RELIEF_TEAMMATE_RADIUS_YARDS: f64 = 7.0;
 const OFFENSIVE_OVERLAP_RELIEF_MIN_FORWARD_YARDS: f64 = 0.35;
 const OFFENSIVE_OVERLAP_RELIEF_LOOKAHEAD_SECONDS: f64 = 0.35;
