@@ -42730,7 +42730,9 @@ fn modulated_pass_speed_yps(
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let reach_target_floor = distance / hang_time.max(0.35);
         let lively_floor = mph_to_yps(13.0);
-        reach_target_floor.max(lively_floor)
+        // Never demand more than the ball can physically be struck (the cap): a ball too far to
+        // reach within its hang time simply lands short, it doesn't fly impossibly fast.
+        reach_target_floor.max(lively_floor).min(cap)
     } else {
         mph_to_yps(4.0)
     };

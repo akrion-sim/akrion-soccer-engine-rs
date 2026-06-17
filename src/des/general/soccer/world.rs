@@ -12416,8 +12416,11 @@ impl BallAgent {
             .pending_pass
             .as_ref()
             .map(|pass| {
-                let time_aloft =
-                    (context.tick.saturating_sub(pass.launch_tick)) as f64 * context.dt_seconds;
+                // The ball has just been advanced one step, so by here it has been aloft for
+                // (ticks-since-launch + 1) steps — even on the launch tick itself (where
+                // context.tick == launch_tick) it has already travelled one dt.
+                let time_aloft = (context.tick.saturating_sub(pass.launch_tick) as f64 + 1.0)
+                    * context.dt_seconds;
                 pass_ball_altitude_yards(pass, time_aloft)
             })
             .unwrap_or(loose_long_ball_altitude);
