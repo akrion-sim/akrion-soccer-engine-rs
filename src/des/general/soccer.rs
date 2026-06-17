@@ -1703,6 +1703,10 @@ const CHASE_EMERGENCY_RADIUS_YARDS: f64 = 5.0;
 const CHASE_EMERGENCY_SPEED_YPS: f64 = 5.0;
 // A non-aerial ball within this radius is always trapped (players are elite at it).
 const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
+// Low passes (<=6ft / 2yd) that physically cross a player's body/control bubble must
+// touch that player before continuing to a later receiver. This is deliberately a
+// segment-level contact radius, not a scored reception preference.
+const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
 // looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
@@ -43480,6 +43484,7 @@ fn nearest_ball_controller_for_segment(
     let ball_segment = ball_pos - previous_ball_pos;
     let ball_segment_len = ball_segment.len();
     let mut candidates = Vec::new();
+    let mut low_pass_body_contact: Option<(f64, f64, usize, Team, Vec2)> = None;
     for p in players {
         if same_tick_long_ball_launcher == Some(p.id) {
             continue;
@@ -43489,12 +43494,48 @@ fn nearest_ball_controller_for_segment(
                 continue;
             }
         }
+        let control_projection = if ball_segment_len > 1e-6 {
+            segment_projection_factor(previous_ball_pos, ball_pos, p.position)
+        } else {
+            1.0
+        };
         let control_point = if ball_segment_len > 1e-6 {
-            previous_ball_pos
-                + ball_segment * segment_projection_factor(previous_ball_pos, ball_pos, p.position)
+            previous_ball_pos + ball_segment * control_projection
         } else {
             ball_pos
         };
+        if let Some(pass) = pending_pass {
+            let is_target = pass.target == Some(p.id);
+            let progress = pass_progress_along_path(pass, control_point);
+            let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
+            let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
+            let contact_altitude = pass_ball_altitude_yards(pass, control_point);
+            let same_team_launch_bystander =
+                same_tick_launch && p.team == pass.team && !is_target;
+            let body_contact_distance = p.position.distance(control_point);
+            if contact_altitude <= LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS
+                && !is_own_outgoing_pass
+                && !same_team_launch_bystander
+                && body_contact_distance <= LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS
+            {
+                let replace = low_pass_body_contact.as_ref().is_none_or(
+                    |(best_projection, best_distance, _, _, _)| {
+                        control_projection < *best_projection - 1e-9
+                            || ((control_projection - *best_projection).abs() <= 1e-9
+                                && body_contact_distance < *best_distance)
+                    },
+                );
+                if replace {
+                    low_pass_body_contact = Some((
+                        control_projection,
+                        body_contact_distance,
+                        p.id,
+                        p.team,
+                        control_point,
+                    ));
+                }
+            }
+        }
         let mut player_control_position = p.position;
         let mut control_radius = (PLAYER_CONTROL_RADIUS_YARDS
             + ability01(p.skills.first_touch) * 0.48
@@ -43708,6 +43749,9 @@ fn nearest_ball_controller_for_segment(
             + pass_reception_score_bonus
             + aerial_score_bonus;
         candidates.push((p.id, p.team, score, control_point));
+    }
+    if let Some((_, _, id, team, point)) = low_pass_body_contact {
+        return Some((id, team, point));
     }
     sample_control_candidate_with_point(&candidates, rng)
 }

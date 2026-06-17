@@ -22267,14 +22267,81 @@ fn aerial_pass_interception_pressure_doubles_or_triples_near_landing() {
 }
 
 #[test]
-fn pass_interception_requires_defender_to_face_ball_path() {
+fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 1774,
+        ..Default::default()
+    });
+    let mut defender = sim.players[12].clone();
+    let mut receiver = sim.players[9].clone();
+    let receiver_id = receiver.id;
+    defender.position = Vec2::new(40.0, 55.0);
+    defender.velocity = Vec2::zero();
+    defender.action_facing = FacingBucket::East;
+    defender.receive_facing = FacingBucket::East;
+    receiver.position = Vec2::new(40.0, 60.0);
+    receiver.velocity = Vec2::zero();
+    receiver.skills.first_touch = 10.0;
+    let origin = Vec2::new(40.0, 50.0);
+    let target = Vec2::new(40.0, 60.0);
+    let mut pass = test_pending_pass(Team::Home, 7, receiver_id, origin, target);
+    pass.launch_speed_yps = 14.0;
+    let previous_ball_pos = origin;
+    let ball_pos = target;
+    let ball_velocity = Vec2::new(0.0, 14.0);
+
+    let low = nearest_ball_controller_for_segment(
+        1,
+        previous_ball_pos,
+        ball_pos,
+        ball_velocity,
+        &[receiver.clone(), defender.clone()],
+        Some(&pass),
+        None,
+        None,
+        0.0,
+        &mut mulberry32(17_740),
+    );
+    assert_eq!(
+        low.map(|(id, team, point)| (id, team, point)),
+        Some((defender.id, defender.team, Vec2::new(40.0, 55.0))),
+        "a low pass crossing an untargeted player's body must hit that player before the receiver"
+    );
+
+    pass.flight = PassFlight::Aerial;
+    assert!(
+        pass_ball_altitude_yards(&pass, defender.position) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
+        "test setup should put the loft above the 6ft body-contact gate"
+    );
+    let high = nearest_ball_controller_for_segment(
+        1,
+        previous_ball_pos,
+        ball_pos,
+        ball_velocity,
+        &[receiver, defender],
+        Some(&pass),
+        None,
+        None,
+        0.0,
+        &mut mulberry32(17_741),
+    );
+    assert_eq!(
+        high.map(|(id, team, _)| (id, team)),
+        Some((receiver_id, Team::Home)),
+        "a pass above 6ft at the defender should clear them and reach the intended receiver"
+    );
+}
+
+#[test]
+fn pass_reach_interception_requires_defender_to_face_ball_path() {
     let sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 1773,
         ..Default::default()
     });
     let mut defender = sim.players[12].clone();
-    defender.position = Vec2::new(41.1, 55.0);
+    defender.position = Vec2::new(41.8, 55.0);
     defender.velocity = Vec2::zero();
     defender.action_facing = FacingBucket::West;
     defender.receive_facing = FacingBucket::West;
@@ -22305,6 +22372,10 @@ fn pass_interception_requires_defender_to_face_ball_path() {
     assert_eq!(
         player_facing_ball_control_multiplier(&defender, Vec2::new(40.0, 55.0), 14.0),
         1.0
+    );
+    assert!(
+        defender.position.distance(Vec2::new(40.0, 55.0)) > LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS,
+        "this test covers reach interception outside the deterministic body-contact radius"
     );
     let facing_result = nearest_ball_controller_for_segment(
         1,
