@@ -590,6 +590,23 @@ fn park_players_except(sim: &mut SoccerMatch, keep: &[usize]) {
     }
 }
 
+/// RAII guard that disables the always-on collective back-line ball band for the
+/// duration of a unit test that parks most of the back four (which would otherwise
+/// distort the holding centroid) to isolate an orthogonal mechanic. Resets on drop,
+/// including on assertion panic, so it never leaks to a reused test thread.
+struct BackLineBallBandDisableGuard;
+impl BackLineBallBandDisableGuard {
+    fn new() -> Self {
+        crate::des::general::soccer::world::set_back_line_ball_band_disabled_for_test(true);
+        BackLineBallBandDisableGuard
+    }
+}
+impl Drop for BackLineBallBandDisableGuard {
+    fn drop(&mut self) {
+        crate::des::general::soccer::world::set_back_line_ball_band_disabled_for_test(false);
+    }
+}
+
 fn two_home_outfield_indices(sim: &SoccerMatch) -> (usize, usize) {
     let ids: Vec<usize> = sim
         .players
@@ -1979,7 +1996,9 @@ fn pass_anticipation_flag_off_is_a_no_op() {
 #[test]
 fn pass_anticipation_defender_steps_onto_the_lane_to_intercept() {
     // A ground pass up the middle; an Away defender a couple of yards off the lane and
-    // in shape steps onto the lane AHEAD of the ball to cut it out.
+    // in shape steps onto the lane AHEAD of the ball to cut it out. The scene parks the
+    // rest of the back line, so isolate this from the collective back-line ball band.
+    let _band_guard = BackLineBallBandDisableGuard::new();
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
     let mut sim = pass_anticipation_scene(&[14], from, to, true);
@@ -2015,6 +2034,8 @@ fn pass_anticipation_defender_steps_onto_the_lane_to_intercept() {
 fn pass_anticipation_elects_a_single_presser() {
     // Two Away defenders both able to reach the lane and both in shape. Only the one
     // best-placed to reach the reception commits; the other keeps its shape (anti-swarm).
+    // The scene parks the rest of the back line, so isolate from the back-line ball band.
+    let _band_guard = BackLineBallBandDisableGuard::new();
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
     let mut sim = pass_anticipation_scene(&[14, 15], from, to, true);
@@ -31618,6 +31639,11 @@ fn tracking_dataset_infers_tackle() {
 #[test]
 fn player_collision_resolution_separates_body_overlap() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Isolate the two coincident bodies: park everyone else out to the corners so this
+    // stays a clean 2-body separation (the kickoff formation otherwise leaves a third
+    // player on the centre spot, and the single-pass resolver cannot fully settle a
+    // 3-body pile in one sweep — that order-sensitive residual is a separate concern).
+    park_players_except(&mut sim, &[0, 1]);
     sim.players[0].position = Vec2::new(40.0, 60.0);
     sim.players[1].position = Vec2::new(40.0, 60.0);
     sim.players[0].velocity = Vec2::new(1.0, 0.0);
@@ -31627,6 +31653,83 @@ fn player_collision_resolution_separates_body_overlap() {
 
     let dist = sim.players[0].position.distance(sim.players[1].position);
     assert!(dist >= PLAYER_BODY_RADIUS_YARDS * 2.0 - 1e-6);
+}
+
+#[test]
+fn tick_order_shuffle_is_reproducible_per_seed() {
+    // The per-tick operation-order shuffles draw from `tick_order_rng`, seeded purely from
+    // the match seed + tick (+ per-site salt) — never from entropy or the wall clock — so a
+    // match stays byte-reproducible for a fixed seed in BOTH modes. This guards the
+    // determinism the engine relies on for replay/learning against anyone reseeding the
+    // shuffles from a non-deterministic source.
+    let run = |disable: bool| -> Vec<f64> {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 4242,
+            disable_tick_order_shuffle: disable,
+            learning_enabled: false,
+            learning_logging_enabled: false,
+            ..MatchConfig::default()
+        });
+        for _ in 0..240 {
+            sim.run_time_step();
+        }
+        vec![
+            sim.score_home as f64,
+            sim.score_away as f64,
+            sim.ball.position.x,
+            sim.ball.position.y,
+            sim.players[5].position.x,
+            sim.players[5].position.y,
+            sim.players[16].position.x,
+            sim.players[16].position.y,
+        ]
+    };
+    assert_eq!(
+        run(false),
+        run(false),
+        "shuffle ON must be reproducible for a fixed seed"
+    );
+    assert_eq!(
+        run(true),
+        run(true),
+        "shuffle OFF must be reproducible for a fixed seed"
+    );
+}
+
+#[test]
+fn tick_order_shuffle_reorders_collision_pileups() {
+    // A 3-body pile-up settles order-dependently (the resolver is a single sweep). With the
+    // shuffle ON the resolution order AND the exact-overlap tie-break are seed-derived, so two
+    // different seeds settle the SAME pile differently; with it OFF the fixed index order makes
+    // the outcome seed-invariant. Proves the shuffle actually reorders work (not a no-op) and
+    // that disabling it restores one deterministic order — with no draw from the main RNG.
+    let pile = |seed: u32, disable: bool| -> Vec<f64> {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed,
+            disable_tick_order_shuffle: disable,
+            ..MatchConfig::default()
+        });
+        park_players_except(&mut sim, &[0, 1, 2]);
+        for id in [0usize, 1, 2] {
+            sim.players[id].position = Vec2::new(40.0, 60.0);
+            sim.players[id].velocity = Vec2::zero();
+        }
+        sim.resolve_player_collisions();
+        [0usize, 1, 2]
+            .iter()
+            .flat_map(|&id| [sim.players[id].position.x, sim.players[id].position.y])
+            .collect()
+    };
+    assert_eq!(
+        pile(1, true),
+        pile(7777, true),
+        "disabled order must be seed-invariant (fixed legacy order)"
+    );
+    assert_ne!(
+        pile(1, false),
+        pile(7777, false),
+        "shuffle should reorder the pile-up by seed"
+    );
 }
 
 #[test]
@@ -37116,6 +37219,8 @@ fn marked_receiver_checks_to_ball_when_space_behind_opens() {
     );
 }
 
+
+
 #[test]
 fn learned_support_policy_can_choose_check_to_ball() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -38309,6 +38414,12 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
 
 #[test]
 fn defensive_assignment_uses_permuted_genome_line_band() {
+    // This test isolates the per-player evolved genome band by parking the rest of
+    // the back line deep. The always-on collective back-line ball band would
+    // otherwise pull the lone live defender up toward the ball (its centroid is
+    // dominated by the parked teammates), washing out the genome distinction — so
+    // disable that collective rule for this isolation test.
+    let _band_guard = BackLineBallBandDisableGuard::new();
     let target_y_for_band = |permutation_index: usize| {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let defender = 2;
@@ -38334,6 +38445,47 @@ fn defensive_assignment_uses_permuted_genome_line_band() {
     assert!(
         high_line_y > deeper_line_y + 4.0,
         "smaller evolved max gap should hold the line higher: high={high_line_y} deep={deeper_line_y}"
+    );
+}
+
+#[test]
+fn back_line_ball_band_steps_a_stranded_line_up_toward_the_ball() {
+    // Full lineup (no parking): the Home back line sits deep while the ball is high up
+    // the pitch. The collective band must step the line UP to within 25yd of the ball,
+    // on the DEPTH axis only — so the defender keeps its vertical lane (no sideways yank).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 95.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // A CENTRAL Home defender (not one of the two outside backs, which can be exempt).
+    let cb = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .min_by(|a, b| {
+            (a.home_position.x - 40.0)
+                .abs()
+                .partial_cmp(&(b.home_position.x - 40.0).abs())
+                .unwrap()
+        })
+        .map(|p| p.id)
+        .unwrap();
+    let home = sim.players[cb].home_position;
+    assert!(
+        home.y < 60.0,
+        "precondition: the central defender starts deep: home={home:?}"
+    );
+    let target = snapshot.shape_guarded_movement_point(cb, home, &[], home, false);
+    assert!(
+        target.y > home.y + 10.0,
+        "the stranded back line should step up toward a high ball: home={home:?} target={target:?}"
+    );
+    assert!(
+        (target.x - home.x).abs() < 1.0,
+        "the band must not shove the defender out of its vertical lane: home={home:?} target={target:?}"
     );
 }
 
@@ -41001,6 +41153,36 @@ fn kickoff_arms_no_double_touch_guard_and_clears_on_another_touch() {
         .expect("another player");
     sim.record_possession_touch(other);
     assert_eq!(sim.restart_double_touch_guard, None);
+}
+
+#[test]
+fn restart_double_touch_guard_lets_a_teammate_collect_not_stall() {
+    // The taker can't re-control after a restart — but the ball must NOT stall at its feet when
+    // the taker is the closest player. The guard is passed INTO the controller search, so the
+    // taker is excluded from candidacy and the nearest OTHER player (a team-mate receiving the
+    // restart) collects the loose ball. (Pre-fix, filtering the single nearest to None left the
+    // ball dead at the taker's feet — the opening-kickoff stall.)
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let taker = 6;
+    let teammate = 7;
+    park_players_except(&mut sim, &[taker, teammate]);
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.pending_pass = None;
+    sim.restart_double_touch_guard = Some(taker);
+    // Taker closest to the loose ball; the team-mate is just behind, still within control range.
+    sim.players[taker].position = Vec2::new(40.3, 60.0);
+    sim.players[teammate].position = Vec2::new(40.9, 60.0);
+
+    sim.run_ball_time_step();
+
+    assert_eq!(
+        sim.ball.holder,
+        Some(teammate),
+        "a team-mate must collect the restart (guarded taker excluded), not stall the ball"
+    );
 }
 
 #[test]
@@ -47557,6 +47739,10 @@ fn nearest_defender_engages_fast_carrier_instead_of_containing() {
 
 #[test]
 fn close_to_goal_carrier_pulls_nearest_defender_out_of_retreat() {
+    // Every other Home outfielder is parked far upfield to isolate the lone defender's
+    // contain/press behaviour, which distorts the holding centroid — so isolate this
+    // from the collective back-line ball band.
+    let _band_guard = BackLineBallBandDisableGuard::new();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     // No covering defender behind: every other Home outfielder is far upfield, so
     // the selected defender must contain/press by position rather than by lunge.
@@ -58981,6 +59167,10 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
         },
         adversarial_embedding_exploitation_enabled: false,
         max_human_players: 0,
+        // Pin the legacy fixed operation order so this writer test asserts the SAME
+        // documented deterministic 10-minute trace (≈48 pass attempts / 2 shots); the
+        // per-tick order shuffle is exercised by the rest of the suite, not here.
+        disable_tick_order_shuffle: true,
         ..MatchConfig::default()
     };
     assert_eq!(config.dt_seconds, DEFAULT_DT_SECONDS);
