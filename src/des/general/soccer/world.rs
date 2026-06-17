@@ -12933,7 +12933,12 @@ impl BallAgent {
             self.untargeted_long_ball_launch_exclusion(context.tick, context.pending_pass.as_ref());
         if context.pending_shot.is_none() {
             if let Some((holder, holder_team, control_position)) =
-                nearest_ball_controller_for_segment(
+                // No-double-touch on restarts: pass the guard INTO the controller search so the
+                // taker is excluded from candidacy and the nearest OTHER player (the team-mate
+                // receiving the restart) collects the ball — rather than filtering the single
+                // nearest to None, which left the ball stalling at the taker's feet whenever the
+                // taker was closest. The guard clears on any other player's touch.
+                nearest_ball_controller_for_segment_with_guard(
                     context.tick,
                     previous_position,
                     self.position,
@@ -12943,13 +12948,9 @@ impl BallAgent {
                     loose_long_ball_team,
                     same_tick_long_ball_launcher,
                     self.altitude_yards,
+                    context.double_touch_guard,
                     rng,
                 )
-                // No-double-touch on restarts: the taker cannot re-control the
-                // ball until another player has touched it (the guard clears on
-                // any other player's touch). Prevents e.g. the GK touching twice
-                // off a goal kick.
-                .filter(|(id, _, _)| context.double_touch_guard != Some(*id))
             {
                 let untargeted_long_ball = self
                     .untargeted_long_ball_team(context.pending_pass.as_ref())
@@ -13583,6 +13584,27 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
+}
+#[cfg(test)]
+thread_local! {
+    /// Per-test, per-thread override so a unit test can isolate behavior that the
+    /// always-on back-line band would otherwise dominate. Thread-local (not the env
+    /// OnceLock) so it never races across libtest's parallel test threads.
+    static BACK_LINE_BALL_BAND_TEST_DISABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn set_back_line_ball_band_disabled_for_test(disabled: bool) {
+    BACK_LINE_BALL_BAND_TEST_DISABLE.with(|c| c.set(disabled));
+}
+fn dd_soccer_disable_back_line_ball_band() -> bool {
+    #[cfg(test)]
+    if BACK_LINE_BALL_BAND_TEST_DISABLE.with(|c| c.get()) {
+        return true;
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BACK_LINE_BALL_BAND").is_ok())
 }
 
 fn pending_pass_snapshot_from(
@@ -24128,7 +24150,125 @@ impl WorldSnapshot {
         };
         let chosen = self.off_carrier_lane_target(player, chosen);
         let chosen = self.defensive_goal_side_target(player, chosen);
-        self.teammate_cross_through_target(player, chosen)
+        let chosen = self.teammate_cross_through_target(player, chosen);
+        // Strongest off-ball nudge, applied LAST so nothing downstream undoes it:
+        // keep the back line's centroid within 1..=25yd of the ball.
+        self.back_four_ball_band_target(player, chosen)
+    }
+
+    /// Keep the back four connected to the ball: the CENTROID of the holding back
+    /// line must stay between [`BACK_LINE_BALL_BAND_MIN_YARDS`] and
+    /// [`BACK_LINE_BALL_BAND_MAX_YARDS`] *goal-side* of the ball, measured on the
+    /// DEPTH (attack) axis only — line depth is what "stay connected to the ball"
+    /// means for a back four; lateral coverage stays with the vertical-lane /
+    /// man-tracking logic, so this never shoves a defender out of its lane. This is
+    /// the strongest off-ball movement nudge — it re-aims every tick to close the
+    /// entire out-of-band deficit (so the line aims to be consistent within ~2s; it
+    /// does not have to actually reach it — locomotion caps the per-tick step).
+    /// Exactly ONE wingback (the more-advanced of the two outside backs, once it is
+    /// genuinely overlapping) may break the band; the other three must follow it.
+    fn back_four_ball_band_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
+        if dd_soccer_disable_back_line_ball_band() || player.role != PlayerRole::Defender {
+            return target;
+        }
+        let defenders: Vec<&PlayerSnapshot> = self
+            .players
+            .iter()
+            .filter(|p| p.team == player.team && p.role == PlayerRole::Defender)
+            .collect();
+        // Need a recognizable back line (≥3) before the centroid rule is meaningful.
+        if defenders.len() < 3 {
+            return target;
+        }
+        // The two outside backs are the widest by home x. The more-advanced of them
+        // is the single permitted exemption — but only once it is genuinely overlapping
+        // (BACK_LINE_WINGBACK_RUN_MARGIN_YARDS ahead of the rest of the line).
+        let attack = player.team.attack_dir();
+        let fwd = |p: &PlayerSnapshot| self.player_snapshot_position(p).y * attack;
+        let left_back = defenders
+            .iter()
+            .min_by(|a, b| {
+                a.home_position
+                    .x
+                    .partial_cmp(&b.home_position.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.id);
+        let right_back = defenders
+            .iter()
+            .max_by(|a, b| {
+                a.home_position
+                    .x
+                    .partial_cmp(&b.home_position.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| p.id);
+        let candidate = match (left_back, right_back) {
+            (Some(l), Some(r)) if l != r => {
+                let lf = defenders.iter().find(|p| p.id == l).map(|p| fwd(p));
+                let rf = defenders.iter().find(|p| p.id == r).map(|p| fwd(p));
+                match (lf, rf) {
+                    (Some(lf), Some(rf)) => Some(if lf >= rf { l } else { r }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        // Honor the exemption only if that wingback is genuinely ahead of the rest.
+        let exempt = candidate.filter(|&id| {
+            let others: Vec<f64> = defenders
+                .iter()
+                .filter(|p| p.id != id)
+                .map(|p| fwd(p))
+                .collect();
+            if others.is_empty() {
+                return false;
+            }
+            let others_mean = others.iter().sum::<f64>() / others.len() as f64;
+            let cand_fwd = defenders
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| fwd(p))
+                .unwrap_or(others_mean);
+            cand_fwd > others_mean + BACK_LINE_WINGBACK_RUN_MARGIN_YARDS
+        });
+        // The one player who overrides the band: leave its target untouched.
+        if exempt == Some(player.id) {
+            return target;
+        }
+        // Centroid of the HOLDING line (back four minus the exempt wingback) — "the
+        // other three must follow the rule still".
+        let holders: Vec<&PlayerSnapshot> = defenders
+            .iter()
+            .copied()
+            .filter(|p| Some(p.id) != exempt)
+            .collect();
+        if holders.is_empty() {
+            return target;
+        }
+        // The band is measured on the DEPTH (goal-side) axis only — the back four's
+        // connection to the ball is a line-depth concern. Lateral coverage is the job
+        // of the vertical-lane / man-tracking logic, so this never shoves a defender
+        // sideways out of its lane. `behind_gap` is how far the centroid sits on the
+        // own-goal side of the ball: we want it in [1, 25]yd.
+        let centroid_fwd =
+            holders.iter().map(|p| fwd(p)).sum::<f64>() / holders.len() as f64;
+        let ball_fwd = self.ball.position.y * attack;
+        let behind_gap = ball_fwd - centroid_fwd;
+        let target_gap =
+            behind_gap.clamp(BACK_LINE_BALL_BAND_MIN_YARDS, BACK_LINE_BALL_BAND_MAX_YARDS);
+        // The amount (signed, along the attack axis) the line must travel to bring the
+        // centroid back onto the band: +ve = step up toward the ball, -ve = drop back
+        // goal-side. Applying the FULL deficit to each holder re-centres the centroid
+        // on the boundary; re-evaluated every tick, the line keeps aiming for the band
+        // (locomotion caps the per-tick step, so it converges within ~2s rather than
+        // teleporting).
+        let shift_fwd = behind_gap - target_gap;
+        if shift_fwd.abs() < 1e-6 {
+            return target;
+        }
+        Vec2::new(target.x, target.y + attack * shift_fwd)
+            .clamp_to_pitch(self.field_width, self.field_length)
     }
 
     /// Position-swap / cross-through guard: stop an off-ball player from steering a

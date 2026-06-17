@@ -1647,6 +1647,20 @@ const PREFERRED_DEFENDER_DEPTH_YARDS: f64 = 8.5;
 const DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS: f64 = 25.0;
 const DEFENSIVE_GOAL_LINE_HARD_BUFFER_YARDS: f64 = 4.0;
 const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+// Back-line "stay connected to the ball" band, measured on the CENTROID of the
+// holding back line (not per-player) along the DEPTH axis: the average defender
+// position must sit between 1 and 25 yards goal-side of the ball. This is the
+// strongest off-ball movement
+// nudge — it re-aims every tick to close the entire out-of-band deficit so the
+// line converges within ~2s (it does not have to actually reach it; locomotion
+// caps the per-tick step). At most ONE wingback may break the band (overlap
+// forward); the other three defenders must follow it. See
+// `WorldSnapshot::back_four_ball_band_target`.
+const BACK_LINE_BALL_BAND_MAX_YARDS: f64 = 25.0;
+const BACK_LINE_BALL_BAND_MIN_YARDS: f64 = 1.0;
+// A wingback is only granted the single exemption once it is genuinely overlapping
+// — this far forward of the rest of the back line. Otherwise all four comply.
+const BACK_LINE_WINGBACK_RUN_MARGIN_YARDS: f64 = 4.0;
 const DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.65;
 const DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.05;
 // Ball protection (0 = exposed/pushed-ahead at speed, 1 = shielded at the feet).
@@ -43849,6 +43863,36 @@ fn nearest_ball_controller_for_segment(
     ball_altitude_yards: f64,
     rng: &mut SeededRandom,
 ) -> Option<(usize, Team, Vec2)> {
+    // No restart double-touch guard. The guarded entry point below is what the live ball step
+    // uses; tests and the loose-ball-winner wrapper go through this no-guard shim.
+    nearest_ball_controller_for_segment_with_guard(
+        current_tick,
+        previous_ball_pos,
+        ball_pos,
+        ball_velocity,
+        players,
+        pending_pass,
+        loose_long_ball_team,
+        same_tick_long_ball_launcher,
+        ball_altitude_yards,
+        None,
+        rng,
+    )
+}
+
+fn nearest_ball_controller_for_segment_with_guard(
+    current_tick: u64,
+    previous_ball_pos: Vec2,
+    ball_pos: Vec2,
+    ball_velocity: Vec2,
+    players: &[PlayerAgent],
+    pending_pass: Option<&PendingPass>,
+    loose_long_ball_team: Option<Team>,
+    same_tick_long_ball_launcher: Option<usize>,
+    ball_altitude_yards: f64,
+    double_touch_guard: Option<usize>,
+    rng: &mut SeededRandom,
+) -> Option<(usize, Team, Vec2)> {
     let ball_speed = ball_velocity.len();
     let ball_segment = ball_pos - previous_ball_pos;
     let ball_segment_len = ball_segment.len();
@@ -43856,6 +43900,13 @@ fn nearest_ball_controller_for_segment(
     let mut low_pass_body_contact: Option<(f64, f64, usize, Team, Vec2)> = None;
     for p in players {
         if same_tick_long_ball_launcher == Some(p.id) {
+            continue;
+        }
+        // No-double-touch on restarts: the taker is INELIGIBLE to (re-)control the ball until
+        // another player touches it, so exclude it from the search entirely. The nearest OTHER
+        // player — a team-mate receiving the restart — then collects it, instead of the ball
+        // stalling at the taker's feet whenever the taker happens to be the closest player.
+        if double_touch_guard == Some(p.id) {
             continue;
         }
         if let Some(pass) = pending_pass {
