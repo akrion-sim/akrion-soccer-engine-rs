@@ -380,7 +380,8 @@ const CARRIER_CLOSE_GOAL_STEPUP_FRACTION: f64 = 1.0;
 /// anti-bunchball swarm cap. The baseline keeps the defender within the 3.1yd
 /// tackle reach while staying off the ball so it jockeys rather than dogpiles.
 const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
-<<<<<<< HEAD
+const CARRIER_CLOSE_GOAL_JOCKEY_YARDS: f64 = 1.4;
+const CARRIER_CLOSE_GOAL_PRESS_MIN: f64 = 0.38;
 /// Depth-scaled pressing aggression in our own defensive third. The closer an
 /// opponent carrier gets to our own goal, the less a defender can afford to sit
 /// off and contain — letting a dribbler stroll into the box uncontested is worse
@@ -392,10 +393,6 @@ const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
 const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
-=======
-const CARRIER_CLOSE_GOAL_JOCKEY_YARDS: f64 = 1.4;
-const CARRIER_CLOSE_GOAL_PRESS_MIN: f64 = 0.38;
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
 /// channel from the ball. Lets receivers balance open space with a direct route
@@ -666,13 +663,10 @@ const TEAMWORK_PROGRESS_NEAR_BALL_PLAYERS: usize = 5;
 const TEAMWORK_PROGRESS_MIN_RELOCATION_YARDS: f64 = 0.08;
 const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
 const GOAL_REWARD_POINTS: f64 = 100.0;
-<<<<<<< HEAD
 /// Reduced reward pool for a goal scored directly off a turnover — a single
 /// scoring-team player touched the ball between winning it from the opponent and
 /// finishing. There is no build-up play to credit, only the steal-and-finish, so
 /// the goal distributes 30 points instead of the full [`GOAL_REWARD_POINTS`].
-=======
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
 const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 30.0;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
@@ -912,7 +906,6 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
-<<<<<<< HEAD
 // A short backward reset (3–5yd back to a supporting player) is a normal, useful ball;
 // slinging it 6+ yards backward concedes real territory and should be distinctly worse.
 // Beyond this backward distance, an escalating per-yard demerit kicks in so a 3–5yd
@@ -922,7 +915,6 @@ const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
 const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 0.85;
 // Cap so an extreme backward ball can't single-handedly dominate the ranking score.
 const LONG_BACKWARD_PASS_PENALTY_MAX: f64 = 6.5;
-=======
 // Backward recycling should be a short support bounce, not a retreating outlet.
 // If a backward pass is needed, prefer a 3-5yd reset and increasingly demote
 // balls played more than 5yd back toward our own goal.
@@ -931,7 +923,6 @@ const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
 const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
 const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
 const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -1987,14 +1978,9 @@ const ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS: f64 = 1.5;
 const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// While supporting an unpressured carrier, an off-ball attacker edges his support point
 /// up to this many yards ahead of his current position (capped onside) so he actively
-<<<<<<< HEAD
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
-const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 7.0;
-=======
-/// pushes up with the free carrier instead of standing still.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 8.0;
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
@@ -44206,7 +44192,6 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     }
 }
 
-<<<<<<< HEAD
 /// Escalating demerit for a *long* backward pass. Returns 0 for forward, square, or
 /// short-backward (≤5yd) balls so a 3–5yd reset is untouched, then grows per-yard
 /// (capped) for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
@@ -44218,7 +44203,8 @@ fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
     let backward_yards = -forward_yards;
     ((backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
         .min(LONG_BACKWARD_PASS_PENALTY_MAX)
-=======
+}
+
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
         return 0.0;
@@ -44241,7 +44227,6 @@ fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
             .min(BACKWARD_PASS_LONG_RESET_PENALTY_CAP);
     }
     0.0
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
 }
 
 fn lateral_pass_penalty(forward_yards: f64, aerial: bool) -> f64 {

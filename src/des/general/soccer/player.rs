@@ -2452,15 +2452,14 @@ impl PlayerAgent {
                 DribbleTouchDecision::new(0, 1.35),
             );
         }
-<<<<<<< HEAD
-        // A neutral controlling touch carries the ball a little ahead. With pass-anticipation on,
-        // the first touch is made PURPOSEFUL: flick it onto an onside team-mate's forward run, or —
-        // under a bearing-down marker — push it into space away from his momentum to retain it.
+        // A neutral controlling touch carries the ball a little ahead. If a marker
+        // is already tight, make that default safer by nudging away from pressure
+        // and toward a visible forward support lane. With pass-anticipation on, the
+        // snapshot helper can still override this with a runner flick or a stronger
+        // retaining touch against a marker bearing down.
         let neutral = (self.position + carried_ball_lead(self))
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
-        snapshot.first_touch_directional_target_for(self.id, neutral)
-=======
-        let pressured_touch = snapshot
+        let pressured_neutral = snapshot
             .players
             .iter()
             .filter(|player| player.team != self.team)
@@ -2485,13 +2484,9 @@ impl PlayerAgent {
                     (self.position + direction * touch_yards)
                         .clamp_to_pitch(snapshot.field_width, snapshot.field_length),
                 )
-            });
-        if let Some(target) = pressured_touch {
-            return target;
-        }
-        (self.position + carried_ball_lead(self))
-            .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
+            })
+            .unwrap_or(neutral);
+        snapshot.first_touch_directional_target_for(self.id, pressured_neutral)
     }
 
     fn human_shoot_or_carry_action(

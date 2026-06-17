@@ -100,9 +100,9 @@ pub struct SoccerMatch {
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
     /// Per-tick whole-field configuration captures (ball carrier only) for the
     /// retrieval corpus. Populated only when `config.retrieval.capture_enabled`
-    /// and the full-game transition stream is retained; joined with the stream by
-    /// `(tick, player_id)` to attach the decision + n-step outcome in
-    /// [`SoccerMatch::config_moments`]. Empty (zero cost) when capture is off.
+    /// and joined with the retained transition stream by `(tick, player_id)` to
+    /// attach the decision + n-step outcome in [`SoccerMatch::config_moments`].
+    /// Empty (zero cost) when capture is off.
     pub(crate) episode_config_captures: Vec<SoccerConfigCapture>,
     /// Per-team retrieval action prior (action label → bounded favourability in
     /// `[-1, 1]`), set by the retrieval consumer from neighbours of the current
@@ -4567,7 +4567,10 @@ impl SoccerMatch {
             // get silently zeroed outcomes — the "how the decision turned out" signal.
             let capture_config_moments = self.config.retrieval.capture_enabled;
             let capture_reward_transitions = has_tick_reward_events && !learning_due;
-            if learning_due || capture_full_game || capture_config_moments || capture_reward_transitions
+            if learning_due
+                || capture_full_game
+                || capture_config_moments
+                || capture_reward_transitions
             {
                 let phase_started = Instant::now();
                 let tick_transitions = self.learning_transitions_for(
@@ -4585,14 +4588,8 @@ impl SoccerMatch {
                 // Retrieval corpus: capture the whole-field configuration for the
                 // ball carrier's decision this tick (≤1 per tick). The outcome
                 // (n-step return) is attached later by joining with the transition
-<<<<<<< HEAD
-                // stream in `config_moments`. Gated off by default.
+                // stream retained for `config_moments`. Gated off by default.
                 if capture_config_moments {
-=======
-                // stream in `config_moments`; require that stream so each stored
-                // moment carries a trustworthy outcome timeline.
-                if self.config.retrieval.capture_enabled && capture_full_game {
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
                     if let Some(holder) = tick_start_snapshot.ball.holder {
                         if let Some(carrier) =
                             tick_transitions.iter().find(|t| t.player_id == holder)
@@ -5787,11 +5784,7 @@ impl SoccerMatch {
         &mut self,
         scoring_team: Team,
         shooter: Option<usize>,
-<<<<<<< HEAD
-        reward_pool: f64,
-=======
         goal_reward_pool: f64,
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
     ) -> bool {
         if goal_reward_pool <= 1e-9 || !goal_reward_pool.is_finite() {
             return false;
@@ -5809,11 +5802,7 @@ impl SoccerMatch {
         }
 
         for candidate in candidates {
-<<<<<<< HEAD
-            let amount = reward_pool * candidate.score / total_score;
-=======
             let amount = goal_reward_pool * candidate.score / total_score;
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
             if !amount.is_finite() || amount <= 1e-9 {
                 continue;
             }
@@ -5841,8 +5830,9 @@ impl SoccerMatch {
         previous_touch_team: Option<Team>,
     ) -> Option<f64> {
         let shooter = shooter?;
-        let previous_touch_team =
-            self.possession_chain_previous_touch_team.or(previous_touch_team);
+        let previous_touch_team = self
+            .possession_chain_previous_touch_team
+            .or(previous_touch_team);
         if previous_touch_team != Some(scoring_team.other()) {
             return None;
         }
@@ -5853,15 +5843,11 @@ impl SoccerMatch {
         {
             return None;
         }
-        let mut scoring_team_touches = self
-            .possession_chain
-            .iter()
-            .copied()
-            .filter(|player_id| {
-                self.players
-                    .get(*player_id)
-                    .is_some_and(|player| player.team == scoring_team)
-            });
+        let mut scoring_team_touches = self.possession_chain.iter().copied().filter(|player_id| {
+            self.players
+                .get(*player_id)
+                .is_some_and(|player| player.team == scoring_team)
+        });
         if scoring_team_touches.next() == Some(shooter) && scoring_team_touches.next().is_none() {
             Some(DIRECT_TURNOVER_GOAL_REWARD_POINTS)
         } else {
@@ -5874,47 +5860,19 @@ impl SoccerMatch {
         if let Some(shooter) = shooter {
             self.record_possession_touch(shooter);
         }
-<<<<<<< HEAD
-        // A goal scored directly off a turnover earns a reduced reward pool: only a
-        // single scoring-team player touched the ball between winning it and
-        // finishing, so there is no build-up to credit. `possession_chain` holds
-        // only the scoring team's *consecutive* touches (it is cleared whenever the
-        // touching team changes), so a scoring-team chain of length ≤ 1 means the
-        // immediately prior toucher was the other team — a direct-turnover finish.
-        let direct_turnover_goal = self
-            .possession_chain
-            .back()
-            .and_then(|&pid| self.players.get(pid))
-            .is_some_and(|player| player.team == scoring_team)
-            && self.possession_chain.len() <= 1;
-        let goal_reward_pool = if direct_turnover_goal {
-            DIRECT_TURNOVER_GOAL_REWARD_POINTS
-        } else {
-            GOAL_REWARD_POINTS
-        };
-        if !self.record_contextual_goal_rewards(scoring_team, shooter, goal_reward_pool) {
-=======
         if let Some(reward_points) =
             self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
         {
-            self.record_possession_reward_pattern(
-                scoring_team,
-                shooter,
-                &[reward_points],
-            );
+            self.record_possession_reward_pattern(scoring_team, shooter, &[reward_points]);
         } else if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
             );
-            // Scale the fixed chain pattern to the (possibly reduced) pool so the
-            // relative shares are preserved while the total is 30 vs 100.
-            let pattern_scale = goal_reward_pool / GOAL_REWARD_POINTS;
-            let scaled_pattern: Vec<f64> = GOAL_CHAIN_REWARD_PATTERN
-                .iter()
-                .map(|weight| weight * pattern_scale)
-                .collect();
-            self.record_possession_reward_pattern(scoring_team, shooter, &scaled_pattern);
+            self.record_possession_reward_pattern(
+                scoring_team,
+                shooter,
+                &GOAL_CHAIN_REWARD_PATTERN,
+            );
         }
         self.record_recent_defensive_goal_penalties(scoring_team.other());
     }
@@ -6707,10 +6665,6 @@ impl SoccerMatch {
             .find(|player| player.id == target_id && player.team == team)
             .map(|player| player.position)
             .unwrap_or(target_point);
-<<<<<<< HEAD
-=======
-        let snapshot = WorldSnapshot::from_match(self);
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
         if snapshot.nearest_opponent_distance_at(team, receiver_position)
             < GK_HANDLING_SAFE_OUTLET_MARKING_YARDS
         {
@@ -6767,7 +6721,6 @@ impl SoccerMatch {
             Vec2::new(width * 0.18, from.y + attack_dir * forward).clamp_to_pitch(width, length);
         let right_target =
             Vec2::new(width * 0.82, from.y + attack_dir * forward).clamp_to_pitch(width, length);
-<<<<<<< HEAD
         let lane_clearance_to = |target: Vec2| -> f64 {
             self.players
                 .iter()
@@ -6776,12 +6729,6 @@ impl SoccerMatch {
                 .fold(f64::INFINITY, f64::min)
         };
         let clear_target = if lane_clearance_to(left_target) >= lane_clearance_to(right_target) {
-=======
-        let snapshot = WorldSnapshot::from_match(self);
-        let clear_target = if snapshot.nearest_opponent_distance_at(team, left_target)
-            >= snapshot.nearest_opponent_distance_at(team, right_target)
-        {
->>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
             left_target
         } else {
             right_target
@@ -23537,10 +23484,6 @@ impl WorldSnapshot {
         if let Some(press) = self.holder_press_target_for(me) {
             return press;
         }
-        // Step up to an advancing carrier (with cover) rather than backing off.
-        if let Some(stepup) = self.advancing_carrier_stepup_target_for(me, guarded) {
-            return stepup;
-        }
         if me.role == PlayerRole::Defender {
             if let Some((holder_position, line_gap)) =
                 self.opponent_breakthrough_ball_carrier(me.team)
@@ -23553,6 +23496,12 @@ impl WorldSnapshot {
                 );
                 return self.goal_side_defensive_target_for_player(me, target);
             }
+        }
+        // Step up to an advancing carrier (with cover) rather than backing off.
+        // This applies after explicit line-break protection, so deep defenders do
+        // not abandon the emergency goal-side retreat/collapse rules.
+        if let Some(stepup) = self.advancing_carrier_stepup_target_for(me, guarded) {
+            return stepup;
         }
         self.goal_side_defensive_target_for_player(me, guarded)
     }
