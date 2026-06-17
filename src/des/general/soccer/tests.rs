@@ -22879,7 +22879,7 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
 
     pass.flight = PassFlight::Aerial;
     assert!(
-        pass_ball_altitude_yards(&pass, defender.position) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
+        pass_altitude_at_point(&pass, defender.position) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
         "test setup should put the loft above the 6ft body-contact gate"
     );
     let high = nearest_ball_controller_for_segment(
@@ -39664,14 +39664,22 @@ fn low_hopping_ball_partially_feels_grass_resistance() {
 
 #[test]
 fn lofted_pass_apex_is_capped_near_thirty_feet_and_scales_with_distance() {
-    // The peak height (apex) of an aerial pass is reached at the midpoint of the path,
-    // where sin(pi * 0.5) == 1, so sampling altitude there reads the apex directly.
+    // The peak height (apex) of an aerial pass is the top of its gravity arc; the loft is
+    // time-driven (altitude(t) = ½·g·t·(T − t)), peaking at t = T/2 == pass_loft_apex_yards.
     let apex_for = |distance: f64| -> f64 {
         let origin = Vec2::new(40.0, 10.0);
         let target = Vec2::new(40.0, 10.0 + distance);
         let mut pass = test_pending_pass(Team::Home, 6, 9, origin, target);
         pass.flight = PassFlight::Aerial;
-        pass_ball_altitude_yards(&pass, origin + (target - origin) * 0.5)
+        let apex = pass_loft_apex_yards(&pass);
+        // The time-based arc must actually reach that apex at its midpoint hang time.
+        let hang = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+        let mid_height = pass_ball_altitude_yards(&pass, hang * 0.5);
+        assert!(
+            (mid_height - apex).abs() < 1e-6,
+            "the gravity arc should peak at the apex: {mid_height} vs {apex}"
+        );
+        apex
     };
     let short = apex_for(15.0);
     let long = apex_for(60.0);
@@ -39700,7 +39708,7 @@ fn lofted_pass_apex_is_capped_near_thirty_feet_and_scales_with_distance() {
     let target = Vec2::new(40.0, 55.0);
     let floor = test_pending_pass(Team::Home, 6, 9, origin, target);
     assert_eq!(
-        pass_ball_altitude_yards(&floor, origin + (target - origin) * 0.5),
+        pass_altitude_at_point(&floor, origin + (target - origin) * 0.5),
         0.0
     );
 }
@@ -59460,12 +59468,11 @@ fn pass_anticipation_first_touch_flicks_onto_a_forward_runner() {
 
 #[test]
 fn weak_long_aerial_does_not_float_in_the_air() {
-    // Regression: a low-power, low-skill long lofted ball used to keep its slow raw launch
-    // speed (the fit-blend only pulled it partway toward the distance-calibrated speed and the
-    // old aerial floor was far too low), so hang time = distance / speed ballooned to 4s+.
-    // The hang-time ceiling now floors the launch speed at `distance / physical_hang_time`,
-    // keeping every aerial's flight time inside the believable band a real projectile reaching
-    // the same apex would spend aloft (~2.2s for a 20ft loft, ~2.7s for the 30ft ceiling).
+    // Regression: a lofted ball is now a true gravity projectile, so it comes down at its hang
+    // time T = 2·√(2·apex/g) regardless of pace and can never float. The horizontal floor then
+    // keeps a weak ball from also landing badly short: launch speed is floored at distance / T
+    // so the ball reaches the target within the same believable airtime (~2.2s for a 20ft loft,
+    // ~2.7s for the 30ft ceiling). This guards the worst case: a low-power, low-skill long ball.
     let weak = SkillProfile {
         passing: 0.15,
         passing_completion_rate: 0.15,

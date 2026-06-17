@@ -42090,18 +42090,12 @@ fn aerial_interception_multiplier(pass: &PendingPass, ball_position: Vec2) -> f6
     }
 }
 
-fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
-    if !pass.flight.is_aerial() {
-        return 0.0;
-    }
-    let path = pass.intended_target - pass.origin;
-    let denom = path.x * path.x + path.y * path.y;
-    if denom <= 1e-9 {
-        return 0.0;
-    }
-    let progress = dot(ball_position - pass.origin, path) / denom;
-    let progress = progress.clamp(0.0, 1.0);
-    let apex = if pass.flight.is_scoop() {
+// Gravity in yards/s² (9.81 m/s² ÷ 0.9144 m/yd). The ball is a projectile: its height is
+// driven by gravity over TIME, exactly like every other bit of motion in the sim.
+const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
+
+fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
+    if pass.flight.is_scoop() {
         // A scoop LOOPS high despite being short and slow — that steep loft drops it over the
         // close defender's head. Apex UNIFORM in 9-15ft (3-5yd), seeded per-pass from the
         // launch tick so it's stable across the flight but varies shot to shot.
@@ -42113,13 +42107,35 @@ fn pass_ball_altitude_yards(pass: &PendingPass, ball_position: Vec2) -> f64 {
         // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
         // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
         // longest balls — never higher. Slope is set so a ~15yd loft ≈ 20ft and a ~60yd
-        // loft ≈ 30ft. The arc is purely vertical realism: x/y pace is unchanged (loft is a
-        // function of horizontal progress, not time), so a higher arc still arrives just as
-        // fast.
+        // loft ≈ 30ft.
         (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + pass.distance_yards.max(0.0) * 0.074)
             .clamp(5.0, MAX_LOFT_APEX_YARDS)
-    };
-    (std::f64::consts::PI * progress).sin().max(0.0) * apex
+    }
+}
+
+/// Height of a lofted ball, a plain projectile under gravity as a function of how long it has
+/// been in the air. Launched straight up at v = g·T/2, it follows altitude(t) = ½·g·t·(T − t)
+/// and lands (altitude 0) at hang time T = 2·√(2·apex/g) — REGARDLESS of horizontal speed.
+/// A ball that loses pace to drag still falls on the same gravity schedule; it just lands a
+/// little shorter. This is the whole loft model: time in, height out.
+fn pass_ball_altitude_yards(pass: &PendingPass, time_aloft_seconds: f64) -> f64 {
+    if !pass.flight.is_aerial() {
+        return 0.0;
+    }
+    let apex = pass_loft_apex_yards(pass);
+    let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+    let t = time_aloft_seconds.clamp(0.0, hang_time);
+    (0.5 * GRAVITY_YPS2 * t * (hang_time - t)).max(0.0)
+}
+
+/// Ball height when it reaches a given point on its path. The loft is time-driven, so this
+/// converts the point's horizontal progress into an elapsed time (distance covered ÷ launch
+/// pace) and feeds the projectile. Used where reception needs the height at a contact spot.
+fn pass_altitude_at_point(pass: &PendingPass, point: Vec2) -> f64 {
+    let path_len = (pass.intended_target - pass.origin).len();
+    let horizontal_traveled = pass_progress_along_path(pass, point) * path_len;
+    let time_aloft = horizontal_traveled / pass.launch_speed_yps.max(1.0);
+    pass_ball_altitude_yards(pass, time_aloft)
 }
 
 fn pass_progress_along_path(pass: &PendingPass, ball_position: Vec2) -> f64 {
@@ -42702,24 +42718,19 @@ fn modulated_pass_speed_yps(
     let speed =
         (raw_speed_yps + (desired_speed - raw_speed_yps) * fit) * (1.0 + noise).clamp(0.78, 1.24);
     let aerial_carry_floor = if flight.is_aerial() {
-        // HANG-TIME CEILING. The arc is decoupled from time (altitude is a function of
-        // horizontal progress, not gravity), so the ONLY thing keeping a lofted ball aloft
-        // for a believable span is its horizontal pace: hang time = distance / speed. A slow
-        // long ball therefore floats absurdly. Bound it to what a real projectile reaching the
-        // same apex would do: a ball lobbed to apex `h` is airborne for t = 2·√(2h/g). That
-        // gives ~2.2s for a 20ft loft and ~2.7s for the 30ft ceiling — so the MINIMUM launch
-        // speed is `distance / that_hang_time`. Long balls are forced to be driven; short
-        // chips stay gentle (a 15yd chip's floor is only ~14mph), so this isn't an overhit
-        // source — it purely kills the float. Mirrors the apex formula in
-        // `pass_ball_altitude_yards` (sans the per-pass scoop seed; scoops returned above).
+        // Gravity now fixes the hang time (the ball is a projectile that comes down at
+        // T = 2·√(2·apex/g) no matter its pace), so a slow ball no longer floats — it just
+        // lands SHORT. Floor the horizontal speed at `distance / T` so the ball still covers
+        // the ground and arrives at the target within that hang time. Long balls are forced to
+        // be driven; short chips stay gentle (a 15yd chip's floor is only ~14mph). Mirrors the
+        // apex formula in `pass_loft_apex_yards` (sans the per-pass scoop seed; scoops returned
+        // above).
         let apex_yards = (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + distance.max(0.0) * 0.074)
             .clamp(5.0, MAX_LOFT_APEX_YARDS);
-        let apex_meters = apex_yards * METERS_PER_YARD;
-        const GRAVITY_MPS2: f64 = 9.81;
-        let hang_time = 2.0 * (2.0 * apex_meters / GRAVITY_MPS2).sqrt();
-        let hang_time_floor = distance / hang_time.max(0.35);
+        let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
+        let reach_target_floor = distance / hang_time.max(0.35);
         let lively_floor = mph_to_yps(13.0);
-        hang_time_floor.max(lively_floor)
+        reach_target_floor.max(lively_floor)
     } else {
         mph_to_yps(4.0)
     };
@@ -43766,7 +43777,7 @@ fn nearest_ball_controller_for_segment(
             let progress = pass_progress_along_path(pass, control_point);
             let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
             let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
-            let contact_altitude = pass_ball_altitude_yards(pass, control_point);
+            let contact_altitude = pass_altitude_at_point(pass, control_point);
             let same_team_launch_bystander =
                 same_tick_launch && p.team == pass.team && !is_target;
             let body_contact_distance = p.position.distance(control_point);
@@ -43905,7 +43916,7 @@ fn nearest_ball_controller_for_segment(
         let dist = player_control_position.distance(control_point);
         let contact_altitude = pending_pass
             .filter(|pass| pass.flight.is_aerial())
-            .map(|pass| pass_ball_altitude_yards(pass, control_point))
+            .map(|pass| pass_altitude_at_point(pass, control_point))
             .unwrap_or(if loose_long_ball_team.is_some() {
                 ball_altitude_yards
             } else {

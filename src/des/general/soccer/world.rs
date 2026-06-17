@@ -12379,8 +12379,10 @@ impl BallAgent {
             .pending_pass
             .as_ref()
             .map(|pass| {
-                let midpoint = self.position + self.velocity * (context.dt_seconds * 0.5);
-                pass_ball_altitude_yards(pass, midpoint)
+                let time_aloft = (context.tick.saturating_sub(pass.launch_tick)) as f64
+                    * context.dt_seconds
+                    + context.dt_seconds * 0.5;
+                pass_ball_altitude_yards(pass, time_aloft)
             })
             .unwrap_or(self.altitude_yards)
             .max(self.altitude_yards);
@@ -12413,7 +12415,11 @@ impl BallAgent {
         self.altitude_yards = context
             .pending_pass
             .as_ref()
-            .map(|pass| pass_ball_altitude_yards(pass, self.position))
+            .map(|pass| {
+                let time_aloft =
+                    (context.tick.saturating_sub(pass.launch_tick)) as f64 * context.dt_seconds;
+                pass_ball_altitude_yards(pass, time_aloft)
+            })
             .unwrap_or(loose_long_ball_altitude);
         if self.resistance.stopped_by_threshold {
             self.velocity = Vec2::zero();
