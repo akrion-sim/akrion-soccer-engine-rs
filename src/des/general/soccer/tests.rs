@@ -31441,6 +31441,11 @@ fn tracking_dataset_infers_tackle() {
 #[test]
 fn player_collision_resolution_separates_body_overlap() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Isolate the two coincident bodies: park everyone else out to the corners so this
+    // stays a clean 2-body separation (the kickoff formation otherwise leaves a third
+    // player on the centre spot, and the single-pass resolver cannot fully settle a
+    // 3-body pile in one sweep — that order-sensitive residual is a separate concern).
+    park_players_except(&mut sim, &[0, 1]);
     sim.players[0].position = Vec2::new(40.0, 60.0);
     sim.players[1].position = Vec2::new(40.0, 60.0);
     sim.players[0].velocity = Vec2::new(1.0, 0.0);
@@ -36852,6 +36857,82 @@ fn marked_receiver_checks_to_ball_when_space_behind_opens() {
     assert!(
         target.distance(sim.ball.position) < current.distance(sim.ball.position),
         "checking movement should get closer to the ball"
+    );
+}
+
+// Build a "create a vacuum" scenario: Home in possession with an off-ball decoy (id 9) sitting
+// in a dangerous attacking-half pocket A, with opponents patrolling the forward zone (so a
+// forward run lands in SEMI-open space). The two vacuum preconditions are toggled independently:
+// `with_marker` — a defender tight enough on A to be dragged out of it when the decoy runs; and
+// `with_trailer` — a team-mate poised goal-side-behind A to attack the space the decoy vacates.
+// Returns (A, the decoy's chosen open-space target).
+fn vacuum_decoy_target(with_marker: bool, with_trailer: bool) -> (Vec2, Vec2) {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let decoy = 9;
+    let trailer = 7;
+    let marker = 12;
+    sim.ball.holder = Some(6);
+    sim.ball.position = Vec2::new(40.0, 64.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[6].position = sim.ball.position;
+    let a = Vec2::new(40.0, 80.0);
+    sim.players[decoy].position = a;
+    // Spread opponents across the decoy's candidate grid so openness is LOCAL (no artificial
+    // wide-open corner): the most open spot is square-left; the central-forward lane is only
+    // semi-open. Without a vacuum the decoy drifts to the most open (square) spot.
+    sim.players[13].position = Vec2::new(40.0, 95.0); // central-forward cover
+    sim.players[14].position = Vec2::new(52.0, 86.0); // forward-right cover
+    sim.players[15].position = Vec2::new(26.0, 92.0); // forward-left cover
+    sim.players[16].position = Vec2::new(58.0, 78.0); // right cover
+    sim.players[17].position = Vec2::new(30.0, 74.0); // square-left left semi-open, not wide open
+    // Tight marker on the decoy — the man dragged out of the pocket when the decoy runs.
+    sim.players[marker].position = if with_marker {
+        Vec2::new(41.0, 81.0)
+    } else {
+        Vec2::new(72.0, 64.0)
+    };
+    // The trailing team-mate, goal-side-behind A and in range — present only in the vacuum case.
+    sim.players[trailer].position = if with_trailer {
+        Vec2::new(40.0, 71.0)
+    } else {
+        Vec2::new(8.0, 64.0)
+    };
+    // Park the remaining players outside the candidate grid so they don't colour the search.
+    for id in [0usize, 1, 2, 3, 4, 5, 8, 10, 18, 19, 20, 21] {
+        sim.players[id].position = if id < 11 {
+            Vec2::new(8.0, 64.0)
+        } else {
+            Vec2::new(72.0, 64.0)
+        };
+    }
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let target = snapshot.open_space_for(decoy, sim.players[decoy].home_position);
+    (a, target)
+}
+
+#[test]
+fn create_a_vacuum_makes_the_decoy_run_forward_for_a_trailing_teammate() {
+    let (a, with) = vacuum_decoy_target(true, true);
+    let (_, without_trailer) = vacuum_decoy_target(true, false);
+    let (_, without_marker) = vacuum_decoy_target(false, true);
+    // With an exploitable trailing run, the decoy makes the forward run out of the pocket...
+    assert!(
+        with.y > a.y + 2.0,
+        "vacuum decoy should run forward out of the pocket: target={with:?}, A={a:?}"
+    );
+    // ...strictly more forward than when no team-mate can use the vacated space (only the
+    // trailer differs), proving the bonus — not geometry — drives the extra forward commitment.
+    assert!(
+        with.y > without_trailer.y + 2.0,
+        "an exploitable trailer should pull the decoy's run more forward: \
+         with_trailer={with:?}, without_trailer={without_trailer:?}"
+    );
+    // ...and strictly more forward than when no marker sits on the pocket to be dragged out of
+    // it (only the marker differs) — the other half of the vacuum precondition.
+    assert!(
+        with.y > without_marker.y + 2.0,
+        "a marker to drag is required for the vacuum: \
+         with_marker={with:?}, without_marker={without_marker:?}"
     );
 }
 
@@ -58724,6 +58805,10 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
         },
         adversarial_embedding_exploitation_enabled: false,
         max_human_players: 0,
+        // Pin the legacy fixed operation order so this writer test asserts the SAME
+        // documented deterministic 10-minute trace (≈48 pass attempts / 2 shots); the
+        // per-tick order shuffle is exercised by the rest of the suite, not here.
+        disable_tick_order_shuffle: true,
         ..MatchConfig::default()
     };
     assert_eq!(config.dt_seconds, DEFAULT_DT_SECONDS);

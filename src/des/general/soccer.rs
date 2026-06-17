@@ -1981,6 +1981,35 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 8.0;
+// "Create a vacuum" off-ball strategy. A forward run is valuable not only for the space it
+// ARRIVES in but for the space it VACATES: when an off-ball attacker who is occupying a
+// dangerous pocket (A) and being tightly marked runs forward to a semi-open spot (B), his
+// marker tends to follow — emptying A for a trailing team-mate to run onto. So an off-ball
+// attacker should make the forward run even when B is not the most open location, provided
+// vacating A genuinely opens exploitable space. The exploitation itself is emergent: once
+// the marker follows, A becomes open space the trailing team-mate's own support search finds.
+/// A defender must be within this many yards of the runner's current spot to count as a
+/// committed marker who will be dragged out of the pocket (no marker ⇒ nothing to vacate).
+const VACUUM_MARKER_DRAG_RADIUS_YARDS: f64 = 6.0;
+/// A trailing team-mate counts as able to exploit the vacated pocket only if he is at least
+/// this far GOAL-SIDE-BEHIND it (so his run onto it is forward and stays onside).
+const VACUUM_TRAILER_MIN_BEHIND_YARDS: f64 = 2.0;
+/// ...and no farther than this from the pocket (a run he can realistically complete in time).
+const VACUUM_TRAILER_MAX_RANGE_YARDS: f64 = 24.0;
+/// ...and at least this far from it (a team-mate already standing on the pocket is not a
+/// trailing runner — vacating it for him gains nothing).
+const VACUUM_TRAILER_MIN_RANGE_YARDS: f64 = 5.0;
+/// A candidate run only "vacates" the pocket if it leaves the current spot by at least this
+/// far AND is a forward run — a square/backward shuffle drags no marker upfield.
+const VACUUM_MIN_VACATE_YARDS: f64 = 4.0;
+const VACUUM_MIN_FORWARD_RUN_YARDS: f64 = 2.0;
+/// A forward run this long earns the full forward factor (longer runs drag the marker farther).
+const VACUUM_FORWARD_REFERENCE_YARDS: f64 = 9.0;
+/// Score weight of a fully-realized vacuum (dangerous pocket × tight marker × ready trailer ×
+/// committed forward run). Sized to tip a SEMI-open forward run over a slightly-more-open
+/// square option without ever luring a runner into a crowd (whose open-space deficit is far
+/// larger than this), so openness still dominates — the run is just no longer the ONLY factor.
+const VACUUM_CREATION_WEIGHT: f64 = 5.5;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
@@ -11658,6 +11687,13 @@ pub struct MatchConfig {
     pub adversarial_embedding_exploitation_enabled: bool,
     #[serde(default = "default_adversarial_moment_memory_limit")]
     pub adversarial_embedding_memory_limit: usize,
+    /// Force the per-tick operation-ORDER shuffles off for THIS match — a reproducible
+    /// fixed legacy order, independent of the process-wide `DD_SOCCER_DISABLE_TICK_ORDER_SHUFFLE`
+    /// env flag. Default `false` => shuffles on. Used by tests/tools that need to pin a
+    /// specific deterministic trajectory (the shuffles draw from an independent RNG stream,
+    /// so disabling them is byte-identical to the legacy order).
+    #[serde(default)]
+    pub disable_tick_order_shuffle: bool,
     pub max_human_players: usize,
     pub seed: u32,
 }
@@ -11696,6 +11732,7 @@ impl Default for MatchConfig {
             retrieval: SoccerRetrievalConfig::default(),
             adversarial_embedding_exploitation_enabled: true,
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
+            disable_tick_order_shuffle: false,
             max_human_players: 4,
             seed: 2026,
         }

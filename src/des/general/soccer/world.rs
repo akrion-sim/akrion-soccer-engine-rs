@@ -4178,6 +4178,20 @@ impl SoccerMatch {
         }
         self.stage_opening_kickoff_if_pending();
         self.maintain_one_two_commitments();
+        // Tokens for the per-tick order shuffles below (see
+        // `dd_soccer_disable_tick_order_shuffle`). Kept function-local because they
+        // exist only to be reordered by `fisher_yates_shuffle` within this step.
+        enum ContestResolutionPass {
+            DribbleHoldUp,
+            BodyCollision,
+        }
+        enum SoftNudge {
+            AntiBunch,
+            SnapshotSpacing,
+            SelfSpacing,
+            RelationalShape,
+            LaneGuard,
+        }
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
         let mut pre_field_snapshot_elapsed = Duration::from_secs(0);
@@ -4356,26 +4370,56 @@ impl SoccerMatch {
                         learned_plan.as_ref(),
                         &mut self.rng,
                     );
-                    // Anti-bunchball: keep at most two field players engaging the
-                    // ball; bias any excess off-ball mover back to its formation slot.
-                    let intent = if dd_soccer_disable_anti_bunch() {
-                        intent
-                    } else {
-                        snapshot.discipline_intent_against_bunchball(intent)
-                    };
-                    // Territorial spacing: nudge a player the brain flagged as camped
-                    // on a teammate back toward open space / its own slot. EXEMPT a
-                    // player committed to winning a live loose ball — on a 50/50 the
-                    // closest two teammates are deliberately sent to contest the SAME
-                    // ball, and nudging the yielder away from its partner pushes it off
-                    // the ball (the two then orbit it without either trapping it).
+                    // Loose-ball-chaser exemption (used by both spacing nudges below).
+                    // EXEMPT a player committed to winning a live loose ball — on a 50/50
+                    // the closest two teammates are deliberately sent to contest the SAME
+                    // ball, and nudging the yielder away from its partner pushes it off the
+                    // ball (the two then orbit it without either trapping it). Reads only
+                    // `player_id`, which no adjustment changes, so it is stable for the
+                    // whole chain regardless of the order the nudges run in.
                     let chasing_loose_ball =
                         snapshot.is_committed_loose_ball_chaser(intent.player_id);
-                    let intent = if dd_soccer_disable_spacing_nudge() || chasing_loose_ball {
-                        intent
-                    } else {
-                        snapshot.nudge_intent_for_teammate_spacing(intent)
-                    };
+                    // Per-player order stream (independent of the main decision RNG): this
+                    // player's soft-nudge order depends only on (seed, tick, its id), so it
+                    // is stable regardless of where it lands in the shuffled agent schedule.
+                    let mut nudge_rng = tick_order_rng(
+                        self.config.seed,
+                        self.tick,
+                        TICK_ORDER_SALT_NUDGE.wrapping_add(scheduled.id as u32),
+                    );
+                    // --- Soft nudge cluster A (before the team-line structure shape) ---
+                    // Anti-bunchball: keep at most two field players engaging the ball;
+                    // bias any excess off-ball mover back to its formation slot.
+                    // Territorial spacing: nudge a player the brain flagged as camped on a
+                    // teammate back toward open space / its own slot.
+                    // These two are independent positional nudges, so neither should
+                    // permanently win the "last word" between them: their relative order is
+                    // Fisher-Yates shuffled per player per tick. Each keeps its exact prior
+                    // gate; with the shuffle disabled the Vec stays in [anti-bunch, spacing]
+                    // order and no RNG is drawn (byte-identical to the legacy chain).
+                    let mut cluster_a: Vec<SoftNudge> = Vec::new();
+                    if !dd_soccer_disable_anti_bunch() {
+                        cluster_a.push(SoftNudge::AntiBunch);
+                    }
+                    if !(dd_soccer_disable_spacing_nudge() || chasing_loose_ball) {
+                        cluster_a.push(SoftNudge::SnapshotSpacing);
+                    }
+                    if tick_order_shuffle_enabled(&self.config) {
+                        fisher_yates_shuffle(&mut cluster_a, &mut nudge_rng);
+                    }
+                    let mut intent = intent;
+                    for nudge in cluster_a {
+                        intent = match nudge {
+                            SoftNudge::AntiBunch => {
+                                snapshot.discipline_intent_against_bunchball(intent)
+                            }
+                            SoftNudge::SnapshotSpacing => {
+                                snapshot.nudge_intent_for_teammate_spacing(intent)
+                            }
+                            _ => intent,
+                        };
+                    }
+                    // --- Team-line structure shape (PINNED order — deliberate hierarchy) ---
                     // Hold the back four's average in its band relative to the ball: push up to
                     // within 20yd in possession; sit >=20yd off (15yd in transit) when the
                     // opponent has the ball upfield.
@@ -4390,24 +4434,43 @@ impl SoccerMatch {
                     // sprinting to break the line unless it is highly confident the trap
                     // (belief in the line + keeper sweep) would catch them.
                     let intent = snapshot.offside_trap_cover_adjusted_intent(intent);
-                    // Territory-spacing: if this player was told to vacate a teammate's
-                    // space last tick, nudge it out of the minimum-spacing radius and
-                    // back toward its formation slot. (Same loose-ball-chaser exemption
-                    // as the snapshot nudge above — both fire per tick.)
-                    let intent = if chasing_loose_ball {
-                        intent
-                    } else {
-                        self.teammate_spacing_disciplined_intent(intent)
-                    };
-                    // Relational shape: nudge an off-ball mover toward its ideal offsets
-                    // to its formation neighbours so the team covers ground as a unit.
-                    let intent = self.relational_shape_disciplined_intent(intent);
-                    // Late route discipline: ordinary off-ball movers should not run
-                    // through or past a teammate's lane, and in possession their support
-                    // movement must still climb toward the opponent goal. Tactical
-                    // exceptions (pass receiver / loose-ball chaser / marking / quick
-                    // handoff) are left alone.
-                    let intent = snapshot.teammate_lane_guard_adjusted_intent(intent);
+                    // --- Soft nudge cluster B (after structure, before the hard overrides) ---
+                    // Territory-spacing self-nudge: if this player was told to vacate a
+                    // teammate's space last tick, nudge it out of the minimum-spacing radius
+                    // and back toward its formation slot (same loose-ball-chaser exemption).
+                    // Relational shape: nudge an off-ball mover toward its ideal offsets to its
+                    // formation neighbours so the team covers ground as a unit.
+                    // Late route discipline: ordinary off-ball movers should not run through or
+                    // past a teammate's lane, and in possession their support movement must
+                    // still climb toward the opponent goal (tactical exceptions left alone).
+                    // All three are soft positional nudges, so — as with cluster A — their
+                    // relative order is shuffled per tick rather than letting the lane guard
+                    // permanently overrule the spacing/relational nudges.
+                    let mut cluster_b: Vec<SoftNudge> = Vec::new();
+                    if !chasing_loose_ball {
+                        cluster_b.push(SoftNudge::SelfSpacing);
+                    }
+                    cluster_b.push(SoftNudge::RelationalShape);
+                    cluster_b.push(SoftNudge::LaneGuard);
+                    if tick_order_shuffle_enabled(&self.config) {
+                        fisher_yates_shuffle(&mut cluster_b, &mut nudge_rng);
+                    }
+                    let mut intent = intent;
+                    for nudge in cluster_b {
+                        intent = match nudge {
+                            SoftNudge::SelfSpacing => {
+                                self.teammate_spacing_disciplined_intent(intent)
+                            }
+                            SoftNudge::RelationalShape => {
+                                self.relational_shape_disciplined_intent(intent)
+                            }
+                            SoftNudge::LaneGuard => {
+                                snapshot.teammate_lane_guard_adjusted_intent(intent)
+                            }
+                            _ => intent,
+                        };
+                    }
+                    // --- Hard safety / shape overrides (PINNED LAST — these MUST win) ---
                     // Ball played IN BEHIND our back line: this has FINAL say over shape — the
                     // keeper sweeps and the two nearest defenders sprint/run goalside to recover
                     // (paced by the chasing attacker's granular pressure). Everyone else keeps
@@ -4482,8 +4545,26 @@ impl SoccerMatch {
         field_loop_elapsed += field_loop_started.elapsed();
 
         let phase_started = Instant::now();
-        self.resolve_dribble_hold_up_contests();
-        self.resolve_player_collisions();
+        // The dribble/hold-up duel (carrier vs nearest committed defender) and the
+        // body-collision separation are independent contests, so neither should
+        // permanently resolve first — shuffle their order per tick. `sync_held_ball`
+        // and the ball-kinematics integration stay PINNED after both: a held ball must
+        // snap to the holder's FINAL post-collision position, and the loose-ball
+        // integration must read the settled state, so those are real data dependencies,
+        // not free precedence. Disabled => legacy [dribble, collision] order, no RNG.
+        let mut contest_order =
+            [ContestResolutionPass::DribbleHoldUp, ContestResolutionPass::BodyCollision];
+        if tick_order_shuffle_enabled(&self.config) {
+            let mut contest_rng =
+                tick_order_rng(self.config.seed, self.tick, TICK_ORDER_SALT_CONTEST);
+            fisher_yates_shuffle(&mut contest_order, &mut contest_rng);
+        }
+        for pass in contest_order {
+            match pass {
+                ContestResolutionPass::DribbleHoldUp => self.resolve_dribble_hold_up_contests(),
+                ContestResolutionPass::BodyCollision => self.resolve_player_collisions(),
+            }
+        }
         self.sync_held_ball_to_holder();
         self.ball.update_kinematics_from(
             ball_velocity_before,
@@ -8744,10 +8825,32 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
-        for i in 0..self.players.len() {
-            for j in i + 1..self.players.len() {
-                let (left, right) = self.players.split_at_mut(j);
-                let a = &mut left[i];
+        // Resolve pairwise overlaps in a per-tick SHUFFLED player order. When three or
+        // more bodies pile up, the sequence the pushes are applied in (and the tie-break
+        // for an exact overlap) decides the settled positions; iterating by raw index
+        // would always resolve the low-id players — i.e. the home team, which occupies
+        // indices 0..10 — first, a standing precedence. Order only matters inside a
+        // pile-up; an isolated overlap settles identically either way. Both the push and
+        // the velocity impulse are symmetric under swapping the two bodies, so relabelling
+        // a/b to put the lower index on the left for `split_at_mut` changes nothing
+        // physically. Disabled => identity order + deterministic tie-break, no extra RNG.
+        let shuffle = tick_order_shuffle_enabled(&self.config);
+        // Independent of the main decision RNG (see `tick_order_rng`).
+        let mut order_rng =
+            tick_order_rng(self.config.seed, self.tick, TICK_ORDER_SALT_COLLISION);
+        let mut order: Vec<usize> = (0..self.players.len()).collect();
+        if shuffle {
+            fisher_yates_shuffle(&mut order, &mut order_rng);
+        }
+        let players = &mut self.players;
+        for oi in 0..order.len() {
+            for oj in oi + 1..order.len() {
+                let (mut a_idx, mut b_idx) = (order[oi], order[oj]);
+                if a_idx > b_idx {
+                    std::mem::swap(&mut a_idx, &mut b_idx);
+                }
+                let (left, right) = players.split_at_mut(b_idx);
+                let a = &mut left[a_idx];
                 let b = &mut right[0];
                 let delta = b.position - a.position;
                 let dist = delta.len();
@@ -8756,7 +8859,14 @@ impl SoccerMatch {
                 }
 
                 let normal = if dist <= 1e-9 {
-                    deterministic_separation_normal(a.id, b.id)
+                    if shuffle {
+                        // Random separation axis so a stack of exactly-coincident bodies
+                        // is not always split along the same id-derived direction.
+                        let theta = order_rng.next_float() * std::f64::consts::TAU;
+                        Vec2::new(theta.cos(), theta.sin())
+                    } else {
+                        deterministic_separation_normal(a.id, b.id)
+                    }
                 } else {
                     delta / dist
                 };
@@ -13412,6 +13522,52 @@ fn dd_soccer_disable_spacing_nudge() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
+}
+// Per-tick Fisher-Yates randomisation of the *order* of otherwise-arbitrary
+// operations inside `run_time_step` (collision pair resolution, the two contest
+// resolvers, and the soft positional-nudge clusters of the per-player intent
+// chain). On by default so no single operand permanently takes precedence over
+// its peers; set DD_SOCCER_DISABLE_TICK_ORDER_SHUFFLE=1 to fall back to the
+// fixed legacy order (byte-identical, consuming zero extra RNG) for repro/A-B.
+fn dd_soccer_disable_tick_order_shuffle() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TICK_ORDER_SHUFFLE").is_ok())
+}
+
+// Per-site salts so the order-shuffle streams below are mutually independent.
+const TICK_ORDER_SALT_COLLISION: u32 = 0xC011_1DE5;
+const TICK_ORDER_SALT_CONTEST: u32 = 0xC042_7E57;
+const TICK_ORDER_SALT_NUDGE: u32 = 0x9D6E_5A17;
+
+/// An independent, reproducible RNG stream for the per-tick operation-ORDER shuffles,
+/// mixed from the match seed + tick + a per-site (and, for the nudges, per-player) salt.
+/// Crucially this is kept entirely OFF the main decision RNG (`self.rng`): reordering
+/// equally-ranked operations must change only which one wins a genuine tie, NOT the
+/// pass/dribble/shot/contest random rolls — drawing the shuffles from the main stream
+/// would displace every downstream roll and effectively reseed the whole match instead
+/// of reordering it. Because nothing here touches `self.rng`, the disabled path stays
+/// byte-identical to the legacy fixed order.
+fn tick_order_rng(seed: u32, tick: u64, salt: u32) -> SeededRandom {
+    let mut s = seed
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add((tick as u32).wrapping_mul(0x85EB_CA77))
+        .wrapping_add(((tick >> 32) as u32).wrapping_mul(0xC2B2_AE3D))
+        .wrapping_add(salt.wrapping_mul(0x27D4_EB2F));
+    // fmix-style finaliser so adjacent (seed, tick, salt) tuples yield well-separated
+    // streams rather than the near-identical opening draws a raw seed would give.
+    s ^= s >> 15;
+    s = s.wrapping_mul(0x2C1B_3C6D);
+    s ^= s >> 12;
+    s = s.wrapping_mul(0x297A_2D39);
+    s ^= s >> 15;
+    SeededRandom::new(s)
+}
+
+/// Whether the per-tick operation-order shuffles are active for this match: on unless
+/// either the process-wide env flag or the per-match config field disables them.
+fn tick_order_shuffle_enabled(config: &MatchConfig) -> bool {
+    !dd_soccer_disable_tick_order_shuffle() && !config.disable_tick_order_shuffle
 }
 fn dd_soccer_disable_power_duration_ceiling() -> bool {
     use std::sync::OnceLock;
@@ -21617,6 +21773,67 @@ impl WorldSnapshot {
             .count()
     }
 
+    /// "Create a vacuum": the value of THIS off-ball attacker vacating his current spot `a`
+    /// by running forward. Returns a [0, 1] potential — the position-`a`-dependent part of the
+    /// per-candidate bonus applied in [`open_space_for`]. Non-zero only when a genuine vacuum
+    /// exists: `a` is a dangerous, ball-reachable pocket in the attacking half, a defender is
+    /// tight enough to be dragged out of it when the runner leaves, AND a trailing team-mate is
+    /// poised to run onto it. Otherwise 0, so shape is unchanged wherever the strategy does not
+    /// apply. The exploitation is emergent — once the marker follows the run, `a` becomes open
+    /// space the trailing team-mate's own [`open_space_for`] search is already drawn into.
+    fn vacuum_creation_potential_for(&self, me: &PlayerSnapshot, a: Vec2) -> f64 {
+        let dir = me.team.attack_dir();
+        // The pocket must be a useful attacking space: in the attacking half, level-or-ahead of
+        // the ball and within pass range, so vacating it opens something the ball can exploit.
+        let in_attacking_half = (a.y - self.field_length * 0.5) * dir > 0.0;
+        let ahead_of_ball = (a.y - self.ball.position.y) * dir;
+        if !in_attacking_half || ahead_of_ball < -6.0 || self.ball.position.distance(a) > 30.0 {
+            return 0.0;
+        }
+        // A committed marker to drag out of the pocket — with no one occupying it, leaving frees
+        // nothing. The tighter the marker, the more reliably the run drags him off the space.
+        let marker_distance = self
+            .nearest_opponent_at(me.team, a)
+            .map_or(f64::INFINITY, |(_, _, distance)| distance);
+        if marker_distance > VACUUM_MARKER_DRAG_RADIUS_YARDS {
+            return 0.0;
+        }
+        let marker_commitment =
+            (1.0 - marker_distance / VACUUM_MARKER_DRAG_RADIUS_YARDS).clamp(0.0, 1.0);
+        // A trailing team-mate poised to attack the vacated pocket: goal-side-behind it (so his
+        // run onto it is forward and onside) and within a range he can realistically cover.
+        let mut trailer_quality = 0.0f64;
+        for mate in self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.id != me.id && p.role != PlayerRole::Goalkeeper)
+        {
+            let mate_position = self.player_snapshot_position(mate);
+            let behind = (a.y - mate_position.y) * dir;
+            if behind < VACUUM_TRAILER_MIN_BEHIND_YARDS {
+                continue;
+            }
+            let range = mate_position.distance(a);
+            if !(VACUUM_TRAILER_MIN_RANGE_YARDS..=VACUUM_TRAILER_MAX_RANGE_YARDS).contains(&range) {
+                continue;
+            }
+            trailer_quality = trailer_quality
+                .max((1.0 - range / VACUUM_TRAILER_MAX_RANGE_YARDS).clamp(0.0, 1.0));
+        }
+        if trailer_quality <= 0.0 {
+            return 0.0;
+        }
+        // Danger of the pocket: central / half-space and advanced spots are worth vacating most.
+        let center_x = self.field_width * 0.5;
+        let lateral = ((a.x - center_x).abs() / (self.field_width * 0.5).max(1.0)).clamp(0.0, 1.0);
+        let central_value = 1.0 - lateral * 0.5;
+        let opponent_goal = Vec2::new(center_x, me.team.goal_y(self.field_length));
+        let advanced_value =
+            (1.0 - a.distance(opponent_goal) / (self.field_length * 0.6).max(1.0)).clamp(0.2, 1.0);
+        let pocket_value = central_value * (0.5 + 0.5 * advanced_value);
+        (pocket_value * marker_commitment * trailer_quality).clamp(0.0, 1.0)
+    }
+
     pub fn open_space_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
@@ -21680,6 +21897,17 @@ impl WorldSnapshot {
             && me.role != PlayerRole::Goalkeeper
             && ball_dist_to_goal_line <= self.field_length / 3.0 * 1.05;
         let me_to_goal = me_position.distance(opponent_goal);
+        // "Create a vacuum": position-dependent worth of vacating the current spot with a
+        // forward run (0 unless a real vacuum exists — see `vacuum_creation_potential_for`).
+        // Off-ball only: the decoy run is made by a supporter, never the carrier.
+        let vacuum_potential = if possession
+            && me.role != PlayerRole::Goalkeeper
+            && self.ball.holder != Some(player_id)
+        {
+            self.vacuum_creation_potential_for(me, me_position)
+        } else {
+            0.0
+        };
         for dx in [-22.0, -13.0, -6.0, 0.0, 6.0, 13.0, 22.0] {
             for dy in [-8.0, 0.0, 7.0, 14.0, 22.0, 30.0] {
                 let raw_p = Vec2::new(
@@ -21795,8 +22023,22 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Vacuum bonus: reward a candidate that actually VACATES the pocket — a forward
+                // run that leaves the current spot — so the player makes the forward run even
+                // when this spot is not the most open. Square/backward shuffles drag no marker
+                // upfield and earn nothing; openness still dominates a genuinely crowded target.
+                let vacuum_bonus = if vacuum_potential > 0.0
+                    && forward > VACUUM_MIN_FORWARD_RUN_YARDS
+                    && me_position.distance(p) > VACUUM_MIN_VACATE_YARDS
+                {
+                    let forward_factor = (forward / VACUUM_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+                    VACUUM_CREATION_WEIGHT * vacuum_potential * forward_factor
+                } else {
+                    0.0
+                };
                 let score = occupancy.open_space_score
                     + counterattack_bonus
+                    + vacuum_bonus
                     + goal_directness_bonus
                     + forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08)
                     + forward_from_ball.clamp(-6.0, 28.0)
