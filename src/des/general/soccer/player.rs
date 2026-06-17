@@ -1590,10 +1590,10 @@ impl PlayerAgent {
                 };
             let space_fit = (snapshot.space_score_at(target, self.team) / 14.0).clamp(0.0, 1.0);
             (base
-                + forward.max(0.0) * 0.018
-                + openness * 0.18
-                + pass_lane * 0.14
-                + space_fit * 0.16)
+                + forward.max(0.0) * 0.034
+                + openness * 0.26
+                + pass_lane * 0.22
+                + space_fit * 0.24)
                 * self.preferences.open_space_bias.clamp(0.25, 1.0)
         };
         let mut options = vec![
@@ -1630,7 +1630,10 @@ impl PlayerAgent {
             let target = guarded_special_target(target);
             options.push(AgentActionOptionTrace::new(
                 "run-in-behind",
-                special_score(target, 0.50 + holder_pressure_urgency * 0.10),
+                special_score(
+                    target,
+                    0.68 + shape_support_urgency * 0.10 + holder_pressure_urgency * 0.18,
+                ),
                 true,
             ));
         }
@@ -1646,11 +1649,11 @@ impl PlayerAgent {
                     // preference and the wider-is-better term so wide attackers push to space
                     // on the wing more readily than drifting inside.
                     target,
-                    0.60 + touchline_fit * 0.28
-                        + shape_support_urgency * 0.14
-                        + holder_pressure_urgency * 0.30
+                    0.72 + touchline_fit * 0.34
+                        + shape_support_urgency * 0.20
+                        + holder_pressure_urgency * 0.34
                         + if flank_policy_active {
-                            0.24 + directive.flank_overlap_run_probability * 0.18
+                            0.28 + directive.flank_overlap_run_probability * 0.22
                         } else {
                             0.0
                         },
@@ -1669,11 +1672,11 @@ impl PlayerAgent {
                 "shot-creation-run",
                 special_score(
                     target,
-                    0.58 + goalward.max(0.0) * 0.018
-                        + centrality * 0.12
-                        + shape_support_urgency * 0.16
-                        + holder_pressure_urgency * 0.14
-                        + directive.flank_overlap_run_probability * 0.20,
+                    0.64 + goalward.max(0.0) * 0.026
+                        + centrality * 0.14
+                        + shape_support_urgency * 0.20
+                        + holder_pressure_urgency * 0.18
+                        + directive.flank_overlap_run_probability * 0.22,
                 ),
                 true,
             ));
@@ -1735,6 +1738,28 @@ impl PlayerAgent {
                 FLANK_OVERLAP_MIN_OPTION_SHARE
             };
             ensure_min_legal_option_probability(&mut options, "overlap-run", min_share);
+        }
+        if options
+            .iter()
+            .any(|option| option.legal && option.label == "run-in-behind")
+        {
+            let run_floor = (0.14
+                + if striker_attack { 0.06 } else { 0.0 }
+                + shape_support_urgency * 0.10
+                + holder_pressure_urgency * 0.14)
+            .clamp(0.18, 0.38);
+            ensure_min_legal_option_probability(&mut options, "run-in-behind", run_floor);
+        }
+        if options
+            .iter()
+            .any(|option| option.legal && option.label == "wide-outlet")
+        {
+            let wide_floor = (0.12
+                + shape_support_urgency * 0.08
+                + holder_pressure_urgency * 0.10
+                + if flank_policy_active { 0.10 } else { 0.0 })
+            .clamp(0.16, 0.34);
+            ensure_min_legal_option_probability(&mut options, "wide-outlet", wide_floor);
         }
         if holder_pressure_urgency >= PRESSURED_SUPPORT_SPRINT_URGENCY {
             if options
