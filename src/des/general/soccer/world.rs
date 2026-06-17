@@ -15965,7 +15965,6 @@ impl WorldSnapshot {
         mut target: Vec2,
     ) -> Vec2 {
         let retreat_y = self.defensive_line_break_retreat_target_y(team, holder, line_gap);
-        let threat_fit = defensive_line_break_threat_fit(line_gap);
         let dir = team.attack_dir();
         // Preserve a narrow close-down window; otherwise the back line either drops
         // for an immediate break threat or retreats to stay connected behind the ball.
@@ -15978,8 +15977,7 @@ impl WorldSnapshot {
                 target.y = target.y.max(retreat_y - 1.0);
             }
         }
-        let max_behind_ball = DEFENSIVE_MAX_BEHIND_BALL_YARDS
-            + DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS * threat_fit;
+        let max_behind_ball = DEFENSIVE_MAX_BEHIND_BALL_YARDS;
         self.clamp_defensive_goal_line_and_ball_gap_with_max(team, target, max_behind_ball)
     }
 
@@ -20331,9 +20329,9 @@ impl WorldSnapshot {
 
     /// Ball-in-behind recovery target + pace for an off-ball DEFENDING player. When a ball is
     /// played in behind our back line, the nearest outfield defender SPRINTS onto it to
-    /// recover; the 2nd-nearest sprints/runs goalside to cover between the ball and our goal;
-    /// the keeper sweeps off its line toward the ball. At least three (keeper + two) strive
-    /// goalside. Run-vs-sprint pace follows the granular pressure of the chasing attacker.
+    /// recover; the 2nd-nearest can cover between the ball and our goal but remains line-bound;
+    /// the keeper sweeps off its line toward the ball. Run-vs-sprint pace follows the granular
+    /// pressure of the chasing attacker.
     /// Returns `(adjusted_target, sprint)`, or the input target with `false` when it doesn't apply.
     pub(crate) fn ball_in_behind_recovery_adjusted_target(
         &self,
@@ -20396,7 +20394,8 @@ impl WorldSnapshot {
             );
         }
         if rank == 1 {
-            // Second man: drop GOALSIDE of the ball to cover the route to goal.
+            // Second man: cover GOALSIDE of the ball, but do not become a second line-rule
+            // exception. The nearest defender is the one player allowed to break the band.
             let to_goal = own_goal - recovery;
             let dir = if to_goal.len() > 1e-3 {
                 to_goal.normalized()
@@ -20405,7 +20404,8 @@ impl WorldSnapshot {
             };
             let cover = recovery + dir * IN_BEHIND_COVER_DISTANCE_YARDS;
             return (
-                cover.clamp_to_pitch(self.field_width, self.field_length),
+                self.defensive_line_cushion_adjusted_target(player_id, cover)
+                    .clamp_to_pitch(self.field_width, self.field_length),
                 pressured_sprint,
             );
         }
@@ -20772,12 +20772,42 @@ impl WorldSnapshot {
         (p + disp).clamp_to_pitch(self.field_width, self.field_length)
     }
 
+    fn defensive_line_rule_exempt_defender(&self, team: Team) -> Option<usize> {
+        if self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team())
+            == Some(team)
+        {
+            return None;
+        }
+        let focus = self
+            .ball
+            .holder
+            .and_then(|holder_id| self.players.iter().find(|p| p.id == holder_id))
+            .filter(|holder| holder.team != team)
+            .map(|holder| self.player_snapshot_position(holder))
+            .or_else(|| self.projected_loose_ball_target())
+            .unwrap_or(self.ball.position);
+        self.players
+            .iter()
+            .filter(|p| p.team == team && p.role == PlayerRole::Defender)
+            .min_by(|a, b| {
+                self.player_snapshot_position(a)
+                    .distance(focus)
+                    .total_cmp(&self.player_snapshot_position(b).distance(focus))
+                    .then(a.id.cmp(&b.id))
+            })
+            .map(|p| p.id)
+    }
+
     /// Keep the back four's AVERAGE position in its band relative to the ball (see the
     /// `DEFENSIVE_LINE_*` constants). For a defender's off-ball move, shifts its target along the
     /// attacking axis by the amount the line's average is outside the band, so the whole line
     /// steps up (in possession) or drops off (opponent has the ball upfield) together while
-    /// keeping its left-right shape. Returns the target unchanged when the line is already in band
-    /// or the player isn't a free off-ball defender.
+    /// keeping its left-right shape. While defending, exactly one closest defender may break the
+    /// band to engage the ball; the remaining defenders carry the line rule. Every tick aims
+    /// those line-bound defenders at the correction needed for consistency inside the 2-second
+    /// horizon, while accepting that physics/traffic may make the actual arrival slower.
     pub(crate) fn defensive_line_cushion_adjusted_target(
         &self,
         player_id: usize,
@@ -20796,24 +20826,40 @@ impl WorldSnapshot {
         if self.ball.holder == Some(player_id) {
             return target;
         }
+        let exempt_defender = self.defensive_line_rule_exempt_defender(me.team);
+        if exempt_defender == Some(player_id) {
+            return target;
+        }
         let attack_dir = me.team.attack_dir();
         let fwd = |p: Vec2| p.y * attack_dir;
-        let defenders: Vec<f64> = self
+        let defenders: Vec<&PlayerSnapshot> = self
             .players
             .iter()
             .filter(|p| p.team == me.team && p.role == PlayerRole::Defender)
-            .map(|p| fwd(self.player_snapshot_position(p)))
             .collect();
-        if defenders.len() < 2 {
+        let line_defenders: Vec<&PlayerSnapshot> = defenders
+            .iter()
+            .copied()
+            .filter(|p| Some(p.id) != exempt_defender)
+            .collect();
+        let line_defenders = if line_defenders.len() >= 2 {
+            line_defenders
+        } else {
+            defenders
+        };
+        if line_defenders.len() < 2 {
             return target;
         }
-        let avg_fwd = defenders.iter().sum::<f64>() / defenders.len() as f64;
+        let avg_fwd = line_defenders
+            .iter()
+            .map(|p| fwd(self.player_snapshot_position(p)))
+            .sum::<f64>()
+            / line_defenders.len() as f64;
         let ball_fwd = fwd(self.ball.position);
-        let gap = ball_fwd - avg_fwd; // > 0 when the line sits behind the ball (the normal case)
-                                      // The band is suspended only with the ball on/near a goal line (forcing "2yd
-                                      // behind" there would shove the line off the end-line). Otherwise it applies
-                                      // even when the line has drifted AHEAD of the ball (gap <= 0) — that's exactly
-                                      // the build-up bug we must pull back, so do NOT bail here.
+        // The band is suspended only with the ball on/near a goal line (forcing "2yd
+        // behind" there would shove the line off the end-line). Otherwise it applies
+        // even when the line has drifted AHEAD of the ball (gap <= 0) — that's exactly
+        // the build-up bug we must pull back, so do NOT bail here.
         let ball_y = self.ball.position.y;
         if ball_y <= DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
             || ball_y >= self.field_length - DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
@@ -20821,12 +20867,14 @@ impl WorldSnapshot {
             return target;
         }
         let (genome_min_gap, genome_max_gap) = self.genome_for(me.team).defensive_line_band_yards();
+        let genome_max_gap = genome_max_gap.min(DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS);
+        let genome_min_gap = genome_min_gap.min(genome_max_gap);
         let in_possession_max_gap = (genome_max_gap * DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
             / DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
             .clamp(genome_min_gap, genome_max_gap);
         // Resolve the allowed band [min_gap, max_gap] for how far the line sits behind
         // the ball. The genome permutes the hard standoff: neutral is 2..=25 yd,
-        // while tournament variants try min {1,2,3} and max {20,23,25,27,29}.
+        // while tournament variants try min {1,2,3} and max values capped at 25.
         let (min_gap, max_gap) = match self.controlled_possession_team() {
             // In possession: keep the same push-up shape, scaled from the genome
             // max so the neutral 25yd gene reproduces the historical 15yd cap.
@@ -20856,7 +20904,6 @@ impl WorldSnapshot {
             .max(DEFENSIVE_LINE_GAP_FLOOR_YARDS);
         let max_gap = max_gap.min(goal_proximity_gap_ceiling);
         let min_gap = min_gap.min(max_gap); // keep the band valid (min ≤ max) when it shrinks
-        let desired_gap = gap.clamp(min_gap, max_gap);
         // In possession the line may push up, but no more than ~5yd past the halfway line.
         let halfway_fwd = own_goal_fwd + self.field_length * 0.5;
         let max_avg_fwd = halfway_fwd + DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS;
@@ -20867,14 +20914,35 @@ impl WorldSnapshot {
         let predicted_ball_fwd =
             fwd(self.predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS));
         let predicted_ceiling_avg_fwd = predicted_ball_fwd - max_gap;
-        let desired_avg_fwd = (ball_fwd - desired_gap)
-            .max(predicted_ceiling_avg_fwd)
-            .min(max_avg_fwd);
-        if (desired_avg_fwd - avg_fwd).abs() < 1e-6 {
-            return target;
-        }
-        let delta = desired_avg_fwd - avg_fwd;
-        let adjusted_y = (target.y + delta * attack_dir).clamp(0.0, self.field_length);
+        let line_band_avg_fwd = |avg: f64| {
+            avg.clamp(ball_fwd - max_gap, ball_fwd - min_gap)
+                .max(predicted_ceiling_avg_fwd)
+                .min(max_avg_fwd)
+        };
+        let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
+        let current_fwd = fwd(self.player_snapshot_position(me));
+        let target_fwd = fwd(target);
+        let horizon = DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let current_delta = desired_avg_fwd - avg_fwd;
+        let adjusted_fwd = if current_delta.abs() > 1e-6 {
+            let correction_yps = current_delta / horizon;
+            current_fwd + correction_yps * horizon
+        } else {
+            let peer_sum_fwd = line_defenders
+                .iter()
+                .filter(|p| p.id != player_id)
+                .map(|p| fwd(self.player_snapshot_position(p)))
+                .sum::<f64>();
+            let line_count = line_defenders.len() as f64;
+            let projected_avg_fwd = (peer_sum_fwd + target_fwd) / line_count;
+            let desired_projected_avg_fwd = line_band_avg_fwd(projected_avg_fwd);
+            let projected_delta = desired_projected_avg_fwd - projected_avg_fwd;
+            if projected_delta.abs() < 1e-6 {
+                return target;
+            }
+            target_fwd + projected_delta * line_count
+        };
+        let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
         return Vec2::new(target.x, adjusted_y);
     }
 
@@ -20882,6 +20950,9 @@ impl WorldSnapshot {
     fn defensive_line_cushion_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.defensive_line_cushion_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+            }
             intent.action = SoccerAction::MoveTo(adjusted);
         }
         return intent;
@@ -23413,7 +23484,7 @@ impl WorldSnapshot {
     }
 
     /// Clamp a defender's target forward-position to the team's evolved back-four
-    /// line band: min {1,2,3} yards behind the ball and max {20,23,25,27,29}
+    /// line band: min {1,2,3} yards behind the ball and max values capped at 25
     /// yards behind the headed ball, scaled tighter while in possession.
     fn defender_line_band_clamped_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         // The band only applies when the ball is BEYOND the 8-yard line at
@@ -23427,24 +23498,18 @@ impl WorldSnapshot {
         }
         let attack = me.team.attack_dir();
         let (min_gap, genome_max_gap) = self.genome_for(me.team).defensive_line_band_yards();
+        let genome_max_gap = genome_max_gap.min(DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS);
+        let min_gap = min_gap.min(genome_max_gap);
         let in_possession_max_gap = (genome_max_gap * DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
             / DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
             .clamp(min_gap, genome_max_gap);
-        let mut max_gap = if self.controlled_possession_team() == Some(me.team) {
+        let max_gap = if self.controlled_possession_team() == Some(me.team) {
             in_possession_max_gap
         } else {
             genome_max_gap
         };
-        // Genuine ball-in-behind break: the line may legitimately drop deeper than
-        // the nominal cap to avoid being played through (rather than camp the line
-        // and get split). Relaxes the ≤25 ceiling by the break extra, scaled by how
-        // real the threat is.
-        if let Some((_, line_gap)) = self.opponent_breakthrough_ball_carrier(me.team) {
-            max_gap += DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS
-                * defensive_line_break_threat_fit(line_gap);
-        }
         // Lower bound of the gap: stay goal-side of the ball by this genome's
-        // selected min. Upper bound: no more than the genome max behind where the
+        // selected min. Upper bound: no more than the capped genome max behind where the
         // ball is headed, with the historical in-possession push-up preserved by
         // scaling the max.
         let ball_fwd = self.ball.position.y * attack;

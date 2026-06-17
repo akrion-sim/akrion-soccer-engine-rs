@@ -1170,8 +1170,11 @@ const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // 15yd if it's airborne or moving (in transit). The LP/formation nudge shifts the whole line to
 // restore the band.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
+// The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
+// the average correction that would make the back four legal within this many seconds.
+const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min over {1,2,3}yd and max over {20,23,25,27,29}yd.
+// permute the min over {1,2,3}yd and max over values capped at 25yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
@@ -1676,7 +1679,6 @@ const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
 const MIDFIELDER_DEEP_RETREAT_CHANCE: f64 = 0.25;
-const DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS: f64 = 12.0;
 const DEFENSIVE_LINE_BREAK_MIN_ADVANCEMENT_FROM_GOAL_YARDS: f64 = 6.0;
 const DEFENSIVE_LOW_LINE_BREAK_TRIGGER_GAP_YARDS: f64 = 12.0;
 const DEFENSIVE_LINE_BREAK_TRIGGER_GAP_YARDS: f64 = 42.0;
