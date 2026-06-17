@@ -4031,6 +4031,36 @@ pub struct SoccerMdpMpcComparisonTrace {
     #[serde(default)]
     pub mdp_confidence: f64,
     #[serde(default)]
+    pub mpc_ball_urgency: f64,
+    #[serde(default)]
+    pub mpc_touch_window_seconds: f64,
+    #[serde(default)]
+    pub mpc_body_mechanics_fit: f64,
+    #[serde(default)]
+    pub mpc_execution_probability: f64,
+    #[serde(default)]
+    pub mpc_pass_completion_probability: f64,
+    #[serde(default)]
+    pub mpc_dribble_success_probability: f64,
+    #[serde(default)]
+    pub mpc_dribble_left_success_probability: f64,
+    #[serde(default)]
+    pub mpc_dribble_right_success_probability: f64,
+    #[serde(default)]
+    pub mpc_recommended_speed_yps: f64,
+    #[serde(default)]
+    pub mpc_recommended_angle_degrees: f64,
+    #[serde(default)]
+    pub mpc_recommended_curve_bend_yards: f64,
+    #[serde(default)]
+    pub mpc_recommended_spin_rps: f64,
+    #[serde(default)]
+    pub mpc_recommended_curve: String,
+    #[serde(default)]
+    pub mpc_execution_horizon_seconds: f64,
+    #[serde(default)]
+    pub mpc_reselect_reason: String,
+    #[serde(default)]
     pub mpc_guidance_present: bool,
     #[serde(default)]
     pub blend_eligible: bool,
