@@ -10080,12 +10080,14 @@ fn defensive_kickoff_shape_is_perturbed_across_seeds() {
 
 #[test]
 fn pass_length_preference_peaks_at_eight_yards() {
+    // Single optimum at ~8yd: a 5yd tap and a 12yd ball are BOTH clearly worse than 8.
     assert_eq!(pass_length_preference(8.0), 1.0);
     assert!(pass_length_preference(5.0) < pass_length_preference(8.0));
     assert!(pass_length_preference(12.0) < pass_length_preference(8.0));
     // A too-short square ball and a too-long hopeful ball are both less preferred.
     assert!(pass_length_preference(4.0) < 1.0);
     assert!(pass_length_preference(25.0) < 1.0);
+    // The optimum beats a longer ball on the same lane (favours the nearer teammate).
     assert!(pass_length_preference(8.0) > pass_length_preference(20.0));
 }
 
@@ -40771,8 +40773,12 @@ fn pass_quality_observation_for_marked_receiver(marked: bool) -> SoccerPomdpObse
 fn pomdp_and_q_state_track_receiver_openness_for_pass_completion() {
     let open = pass_quality_observation_for_marked_receiver(false);
     let marked = pass_quality_observation_for_marked_receiver(true);
+    // The forward receiver is a visible option in BOTH cases: a 22yd-forward teammate with
+    // a marker ~3yd off is "half-open", which a skilled passer keeps as a priced option
+    // (the half-open forward exception) rather than hiding. The observation must still rate
+    // the genuinely-open receiver clearly higher on openness AND completion.
     assert_eq!(open.visible_pass_options, 1);
-    assert_eq!(marked.visible_pass_options, 0);
+    assert_eq!(marked.visible_pass_options, 1);
     assert!(
         open.best_pass_receiver_openness > marked.best_pass_receiver_openness + 0.30,
         "open receiver {:.3} should exceed marked {:.3}",
@@ -45301,6 +45307,75 @@ fn cannot_control_a_low_ball_behind_you_but_can_backpedal_under_a_high_one() {
 }
 
 #[test]
+fn a_grounded_non_target_intercepts_a_ball_within_six_feet_of_the_air() {
+    // A ball crossing a non-target player's body at or below ~6ft (head/chest height) must
+    // be contestable every tick, even by a poor leaper — it does not sail past as if it
+    // cleared their head. Aerial ability only extends reach ABOVE 6ft (leaping headers).
+    // This is the floor that stops "the ball was passed straight through P1" at low height.
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 1234,
+        ..Default::default()
+    });
+    let mut blocker = sim.players[12].clone();
+    let team = blocker.team;
+    // A poor aerial player: standing reach alone (no jump) is only ~4.8ft, so a ~5.5ft
+    // ball used to fly over this player before the 6ft interception-reach floor.
+    blocker.skills.height = 1.0;
+    blocker.skills.strength = 1.0;
+    blocker.skills.aggression = 1.0;
+    blocker.skills.first_touch = 1.0;
+    // Stand in the ball's path, facing the incoming (westward) ball so the control-cone
+    // gate is satisfied — the only thing in question is the height the player can reach.
+    blocker.position = Vec2::new(41.0, 55.0);
+    blocker.velocity = Vec2::zero();
+    blocker.action_facing = FacingBucket::West;
+    blocker.receive_facing = FacingBucket::West;
+    // A slow airborne ball passing west through the blocker (speed below the kinematic
+    // gate, so reach is not capped by ball pace — altitude is the deciding factor).
+    let previous_ball_pos = Vec2::new(40.2, 55.0);
+    let ball_pos = Vec2::new(40.0, 55.0);
+    let ball_velocity = Vec2::new(-2.0, 0.0);
+
+    // ~5.5ft (1.83yd) — below the 6ft floor: intercepted despite zero aerial ability.
+    let within_reach = nearest_ball_controller_for_segment(
+        1,
+        previous_ball_pos,
+        ball_pos,
+        ball_velocity,
+        &[blocker.clone()],
+        None,
+        Some(team),
+        None,
+        1.83,
+        &mut mulberry32(1),
+    );
+    assert!(
+        within_reach.is_some(),
+        "a sub-6ft airborne ball crossing a non-target must be intercepted (proximity \
+         permitting), not flown over: {within_reach:?}"
+    );
+
+    // ~9ft (3.0yd) — clearly overhead: still flies over a player who cannot leap to it.
+    let overhead = nearest_ball_controller_for_segment(
+        1,
+        previous_ball_pos,
+        ball_pos,
+        ball_velocity,
+        &[blocker],
+        None,
+        Some(team),
+        None,
+        3.0,
+        &mut mulberry32(1),
+    );
+    assert!(
+        overhead.is_none(),
+        "a ball well above head height must still fly over a non-leaper: {overhead:?}"
+    );
+}
+
+#[test]
 fn a_ball_right_at_the_feet_is_trapped_regardless_of_facing() {
     // Complement to `cannot_control_a_low_ball_behind_you`: a ball rolling RIGHT under
     // a player's feet (<=0.5yd) is controlled even when they face away — a ball at your
@@ -48205,19 +48280,59 @@ fn live_http_routes_state_and_step_json() {
         pg_jsonl_entry["entry"]["stateHash"].as_str().unwrap().len(),
         32
     );
+    // The decision-trace capture below is asserted on a frame that actually has a
+    // ball-holder's ON-BALL decision. The shared 2-tick frame above can have the ball in
+    // flight after a first-time pass (no on-ball decision survives that tick), so step a
+    // dedicated fresh session one tick at a time until a holder's on-ball decision is
+    // recorded, and assert agent schedule + players + holder all against THAT frame.
+    let on_ball_decision = |frame: &serde_json::Value| -> bool {
+        frame["frame"]["players"].as_array().is_some_and(|players| {
+            players.iter().any(|player| {
+                player["lastDecision"]["observation"]["hasBall"] == serde_json::json!(true)
+            })
+        })
+    };
+    let holder_session = Arc::new(Mutex::new(SoccerRealtimeSession::new(MatchConfig {
+        duration_seconds: 1.0,
+        learning_interval_ticks: 1,
+        max_human_players: 2,
+        seed: 55,
+        ..Default::default()
+    })));
+    let holder_input_queue = holder_session.lock().unwrap().input_queue();
+    let one_tick = r#"{"ticks":1,"recordEveryTicks":1}"#;
+    let mut holder_value = serde_json::Value::Null;
+    for _ in 0..14 {
+        let step_one = handle_live_soccer_request(
+            &format!(
+                "POST /api/step HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                one_tick.len(),
+                one_tick
+            ),
+            &holder_session,
+            &holder_input_queue,
+        );
+        assert_eq!(step_one.status, 200);
+        holder_value = serde_json::from_str(&step_one.body).expect("step json");
+        if on_ball_decision(&holder_value) {
+            break;
+        }
+    }
+    // Assert all frame-content (schedule, players, ball, brains, officials, intents) against
+    // this carrier-bearing frame so they stay mutually consistent; the count/learning/policy
+    // assertions above already used the original 2-tick `value`.
+    let value = holder_value;
     let agent_schedule = value["frame"]["agentSchedule"]
         .as_array()
         .expect("agent schedule array");
     let frame_players = value["frame"]["players"]
         .as_array()
         .expect("frame players array");
-    let holder_id = value["frame"]["ball"]["holder"]
-        .as_u64()
-        .expect("live holder") as usize;
     let holder_player = frame_players
         .iter()
-        .find(|player| player["id"].as_u64() == Some(holder_id as u64))
-        .expect("holder player");
+        .find(|player| player["lastDecision"]["observation"]["hasBall"] == serde_json::json!(true))
+        .expect("a player whose last decision was made on the ball");
+    let holder_id = holder_player["id"].as_u64().expect("holder id") as usize;
     assert!(holder_player["lastDecision"].get("mdpState").is_some());
     let holder_decision = &holder_player["lastDecision"];
     assert!(

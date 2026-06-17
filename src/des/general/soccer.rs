@@ -105,6 +105,13 @@ const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
 // grounded players (the correct "aerial pass passed through" behavior).
 const CONTROL_STANDING_REACH_YARDS: f64 = 1.6;
 const CONTROL_AERIAL_JUMP_REACH_YARDS: f64 = 2.2;
+// ...but a ball at or below ~6ft (head/chest height) is reachable by ANY standing
+// player without leaping, so it is always within interception reach regardless of
+// aerial ability — a pass played through a player at that height must be contestable
+// (proximity permitting), not allowed to sail past a poor leaper. Aerial ability only
+// extends reach ABOVE this floor (jumping headers). Matches the existing "low ball"
+// threshold (`LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS`).
+const LOW_BALL_INTERCEPT_REACH_FLOOR_YARDS: f64 = 2.0; // ~6 ft
 // Body rotation about the vertical (z) axis. A player's heading turns toward the
 // thing it wants to watch (the ball, or where it's playing) at up to a
 // biomechanical max yaw rate — this also smooths the rendered facing. Turning
@@ -1945,11 +1952,23 @@ const GK_MPC_ACTIVE_RADIUS_YARDS: f64 = 40.0;
 const GK_BACKPASS_MIN_YARDS: f64 = 8.0;
 const GK_BACKPASS_MAX_YARDS: f64 = 40.0;
 /// A goalkeeper may handle the ball with his hands ONLY inside his own penalty
-/// area; while he holds it there it cannot be tackled or stolen. He must release
-/// it within this many seconds — past the limit he is forced to clear it. (Owner
-/// asked for 5s; classic Law 12 is 6s and the 2025 IFAB trial is 8s-then-corner,
-/// so 6.0 is used here as the modelled value — change this one const to retune.)
-const GK_HANDLING_HOLD_LIMIT_SECONDS: f64 = 6.0;
+/// area; while he holds it there it cannot be tackled or stolen. He should USE
+/// this whole window to pick out an open team-mate (see the calm-distribution
+/// hold in `apply_player_intent`), only releasing once a clear lane exists; past
+/// the limit he is forced to clear it. (Owner asked for 5s — used here; classic
+/// Law 12 is 6s and the 2025 IFAB trial is 8s-then-corner. Change this one const
+/// to retune.)
+const GK_HANDLING_HOLD_LIMIT_SECONDS: f64 = 5.0;
+/// A keeper holding in his hands is unstealable, so he is in no hurry: he should
+/// hold for an open distribution rather than gifting the ball straight back to a
+/// nearby presser (e.g. the player who just shot). A team-mate counts as a safe
+/// distribution outlet only when no opponent is tighter than this to the intended
+/// receiver. Below it the keeper keeps holding (up to the limit) and looks again.
+const GK_HANDLING_SAFE_OUTLET_MARKING_YARDS: f64 = 3.5;
+/// Pass-lane half-width used when deciding whether the keeper's chosen distribution
+/// would be cut out by an opponent standing in the lane — matches the pass-selection
+/// lane radius used elsewhere.
+const GK_HANDLING_DISTRIBUTION_LANE_RADIUS_YARDS: f64 = 2.5;
 /// Hurried forced clearance speed (yds/s) when a keeper overruns the handling
 /// limit without distributing — a firm punt upfield, not a gentle drop.
 const GK_HANDLING_FORCED_CLEARANCE_YPS: f64 = 26.0;
@@ -43728,10 +43747,15 @@ fn nearest_ball_controller_for_segment(
         }
         // Altitude gate (non-targets only): a ball above the ground can only be
         // reached by players who can get up to it. High balls fly over grounded
-        // players — but the intended receiver is taking it at the landing.
+        // players — but the intended receiver is taking it at the landing. A ball at
+        // or below ~6ft is at head/chest height and is reachable by any standing
+        // player (the reach floor), so a pass played THROUGH a player at that height
+        // is always contestable here regardless of aerial ability; aerial skill only
+        // extends reach above the floor for leaping headers.
         if !is_pass_target && !guaranteed_trap && contact_altitude > BALL_ROLLING_ALTITUDE_YARDS {
-            let reach_height = CONTROL_STANDING_REACH_YARDS
-                + aerial_duel_skill_from_agent(p) * CONTROL_AERIAL_JUMP_REACH_YARDS;
+            let reach_height = (CONTROL_STANDING_REACH_YARDS
+                + aerial_duel_skill_from_agent(p) * CONTROL_AERIAL_JUMP_REACH_YARDS)
+                .max(LOW_BALL_INTERCEPT_REACH_FLOOR_YARDS);
             if contact_altitude > reach_height {
                 continue;
             }

@@ -1620,7 +1620,7 @@ impl PlayerAgent {
                 special_score(
                     target,
                     0.42 + ball_gain.min(8.0) * 0.030
-                        + shape_support_urgency * 0.90
+                        + shape_support_urgency * 2.0
                         + holder_pressure_urgency * 0.58,
                 ),
                 true,
