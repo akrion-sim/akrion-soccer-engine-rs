@@ -21617,6 +21617,161 @@ impl WorldSnapshot {
             .count()
     }
 
+    pub(crate) fn attacking_vacuum_run_bonus(
+        &self,
+        player: &PlayerSnapshot,
+        current: Vec2,
+        target: Vec2,
+        target_occupancy: CandidateOccupancy,
+        forward_yards: f64,
+    ) -> f64 {
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.role == PlayerRole::Goalkeeper
+            || forward_yards < CREATE_VACUUM_MIN_FORWARD_YARDS
+            || self.position_would_be_offside(player.team, target)
+        {
+            return 0.0;
+        }
+
+        let target_teammate_pressure = target_occupancy.teammate_occupied_space_pressure();
+        if target_teammate_pressure > CREATE_VACUUM_DEST_MAX_TEAMMATE_PRESSURE {
+            return 0.0;
+        }
+        let target_opponent_distance = self.nearest_opponent_distance_at(player.team, target);
+        if target_opponent_distance < CREATE_VACUUM_DEST_MIN_OPPONENT_DISTANCE_YARDS {
+            return 0.0;
+        }
+
+        let origin_occupancy = self.candidate_occupancy_at(player.team, current, Some(player.id));
+        if origin_occupancy.teammate_occupied_space_pressure()
+            > CREATE_VACUUM_ORIGIN_MAX_TEAMMATE_PRESSURE
+        {
+            return 0.0;
+        }
+        let filler_fit = self.vacuum_filling_teammate_fit(player, current);
+        if filler_fit <= 0.0 {
+            return 0.0;
+        }
+
+        let forward_fit = ((forward_yards - CREATE_VACUUM_MIN_FORWARD_YARDS)
+            / (CREATE_VACUUM_FORWARD_REFERENCE_YARDS - CREATE_VACUUM_MIN_FORWARD_YARDS).max(1e-6))
+        .clamp(0.0, 1.0);
+        let destination_space_fit = ((target_occupancy.open_space_score
+            - CREATE_VACUUM_DEST_MIN_OPEN_SCORE)
+            / (CREATE_VACUUM_DEST_FULL_OPEN_SCORE - CREATE_VACUUM_DEST_MIN_OPEN_SCORE).max(1e-6))
+        .clamp(0.0, 1.0);
+        if destination_space_fit <= 0.0 {
+            return 0.0;
+        }
+        let destination_opponent_fit = ((target_opponent_distance
+            - CREATE_VACUUM_DEST_MIN_OPPONENT_DISTANCE_YARDS)
+            / (CREATE_VACUUM_DEST_FULL_OPPONENT_DISTANCE_YARDS
+                - CREATE_VACUUM_DEST_MIN_OPPONENT_DISTANCE_YARDS)
+                .max(1e-6))
+        .clamp(0.0, 1.0);
+        let origin_space_fit = ((origin_occupancy.open_space_score
+            - CREATE_VACUUM_ORIGIN_MIN_OPEN_SCORE)
+            / (CREATE_VACUUM_ORIGIN_FULL_OPEN_SCORE - CREATE_VACUUM_ORIGIN_MIN_OPEN_SCORE)
+                .max(1e-6))
+        .clamp(0.0, 1.0);
+        if origin_space_fit <= 0.0 {
+            return 0.0;
+        }
+        let role_fit = match player.role {
+            PlayerRole::Forward => 1.0,
+            PlayerRole::Midfielder => 0.90,
+            PlayerRole::Defender if self.is_wide_defender(player) => 0.62,
+            PlayerRole::Defender => 0.38,
+            PlayerRole::Goalkeeper => 0.0,
+        };
+        let lane_fit = if self.clear_line(self.ball.position, target, player.team.other(), 1.6) {
+            1.0
+        } else {
+            0.72
+        };
+        let destination_fit = (0.55 + destination_space_fit * 0.45)
+            * (0.65 + destination_opponent_fit * 0.35)
+            * (1.0 - target_teammate_pressure * 0.50).clamp(0.40, 1.0);
+        CREATE_VACUUM_MAX_BONUS
+            * forward_fit
+            * destination_fit
+            * (0.40 + origin_space_fit * 0.60)
+            * filler_fit
+            * role_fit
+            * lane_fit
+    }
+
+    fn vacuum_filling_teammate_fit(&self, runner: &PlayerSnapshot, origin: Vec2) -> f64 {
+        let attack = runner.team.attack_dir();
+        let mut best: f64 = 0.0;
+        for teammate in self.players.iter() {
+            if teammate.team != runner.team
+                || teammate.id == runner.id
+                || teammate.role == PlayerRole::Goalkeeper
+                || self.ball.holder == Some(teammate.id)
+            {
+                continue;
+            }
+            let teammate_position = self.player_snapshot_position(teammate);
+            let to_origin = origin - teammate_position;
+            let distance = to_origin.len();
+            if !(CREATE_VACUUM_FILLER_MIN_DISTANCE_YARDS..=CREATE_VACUUM_FILLER_MAX_DISTANCE_YARDS)
+                .contains(&distance)
+            {
+                continue;
+            }
+            let forward_to_origin = to_origin.y * attack;
+            if forward_to_origin < -1.0 {
+                continue;
+            }
+            let distance_fit = if distance <= CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS {
+                ((distance - CREATE_VACUUM_FILLER_MIN_DISTANCE_YARDS)
+                    / (CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS
+                        - CREATE_VACUUM_FILLER_MIN_DISTANCE_YARDS)
+                        .max(1e-6))
+                .clamp(0.30, 1.0)
+            } else {
+                ((CREATE_VACUUM_FILLER_MAX_DISTANCE_YARDS - distance)
+                    / (CREATE_VACUUM_FILLER_MAX_DISTANCE_YARDS
+                        - CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS)
+                        .max(1e-6))
+                .clamp(0.30, 1.0)
+            };
+            let forward_fit = ((forward_to_origin + 1.0)
+                / CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS)
+                .clamp(0.25, 1.0);
+            let lane_fit = if self.clear_line(teammate_position, origin, runner.team.other(), 1.25)
+            {
+                1.0
+            } else {
+                0.55
+            };
+            let teammate_velocity = self
+                .player_velocity(teammate.id)
+                .unwrap_or(teammate.velocity);
+            let motion_fit = if teammate_velocity.len() > 0.25 {
+                let toward_origin = to_origin.normalized();
+                (0.78
+                    + teammate_velocity
+                        .normalized()
+                        .dot(toward_origin)
+                        .clamp(-1.0, 1.0)
+                        * 0.22)
+                    .clamp(0.56, 1.0)
+            } else {
+                0.82
+            };
+            let role_fit = if teammate.role == PlayerRole::Defender {
+                0.72
+            } else {
+                1.0
+            };
+            best = best.max(distance_fit * forward_fit * lane_fit * motion_fit * role_fit);
+        }
+        best
+    }
+
     pub fn open_space_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
@@ -21795,9 +21950,12 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let vacuum_run_bonus =
+                    self.attacking_vacuum_run_bonus(me, me_position, p, occupancy, forward);
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + goal_directness_bonus
+                    + vacuum_run_bonus
                     + forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08)
                     + forward_from_ball.clamp(-6.0, 28.0)
                         * (0.08 + directive.risk_tolerance * 0.09)

@@ -399,6 +399,24 @@ const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.
 /// to goal (slips/through-balls). Purely additive — width/crossing positions
 /// keep their own bonus, so this never penalises wide runs that set up crosses.
 const FINAL_THIRD_GOAL_DIRECTNESS_WEIGHT: f64 = 0.06;
+/// "Create a vacuum": an off-ball attacker may make a forward run into only
+/// semi-open space when leaving its current pocket gives a trailing teammate a
+/// useful place to arrive into. The destination still has to be playable; this
+/// is a bounded bonus, not an override of pressure/offside/shape guards.
+const CREATE_VACUUM_MIN_FORWARD_YARDS: f64 = 5.0;
+const CREATE_VACUUM_FORWARD_REFERENCE_YARDS: f64 = 18.0;
+const CREATE_VACUUM_DEST_MIN_OPEN_SCORE: f64 = 5.0;
+const CREATE_VACUUM_DEST_FULL_OPEN_SCORE: f64 = 15.0;
+const CREATE_VACUUM_DEST_MIN_OPPONENT_DISTANCE_YARDS: f64 = 3.2;
+const CREATE_VACUUM_DEST_FULL_OPPONENT_DISTANCE_YARDS: f64 = 8.0;
+const CREATE_VACUUM_DEST_MAX_TEAMMATE_PRESSURE: f64 = 0.68;
+const CREATE_VACUUM_ORIGIN_MIN_OPEN_SCORE: f64 = 6.0;
+const CREATE_VACUUM_ORIGIN_FULL_OPEN_SCORE: f64 = 15.0;
+const CREATE_VACUUM_ORIGIN_MAX_TEAMMATE_PRESSURE: f64 = 0.82;
+const CREATE_VACUUM_FILLER_MIN_DISTANCE_YARDS: f64 = 4.0;
+const CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS: f64 = 10.0;
+const CREATE_VACUUM_FILLER_MAX_DISTANCE_YARDS: f64 = 18.0;
+const CREATE_VACUUM_MAX_BONUS: f64 = 2.6;
 const GOALKEEPER_CLEAR_SIGHTLINE_SAVE_CAP: f64 = 0.78;
 const GOALKEEPER_PARRY_MIN_YARDS: f64 = 2.0;
 const GOALKEEPER_PARRY_MAX_YARDS: f64 = 5.0;

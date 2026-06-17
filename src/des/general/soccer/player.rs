@@ -1960,7 +1960,7 @@ impl PlayerAgent {
                 + if striker_attack { 0.06 } else { 0.0 }
                 + shape_support_urgency * 0.10
                 + holder_pressure_urgency * 0.14)
-            .clamp(0.18, 0.38);
+                .clamp(0.18, 0.38);
             ensure_min_legal_option_probability(&mut options, "run-in-behind", run_floor);
         }
         if options
@@ -3296,7 +3296,10 @@ impl PlayerAgent {
                     mdp_state,
                     observation,
                     belief,
-                    vec!["anticipate-pass".to_string(), "contest-reception".to_string()],
+                    vec![
+                        "anticipate-pass".to_string(),
+                        "contest-reception".to_string(),
+                    ],
                     single_action_option("recover"),
                     &action,
                     "recover",
@@ -3449,7 +3452,7 @@ impl PlayerAgent {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.striker_hold_up_flank_target_for(self.id);
-            let action_options = self.possession_action_options(
+            let mut action_options = self.possession_action_options(
                 &observation,
                 &directive,
                 pass_targets.len(),
@@ -3458,38 +3461,88 @@ impl PlayerAgent {
                 snapshot.dt_seconds,
                 snapshot.field_width,
             );
-            if let Some(target) = snapshot.killer_pass_target_for(self.id, &pass_targets) {
-                let preempt_chance = final_third_killer_pass_preemption_probability(
+            let killer_pass_preempt_chance = if snapshot
+                .killer_pass_target_for(self.id, &pass_targets)
+                .is_some()
+            {
+                final_third_killer_pass_preemption_probability(
                     &observation,
                     self.role,
                     &action_options,
-                );
-                if preempt_chance > 0.0 && rng.next_float() < preempt_chance {
-                    let action = SoccerAction::Pass {
-                        target_player: Some(target),
-                        power: 0.68 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                        flight: PassFlight::Floor,
-                    };
-                    self.last_decision = Some(self.decision_trace(
-                        snapshot,
-                        mdp_state,
-                        observation,
-                        belief,
-                        vec![
-                            "decisive-goal-pressure".to_string(),
-                            "killer-pass".to_string(),
-                        ],
-                        action_options,
-                        &action,
-                        "killer-pass",
-                    ));
-                    return PlayerIntent {
-                        player_id: self.id,
-                        action,
-                        sprint: false,
-                    };
+                )
+            } else {
+                0.0
+            };
+            if killer_pass_preempt_chance > 0.0 {
+                if let Some(option) = action_options
+                    .iter_mut()
+                    .find(|option| option.legal && option.label == "killer-pass")
+                {
+                    option.score = option.score.max(killer_pass_preempt_chance);
                 }
             }
+            let scoop_pass_option = snapshot.scoop_pass_target_for(self.id).map(|target| {
+                let technique = ability01(self.skills.flair_passing) * 0.5
+                    + ability01(self.skills.passing) * 0.3
+                    + ability01(self.skills.vision) * 0.2;
+                let scoop_chance = (0.22 + technique * 0.56).clamp(0.0, 0.80);
+                (target, scoop_chance)
+            });
+            if let Some((_, scoop_chance)) = scoop_pass_option {
+                action_options.push(AgentActionOptionTrace::new(
+                    "scoop-pass",
+                    scoop_chance,
+                    true,
+                ));
+            }
+            let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
+                let give_and_go_strategy = matches!(
+                    directive.attack_strategy,
+                    TeamAttackStrategy::GiveAndGoCentral
+                        | TeamAttackStrategy::OneTwoLeftRelease
+                        | TeamAttackStrategy::OneTwoRightRelease
+                        | TeamAttackStrategy::CentralDoubleOneTwo
+                );
+                let goal_proximity = (1.0
+                    - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
+                        .clamp(0.0, 1.0))
+                .clamp(0.0, 1.0);
+                let raw_wall_appetite = WALL_PASS_BASE_APPETITE
+                    * self.preferences.pass_bias.clamp(0.4, 1.0)
+                    * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
+                    * (0.5 + plan.quality)
+                    * (1.0 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.9)
+                    * (1.0 + goal_proximity * 0.8)
+                    * if give_and_go_strategy {
+                        WALL_PASS_STRATEGY_APPETITE_BOOST
+                    } else {
+                        1.0
+                    };
+                let strategy_commitment_floor = if give_and_go_strategy {
+                    (WALL_PASS_STRATEGY_MIN_APPETITE + plan.quality * 0.14).clamp(0.0, 0.95)
+                } else {
+                    0.0
+                };
+                let wall_appetite = raw_wall_appetite
+                    .max(strategy_commitment_floor)
+                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
+                let strategy_commits =
+                    give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
+                (plan, wall_appetite, strategy_commits)
+            });
+            if let Some((_, wall_appetite, strategy_commits)) = wall_pass_option {
+                action_options.push(AgentActionOptionTrace::new(
+                    "wall-pass",
+                    if strategy_commits {
+                        wall_appetite.max(1.0)
+                    } else {
+                        wall_appetite
+                    },
+                    true,
+                ));
+            }
+            action_options = normalize_action_options(action_options);
+            annotate_tick_probabilities_from_scores(&mut action_options, snapshot.dt_seconds);
             let mut weighted_ops = vec![
                 (
                     "shoot".to_string(),
@@ -3552,6 +3605,18 @@ impl PlayerAgent {
                     action_option_score(&action_options, "killer-pass"),
                 ),
             ];
+            if scoop_pass_option.is_some() {
+                weighted_ops.push((
+                    "scoop-pass".to_string(),
+                    action_option_score(&action_options, "scoop-pass"),
+                ));
+            }
+            if wall_pass_option.is_some() {
+                weighted_ops.push((
+                    "wall-pass".to_string(),
+                    action_option_score(&action_options, "wall-pass"),
+                ));
+            }
             for rank in 0..pass_targets.len() {
                 let label = format!("pass{}", rank + 1);
                 weighted_ops.push((label.clone(), action_option_score(&action_options, &label)));
@@ -3559,109 +3624,6 @@ impl PlayerAgent {
             for rank in 0..aerial_pass_targets.len() {
                 let label = format!("aerial-pass{}", rank + 1);
                 weighted_ops.push((label.clone(), action_option_score(&action_options, &label)));
-            }
-            // SCOOP: a clear lofted-dink chance — the carrier is surrounded and an open
-            // teammate sits 5-8yd away, in the facing cone, behind a defender in the lane.
-            // Take it ahead of the general option roll, gated by technique so only capable
-            // players attempt the delicate chip.
-            if let Some(scoop_target) = snapshot.scoop_pass_target_for(self.id) {
-                let technique = ability01(self.skills.flair_passing) * 0.5
-                    + ability01(self.skills.passing) * 0.3
-                    + ability01(self.skills.vision) * 0.2;
-                let scoop_chance = (0.22 + technique * 0.56).clamp(0.0, 0.80);
-                if rng.next_float() < scoop_chance {
-                    let action = SoccerAction::Pass {
-                        target_player: Some(scoop_target),
-                        power: 0.5,
-                        flight: PassFlight::Scoop,
-                    };
-                    self.last_decision = Some(self.decision_trace(
-                        snapshot,
-                        mdp_state.clone(),
-                        observation.clone(),
-                        belief.clone(),
-                        vec!["scoop-pass".to_string()],
-                        single_action_option("scoop-pass"),
-                        &action,
-                        "scoop-pass",
-                    ));
-                    return PlayerIntent {
-                        player_id: self.id,
-                        action,
-                        sprint: false,
-                    };
-                }
-            }
-            // WALL PASS (one-two / give-and-go): with a beatable man in front, a free
-            // side-on teammate, and onside space to run into, lay the ball off and burst
-            // past him — a combination to a shot is usually the better route than going it
-            // alone. Genuinely tried (not rare): appetite scales with the quality of the
-            // combination, with pressure on the carrier (relief + penetration), and with
-            // goal proximity, and is lifted hard when the team's active maneuver IS a
-            // give-and-go / one-two. On commit, the give is played AND this player takes on
-            // the runner role (the "go"), bursting onside to receive the first-time return.
-            if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
-                let give_and_go_strategy = matches!(
-                    directive.attack_strategy,
-                    TeamAttackStrategy::GiveAndGoCentral
-                        | TeamAttackStrategy::OneTwoLeftRelease
-                        | TeamAttackStrategy::OneTwoRightRelease
-                        | TeamAttackStrategy::CentralDoubleOneTwo
-                );
-                let goal_proximity = (1.0
-                    - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
-                        .clamp(0.0, 1.0))
-                .clamp(0.0, 1.0);
-                let raw_wall_appetite = WALL_PASS_BASE_APPETITE
-                    * self.preferences.pass_bias.clamp(0.4, 1.0)
-                    * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
-                    * (0.5 + plan.quality)
-                    * (1.0 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.9)
-                    * (1.0 + goal_proximity * 0.8)
-                    * if give_and_go_strategy {
-                        WALL_PASS_STRATEGY_APPETITE_BOOST
-                    } else {
-                        1.0
-                    };
-                let strategy_commitment_floor = if give_and_go_strategy {
-                    (WALL_PASS_STRATEGY_MIN_APPETITE + plan.quality * 0.14).clamp(0.0, 0.95)
-                } else {
-                    0.0
-                };
-                let wall_appetite = raw_wall_appetite
-                    .max(strategy_commitment_floor)
-                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
-                let strategy_commits =
-                    give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
-                if strategy_commits
-                    || rng.next_float() < time_window_probability(wall_appetite, snapshot.dt_seconds)
-                {
-                    let action = SoccerAction::Pass {
-                        target_player: Some(plan.wall_partner),
-                        power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
-                        flight: PassFlight::Floor,
-                    };
-                    self.one_two = Some(OneTwoRun {
-                        wall_partner: plan.wall_partner,
-                        launch_clock_seconds: snapshot.clock_seconds,
-                        return_target: plan.return_target,
-                    });
-                    self.last_decision = Some(self.decision_trace(
-                        snapshot,
-                        mdp_state.clone(),
-                        observation.clone(),
-                        belief.clone(),
-                        vec!["wall-pass".to_string()],
-                        single_action_option("wall-pass"),
-                        &action,
-                        "wall-pass",
-                    ));
-                    return PlayerIntent {
-                        player_id: self.id,
-                        action,
-                        sprint: false,
-                    };
-                }
             }
             let ops = weighted_fisher_yates_order(weighted_ops, rng);
             let mut order_names = Vec::with_capacity(ops.len());
@@ -3957,6 +3919,46 @@ impl PlayerAgent {
                             }
                         }
                     }
+                    "scoop-pass" => {
+                        order_names.push("scoop-pass".to_string());
+                        if let Some((scoop_target, scoop_chance)) = scoop_pass_option {
+                            if rng.next_float() < scoop_chance {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(scoop_target),
+                                        power: 0.5,
+                                        flight: PassFlight::Scoop,
+                                    },
+                                    "scoop-pass".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "wall-pass" => {
+                        order_names.push("wall-pass".to_string());
+                        if let Some((plan, wall_appetite, strategy_commits)) = wall_pass_option {
+                            if strategy_commits
+                                || rng.next_float()
+                                    < time_window_probability(wall_appetite, snapshot.dt_seconds)
+                            {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(plan.wall_partner),
+                                        power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "wall-pass".to_string(),
+                                ));
+                                self.one_two = Some(OneTwoRun {
+                                    wall_partner: plan.wall_partner,
+                                    launch_clock_seconds: snapshot.clock_seconds,
+                                    return_target: plan.return_target,
+                                });
+                                break;
+                            }
+                        }
+                    }
                     pass_label if pass_label.starts_with("pass") => {
                         let rank = pass_label
                             .trim_start_matches("pass")
@@ -4176,9 +4178,7 @@ impl PlayerAgent {
 
         let possession_team = snapshot.controlled_possession_team();
         let mut order_names = Vec::new();
-        // Initialized empty so every decision path is definitely-assigned (one of the
-        // branches below overwrites it); a path that doesn't just records no options.
-        let mut action_options: Vec<AgentActionOptionTrace> = Vec::new();
+        let action_options: Vec<AgentActionOptionTrace>;
         // Mechanism 5: set when the off-ball target was lifted upfield far enough to
         // warrant a sprint (run, not jog) into the space ahead. Read by the sprint
         // resolver below for the "defend"/"hold" off-ball moves.
@@ -4197,7 +4197,10 @@ impl PlayerAgent {
             // overrides ordinary support shape and is sprinted (see the sprint resolver).
             action_options = single_action_option("one-two-run");
             order_names.push("one-two-run".to_string());
-            (SoccerAction::MoveTo(burst_target), "one-two-run".to_string())
+            (
+                SoccerAction::MoveTo(burst_target),
+                "one-two-run".to_string(),
+            )
         } else if possession_team == Some(self.team) {
             let support_context = self.support_action_context(snapshot);
             action_options = support_context.options.clone();

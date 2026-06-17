@@ -3808,6 +3808,83 @@ fn possession_run_time_step_randomizes_internal_operation_order() {
 }
 
 #[test]
+fn possession_run_time_step_folds_scoop_pass_into_weighted_order() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_514,
+        ..Default::default()
+    });
+    let holder = 6;
+    let outlet = 8;
+    let lane_defender = 13;
+    let crowd_left = 14;
+    let crowd_right = 15;
+    park_players_except(
+        &mut sim,
+        &[holder, outlet, lane_defender, crowd_left, crowd_right],
+    );
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[holder].home_position = sim.ball.position;
+    sim.players[holder].incoming_ball = None;
+    sim.players[holder].skills.flair_passing = 10.0;
+    sim.players[holder].skills.passing = 10.0;
+    sim.players[holder].skills.vision = 10.0;
+    sim.players[outlet].position = Vec2::new(40.0, 65.5);
+    sim.players[outlet].home_position = sim.players[outlet].position;
+    sim.players[lane_defender].position = Vec2::new(40.0, 61.5);
+    sim.players[crowd_left].position = Vec2::new(36.0, 58.0);
+    sim.players[crowd_right].position = Vec2::new(44.0, 58.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.scoop_pass_target_for(holder),
+        Some(outlet),
+        "test setup should create a legal scoop-pass opportunity"
+    );
+
+    let mut first_ops = std::collections::BTreeSet::new();
+    let mut saw_scoop_in_order = false;
+    for seed in 0..100 {
+        let mut player = sim.players[holder].clone();
+        let _intent = player.run_time_step(&snapshot, None, None, &mut mulberry32(22_800 + seed));
+        let decision = player.last_decision.expect("possession decision trace");
+        assert!(
+            decision
+                .action_options
+                .iter()
+                .any(|option| option.label == "scoop-pass" && option.legal),
+            "scoop-pass should be exposed as a weighted legal option: {decision:?}"
+        );
+        if decision
+            .operation_order
+            .iter()
+            .any(|operation| operation == "scoop-pass")
+        {
+            saw_scoop_in_order = true;
+        }
+        if let Some(first) = decision.operation_order.first() {
+            first_ops.insert(first.clone());
+        }
+    }
+
+    assert!(
+        saw_scoop_in_order,
+        "weighted Fisher-Yates order should consider the legal scoop-pass"
+    );
+    assert!(
+        first_ops.contains("scoop-pass") && first_ops.len() > 1,
+        "scoop-pass should be weighted, not a guaranteed preemptive first operation: {first_ops:?}"
+    );
+}
+
+#[test]
 fn first_touch_run_time_step_randomizes_pass_or_control_order() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -33078,6 +33155,94 @@ fn candidate_occupancy_matches_existing_spacing_helpers() {
             ))
         .abs()
             < 1e-9
+    );
+}
+
+#[test]
+fn create_vacuum_run_bonus_rewards_semi_open_forward_decoy() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 6;
+    let runner = 9;
+    let filling_teammate = 8;
+    let nearby_marker = 14;
+    park_players_except(&mut sim, &[carrier, runner, filling_teammate, nearby_marker]);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(32.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[runner].position = Vec2::new(42.0, 62.0);
+    sim.players[runner].home_position = sim.players[runner].position;
+    sim.players[filling_teammate].position = Vec2::new(42.0, 53.5);
+    sim.players[filling_teammate].velocity = Vec2::new(0.0, 2.0);
+    let semi_open_run = Vec2::new(42.0, 74.0);
+    let cleaner_lateral_space = Vec2::new(58.0, 62.0);
+    sim.players[nearby_marker].position = semi_open_run + Vec2::new(3.8, 0.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let runner_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let semi_open_occupancy =
+        snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner));
+    let cleaner_occupancy =
+        snapshot.candidate_occupancy_at(Team::Home, cleaner_lateral_space, Some(runner));
+    let forward = (semi_open_run.y - sim.players[runner].position.y) * Team::Home.attack_dir();
+    let bonus = snapshot.attacking_vacuum_run_bonus(
+        runner_snapshot,
+        sim.players[runner].position,
+        semi_open_run,
+        semi_open_occupancy,
+        forward,
+    );
+    assert!(
+        semi_open_occupancy.open_space_score < cleaner_occupancy.open_space_score,
+        "test setup should make the forward run semi-open rather than the most open space"
+    );
+    assert!(
+        bonus > 0.25,
+        "forward decoy should earn a create-vacuum bonus despite only semi-open destination: {bonus}"
+    );
+
+    sim.players[filling_teammate].position = Vec2::new(8.0, 8.0);
+    let no_filler_snapshot = WorldSnapshot::from_match(&sim);
+    let no_filler_runner = no_filler_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let no_filler_bonus = no_filler_snapshot.attacking_vacuum_run_bonus(
+        no_filler_runner,
+        sim.players[runner].position,
+        semi_open_run,
+        no_filler_snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner)),
+        forward,
+    );
+    assert_eq!(
+        no_filler_bonus, 0.0,
+        "vacuum run needs a trailing teammate close enough to fill the vacated pocket"
+    );
+
+    sim.players[filling_teammate].position = Vec2::new(42.0, 53.5);
+    sim.players[nearby_marker].position = semi_open_run + Vec2::new(1.0, 0.0);
+    let smothered_snapshot = WorldSnapshot::from_match(&sim);
+    let smothered_runner = smothered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let smothered_bonus = smothered_snapshot.attacking_vacuum_run_bonus(
+        smothered_runner,
+        sim.players[runner].position,
+        semi_open_run,
+        smothered_snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner)),
+        forward,
+    );
+    assert_eq!(
+        smothered_bonus, 0.0,
+        "create-vacuum run must not reward sprinting into fully smothered space"
     );
 }
 
