@@ -6500,6 +6500,66 @@ impl SoccerMatch {
         Some(holder)
     }
 
+    /// Seconds the keeper has been holding the ball in his hands, if he is the
+    /// current handling holder. `None` when no keeper is handling. The clock is
+    /// started lazily by `update_keeper_handling` at the end of the tick, so on
+    /// the very first handling tick this reports ~0.
+    pub(crate) fn keeper_handling_held_seconds(&self, keeper_id: usize) -> Option<f64> {
+        if self.keeper_handling_holder() != Some(keeper_id) {
+            return None;
+        }
+        Some(match self.gk_handling_since_clock {
+            Some(since) => (self.clock_seconds - since).max(0.0),
+            None => 0.0,
+        })
+    }
+
+    /// A keeper holding the ball in his hands is unstealable, so he has the whole
+    /// handling window to find a clean outlet. This decides whether a chosen
+    /// distribution is "intelligent" enough to release NOW, or whether he should
+    /// keep holding (and look again next tick). A release is allowed only when the
+    /// intended receiver is genuinely open — no opponent is tight to him AND no
+    /// opponent sits in the passing lane — so the keeper stops rolling/throwing the
+    /// ball straight back to the player who just pressed/shot. A clear (no target)
+    /// is always allowed; the forced-clearance safety net (`update_keeper_handling`)
+    /// still releases him at the limit if nothing ever opens up.
+    pub(crate) fn keeper_handling_release_is_intelligent(
+        &self,
+        keeper_id: usize,
+        target_id: Option<usize>,
+        target_point: Vec2,
+    ) -> bool {
+        let Some(keeper) = self.players.iter().find(|player| player.id == keeper_id) else {
+            return true;
+        };
+        let team = keeper.team;
+        // A genuine clear upfield (no team-mate target) is always permitted.
+        let Some(target_id) = target_id else {
+            return true;
+        };
+        // Where will the ball actually arrive — the receiver's feet, marking judged there.
+        let receiver_position = self
+            .players
+            .iter()
+            .find(|player| player.id == target_id && player.team == team)
+            .map(|player| player.position)
+            .unwrap_or(target_point);
+        if self.nearest_opponent_distance_at(team, receiver_position)
+            < GK_HANDLING_SAFE_OUTLET_MARKING_YARDS
+        {
+            return false;
+        }
+        // And no opponent currently sitting in the passing lane (a near-certain cut-out).
+        let (lane_clear_now, _) = self.pass_lane_clearance(
+            keeper.position,
+            receiver_position,
+            team.other(),
+            GK_HANDLING_DISTRIBUTION_LANE_RADIUS_YARDS,
+            GK_HANDLING_FORCED_CLEARANCE_YPS,
+        );
+        lane_clear_now
+    }
+
     /// Per-tick maintenance of the keeper-handling clock: start it when a keeper
     /// gathers the ball in his box, clear it when he is no longer handling, and
     /// force a clearance once he overruns the handling time limit. Called once at
@@ -6528,9 +6588,27 @@ impl SoccerMatch {
         let team = keeper.team;
         let from = keeper.position;
         let attack_dir = team.attack_dir();
+        let width = self.config.field_width_yards;
+        let length = self.config.field_length_yards;
+        // Clear toward the more open flank channel upfield, NOT straight up the middle
+        // where the player who just pressed/shot tends to be standing — a hoof into the
+        // central striker is exactly the "gift it right back to them" we want to avoid.
+        let forward = (length * 0.40).min(45.0);
+        let left_target =
+            Vec2::new(width * 0.18, from.y + attack_dir * forward).clamp_to_pitch(width, length);
+        let right_target =
+            Vec2::new(width * 0.82, from.y + attack_dir * forward).clamp_to_pitch(width, length);
+        let clear_target = if self.nearest_opponent_distance_at(team, left_target)
+            >= self.nearest_opponent_distance_at(team, right_target)
+        {
+            left_target
+        } else {
+            right_target
+        };
+        let clear_dir = (clear_target - from).normalized();
         self.ball.holder = None;
         self.ball.position = from;
-        self.ball.velocity = Vec2::new(0.0, attack_dir * GK_HANDLING_FORCED_CLEARANCE_YPS);
+        self.ball.velocity = clear_dir * GK_HANDLING_FORCED_CLEARANCE_YPS;
         self.ball.altitude_yards = 0.0;
         self.ball.curl_acceleration = Vec2::zero();
         self.ball.last_touch_team = Some(team);
@@ -7093,6 +7171,28 @@ impl SoccerMatch {
                                 player_team,
                             )
                         });
+                    // Calm keeper distribution: a keeper holding in his hands inside his
+                    // box is unstealable, so he is in no hurry. Rather than rolling/throwing
+                    // the ball straight back to a nearby presser (e.g. the player who just
+                    // shot), he keeps holding until a genuinely open team-mate appears, up
+                    // to the handling limit (then `update_keeper_handling` forces a clear).
+                    if let Some(held) = self.keeper_handling_held_seconds(player_id) {
+                        if held < GK_HANDLING_HOLD_LIMIT_SECONDS
+                            && !self.keeper_handling_release_is_intelligent(
+                                player_id, target_id, target,
+                            )
+                        {
+                            // Survey the field (face the considered outlet) and hold the ball.
+                            let look = target - player_pos;
+                            if look.len() > 1e-6 {
+                                let face = facing_bucket_from_vector(look);
+                                if face != FacingBucket::Unknown {
+                                    self.players[player_id].action_facing = face;
+                                }
+                            }
+                            return;
+                        }
+                    }
                     let pressure = pressure_from_observation(&observation);
                     let initial_is_cross = pass_would_be_cross(
                         player_pos,
