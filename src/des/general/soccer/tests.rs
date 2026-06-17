@@ -9974,15 +9974,16 @@ fn defensive_kickoff_shape_is_perturbed_across_seeds() {
 }
 
 #[test]
-fn pass_length_preference_peaks_in_the_8_to_12_yard_window() {
+fn pass_length_preference_peaks_at_eight_yards() {
+    // Single optimum at ~8yd: a 5yd tap and a 12yd ball are BOTH clearly worse than 8.
     assert_eq!(pass_length_preference(8.0), 1.0);
-    assert_eq!(pass_length_preference(10.0), 1.0);
-    assert_eq!(pass_length_preference(12.0), 1.0);
+    assert!(pass_length_preference(5.0) < pass_length_preference(8.0));
+    assert!(pass_length_preference(12.0) < pass_length_preference(8.0));
     // A too-short square ball and a too-long hopeful ball are both less preferred.
     assert!(pass_length_preference(4.0) < 1.0);
     assert!(pass_length_preference(25.0) < 1.0);
-    // The optimal window beats a longer ball on the same lane (favours the nearer teammate).
-    assert!(pass_length_preference(10.0) > pass_length_preference(20.0));
+    // The optimum beats a longer ball on the same lane (favours the nearer teammate).
+    assert!(pass_length_preference(8.0) > pass_length_preference(20.0));
 }
 
 #[test]

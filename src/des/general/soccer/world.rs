@@ -17383,22 +17383,8 @@ impl WorldSnapshot {
                                 2.5,
                                 nominal_speed,
                             );
-                        // Optimism toward a HALF-OPEN forward runner anywhere on the pitch: keep
-                        // a forward ball to a partially-clear teammate even when a goal-side
-                        // defender wins the race to the (often aggressively led) reception point.
-                        // The race risk is then PRICED in the score (congestion/anticipation),
-                        // not used to hide the option — this is what stops the endless square
-                        // recycling when the only "uncontested" ball is sideways or backward.
-                        // Hard giveaways are still vetoed (committed cut-out, set interceptor,
-                        // lane blocked now via `aim_point_and_anticipation`).
-                        let half_open_forward = forward > 1.25
-                            && pass_receiver_openness_for_snapshots(
-                                &self.players,
-                                me.team,
-                                position,
-                            ) >= HALF_OPEN_FORWARD_PASS_OPENNESS;
                         (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && (!require_reception_won || race_won || half_open_forward)
+                            && (!require_reception_won || race_won)
                             && !committed_cutout
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
