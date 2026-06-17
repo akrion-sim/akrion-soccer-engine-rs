@@ -184,14 +184,24 @@ spec:
                 # clusters. The CPU limit enforces the "2 games in parallel max"
                 # contract even if the node is otherwise idle.
                 requests:
-                  cpu: "1"
-                  memory: 4Gi
+                  # 250m, not a full core: both clusters' single shared node sits near
+                  # ~96% CPU *requests* while only ~12% is actually used (pods over-reserve),
+                  # so a 1-core request left the pod Pending for hours. The CPU *limit* below
+                  # still enforces the 2-games-in-parallel contract; this only lowers the
+                  # scheduling reservation so the job fits the real free headroom.
+                  cpu: 250m
+                  # 8Gi request keeps the pod off the 8Gi Hetzner worker nodes
+                  # (dd-k8s-wrk1/2) — it can only land on a 32Gi control-plane node or
+                  # the large AWS node, where the higher memory limit below actually fits.
+                  memory: 8Gi
                 limits:
                   # cpu == SOCCER_TOURNAMENT_THREADS (2). The tournament holds 128
-                  # neural brains + up to THREADS concurrent live matches; keep the
-                  # memory cap below half of a 32Gi Hetzner node.
+                  # neural brains + up to THREADS concurrent live matches and the
+                  # bilearning transition buffers; 12Gi OOMKilled the run ~45min in
+                  # (exit 137, verified 2026-06-17 on Hetzner), so raise to 22Gi —
+                  # still comfortably under a 32Gi node alongside the control plane.
                   cpu: "2"
-                  memory: 12Gi
+                  memory: 22Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
