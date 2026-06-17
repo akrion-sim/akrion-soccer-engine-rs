@@ -852,6 +852,21 @@ const OWN_BOX_ACROSS_GOAL_SAFE_LANE_YARDS: f64 = 6.0;
 // Per-yard reward for a forward pass to an OPEN receiver (openness 0..1 × forward yards, capped
 // at 24yd). Biases pass selection toward playing forward to the most-open player.
 const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
+// Forward passes are valued ~3x a backward pass ANYWHERE on the pitch (and well above
+// a square ball): progression beats safe recycling. Applied as a multiplier on a pass
+// option's positive appeal so the selector reaches for the forward ball first and only
+// knocks it square/back when nothing forward is on. Backward = forward / 3 (the "3x"
+// rule); a lateral/square ball sits at `LATERAL_PASS_DIRECTION_FRACTION` of forward.
+const FORWARD_PASS_DIRECTION_MULT: f64 = 1.5;
+const LATERAL_PASS_DIRECTION_FRACTION: f64 = 0.45;
+// Be optimistic/skilled about playing a forward teammate who is only HALF-open: a
+// forward target at or above this openness is kept as a pass option ANYWHERE on the
+// pitch (priced, not hidden, even if a goal-side defender wins the race to the led
+// point) and earns the bonus below. This is what lets us hit a partially-clear forward
+// runner instead of recycling square; hard giveaways (committed cut-out, set
+// interceptor in the lane, lane blocked now) are still vetoed.
+const HALF_OPEN_FORWARD_PASS_OPENNESS: f64 = 0.4;
+const HALF_OPEN_FORWARD_PASS_BONUS: f64 = 3.0;
 /// Pass-score bonus for a receiver on a flank where we have a numerical overload — pull
 /// the ball to the overloaded wing instead of bypassing it with a long ball.
 const WING_OVERLOAD_PASS_BONUS: f64 = 2.6;
@@ -891,10 +906,11 @@ const FINAL_THIRD_CONGESTION_FLOOR: f64 = 0.35;
 // the final third and ramps back to the normal requirement over this band just OUTSIDE the
 // line, so the relaxation eases in through the middle third instead of switching on abruptly.
 const FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS: f64 = 14.0;
-// Weight of the optimal-pass-length tiebreaker (peaks in the 8-12yd sweet spot).
+// Weight of the optimal-pass-length tiebreaker (single peak at ~8yd).
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
-const PASS_LENGTH_OPTIMAL_MIN_YARDS: f64 = 8.0;
-const PASS_LENGTH_OPTIMAL_MAX_YARDS: f64 = 12.0;
+// Optimal pass length is ~8yd; preference declines on both sides and fades out by ~24yd.
+const PASS_LENGTH_OPTIMAL_YARDS: f64 = 8.0;
+const PASS_LENGTH_FADEOUT_YARDS: f64 = 24.0;
 // Build-up short-pass discouragement. OUTSIDE the final attacking third, sub-4yd passes are
 // dangerous busy-work that neither progresses nor relieves — longer, progressive balls are
 // prioritised. This penalty applies regardless of pressure (unlike the pressure-gated
@@ -11745,6 +11761,17 @@ pub struct MatchStats {
     pub passes_attempted_away: u32,
     pub passes_completed_home: u32,
     pub passes_completed_away: u32,
+    // Completed passes split by direction (forward vs backward relative to the
+    // attacking goal). Lets us see how much of the high completion rate is safe
+    // backward/square recycling vs genuine forward progression.
+    #[serde(default)]
+    pub passes_completed_forward_home: u32,
+    #[serde(default)]
+    pub passes_completed_forward_away: u32,
+    #[serde(default)]
+    pub passes_completed_backward_home: u32,
+    #[serde(default)]
+    pub passes_completed_backward_away: u32,
     #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
@@ -13515,13 +13542,13 @@ fn short_pass_preference_bonus(distance_yards: f64, holder_low_pressure: bool) -
     if distance_yards < 5.0 {
         return -((5.0 - distance_yards) / 5.0) * calm * 0.6;
     }
+    // Single optimum at ~8yd (not a 5yd tap nor a 12yd ball): ramp up 5→8, then decline
+    // so the 8yd ball is clearly preferred over both a shorter and a longer pass.
     let band = if distance_yards <= 8.0 {
         (distance_yards - 5.0) / 3.0 // ramp 5→8 up to the peak
-    } else if distance_yards <= 14.0 {
-        1.0 // plateau across the 8-14yd sweet spot so the 5-15 band dominates
     } else {
-        // fade to zero by 20yd (no short-pass preference at/beyond 20)
-        (1.0 - (distance_yards - 14.0) / 6.0).clamp(0.0, 1.0)
+        // decline from the 8yd peak, reaching 0 by ~20yd
+        (1.0 - (distance_yards - 8.0) / 12.0).clamp(0.0, 1.0)
     };
     band.clamp(0.0, 1.0) * calm
 }
@@ -43743,13 +43770,15 @@ fn clamp_dir_to_cone(target: Vec2, axis: Vec2, max_angle: f64) -> Vec2 {
 /// ramping up from 0 below 8yd and tapering off above 12yd. A mild tiebreaker that favours the
 /// crisp medium pass over an over-short square ball or an over-long hopeful one.
 fn pass_length_preference(dist: f64) -> f64 {
-    if dist < PASS_LENGTH_OPTIMAL_MIN_YARDS {
-        return (dist / PASS_LENGTH_OPTIMAL_MIN_YARDS).clamp(0.0, 1.0);
+    // Single optimum at ~8yd (real possession football), declining on BOTH sides: a 5yd
+    // tap and a 12yd ball are both clearly worse than 8. Below the optimum it ramps from
+    // 0 (a useless 0yd "pass") up to 1 at 8yd; above it, it fades toward 0 by ~24yd.
+    let opt = PASS_LENGTH_OPTIMAL_YARDS;
+    if dist <= opt {
+        (dist / opt).clamp(0.0, 1.0)
+    } else {
+        (1.0 - (dist - opt) / (PASS_LENGTH_FADEOUT_YARDS - opt)).clamp(0.0, 1.0)
     }
-    if dist <= PASS_LENGTH_OPTIMAL_MAX_YARDS {
-        return 1.0;
-    }
-    return (1.0 - (dist - PASS_LENGTH_OPTIMAL_MAX_YARDS) / 24.0).clamp(0.0, 1.0);
 }
 
 pub fn segment_distance_to_point(a: Vec2, b: Vec2, p: Vec2) -> f64 {

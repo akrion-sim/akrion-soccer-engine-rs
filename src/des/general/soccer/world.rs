@@ -9084,6 +9084,14 @@ impl SoccerMatch {
                     BallPossessionResult::PassCompleted(team) => {
                         if let Some(pass) = pending_pass_for_reward.as_ref() {
                             self.record_completed_pass_reward(pass, holder);
+                            let reception_y = self
+                                .players
+                                .iter()
+                                .find(|player| player.id == holder)
+                                .map(|player| player.position.y)
+                                .unwrap_or(self.ball.position.y);
+                            let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
+                            self.stat_pass_completed_direction(team, forward_yards);
                         }
                         self.pending_pass = None;
                         self.stat_pass_completed(team);
@@ -11392,6 +11400,23 @@ impl SoccerMatch {
         match team {
             Team::Home => self.stats.passes_completed_home += 1,
             Team::Away => self.stats.passes_completed_away += 1,
+        }
+    }
+
+    /// Record the direction of a completed pass (forward/backward along the attacking
+    /// axis). Lateral balls (within the ±1.25yd deadband used by pass scoring) count as
+    /// neither. Diagnostic only — surfaces how much completion is forward progression.
+    fn stat_pass_completed_direction(&mut self, team: Team, forward_yards: f64) {
+        if forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_forward_home += 1,
+                Team::Away => self.stats.passes_completed_forward_away += 1,
+            }
+        } else if forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_backward_home += 1,
+                Team::Away => self.stats.passes_completed_backward_away += 1,
+            }
         }
     }
 
@@ -17358,8 +17383,22 @@ impl WorldSnapshot {
                                 2.5,
                                 nominal_speed,
                             );
+                        // Optimism toward a HALF-OPEN forward runner anywhere on the pitch: keep
+                        // a forward ball to a partially-clear teammate even when a goal-side
+                        // defender wins the race to the (often aggressively led) reception point.
+                        // The race risk is then PRICED in the score (congestion/anticipation),
+                        // not used to hide the option — this is what stops the endless square
+                        // recycling when the only "uncontested" ball is sideways or backward.
+                        // Hard giveaways are still vetoed (committed cut-out, set interceptor,
+                        // lane blocked now via `aim_point_and_anticipation`).
+                        let half_open_forward = forward > 1.25
+                            && pass_receiver_openness_for_snapshots(
+                                &self.players,
+                                me.team,
+                                position,
+                            ) >= HALF_OPEN_FORWARD_PASS_OPENNESS;
                         (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && (!require_reception_won || race_won)
+                            && (!require_reception_won || race_won || half_open_forward)
                             && !committed_cutout
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
@@ -17390,6 +17429,16 @@ impl WorldSnapshot {
                 let own_half = pass_origin_in_own_half(me.team, me_position, self.field_length);
                 let backward = forward < -1.25;
                 let lateral = forward.abs() <= 1.25;
+                // Direction value: a forward ball is worth ~3x a backward one (and clearly
+                // more than a square ball) anywhere on the pitch. Applied to the option's
+                // positive appeal at the end so progression is chosen ahead of safe recycling.
+                let directional_value = if forward > 1.25 {
+                    FORWARD_PASS_DIRECTION_MULT
+                } else if backward {
+                    FORWARD_PASS_DIRECTION_MULT / 3.0
+                } else {
+                    FORWARD_PASS_DIRECTION_MULT * LATERAL_PASS_DIRECTION_FRACTION
+                };
                 let blind_backward_penalty = if backward && own_half {
                     3.6 + (1.0 - confidence) * 4.2
                 } else if backward {
@@ -17397,7 +17446,7 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let lateral_penalty = if lateral { 0.85 } else { 0.0 };
+                let lateral_penalty = if lateral { 1.6 } else { 0.0 };
                 // Recycled possession: lean harder on forward progress and demote handing the
                 // ball straight back to a recycle partner unless THIS pass actually breaks the
                 // ball forward past them (a genuine progression escapes the recycle).
@@ -17508,6 +17557,17 @@ impl WorldSnapshot {
                 let forward_open_bonus = pass_quality.receiver_openness.clamp(0.0, 1.0)
                     * forward.clamp(0.0, 24.0)
                     * FORWARD_OPEN_PASS_BONUS_PER_YARD;
+                // Optimism toward a HALF-open forward teammate: reward forward targets across
+                // the mid-openness band (concave in openness, so a 0.4-0.6 open forward runner
+                // already earns most of it) rather than demanding a fully-clear receiver. Pairs
+                // with the filter relaxation above so a partially-open forward runner is both
+                // KEPT as an option and scored as a genuine progressive ball.
+                let half_open_forward_bonus = if forward > 1.25 {
+                    HALF_OPEN_FORWARD_PASS_BONUS
+                        * pass_quality.receiver_openness.clamp(0.0, 1.0).sqrt()
+                } else {
+                    0.0
+                };
                 // Exploit a wing overload: reward a receiver on the flank where we outnumber
                 // the opponent (computed once in the header) so the ball goes to the
                 // overloaded wing rather than being bypassed by a long ball.
@@ -17604,10 +17664,20 @@ impl WorldSnapshot {
                     + over_the_top_invite_bonus
                     + own_box_play_out_adjustment
                     + forward_open_bonus
+                    + half_open_forward_bonus
                     + wing_overload_bonus
                     + pass_length_bonus
                     + keeper_outlet_bonus
                     - backheel_penalty;
+                // Forward passes are worth ~3x a backward pass (and clearly more than a square
+                // ball) anywhere on the pitch: scale the option's positive appeal by direction
+                // so the selector plays forward first and only recycles square/back when there
+                // is nothing forward on. A negative (genuinely bad) option is left as-is.
+                let score = if score > 0.0 {
+                    score * directional_value
+                } else {
+                    score
+                };
                 (p.id, score)
             })
             .collect::<Vec<_>>();
@@ -18143,7 +18213,7 @@ impl WorldSnapshot {
         let urgent_run_invite =
             through_ball_invite || carrier_driving || self.forward_attacking_momentum(me.team);
         let cadence = (self.tick + player_id as u64 * 17) % 41;
-        if cadence > 5 && !urgent_run_invite {
+        if cadence > 13 && !urgent_run_invite {
             return None;
         }
         let current = self.player_snapshot_position(me);
@@ -21721,13 +21791,29 @@ impl WorldSnapshot {
                         * match me.role {
                             PlayerRole::Goalkeeper if own_half_possession => 24.0,
                             PlayerRole::Goalkeeper => 30.0,
-                            PlayerRole::Midfielder if own_half_possession => -8.0 - tendency * 12.0,
-                            PlayerRole::Midfielder => -2.0 - tendency * 18.0,
-                            PlayerRole::Forward if own_half_possession => -12.0,
-                            PlayerRole::Forward => -6.0,
+                            // Attacking mids/forwards hold a HIGHER line ahead of the ball so
+                            // the carrier has a real forward outlet (otherwise everyone
+                            // flattens onto the ball's line and the only options are square).
+                            PlayerRole::Midfielder if own_half_possession => -10.0 - tendency * 16.0,
+                            PlayerRole::Midfielder => -6.0 - tendency * 22.0,
+                            PlayerRole::Forward if own_half_possession => -20.0,
+                            PlayerRole::Forward => -16.0,
                             PlayerRole::Defender => 18.0,
                         }
             };
+            // Hold that advanced line ONSIDE: forwards/attacking mids stretch the pitch to
+            // offer a forward ball, but in settled possession they never drift beyond the
+            // second-last defender (the burst in behind happens once the ball is played).
+            if matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder) {
+                if let Some(line_y) = self.second_last_defender_line_for(me.team) {
+                    let onside_cap = line_y - me.team.attack_dir() * ONSIDE_RUN_HOLD_BUFFER_YARDS;
+                    support_y = if me.team.attack_dir() > 0.0 {
+                        support_y.min(onside_cap)
+                    } else {
+                        support_y.max(onside_cap)
+                    };
+                }
+            }
             if me.role == PlayerRole::Midfielder
                 && me.preferences.defensive_mindedness > me.preferences.offensive_mindedness
             {
