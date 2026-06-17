@@ -331,6 +331,50 @@ fn mdp_mpc_reconciliation_records_divergence_and_blends_when_sensible() {
     assert_eq!(sim.tick, 300);
 }
 
+fn push_stationary_mpc_guidance(snapshot: &mut WorldSnapshot, player_id: usize, target: Vec2) {
+    snapshot
+        .formation_lp_guidance
+        .retain(|guidance| guidance.player_id != player_id);
+    snapshot.formation_lp_guidance.push(SoccerFormationLpPlayerGuidance {
+        team: snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .map(|player| player.team)
+            .unwrap_or(Team::Home),
+        player_id,
+        slot: player_id,
+        current: target,
+        target,
+        formation_anchor: target,
+        pressure_target: None,
+        recommended_move: Vec2::zero(),
+        target_velocity: Vec2::zero(),
+        target_acceleration: Vec2::zero(),
+        local_mpc_guidance: true,
+        recommended_move_yards: 0.0,
+        recommended_speed_yps: 0.0,
+        recommended_acceleration_yps2: 0.0,
+        formation_error_yards: 0.0,
+        movement_error_yards: 0.0,
+        pair_error_yards: 0.0,
+        role_line_error_yards: 0.0,
+        pressure_error_yards: 0.0,
+        fore_aft_speed_error_yps: 0.0,
+        pressure_weight: 1.0,
+        speed_match_weight: 0.0,
+        alignment_weight: 1.0,
+        reduced_cost_target_x: 0.0,
+        reduced_cost_target_y: 0.0,
+        solver_status: "optimal".to_string(),
+        solver_objective: 0.0,
+        solver_iterations: Some(1),
+        solver_elapsed_ms: 0.0,
+        variable_count: 1,
+        constraint_count: 1,
+    });
+}
+
 #[test]
 fn learned_mdp_action_reselects_when_mpc_cannot_execute_it() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -420,6 +464,183 @@ fn learned_mdp_action_reselects_when_mpc_cannot_execute_it() {
     assert_ne!(
         decision.action, "vertical-attack",
         "final action should not keep the MPC-rejected learned action"
+    );
+}
+
+#[test]
+fn mpc_pass_execution_prices_lane_and_ball_recipe() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_194,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let blocker = 13;
+    park_players_except(&mut sim, &[passer, receiver, blocker]);
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].skills.passing_completion_rate = 6.0;
+    sim.players[passer].skills.passing = 6.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 76.0);
+    sim.players[blocker].team = Team::Away;
+    sim.players[blocker].position = Vec2::new(40.0, 66.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, passer, sim.players[passer].position);
+    let player = sim.players[passer].clone();
+    let action = SoccerAction::Pass {
+        target_player: Some(receiver),
+        power: 0.58,
+        flight: PassFlight::Floor,
+    };
+    let target = player.action_target_trace(&action, &snapshot);
+    let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "pass1")
+        .expect("MPC should trace a guided pass command");
+    assert_eq!(trace.decision, "reselect-mdp-after-mpc-low-confidence");
+    assert_eq!(trace.mpc_reselect_reason, "mpc-pass-lane-blocked-now");
+    assert!(
+        trace.mpc_pass_completion_probability < 0.34,
+        "blocked lane should be low-completion: {trace:?}"
+    );
+    assert!(trace.mpc_recommended_speed_yps > 0.0);
+    assert!(trace.mpc_recommended_angle_degrees.is_finite());
+    assert!(trace.mpc_recommended_spin_rps >= 0.0);
+}
+
+#[test]
+fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_195,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let carrier = 7;
+    let marker = 13;
+    park_players_except(&mut sim, &[carrier, marker]);
+    sim.players[carrier].position = Vec2::new(40.0, 58.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].skills.dribbling = 8.0;
+    sim.players[carrier].skills.acceleration = 8.0;
+    sim.players[carrier].skills.first_touch = 7.0;
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].position = Vec2::new(44.0, 58.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, carrier, sim.players[carrier].position);
+    let player = sim.players[carrier].clone();
+    let action = SoccerAction::DribbleMove {
+        target: Vec2::new(36.0, 63.0),
+        kind: DribbleMoveKind::CarryOutLeft,
+        touch: DribbleTouchDecision::new(9, 2.2),
+    };
+    let target = player.action_target_trace(&action, &snapshot);
+    let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "carry-out-left")
+        .expect("MPC should trace a guided dribble command");
+    assert!(
+        trace.mpc_dribble_left_success_probability
+            > trace.mpc_dribble_right_success_probability + 0.08,
+        "marker on the right should make left feint/carry more executable: {trace:?}"
+    );
+    assert!(trace.mpc_dribble_success_probability >= 0.34);
+    assert_eq!(trace.mpc_recommended_curve, "left");
+    assert!(trace.mpc_recommended_speed_yps > 0.0);
+}
+
+#[test]
+fn mpc_bouncing_ball_urgency_reprices_pass_execution_window() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_196,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].skills.passing_completion_rate = 6.4;
+    sim.players[passer].skills.passing = 6.2;
+    sim.players[passer].skills.first_touch = 1.1;
+    sim.players[passer].skills.strength = 2.0;
+    sim.players[passer].skills.dribbling = 2.0;
+    sim.players[passer].skills.flair_passing = 2.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(42.0, 75.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let action = SoccerAction::Pass {
+        target_player: Some(receiver),
+        power: 0.58,
+        flight: PassFlight::Floor,
+    };
+    let mut calm_snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut calm_snapshot, passer, sim.players[passer].position);
+    let player = sim.players[passer].clone();
+    let calm_target = player.action_target_trace(&action, &calm_snapshot);
+    let calm_trace =
+        player_mdp_mpc_comparison_trace(&calm_snapshot, &player, &calm_target, "pass1")
+            .expect("MPC should trace a calm pass command");
+
+    sim.ball.velocity = Vec2::new(8.0, 18.0);
+    sim.ball.altitude_yards = 1.45;
+    let mut urgent_snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut urgent_snapshot, passer, sim.players[passer].position);
+    let urgent_target = player.action_target_trace(&action, &urgent_snapshot);
+    let urgent_trace =
+        player_mdp_mpc_comparison_trace(&urgent_snapshot, &player, &urgent_target, "pass1")
+            .expect("MPC should trace a bouncing-ball pass command");
+
+    assert!(
+        urgent_trace.mpc_ball_urgency > calm_trace.mpc_ball_urgency + 0.35,
+        "bouncing ball should be materially more urgent: calm={calm_trace:?} urgent={urgent_trace:?}"
+    );
+    assert!(
+        urgent_trace.mpc_touch_window_seconds < calm_trace.mpc_touch_window_seconds,
+        "bouncing ball should compress the touch window: calm={calm_trace:?} urgent={urgent_trace:?}"
+    );
+    assert!(
+        urgent_trace.mpc_body_mechanics_fit < calm_trace.mpc_body_mechanics_fit,
+        "awkward bouncing ball should reduce body-mechanics fit: calm={calm_trace:?} urgent={urgent_trace:?}"
+    );
+    assert!(
+        urgent_trace.mpc_pass_completion_probability
+            < calm_trace.mpc_pass_completion_probability - 0.15,
+        "MPC should reprice the same pass when the ball cannot be waited on: calm={calm_trace:?} urgent={urgent_trace:?}"
+    );
+    assert_eq!(
+        urgent_trace.mpc_reselect_reason,
+        "mpc-ball-touch-window-closing"
+    );
+    assert_eq!(
+        urgent_trace.decision,
+        "reselect-mdp-after-mpc-low-confidence"
     );
 }
 

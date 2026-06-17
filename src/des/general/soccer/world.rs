@@ -14521,32 +14521,6 @@ impl WorldSnapshot {
         self.nearest_opponent_distance_at(team, position) > NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS
     }
 
-    /// Execution urgency in `[0, 1]` for `player_id`: how little time the situation
-    /// affords a *clean* execution. An airborne or fast-loose ball can't be waited on,
-    /// and a presser bearing down forces a rushed touch. Consumed by the per-action MPC
-    /// completion-probability model so urgent moments raise the bar for re-deciding (you
-    /// take the simpler, surer option when you can't take your time).
-    pub(crate) fn execution_urgency_for(&self, player_id: usize) -> f64 {
-        let me = self.players.iter().find(|p| p.id == player_id);
-        let pos = me.map(|p| p.position).unwrap_or(self.ball.position);
-        // An airborne ball (loft/bounce) can't be controlled at the feet yet.
-        let airborne = (self.ball.altitude_yards / 2.5).clamp(0.0, 1.0);
-        // A fast loose ball must be committed to, not shepherded.
-        let loose = if self.ball.holder.is_none() {
-            (self.ball.velocity.len() / 14.0).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        // A closing opponent shrinks the time available for the touch.
-        let presser = me
-            .map(|p| {
-                let d = self.nearest_opponent_distance_at(p.team, pos);
-                (1.0 - d / 6.0).clamp(0.0, 1.0)
-            })
-            .unwrap_or(0.0);
-        airborne.max(loose).max(presser * 0.85).clamp(0.0, 1.0)
-    }
-
     pub(crate) fn candidate_occupancy_at(
         &self,
         team: Team,

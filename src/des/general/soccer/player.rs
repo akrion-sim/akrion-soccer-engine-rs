@@ -504,18 +504,489 @@ const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
 const MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS: f64 = 6.0;
 const MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS: f64 = 16.0;
 const MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE: f64 = 0.18;
-/// Completion-probability floor below which MPC kicks a chosen action back to the
-/// policy even when it is kinematically reachable (e.g. a pass into a covered lane,
-/// or a feint a player lacks the skill to land). Deliberately low so only genuinely
-/// doomed executions (~the rare <1% the design targets) are vetoed and ordinary play
-/// is untouched; raised by urgency at the call site.
-const MDP_MPC_RESELECT_MIN_COMPLETION_PROBABILITY: f64 = 0.12;
-/// When the re-selection does fire, alternatives below this completion probability are
-/// dropped from the candidate set so we never re-decide FROM a doomed action TO another
-/// one; among the executable survivors the policy's own value ranking still chooses.
-const MDP_MPC_FALLBACK_MIN_COMPLETION_PROBABILITY: f64 = 0.12;
+const MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY: f64 = 0.34;
 
-fn player_mdp_mpc_comparison_trace(
+#[derive(Clone, Debug, Default)]
+struct MpcExecutionEstimate {
+    ball_urgency: f64,
+    touch_window_seconds: f64,
+    body_mechanics_fit: f64,
+    execution_probability: f64,
+    pass_completion_probability: f64,
+    dribble_success_probability: f64,
+    dribble_left_success_probability: f64,
+    dribble_right_success_probability: f64,
+    recommended_speed_yps: f64,
+    recommended_angle_degrees: f64,
+    recommended_curve_bend_yards: f64,
+    recommended_spin_rps: f64,
+    recommended_curve: &'static str,
+    horizon_seconds: f64,
+    reselect_reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MpcBallExecutionContext {
+    urgency: f64,
+    touch_window_seconds: f64,
+    body_mechanics_fit: f64,
+}
+
+fn mpc_ball_execution_context_for_player(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    current: Vec2,
+    movement_execution_confidence: f64,
+) -> MpcBallExecutionContext {
+    let holder = snapshot.ball.holder;
+    let ball_altitude = finite_metric(snapshot.ball.altitude_yards).max(0.0);
+    let ball_speed = snapshot.ball.velocity.len();
+    let ball_distance = current.distance(snapshot.ball.position);
+    let top_speed = player_top_speed_yps(player.role, &player.skills)
+        * MovementGait::Sprint.speed_multiplier()
+        * fatigue_speed_factor(player.skills.stamina, player.fatigue);
+    let fallback_time_to_ball = ball_distance / top_speed.max(0.85);
+    let loose_race = if holder.is_none() {
+        loose_ball_race_context_for_snapshot(snapshot, player.id)
+    } else {
+        LooseBallRaceContext::default()
+    };
+    let player_time_to_ball = if holder == Some(player.id) {
+        0.0
+    } else if loose_race.loose_ball {
+        loose_race.player_time_to_ball_seconds
+    } else {
+        fallback_time_to_ball
+    }
+    .clamp(0.0, 8.0);
+    let nearest_opponent_distance = snapshot
+        .players
+        .iter()
+        .filter(|opponent| opponent.team == player.team.other())
+        .map(|opponent| opponent.position.distance(current))
+        .fold(f64::INFINITY, f64::min);
+    let pressure_urgency = pressure_from_nearest_distance(nearest_opponent_distance);
+    let altitude_urgency = if ball_altitude <= BALL_ROLLING_ALTITUDE_YARDS {
+        0.0
+    } else if ball_altitude <= AERIAL_HEADER_MAX_ALTITUDE_YARDS {
+        (0.30 + ball_altitude / AERIAL_HEADER_MAX_ALTITUDE_YARDS * 0.70).clamp(0.0, 1.0)
+    } else {
+        (0.54 - (ball_altitude - AERIAL_HEADER_MAX_ALTITUDE_YARDS) / 8.0 * 0.34).clamp(0.14, 0.54)
+    };
+    let speed_urgency =
+        (ball_speed / 24.0).clamp(0.0, 1.0) * if ball_distance <= 3.0 { 1.0 } else { 0.65 };
+    let race_urgency = if loose_race.loose_ball {
+        let time_pressure = (1.0 - player_time_to_ball / 1.8).clamp(0.0, 1.0);
+        let contest_pressure = if loose_race.fifty_fifty {
+            0.35
+        } else if loose_race.team_time_advantage_seconds < 0.0 {
+            0.25
+        } else {
+            0.0
+        };
+        (time_pressure * 0.55 + contest_pressure).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let first_touch_tool = (ability01(player.skills.first_touch) * 0.42
+        + ability01(player.skills.strength) * 0.18
+        + ability01(player.skills.dribbling) * 0.18
+        + ability01(player.skills.flair_passing) * 0.12
+        + movement_execution_confidence.clamp(0.0, 1.0) * 0.10)
+        .clamp(0.0, 1.0);
+    let aerial_tool = aerial_duel_skill_from_agent(player);
+    let touch_tool = if ball_altitude >= AERIAL_HEADER_MIN_ALTITUDE_YARDS {
+        (first_touch_tool * 0.52 + aerial_tool * 0.48).clamp(0.0, 1.0)
+    } else {
+        first_touch_tool
+    };
+    let base_window = if ball_altitude <= BALL_ROLLING_ALTITUDE_YARDS {
+        1.35
+    } else if ball_altitude <= AERIAL_HEADER_MIN_ALTITUDE_YARDS {
+        0.46 + touch_tool * 0.46
+    } else if ball_altitude <= AERIAL_HEADER_MAX_ALTITUDE_YARDS {
+        0.34 + touch_tool * 0.42 + aerial_tool * 0.14
+    } else {
+        0.68 + aerial_tool * 0.50
+    };
+    let travel_loss = if holder == Some(player.id) {
+        0.0
+    } else {
+        (player_time_to_ball / 2.4).clamp(0.0, 1.0) * 0.32
+    };
+    let speed_loss = if ball_altitude > BALL_ROLLING_ALTITUDE_YARDS || holder.is_none() {
+        (ball_speed / 30.0).clamp(0.0, 1.0) * 0.24
+    } else {
+        (ball_speed / 35.0).clamp(0.0, 1.0) * 0.10
+    };
+    let touch_window_seconds =
+        (base_window - travel_loss - speed_loss - pressure_urgency * 0.12).clamp(0.06, 1.60);
+    let window_urgency = (1.0 - touch_window_seconds / 1.05).clamp(0.0, 1.0);
+    let urgency = (altitude_urgency * 0.48
+        + speed_urgency * 0.20
+        + race_urgency * 0.24
+        + pressure_urgency * 0.08)
+        .clamp(0.0, 1.0)
+        .max(window_urgency);
+    let mechanics_baseline = (0.70 + touch_tool * 0.30).clamp(0.70, 1.0);
+    let urgency_damp = (1.0 - urgency * (0.20 + (1.0 - touch_tool) * 0.70)).clamp(0.20, 1.0);
+    let window_fit = (touch_window_seconds / 0.75).clamp(0.25, 1.0);
+    let body_mechanics_fit = if urgency <= 0.05 {
+        1.0
+    } else {
+        (mechanics_baseline * urgency_damp)
+            .min(window_fit)
+            .clamp(0.20, 1.0)
+    };
+    MpcBallExecutionContext {
+        urgency,
+        touch_window_seconds,
+        body_mechanics_fit,
+    }
+}
+
+fn mpc_execution_estimate_for_action(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action_target: &Option<AgentActionTargetTrace>,
+    action_label: &str,
+    current: Vec2,
+    dt: f64,
+    target_delta_yards: f64,
+    reachable_delta_yards: f64,
+    movement_execution_confidence: f64,
+) -> MpcExecutionEstimate {
+    let label = normalize_soccer_action_label(action_label);
+    let mut estimate = MpcExecutionEstimate {
+        execution_probability: movement_execution_confidence,
+        horizon_seconds: (dt * 2.0).clamp(2.0 / 15.0, 0.24),
+        ..MpcExecutionEstimate::default()
+    };
+    let ball_context = mpc_ball_execution_context_for_player(
+        snapshot,
+        player,
+        current,
+        movement_execution_confidence,
+    );
+    estimate.ball_urgency = ball_context.urgency;
+    estimate.touch_window_seconds = ball_context.touch_window_seconds;
+    estimate.body_mechanics_fit = ball_context.body_mechanics_fit;
+    if let Some(target) = action_target.as_ref().and_then(|target| target.point) {
+        let to_target = target - current;
+        if to_target.len() > 1e-6 {
+            estimate.recommended_angle_degrees = to_target.y.atan2(to_target.x).to_degrees();
+        }
+    }
+
+    let pass_flight = pass_like_action_flight(label);
+    if let Some(flight) = pass_flight {
+        let target_point = action_target
+            .as_ref()
+            .and_then(|target| target.point)
+            .or_else(|| {
+                action_target
+                    .as_ref()
+                    .and_then(|target| target.player_id)
+                    .and_then(|id| snapshot.player_position(id))
+            });
+        let Some(target_point) = target_point else {
+            estimate.execution_probability = 0.0;
+            estimate.pass_completion_probability = 0.0;
+            estimate.reselect_reason = "mpc-pass-has-no-target";
+            return estimate;
+        };
+        let distance = current.distance(target_point);
+        let is_cross = pass_would_be_cross(
+            current,
+            target_point,
+            player.team,
+            snapshot.field_width,
+            snapshot.field_length,
+        );
+        let power = match label {
+            "wall-pass" => WALL_PASS_GIVE_POWER + 0.20 * ability01(player.skills.passing),
+            "killer-pass" => 0.66
+                + 0.24
+                    * ability01(player.skills.passing_completion_rate)
+                        .max(ability01(player.skills.vision)),
+            "switch-play" => 0.62
+                + 0.24
+                    * ability01(player.skills.passing_completion_rate)
+                        .max(ability01(player.skills.flair_passing)),
+            "recycle-reset" => 0.46 + 0.22 * ability01(player.skills.passing_completion_rate),
+            "flank-low-cross" | "corner-flag-cross" => {
+                0.60 + 0.28
+                    * ability01(player.skills.crossing_left.max(player.skills.crossing_right))
+                        .max(ability01(player.skills.passing_completion_rate))
+            }
+            "flank-high-cross" | "flick-on" => {
+                0.64 + 0.28
+                    * ability01(player.skills.crossing_left.max(player.skills.crossing_right))
+                        .max(ability01(player.skills.passing_completion_rate))
+            }
+            "surprise-pass" => 0.50
+                + 0.22
+                    * ability01(player.skills.passing_completion_rate)
+                        .max(ability01(player.skills.flair_passing)),
+            _ => 0.58 + 0.32 * ability01(player.skills.passing_completion_rate),
+        }
+        .clamp(0.25, 1.0);
+        let speed = pass_speed_yps_from_power(power, flight, is_cross, &player.skills);
+        let lane_radius = if flight.is_aerial() { 1.25 } else { 1.8 };
+        let (clear_now, clear_through_flight) = snapshot.pass_lane_clearance(
+            current,
+            target_point,
+            player.team.other(),
+            lane_radius,
+            speed,
+        );
+        let nearest_opponent_to_lane = snapshot
+            .players
+            .iter()
+            .filter(|opponent| opponent.team == player.team.other())
+            .map(|opponent| segment_distance_to_point(current, target_point, opponent.position))
+            .fold(f64::INFINITY, f64::min);
+        let lane_fit = if clear_now {
+            if clear_through_flight {
+                1.0
+            } else {
+                0.46
+            }
+        } else {
+            0.08
+        };
+        let receiver_fit = action_target
+            .as_ref()
+            .and_then(|target| target.player_id)
+            .and_then(|id| snapshot.player_position(id).map(|position| (id, position)))
+            .map(|(id, receiver_position)| {
+                let receiver_pressure = snapshot
+                    .players
+                    .iter()
+                    .filter(|opponent| opponent.team == player.team.other())
+                    .map(|opponent| opponent.position.distance(receiver_position))
+                    .fold(f64::INFINITY, f64::min);
+                let moving_target_bonus = snapshot
+                    .player_velocity(id)
+                    .map(|velocity| {
+                        (velocity.y * player.team.attack_dir()).max(0.0).clamp(0.0, 7.0) / 7.0
+                    })
+                    .unwrap_or(0.0);
+                (0.50
+                    + (receiver_pressure / 7.0).clamp(0.0, 1.0) * 0.32
+                    + moving_target_bonus * 0.18)
+                    .clamp(0.16, 1.0)
+            })
+            .unwrap_or(0.62);
+        let speed_fit = (1.0 - ((distance / speed.max(1.0)) - 1.0).abs() / 3.4).clamp(0.35, 1.0);
+        let skill = pass_execution_skill(&player.skills, flight, is_cross);
+        let body_fit =
+            ((0.36 + movement_execution_confidence * 0.40 + player.decision_confidence * 0.24)
+                .clamp(0.0, 1.0)
+                * ball_context.body_mechanics_fit)
+                .clamp(0.0, 1.0);
+        let lane_margin_fit = if nearest_opponent_to_lane.is_finite() {
+            ((nearest_opponent_to_lane - lane_radius) / 4.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let pass_probability = (0.05
+            + skill * 0.30
+            + lane_fit * 0.30
+            + receiver_fit * 0.15
+            + speed_fit * 0.08
+            + lane_margin_fit * 0.12)
+            * body_fit;
+        estimate.pass_completion_probability = pass_probability.clamp(0.0, 0.99);
+        estimate.execution_probability = estimate.pass_completion_probability;
+        estimate.recommended_speed_yps = speed;
+        let curl_probability = pass_curl_probability_for_player(
+            &player.skills,
+            flight,
+            is_cross,
+            distance,
+            1.0 - lane_margin_fit,
+        );
+        let curve = if curl_probability >= 0.38 && discretized_kick_curve_allowed(distance, speed) {
+            if target_point.x >= snapshot.field_width * 0.5 {
+                DiscretizedKickCurve::Right
+            } else {
+                DiscretizedKickCurve::Left
+            }
+        } else {
+            DiscretizedKickCurve::None
+        };
+        estimate.recommended_curve = match curve {
+            DiscretizedKickCurve::Left => "left",
+            DiscretizedKickCurve::Right => "right",
+            DiscretizedKickCurve::None => "none",
+        };
+        estimate.recommended_curve_bend_yards = if curve == DiscretizedKickCurve::None {
+            0.0
+        } else {
+            (0.55 + distance / 24.0).clamp(0.55, 2.8)
+                * (0.72 + ability01(player.skills.flair_passing) * 0.56)
+        };
+        estimate.recommended_spin_rps =
+            (estimate.recommended_curve_bend_yards / distance.max(1.0) * speed.max(1.0) * 0.42)
+                .clamp(0.0, 9.0);
+        estimate.reselect_reason = if !clear_now {
+            "mpc-pass-lane-blocked-now"
+        } else if !clear_through_flight {
+            "mpc-pass-cut-out-during-flight"
+        } else if ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60 {
+            "mpc-ball-touch-window-closing"
+        } else if estimate.pass_completion_probability
+            < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+        {
+            "mpc-pass-low-completion"
+        } else {
+            ""
+        };
+        return estimate;
+    }
+
+    if matches!(
+        label,
+        "dribble"
+            | "carry-forward"
+            | "vertical-attack"
+            | "turnover-burst"
+            | "carry-out-left"
+            | "carry-out-right"
+            | "side-step"
+            | "left-cut"
+            | "right-cut"
+            | "nutmeg"
+            | "fake-left-cut-right"
+            | "fake-right-cut-left"
+            | "protect-ball"
+    ) {
+        let target = action_target
+            .as_ref()
+            .and_then(|target| target.point)
+            .unwrap_or(current);
+        let nearest_opponent = snapshot
+            .players
+            .iter()
+            .filter(|opponent| opponent.team == player.team.other())
+            .min_by(|a, b| {
+                a.position
+                    .distance(current)
+                    .total_cmp(&b.position.distance(current))
+            });
+        let nearest_distance = nearest_opponent
+            .map(|opponent| opponent.position.distance(current))
+            .unwrap_or(24.0);
+        let target_clearance = snapshot
+            .players
+            .iter()
+            .filter(|opponent| opponent.team == player.team.other())
+            .map(|opponent| opponent.position.distance(target))
+            .fold(f64::INFINITY, f64::min);
+        let to_target = target - current;
+        let forward_dir = Vec2::new(0.0, player.team.attack_dir());
+        let left_dir = Vec2::new(-player.team.attack_dir(), 0.0);
+        let right_dir = Vec2::new(player.team.attack_dir(), 0.0);
+        let normalized_target = to_target.normalized();
+        let lateral_left_fit = normalized_target.dot(left_dir).clamp(0.0, 1.0);
+        let lateral_right_fit = normalized_target.dot(right_dir).clamp(0.0, 1.0);
+        let opponent_lateral = nearest_opponent
+            .map(|opponent| (opponent.position - current).dot(left_dir))
+            .unwrap_or(0.0);
+        let space_left = if opponent_lateral > 0.0 { 0.34 } else { 1.0 };
+        let space_right = if opponent_lateral < 0.0 { 0.34 } else { 1.0 };
+        let dribble_skill = (ability01(player.skills.dribbling) * 0.42
+            + ability01(player.skills.acceleration) * 0.30
+            + ability01(player.skills.first_touch) * 0.18
+            + ability01(player.skills.flair_passing) * 0.10)
+            .clamp(0.0, 1.0);
+        let pressure = dribble_spacing_pressure_for_role(player.role, nearest_distance)
+            .max(pressure_from_nearest_distance(nearest_distance));
+        let target_space_fit = (target_clearance / 5.5).clamp(0.0, 1.0);
+        let touch_fit = action_target
+            .as_ref()
+            .and_then(|target| target.dribble_touch)
+            .map(|touch| (1.0 - (touch.distance_yards - 2.2).abs() / 3.4).clamp(0.25, 1.0))
+            .unwrap_or(0.72);
+        let forward_fit = normalized_target.dot(forward_dir).clamp(-0.4, 1.0);
+        let left_prob = (0.16
+            + dribble_skill * 0.34
+            + target_space_fit * 0.22
+            + touch_fit * 0.12
+            + lateral_left_fit * 0.12
+            + space_left * 0.16
+            - pressure * 0.24)
+            .clamp(0.02, 0.96);
+        let right_prob = (0.16
+            + dribble_skill * 0.34
+            + target_space_fit * 0.22
+            + touch_fit * 0.12
+            + lateral_right_fit * 0.12
+            + space_right * 0.16
+            - pressure * 0.24)
+            .clamp(0.02, 0.96);
+        let direct_prob = (0.14
+            + dribble_skill * 0.36
+            + target_space_fit * 0.24
+            + touch_fit * 0.12
+            + forward_fit.max(0.0) * 0.14
+            - pressure * 0.28)
+            .clamp(0.02, 0.96);
+        let selected = match label {
+            "carry-out-left" | "left-cut" => left_prob,
+            "carry-out-right" | "right-cut" => right_prob,
+            "side-step" | "fake-left-cut-right" | "fake-right-cut-left" => {
+                left_prob.max(right_prob)
+            }
+            "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
+            _ => direct_prob.max(if left_prob > right_prob {
+                left_prob * 0.92
+            } else {
+                right_prob * 0.92
+            }),
+        };
+        estimate.dribble_left_success_probability = left_prob;
+        estimate.dribble_right_success_probability = right_prob;
+        estimate.dribble_success_probability = (selected
+            * (0.62 + movement_execution_confidence * 0.38)
+            * ball_context.body_mechanics_fit)
+            .clamp(0.0, 0.99);
+        estimate.execution_probability = estimate.dribble_success_probability;
+        estimate.recommended_speed_yps = (to_target.len() / estimate.horizon_seconds.max(1e-6))
+            .clamp(
+                0.0,
+                player_top_speed_yps(player.role, &player.skills) * 1.16,
+            );
+        estimate.recommended_curve = if left_prob > right_prob + 0.08 {
+            "left"
+        } else if right_prob > left_prob + 0.08 {
+            "right"
+        } else {
+            "none"
+        };
+        estimate.recommended_curve_bend_yards = 0.0;
+        estimate.recommended_spin_rps = 0.0;
+        estimate.reselect_reason =
+            if ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60 {
+                "mpc-ball-touch-window-closing"
+            } else if estimate.dribble_success_probability
+                < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+            {
+                "mpc-dribble-low-success"
+            } else {
+                ""
+            };
+        return estimate;
+    }
+
+    if target_delta_yards > reachable_delta_yards {
+        estimate.reselect_reason = "mpc-target-beyond-reachable-horizon";
+    }
+    estimate
+}
+
+pub(crate) fn player_mdp_mpc_comparison_trace(
     snapshot: &WorldSnapshot,
     player: &PlayerAgent,
     action_target: &Option<AgentActionTargetTrace>,
@@ -651,12 +1122,26 @@ fn player_mdp_mpc_comparison_trace(
         * (0.42 + execution_skill * 0.58)
         * player.decision_confidence.clamp(0.0, 1.0))
     .clamp(0.0, 1.0);
+    let execution_estimate = mpc_execution_estimate_for_action(
+        snapshot,
+        player,
+        action_target,
+        action_label,
+        current,
+        dt,
+        target_delta_yards,
+        reachable_delta_yards,
+        execution_confidence,
+    );
     let reselect_after_mpc_low_confidence = mpc_reselect_candidate
-        && target_delta_yards.is_finite()
-        && target_delta_yards >= MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS
-        && velocity_delta_yps.is_finite()
-        && velocity_delta_yps >= reachable_delta_yards / mpc_horizon_seconds.max(1e-6)
-        && execution_confidence < MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE;
+        && ((target_delta_yards.is_finite()
+            && target_delta_yards >= MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS
+            && velocity_delta_yps.is_finite()
+            && velocity_delta_yps >= reachable_delta_yards / mpc_horizon_seconds.max(1e-6)
+            && execution_confidence < MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE)
+            || (!execution_estimate.reselect_reason.is_empty()
+                && execution_estimate.execution_probability
+                    < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY));
     let blended_target = if blend_eligible {
         mdp_target.map(|target| {
             ((target + mpc_target) * 0.5)
@@ -688,6 +1173,33 @@ fn player_mdp_mpc_comparison_trace(
         target_delta_yards: finite_metric(target_delta_yards),
         velocity_delta_yps: finite_metric(velocity_delta_yps),
         mdp_confidence: player.decision_confidence.clamp(0.0, 1.0),
+        mpc_ball_urgency: finite_metric(execution_estimate.ball_urgency),
+        mpc_touch_window_seconds: finite_metric(execution_estimate.touch_window_seconds),
+        mpc_body_mechanics_fit: finite_metric(execution_estimate.body_mechanics_fit),
+        mpc_execution_probability: finite_metric(execution_estimate.execution_probability),
+        mpc_pass_completion_probability: finite_metric(
+            execution_estimate.pass_completion_probability,
+        ),
+        mpc_dribble_success_probability: finite_metric(
+            execution_estimate.dribble_success_probability,
+        ),
+        mpc_dribble_left_success_probability: finite_metric(
+            execution_estimate.dribble_left_success_probability,
+        ),
+        mpc_dribble_right_success_probability: finite_metric(
+            execution_estimate.dribble_right_success_probability,
+        ),
+        mpc_recommended_speed_yps: finite_metric(execution_estimate.recommended_speed_yps),
+        mpc_recommended_angle_degrees: finite_metric(
+            execution_estimate.recommended_angle_degrees,
+        ),
+        mpc_recommended_curve_bend_yards: finite_metric(
+            execution_estimate.recommended_curve_bend_yards,
+        ),
+        mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
+        mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
+        mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
+        mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,
         blend_eligible,
         deviation_recorded,
@@ -701,168 +1213,12 @@ fn mpc_reselects_candidate(
     action: &SoccerAction,
     action_label: &str,
 ) -> bool {
-    // (1) Kinematic reach/skill gate: a MOVEMENT target the player cannot get to in time.
     let action_target = player.action_target_trace(action, snapshot);
-    let kinematic = player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
-        .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence");
-    // (2) Completion-probability gate: even a reachable action — including a PASS, which the
-    // kinematic gate treats as a semantic mismatch and skips — is handed back when the MPC
-    // 3-D physics say it is unlikely to come off (a covered lane, a launch across the body,
-    // a feint beyond the player's skill). The bar rises with urgency: under a closing presser
-    // or with a ball you can't wait for, take the surer option.
-    let urgency = snapshot.execution_urgency_for(player.id);
-    let min_completion =
-        (MDP_MPC_RESELECT_MIN_COMPLETION_PROBABILITY + urgency * 0.10).clamp(0.0, 0.60);
-    let low_completion = player.action_completion_probability(snapshot, action) < min_completion;
-    kinematic || low_completion
+    player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
+        .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
 }
 
 impl PlayerAgent {
-    /// MPC-grounded probability in `[0, 1]` that this player can EXECUTE `action` to a
-    /// good outcome *right now*. For a pass it is the 3-D lane/interception physics and
-    /// the body-mechanics feasibility of the launch; for a carry/feint, the reach and the
-    /// turn the move demands vs the player's skill — all discounted by URGENCY (an airborne
-    /// or fast-loose ball, or a presser bearing down, denies the time a clean execution
-    /// would take). This is the signal the MDP/POMDP re-rank consumes: a high-VALUE
-    /// decision with a low completion probability is no longer the best decision, so the
-    /// policy drops to its next-best executable option.
-    pub(crate) fn action_completion_probability(
-        &self,
-        snapshot: &WorldSnapshot,
-        action: &SoccerAction,
-    ) -> f64 {
-        let urgency = snapshot.execution_urgency_for(self.id);
-        let p = match action {
-            SoccerAction::Pass {
-                target_player,
-                flight,
-                ..
-            } => self.pass_completion_probability(snapshot, *target_player, *flight, urgency),
-            SoccerAction::DribbleMove { target, kind, .. } => {
-                self.dribble_completion_probability(snapshot, *target, *kind, urgency)
-            }
-            SoccerAction::Dribble(target)
-            | SoccerAction::MoveTo(target)
-            | SoccerAction::ControlTouch { target } => {
-                self.movement_completion_probability(snapshot, *target, urgency)
-            }
-            // Releases leave the foot immediately, so they are almost always "executable";
-            // urgency barely dents a hoof or a shot.
-            SoccerAction::Shoot { .. }
-            | SoccerAction::Clearance { .. }
-            | SoccerAction::RouteOne { .. } => (0.92 - urgency * 0.10).clamp(0.5, 1.0),
-            SoccerAction::HoldShape | SoccerAction::Tackle { .. } => 1.0,
-        };
-        p.clamp(0.0, 1.0)
-    }
-
-    /// Pass completion probability: lane interception physics × launch (body-facing)
-    /// feasibility × passer skill, lightly shaded by urgency (a rushed ball under a
-    /// closing presser completes less often).
-    fn pass_completion_probability(
-        &self,
-        snapshot: &WorldSnapshot,
-        target_player: Option<usize>,
-        flight: PassFlight,
-        urgency: f64,
-    ) -> f64 {
-        let Some(target_id) = target_player else {
-            return 0.25; // a pass to nobody is a guess
-        };
-        let from = snapshot.player_position(self.id).unwrap_or(self.position);
-        let Some(to) = snapshot.player_position(target_id) else {
-            return 0.30;
-        };
-        let opp = self.team.other();
-        // Interception physics over the flight. Aerial balls clear ground traffic, so the
-        // receiver-end gate dominates; ground balls must run the whole lane clean.
-        let (clear_now, clear_flight) = snapshot.pass_lane_clearance(from, to, opp, 1.0, 18.0);
-        let lane_factor = if flight.is_aerial() {
-            if clear_now {
-                0.90
-            } else {
-                0.70
-            }
-        } else if clear_flight {
-            0.90
-        } else if clear_now {
-            0.55
-        } else {
-            0.25
-        };
-        // Launch feasibility: a ball played across the body (hips pointing away) is harder
-        // and less accurate than one struck where the player is already facing.
-        let dir = to - from;
-        let dist = dir.len();
-        let facing_factor = if dist < 1e-3 {
-            1.0
-        } else {
-            let d = dir * (1.0 / dist);
-            let f = Vec2::new(self.facing_yaw.cos(), self.facing_yaw.sin());
-            let cos = (d.x * f.x + d.y * f.y).clamp(-1.0, 1.0);
-            (0.45 + 0.55 * ((cos + 1.0) / 2.0)).clamp(0.45, 1.0)
-        };
-        let skill = if flight.is_aerial() {
-            ability01(self.skills.crossing_left.max(self.skills.crossing_right)) * 0.5
-                + ability01(self.skills.passing_completion_rate) * 0.5
-        } else {
-            ability01(self.skills.passing_completion_rate) * 0.7 + ability01(self.skills.vision) * 0.3
-        };
-        (lane_factor * facing_factor * (0.45 + 0.55 * skill) * (1.0 - urgency * 0.18)).clamp(0.0, 1.0)
-    }
-
-    /// Carry/feint completion probability: can the player physically pull off this touch —
-    /// reach plus the turn the move demands vs his agility — and not while the ball is
-    /// unsettled (urgency from an airborne/bouncing ball collapses a clean dribble far more
-    /// than a simple shield).
-    fn dribble_completion_probability(
-        &self,
-        _snapshot: &WorldSnapshot,
-        _target: Vec2,
-        kind: DribbleMoveKind,
-        urgency: f64,
-    ) -> f64 {
-        // A carrier pushing the ball a short distance is nearly always executable — this is
-        // about whether the TOUCH comes off, not whether the player can run somewhere — so a
-        // plain carry has a high base. Skill-demanding feints (cuts, fakes, a nutmeg) erode it,
-        // and an unsettled (airborne/bouncing) ball erodes it far more, the harder the move.
-        let move_difficulty = match kind {
-            DribbleMoveKind::CarryForward
-            | DribbleMoveKind::CarryOutLeft
-            | DribbleMoveKind::CarryOutRight
-            | DribbleMoveKind::ProtectBall => 0.0,
-            DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 0.30,
-            DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0.42,
-            DribbleMoveKind::Nutmeg => 0.55,
-        };
-        let touch =
-            ability01(self.skills.dribbling) * 0.6 + ability01(self.skills.first_touch) * 0.4;
-        let base = 0.92 - move_difficulty * (1.0 - touch) * 0.8;
-        let unsettled_penalty = urgency * (0.20 + move_difficulty * 0.5);
-        (base * (1.0 - unsettled_penalty)).clamp(0.0, 1.0)
-    }
-
-    /// Movement reach probability: how achievable `target` is under the player's current
-    /// velocity and acceleration over the short MPC window, lightly cut by urgency.
-    fn movement_completion_probability(
-        &self,
-        snapshot: &WorldSnapshot,
-        target: Vec2,
-        urgency: f64,
-    ) -> f64 {
-        let from = snapshot.player_position(self.id).unwrap_or(self.position);
-        let dist = (target - from).len();
-        if dist < 0.75 {
-            return (1.0 - urgency * 0.10).clamp(0.6, 1.0);
-        }
-        let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
-        let window = (8.0 * dt).clamp(0.18, 0.6);
-        let accel = acceleration_yps2_from_score(self.skills.acceleration).max(0.5);
-        let reachable = (self.velocity.len() * window + 0.5 * accel * window * window).max(0.75);
-        let reach_factor = (reachable / dist).clamp(0.0, 1.0);
-        (reach_factor * (1.0 - urgency * 0.15)).clamp(0.0, 1.0)
-    }
-
     pub(crate) fn record_position_history(&mut self) {
         self.position_history.push_back(self.position);
         while self.position_history.len() > PLAYER_POSITION_HISTORY_LIMIT {
@@ -5179,24 +5535,38 @@ impl PlayerAgent {
                             )),
                             _ => None,
                         };
-                        // Keep only alternatives the MPC 3-D physics say are actually
-                        // executable — "a good decision that can't be executed well is no
-                        // longer a good decision" — then let the policy's own value ranking
-                        // pick among the executable survivors (the next-best *executable*
-                        // option). Filtering rather than re-weighting keeps the value order
-                        // intact for the common case where several options are executable.
-                        candidate.filter(|candidate| {
-                            self.action_completion_probability(snapshot, &candidate.0)
-                                >= MDP_MPC_FALLBACK_MIN_COMPLETION_PROBABILITY
-                        })
-                        .map(|candidate| (option.score, candidate))
+                        candidate
+                            .filter(|(candidate_action, candidate_label)| {
+                                !mpc_reselects_candidate(
+                                    snapshot,
+                                    self,
+                                    candidate_action,
+                                    candidate_label,
+                                )
+                            })
+                            .map(|candidate| (option.score, candidate))
                     })
                     .max_by(|a, b| a.0.total_cmp(&b.0))
                     .map(|(_, candidate)| candidate);
-                if let Some((fallback_action, fallback_label)) = fallback {
-                    action = fallback_action;
-                    action_label = fallback_label;
-                }
+                let (fallback_action, fallback_label) = fallback.unwrap_or_else(|| {
+                    let kind = DribbleMoveKind::ProtectBall;
+                    let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                    (
+                        SoccerAction::DribbleMove {
+                            target: snapshot.dribble_move_target_for_touch(
+                                self.id,
+                                self.home_position,
+                                kind,
+                                touch,
+                            ),
+                            kind,
+                            touch,
+                        },
+                        "protect-ball".to_string(),
+                    )
+                });
+                action = fallback_action;
+                action_label = fallback_label;
             }
             let sprint = matches!(action, SoccerAction::DribbleMove { .. })
                 && (self.role == PlayerRole::Forward
