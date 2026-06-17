@@ -2185,6 +2185,28 @@ fn forward_pass_progress_is_valued_three_times_backward_recycle() {
 }
 
 #[test]
+fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
+    let weight = 0.37;
+    let short_reset =
+        directional_pass_progress_score(-4.0, weight) + backward_pass_depth_adjustment(-4.0);
+    let long_retreat =
+        directional_pass_progress_score(-9.0, weight) + backward_pass_depth_adjustment(-9.0);
+
+    assert!(
+        backward_pass_depth_adjustment(-4.0) > 0.0,
+        "3-5yd backward releases should get a reset bonus"
+    );
+    assert!(
+        backward_pass_depth_adjustment(-6.0) < 0.0,
+        ">5yd backward releases should be demoted"
+    );
+    assert!(
+        short_reset > long_retreat + 2.0,
+        "short reset should clearly outrank long retreat: short={short_reset} long={long_retreat}"
+    );
+}
+
+#[test]
 fn half_open_forward_target_stays_visible_and_beats_backward_recycle() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -5399,6 +5421,7 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
     // attacking chain (so an intermediate received pass that leads to a shot/goal
     // earns a share).
     assert_eq!(GOAL_REWARD_POINTS, 100.0);
+    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 30.0);
     assert_eq!(SHOT_ON_TARGET_REWARD_POINTS, 40.0);
     assert!((GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - 100.0).abs() < 1e-9);
     assert!((SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - 40.0).abs() < 1e-9);
@@ -10605,6 +10628,152 @@ fn off_ball_no_chance_player_drops_goalside_of_anticipated_ball() {
     assert!(
         adjusted.y <= 60.0,
         "a no-chance off-ball player should drop goalside of where the ball is GOING: {adjusted:?}"
+    );
+}
+
+#[test]
+fn ordinary_off_ball_move_stops_before_teammate_lane() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let (ia, ib) = two_home_outfield_indices(&sim);
+    let mover = sim.players[ia].id;
+    let teammate = sim.players[ib].id;
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Forward)
+        .map(|player| player.id)
+        .unwrap();
+    park_players_except(&mut sim, &[mover, teammate, away_holder]);
+    let mover_idx = sim.players.iter().position(|p| p.id == mover).unwrap();
+    let teammate_idx = sim.players.iter().position(|p| p.id == teammate).unwrap();
+    let away_holder_idx = sim
+        .players
+        .iter()
+        .position(|p| p.id == away_holder)
+        .unwrap();
+    sim.players[mover_idx].position = Vec2::new(40.0, 50.0);
+    sim.players[teammate_idx].position = Vec2::new(40.0, 56.0);
+    sim.players[away_holder_idx].position = Vec2::new(70.0, 96.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder_idx].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let raw_target = Vec2::new(40.0, 66.0);
+    let adjusted = snapshot.teammate_lane_guard_adjusted_target(mover, raw_target);
+
+    assert!(
+        adjusted.y < sim.players[teammate_idx].position.y - 0.5,
+        "ordinary movement should stop before running through a teammate lane: {adjusted:?}"
+    );
+    assert!(
+        adjusted.y > sim.players[mover_idx].position.y,
+        "the guard should still allow progress toward the route: {adjusted:?}"
+    );
+}
+
+#[test]
+fn lane_guard_preserves_goalside_drop_during_in_flight_pass() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home)
+        .map(|p| p.id)
+        .collect();
+    let player = home[0];
+    let passer = home[1];
+    let receiver = home[2];
+    let player_idx = sim.players.iter().position(|p| p.id == player).unwrap();
+    sim.players[player_idx].role = PlayerRole::Forward;
+    sim.players[player_idx].position = Vec2::new(10.0, 70.0);
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 40.0);
+    sim.ball.velocity = Vec2::new(0.0, 20.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.pending_pass = Some(PendingPass {
+        team: Team::Home,
+        from: passer,
+        target: Some(receiver),
+        flight: PassFlight::Floor,
+        is_cross: false,
+        launch_tick: sim.tick,
+        origin: Vec2::new(40.0, 40.0),
+        intended_target: Vec2::new(40.0, 60.0),
+        distance_yards: 20.0,
+        receiver_openness: 1.0,
+        passer_skill: 0.8,
+        launch_speed_yps: 20.0,
+        receiver_position_at_launch: Some(Vec2::new(40.0, 60.0)),
+        receiver_velocity_at_launch: Some(Vec2::zero()),
+        offside: None,
+        offside_candidates: Vec::new(),
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let raw_target = Vec2::new(50.0, 75.0);
+    let goalside = snapshot.goalside_anticipation_adjusted_target(player, raw_target);
+    let guarded = snapshot.teammate_lane_guard_adjusted_target(player, goalside);
+
+    assert!(
+        goalside.y < sim.players[player_idx].position.y,
+        "test setup should make the transit rule pull the player goalside: {goalside:?}"
+    );
+    assert!(
+        guarded.y <= goalside.y + 1e-6,
+        "lane guard must not undo an in-flight goalside drop: goalside={goalside:?} guarded={guarded:?}"
+    );
+}
+
+#[test]
+fn in_possession_support_move_climbs_upfield_instead_of_sideways_or_back() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let (ia, ib) = two_home_outfield_indices(&sim);
+    let mover = sim.players[ia].id;
+    let holder = sim.players[ib].id;
+    park_players_except(&mut sim, &[mover, holder]);
+    let mover_idx = sim.players.iter().position(|p| p.id == mover).unwrap();
+    let holder_idx = sim.players.iter().position(|p| p.id == holder).unwrap();
+    let current = Vec2::new(40.0, 50.0);
+    sim.players[mover_idx].position = current;
+    sim.players[holder_idx].position = Vec2::new(15.0, 50.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder_idx].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let sideways_and_back = Vec2::new(50.0, 48.0);
+    let adjusted = snapshot.teammate_lane_guard_adjusted_target(mover, sideways_and_back);
+    let forward = (adjusted.y - current.y) * Team::Home.attack_dir();
+
+    assert!(
+        forward >= 1.9,
+        "a 10yd lateral support move should be turned into an upfield route: {adjusted:?}"
+    );
+}
+
+#[test]
+fn quick_handoff_support_is_exempt_from_lane_and_upfield_guard() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let (ia, ib) = two_home_outfield_indices(&sim);
+    let mover = sim.players[ia].id;
+    let holder = sim.players[ib].id;
+    park_players_except(&mut sim, &[mover, holder]);
+    let mover_idx = sim.players.iter().position(|p| p.id == mover).unwrap();
+    let holder_idx = sim.players.iter().position(|p| p.id == holder).unwrap();
+    sim.players[mover_idx].position = Vec2::new(40.0, 50.0);
+    sim.players[holder_idx].position = Vec2::new(42.0, 50.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder_idx].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let handoff_target = Vec2::new(43.0, 49.0);
+    let adjusted = snapshot.teammate_lane_guard_adjusted_target(mover, handoff_target);
+
+    assert_eq!(
+        adjusted, handoff_target,
+        "close support should be allowed to step into a quick handoff"
     );
 }
 
@@ -22902,6 +23071,78 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
 }
 
 #[test]
+fn run_time_step_intercepts_low_pending_pass_body_contact_but_not_high_loft() {
+    let setup = |flight: PassFlight| {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.2,
+            ball_drag_per_tick: 0.0,
+            ball_air_resistance: 0.0,
+            ball_grass_resistance_yps2: 0.0,
+            ball_stop_speed_yps: 0.0,
+            seed: 17_775,
+            ..Default::default()
+        });
+        let passer = 6usize;
+        let receiver = 9usize;
+        let defender = 12usize;
+        let origin = Vec2::new(40.0, 50.0);
+        let receiver_target = Vec2::new(40.0, 70.0);
+        park_players_except(&mut sim, &[passer, receiver, defender]);
+        sim.tick = 5;
+        sim.players[passer].position = origin;
+        sim.players[receiver].position = receiver_target;
+        sim.players[defender].position = Vec2::new(40.0, 55.0);
+        sim.players[defender].velocity = Vec2::zero();
+        sim.players[defender].action_facing = FacingBucket::East;
+        sim.players[defender].receive_facing = FacingBucket::East;
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(40.0, 54.0);
+        sim.ball.velocity = Vec2::new(0.0, 30.0);
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(Team::Home);
+        let mut pass = test_pending_pass(Team::Home, passer, receiver, origin, receiver_target);
+        pass.flight = flight;
+        pass.launch_tick = 1;
+        pass.launch_speed_yps = 30.0;
+        sim.pending_pass = Some(pass);
+        sim
+    };
+
+    let mut low = setup(PassFlight::Floor);
+    low.integrate_ball();
+    assert_eq!(
+        low.ball.holder,
+        Some(12),
+        "low pass should hit the defender it crosses during the ball tick"
+    );
+    assert_eq!(low.stats.interceptions_away, 1);
+    assert!(
+        low.pending_pass.is_none(),
+        "intercepted pending pass should resolve immediately"
+    );
+
+    let mut high = setup(PassFlight::Aerial);
+    assert!(
+        pass_ball_altitude_yards(
+            high.pending_pass.as_ref().expect("pending pass"),
+            high.players[12].position,
+        ) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
+        "test setup should put the loft above the 6ft body-contact gate"
+    );
+    high.integrate_ball();
+    assert_ne!(
+        high.ball.holder,
+        Some(12),
+        "high loft should not be body-intercepted by the crossed defender"
+    );
+    assert_eq!(high.stats.interceptions_away, 0);
+    assert!(
+        high.pending_pass.is_some(),
+        "high pass should keep travelling after clearing the defender"
+    );
+}
+
+#[test]
 fn pass_reach_interception_requires_defender_to_face_ball_path() {
     let sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -27139,6 +27380,7 @@ fn goal_reward_divides_pool_across_recent_attacking_chain() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn direct_turnover_goal_distributes_reduced_reward_pool() {
     // A goal where only a single scoring-team player touched the ball since
     // winning it from the opponent (possession chain length 1) is a direct
@@ -27184,14 +27426,84 @@ fn direct_turnover_goal_distributes_reduced_reward_pool() {
 
 #[test]
 fn goal_reward_contextualizes_recent_attacking_decisions() {
+=======
+fn direct_turnover_goal_distributes_only_thirty_points() {
+>>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
-        seed: 157,
+        seed: 155,
         ..Default::default()
     });
-    sim.tick = 120;
-    let before = WorldSnapshot::from_match(&sim);
+    let scorer = 9;
+    let support = 7;
+    let deeper_support = 5;
+    let opponent = 12;
+    assert_eq!(sim.players[scorer].team, Team::Home);
+    assert_eq!(sim.players[support].team, Team::Home);
+    assert_eq!(sim.players[deeper_support].team, Team::Home);
+    assert_eq!(sim.players[opponent].team, Team::Away);
 
+    sim.tick = 34;
+    sim.record_possession_touch(opponent);
+    sim.record_possession_touch(scorer);
+    sim.record_possession_touch(scorer);
+    assert_eq!(sim.possession_chain_previous_touch_team, Some(Team::Away));
+    sim.reward_events.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+
+    let reward_for = |player_id| {
+        sim.reward_events
+            .iter()
+            .filter(|event| event.player_id == player_id)
+            .map(|event| event.amount)
+            .sum::<f64>()
+    };
+    let attacking_total = [deeper_support, support, scorer]
+        .into_iter()
+        .map(|player_id| reward_for(player_id))
+        .sum::<f64>();
+    assert_eq!(reward_for(scorer), DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    assert_eq!(reward_for(support), 0.0);
+    assert_eq!(reward_for(deeper_support), 0.0);
+    assert_eq!(reward_for(opponent), 0.0);
+    assert!((attacking_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!(attacking_total < GOAL_REWARD_POINTS);
+}
+
+#[test]
+fn direct_turnover_goal_requires_scorer_to_be_only_scoring_touch() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 159,
+        ..Default::default()
+    });
+    let scorer = 9;
+    let support = 7;
+    let opponent = 12;
+
+    sim.tick = 35;
+    sim.record_possession_touch(opponent);
+    sim.record_possession_touch(support);
+    sim.record_possession_touch(scorer);
+    assert_eq!(sim.possession_chain_previous_touch_team, Some(Team::Away));
+    sim.reward_events.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+
+    let reward_for = |player_id| {
+        sim.reward_events
+            .iter()
+            .filter(|event| event.player_id == player_id)
+            .map(|event| event.amount)
+            .sum::<f64>()
+    };
+    assert_eq!(reward_for(scorer), GOAL_CHAIN_REWARD_PATTERN[0]);
+    assert_eq!(reward_for(support), GOAL_CHAIN_REWARD_PATTERN[1]);
+    assert!(reward_for(scorer) + reward_for(support) > DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+}
+
+fn push_contextual_goal_credit_history(sim: &mut SoccerMatch, before: &WorldSnapshot) {
     for (tick, player_id, action, target, target_player) in [
         (112, 5, "dribble", Vec2::new(45.0, 76.0), None),
         (116, 7, "pass", Vec2::new(43.0, 91.0), Some(9)),
@@ -27201,7 +27513,7 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
         after.ball.position = target;
         after.ball.velocity = Vec2::new(0.8, 18.0);
         after.ball.holder = target_player;
-        let mut decision = test_decision_trace(&before, player_id, action);
+        let mut decision = test_decision_trace(before, player_id, action);
         decision.action_target = Some(AgentActionTargetTrace {
             point: Some(target),
             player_id: target_player,
@@ -27236,7 +27548,7 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
             team,
             &decision.action,
             decision.action_target.as_ref(),
-            &before,
+            before,
             &after,
         );
         sim.recent_learning_history
@@ -27258,6 +27570,18 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
                 done: false,
             });
     }
+}
+
+#[test]
+fn goal_reward_contextualizes_recent_attacking_decisions() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 157,
+        ..Default::default()
+    });
+    sim.tick = 120;
+    let before = WorldSnapshot::from_match(&sim);
+    push_contextual_goal_credit_history(&mut sim, &before);
 
     sim.record_goal_rewards(Team::Home, Some(9));
 
@@ -27288,6 +27612,45 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
         .reward_events
         .iter()
         .any(|event| event.tick == sim.tick && (event.amount - 30.0).abs() < 1e-9));
+}
+
+#[test]
+fn direct_turnover_goal_ignores_stale_contextual_credit() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 158,
+        ..Default::default()
+    });
+    sim.tick = 120;
+    let before = WorldSnapshot::from_match(&sim);
+    push_contextual_goal_credit_history(&mut sim, &before);
+
+    sim.record_possession_touch(12);
+    sim.record_possession_touch(9);
+    sim.record_possession_touch(9);
+    assert_eq!(sim.possession_chain_previous_touch_team, Some(Team::Away));
+    sim.reward_events.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(9));
+
+    let stale_context_total = sim
+        .deferred_reward_transitions
+        .iter()
+        .filter(|transition| transition.team == Team::Home)
+        .map(|transition| transition.reward)
+        .sum::<f64>();
+    let reward_event_total = sim
+        .reward_events
+        .iter()
+        .filter(|event| sim.players[event.player_id].team == Team::Home)
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert_eq!(stale_context_total, 0.0);
+    assert!((reward_event_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!(sim
+        .deferred_reward_transitions
+        .iter()
+        .all(|transition| transition.team != Team::Home));
 }
 
 #[test]
@@ -32262,10 +32625,17 @@ fn uncontested_carrier_pulls_off_ball_attackers_forward_not_back() {
     );
     let attack = Team::Home.attack_dir();
     let current = sim.players[striker].position;
+    let support_forward_yards = (support.point.y - current.y) * attack;
     assert!(
-        (support.point.y - current.y) * attack > 1.0,
+        support_forward_yards >= 6.0,
         "off-ball striker should be pushed FORWARD to support the free carrier, \
          not held or dropped back: target {:?} vs current {:?}",
+        support.point,
+        current
+    );
+    assert!(
+        support.point.distance(current) > 3.5,
+        "forward support target should be far enough to sustain a sprint: target {:?} vs current {:?}",
         support.point,
         current
     );
@@ -34664,6 +35034,55 @@ fn no_pressure_pass_ranking_filters_backward_outlets() {
     assert!(
         !targets.contains(&backward_outlet),
         "backward outlet should be ineligible without pressure: {targets:?}"
+    );
+}
+
+#[test]
+fn pressured_backward_pass_ranking_prefers_short_reset_over_long_retreat() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let short_reset = 5;
+    let long_retreat = 7;
+    let presser = 12;
+    park_players_except(&mut sim, &[passer, short_reset, long_retreat, presser]);
+
+    for id in [passer, short_reset, long_retreat] {
+        sim.players[id].role = PlayerRole::Midfielder;
+        sim.players[id].skills.passing = 7.0;
+        sim.players[id].skills.passing_completion_rate = 7.0;
+        sim.players[id].velocity = Vec2::zero();
+    }
+    sim.players[passer].position = Vec2::new(40.0, 60.0);
+    sim.players[short_reset].position = Vec2::new(39.0, 56.0);
+    sim.players[long_retreat].position = Vec2::new(41.0, 51.0);
+    sim.players[presser].position = Vec2::new(45.0, 60.0);
+    sim.players[presser].velocity = Vec2::new(-3.0, 0.0);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.holder = Some(passer);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.no_pressure_at(Team::Home, sim.players[passer].position),
+        "test setup should keep backward outlets pressure-eligible"
+    );
+    let targets = snapshot.ranked_pass_targets(passer, 11);
+    assert!(
+        targets.contains(&short_reset) && targets.contains(&long_retreat),
+        "test setup should expose both backward outlets: {targets:?}"
+    );
+    let short_rank = targets
+        .iter()
+        .position(|id| *id == short_reset)
+        .expect("short reset rank");
+    let long_rank = targets
+        .iter()
+        .position(|id| *id == long_retreat)
+        .expect("long retreat rank");
+
+    assert!(
+        short_rank < long_rank,
+        "3-5yd backward reset should outrank >5yd retreat: targets={targets:?}"
     );
 }
 
@@ -37247,6 +37666,125 @@ fn pressured_pending_pass_receiver_prioritizes_early_intercept_margin() {
         ) < 0.75,
         "pressured receiver target should stay on the moving pass path: {pressured_target:?}"
     );
+}
+
+#[test]
+fn intended_pending_pass_target_uses_belief_urgency_floor() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let receiver = 9;
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(5.0, 0.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(38.0, 60.0);
+    sim.players[receiver].position = Vec2::new(43.0, 60.0);
+    sim.pending_pass = Some(PendingPass {
+        team: Team::Home,
+        from: passer,
+        target: Some(receiver),
+        flight: PassFlight::Floor,
+        is_cross: false,
+        launch_tick: sim.tick,
+        origin: sim.players[passer].position,
+        intended_target: Vec2::new(48.0, 60.0),
+        distance_yards: sim.players[passer]
+            .position
+            .distance(Vec2::new(48.0, 60.0)),
+        receiver_openness: pass_receiver_openness_for_agents(
+            &sim.players,
+            Team::Home,
+            sim.players[receiver].position,
+        ),
+        passer_skill: ability01(sim.players[passer].skills.passing_completion_rate),
+        launch_speed_yps: 12.0,
+        receiver_position_at_launch: Some(sim.players[receiver].position),
+        receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
+        offside: None,
+        offside_candidates: Vec::new(),
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass = snapshot.pending_pass.as_ref().expect("pending pass");
+    assert_eq!(pass.nearest_receiver, Some(receiver));
+    assert!(
+        pass.receiver_urgency < 0.25,
+        "fixture should rely on intended-target belief floor, raw urgency={}",
+        pass.receiver_urgency
+    );
+    let observation = snapshot.observation_for(receiver);
+    assert!(observation.receiving_pending_pass);
+    assert!(
+        observation.pending_pass_receiver_urgency >= 0.63,
+        "intended target should carry 0.8 x 0.8 belief urgency: {}",
+        observation.pending_pass_receiver_urgency
+    );
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(receiver),
+        &observation,
+        Team::Home,
+        sim.players[receiver].role,
+    );
+    assert!(state.pending_pass_receiver_urgency_bin > 0);
+    let (_, sprint) = snapshot
+        .pending_pass_reception_target_for(receiver)
+        .expect("intended target should attack the pass");
+    assert!(sprint);
+}
+
+#[test]
+fn intended_pending_pass_target_backs_off_for_clearly_closer_teammate() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let intended = 9;
+    let closer = 8;
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(50.0, 66.0);
+    sim.ball.velocity = Vec2::new(7.0, 0.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    park_players_except(&mut sim, &[passer, intended, closer]);
+    sim.players[passer].position = Vec2::new(38.0, 60.0);
+    sim.players[intended].position = Vec2::new(70.0, 60.0);
+    sim.players[closer].position = Vec2::new(51.0, 66.0);
+    sim.pending_pass = Some(PendingPass {
+        team: Team::Home,
+        from: passer,
+        target: Some(intended),
+        flight: PassFlight::Floor,
+        is_cross: false,
+        launch_tick: sim.tick,
+        origin: sim.players[passer].position,
+        intended_target: sim.players[intended].position,
+        distance_yards: sim.players[passer]
+            .position
+            .distance(sim.players[intended].position),
+        receiver_openness: pass_receiver_openness_for_agents(
+            &sim.players,
+            Team::Home,
+            sim.players[intended].position,
+        ),
+        passer_skill: ability01(sim.players[passer].skills.passing_completion_rate),
+        launch_speed_yps: 18.0,
+        receiver_position_at_launch: Some(sim.players[intended].position),
+        receiver_velocity_at_launch: Some(sim.players[intended].velocity),
+        offside: None,
+        offside_candidates: Vec::new(),
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass = snapshot.pending_pass.as_ref().expect("pending pass");
+    assert!(pass.off_target_yards > 1.1);
+    assert_eq!(pass.target, Some(intended));
+    assert_eq!(pass.nearest_receiver, Some(closer));
+
+    let intended_observation = snapshot.observation_for(intended);
+    let closer_observation = snapshot.observation_for(closer);
+    assert!(!intended_observation.receiving_pending_pass);
+    assert_eq!(intended_observation.pending_pass_receiver_urgency, 0.0);
+    assert!(closer_observation.receiving_pending_pass);
+    assert!(snapshot.pending_pass_reception_target_for(intended).is_none());
+    assert!(snapshot.pending_pass_reception_target_for(closer).is_some());
 }
 
 #[test]
@@ -46755,6 +47293,145 @@ fn nearest_defender_engages_fast_carrier_instead_of_containing() {
 }
 
 #[test]
+fn close_to_goal_carrier_pulls_nearest_defender_out_of_retreat() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // No covering defender behind: every other Home outfielder is far upfield, so
+    // the selected defender must contain/press by position rather than by lunge.
+    for id in 0..=10 {
+        if sim.players[id].role != PlayerRole::Goalkeeper {
+            sim.players[id].position = Vec2::new(8.0, 96.0);
+            sim.players[id].home_position = sim.players[id].position;
+        }
+    }
+    let defender = 2;
+    sim.players[defender].position = Vec2::new(40.0, 16.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    let carrier = 17;
+    sim.players[carrier].position = Vec2::new(40.0, 22.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -2.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let me = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == defender)
+        .unwrap();
+    assert!(
+        snapshot.fast_carrier_engage_target_for(me).is_none(),
+        "a jogging carrier should not trigger the all-in fast engage"
+    );
+    assert!(
+        snapshot.advancing_carrier_steal_urgency(defender) < 1.0,
+        "without cover, the defender should still contain instead of lunging"
+    );
+
+    let carrier_pos = snapshot.player_snapshot_position(
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == carrier)
+            .unwrap(),
+    );
+    let defender_pos = snapshot.player_snapshot_position(me);
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.y > defender_pos.y + 1.0,
+        "near goal, the defender should step toward the carrier instead of retreating: \
+         defender={defender_pos:?} target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) < defender_pos.distance(carrier_pos),
+        "assignment should close the carrier distance: defender={defender_pos:?} \
+         target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) <= 3.5,
+        "close-goal pressure should reach jockeying range, got target={assignment:?} \
+         carrier={carrier_pos:?}"
+    );
+}
+
+#[test]
+fn close_to_goal_pressure_is_symmetric_for_away_defense() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Defender)
+        .expect("away defender")
+        .id;
+    let carrier = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home carrier")
+        .id;
+    // No covering defender behind the selected Away defender: all other Away
+    // outfielders are far from their own goal, so pressure must be positional.
+    for player in sim.players.iter_mut() {
+        if player.team == Team::Away
+            && player.id != defender
+            && player.role != PlayerRole::Goalkeeper
+        {
+            player.position = Vec2::new(72.0, 24.0);
+            player.home_position = player.position;
+        }
+    }
+    sim.players[defender].position = Vec2::new(40.0, 104.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.players[carrier].position = Vec2::new(40.0, 98.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, 2.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let me = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == defender)
+        .unwrap();
+    assert!(
+        snapshot.fast_carrier_engage_target_for(me).is_none(),
+        "a jogging carrier should not trigger the all-in fast engage"
+    );
+    assert!(
+        snapshot.advancing_carrier_steal_urgency(defender) < 1.0,
+        "without cover, Away should still contain instead of lunging"
+    );
+
+    let carrier_pos = snapshot.player_snapshot_position(
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == carrier)
+            .unwrap(),
+    );
+    let defender_pos = snapshot.player_snapshot_position(me);
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        (assignment.y - defender_pos.y) * Team::Away.attack_dir() > 1.0,
+        "Away defender should step toward the carrier instead of retreating: \
+         defender={defender_pos:?} target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) < defender_pos.distance(carrier_pos),
+        "Away assignment should close the carrier distance: defender={defender_pos:?} \
+         target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) <= 3.5,
+        "Away close-goal pressure should reach jockeying range, got target={assignment:?} \
+         carrier={carrier_pos:?}"
+    );
+}
+
+#[test]
 fn keeper_controls_long_range_shots_almost_always() {
     // A keeper set on their line should stop (and cleanly control) shots from
     // 40-50yd ~95%+ of the time — long efforts buy reaction time, so they must
@@ -53681,6 +54358,81 @@ fn first_touch_near_goal_controls_toward_goal_not_endline() {
 }
 
 #[test]
+fn pressured_first_touch_cushions_away_from_marker() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 2233,
+        ..Default::default()
+    });
+    let receiver = 8;
+    let marker = 13;
+    let runner = 9;
+    park_players_except(&mut sim, &[receiver, marker, runner]);
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(40.0, 62.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::new(0.0, 2.2);
+    sim.players[receiver].skills.first_touch = 8.6;
+    sim.players[receiver].incoming_ball = Some(IncomingBallContext {
+        from_player: Some(6),
+        target_player: Some(receiver),
+        team: Some(Team::Home),
+        kind: IncomingBallKind::GroundPass,
+        origin: Some(Vec2::new(36.0, 54.0)),
+        intended_target: Some(sim.players[receiver].position),
+        speed_yps: 15.0,
+        distance_yards: 12.0,
+        received_tick: sim.tick,
+        is_cross: false,
+        is_aerial: false,
+    });
+    sim.players[marker].position = Vec2::new(42.2, 62.0);
+    sim.players[runner].position = Vec2::new(37.0, 75.0);
+    sim.players[runner].velocity = Vec2::new(-0.2, 4.5);
+    sim.ball.holder = Some(receiver);
+    sim.ball.position = sim.players[receiver].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(receiver);
+    assert!(observation.first_touch_available);
+    assert!(!goal_approach_forces_goalmouth_carry(
+        &observation,
+        sim.players[receiver].role
+    ));
+
+    let plan = SoccerLearnedPlan {
+        action: "control-touch".to_string(),
+        target_player: None,
+        target_point: None,
+    };
+    let player = sim.players[receiver].clone();
+    let (action, label) = player
+        .action_from_learned_plan(&plan, &snapshot, &observation)
+        .expect("learned control touch");
+    let SoccerAction::ControlTouch { target } = action else {
+        panic!("expected control touch, got {action:?}");
+    };
+    let origin = sim.players[receiver].position;
+    let marker_pos = sim.players[marker].position;
+    let old_velocity_touch =
+        (origin + carried_ball_lead(&sim.players[receiver])).clamp_to_pitch(
+            snapshot.field_width,
+            snapshot.field_length,
+        );
+    assert_eq!(label, "control-touch");
+    assert!(
+        target.x < origin.x - 0.45,
+        "pressured first touch should cushion away from the marker: target={target:?}"
+    );
+    assert!(
+        target.distance(marker_pos) > old_velocity_touch.distance(marker_pos) + 0.25,
+        "pressured first touch should improve retention distance: target={target:?} old={old_velocity_touch:?}"
+    );
+}
+
+#[test]
 fn clear_goal_approach_striker_shoots_instead_of_extra_dribble() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -59267,6 +60019,54 @@ fn wall_pass_available_with_beatable_man_and_free_wall() {
 }
 
 #[test]
+fn give_and_go_strategy_commits_to_wall_pass_and_runner_expectation() {
+    let mut sim = wall_pass_scenario();
+    sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;
+    sim.central_brain.home_directive.attack_strategy = TeamAttackStrategy::GiveAndGoCentral;
+    sim.players[6].skills.passing_completion_rate = 9.0;
+    sim.players[6].skills.passing = 9.0;
+    sim.players[6].skills.vision = 9.0;
+    sim.players[6].preferences.pass_bias = 1.0;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .wall_pass_option_for(6)
+        .expect("a named give-and-go strategy should have a viable wall-pass plan");
+    assert!(
+        plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY,
+        "fixture must clear the strategy commitment quality floor: {plan:?}"
+    );
+
+    let mut carrier = sim.players[6].clone();
+    let intent = carrier.run_time_step(&snapshot, None, None, &mut mulberry32(58_401));
+    match intent.action {
+        SoccerAction::Pass {
+            target_player,
+            flight,
+            ..
+        } => {
+            assert_eq!(target_player, Some(plan.wall_partner));
+            assert_eq!(flight, PassFlight::Floor);
+        }
+        other => panic!("give-and-go strategy should commit to the wall pass, got {other:?}"),
+    }
+    let commitment = carrier.one_two.expect("carrier should store the one-two run");
+    assert_eq!(commitment.wall_partner, plan.wall_partner);
+    assert!(
+        commitment.return_target.distance(plan.return_target) <= 1e-9,
+        "stored return target should match the planned burst: {commitment:?} vs {plan:?}"
+    );
+    assert_eq!(
+        carrier
+            .last_decision
+            .as_ref()
+            .expect("decision trace")
+            .action,
+        "wall-pass"
+    );
+}
+
+#[test]
 fn wall_pass_unavailable_in_own_half() {
     let mut sim = wall_pass_scenario();
     // Drop the whole attack back into our own half.
@@ -59335,6 +60135,37 @@ fn one_two_run_target_is_onside_and_lapses_after_timeout() {
     assert!(
         stale.one_two_run_target_for(runner).is_none(),
         "a commitment past its time-out should no longer drive a run"
+    );
+}
+
+#[test]
+fn one_two_run_target_is_exempt_from_teammate_lane_guard() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.clock_seconds = 20.0;
+    let runner = 9;
+    let wall = 7;
+    let teammate_in_lane = 8;
+    park_players_except(&mut sim, &[runner, wall, teammate_in_lane]);
+    sim.ball.holder = Some(wall);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[wall].position = Vec2::new(35.0, 84.0);
+    sim.players[runner].position = Vec2::new(40.0, 82.0);
+    sim.players[teammate_in_lane].position = Vec2::new(40.0, 87.0);
+    sim.players[runner].one_two = Some(OneTwoRun {
+        wall_partner: wall,
+        launch_clock_seconds: sim.clock_seconds - 0.4,
+        return_target: Vec2::new(40.0, 96.0),
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let burst = snapshot
+        .one_two_run_target_for(runner)
+        .expect("a live one-two should produce a burst target");
+    let guarded = snapshot.teammate_lane_guard_adjusted_target(runner, burst);
+
+    assert_eq!(
+        guarded, burst,
+        "one-two burst is a tactical quick-handoff run and should not be lane-stopped"
     );
 }
 

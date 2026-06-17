@@ -2452,12 +2452,46 @@ impl PlayerAgent {
                 DribbleTouchDecision::new(0, 1.35),
             );
         }
+<<<<<<< HEAD
         // A neutral controlling touch carries the ball a little ahead. With pass-anticipation on,
         // the first touch is made PURPOSEFUL: flick it onto an onside team-mate's forward run, or —
         // under a bearing-down marker — push it into space away from his momentum to retain it.
         let neutral = (self.position + carried_ball_lead(self))
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
         snapshot.first_touch_directional_target_for(self.id, neutral)
+=======
+        let pressured_touch = snapshot
+            .players
+            .iter()
+            .filter(|player| player.team != self.team)
+            .map(|player| (player.position, player.position.distance(self.position)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|(_, distance)| *distance <= 6.5)
+            .and_then(|(marker, _)| {
+                let away = self.position - marker;
+                if away.len() <= 1e-6 {
+                    return None;
+                }
+                let support_lane = snapshot
+                    .ranked_visible_pass_targets(self.id, 1)
+                    .first()
+                    .and_then(|target_id| snapshot.player_position(*target_id))
+                    .filter(|target| (target.y - self.position.y) * self.team.attack_dir() > 1.0)
+                    .map(|target| (target - self.position).normalized())
+                    .unwrap_or_else(|| Vec2::new(0.0, self.team.attack_dir()));
+                let direction = (away.normalized() * 0.72 + support_lane * 0.28).normalized();
+                let touch_yards = 1.05 + ability01(self.skills.first_touch) * 1.10;
+                Some(
+                    (self.position + direction * touch_yards)
+                        .clamp_to_pitch(snapshot.field_width, snapshot.field_length),
+                )
+            });
+        if let Some(target) = pressured_touch {
+            return target;
+        }
+        (self.position + carried_ball_lead(self))
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+>>>>>>> 3326b4e7e83ed9e505afb3724c6c5e10c8e6070a
     }
 
     fn human_shoot_or_carry_action(
@@ -2873,6 +2907,80 @@ impl PlayerAgent {
                 action,
                 sprint: false,
             };
+        }
+
+        if has_ball {
+            // WALL RETURN (the "two" of a one-two): return the lay-off before
+            // generic first-touch logic turns the combination into an ordinary pass.
+            if let Some(runner) = snapshot.wall_return_pass_target_for(self.id) {
+                let return_reliability = (0.70
+                    + ability01(self.skills.first_touch) * 0.20
+                    + ability01(self.skills.passing) * 0.10)
+                    .clamp(0.0, 0.97);
+                if rng.next_float()
+                    < time_window_probability(return_reliability, snapshot.dt_seconds)
+                {
+                    let action = SoccerAction::Pass {
+                        target_player: Some(runner),
+                        power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
+                        flight: PassFlight::Floor,
+                    };
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state.clone(),
+                        observation.clone(),
+                        belief.clone(),
+                        vec!["wall-return".to_string()],
+                        single_action_option("wall-return"),
+                        &action,
+                        "wall-return",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
+            }
+
+            // Named one-two / give-and-go strategies commit to the wall pass before
+            // first-touch, killer/scoop, or generic pass selection can swallow it.
+            if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
+                let give_and_go_strategy = matches!(
+                    directive.attack_strategy,
+                    TeamAttackStrategy::GiveAndGoCentral
+                        | TeamAttackStrategy::OneTwoLeftRelease
+                        | TeamAttackStrategy::OneTwoRightRelease
+                        | TeamAttackStrategy::CentralDoubleOneTwo
+                );
+                if give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY {
+                    let action = SoccerAction::Pass {
+                        target_player: Some(plan.wall_partner),
+                        power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
+                        flight: PassFlight::Floor,
+                    };
+                    self.one_two = Some(OneTwoRun {
+                        wall_partner: plan.wall_partner,
+                        launch_clock_seconds: snapshot.clock_seconds,
+                        return_target: plan.return_target,
+                    });
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state.clone(),
+                        observation.clone(),
+                        belief.clone(),
+                        vec!["wall-pass".to_string()],
+                        single_action_option("wall-pass"),
+                        &action,
+                        "wall-pass",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
+            }
         }
 
         if has_ball && observation.first_touch_available {
@@ -3343,42 +3451,6 @@ impl PlayerAgent {
         }
 
         if has_ball {
-            // WALL RETURN (the "two" of a one-two): we are the wall and a teammate has
-            // just laid the ball off and burst past his man. Return it first-time, led
-            // into his onside run, rather than settling on the ball — this is the whole
-            // point of the give-and-go and is played near-reliably (skill-gated so a poor
-            // first touch can break down). Fires only when a live commitment names us, so
-            // it costs nothing when no one-two is in progress.
-            if let Some(runner) = snapshot.wall_return_pass_target_for(self.id) {
-                let return_reliability = (0.70
-                    + ability01(self.skills.first_touch) * 0.20
-                    + ability01(self.skills.passing) * 0.10)
-                    .clamp(0.0, 0.97);
-                if rng.next_float()
-                    < time_window_probability(return_reliability, snapshot.dt_seconds)
-                {
-                    let action = SoccerAction::Pass {
-                        target_player: Some(runner),
-                        power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
-                        flight: PassFlight::Floor,
-                    };
-                    self.last_decision = Some(self.decision_trace(
-                        snapshot,
-                        mdp_state.clone(),
-                        observation.clone(),
-                        belief.clone(),
-                        vec!["wall-return".to_string()],
-                        single_action_option("wall-return"),
-                        &action,
-                        "wall-return",
-                    ));
-                    return PlayerIntent {
-                        player_id: self.id,
-                        action,
-                        sprint: false,
-                    };
-                }
-            }
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.striker_hold_up_flank_target_for(self.id);
@@ -3545,7 +3617,7 @@ impl PlayerAgent {
                     - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
-                let wall_appetite = (WALL_PASS_BASE_APPETITE
+                let raw_wall_appetite = WALL_PASS_BASE_APPETITE
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
@@ -3555,9 +3627,20 @@ impl PlayerAgent {
                         WALL_PASS_STRATEGY_APPETITE_BOOST
                     } else {
                         1.0
-                    })
-                .clamp(0.0, 0.92);
-                if rng.next_float() < time_window_probability(wall_appetite, snapshot.dt_seconds) {
+                    };
+                let strategy_commitment_floor = if give_and_go_strategy {
+                    (WALL_PASS_STRATEGY_MIN_APPETITE + plan.quality * 0.14).clamp(0.0, 0.95)
+                } else {
+                    0.0
+                };
+                let wall_appetite = raw_wall_appetite
+                    .max(strategy_commitment_floor)
+                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
+                let strategy_commits =
+                    give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
+                if strategy_commits
+                    || rng.next_float() < time_window_probability(wall_appetite, snapshot.dt_seconds)
+                {
                     let action = SoccerAction::Pass {
                         target_player: Some(plan.wall_partner),
                         power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,

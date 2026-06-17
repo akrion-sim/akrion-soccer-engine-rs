@@ -13,9 +13,10 @@ use uuid::Uuid;
 
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigMomentInsert, SoccerMomentEmbeddingInsert,
-    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey,
-    SoccerQTargetEntry, SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights,
-    SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM, SOCCER_MOMENT_EMBEDDING_DIM,
+    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
+    SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
+    CONFIG_FEATURE_DIM_V1, SOCCER_MOMENT_EMBEDDING_DIM,
 };
 use crate::des::general::tournament::{
     MatchReport, SoccerTeamGenome, TournamentFormat, TournamentTeam,
@@ -1531,6 +1532,10 @@ impl SoccerLearningPgStore {
         output_policy_version_id: Option<&str>,
         game: &SoccerLearningCompletedGame,
     ) -> Result<String, String> {
+        self.ensure_connected()?;
+        if !game.config_moments.is_empty() {
+            validate_config_moments(&game.config_moments)?;
+        }
         let mut tx = self
             .client
             .transaction()
@@ -1543,6 +1548,15 @@ impl SoccerLearningPgStore {
             output_policy_version_id,
             game,
         )?;
+        if !game.config_moments.is_empty() {
+            ensure_soccer_config_moment_tables(&mut tx)?;
+            insert_config_moments_in_transaction(
+                &mut tx,
+                Some(run_id.as_str()),
+                Some(experiment_id),
+                &game.config_moments,
+            )?;
+        }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run: {err}"))?;
         Ok(run_id)
@@ -1695,66 +1709,14 @@ impl SoccerLearningPgStore {
         if moments.is_empty() {
             return Ok(0);
         }
-        for moment in moments {
-            if moment.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
-                return Err(format!(
-                    "config moment embedding has {} dims, expected {SOCCER_MOMENT_EMBEDDING_DIM}",
-                    moment.embedding.len()
-                ));
-            }
-        }
+        validate_config_moments(moments)?;
+        self.ensure_connected()?;
         let mut tx = self
             .client
             .transaction()
             .map_err(|err| format!("begin config moment transaction: {err}"))?;
         ensure_soccer_config_moment_tables(&mut tx)?;
-        // Chunked multi-row insert: 9 params per row plus the 2 shared run/experiment
-        // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
-        // 65535-parameter ceiling.
-        for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
-            let teams: Vec<&'static str> =
-                chunk.iter().map(|m| soccer_team_label(m.team)).collect();
-            let ticks: Vec<i64> = chunk.iter().map(|m| checked_i64(m.tick)).collect();
-            let roles: Vec<&'static str> =
-                chunk.iter().map(|m| soccer_role_label(m.role)).collect();
-            let rewards: Vec<i64> = chunk
-                .iter()
-                .map(|m| soccer_learning_to_micros(m.reward))
-                .collect();
-            let returns: Vec<i64> = chunk
-                .iter()
-                .map(|m| soccer_learning_to_micros(m.nstep_return))
-                .collect();
-            let values: Vec<Option<i64>> = chunk
-                .iter()
-                .map(|m| m.value.map(soccer_learning_to_micros))
-                .collect();
-            let embeddings: Vec<String> =
-                chunk.iter().map(|m| pg_vector_text(&m.embedding)).collect();
-            let features: Vec<Vec<f32>> =
-                chunk.iter().map(|m| sanitize_features(&m.features)).collect();
-            let sql = format!(
-                "insert into des_soccer_config_moments \
-                 (run_id, experiment_id, team, tick, role, action, reward_micros, \
-                  nstep_return_micros, value_micros, embedding, features) \
-                 values {}",
-                config_moment_values_clause(chunk.len())
-            );
-            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&run_id, &experiment_id];
-            for (i, moment) in chunk.iter().enumerate() {
-                params.push(&teams[i]);
-                params.push(&ticks[i]);
-                params.push(&roles[i]);
-                params.push(&moment.action);
-                params.push(&rewards[i]);
-                params.push(&returns[i]);
-                params.push(&values[i]);
-                params.push(&embeddings[i]);
-                params.push(&features[i]);
-            }
-            tx.execute(&sql, &params)
-                .map_err(|err| format!("insert soccer config moments: {err}"))?;
-        }
+        insert_config_moments_in_transaction(&mut tx, run_id, experiment_id, moments)?;
         tx.commit()
             .map_err(|err| format!("commit soccer config moments: {err}"))?;
         Ok(moments.len())
@@ -1832,11 +1794,20 @@ impl SoccerLearningPgStore {
             return Ok(Vec::new());
         }
         self.ensure_connected()?;
+        let has_config_moments = runs.iter().any(|run| !run.game.config_moments.is_empty());
+        if has_config_moments {
+            for run in runs {
+                validate_config_moments(&run.game.config_moments)?;
+            }
+        }
 
         let mut tx = self
             .client
             .transaction()
             .map_err(|err| format!("begin soccer run batch transaction: {err}"))?;
+        if has_config_moments {
+            ensure_soccer_config_moment_tables(&mut tx)?;
+        }
         let mut run_ids = Vec::with_capacity(runs.len());
         for chunk in runs.chunks(SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE) {
             let chunk_run_ids = insert_completed_run_headers_in_transaction(
@@ -1846,6 +1817,18 @@ impl SoccerLearningPgStore {
                 chunk,
             )?;
             insert_completed_run_delta_rows_in_transaction(&mut tx, &chunk_run_ids, chunk)?;
+            if has_config_moments {
+                for (run_id, run) in chunk_run_ids.iter().zip(chunk.iter()) {
+                    if !run.game.config_moments.is_empty() {
+                        insert_config_moments_in_transaction(
+                            &mut tx,
+                            Some(run_id.as_str()),
+                            Some(experiment_id),
+                            &run.game.config_moments,
+                        )?;
+                    }
+                }
+            }
             run_ids.extend(chunk_run_ids);
         }
         tx.commit()
@@ -3562,6 +3545,79 @@ fn sanitize_features(features: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+fn validate_config_moments(moments: &[SoccerConfigMomentInsert]) -> Result<(), String> {
+    for moment in moments {
+        if moment.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            return Err(format!(
+                "config moment embedding has {} dims, expected {SOCCER_MOMENT_EMBEDDING_DIM}",
+                moment.embedding.len()
+            ));
+        }
+        if moment.features.len() != CONFIG_FEATURE_DIM {
+            return Err(format!(
+                "config moment features have {} dims, expected {CONFIG_FEATURE_DIM}",
+                moment.features.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn insert_config_moments_in_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: Option<&str>,
+    experiment_id: Option<&str>,
+    moments: &[SoccerConfigMomentInsert],
+) -> Result<(), String> {
+    // Chunked multi-row insert: 9 params per row plus the 2 shared run/experiment
+    // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
+    // 65535-parameter ceiling.
+    for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
+        let teams: Vec<&'static str> = chunk.iter().map(|m| soccer_team_label(m.team)).collect();
+        let ticks: Vec<i64> = chunk.iter().map(|m| checked_i64(m.tick)).collect();
+        let roles: Vec<&'static str> = chunk.iter().map(|m| soccer_role_label(m.role)).collect();
+        let rewards: Vec<i64> = chunk
+            .iter()
+            .map(|m| soccer_learning_to_micros(m.reward))
+            .collect();
+        let returns: Vec<i64> = chunk
+            .iter()
+            .map(|m| soccer_learning_to_micros(m.nstep_return))
+            .collect();
+        let values: Vec<Option<i64>> = chunk
+            .iter()
+            .map(|m| m.value.map(soccer_learning_to_micros))
+            .collect();
+        let embeddings: Vec<String> = chunk.iter().map(|m| pg_vector_text(&m.embedding)).collect();
+        let features: Vec<Vec<f32>> = chunk
+            .iter()
+            .map(|m| sanitize_features(&m.features))
+            .collect();
+        let sql = format!(
+            "insert into des_soccer_config_moments \
+             (run_id, experiment_id, team, tick, role, action, reward_micros, \
+              nstep_return_micros, value_micros, embedding, features) \
+             values {}",
+            config_moment_values_clause(chunk.len())
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&run_id, &experiment_id];
+        for (i, moment) in chunk.iter().enumerate() {
+            params.push(&teams[i]);
+            params.push(&ticks[i]);
+            params.push(&roles[i]);
+            params.push(&moment.action);
+            params.push(&rewards[i]);
+            params.push(&returns[i]);
+            params.push(&values[i]);
+            params.push(&embeddings[i]);
+            params.push(&features[i]);
+        }
+        tx.execute(&sql, &params)
+            .map_err(|err| format!("insert soccer config moments: {err}"))?;
+    }
+    Ok(())
+}
+
 /// Max config moments per multi-row insert. Each row binds 9 params plus the 2
 /// shared run/experiment ids, so 256 rows = 2306 params — well under the ceiling.
 const CONFIG_MOMENT_INSERT_CHUNK_ROWS: usize = 256;
@@ -3601,6 +3657,7 @@ fn config_moment_values_clause(rows: usize) -> String {
 fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
     tx.batch_execute(&format!(
         r#"
+        create extension if not exists pgcrypto;
         create extension if not exists vector;
         create table if not exists des_soccer_config_moments (
           id uuid primary key default gen_random_uuid(),
@@ -3618,14 +3675,20 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
           created_at timestamptz not null default now(),
           constraint des_soccer_config_moments_team_chk check (team in ('home','away')),
           constraint des_soccer_config_moments_features_len_chk
-            check (array_length(features, 1) = {features})
+            check (array_length(features, 1) in ({legacy_features}, {features}))
         );
+        alter table des_soccer_config_moments
+          drop constraint if exists des_soccer_config_moments_features_len_chk;
+        alter table des_soccer_config_moments
+          add constraint des_soccer_config_moments_features_len_chk
+            check (array_length(features, 1) in ({legacy_features}, {features}));
         create index if not exists des_soccer_config_moments_hnsw
           on des_soccer_config_moments using hnsw (embedding vector_cosine_ops);
         create index if not exists des_soccer_config_moments_run_idx
           on des_soccer_config_moments (run_id);
         "#,
         dim = SOCCER_MOMENT_EMBEDDING_DIM,
+        legacy_features = CONFIG_FEATURE_DIM_V1,
         features = CONFIG_FEATURE_DIM
     ))
     .map_err(|err| format!("ensure soccer config moment tables: {err}"))
@@ -3634,6 +3697,7 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
 fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
     tx.batch_execute(&format!(
         r#"
+        create extension if not exists pgcrypto;
         create extension if not exists vector;
         create table if not exists des_soccer_moment_embeddings (
           id uuid primary key default gen_random_uuid(),
@@ -4285,6 +4349,13 @@ mod tests {
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 9;
         assert!(params < 65535, "chunk uses {params} params");
+    }
+
+    #[test]
+    fn config_moment_feature_width_tracks_holder_channel_migration() {
+        assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
+        assert_eq!(CONFIG_FEATURE_DIM, 164);
+        assert!(CONFIG_FEATURE_DIM > CONFIG_FEATURE_DIM_V1);
     }
 
     #[test]

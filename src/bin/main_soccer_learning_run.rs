@@ -12,11 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
-    SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
-    SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams,
-    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
+    SoccerConfigMomentInsert, SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
+    SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
+    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
+    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
 };
 use soccer_engine::des::soccer_learning::{
     evolve_soccer_tactical_learning_weights_from_genomes, evolve_soccer_team_policies,
@@ -876,6 +876,7 @@ struct CompletedGame {
     starting_policy_generation: i32,
     starting_tactical_learning: SoccerTacticalLearningWeights,
     policies: SoccerTeamQPolicies,
+    config_moments: Vec<SoccerConfigMomentInsert>,
     neural_network: Option<SoccerNeuralNetworkSnapshot>,
     elapsed_seconds: f64,
 }
@@ -1657,6 +1658,7 @@ fn run_game(
     let progress_interval = (total_ticks / 9).max(1);
     let mut sim =
         SoccerMatch::default_11v11(config).with_team_policies((*starting_policies).clone());
+    sim.set_uniform_elite_players();
     if let Some(snapshot) = initial_neural_network.as_ref() {
         sim.set_neural_network_snapshot((**snapshot).clone())?;
     }
@@ -1686,6 +1688,7 @@ fn run_game(
         .team_policies()
         .cloned()
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
+    let config_moments = sim.config_moments();
     let mut artifact = sim.team_policy_artifact();
     let neural_network = if retain_neural_network_in_game_artifact {
         artifact.learning.neural_network.clone()
@@ -1711,6 +1714,7 @@ fn run_game(
         starting_policy_generation,
         starting_tactical_learning,
         policies,
+        config_moments,
         neural_network,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })
@@ -1823,6 +1827,7 @@ fn soccer_learning_completed_game_from_completed(
         policies: game.policies.clone(),
         score,
         delta,
+        config_moments: game.config_moments.clone(),
         neural_network: None,
         elapsed_seconds: game.elapsed_seconds,
     }
@@ -2465,6 +2470,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         pg_refresh_with_resume_artifact,
     );
     let mut pg_store = SoccerLearningPgStore::connect_from_env().map_err(invalid_data)?;
+    let retrieval_capture_enabled = env_bool_alias(
+        "SOCCER_RETRIEVAL_CAPTURE_ENABLED",
+        "SOCCER_RETRIEVAL_CAPTURE",
+        pg_store.is_some(),
+    )?;
+    config.retrieval.capture_enabled = retrieval_capture_enabled;
     let mut pg_experiment_slug = None::<String>;
     let mut pg_experiment_id = None::<String>;
     let mut pg_base_policy_version_id = None::<String>;
@@ -2538,11 +2549,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         println!(
-            "postgres_enabled experiment={} experiment_id={} base_policy_version={} generation={}",
+            "postgres_enabled experiment={} experiment_id={} base_policy_version={} generation={} retrieval_capture={}",
             experiment_slug,
             experiment_id,
             pg_base_policy_version_id.as_deref().unwrap_or("none"),
-            pg_generation
+            pg_generation,
+            config.retrieval.capture_enabled
         );
         pg_experiment_slug = Some(experiment_slug);
         pg_experiment_id = Some(experiment_id);
@@ -3448,6 +3460,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soccer_engine::des::general::soccer::{
+        PlayerRole, Team, CONFIG_FEATURE_DIM, SOCCER_MOMENT_EMBEDDING_DIM,
+    };
     use std::sync::Mutex;
 
     static SOCCER_RUN_PG_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -3813,6 +3828,7 @@ mod tests {
             starting_policy_generation: 0,
             starting_tactical_learning,
             policies,
+            config_moments: Vec::new(),
             neural_network: None,
             elapsed_seconds: 0.0,
         }
@@ -3862,6 +3878,7 @@ mod tests {
             starting_policy_generation: 3,
             starting_tactical_learning: SoccerTacticalLearningWeights::default(),
             policies,
+            config_moments: Vec::new(),
             neural_network: None,
             elapsed_seconds: 0.0,
         };
@@ -3872,6 +3889,40 @@ mod tests {
         assert_eq!(completed.delta.entries[0].visit_delta, 3);
         assert_eq!(completed.delta.entries[0].before_value, 1.0);
         assert_eq!(completed.delta.entries[0].after_value, 3.0);
+    }
+
+    #[test]
+    fn completed_game_conversion_preserves_config_moments() {
+        let mut game = completed_game_with_starting_tactical_learning(
+            0,
+            SoccerTacticalLearningWeights::default(),
+            SoccerTacticalLearningSummary::default(),
+        );
+        game.config_moments.push(SoccerConfigMomentInsert {
+            team: Team::Home,
+            tick: 42,
+            role: PlayerRole::Midfielder,
+            action: "pass-forward".to_string(),
+            reward: -0.25,
+            nstep_return: -0.75,
+            value: Some(-0.5),
+            embedding: vec![0.0; SOCCER_MOMENT_EMBEDDING_DIM],
+            features: vec![0.0; CONFIG_FEATURE_DIM],
+        });
+
+        let completed = soccer_learning_completed_game_from_completed(&game);
+
+        assert_eq!(completed.config_moments.len(), 1);
+        assert_eq!(completed.config_moments[0].tick, 42);
+        assert_eq!(completed.config_moments[0].action, "pass-forward");
+        assert_eq!(
+            completed.config_moments[0].features.len(),
+            CONFIG_FEATURE_DIM
+        );
+        assert_eq!(
+            completed.config_moments[0].embedding.len(),
+            SOCCER_MOMENT_EMBEDDING_DIM
+        );
     }
 
     #[test]
