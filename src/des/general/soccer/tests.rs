@@ -11297,7 +11297,7 @@ fn midfield_line_holds_band_in_front_of_defenders() {
 }
 
 #[test]
-fn defensive_line_does_not_drop_more_than_30yd_behind_when_defending() {
+fn defensive_line_does_not_drop_more_than_25yd_behind_when_defending() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 22,
@@ -11325,10 +11325,10 @@ fn defensive_line_does_not_drop_more_than_30yd_behind_when_defending() {
     sim.ball.position = Vec2::new(40.0, 60.0);
     sim.ball.last_touch_team = Some(Team::Away);
     let snap = WorldSnapshot::from_match(&sim);
-    let pushed = snap.defensive_line_cushion_adjusted_target(home_def[0], Vec2::new(30.0, 20.0));
+    let pushed = snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 20.0));
     assert!(
         pushed.y > 20.0,
-        "defending back line must not sit more than 30yd behind the ball: {pushed:?}"
+        "defending back line must not sit more than 25yd behind the ball: {pushed:?}"
     );
 }
 
@@ -11352,7 +11352,7 @@ fn defensive_line_cushion_drops_off_and_pushes_up_with_the_ball() {
         .find(|p| p.team == Team::Away)
         .map(|p| p.id)
         .unwrap();
-    let test_def = home_def[0];
+    let test_def = home_def[1];
     for &d in &home_def {
         sim.players[d].role = PlayerRole::Defender;
         sim.players[d].position = Vec2::new(30.0, 50.0);
@@ -11399,6 +11399,61 @@ fn defensive_line_cushion_drops_off_and_pushes_up_with_the_ball() {
 }
 
 #[test]
+fn defensive_line_cushion_allows_one_ball_defender_but_holds_other_three() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 23,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .take(4)
+        .collect();
+    let away_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .map(|p| p.id)
+        .unwrap();
+    for &d in &home_def {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(30.0, 20.0);
+    }
+    sim.players[home_def[0]].position = Vec2::new(40.0, 59.5);
+    sim.players[away_id].position = Vec2::new(40.0, 60.0);
+    sim.ball.holder = Some(away_id);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let exempt = snap.defensive_line_cushion_adjusted_target(home_def[0], Vec2::new(40.0, 59.5));
+    assert!(
+        exempt.y > sim.ball.position.y - 1.0,
+        "the closest defender may be the one ball-engagement exemption: {exempt:?}"
+    );
+
+    let other_targets: Vec<Vec2> = home_def[1..]
+        .iter()
+        .map(|&id| snap.defensive_line_cushion_adjusted_target(id, Vec2::new(30.0, 20.0)))
+        .collect();
+    let other_mean_y =
+        other_targets.iter().map(|target| target.y).sum::<f64>() / other_targets.len() as f64;
+    assert!(
+        other_mean_y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS,
+        "the other three defenders must pull the line back inside 25yd: {other_targets:?}"
+    );
+    assert!(
+        other_mean_y <= sim.ball.position.y - 1.0,
+        "the other three defenders should still stay goal-side of the ball: {other_targets:?}"
+    );
+}
+
+#[test]
 fn defensive_line_cushion_shrinks_as_ball_nears_own_goal() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -11418,7 +11473,7 @@ fn defensive_line_cushion_shrinks_as_ball_nears_own_goal() {
         .find(|p| p.team == Team::Away)
         .map(|p| p.id)
         .unwrap();
-    let test_def = home_def[0];
+    let test_def = home_def[1];
     // Home defends the y=0 goal. Put the back four deep (y=5) with a settled opponent ball
     // at the 18yd box (y=18). The OLD fixed 20yd cushion would demand the line sit 20yd
     // behind the ball -> y=-2 (in the net). The shrink must instead hold a 3yd cushion
@@ -34321,16 +34376,12 @@ fn back_line_steps_up_and_wingbacks_slide_to_the_ball() {
         / defenders.len() as f64;
     // Home defends the low-y goal; the ball is upfield at l*0.58, so "no more
     // than 25yd behind" means the line average sits at/above (ball_y - 25).
-    // ~25yd behind, plus a small allowance for the break-threat relaxation; the
-    // point is it steps up to fill space rather than dropping into its own third.
+    // The point is it steps up to fill space rather than dropping into its own third.
     assert!(
-            mean_line_y
-                >= sim.ball.position.y
-                    - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS
-                    - DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS,
-            "the back line should step up to within ~25yd of the ball, not drop deep (mean line y={mean_line_y:.1}, ball y={:.1})",
-            sim.ball.position.y
-        );
+        mean_line_y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS,
+        "the back line should step up to within ~25yd of the ball, not drop deep (mean line y={mean_line_y:.1}, ball y={:.1})",
+        sim.ball.position.y
+    );
 
     // (2) The far-side (right) wing-back slides across toward the wide-left ball,
     //     well inside its wide home — wing-backs shuttle to the ball.
@@ -38206,8 +38257,8 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
     );
     assert!(
         snapshot.ball.position.y - target.y
-            <= max_gap + DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS + 1e-9,
-        "defender target should stay within the break-relaxed line band: {target:?}"
+            <= max_gap.min(DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS) + 1e-9,
+        "defender target should stay within the 25yd-capped line band: {target:?}"
     );
 }
 
@@ -38234,7 +38285,7 @@ fn defensive_assignment_uses_permuted_genome_line_band() {
     };
 
     let high_line_y = target_y_for_band(0); // 1..20 yd band
-    let deeper_line_y = target_y_for_band(14); // 3..29 yd band
+    let deeper_line_y = target_y_for_band(14); // 3..25 yd band
     assert!(
         high_line_y > deeper_line_y + 4.0,
         "smaller evolved max gap should hold the line higher: high={high_line_y} deep={deeper_line_y}"
@@ -38613,7 +38664,7 @@ fn defenders_retreat_from_six_yard_line_break_threshold() {
 }
 
 #[test]
-fn immediate_break_threat_allows_extra_retreat_without_endline_camping() {
+fn immediate_break_threat_still_respects_ordinary_ball_gap() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
     let threat = 17;
@@ -38627,29 +38678,25 @@ fn immediate_break_threat_allows_extra_retreat_without_endline_camping() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let (_, line_gap) = snapshot
+    let (_, _line_gap) = snapshot
         .opponent_breakthrough_ball_carrier(Team::Home)
         .expect("line-break threat");
-    let threat_fit = defensive_line_break_threat_fit(line_gap);
     let standard_floor = snapshot.ball.position.y - DEFENSIVE_MAX_BEHIND_BALL_YARDS;
-    let extra_floor = snapshot.ball.position.y
-        - (DEFENSIVE_MAX_BEHIND_BALL_YARDS
-            + DEFENSIVE_LINE_BREAK_EXTRA_BEHIND_BALL_YARDS * threat_fit);
     let target =
         snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
 
     assert!(
-            target.y < standard_floor - 0.75,
-            "immediate break threat should let the back four retreat deeper than the ordinary 30-yard ball gap: target={target:?} standard_floor={standard_floor}"
-        );
-    assert!(
-        target.y >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
-        "extra retreat must still respect the six-yard endline buffer: {target:?}"
+        target.y >= standard_floor - 1e-9,
+        "immediate break threat must still keep the back four inside the 25-yard ball gap: target={target:?} standard_floor={standard_floor}"
     );
     assert!(
-            target.y >= extra_floor - 1e-9,
-            "extra retreat should stay connected to the active threat cap: target={target:?} extra_floor={extra_floor}"
-        );
+        target.y >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
+        "retreat must still respect the six-yard endline buffer: {target:?}"
+    );
+    assert!(
+        snapshot.ball.position.y - target.y <= DEFENSIVE_MAX_BEHIND_BALL_YARDS + 1e-9,
+        "line-break retreat should stay connected to the ordinary cap: target={target:?}"
+    );
 }
 
 #[test]

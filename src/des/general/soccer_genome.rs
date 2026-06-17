@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub const PITCH_GENOME_LANES: u8 = 12;
 pub const PITCH_GENOME_ROWS: u8 = 24;
 pub const DEF_LINE_MIN_DISTANCE_CHOICES_YARDS: [f64; 3] = [1.0, 2.0, 3.0];
-pub const DEF_LINE_MAX_DISTANCE_CHOICES_YARDS: [f64; 5] = [20.0, 23.0, 25.0, 27.0, 29.0];
+pub const DEF_LINE_MAX_DISTANCE_CHOICES_YARDS: [f64; 5] = [20.0, 22.0, 23.0, 24.0, 25.0];
 pub const DEF_LINE_BAND_PERMUTATION_COUNT: usize =
     DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.len() * DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.len();
 
