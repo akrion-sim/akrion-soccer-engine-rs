@@ -1288,6 +1288,64 @@ fn relational_shape_nudges_out_of_shape_player_back_into_the_unit() {
 }
 
 #[test]
+fn relational_ball_compactness_refuses_same_pocket_teammate_clump() {
+    let mut config = MatchConfig::default();
+    config.spacing.relational_nudge_bias = 0.0;
+    let mut sim = SoccerMatch::default_11v11(config);
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 42.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 54.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 68.0);
+    }
+
+    let mover = mids[0];
+    let occupying_teammate = mids[1];
+    let target = Vec2::new(18.0, 54.0);
+    sim.players[mover].position = target;
+    sim.players[occupying_teammate].position = Vec2::new(20.9, 57.3);
+    sim.players[away_holder].position = Vec2::new(18.0, 74.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let intent = PlayerIntent {
+        player_id: mover,
+        action: SoccerAction::MoveTo(target),
+        sprint: false,
+    };
+    let SoccerAction::MoveTo(adjusted) = sim.relational_shape_disciplined_intent(intent).action
+    else {
+        panic!("expected a MoveTo");
+    };
+    assert!(
+        adjusted.distance(target) < 1e-6,
+        "ball compactness must not pull a player into a teammate's same x/y pocket: target={target:?} adjusted={adjusted:?}"
+    );
+}
+
+#[test]
 fn spacing_params_are_configurable_and_learnable_and_sanitized() {
     // Defaults equal the documented constants (the consts are the default source).
     let d = SoccerSpacingParams::default();
@@ -11771,6 +11829,60 @@ fn ball_proximity_nudge_respects_forward_midfield_padding() {
         adjusted.distance(target) < 1e-6,
         "ball pull must not collapse forwards inside the 3yd midfield padding: {adjusted:?}"
     );
+}
+
+#[test]
+fn ball_proximity_nudge_rejects_same_pocket_teammate_clump() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 2601,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 42.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 54.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 68.0);
+    }
+
+    let mover = mids[0];
+    let occupying_teammate = mids[1];
+    let target = Vec2::new(18.0, 54.0);
+    sim.players[mover].position = target;
+    sim.players[occupying_teammate].position = Vec2::new(20.9, 57.1);
+    sim.players[away_holder].position = Vec2::new(18.0, 60.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let (adjusted, sprint) = snap.ball_proximity_adjusted_target(mover, target);
+    assert!(
+        adjusted.distance(target) < 1e-6,
+        "ball pull must not accept a candidate that is radially legal but too close on both axes: target={target:?} adjusted={adjusted:?}"
+    );
+    assert!(!sprint, "settled opponent possession should not sprint");
 }
 
 #[test]

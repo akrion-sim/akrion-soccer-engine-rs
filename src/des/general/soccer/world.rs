@@ -3579,6 +3579,33 @@ impl SoccerMatch {
         near_goal_line && central
     }
 
+    fn teammate_axis_clump_pressure_at(
+        &self,
+        team: Team,
+        position: Vec2,
+        exclude_player_id: Option<usize>,
+    ) -> f64 {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return 0.0;
+        }
+        let axis_radius = if self.point_in_either_penalty_area(position) {
+            TEAMMATE_MIN_SPACING_BOX_YARDS
+        } else {
+            TEAMMATE_MIN_SPACING_YARDS
+        };
+        self.players
+            .iter()
+            .filter(|player| player.team == team && exclude_player_id != Some(player.id))
+            .filter(|player| player.position.x.is_finite() && player.position.y.is_finite())
+            .map(|player| {
+                teammate_axis_clump_pressure_from_delta_with_radius(
+                    player.position - position,
+                    axis_radius,
+                )
+            })
+            .fold(0.0, f64::max)
+    }
+
     /// True if `p` is inside `team`'s OWN 18-yard penalty area (the box in front of the goal
     /// they defend): Home defends the y=0 end, Away the y=field_length end. Mirrors the
     /// identically-named [`WorldSnapshot`] helper, used for Law 16 goal-kick enforcement.
@@ -3638,15 +3665,26 @@ impl SoccerMatch {
                 .iter()
                 .filter(|&&(other_id, other_team, _, _)| other_team == team && other_id != id)
                 .map(|&(other_id, _, other_pos, other_home)| {
-                    (other_id, other_pos, other_home, pos.distance(other_pos))
+                    let delta = other_pos - pos;
+                    let distance = (delta.x * delta.x + delta.y * delta.y).sqrt();
+                    let occupied_pressure =
+                        teammate_occupied_space_pressure_from_distance(distance)
+                            .max(teammate_axis_clump_pressure_from_delta(delta));
+                    (other_id, other_pos, other_home, distance, occupied_pressure)
                 })
-                // Nearest teammate, ties broken by id for determinism.
-                .min_by(|a, b| {
-                    a.3.partial_cmp(&b.3)
+                // Most crowded teammate, ties broken by nearest distance and id for determinism.
+                .max_by(|a, b| {
+                    a.4.partial_cmp(&b.4)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.0.cmp(&b.0))
+                        .then_with(|| {
+                            b.3.partial_cmp(&a.3)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then(b.0.cmp(&a.0))
                 });
-            let Some((partner_id, partner_pos, partner_home, distance)) = nearest else {
+            let Some((partner_id, partner_pos, partner_home, distance, _occupied_pressure)) =
+                nearest
+            else {
                 self.teammate_spacing_near_clocks.remove(&id);
                 self.teammate_spacing_far_clocks.remove(&id);
                 continue;
@@ -3660,9 +3698,13 @@ impl SoccerMatch {
             };
             let near_radius = (params.near_radius_yards - box_cut).max(0.0);
             let far_radius = (params.far_radius_yards - box_cut).max(0.0);
+            let axis_pressure =
+                teammate_axis_clump_pressure_from_delta_with_radius(partner_pos - pos, far_radius);
 
             let decay = dt * params.clock_decay_rate;
-            let near_elapsed = if distance <= near_radius {
+            let near_elapsed = if distance <= near_radius
+                || axis_pressure >= TEAMMATE_AXIS_CLUMP_NEAR_PRESSURE
+            {
                 let elapsed = self.teammate_spacing_near_clocks.entry(id).or_insert(0.0);
                 *elapsed += dt;
                 *elapsed
@@ -3682,7 +3724,9 @@ impl SoccerMatch {
                     0.0
                 }
             };
-            let far_elapsed = if distance <= far_radius {
+            let far_elapsed = if distance <= far_radius
+                || axis_pressure > TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
+            {
                 let elapsed = self.teammate_spacing_far_clocks.entry(id).or_insert(0.0);
                 *elapsed += dt;
                 *elapsed
@@ -3781,13 +3825,20 @@ impl SoccerMatch {
 
         // If the player's own decided move already clears the radius, it is vacating on
         // its own — leave the plan alone.
-        if decided_target.is_some() && target.distance(partner_pos) >= min_spacing {
+        let target_axis_pressure =
+            teammate_axis_clump_pressure_from_delta_with_radius(target - partner_pos, min_spacing);
+        if decided_target.is_some()
+            && target.distance(partner_pos) >= min_spacing
+            && target_axis_pressure <= TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
+        {
             return intent;
         }
 
         // How far inside the minimum-spacing ring the decided target sits. The nudge
         // closes a bounded fraction of this each tick — a bias, not a snap.
-        let deficit = (min_spacing - target.distance(partner_pos)).max(0.0);
+        let radial_deficit = (min_spacing - target.distance(partner_pos)).max(0.0);
+        let axis_deficit = target_axis_pressure * min_spacing;
+        let deficit = radial_deficit.max(axis_deficit);
         if deficit <= 1e-6 {
             return intent;
         }
@@ -4135,7 +4186,15 @@ impl SoccerMatch {
             let pull = ((ball_dist - BALL_COMPACTNESS_DEADZONE_YARDS) * gain).min(max_pull);
             let cand = working + to_ball.normalized() * pull;
             if cand.x.is_finite() && cand.y.is_finite() {
-                working = cand;
+                let base_axis_pressure =
+                    self.teammate_axis_clump_pressure_at(me.team, working, Some(me.id));
+                let candidate_axis_pressure =
+                    self.teammate_axis_clump_pressure_at(me.team, cand, Some(me.id));
+                if candidate_axis_pressure
+                    <= base_axis_pressure + TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
+                {
+                    working = cand;
+                }
             }
         }
         // Fore-aft (inter-line) band: cap the (now ball-pulled) target's depth into the
@@ -13581,11 +13640,13 @@ pub(crate) struct KillerPassTargetAssessment {
 pub(crate) struct CandidateOccupancy {
     pub(crate) open_space_score: f64,
     pub(crate) nearest_teammate_distance: f64,
+    pub(crate) teammate_axis_clump_pressure: f64,
 }
 
 impl CandidateOccupancy {
     pub(crate) fn teammate_occupied_space_pressure(self) -> f64 {
         teammate_occupied_space_pressure_from_distance(self.nearest_teammate_distance)
+            .max(self.teammate_axis_clump_pressure)
     }
 
     pub(crate) fn teammate_occupied_space_penalty(self, relief: f64) -> f64 {
@@ -13595,8 +13656,36 @@ impl CandidateOccupancy {
     }
 
     pub(crate) fn team_spacing_score(self, mode: TeamSpacingMode) -> f64 {
-        spacing_score_from_distance(self.nearest_teammate_distance, mode)
+        (spacing_score_from_distance(self.nearest_teammate_distance, mode)
+            - self.teammate_axis_clump_pressure * 0.55)
+            .clamp(-1.0, 1.0)
     }
+}
+
+const TEAMMATE_AXIS_CLUMP_HARD_RADIUS_YARDS: f64 = 1.0;
+const TEAMMATE_AXIS_CLUMP_NEAR_PRESSURE: f64 = 0.50;
+const TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON: f64 = 1e-6;
+
+fn teammate_axis_clump_pressure_from_delta(delta: Vec2) -> f64 {
+    teammate_axis_clump_pressure_from_delta_with_radius(delta, TEAMMATE_MIN_SPACING_YARDS)
+}
+
+fn teammate_axis_clump_pressure_from_delta_with_radius(delta: Vec2, radius: f64) -> f64 {
+    fn axis_pressure_with_radius(gap: f64, radius: f64) -> f64 {
+        let radius = radius.max(0.0);
+        if !gap.is_finite() || gap >= radius || radius <= 1e-6 {
+            0.0
+        } else {
+            let hard_radius = TEAMMATE_AXIS_CLUMP_HARD_RADIUS_YARDS.min(radius * 0.5);
+            if gap <= hard_radius {
+                return 1.0;
+            }
+            ((radius - gap) / (radius - hard_radius).max(1e-6)).clamp(0.0, 1.0)
+        }
+    }
+
+    axis_pressure_with_radius(delta.x.abs(), radius)
+        .min(axis_pressure_with_radius(delta.y.abs(), radius))
 }
 
 impl TeamSpacingMode {
@@ -13656,9 +13745,18 @@ pub(crate) fn open_space_score_from_distances(
     opponent_distance: f64,
     teammate_crowding: f64,
 ) -> f64 {
+    open_space_score_from_distances_with_axis_pressure(opponent_distance, teammate_crowding, 0.0)
+}
+
+fn open_space_score_from_distances_with_axis_pressure(
+    opponent_distance: f64,
+    teammate_crowding: f64,
+    teammate_axis_clump_pressure: f64,
+) -> f64 {
     let opponent_distance = opponent_distance.min(35.0);
     let teammate_crowding = teammate_crowding.min(25.0);
-    let teammate_pressure = teammate_occupied_space_pressure_from_distance(teammate_crowding);
+    let teammate_pressure = teammate_occupied_space_pressure_from_distance(teammate_crowding)
+        .max(teammate_axis_clump_pressure);
     opponent_distance * 0.68 + teammate_crowding * 0.32
         - TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY * teammate_pressure * 0.72
 }
@@ -14688,6 +14786,12 @@ impl WorldSnapshot {
         let mut opponent_distance_sq: f64 = 35.0_f64.powi(2);
         let mut teammate_crowding_sq: f64 = 25.0_f64.powi(2);
         let mut nearest_teammate_distance_sq = f64::INFINITY;
+        let mut teammate_axis_clump_pressure: f64 = 0.0;
+        let axis_radius = if self.point_in_either_penalty_area(position) {
+            TEAMMATE_MIN_SPACING_BOX_YARDS
+        } else {
+            TEAMMATE_MIN_SPACING_YARDS
+        };
         for player in &self.players {
             let player_position = finite_pitch_point(
                 self.player_snapshot_position(player),
@@ -14705,6 +14809,9 @@ impl WorldSnapshot {
                 }
                 if exclude_player_id != Some(player.id) {
                     nearest_teammate_distance_sq = nearest_teammate_distance_sq.min(distance_sq);
+                    teammate_axis_clump_pressure = teammate_axis_clump_pressure.max(
+                        teammate_axis_clump_pressure_from_delta_with_radius(delta, axis_radius),
+                    );
                 }
             }
         }
@@ -14712,8 +14819,13 @@ impl WorldSnapshot {
         let teammate_crowding = teammate_crowding_sq.sqrt();
         let nearest_teammate_distance = nearest_teammate_distance_sq.sqrt();
         CandidateOccupancy {
-            open_space_score: open_space_score_from_distances(opponent_distance, teammate_crowding),
+            open_space_score: open_space_score_from_distances_with_axis_pressure(
+                opponent_distance,
+                teammate_crowding,
+                teammate_axis_clump_pressure,
+            ),
             nearest_teammate_distance,
+            teammate_axis_clump_pressure,
         }
     }
 
@@ -14735,6 +14847,16 @@ impl WorldSnapshot {
     ) -> f64 {
         self.candidate_occupancy_at(team, position, exclude_player_id)
             .teammate_occupied_space_pressure()
+    }
+
+    pub(crate) fn teammate_axis_clump_pressure_at(
+        &self,
+        team: Team,
+        position: Vec2,
+        exclude_player_id: Option<usize>,
+    ) -> f64 {
+        self.candidate_occupancy_at(team, position, exclude_player_id)
+            .teammate_axis_clump_pressure
     }
 
     pub(crate) fn teammate_occupied_space_penalty_at(
@@ -21113,6 +21235,11 @@ impl WorldSnapshot {
         };
         if self.nearest_teammate_distance_at(player.team, candidate, Some(player.id))
             < teammate_padding
+        {
+            return false;
+        }
+        if self.teammate_axis_clump_pressure_at(player.team, candidate, Some(player.id))
+            > TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
         {
             return false;
         }

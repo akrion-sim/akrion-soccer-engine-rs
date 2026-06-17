@@ -2253,6 +2253,7 @@ impl PlayerAgent {
         let release_pressure = pressure_urgency
             .max(pressure)
             .max(observation.immediate_dispossession_risk)
+            .max(defender_crowding)
             .clamp(0.0, 1.0);
         if pass_target_count > 0
             && hold_pressure >= 0.12
@@ -2268,6 +2269,18 @@ impl PlayerAgent {
                 + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.10)
                 .clamp(0.28, 0.68 + open_support_fit * 0.16);
             ensure_min_legal_option_probability(&mut options, "pass1", release_floor);
+        }
+        if pass_target_count > 0
+            && defender_crowding >= 0.30
+            && open_outlet_fit >= 0.55
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let spacing_release_floor = (0.42
+                + defender_crowding * 0.34
+                + open_outlet_fit * 0.16
+                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.08)
+                .clamp(0.50, 0.78);
+            ensure_min_legal_option_probability(&mut options, "pass1", spacing_release_floor);
         }
         if clearance_legal && hold_pressure >= 0.16 && release_pressure >= 0.42 {
             let danger_clearance_floor =

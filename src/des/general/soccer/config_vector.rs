@@ -517,16 +517,106 @@ mod tests {
         let (w, l) = (mirror.field_width, mirror.field_length);
         let flip_pos = |v: Vec2| Vec2::new(w - v.x, l - v.y);
         let flip_vec = |v: Vec2| Vec2::new(-v.x, -v.y);
+        let flip_team = |team: Option<Team>| team.map(Team::other);
         for p in &mut mirror.players {
             p.position = flip_pos(p.position);
+            for history_position in &mut p.position_history {
+                *history_position = flip_pos(*history_position);
+            }
+            p.home_position = flip_pos(p.home_position);
             p.velocity = flip_vec(p.velocity);
             p.acceleration = flip_vec(p.acceleration);
+            p.jerk = flip_vec(p.jerk);
+            if let Some(incoming) = &mut p.incoming_ball {
+                incoming.team = flip_team(incoming.team);
+                incoming.origin = incoming.origin.map(flip_pos);
+                incoming.intended_target = incoming.intended_target.map(flip_pos);
+            }
+            if let Some(one_two) = &mut p.one_two {
+                one_two.return_target = flip_pos(one_two.return_target);
+            }
             p.team = p.team.other();
         }
         mirror.ball.position = flip_pos(mirror.ball.position);
         mirror.ball.velocity = flip_vec(mirror.ball.velocity);
         mirror.ball.acceleration = flip_vec(mirror.ball.acceleration);
+        mirror.ball.jerk = flip_vec(mirror.ball.jerk);
+        mirror.ball.curl_acceleration = flip_vec(mirror.ball.curl_acceleration);
+        mirror.ball.last_touch_team = flip_team(mirror.ball.last_touch_team);
+        for sample in &mut mirror.ball_history {
+            sample.position = flip_pos(sample.position);
+            sample.velocity = flip_vec(sample.velocity);
+            sample.acceleration = flip_vec(sample.acceleration);
+            sample.jerk = flip_vec(sample.jerk);
+            sample.curl_acceleration = flip_vec(sample.curl_acceleration);
+            sample.last_touch_team = flip_team(sample.last_touch_team);
+        }
+        if let Some(pass) = &mut mirror.pending_pass {
+            pass.team = pass.team.other();
+            pass.origin = flip_pos(pass.origin);
+            pass.intended_target = flip_pos(pass.intended_target);
+            pass.receiver_position_at_launch = pass.receiver_position_at_launch.map(flip_pos);
+            pass.receiver_velocity_at_launch = pass.receiver_velocity_at_launch.map(flip_vec);
+            if let Some(offside) = &mut pass.offside {
+                offside.team = offside.team.other();
+                offside.position = flip_pos(offside.position);
+                offside.ball_y = l - offside.ball_y;
+                offside.second_last_defender_y = l - offside.second_last_defender_y;
+            }
+        }
+        if let Some(rebound) = &mut mirror.pending_rebound {
+            rebound.attacking_team = rebound.attacking_team.other();
+            rebound.parry_position = flip_pos(rebound.parry_position);
+        }
+        for sample in &mut mirror.shared_positions.latest {
+            sample.position = flip_pos(sample.position);
+            sample.velocity = flip_vec(sample.velocity);
+            sample.acceleration = flip_vec(sample.acceleration);
+            sample.jerk = flip_vec(sample.jerk);
+        }
+        for history in mirror.shared_positions.histories.values_mut() {
+            for sample in history {
+                sample.position = flip_pos(sample.position);
+                sample.velocity = flip_vec(sample.velocity);
+                sample.acceleration = flip_vec(sample.acceleration);
+                sample.jerk = flip_vec(sample.jerk);
+            }
+        }
+        for sample in &mut mirror.shared_positions.official_latest {
+            sample.position = flip_pos(sample.position);
+            sample.velocity = flip_vec(sample.velocity);
+            sample.acceleration = flip_vec(sample.acceleration);
+            sample.jerk = flip_vec(sample.jerk);
+        }
+        for history in mirror.shared_positions.official_histories.values_mut() {
+            for sample in history {
+                sample.position = flip_pos(sample.position);
+                sample.velocity = flip_vec(sample.velocity);
+                sample.acceleration = flip_vec(sample.acceleration);
+                sample.jerk = flip_vec(sample.jerk);
+            }
+        }
+        if let Some(sample) = &mut mirror.shared_positions.ball_latest {
+            sample.position = flip_pos(sample.position);
+            sample.velocity = flip_vec(sample.velocity);
+            sample.acceleration = flip_vec(sample.acceleration);
+            sample.jerk = flip_vec(sample.jerk);
+            sample.curl_acceleration = flip_vec(sample.curl_acceleration);
+            sample.last_touch_team = flip_team(sample.last_touch_team);
+        }
+        for sample in &mut mirror.shared_positions.ball_history {
+            sample.position = flip_pos(sample.position);
+            sample.velocity = flip_vec(sample.velocity);
+            sample.acceleration = flip_vec(sample.acceleration);
+            sample.jerk = flip_vec(sample.jerk);
+            sample.curl_acceleration = flip_vec(sample.curl_acceleration);
+            sample.last_touch_team = flip_team(sample.last_touch_team);
+        }
         std::mem::swap(&mut mirror.score_home, &mut mirror.score_away);
+        std::mem::swap(
+            &mut mirror.home_team_possession_seconds,
+            &mut mirror.away_team_possession_seconds,
+        );
         // Relabelling the teams also relabels which side each phase belongs to.
         mirror.phase = match mirror.phase {
             TacticalPhase::HomeBuildUp => TacticalPhase::AwayBuildUp,
@@ -537,10 +627,18 @@ mod tests {
         };
 
         let away_of_mirror = SoccerConfigVector::from_snapshot(&mirror, Team::Away).to_features();
+        let similarity = cosine(&home, &away_of_mirror);
+        let largest_diffs = home
+            .iter()
+            .zip(away_of_mirror.iter())
+            .enumerate()
+            .map(|(idx, (a, b))| (idx, *a, *b, (*a - *b).abs()))
+            .filter(|(_, _, _, diff)| *diff > 1e-9)
+            .collect::<Vec<_>>();
         assert!(
-            cosine(&home, &away_of_mirror) > 0.999,
-            "board-flip + relabel must canonicalise identically (got {})",
-            cosine(&home, &away_of_mirror)
+            similarity > 0.999,
+            "board-flip + relabel must canonicalise identically (got {similarity}; diffs {:?})",
+            largest_diffs.iter().take(12).collect::<Vec<_>>()
         );
     }
 
