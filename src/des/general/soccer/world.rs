@@ -20626,8 +20626,9 @@ impl WorldSnapshot {
     /// attacking axis by the amount the line's average is outside the band, so the whole line
     /// steps up (in possession) or drops off (opponent has the ball upfield) together while
     /// keeping its left-right shape. While defending, exactly one closest defender may break the
-    /// band to engage the ball; the remaining defenders carry the line rule. Returns the target
-    /// unchanged when the line is already in band or the player isn't a free off-ball defender.
+    /// band to engage the ball; the remaining defenders carry the line rule. Every tick aims
+    /// those line-bound defenders at the correction needed for consistency inside the 2-second
+    /// horizon, while accepting that physics/traffic may make the actual arrival slower.
     pub(crate) fn defensive_line_cushion_adjusted_target(
         &self,
         player_id: usize,
@@ -20676,11 +20677,10 @@ impl WorldSnapshot {
             .sum::<f64>()
             / line_defenders.len() as f64;
         let ball_fwd = fwd(self.ball.position);
-        let gap = ball_fwd - avg_fwd; // > 0 when the line sits behind the ball (the normal case)
-                                      // The band is suspended only with the ball on/near a goal line (forcing "2yd
-                                      // behind" there would shove the line off the end-line). Otherwise it applies
-                                      // even when the line has drifted AHEAD of the ball (gap <= 0) — that's exactly
-                                      // the build-up bug we must pull back, so do NOT bail here.
+        // The band is suspended only with the ball on/near a goal line (forcing "2yd
+        // behind" there would shove the line off the end-line). Otherwise it applies
+        // even when the line has drifted AHEAD of the ball (gap <= 0) — that's exactly
+        // the build-up bug we must pull back, so do NOT bail here.
         let ball_y = self.ball.position.y;
         if ball_y <= DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
             || ball_y >= self.field_length - DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
@@ -20725,7 +20725,6 @@ impl WorldSnapshot {
             .max(DEFENSIVE_LINE_GAP_FLOOR_YARDS);
         let max_gap = max_gap.min(goal_proximity_gap_ceiling);
         let min_gap = min_gap.min(max_gap); // keep the band valid (min ≤ max) when it shrinks
-        let desired_gap = gap.clamp(min_gap, max_gap);
         // In possession the line may push up, but no more than ~5yd past the halfway line.
         let halfway_fwd = own_goal_fwd + self.field_length * 0.5;
         let max_avg_fwd = halfway_fwd + DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS;
@@ -20736,14 +20735,35 @@ impl WorldSnapshot {
         let predicted_ball_fwd =
             fwd(self.predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS));
         let predicted_ceiling_avg_fwd = predicted_ball_fwd - max_gap;
-        let desired_avg_fwd = (ball_fwd - desired_gap)
-            .max(predicted_ceiling_avg_fwd)
-            .min(max_avg_fwd);
-        if (desired_avg_fwd - avg_fwd).abs() < 1e-6 {
-            return target;
-        }
-        let delta = desired_avg_fwd - avg_fwd;
-        let adjusted_y = (target.y + delta * attack_dir).clamp(0.0, self.field_length);
+        let line_band_avg_fwd = |avg: f64| {
+            avg.clamp(ball_fwd - max_gap, ball_fwd - min_gap)
+                .max(predicted_ceiling_avg_fwd)
+                .min(max_avg_fwd)
+        };
+        let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
+        let current_fwd = fwd(self.player_snapshot_position(me));
+        let target_fwd = fwd(target);
+        let horizon = DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let current_delta = desired_avg_fwd - avg_fwd;
+        let adjusted_fwd = if current_delta.abs() > 1e-6 {
+            let correction_yps = current_delta / horizon;
+            current_fwd + correction_yps * horizon
+        } else {
+            let peer_sum_fwd = line_defenders
+                .iter()
+                .filter(|p| p.id != player_id)
+                .map(|p| fwd(self.player_snapshot_position(p)))
+                .sum::<f64>();
+            let line_count = line_defenders.len() as f64;
+            let projected_avg_fwd = (peer_sum_fwd + target_fwd) / line_count;
+            let desired_projected_avg_fwd = line_band_avg_fwd(projected_avg_fwd);
+            let projected_delta = desired_projected_avg_fwd - projected_avg_fwd;
+            if projected_delta.abs() < 1e-6 {
+                return target;
+            }
+            target_fwd + projected_delta * line_count
+        };
+        let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
         return Vec2::new(target.x, adjusted_y);
     }
 
@@ -20751,6 +20771,9 @@ impl WorldSnapshot {
     fn defensive_line_cushion_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.defensive_line_cushion_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+            }
             intent.action = SoccerAction::MoveTo(adjusted);
         }
         return intent;

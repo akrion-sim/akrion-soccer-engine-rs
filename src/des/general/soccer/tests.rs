@@ -11454,6 +11454,51 @@ fn defensive_line_cushion_allows_one_ball_defender_but_holds_other_three() {
 }
 
 #[test]
+fn defensive_line_cushion_clamps_two_second_target_when_line_already_legal() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .take(4)
+        .collect();
+    let away_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .map(|p| p.id)
+        .unwrap();
+    for &d in &home_def {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(30.0, 35.0);
+    }
+    sim.players[home_def[0]].position = Vec2::new(40.0, 59.5);
+    sim.players[away_id].position = Vec2::new(40.0, 60.0);
+    sim.ball.holder = Some(away_id);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let adjusted =
+        snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 20.0));
+    assert!(
+        adjusted.y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS - 1e-9,
+        "a legal line must not aim its two-second target back outside the 25yd band: {adjusted:?}"
+    );
+    assert!(
+        adjusted.y <= sim.ball.position.y - 1.0 + 1e-9,
+        "the line-bound target should still respect the 1yd goal-side standoff: {adjusted:?}"
+    );
+}
+
+#[test]
 fn defensive_line_cushion_shrinks_as_ball_nears_own_goal() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
