@@ -13303,16 +13303,6 @@ pub struct WorldSnapshot {
     /// snapshot-side shape helpers read the configurable+learnable values, not constants.
     #[serde(default = "default_spacing_params")]
     pub spacing_params: SoccerSpacingParams,
-    /// Execution-feasibility fallback parameters, copied from `config.mpc` so the
-    /// snapshot-side carrier decision can veto an un-executable movement and re-decide
-    /// (see [`WorldSnapshot::action_execution_confidence`]). `serde(default)` keeps
-    /// older serialized snapshots loadable (fallback on, threshold 0.15).
-    #[serde(default = "default_execution_feasibility_fallback")]
-    pub(crate) execution_feasibility_fallback: bool,
-    #[serde(default = "default_execution_min_confidence")]
-    pub(crate) execution_min_confidence: f64,
-    #[serde(default = "default_execution_redecide_max_attempts")]
-    pub(crate) execution_redecide_max_attempts: usize,
     #[serde(default = "default_ball_drag_per_tick")]
     pub ball_drag_per_tick: f64,
     #[serde(default = "default_ball_air_resistance")]
@@ -13817,132 +13807,6 @@ impl WorldSnapshot {
         Self::from_match_with_options(m, WorldSnapshotOptions::FULL)
     }
 
-    /// Whether the execution-feasibility fallback is active (config-gated, on by default).
-    pub(crate) fn execution_feasibility_fallback_enabled(&self) -> bool {
-        self.execution_feasibility_fallback
-    }
-
-    /// Confidence in `[0, 1]` that `player_id` can physically EXECUTE `action` over the
-    /// next short horizon, judged by a 3-D point-mass MPC rollout around live traffic.
-    /// Ball-release actions (pass / shoot / clearance / tackle / hold) are outside the
-    /// point-mass MOVEMENT remit and are always fully executable here (`1.0`); the veto
-    /// targets movement the player may not be able to pull off — boxed in by opponents,
-    /// or a cut/reversal his current velocity and skill cannot achieve in the window.
-    pub(crate) fn action_execution_confidence(
-        &self,
-        player_id: usize,
-        action: &SoccerAction,
-    ) -> f64 {
-        let target = match action {
-            SoccerAction::Dribble(t) => *t,
-            SoccerAction::DribbleMove { target, .. } => *target,
-            SoccerAction::MoveTo(t) => *t,
-            SoccerAction::ControlTouch { target } => *target,
-            SoccerAction::Pass { .. }
-            | SoccerAction::Clearance { .. }
-            | SoccerAction::RouteOne { .. }
-            | SoccerAction::Shoot { .. }
-            | SoccerAction::Tackle { .. }
-            | SoccerAction::HoldShape => return 1.0,
-        };
-        self.movement_execution_confidence(player_id, target)
-    }
-
-    /// Point-mass execution confidence for moving `player_id` toward `target`:
-    /// `obstacle_term × turn_term`, where `obstacle_term` is how much of the
-    /// *unobstructed* progress survives the live traffic over the horizon (≈1 in open
-    /// space regardless of pace; → 0 when walled off) and `turn_term` is whether the
-    /// heading change the move demands is achievable given the player's current speed
-    /// (a hard reversal at a sprint is low; running onto the ball is high).
-    fn movement_execution_confidence(&self, player_id: usize, target: Vec2) -> f64 {
-        use crate::des::general::mpc_point_mass::{
-            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
-        };
-        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
-            return 1.0;
-        };
-        let pos = me.position;
-        let vel = me.velocity;
-        let to_target = target - pos;
-        let dist = to_target.len();
-        if dist < 0.75 {
-            return 1.0; // already on the spot — nothing to execute
-        }
-        let accel_cap = acceleration_yps2_from_score(me.skills.acceleration).max(0.5);
-        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
-        // ~0.5 s lookahead: long enough that "two ticks later it got harder" surfaces,
-        // short enough that constant-velocity opponent prediction is still meaningful.
-        let horizon = ((0.5 / dt).round() as usize).clamp(4, 16);
-
-        const OPP_KEEPOUT_YARDS: f64 = 2.0;
-        const MATE_KEEPOUT_YARDS: f64 = 1.0;
-        const KEEPOUT_WEIGHT: f64 = 40.0;
-        let obstacles: Vec<PlanarObstacle> = self
-            .players
-            .iter()
-            .filter(|p| p.id != player_id)
-            .map(|p| {
-                let (r, w) = if p.team == me.team {
-                    (MATE_KEEPOUT_YARDS, KEEPOUT_WEIGHT * 0.25)
-                } else {
-                    (OPP_KEEPOUT_YARDS, KEEPOUT_WEIGHT)
-                };
-                PlanarObstacle::fixed([p.position.x, p.position.y], r, w)
-            })
-            .collect();
-
-        let cfg = PlanarMpcConfig {
-            horizon,
-            dt,
-            a_max: accel_cap,
-            ..PlanarMpcConfig::default()
-        };
-        let Ok(mut controller) = PlanarPointMassMpc::new(cfg) else {
-            return 1.0;
-        };
-        let state = PlanarState {
-            pos: [pos.x, pos.y],
-            vel: [vel.x, vel.y],
-        };
-        let reference = PlanarReference::arrive([target.x, target.y]);
-
-        // Obstructed rollout — progress toward the target through the live traffic.
-        let _ = controller.control_with_obstacles(state, &[reference], &obstacles);
-        let obstructed_end = controller
-            .predicted_path(state)
-            .last()
-            .map(|p| Vec2::new(p[0], p[1]))
-            .unwrap_or(pos);
-        let obstructed_progress = (dist - obstructed_end.distance(target)).max(0.0);
-
-        // Free-space baseline — same dynamics, no traffic.
-        controller.reset();
-        let _ = controller.control(state, &[reference]);
-        let free_end = controller
-            .predicted_path(state)
-            .last()
-            .map(|p| Vec2::new(p[0], p[1]))
-            .unwrap_or(pos);
-        let free_progress = (dist - free_end.distance(target)).max(1e-3);
-
-        let obstacle_term = (obstructed_progress / free_progress).clamp(0.0, 1.0);
-
-        // Turn feasibility: only sharp REVERSALS at pace are hard. A normal cut is fine.
-        let speed = vel.len();
-        let turn_term = if speed < 2.0 {
-            1.0
-        } else {
-            let desired = to_target * (1.0 / dist);
-            let cur = vel * (1.0 / speed);
-            let cos = (desired.x * cur.x + desired.y * cur.y).clamp(-1.0, 1.0);
-            let reversal = (-cos).clamp(0.0, 1.0); // 0 at ≤90°, 1 at a full 180° about-face
-            let speed_factor = ((speed - 2.0) / 6.0).clamp(0.0, 1.0); // faster ⇒ harder to reverse
-            (1.0 - reversal * speed_factor).clamp(0.0, 1.0)
-        };
-
-        (obstacle_term * turn_term).clamp(0.0, 1.0)
-    }
-
     pub(crate) fn from_match_for_agent_decision(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::AGENT_DECISION)
     }
@@ -14140,9 +14004,6 @@ impl WorldSnapshot {
             field_width: m.config.field_width_yards,
             goal_width: m.config.goal_width_yards,
             spacing_params: m.config.spacing,
-            execution_feasibility_fallback: m.config.mpc.execution_feasibility_fallback,
-            execution_min_confidence: m.config.mpc.execution_min_confidence,
-            execution_redecide_max_attempts: m.config.mpc.execution_redecide_max_attempts,
             ball_drag_per_tick: m.config.ball_drag_per_tick,
             ball_air_resistance: m.config.ball_air_resistance,
             ball_grass_resistance_yps2: m.config.ball_grass_resistance_yps2,
@@ -14658,6 +14519,32 @@ impl WorldSnapshot {
 
     pub(crate) fn no_pressure_at(&self, team: Team, position: Vec2) -> bool {
         self.nearest_opponent_distance_at(team, position) > NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS
+    }
+
+    /// Execution urgency in `[0, 1]` for `player_id`: how little time the situation
+    /// affords a *clean* execution. An airborne or fast-loose ball can't be waited on,
+    /// and a presser bearing down forces a rushed touch. Consumed by the per-action MPC
+    /// completion-probability model so urgent moments raise the bar for re-deciding (you
+    /// take the simpler, surer option when you can't take your time).
+    pub(crate) fn execution_urgency_for(&self, player_id: usize) -> f64 {
+        let me = self.players.iter().find(|p| p.id == player_id);
+        let pos = me.map(|p| p.position).unwrap_or(self.ball.position);
+        // An airborne ball (loft/bounce) can't be controlled at the feet yet.
+        let airborne = (self.ball.altitude_yards / 2.5).clamp(0.0, 1.0);
+        // A fast loose ball must be committed to, not shepherded.
+        let loose = if self.ball.holder.is_none() {
+            (self.ball.velocity.len() / 14.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // A closing opponent shrinks the time available for the touch.
+        let presser = me
+            .map(|p| {
+                let d = self.nearest_opponent_distance_at(p.team, pos);
+                (1.0 - d / 6.0).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0);
+        airborne.max(loose).max(presser * 0.85).clamp(0.0, 1.0)
     }
 
     pub(crate) fn candidate_occupancy_at(
