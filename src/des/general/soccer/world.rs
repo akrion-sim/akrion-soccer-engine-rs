@@ -7057,7 +7057,14 @@ impl SoccerMatch {
                 if self.ball.holder == Some(player_id) {
                     let snapshot = WorldSnapshot::from_match(self);
                     let observation = snapshot.observation_for(player_id);
-                    let target_id = target_player.or_else(|| {
+                    let explicit_target_id = target_player.filter(|target_id| {
+                        self.players.iter().any(|player| {
+                            player.id == *target_id
+                                && player.id != player_id
+                                && player.team == player_team
+                        })
+                    });
+                    let target_id = explicit_target_id.or_else(|| {
                         if flight.is_aerial() {
                             snapshot.best_aerial_pass_target(player_id)
                         } else {
@@ -7188,7 +7195,7 @@ impl SoccerMatch {
                         &mut self.rng,
                     );
                     let distance = player_pos.distance(led_target);
-                    let aimed_target = noisy_pass_target_with_receiver_openness(
+                    let mut aimed_target = noisy_pass_target_with_receiver_openness(
                         player_pos,
                         led_target,
                         effective_pass_skill,
@@ -7201,6 +7208,45 @@ impl SoccerMatch {
                         self.config.field_width_yards,
                         self.config.field_length_yards,
                     );
+                    if !flight.is_aerial() {
+                        if let Some((receiver_position, receiver_velocity)) =
+                            target_id.and_then(|target| {
+                                self.players
+                                    .iter()
+                                    .find(|player| {
+                                        player.id == target && player.team == player_team
+                                    })
+                                    .map(|player| (player.position, player.velocity))
+                            })
+                        {
+                            let receiver_forward_velocity =
+                                receiver_velocity.y * player_team.attack_dir();
+                            let aimed_opponent_distance = self
+                                .players
+                                .iter()
+                                .filter(|player| player.team == player_team.other())
+                                .map(|player| player.position.distance(aimed_target))
+                                .fold(f64::INFINITY, f64::min);
+                            let aimed_receiver_distance = aimed_target.distance(receiver_position);
+                            if pass_skill < 0.55
+                                && receiver_forward_velocity < 1.0
+                                && aimed_opponent_distance < aimed_receiver_distance
+                            {
+                                let led_opponent_distance = self
+                                    .players
+                                    .iter()
+                                    .filter(|player| player.team == player_team.other())
+                                    .map(|player| player.position.distance(led_target))
+                                    .fold(f64::INFINITY, f64::min);
+                                let led_receiver_distance = led_target.distance(receiver_position);
+                                aimed_target = if led_opponent_distance < led_receiver_distance {
+                                    receiver_position
+                                } else {
+                                    led_target
+                                };
+                            }
+                        }
+                    }
                     let pass_curl_probability = pass_curl_probability_for_player(
                         &self.players[player_id].skills,
                         flight,
@@ -20890,6 +20936,11 @@ impl WorldSnapshot {
             .map(|(_, _, distance)| distance)
             .unwrap_or(36.0);
         let pressure = pressure_from_nearest_distance(nearest_opponent_distance);
+        let defender_spacing_pressure = if player.role == PlayerRole::Defender {
+            dribble_spacing_pressure_for_role(player.role, nearest_opponent_distance)
+        } else {
+            0.0
+        };
         let forward_space = self.forward_dribble_space_yards(player.id);
         let (lateral_component, forward_component) = dribble_touch_bucket_components(bucket);
         let open_grass = (forward_space / 18.0).clamp(0.0, 1.0);
@@ -20926,8 +20977,14 @@ impl WorldSnapshot {
                 unreachable!("feints are resolved into their final cut before touch distance")
             }
         };
+        let defender_take_on_damp = if player.role == PlayerRole::Defender {
+            (1.0 - defender_spacing_pressure * 0.72).clamp(0.24, 1.0)
+        } else {
+            1.0
+        };
         let beat_defender_bonus = if pressure > 0.40 && forward_component > 0.05 {
-            0.55 + pressure * 0.85 + acceleration * 0.68 + draw01.clamp(0.0, 1.0) * 1.15
+            (0.55 + pressure * 0.85 + acceleration * 0.68 + draw01.clamp(0.0, 1.0) * 1.15)
+                * defender_take_on_damp
         } else {
             0.0
         };
@@ -20944,6 +21001,12 @@ impl WorldSnapshot {
         } else if forward_component.abs() <= 0.20 {
             distance *= 0.82;
         }
+        if defender_spacing_pressure > 0.0 {
+            distance *= (1.0 - defender_spacing_pressure * 0.34).clamp(0.62, 1.0);
+            if forward_component > 0.20 {
+                distance -= defender_spacing_pressure * 0.45;
+            }
+        }
         let cap = if forward_component > 0.20 {
             (forward_space + PLAYER_CONTROL_RADIUS_YARDS * 2.1)
                 .max(3.65)
@@ -20953,19 +21016,29 @@ impl WorldSnapshot {
         } else {
             3.80
         };
+        let defender_spacing_cap = if defender_spacing_pressure > 0.0 {
+            (3.65 - defender_spacing_pressure * 1.65).clamp(2.25, 3.65)
+        } else {
+            DRIBBLE_MAX_TOUCH_YARDS
+        };
         if kind == DribbleMoveKind::ProtectBall {
             return distance.clamp(0.62, 1.45);
         }
         if kind == DribbleMoveKind::CarryForward {
-            return distance.clamp(1.05, cap.max(3.2).min(DRIBBLE_MAX_TOUCH_YARDS));
+            return distance.clamp(
+                1.05,
+                cap.max(3.2)
+                    .min(DRIBBLE_MAX_TOUCH_YARDS)
+                    .min(defender_spacing_cap),
+            );
         }
         if matches!(
             kind,
             DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight
         ) {
-            return distance.clamp(0.95, cap.max(2.8).min(4.35));
+            return distance.clamp(0.95, cap.max(2.8).min(4.35).min(defender_spacing_cap));
         }
-        distance.clamp(DRIBBLE_MIN_TOUCH_YARDS, cap)
+        distance.clamp(DRIBBLE_MIN_TOUCH_YARDS, cap.min(defender_spacing_cap))
     }
 
     fn carry_forward_direction_for(&self, player: &PlayerSnapshot, current: Vec2) -> Vec2 {
@@ -21047,6 +21120,30 @@ impl WorldSnapshot {
             self.goalmouth_carry_target_for_touch(player_id, current, target, kind, touch)
         {
             target = goalmouth_target;
+        }
+
+        if me.role == PlayerRole::Defender
+            && !matches!(
+                dribble_final_cut_kind(kind),
+                DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg
+            )
+        {
+            if let Some((_, defender_position, defender_distance)) = nearest_defender {
+                let spacing_pressure =
+                    dribble_spacing_pressure_for_role(me.role, defender_distance);
+                let min_gap = defender_distance
+                    .min(DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS)
+                    .max(DRIBBLE_OPPONENT_MIN_SPACE_YARDS);
+                if spacing_pressure > 0.0 && target.distance(defender_position) < min_gap {
+                    let away = (current - defender_position).normalized();
+                    if away.len() > 1e-6 {
+                        let escape_distance =
+                            (touch.distance_yards * (0.35 + spacing_pressure * 0.20))
+                                .clamp(0.75, 1.75);
+                        target = current + away * escape_distance;
+                    }
+                }
+            }
         }
 
         target.clamp_to_pitch(self.field_width, self.field_length)

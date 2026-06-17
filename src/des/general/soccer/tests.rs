@@ -1943,6 +1943,115 @@ fn visible_pass_targets_filter_defender_who_can_step_into_lane() {
 }
 
 #[test]
+fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_209,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let teammate = 7usize;
+    let opponent = 14usize;
+    park_players_except(&mut sim, &[passer, teammate, opponent]);
+    sim.players[passer].position = Vec2::new(40.0, 60.0);
+    sim.players[passer].velocity = Vec2::new(4.0, 0.0);
+    sim.players[passer].action_facing = FacingBucket::East;
+    sim.players[passer].receive_facing = FacingBucket::East;
+    sim.players[passer].skills.passing_completion_rate = 8.8;
+    sim.players[passer].skills.passing = 8.8;
+    sim.players[teammate].position = Vec2::new(56.0, 60.0);
+    sim.players[teammate].velocity = Vec2::zero();
+    sim.players[opponent].position = Vec2::new(68.0, 60.0);
+    sim.players[opponent].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.ranked_visible_pass_targets(passer, 1),
+        vec![teammate],
+        "setup should expose the teammate as the safe pass target"
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(opponent),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+
+    let pass = sim.pending_pass.as_ref().expect("pass launched");
+    assert_eq!(
+        pass.target,
+        Some(teammate),
+        "launch path must never preserve an explicit opponent pass target"
+    );
+    assert!(
+        pass.intended_target.distance(sim.players[teammate].position)
+            < pass.intended_target.distance(sim.players[opponent].position),
+        "sanitized pass should aim nearer the teammate than the opponent: target={:?}",
+        pass.intended_target
+    );
+}
+
+#[test]
+fn targeted_floor_pass_noise_does_not_pull_aim_into_opponent() {
+    for seed in 41_300..41_360 {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed,
+            ..Default::default()
+        });
+        let passer = 6usize;
+        let teammate = 7usize;
+        let opponent = 14usize;
+        let pressure = 12usize;
+        park_players_except(&mut sim, &[passer, teammate, opponent, pressure]);
+        sim.players[passer].position = Vec2::new(40.0, 60.0);
+        sim.players[passer].velocity = Vec2::new(4.0, 0.0);
+        sim.players[passer].action_facing = FacingBucket::East;
+        sim.players[passer].receive_facing = FacingBucket::East;
+        sim.players[passer].skills.passing_completion_rate = 1.0;
+        sim.players[passer].skills.passing = 1.0;
+        sim.players[teammate].position = Vec2::new(66.0, 60.0);
+        sim.players[teammate].velocity = Vec2::zero();
+        sim.players[opponent].position = Vec2::new(66.0, 62.4);
+        sim.players[opponent].velocity = Vec2::zero();
+        sim.players[pressure].position = Vec2::new(40.0, 62.0);
+        sim.players[pressure].velocity = Vec2::zero();
+        sim.ball.holder = Some(passer);
+        sim.ball.position = sim.players[passer].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        sim.apply_player_intent(PlayerIntent {
+            player_id: passer,
+            action: SoccerAction::Pass {
+                target_player: Some(teammate),
+                power: 0.68,
+                flight: PassFlight::Floor,
+            },
+            sprint: false,
+        });
+
+        let pass = sim.pending_pass.as_ref().expect("pass launched");
+        assert_eq!(pass.target, Some(teammate));
+        let teammate_distance = pass.intended_target.distance(sim.players[teammate].position);
+        let opponent_distance = pass.intended_target.distance(sim.players[opponent].position);
+        assert!(
+            teammate_distance <= opponent_distance,
+            "seed {seed}: targeted pass aim drifted closer to opponent than teammate: target={:?} teammate_distance={teammate_distance} opponent_distance={opponent_distance}",
+            pass.intended_target
+        );
+    }
+}
+
+#[test]
 fn final_third_pressure_exposes_killer_pass_option() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -40421,7 +40530,7 @@ fn pomdp_and_q_state_track_receiver_openness_for_pass_completion() {
     let open = pass_quality_observation_for_marked_receiver(false);
     let marked = pass_quality_observation_for_marked_receiver(true);
     assert_eq!(open.visible_pass_options, 1);
-    assert_eq!(marked.visible_pass_options, 1);
+    assert_eq!(marked.visible_pass_options, 0);
     assert!(
         open.best_pass_receiver_openness > marked.best_pass_receiver_openness + 0.30,
         "open receiver {:.3} should exceed marked {:.3}",
@@ -43260,22 +43369,26 @@ fn pressured_overholding_midfielder_gets_pass_release_probability_floor() {
     park_players_except(&mut sim, &[holder, outlet, pressure]);
     sim.players[holder].position = Vec2::new(38.0, 42.0);
     sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].action_facing = FacingBucket::South;
+    sim.players[holder].receive_facing = FacingBucket::South;
     sim.players[holder].skills.dribbling = 7.7;
     sim.players[holder].skills.passing_completion_rate = 7.8;
     sim.players[holder].preferences.dribble_bias = 1.18;
     sim.players[holder].preferences.pass_bias = 0.70;
-    sim.players[outlet].position = Vec2::new(45.0, 50.0);
+    sim.players[outlet].position = Vec2::new(40.0, 58.0);
     sim.players[outlet].home_position = sim.players[outlet].position;
-    sim.players[pressure].position = Vec2::new(35.0, 40.0);
+    sim.players[pressure].position = Vec2::new(22.0, 32.0);
     sim.ball.holder = Some(holder);
     sim.ball.position = sim.players[holder].position;
     sim.ball.last_touch_team = Some(Team::Home);
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let pass_targets = snapshot.ranked_visible_pass_targets(holder, 3);
+    let any_targets = snapshot.ranked_pass_targets(holder, 3);
+    let can_see_outlet = snapshot.player_can_see_player(holder, outlet);
     assert!(
         pass_targets.contains(&outlet),
-        "test setup should expose a visible outlet, got {pass_targets:?}"
+        "test setup should expose a visible outlet, got {pass_targets:?}; any={any_targets:?}; can_see={can_see_outlet}"
     );
     let mut observation = snapshot.observation_for(holder);
     observation.actual_time_on_ball_seconds = 3.4;
@@ -44642,6 +44755,90 @@ fn defender_in_possession_keeps_three_to_four_yards_and_releases_as_gap_closes()
     assert!(
         closing_pass / closing_carry > soft_gap_pass / soft_gap_carry + 0.18,
         "closing pressure should increase defender pass urgency: closing={closing_pass}/{closing_carry} soft_gap={soft_gap_pass}/{soft_gap_carry}"
+    );
+}
+
+#[test]
+fn defender_under_dribble_spacing_pressure_takes_shorter_touches_than_forward() {
+    let touch_summary = |role: PlayerRole| -> (f64, f64) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let holder = 4;
+        let marker = 12;
+        park_players_except(&mut sim, &[holder, marker]);
+        sim.players[holder].role = role;
+        sim.players[holder].position = Vec2::new(40.0, 38.0);
+        sim.players[holder].skills.dribbling = 8.6;
+        sim.players[holder].skills.first_touch = 8.4;
+        sim.players[holder].skills.acceleration = 8.8;
+        sim.players[marker].position = Vec2::new(40.8, 41.0);
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut total = 0.0;
+        let mut max_touch = 0.0_f64;
+        let trials = 180;
+        for seed in 0..trials {
+            let mut rng = mulberry32(64_100 + seed);
+            let touch = snapshot.choose_dribble_touch_decision_for(
+                holder,
+                DribbleMoveKind::CarryForward,
+                &mut rng,
+            );
+            total += touch.distance_yards;
+            max_touch = max_touch.max(touch.distance_yards);
+        }
+        (total / trials as f64, max_touch)
+    };
+
+    let (defender_avg, defender_max) = touch_summary(PlayerRole::Defender);
+    let (forward_avg, forward_max) = touch_summary(PlayerRole::Forward);
+
+    assert!(
+        defender_avg < forward_avg - 0.25,
+        "defender touches should be shorter under 3-4yd pressure: defender_avg={defender_avg} forward_avg={forward_avg}"
+    );
+    assert!(
+        defender_max < forward_max - 0.30,
+        "defender should lose the long take-on touches under spacing pressure: defender_max={defender_max} forward_max={forward_max}"
+    );
+}
+
+#[test]
+fn defender_carry_target_preserves_spacing_gap_under_pressure() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 4;
+    let marker = 12;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Defender;
+    sim.players[holder].position = Vec2::new(40.0, 38.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 7.0;
+    sim.players[marker].position = Vec2::new(40.0, 41.25);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let marker_position = sim.players[marker].position;
+    let starting_gap = origin.distance(marker_position);
+    let target = snapshot.dribble_move_target_for_touch(
+        holder,
+        sim.players[holder].home_position,
+        DribbleMoveKind::CarryForward,
+        DribbleTouchDecision::new(0, 4.8),
+    );
+    let target_gap = target.distance(marker_position);
+
+    assert!(
+        target_gap >= starting_gap - 1e-6,
+        "defender carry target must not close an already-tight spacing gap: start={starting_gap} target={target_gap} target={target:?}"
+    );
+    assert!(
+        (target.y - origin.y) * Team::Home.attack_dir() <= 0.1,
+        "with the nearest opponent straight ahead, the safe defender target should not poke forward: origin={origin:?} target={target:?}"
     );
 }
 

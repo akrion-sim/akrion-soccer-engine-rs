@@ -4,7 +4,6 @@
 
 use super::*;
 
-const DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS: f64 = 4.0;
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -607,17 +606,8 @@ impl PlayerAgent {
         // the 2-yard floor; defenders on the ball should prefer a larger 3-4 yard buffer.
         // The response stays soft: dribbling is damped and passing lifted rather than
         // making carry options illegal.
-        let dribble_comfort_space_yards = if self.role == PlayerRole::Defender {
-            DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS
-        } else {
-            DRIBBLE_OPPONENT_MIN_SPACE_YARDS
-        };
-        let defender_crowding = if observation.nearest_opponent_distance.is_finite() {
-            (1.0 - observation.nearest_opponent_distance / dribble_comfort_space_yards)
-                .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let defender_crowding =
+            dribble_spacing_pressure_for_role(self.role, observation.nearest_opponent_distance);
         let crowded_dribble_damp =
             (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
         // The flip side: when a defender closes the spacing gap AND a receiver is open,

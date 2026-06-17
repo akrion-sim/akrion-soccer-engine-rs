@@ -431,13 +431,13 @@ const PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS: f64 = 3.2;
 // allowed, so the guard is relaxed there.
 const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
-// Critical spacing discipline: the carrier should keep 2+ yards between the ball
-// and the NEAREST defender (in any direction), not just space straight ahead. As
-// that gap closes inside 2 yards the carrier should release the ball sooner —
-// forward dribbling is damped and passing is lifted — rather than let a defender
-// get on top of the ball. These weight that crowding response.
+// Critical spacing discipline: most carriers should keep 2+ yards between the
+// ball and the NEAREST defender (in any direction), not just space straight ahead.
+// Defenders in possession should preserve a larger 3-4 yard buffer before they
+// keep carrying. These weight that crowding response.
 const DRIBBLE_CROWDED_SPACE_DAMP: f64 = 0.70;
 const PASS_CROWDED_RELEASE_LIFT: f64 = 0.95;
+const DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS: f64 = 4.0;
 const DEFENSIVE_MID_CENTER_BACK_COVER_RADIUS_YARDS: f64 = 10.0;
 const PROBABILITY_REFERENCE_DT_SECONDS: f64 = 1.0;
 const DRIBBLE_TOUCH_LEAD_YARDS: f64 = 0.92;
@@ -39535,6 +39535,22 @@ fn pressure_from_observation(observation: &SoccerPomdpObservation) -> f64 {
 fn pressure_from_nearest_distance(nearest_opponent_distance: f64) -> f64 {
     if nearest_opponent_distance.is_finite() {
         (1.0 - nearest_opponent_distance / 18.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn dribble_comfort_space_yards_for_role(role: PlayerRole) -> f64 {
+    match role {
+        PlayerRole::Defender => DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS,
+        _ => DRIBBLE_OPPONENT_MIN_SPACE_YARDS,
+    }
+}
+
+fn dribble_spacing_pressure_for_role(role: PlayerRole, nearest_opponent_distance: f64) -> f64 {
+    if nearest_opponent_distance.is_finite() {
+        (1.0 - nearest_opponent_distance / dribble_comfort_space_yards_for_role(role))
+            .clamp(0.0, 1.0)
     } else {
         0.0
     }
