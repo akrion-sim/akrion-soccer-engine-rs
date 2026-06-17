@@ -1943,6 +1943,103 @@ fn visible_pass_targets_filter_defender_who_can_step_into_lane() {
 }
 
 #[test]
+fn forward_pass_progress_is_valued_three_times_backward_recycle() {
+    let weight = 0.37;
+    let forward = directional_pass_progress_score(10.0, weight);
+    let backward = directional_pass_progress_score(-10.0, weight);
+
+    assert!((forward - 10.0 * weight * FORWARD_PASS_VALUE_MULTIPLIER).abs() < 1e-12);
+    assert!((backward + 10.0 * weight * BACKWARD_PASS_VALUE_MULTIPLIER).abs() < 1e-12);
+    assert!(
+        (forward / backward.abs() - 3.0).abs() < 1e-12,
+        "a forward pass of equal yardage must be worth exactly 3x the backward recycle"
+    );
+}
+
+#[test]
+fn half_open_forward_target_stays_visible_and_beats_backward_recycle() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_211,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let backward_recycle = 7usize;
+    let forward_runner = 9usize;
+    let presser = 12usize;
+    let marker = 14usize;
+    park_players_except(
+        &mut sim,
+        &[passer, backward_recycle, forward_runner, presser, marker],
+    );
+
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 35.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].action_facing = FacingBucket::East;
+    sim.players[passer].receive_facing = FacingBucket::East;
+    sim.players[passer].skills.passing_completion_rate = 8.8;
+    sim.players[passer].skills.passing = 8.8;
+    sim.players[passer].skills.vision = 9.0;
+
+    sim.players[backward_recycle].role = PlayerRole::Midfielder;
+    sim.players[backward_recycle].position = Vec2::new(52.0, 23.0);
+    sim.players[backward_recycle].velocity = Vec2::zero();
+
+    sim.players[forward_runner].role = PlayerRole::Forward;
+    sim.players[forward_runner].position = Vec2::new(52.0, 58.0);
+    sim.players[forward_runner].velocity = Vec2::new(0.0, 2.0);
+    sim.players[forward_runner].skills.first_touch = 8.4;
+    sim.players[forward_runner].skills.top_speed = 8.6;
+
+    sim.players[marker].position = Vec2::new(57.0, 58.0);
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[presser].position = Vec2::new(31.0, 35.0);
+    sim.players[presser].velocity = Vec2::zero();
+
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(snapshot.player_can_see_player(passer, forward_runner));
+    assert!(snapshot.player_can_see_player(passer, backward_recycle));
+    assert!(
+        snapshot.clear_line(
+            sim.players[passer].position,
+            sim.players[forward_runner].position,
+            Team::Away,
+            2.5
+        ),
+        "half-open forward runner should have a passable lane"
+    );
+
+    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 5);
+    assert!(
+        visible_targets.contains(&forward_runner),
+        "half-open forward runner must remain a visible pass option: {visible_targets:?}"
+    );
+    assert!(
+        visible_targets.contains(&backward_recycle),
+        "test setup should expose the backward recycle too: {visible_targets:?}"
+    );
+    assert_eq!(
+        visible_targets.first().copied(),
+        Some(forward_runner),
+        "forward half-open teammate should outrank the safer backward recycle: {visible_targets:?}"
+    );
+
+    let observation = snapshot.observation_for(passer);
+    assert!(observation.visible_forward_pass_options >= 1);
+    assert!(
+        observation.best_forward_pass_receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS,
+        "forward receiver should qualify as half-open: {:.3}",
+        observation.best_forward_pass_receiver_openness
+    );
+}
+
+#[test]
 fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -5032,8 +5129,16 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
 
 #[test]
 fn short_pass_preference_favours_sub_20_yard_balls_more_when_calm() {
-    // A real pass is ~5-12yd: the preference peaks in that band and is amplified
-    // when the holder is calm (low pressure) so it picks the controlled ball.
+    // A real controlled forward pass peaks at 8yd exactly; shorter support balls
+    // and 12yd+ passes are useful but not the optimum.
+    assert!(
+        short_pass_preference_bonus(8.0, true) > short_pass_preference_bonus(5.0, true),
+        "the 8yd optimum is preferred over a 5yd support ball"
+    );
+    assert!(
+        short_pass_preference_bonus(8.0, true) > short_pass_preference_bonus(12.0, true),
+        "the 8yd optimum is preferred over a 12yd ball"
+    );
     assert!(
         short_pass_preference_bonus(8.0, true) > short_pass_preference_bonus(15.0, true),
         "the 8yd optimal is preferred over a longer 15yd ball"
@@ -5058,7 +5163,7 @@ fn short_pass_preference_favours_sub_20_yard_balls_more_when_calm() {
         short_pass_preference_bonus(2.0, true) < short_pass_preference_bonus(2.0, false),
         "the ultra-short penalty bites harder when calm"
     );
-    // The keep-possession peak sits in the 5-12yd window, above an ultra-short tap.
+    // The keep-possession peak sits at 8yd, above an ultra-short tap.
     assert!(short_pass_preference_bonus(8.0, true) > short_pass_preference_bonus(3.0, true));
 }
 
@@ -9974,15 +10079,25 @@ fn defensive_kickoff_shape_is_perturbed_across_seeds() {
 }
 
 #[test]
-fn pass_length_preference_peaks_in_the_8_to_12_yard_window() {
+fn pass_length_preference_peaks_at_eight_yards() {
     assert_eq!(pass_length_preference(8.0), 1.0);
-    assert_eq!(pass_length_preference(10.0), 1.0);
-    assert_eq!(pass_length_preference(12.0), 1.0);
+    assert!(pass_length_preference(5.0) < pass_length_preference(8.0));
+    assert!(pass_length_preference(12.0) < pass_length_preference(8.0));
     // A too-short square ball and a too-long hopeful ball are both less preferred.
     assert!(pass_length_preference(4.0) < 1.0);
     assert!(pass_length_preference(25.0) < 1.0);
-    // The optimal window beats a longer ball on the same lane (favours the nearer teammate).
-    assert!(pass_length_preference(10.0) > pass_length_preference(20.0));
+    assert!(pass_length_preference(8.0) > pass_length_preference(20.0));
+}
+
+#[test]
+fn lateral_pass_penalty_demotes_square_recycling() {
+    assert_eq!(lateral_pass_penalty(0.0, false), GROUND_LATERAL_PASS_PENALTY);
+    assert_eq!(lateral_pass_penalty(1.25, true), AERIAL_LATERAL_PASS_PENALTY);
+    assert!(lateral_pass_penalty(2.0, false) <= 0.0);
+    assert!(
+        GROUND_LATERAL_PASS_PENALTY > AERIAL_LATERAL_PASS_PENALTY,
+        "ground square balls need the stronger demotion because they are the overused recycle"
+    );
 }
 
 #[test]
@@ -36125,6 +36240,10 @@ fn learned_support_policy_can_choose_wide_outlet() {
         wide_option.score > 0.0 && wide_option.probability > 0.0,
         "wide-outlet should be a real autonomous/MDP option: {wide_option:?}"
     );
+    assert!(
+        wide_option.probability >= 0.16,
+        "wide-outlet should keep a meaningful support share: {wide_option:?}; options={options:?}"
+    );
     assert!(learned_action_label_is_legal(
         "wide_outlet",
         &snapshot,
@@ -36190,6 +36309,10 @@ fn learned_support_policy_can_choose_in_behind_run() {
     assert!(
         run_option.score > 0.0 && run_option.probability > 0.0,
         "run-in-behind should be a real autonomous/MDP option: {run_option:?}"
+    );
+    assert!(
+        run_option.probability >= 0.18,
+        "in-behind run should keep a meaningful support share: {run_option:?}; options={options:?}"
     );
     assert!(learned_action_label_is_legal(
         "run_in_behind",

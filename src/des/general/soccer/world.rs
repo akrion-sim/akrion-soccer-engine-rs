@@ -17330,6 +17330,27 @@ impl WorldSnapshot {
                         // hard race veto in the build-up half and loses it gradually as play
                         // progresses goalward.
                         let forward_pass = forward > 1.25;
+                        let half_open_forward_pass = if forward_pass
+                            && forward >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
+                        {
+                            let receiver_openness =
+                                pass_receiver_openness_for_snapshots_with_teammates(
+                                    &self.players,
+                                    me.team,
+                                    position,
+                                    Some(p.id),
+                                );
+                            let passer_skill = ability01(
+                                me.skills
+                                    .passing_completion_rate
+                                    .max(me.skills.passing)
+                                    .max(me.skills.vision),
+                            );
+                            receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
+                                && passer_skill >= HALF_OPEN_FORWARD_PASS_MIN_SKILL
+                        } else {
+                            false
+                        };
                         let race_won = if forward_pass {
                             let aim_yards_to_goal =
                                 (me.team.goal_y(self.field_length) - aim_point.y).abs();
@@ -17342,6 +17363,7 @@ impl WorldSnapshot {
                             let margin = PASS_RECEPTION_OPPONENT_TIME_MARGIN * (1.0 - relax);
                             opponent_time_to_point >= ball_time_to_point * margin
                                 || opponent_time_to_current >= ball_time_to_current * margin
+                                || half_open_forward_pass
                         } else {
                             reception_won
                         };
@@ -17389,7 +17411,6 @@ impl WorldSnapshot {
                     .unwrap_or(0.0);
                 let own_half = pass_origin_in_own_half(me.team, me_position, self.field_length);
                 let backward = forward < -1.25;
-                let lateral = forward.abs() <= 1.25;
                 let blind_backward_penalty = if backward && own_half {
                     3.6 + (1.0 - confidence) * 4.2
                 } else if backward {
@@ -17397,7 +17418,7 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let lateral_penalty = if lateral { 0.85 } else { 0.0 };
+                let lateral_penalty = lateral_pass_penalty(forward, false);
                 // Recycled possession: lean harder on forward progress and demote handing the
                 // ball straight back to a recycle partner unless THIS pass actually breaks the
                 // ball forward past them (a genuine progression escapes the recycle).
@@ -17426,6 +17447,22 @@ impl WorldSnapshot {
                     position,
                     PassFlight::Floor,
                 );
+                let half_open_forward_score = forward >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
+                    && pass_quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
+                let receiver_openness_for_score = if half_open_forward_score {
+                    pass_quality
+                        .receiver_openness
+                        .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
+                } else {
+                    pass_quality.receiver_openness
+                };
+                let expected_completion_for_score = if half_open_forward_score {
+                    pass_quality
+                        .expected_completion
+                        .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
+                } else {
+                    pass_quality.expected_completion
+                };
                 let reception_teammate_penalty =
                     self.teammate_occupied_space_penalty_at(me.team, pass_point, Some(p.id), 0.0);
                 let finishing_window_bonus = self.shooting_window_score_at(p, pass_point)
@@ -17459,10 +17496,10 @@ impl WorldSnapshot {
                 // Prefer shorter (<20 yd) passes that keep possession over longer balls,
                 // and prefer them MORE when the holder is calm (low pressure) and can
                 // pick a controlled short option rather than forcing it forward.
-                let short_pass_preference = if backward {
-                    0.0
-                } else {
+                let short_pass_preference = if forward > 1.25 {
                     short_pass_preference_bonus(dist, no_pressure)
+                } else {
+                    0.0
                 };
                 // You can only pass the way you're facing — unless you backheel, which
                 // is only allowed in the opponent's half. Demote an own-half backheel
@@ -17479,15 +17516,17 @@ impl WorldSnapshot {
                         }
                     })
                     .unwrap_or(0.0);
-                let score = forward * forward_weight + self.space_score_at(position, me.team)
+                let directional_progress_score =
+                    directional_pass_progress_score(forward, forward_weight);
+                let score = directional_progress_score + self.space_score_at(position, me.team)
                     - dist * 0.010
                     - support_fit * 0.020
                     - recycle_pingpong_penalty
                     + confidence * 0.65
                     + role_bonus
                     + short_pass_preference
-                    + pass_quality.expected_completion * 1.55
-                    + pass_quality.receiver_openness * 0.62
+                    + expected_completion_for_score * 1.55
+                    + receiver_openness_for_score * 0.62
                     + pass_quality.stride_fit * 1.18
                     + (p.velocity.y * me.team.attack_dir()).max(0.0).min(5.5) * 0.12
                     + finishing_window_bonus
@@ -17505,7 +17544,7 @@ impl WorldSnapshot {
                 // Prioritise playing the ball FORWARD to the most OPEN player: reward targets
                 // that are both ahead and in space, so an open forward (a winger who's pulled
                 // wide into room) is preferred over a square/safe ball almost every time.
-                let forward_open_bonus = pass_quality.receiver_openness.clamp(0.0, 1.0)
+                let forward_open_bonus = receiver_openness_for_score.clamp(0.0, 1.0)
                     * forward.clamp(0.0, 24.0)
                     * FORWARD_OPEN_PASS_BONUS_PER_YARD;
                 // Exploit a wing overload: reward a receiver on the flank where we outnumber
@@ -17518,11 +17557,10 @@ impl WorldSnapshot {
                     }
                     _ => 0.0,
                 };
-                // Optimal pass length is ~8-12yd: prefer that to shorter or longer when choices
-                // are otherwise comparable (a mild tiebreaker). On a shared lane this also favours
-                // the nearer teammate, since the farther one is a longer ball down the same line.
-                let pass_length_bonus =
-                    pass_length_preference(dist) * PASS_LENGTH_PREFERENCE_WEIGHT;
+                // The 8yd length tiebreaker should not make square recycling look optimal.
+                let pass_length_bonus = pass_length_preference(dist)
+                    * PASS_LENGTH_PREFERENCE_WEIGHT
+                    * if forward > 1.25 { 1.0 } else { 0.35 };
                 // Pressured outlet to the keeper: a defender being closed down may play it
                 // back to the keeper IF the keeper is the MORE OPEN option and a controllable
                 // 8-40yd away (shorter is pointless; longer risks a giveaway across our own
@@ -17797,6 +17835,22 @@ impl WorldSnapshot {
                     position,
                     PassFlight::Aerial,
                 );
+                let half_open_forward_score = forward >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
+                    && pass_quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
+                let receiver_openness_for_score = if half_open_forward_score {
+                    pass_quality
+                        .receiver_openness
+                        .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
+                } else {
+                    pass_quality.receiver_openness
+                };
+                let expected_completion_for_score = if half_open_forward_score {
+                    pass_quality
+                        .expected_completion
+                        .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
+                } else {
+                    pass_quality.expected_completion
+                };
                 let reception_teammate_penalty =
                     self.teammate_occupied_space_penalty_at(me.team, pass_point, Some(p.id), 0.0);
                 let keeper_distribution_bonus = if me.role == PlayerRole::Goalkeeper {
@@ -17810,7 +17864,7 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let lateral_penalty = if forward.abs() <= 1.25 { 0.55 } else { 0.0 };
+                let lateral_penalty = lateral_pass_penalty(forward, true);
                 let blind_backward_penalty = if forward < -1.25
                     && pass_origin_in_own_half(me.team, me_position, self.field_length)
                 {
@@ -17820,7 +17874,11 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let score = forward * (0.16 + directive.risk_tolerance * 0.24)
+                let directional_progress_score = directional_pass_progress_score(
+                    forward,
+                    0.16 + directive.risk_tolerance * 0.24,
+                );
+                let score = directional_progress_score
                     + self.space_score_at(pass_point, me.team) * 0.65
                     - dist * 0.018
                     + confidence * 0.42
@@ -17831,8 +17889,8 @@ impl WorldSnapshot {
                     + finishing_window_bonus
                     + in_behind_bonus
                     + preferred_in_behind_bonus
-                    + pass_quality.expected_completion * 0.85
-                    + pass_quality.receiver_openness * 0.38
+                    + expected_completion_for_score * 0.85
+                    + receiver_openness_for_score * 0.38
                     + pass_quality.stride_fit * 0.46
                     + keeper_distribution_bonus
                     - blind_backward_penalty
