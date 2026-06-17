@@ -166,6 +166,14 @@ pub struct SoccerMatch {
     /// worse-positioned member of a too-close pair is entered here (the better-placed
     /// one holds its ground); both are "aware" via their running clocks.
     pub(crate) teammate_spacing_yield: HashMap<usize, usize>,
+    /// Inter-line band clocks: continuous seconds each midfielder/forward has spent
+    /// OUT of its required fore-aft band relative to the line behind it (midfielders
+    /// 2-18 yd ahead of the defensive line; strikers 3-20 yd ahead of the midfield
+    /// line). Accumulates while out of band, decays while in band. Once a player's
+    /// clock passes its line's grace window (`MIDFIELD_BAND_GRACE_SECONDS` /
+    /// `STRIKER_BAND_GRACE_SECONDS`) the fore-aft nudge escalates from a soft pull to a
+    /// strict correction, giving eventual consistency without snapping transient runs.
+    pub(crate) inter_line_band_clocks: HashMap<usize, f64>,
     pub(crate) defensive_clear_hold_trackers: HashMap<Team, DefensiveClearAndHoldTracker>,
     pub(crate) adversarial_moment_memory: VecDeque<SoccerMomentWindow>,
     pub(crate) retrieved_action_prior_cache: std::cell::RefCell<SoccerRetrievedActionPriorCache>,
@@ -973,6 +981,7 @@ impl SoccerMatch {
             teammate_spacing_near_clocks: HashMap::new(),
             teammate_spacing_far_clocks: HashMap::new(),
             teammate_spacing_yield: HashMap::new(),
+            inter_line_band_clocks: HashMap::new(),
             defensive_clear_hold_trackers: HashMap::new(),
             adversarial_moment_memory: VecDeque::new(),
             retrieved_action_prior_cache: std::cell::RefCell::new(
@@ -3851,54 +3860,158 @@ impl SoccerMatch {
     /// line shifts coherently; each adjacent pair shares the correction (half the
     /// shortfall each) so it converges to the padding without either line
     /// over-shooting. Soft + capped — a nudge, never a hard constraint.
-    pub(crate) fn fore_aft_line_padding_nudge_y(&self, me_team: Team, me_role: PlayerRole) -> f64 {
-        let line_of = |role: PlayerRole| -> Option<usize> {
-            match role {
-                PlayerRole::Defender => Some(0),
-                PlayerRole::Midfielder => Some(1),
-                PlayerRole::Forward => Some(2),
-                PlayerRole::Goalkeeper => None,
-            }
-        };
-        let Some(my_line) = line_of(me_role) else {
-            return 0.0;
-        };
-        let mut sum = [0.0f64; 3];
-        let mut cnt = [0usize; 3];
-        for player in self.players.iter().filter(|player| player.team == me_team) {
-            if let Some(line) = line_of(player.role) {
-                if player.position.y.is_finite() {
-                    sum[line] += player.position.y;
-                    cnt[line] += 1;
-                }
-            }
-        }
-        if cnt[my_line] < FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS {
-            return 0.0;
+    /// The fore-aft band correction for `(me_y, me_team, me_role)`: the signed Y delta
+    /// that would bring the player into its required depth band, sandwiched between the
+    /// lines around it, plus that line's grace window. Every outfield line is bounded:
+    /// the defence must stay at least the midfield minimum BEHIND the midfield line;
+    /// midfielders sit 2-18 yd ahead of the defence AND at least the striker minimum
+    /// behind the strikers; strikers sit 3-20 yd ahead of midfield. A `0.0` delta means
+    /// in-band. `None` for keepers, when no neighbour line is defined, or when the
+    /// neighbour lines have crossed (don't fight an impossible band). Works in an
+    /// "along-attack" coordinate (`y * attack_dir`) so larger always means more forward.
+    fn inter_line_band_correction(
+        &self,
+        me_y: f64,
+        me_team: Team,
+        me_role: PlayerRole,
+    ) -> Option<(f64, f64)> {
+        if matches!(me_role, PlayerRole::Goalkeeper) {
+            return None;
         }
         let attack = me_team.attack_dir();
-        let my_mean = sum[my_line] / cnt[my_line] as f64;
-        let mut nudge = 0.0;
-        // Line ahead (toward the opponent goal): sit at least PADDING behind it.
-        if my_line < 2 && cnt[my_line + 1] >= FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS {
-            let ahead_mean = sum[my_line + 1] / cnt[my_line + 1] as f64;
-            let gap = (ahead_mean - my_mean) * attack;
-            if gap < FORE_AFT_LINE_PADDING_YARDS {
-                nudge += -attack * (FORE_AFT_LINE_PADDING_YARDS - gap) * 0.5;
+        // Mean of a role's line in along-attack coordinates (None if too sparse).
+        let line_mean_a = |role: PlayerRole| -> Option<f64> {
+            let mut sum = 0.0;
+            let mut cnt = 0usize;
+            for player in self
+                .players
+                .iter()
+                .filter(|player| player.team == me_team && player.role == role)
+            {
+                if player.position.y.is_finite() {
+                    sum += player.position.y * attack;
+                    cnt += 1;
+                }
+            }
+            (cnt >= FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS).then(|| sum / cnt as f64)
+        };
+        let (lo, hi, grace) = match me_role {
+            // Stay at least the midfield minimum BEHIND the midfield line; no deep cap.
+            PlayerRole::Defender => {
+                let hi = line_mean_a(PlayerRole::Midfielder)
+                    .map(|m| m - MIDFIELD_AHEAD_OF_DEFENSE_MIN_YARDS)?;
+                (f64::NEG_INFINITY, hi, MIDFIELD_BAND_GRACE_SECONDS)
+            }
+            PlayerRole::Midfielder => {
+                let def = line_mean_a(PlayerRole::Defender);
+                let fwd = line_mean_a(PlayerRole::Forward);
+                if def.is_none() && fwd.is_none() {
+                    return None;
+                }
+                let lo = def
+                    .map(|d| d + MIDFIELD_AHEAD_OF_DEFENSE_MIN_YARDS)
+                    .unwrap_or(f64::NEG_INFINITY);
+                let hi_def = def
+                    .map(|d| d + MIDFIELD_AHEAD_OF_DEFENSE_MAX_YARDS)
+                    .unwrap_or(f64::INFINITY);
+                let hi_fwd = fwd
+                    .map(|f| f - STRIKER_AHEAD_OF_MIDFIELD_MIN_YARDS)
+                    .unwrap_or(f64::INFINITY);
+                (lo, hi_def.min(hi_fwd), MIDFIELD_BAND_GRACE_SECONDS)
+            }
+            PlayerRole::Forward => {
+                let mid = line_mean_a(PlayerRole::Midfielder)?;
+                (
+                    mid + STRIKER_AHEAD_OF_MIDFIELD_MIN_YARDS,
+                    mid + STRIKER_AHEAD_OF_MIDFIELD_MAX_YARDS,
+                    STRIKER_BAND_GRACE_SECONDS,
+                )
+            }
+            PlayerRole::Goalkeeper => return None,
+        };
+        // Neighbour lines crossed (e.g. a sparse, scrambled shape): don't fight it.
+        if lo > hi {
+            return None;
+        }
+        let me_a = me_y * attack;
+        let clamped_a = me_a.clamp(lo, hi);
+        Some(((clamped_a - me_a) * attack, grace))
+    }
+
+    /// Per-player fore-aft band nudge (y only): pull a midfielder/striker toward its
+    /// band relative to the line behind it. Soft and capped while the player's
+    /// out-of-band clock is under the grace window; once it passes, the correction
+    /// becomes strict so the band is actually held. Keepers and the defensive anchor
+    /// line return `0.0`.
+    pub(crate) fn fore_aft_line_padding_nudge_y(
+        &self,
+        me_id: usize,
+        me_y: f64,
+        me_team: Team,
+        me_role: PlayerRole,
+    ) -> f64 {
+        let Some((corrective_y, grace)) = self.inter_line_band_correction(me_y, me_team, me_role)
+        else {
+            return 0.0;
+        };
+        if corrective_y.abs() < 1e-6 {
+            return 0.0;
+        }
+        let elapsed = self
+            .inter_line_band_clocks
+            .get(&me_id)
+            .copied()
+            .unwrap_or(0.0);
+        let (gain, max_nudge) = if elapsed >= grace {
+            (
+                INTER_LINE_BAND_STRICT_GAIN,
+                INTER_LINE_BAND_STRICT_MAX_NUDGE_YARDS,
+            )
+        } else {
+            (INTER_LINE_BAND_SOFT_GAIN, FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS)
+        };
+        (corrective_y * gain).clamp(-max_nudge, max_nudge)
+    }
+
+    /// Advance the inter-line band clocks from the settled end-of-tick positions:
+    /// accumulate while a midfielder/striker is out of its band relative to the line
+    /// behind it, decay (faster than it fills) while in band. Read next tick by
+    /// [`Self::fore_aft_line_padding_nudge_y`]. Mirrors the territory-spacing clocks.
+    pub(crate) fn update_inter_line_band_clocks(&mut self) {
+        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS);
+        // Snapshot (id, in_band) first so the immutable band reads don't alias the clock
+        // mutation below.
+        let states: Vec<(usize, bool)> = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.role != PlayerRole::Goalkeeper && player.position.y.is_finite()
+            })
+            .filter_map(|player| {
+                self.inter_line_band_correction(player.position.y, player.team, player.role)
+                    .map(|(corrective_y, _grace)| (player.id, corrective_y.abs() < 1e-6))
+            })
+            .collect();
+        let decay = dt * INTER_LINE_BAND_CLOCK_DECAY_RATE;
+        let live: std::collections::HashSet<usize> = states.iter().map(|(id, _)| *id).collect();
+        for (id, in_band) in states {
+            if in_band {
+                let decayed = self
+                    .inter_line_band_clocks
+                    .get(&id)
+                    .map(|elapsed| elapsed - decay)
+                    .unwrap_or(0.0);
+                if decayed > 0.0 {
+                    self.inter_line_band_clocks.insert(id, decayed);
+                } else {
+                    self.inter_line_band_clocks.remove(&id);
+                }
+            } else {
+                *self.inter_line_band_clocks.entry(id).or_insert(0.0) += dt;
             }
         }
-        // Line behind (toward our own goal): sit at least PADDING ahead of it.
-        if my_line > 0 && cnt[my_line - 1] >= FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS {
-            let behind_mean = sum[my_line - 1] / cnt[my_line - 1] as f64;
-            let gap = (my_mean - behind_mean) * attack;
-            if gap < FORE_AFT_LINE_PADDING_YARDS {
-                nudge += attack * (FORE_AFT_LINE_PADDING_YARDS - gap) * 0.5;
-            }
-        }
-        nudge.clamp(
-            -FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS,
-            FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS,
-        )
+        // Drop clocks for players no longer eligible (role change / left the pitch).
+        self.inter_line_band_clocks.retain(|id, _| live.contains(id));
     }
 
     pub(crate) fn relational_shape_disciplined_intent(
@@ -3993,11 +4106,44 @@ impl SoccerMatch {
                 }
             }
         }
-        // Fore-aft (inter-line) depth padding: keep the DEF/MID/FWD lines from
-        // compacting vertically onto each other. Orthogonal to the lateral pull
-        // above (which only sees same-line neighbours), so it applies even when a
-        // player is laterally in-band.
-        working.y += self.fore_aft_line_padding_nudge_y(me.team, me.role);
+        // Compactness toward the ball: every off-ball player the territory-spacing nudge
+        // has NOT already pinned at its teammate padding (those return above) drifts
+        // toward the ball, bounded. The inter-line band applied right after caps the
+        // forward drift and the spacing nudge caps the crowding, so the team compacts
+        // ONTO the ball without collapsing its lines or running into each other — "move
+        // to the ball until you reach your padding". A loose, CONTESTED ball pulls harder
+        // and more directly (go win it); a totally uncontested loose ball does not (no
+        // need to rush — keep shape).
+        let ball = self.ball.position;
+        let to_ball = ball - working;
+        let ball_dist = to_ball.len();
+        if ball_dist > BALL_COMPACTNESS_DEADZONE_YARDS {
+            let free_ball_contested = self.ball.holder.is_none()
+                && self.players.iter().any(|p| {
+                    p.team != me.team
+                        && p.role != PlayerRole::Goalkeeper
+                        && p.position.distance(ball) < FREE_BALL_CONTEST_RADIUS_YARDS
+                });
+            let (gain, max_pull) = if free_ball_contested {
+                (
+                    BALL_COMPACTNESS_GAIN * FREE_BALL_COMPACTNESS_GAIN_MULT,
+                    BALL_COMPACTNESS_MAX_NUDGE_YARDS * FREE_BALL_COMPACTNESS_MAX_MULT,
+                )
+            } else {
+                (BALL_COMPACTNESS_GAIN, BALL_COMPACTNESS_MAX_NUDGE_YARDS)
+            };
+            let pull = ((ball_dist - BALL_COMPACTNESS_DEADZONE_YARDS) * gain).min(max_pull);
+            let cand = working + to_ball.normalized() * pull;
+            if cand.x.is_finite() && cand.y.is_finite() {
+                working = cand;
+            }
+        }
+        // Fore-aft (inter-line) band: cap the (now ball-pulled) target's depth into the
+        // line's band relative to the line directly behind it — midfielders 2-18 yd ahead
+        // of the defence, strikers 3-20 yd ahead of midfield — strictly once the player's
+        // out-of-band grace clock has elapsed. This is what stops the ball-attraction from
+        // collapsing the lines onto each other.
+        working.y += self.fore_aft_line_padding_nudge_y(me.id, working.y, me.team, me.role);
         if !working.x.is_finite() || !working.y.is_finite() {
             return intent;
         }
@@ -4585,6 +4731,9 @@ impl SoccerMatch {
         // positions and flag any over-grace pair's worse-positioned player to move on
         // the next tick.
         self.update_teammate_spacing_separation();
+        // Inter-line bands: advance each midfielder/striker's out-of-band clock so the
+        // fore-aft nudge can escalate to strict enforcement past the grace window.
+        self.update_inter_line_band_clocks();
         self.record_ball_position_history();
         self.shared_positions.sync_from_players_and_ball(
             &self.players,
