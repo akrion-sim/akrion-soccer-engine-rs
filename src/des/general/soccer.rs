@@ -12865,24 +12865,50 @@ fn sample_defensive_cover_target(rng: &mut SeededRandom) -> usize {
     }
 }
 
+// A forward more advanced than the next-most-advanced opponent by more than this
+// (in yards along the attacking axis) is an isolated goal-hanger, not part of the
+// attacking line, and is ignored when anchoring the defensive cover line.
+const FOREMOST_ATTACKER_SUPPORT_GAP_YARDS: f64 = 16.0;
+
 fn defensive_cover_profile(
     snapshot: &WorldSnapshot,
     team: Team,
     target: usize,
 ) -> DefensiveCoverProfile {
-    let foremost_attacker_y = snapshot
+    // The cover line is anchored to the most-advanced opponent attacker — but a LONE
+    // forward stranded goal-side of our defence (a goal-hanger parked behind the keeper,
+    // far from any team-mate) must NOT define it: that drags the WHOLE block back onto
+    // our own goal (the "two teams separated" artefact). Pick the most-advanced
+    // *supported* attacker — one with another attacker within
+    // FOREMOST_ATTACKER_SUPPORT_GAP_YARDS along the attacking axis. An isolated forward
+    // is left to a single marker, not treated as the reference for the entire line.
+    // Degenerate fallback (every attacker isolated): the single most-advanced one.
+    let opp_attack_dir = team.other().attack_dir();
+    let mut attacker_ys: Vec<f64> = snapshot
         .players
         .iter()
         .filter(|player| player.team == team.other() && player.role != PlayerRole::Goalkeeper)
-        .filter_map(|player| {
-            snapshot
-                .player_position(player.id)
-                .map(|position| position.y)
+        .filter_map(|player| snapshot.player_position(player.id).map(|position| position.y))
+        .collect();
+    // Most-advanced (deepest into our half, i.e. largest `y * opp_attack_dir`) first.
+    attacker_ys.sort_by(|a, b| {
+        (b * opp_attack_dir)
+            .partial_cmp(&(a * opp_attack_dir))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let foremost_attacker_y = attacker_ys
+        .iter()
+        .enumerate()
+        .find(|(idx, &cand)| {
+            attacker_ys
+                .iter()
+                .enumerate()
+                .any(|(other_idx, &other)| {
+                    *idx != other_idx && (cand - other).abs() <= FOREMOST_ATTACKER_SUPPORT_GAP_YARDS
+                })
         })
-        .reduce(|a, b| match team {
-            Team::Home => a.min(b),
-            Team::Away => a.max(b),
-        });
+        .map(|(_, &cand)| cand)
+        .or_else(|| attacker_ys.first().copied());
 
     let actual = foremost_attacker_y
         .map(|attacker_y| {

@@ -4378,6 +4378,10 @@ impl SoccerMatch {
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
                     // Hold the striker line 3-20yd in front of the midfield line.
                     let intent = snapshot.forward_line_band_adjusted_intent(intent);
+                    // A forward/mid that chose to STAND while offside in our possession is a
+                    // stranded goal-hanger; pull it straight back onside (the band/onside
+                    // clamps above only reshape a MoveTo, never a HoldShape).
+                    let intent = snapshot.offside_standing_recovery_adjusted_intent(intent);
                     // While the ball is in transit, a player who can't get it drops goalside of
                     // where the ball is GOING (anticipated possession), not where it is now.
                     let intent = snapshot.goalside_anticipation_adjusted_intent(intent);
@@ -21359,6 +21363,42 @@ impl WorldSnapshot {
             intent.action = SoccerAction::MoveTo(adjusted);
         }
         return intent;
+    }
+
+    /// Pull a STANDING attacker back onside. The line-band and onside clamps only
+    /// reshape a `MoveTo`; an attacker that DECIDES to hold shape (`HoldShape`) while
+    /// offside in our own possession is otherwise stranded goal-side of the last line
+    /// forever (the goal-hanger artefact). When such a player is genuinely offside —
+    /// not the carrier, not on a sanctioned in-behind run — convert its hold into a
+    /// `MoveTo` straight back to its onside support position.
+    fn offside_standing_recovery_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+        if self.active_set_play.is_some() {
+            return intent;
+        }
+        // Only a non-moving decision needs rescuing; MoveTo already runs the clamps.
+        if !matches!(intent.action, SoccerAction::HoldShape) {
+            return intent;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == intent.player_id) else {
+            return intent;
+        };
+        if !matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            || me.controller_slot.is_some()
+            || self.ball.holder == Some(me.id)
+            || self.possession_team() != Some(me.team)
+            || self.in_behind_run_target_for(me.id).is_some()
+        {
+            return intent;
+        }
+        let pos = self.player_snapshot_position(me);
+        if !self.position_would_be_offside(me.team, pos) {
+            return intent;
+        }
+        let onside = self.clamp_forward_onside_support(me, pos);
+        if onside.distance(pos) > 0.5 {
+            intent.action = SoccerAction::MoveTo(onside);
+        }
+        intent
     }
 
     /// While the ball is in transit, pull an off-ball player who has no chance of receiving it to
