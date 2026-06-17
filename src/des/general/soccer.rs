@@ -852,8 +852,13 @@ const OWN_BOX_ACROSS_GOAL_SAFE_LANE_YARDS: f64 = 6.0;
 // Per-yard reward for a forward pass to an OPEN receiver (openness 0..1 × forward yards, capped
 // at 24yd). Biases pass selection toward playing forward to the most-open player.
 const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
+// Forward pass progress is valued exactly 3x a backward recycle of equal yardage,
+// anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
+// Be optimistic/skilled about playing a forward teammate who is only half-open:
+// qualified forward targets stay visible and get sane scoring floors instead of being
+// hidden behind safe square/backward recycling.
 const HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS: f64 = 8.0;
 const HALF_OPEN_FORWARD_PASS_MIN_OPENNESS: f64 = 0.30;
 const HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR: f64 = 0.44;
@@ -902,6 +907,7 @@ const FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS: f64 = 14.0;
 // and 12yd+ balls are useful, but no longer share the "optimal" score.
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_YARDS: f64 = 8.0;
+const PASS_LENGTH_FADEOUT_YARDS: f64 = 24.0;
 const GROUND_LATERAL_PASS_PENALTY: f64 = 1.85;
 const AERIAL_LATERAL_PASS_PENALTY: f64 = 1.20;
 // Build-up short-pass discouragement. OUTSIDE the final attacking third, sub-4yd passes are
@@ -11754,6 +11760,17 @@ pub struct MatchStats {
     pub passes_attempted_away: u32,
     pub passes_completed_home: u32,
     pub passes_completed_away: u32,
+    // Completed passes split by direction (forward vs backward relative to the
+    // attacking goal). Lets us see how much of the high completion rate is safe
+    // backward/square recycling vs genuine forward progression.
+    #[serde(default)]
+    pub passes_completed_forward_home: u32,
+    #[serde(default)]
+    pub passes_completed_forward_away: u32,
+    #[serde(default)]
+    pub passes_completed_backward_home: u32,
+    #[serde(default)]
+    pub passes_completed_backward_away: u32,
     #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
@@ -13519,10 +13536,12 @@ fn short_pass_preference_bonus(distance_yards: f64, holder_low_pressure: bool) -
     if distance_yards < 5.0 {
         return -((5.0 - distance_yards) / 5.0) * calm * 0.6;
     }
+    // Single optimum at ~8yd (not a 5yd tap nor a 12yd ball): ramp up 5→8, then decline
+    // so the 8yd ball is clearly preferred over both a shorter and a longer pass.
     let band = if distance_yards <= 8.0 {
         (distance_yards - 5.0) / 3.0 // ramp 5→8 up to the peak
     } else {
-        // fade to zero by 20yd (no short-pass preference at/beyond 20)
+        // decline from the 8yd peak, reaching 0 by ~20yd
         (1.0 - (distance_yards - 8.0) / 12.0).clamp(0.0, 1.0)
     };
     band.clamp(0.0, 1.0) * calm
@@ -43749,7 +43768,8 @@ fn pass_length_preference(dist: f64) -> f64 {
     if dist <= PASS_LENGTH_OPTIMAL_YARDS {
         return (dist / PASS_LENGTH_OPTIMAL_YARDS).clamp(0.0, 1.0);
     }
-    (1.0 - (dist - PASS_LENGTH_OPTIMAL_YARDS) / 18.0).clamp(0.0, 1.0)
+    let fade_band = (PASS_LENGTH_FADEOUT_YARDS - PASS_LENGTH_OPTIMAL_YARDS).max(1.0);
+    (1.0 - (dist - PASS_LENGTH_OPTIMAL_YARDS) / fade_band).clamp(0.0, 1.0)
 }
 
 fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {

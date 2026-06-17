@@ -9084,6 +9084,14 @@ impl SoccerMatch {
                     BallPossessionResult::PassCompleted(team) => {
                         if let Some(pass) = pending_pass_for_reward.as_ref() {
                             self.record_completed_pass_reward(pass, holder);
+                            let reception_y = self
+                                .players
+                                .iter()
+                                .find(|player| player.id == holder)
+                                .map(|player| player.position.y)
+                                .unwrap_or(self.ball.position.y);
+                            let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
+                            self.stat_pass_completed_direction(team, forward_yards);
                         }
                         self.pending_pass = None;
                         self.stat_pass_completed(team);
@@ -11392,6 +11400,23 @@ impl SoccerMatch {
         match team {
             Team::Home => self.stats.passes_completed_home += 1,
             Team::Away => self.stats.passes_completed_away += 1,
+        }
+    }
+
+    /// Record the direction of a completed pass (forward/backward along the attacking
+    /// axis). Lateral balls (within the ±1.25yd deadband used by pass scoring) count as
+    /// neither. Diagnostic only — surfaces how much completion is forward progression.
+    fn stat_pass_completed_direction(&mut self, team: Team, forward_yards: f64) {
+        if forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_forward_home += 1,
+                Team::Away => self.stats.passes_completed_forward_away += 1,
+            }
+        } else if forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_backward_home += 1,
+                Team::Away => self.stats.passes_completed_backward_away += 1,
+            }
         }
     }
 
@@ -17380,6 +17405,9 @@ impl WorldSnapshot {
                                 2.5,
                                 nominal_speed,
                             );
+                        // `race_won` already includes the qualified half-open forward exception:
+                        // skilled passers keep those options visible, while hard giveaways are
+                        // still vetoed below.
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || race_won)
                             && !committed_cutout
@@ -18201,7 +18229,7 @@ impl WorldSnapshot {
         let urgent_run_invite =
             through_ball_invite || carrier_driving || self.forward_attacking_momentum(me.team);
         let cadence = (self.tick + player_id as u64 * 17) % 41;
-        if cadence > 5 && !urgent_run_invite {
+        if cadence > 13 && !urgent_run_invite {
             return None;
         }
         let current = self.player_snapshot_position(me);
@@ -21779,13 +21807,29 @@ impl WorldSnapshot {
                         * match me.role {
                             PlayerRole::Goalkeeper if own_half_possession => 24.0,
                             PlayerRole::Goalkeeper => 30.0,
-                            PlayerRole::Midfielder if own_half_possession => -8.0 - tendency * 12.0,
-                            PlayerRole::Midfielder => -2.0 - tendency * 18.0,
-                            PlayerRole::Forward if own_half_possession => -12.0,
-                            PlayerRole::Forward => -6.0,
+                            // Attacking mids/forwards hold a HIGHER line ahead of the ball so
+                            // the carrier has a real forward outlet (otherwise everyone
+                            // flattens onto the ball's line and the only options are square).
+                            PlayerRole::Midfielder if own_half_possession => -10.0 - tendency * 16.0,
+                            PlayerRole::Midfielder => -6.0 - tendency * 22.0,
+                            PlayerRole::Forward if own_half_possession => -20.0,
+                            PlayerRole::Forward => -16.0,
                             PlayerRole::Defender => 18.0,
                         }
             };
+            // Hold that advanced line ONSIDE: forwards/attacking mids stretch the pitch to
+            // offer a forward ball, but in settled possession they never drift beyond the
+            // second-last defender (the burst in behind happens once the ball is played).
+            if matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder) {
+                if let Some(line_y) = self.second_last_defender_line_for(me.team) {
+                    let onside_cap = line_y - me.team.attack_dir() * ONSIDE_RUN_HOLD_BUFFER_YARDS;
+                    support_y = if me.team.attack_dir() > 0.0 {
+                        support_y.min(onside_cap)
+                    } else {
+                        support_y.max(onside_cap)
+                    };
+                }
+            }
             if me.role == PlayerRole::Midfielder
                 && me.preferences.defensive_mindedness > me.preferences.offensive_mindedness
             {
