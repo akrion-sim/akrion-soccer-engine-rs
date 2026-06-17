@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::des::general::prng::SeededRandom;
 use crate::des::general::soccer::{
-    MatchConfig, MatchSummary, SoccerMatch, SoccerNeuralLearningConfig,
+    MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
     SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
@@ -128,6 +128,7 @@ pub struct SoccerLearningCompletedGame {
     pub policies: SoccerTeamQPolicies,
     pub score: SoccerLearningRunScore,
     pub delta: SoccerLearningPolicyDelta,
+    pub config_moments: Vec<SoccerConfigMomentInsert>,
     pub neural_network: Option<SoccerNeuralNetworkSnapshot>,
     pub elapsed_seconds: f64,
 }
@@ -3165,6 +3166,7 @@ fn run_soccer_learning_game_from_snapshot(
     let total_ticks = config.total_ticks();
     let mut sim =
         SoccerMatch::default_11v11(config).with_team_policies((*starting_policies).clone());
+    sim.set_uniform_elite_players();
     if let Some(snapshot) = initial_neural_network.as_ref() {
         sim.set_neural_network_snapshot((**snapshot).clone())?;
     }
@@ -3183,6 +3185,7 @@ fn run_soccer_learning_game_from_snapshot(
     let summary = artifact.summary.clone();
     let score = soccer_learning_run_score(&summary);
     let delta = soccer_policy_delta_entries(starting_policies.as_ref(), &policies, &score);
+    let config_moments = sim.config_moments();
     let episode_summary = SoccerSelfPlayEpisodeSummary {
         episode,
         seed,
@@ -3204,6 +3207,7 @@ fn run_soccer_learning_game_from_snapshot(
         policies,
         score,
         delta,
+        config_moments,
         neural_network,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })

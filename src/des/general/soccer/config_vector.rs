@@ -1,6 +1,6 @@
 //! Canonical kinematic **configuration vector** of the whole field — the 22
-//! players + ball, each with position / velocity / acceleration — for retrieval
-//! ("have we seen a state like this before?").
+//! players + ball, each with position / velocity / acceleration, plus the ball
+//! holder and ball altitude — for retrieval ("have we seen a state like this before?").
 //!
 //! This is the substrate for the vector-search side of the retrieval-guided
 //! decision pipeline. A live snapshot `S1` is projected into a fixed-width,
@@ -32,8 +32,11 @@ use super::*;
 /// Players per team packed into the fixed-width feature vector. Real squads are
 /// 11; fewer (red card) pad with zeros, more truncate — keeping the width stable.
 pub const CONFIG_PLAYERS_PER_TEAM: usize = 11;
-/// Floats per player: `pos.x, pos.y, vel.x, vel.y, acc.x, acc.y` (canonical).
-pub const CONFIG_PER_PLAYER_FLOATS: usize = 6;
+/// Legacy raw feature width before the per-player possession channel existed.
+pub const CONFIG_FEATURE_DIM_V1: usize =
+    2 * CONFIG_PLAYERS_PER_TEAM * 6 + CONFIG_BALL_FLOATS + CONFIG_SCALAR_FLOATS;
+/// Floats per player: `pos.x, pos.y, vel.x, vel.y, acc.x, acc.y, has_possession` (canonical).
+pub const CONFIG_PER_PLAYER_FLOATS: usize = 7;
 /// Floats for the ball: `pos.x, pos.y, altitude, vel.x, vel.y, acc.x, acc.y`.
 /// (The engine's ball has no vertical velocity channel; altitude is its own.)
 pub const CONFIG_BALL_FLOATS: usize = 7;
@@ -41,8 +44,9 @@ pub const CONFIG_BALL_FLOATS: usize = 7;
 pub const CONFIG_SCALAR_FLOATS: usize = 3;
 
 /// Total raw feature width before projection into [`SOCCER_MOMENT_EMBEDDING_DIM`].
-pub const CONFIG_FEATURE_DIM: usize =
-    2 * CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_PLAYER_FLOATS + CONFIG_BALL_FLOATS + CONFIG_SCALAR_FLOATS;
+pub const CONFIG_FEATURE_DIM: usize = 2 * CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_PLAYER_FLOATS
+    + CONFIG_BALL_FLOATS
+    + CONFIG_SCALAR_FLOATS;
 
 // Characteristic scales used to normalise physical units into ~[-1, 1] so no one
 // channel dominates the cosine geometry. Positions are normalised by the pitch
@@ -64,6 +68,8 @@ pub struct SoccerPlayerKin {
     pub vel: Vec2,
     /// Canonical, scale-normalised acceleration.
     pub acc: Vec2,
+    /// `1` if this exact player holds the ball in the source snapshot, else `0`.
+    pub has_possession: f64,
 }
 
 /// The whole-field configuration as seen from one team's perspective, after
@@ -163,8 +169,8 @@ impl SoccerConfigVector {
         };
         const BALL_HANDEDNESS_WEIGHT: f64 = 3.0;
         let half_width = field_width * 0.5;
-        let mut handedness =
-            BALL_HANDEDNESS_WEIGHT * (provisional.apply(snapshot.ball.position, false).x - half_width);
+        let mut handedness = BALL_HANDEDNESS_WEIGHT
+            * (provisional.apply(snapshot.ball.position, false).x - half_width);
         for player in &snapshot.players {
             handedness += provisional.apply(player.position, false).x - half_width;
         }
@@ -178,12 +184,14 @@ impl SoccerConfigVector {
 
         let mut own = Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
         let mut opponents = Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
+        let holder = snapshot.ball.holder;
         for player in &snapshot.players {
             let kin = SoccerPlayerKin {
                 role: player.role,
                 pos: canon.norm_pos(player.position),
                 vel: canon.norm_vel(player.velocity, PLAYER_SPEED_SCALE_YPS),
                 acc: canon.norm_vel(player.acceleration, PLAYER_ACCEL_SCALE_YPS2),
+                has_possession: if holder == Some(player.id) { 1.0 } else { 0.0 },
             };
             if player.team == perspective {
                 own.push(kin);
@@ -199,11 +207,7 @@ impl SoccerConfigVector {
         let bvel = canon.norm_vel(ball.velocity, BALL_SPEED_SCALE_YPS);
         let bacc = canon.norm_vel(ball.acceleration, BALL_ACCEL_SCALE_YPS2);
 
-        let holder_team = ball
-            .holder
-            .and_then(|id| snapshot.players.iter().find(|p| p.id == id))
-            .map(|p| p.team);
-        let possession_relative = match holder_team {
+        let possession_relative = match snapshot.possession_team() {
             Some(t) if t == perspective => 1.0,
             Some(_) => -1.0,
             None => 0.0,
@@ -258,7 +262,15 @@ impl SoccerConfigVector {
 fn push_team(out: &mut Vec<f64>, team: &[SoccerPlayerKin]) {
     for slot in 0..CONFIG_PLAYERS_PER_TEAM {
         if let Some(k) = team.get(slot) {
-            out.extend_from_slice(&[k.pos.x, k.pos.y, k.vel.x, k.vel.y, k.acc.x, k.acc.y]);
+            out.extend_from_slice(&[
+                k.pos.x,
+                k.pos.y,
+                k.vel.x,
+                k.vel.y,
+                k.acc.x,
+                k.acc.y,
+                k.has_possession,
+            ]);
         } else {
             out.extend_from_slice(&[0.0; CONFIG_PER_PLAYER_FLOATS]);
         }
@@ -367,6 +379,9 @@ pub fn soccer_retrieval_action_prior(
     // (similarity-weighted favourability sum, weight sum) per action.
     let mut acc: HashMap<String, (f64, f64)> = HashMap::new();
     for n in neighbors {
+        if !n.distance.is_finite() {
+            continue;
+        }
         let similarity = (1.0 - n.distance).clamp(0.0, 1.0);
         if similarity <= f64::EPSILON {
             continue;
@@ -378,8 +393,14 @@ pub fn soccer_retrieval_action_prior(
         } else {
             n.value.unwrap_or(0.0)
         };
+        if !outcome.is_finite() {
+            continue;
+        }
         let favourability = outcome.tanh(); // squash to (-1, 1)
         let action = normalize_soccer_action_label(&n.action).to_string();
+        if action.is_empty() {
+            continue;
+        }
         let entry = acc.entry(action).or_insert((0.0, 0.0));
         entry.0 += similarity * favourability;
         entry.1 += similarity;
@@ -404,17 +425,22 @@ pub fn soccer_config_feature_cosine(a: &[f32], b: &[f32]) -> f64 {
     let mut na = 0.0_f64;
     let mut nb = 0.0_f64;
     for i in 0..n {
-        let (x, y) = (a[i] as f64, b[i] as f64);
+        let x = if a[i].is_finite() { a[i] as f64 } else { 0.0 };
+        let y = if b[i].is_finite() { b[i] as f64 } else { 0.0 };
         dot += x * y;
         na += x * x;
         nb += y * y;
     }
     // Account for tail energy so unequal lengths can't inflate similarity.
     for &x in &a[n..] {
-        na += (x as f64) * (x as f64);
+        if x.is_finite() {
+            na += (x as f64) * (x as f64);
+        }
     }
     for &y in &b[n..] {
-        nb += (y as f64) * (y as f64);
+        if y.is_finite() {
+            nb += (y as f64) * (y as f64);
+        }
     }
     if na <= 1e-12 || nb <= 1e-12 {
         0.0
@@ -461,10 +487,18 @@ mod tests {
             let (a, b) = (shuffled.players[0].id, shuffled.players[n - 1].id);
             shuffled.players[0].id = b;
             shuffled.players[n - 1].id = a;
+            shuffled.ball.holder = match shuffled.ball.holder {
+                Some(id) if id == a => Some(b),
+                Some(id) if id == b => Some(a),
+                holder => holder,
+            };
         }
         let permuted = SoccerConfigVector::from_snapshot(&shuffled, Team::Home).to_features();
 
-        assert_eq!(base, permuted, "relabelled identical config must be byte-identical");
+        assert_eq!(
+            base, permuted,
+            "relabelled identical config must be byte-identical"
+        );
     }
 
     /// A Home-attacking-up moment must canonicalise identically to the same shape
@@ -542,7 +576,58 @@ mod tests {
         let snap = sample_snapshot();
         let cfg = SoccerConfigVector::from_snapshot(&snap, Team::Home);
         assert_eq!(cfg.to_features().len(), CONFIG_FEATURE_DIM);
+        assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
         assert_eq!(cfg.embedding().len(), SOCCER_MOMENT_EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn feature_vector_contains_ball_altitude_and_holder_flags() {
+        let mut snap = sample_snapshot();
+        let holder = snap
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home)
+            .expect("home player")
+            .id;
+        snap.ball.holder = Some(holder);
+        snap.ball.altitude_yards = 6.0;
+
+        let features = SoccerConfigVector::from_snapshot(&snap, Team::Home).to_features();
+        let own_flags = (0..CONFIG_PLAYERS_PER_TEAM)
+            .map(|slot| features[slot * CONFIG_PER_PLAYER_FLOATS + CONFIG_PER_PLAYER_FLOATS - 1])
+            .collect::<Vec<_>>();
+        let opponent_offset = CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_PLAYER_FLOATS;
+        let opponent_flags = (0..CONFIG_PLAYERS_PER_TEAM)
+            .map(|slot| {
+                features[opponent_offset
+                    + slot * CONFIG_PER_PLAYER_FLOATS
+                    + CONFIG_PER_PLAYER_FLOATS
+                    - 1]
+            })
+            .collect::<Vec<_>>();
+        let ball_offset = 2 * CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_PLAYER_FLOATS;
+
+        assert_eq!(own_flags.iter().filter(|&&flag| flag == 1.0).count(), 1);
+        assert!(opponent_flags.iter().all(|&flag| flag == 0.0));
+        assert!((features[ball_offset + 2] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn feature_vector_keeps_possession_team_when_ball_is_in_flight() {
+        let mut snap = sample_snapshot();
+        snap.ball.holder = None;
+        snap.ball.last_touch_team = Some(Team::Home);
+
+        let home_features = SoccerConfigVector::from_snapshot(&snap, Team::Home).to_features();
+        let away_features = SoccerConfigVector::from_snapshot(&snap, Team::Away).to_features();
+        let possession_offset =
+            2 * CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_PLAYER_FLOATS + CONFIG_BALL_FLOATS;
+
+        assert_eq!(home_features[possession_offset], 1.0);
+        assert_eq!(away_features[possession_offset], -1.0);
+        assert!((0..(2 * CONFIG_PLAYERS_PER_TEAM)).all(|slot| {
+            home_features[slot * CONFIG_PER_PLAYER_FLOATS + CONFIG_PER_PLAYER_FLOATS - 1] == 0.0
+        }));
     }
 
     /// Capturing config-moments during a match must, after the episode, yield
@@ -623,10 +708,57 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_action_prior_ignores_non_finite_neighbors() {
+        let neighbors = vec![
+            SoccerRetrievalNeighborView {
+                action: "shoot".to_string(),
+                distance: f64::NAN,
+                nstep_return: 10.0,
+                value: None,
+            },
+            SoccerRetrievalNeighborView {
+                action: "pass".to_string(),
+                distance: 0.0,
+                nstep_return: f64::NAN,
+                value: Some(f64::INFINITY),
+            },
+            SoccerRetrievalNeighborView {
+                action: "".to_string(),
+                distance: 0.0,
+                nstep_return: 10.0,
+                value: None,
+            },
+            SoccerRetrievalNeighborView {
+                action: "hold".to_string(),
+                distance: 0.0,
+                nstep_return: -1.0,
+                value: None,
+            },
+        ];
+
+        let prior = soccer_retrieval_action_prior(&neighbors);
+
+        assert_eq!(prior.len(), 1);
+        assert!(prior["hold"] < 0.0, "finite bad hold should remain");
+        assert!(prior.values().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn config_feature_cosine_self_is_one() {
         let snap = sample_snapshot();
         let f = SoccerConfigVector::from_snapshot(&snap, Team::Home).to_features();
         let f32v: Vec<f32> = f.iter().map(|&x| x as f32).collect();
         assert!((soccer_config_feature_cosine(&f32v, &f32v) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn config_feature_cosine_sanitizes_non_finite_channels() {
+        let a = vec![1.0, f32::NAN, f32::INFINITY, 0.0];
+        let b = vec![1.0, 0.0, 0.0, f32::NEG_INFINITY];
+
+        let cosine = soccer_config_feature_cosine(&a, &b);
+
+        assert!(cosine.is_finite());
+        assert!((cosine - 1.0).abs() < 1e-9);
     }
 }

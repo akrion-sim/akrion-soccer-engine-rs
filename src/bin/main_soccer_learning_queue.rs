@@ -1385,6 +1385,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| run_dir.join("learned-params.json"));
     let mut pg_store = SoccerLearningPgStore::connect_from_env().map_err(invalid_data)?;
+    let retrieval_capture_enabled = env_bool_alias(
+        "SOCCER_RETRIEVAL_CAPTURE_ENABLED",
+        "SOCCER_RETRIEVAL_CAPTURE",
+        pg_store.is_some(),
+    )?;
+    config.retrieval.capture_enabled = retrieval_capture_enabled;
     let postgres_required = env_bool("SOCCER_REQUIRE_POSTGRES", false)?;
     if postgres_required && pg_store.is_none() {
         return Err(

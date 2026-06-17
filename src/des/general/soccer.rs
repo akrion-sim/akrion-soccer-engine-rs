@@ -371,12 +371,17 @@ const CARRIER_ADVANCE_FULL_SPEED_YPS: f64 = 6.0; // at/above this goalward speed
 const CARRIER_ADVANCE_STEAL_BOOST: f64 = 0.9; // cover + full advance ⇒ up to ~1.9× commit.
 const CARRIER_COVER_RADIUS_YARDS: f64 = 20.0; // a covering teammate goal-side within this range.
 const CARRIER_NO_COVER_CONTAIN_FACTOR: f64 = 0.7; // lone last defender: contain, don't lunge.
-const CARRIER_ADVANCE_STEPUP_FRACTION: f64 = 0.4; // close this share of the goal-side cushion when committing.
-                                                  // The step-up presses to JOCKEYING distance (edge of tackle range), not onto the
-                                                  // ball — diving to the carrier's feet pulls the defender into the on-ball cluster
-                                                  // and trips the anti-bunchball swarm cap. ~2.8yd keeps them within the 3.1yd tackle
-                                                  // reach while staying off the ball so they jockey rather than dogpile.
+/// Share of the goal-side cushion closed when the carrier is advancing with cover.
+const CARRIER_ADVANCE_STEPUP_FRACTION: f64 = 0.4;
+/// Near goal, close the whole cushion so the defender actively contests the carrier.
+const CARRIER_CLOSE_GOAL_STEPUP_FRACTION: f64 = 1.0;
+/// The step-up presses to jockeying distance, not onto the ball. Diving to the
+/// carrier's feet pulls the defender into the on-ball cluster and trips the
+/// anti-bunchball swarm cap. The baseline keeps the defender within the 3.1yd
+/// tackle reach while staying off the ball so it jockeys rather than dogpiles.
 const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
+const CARRIER_CLOSE_GOAL_JOCKEY_YARDS: f64 = 1.4;
+const CARRIER_CLOSE_GOAL_PRESS_MIN: f64 = 0.38;
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
 /// channel from the ball. Lets receivers balance open space with a direct route
@@ -647,6 +652,7 @@ const TEAMWORK_PROGRESS_NEAR_BALL_PLAYERS: usize = 5;
 const TEAMWORK_PROGRESS_MIN_RELOCATION_YARDS: f64 = 0.08;
 const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
 const GOAL_REWARD_POINTS: f64 = 100.0;
+const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 30.0;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
@@ -863,6 +869,14 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
+// Backward recycling should be a short support bounce, not a retreating outlet.
+// If a backward pass is needed, prefer a 3-5yd reset and increasingly demote
+// balls played more than 5yd back toward our own goal.
+const BACKWARD_PASS_SHORT_RESET_MIN_YARDS: f64 = 3.0;
+const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
+const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
+const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
+const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -1861,7 +1875,7 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// While supporting an unpressured carrier, an off-ball attacker edges his support point
 /// up to this many yards ahead of his current position (capped onside) so he actively
 /// pushes up with the free carrier instead of standing still.
-const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 4.0;
+const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 8.0;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
@@ -1901,6 +1915,11 @@ const WALL_PASS_BASE_APPETITE: f64 = 0.30;
 /// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
 /// looking to combine — lift the appetite hard.
 const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
+/// And make that strategy a real commitment once the geometry exists, not just a
+/// background nudge that loses most ticks to generic pass/dribble rolls.
+const WALL_PASS_STRATEGY_MIN_APPETITE: f64 = 0.78;
+/// Minimum quality for a named one-two strategy to commit immediately.
+const WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY: f64 = 0.25;
 /// Goal-proximity reference: appetite to combine ramps up inside this distance to goal.
 const WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS: f64 = 40.0;
 /// Firm-but-controlled power for the lay-off give (skill adds a little).
@@ -15773,12 +15792,39 @@ fn pending_pass_reception_reward(
 ) -> f64 {
     let before_ball_distance = before_pos.distance(before.ball.position);
     let after_ball_distance = after_pos.distance(after.ball.position);
-    let closing_yards = (before_ball_distance - after_ball_distance).clamp(-10.0, 10.0);
+    let ball_closing_yards = (before_ball_distance - after_ball_distance).clamp(-10.0, 10.0);
+    let reception_target = before
+        .pending_pass_reception_target_for(player_id)
+        .map(|(target, _)| target);
+    let (before_reception_distance, closing_yards) = if let Some(target) = reception_target {
+        let before_target_distance = before_pos.distance(target);
+        let after_target_distance = after_pos.distance(target);
+        (
+            before_target_distance,
+            ((before_target_distance - after_target_distance) * 0.82 + ball_closing_yards * 0.18)
+                .clamp(-10.0, 10.0),
+        )
+    } else {
+        (before_ball_distance, ball_closing_yards)
+    };
     let urgency = before_obs.pending_pass_receiver_urgency.clamp(0.0, 1.0);
     let off_target = (before_obs.pending_pass_off_target_yards / 7.0).clamp(0.0, 1.0);
     let pressure = before_obs.perceived_pressure.clamp(0.0, 1.0);
     let scale = 0.12 + urgency * 0.30 + off_target * 0.20 + pressure * 0.20;
     let mut reward = closing_yards * scale;
+
+    if let Some(target) = reception_target {
+        if let Some(margin) = pending_pass_reception_contest_margin(
+            before,
+            player_id,
+            player_team,
+            after_pos,
+            target,
+        ) {
+            let contest_weight = 0.14 + urgency * 0.30 + pressure * 0.20;
+            reward += (margin / 1.20).clamp(-1.0, 1.0) * contest_weight;
+        }
+    }
 
     if matches!(action, "recover") {
         reward += 0.08 + urgency * 0.20 + pressure * 0.12;
@@ -15800,11 +15846,39 @@ fn pending_pass_reception_reward(
     {
         // Letting the ball run straight through to an opponent on reception.
         reward -= 1.1 + urgency * 0.35 + pressure * 0.18;
-    } else if closing_yards < 0.15 && before_ball_distance > 3.0 {
+    } else if closing_yards < 0.15 && before_reception_distance > 3.0 {
         reward -= 0.20 + urgency * 0.30 + pressure * 0.15;
     }
 
     reward.clamp(-3.0, 3.4)
+}
+
+fn pending_pass_reception_contest_margin(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    player_team: Team,
+    player_pos: Vec2,
+    target: Vec2,
+) -> Option<f64> {
+    let player = snapshot.players.iter().find(|player| player.id == player_id)?;
+    let player_speed = (player_top_speed_yps(player.role, &player.skills)
+        * fatigue_speed_factor(player.skills.stamina, player.fatigue)
+        * MovementGait::Sprint.speed_multiplier())
+    .max(1.0);
+    let player_time = player_pos.distance(target) / player_speed;
+    let opponent_time = snapshot
+        .players
+        .iter()
+        .filter(|opponent| opponent.team == player_team.other())
+        .map(|opponent| {
+            let speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+                * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+                * MovementGait::Sprint.speed_multiplier())
+            .max(1.0);
+            snapshot.player_snapshot_position(opponent).distance(target) / speed
+        })
+        .fold(f64::INFINITY, f64::min);
+    opponent_time.is_finite().then_some(opponent_time - player_time)
 }
 
 fn attacking_support_urgency_learning_reward(
@@ -43850,6 +43924,30 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     } else {
         forward_yards * weight * BACKWARD_PASS_VALUE_MULTIPLIER
     }
+}
+
+fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
+        return 0.0;
+    }
+    let backward_yards = -forward_yards;
+    if (BACKWARD_PASS_SHORT_RESET_MIN_YARDS..=BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
+        .contains(&backward_yards)
+    {
+        let midpoint =
+            (BACKWARD_PASS_SHORT_RESET_MIN_YARDS + BACKWARD_PASS_SHORT_RESET_MAX_YARDS) * 0.5;
+        let half_band =
+            ((BACKWARD_PASS_SHORT_RESET_MAX_YARDS - BACKWARD_PASS_SHORT_RESET_MIN_YARDS) * 0.5)
+                .max(1e-6);
+        let center_fit = (1.0 - (backward_yards - midpoint).abs() / half_band).clamp(0.0, 1.0);
+        return BACKWARD_PASS_SHORT_RESET_BONUS * (0.80 + center_fit * 0.20);
+    }
+    if backward_yards > BACKWARD_PASS_SHORT_RESET_MAX_YARDS {
+        return -((backward_yards - BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
+            * BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD)
+            .min(BACKWARD_PASS_LONG_RESET_PENALTY_CAP);
+    }
+    0.0
 }
 
 fn lateral_pass_penalty(forward_yards: f64, aerial: bool) -> f64 {
