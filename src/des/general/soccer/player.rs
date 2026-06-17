@@ -57,9 +57,52 @@ pub struct SkillProfile {
     pub aggression: f64,
 }
 
+/// Per-shirt position accent: small, deterministic shaping deltas applied to the
+/// role baseline so each of the 11 shirts plays to type (a #9 finisher vs a #6
+/// holder) while every player stays the *same overall standard*. The deltas are
+/// hand-balanced to net ≈0 per shirt, so no position is globally stronger — only
+/// differently shaped. Fields left at 0.0 inherit the role baseline unchanged.
+#[derive(Clone, Copy, Default)]
+struct ShirtAccent {
+    top_speed: f64,
+    acceleration: f64,
+    strength: f64,
+    height: f64,
+    shooting: f64,
+    passing: f64,
+    dribbling: f64,
+    first_touch: f64,
+    defending: f64,
+    vision: f64,
+    crossing: f64,
+    stamina: f64,
+    aggression: f64,
+}
+
 impl SkillProfile {
-    pub(crate) fn blended(seed: usize, role: PlayerRole, rng: &mut SeededRandom) -> Self {
-        let role_bias = match role {
+    /// Balanced per-role attribute baseline (14-tuple): top_speed, acceleration,
+    /// strength, height, shooting, passing, dribbling, first_touch, defending,
+    /// stamina, vision, aggression, goalkeeping, defensive_tracking_base. Shared by
+    /// the randomized [`Self::blended`] and the deterministic [`Self::for_shirt`].
+    fn role_bias_tuple(
+        role: PlayerRole,
+    ) -> (
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+    ) {
+        match role {
             PlayerRole::Goalkeeper => (
                 5.8, 6.0, 8.0, 8.6, 3.6, 6.2, 4.0, 7.4, 7.2, 7.8, 7.0, 4.2, 9.2, 7.2,
             ),
@@ -72,7 +115,177 @@ impl SkillProfile {
             PlayerRole::Forward => (
                 9.3, 8.4, 7.5, 7.0, 8.4, 7.1, 8.6, 7.5, 4.9, 8.0, 7.8, 7.4, 1.5, 5.3,
             ),
+        }
+    }
+
+    /// Deterministic, RNG-free skill profile for a given shirt number (1–11): every
+    /// player is the *same overall standard*, distinguished only by a
+    /// position-shaped accent, and identical between the two teams (Home #7 ==
+    /// Away #7). This is the "all players basically equal besides their position
+    /// 1–11" model — no per-player or per-team randomness, so neither side starts
+    /// with a skill edge and both learn from an equal footing.
+    pub(crate) fn for_shirt(shirt: u8, role: PlayerRole) -> Self {
+        let bias = Self::role_bias_tuple(role);
+        // Position accent per shirt (1 GK … 11 LW). Deltas net ≈0 so the overall
+        // standard is equal; they only re-shape toward the position's job.
+        let a = match shirt {
+            // GK
+            1 => ShirtAccent::default(),
+            // Right-back: pace + crossing for the overlap, a touch less aerial.
+            2 => ShirtAccent {
+                top_speed: 0.5,
+                acceleration: 0.4,
+                crossing: 0.7,
+                stamina: 0.4,
+                height: -0.6,
+                strength: -0.4,
+                ..Default::default()
+            },
+            // Left-back: mirror of the right-back (footedness handled below).
+            3 => ShirtAccent {
+                top_speed: 0.5,
+                acceleration: 0.4,
+                crossing: 0.7,
+                stamina: 0.4,
+                height: -0.6,
+                strength: -0.4,
+                ..Default::default()
+            },
+            // Right centre-back: dominant aerial/strength, slower.
+            4 => ShirtAccent {
+                strength: 0.6,
+                height: 0.7,
+                defending: 0.5,
+                aggression: 0.3,
+                top_speed: -0.6,
+                dribbling: -0.5,
+                ..Default::default()
+            },
+            // Left centre-back: same shape as the #4.
+            5 => ShirtAccent {
+                strength: 0.6,
+                height: 0.7,
+                defending: 0.5,
+                aggression: 0.3,
+                top_speed: -0.6,
+                dribbling: -0.5,
+                ..Default::default()
+            },
+            // Holding midfielder: screen + distribute, less attacking thrust.
+            6 => ShirtAccent {
+                defending: 0.7,
+                passing: 0.4,
+                stamina: 0.3,
+                shooting: -0.6,
+                dribbling: -0.4,
+                ..Default::default()
+            },
+            // Right winger: pace + dribbling + crossing, lighter defensively.
+            7 => ShirtAccent {
+                top_speed: 0.7,
+                acceleration: 0.6,
+                dribbling: 0.7,
+                crossing: 0.6,
+                defending: -0.8,
+                strength: -0.4,
+                ..Default::default()
+            },
+            // Box-to-box centre midfielder: passing, vision, engine.
+            8 => ShirtAccent {
+                passing: 0.5,
+                vision: 0.6,
+                stamina: 0.6,
+                strength: 0.2,
+                top_speed: -0.4,
+                ..Default::default()
+            },
+            // Centre-forward: finishing + strength, less creation/defending.
+            9 => ShirtAccent {
+                shooting: 0.8,
+                strength: 0.5,
+                first_touch: 0.3,
+                passing: -0.6,
+                defending: -0.6,
+                ..Default::default()
+            },
+            // Attacking midfielder / second striker: flair, vision, dribbling.
+            10 => ShirtAccent {
+                vision: 0.7,
+                dribbling: 0.6,
+                passing: 0.5,
+                first_touch: 0.3,
+                defending: -0.7,
+                strength: -0.6,
+                ..Default::default()
+            },
+            // Left winger: mirror of the right winger.
+            11 => ShirtAccent {
+                top_speed: 0.7,
+                acceleration: 0.6,
+                dribbling: 0.7,
+                crossing: 0.6,
+                defending: -0.8,
+                strength: -0.4,
+                ..Default::default()
+            },
+            _ => ShirtAccent::default(),
         };
+
+        let clamp = |v: f64| v.clamp(1.0, 10.0);
+        let shooting = clamp(bias.4 + a.shooting);
+        let passing = clamp(bias.5 + a.passing);
+        let dribbling = clamp(bias.6 + a.dribbling);
+        let first_touch = clamp(bias.7 + a.first_touch);
+        let defending = clamp(bias.8 + a.defending);
+        let strength = clamp(bias.2 + a.strength);
+        let height = clamp(bias.3 + a.height);
+        // Footedness is positional, not random: the left-flank shirts are
+        // left-footed; everyone else is right-footed. Deterministic and mirrored.
+        let left_footed = matches!(shirt, 3 | 11);
+        let strong_foot = clamp(shooting + 0.3);
+        let weak_foot = clamp(shooting - 1.1);
+        let (right_foot_shot_power, left_foot_shot_power) = if left_footed {
+            (weak_foot, strong_foot)
+        } else {
+            (strong_foot, weak_foot)
+        };
+        let crossing_strong = clamp(passing * 0.76 + first_touch * 0.16 + a.crossing);
+        let crossing_weak = clamp(passing * 0.72 + first_touch * 0.18 + a.crossing);
+        let (crossing_right, crossing_left) = if left_footed {
+            (crossing_weak, crossing_strong)
+        } else {
+            (crossing_strong, crossing_weak)
+        };
+        let weight_pounds = default_player_weight_for_traits(role, strength, height, 0.0);
+        SkillProfile {
+            top_speed: clamp(bias.0 + a.top_speed),
+            acceleration: clamp(bias.1 + a.acceleration),
+            strength,
+            height,
+            weight_pounds,
+            shooting,
+            right_foot_shot_power,
+            left_foot_shot_power,
+            passing,
+            passing_completion_rate: clamp(passing * 0.86 + first_touch * 0.12),
+            flair_passing: clamp(passing * 0.58 + dribbling * 0.30),
+            crossing_left,
+            crossing_right,
+            dribbling,
+            first_touch,
+            defending,
+            goalkeeping: clamp(bias.12),
+            defensive_tracking: clamp(bias.13 * 0.78 + defending * 0.22),
+            stamina: clamp(bias.9 + a.stamina),
+            vision: clamp(bias.10 + a.vision),
+            // Equal decision discipline for everyone — no per-player noise edge.
+            decision_noise: 0.08,
+            aggression: clamp(bias.11 + a.aggression),
+        }
+    }
+
+    pub(crate) fn blended(seed: usize, role: PlayerRole, rng: &mut SeededRandom) -> Self {
+        let role_bias = Self::role_bias_tuple(role);
         let jitter = |rng: &mut SeededRandom, scale: f64| (rng.next_float() - 0.5) * scale;
         let shooting = (role_bias.4 + jitter(rng, 1.1)).clamp(1.0, 10.0);
         let passing = (role_bias.5 + jitter(rng, 1.0)).clamp(1.0, 10.0);
@@ -2239,8 +2452,12 @@ impl PlayerAgent {
                 DribbleTouchDecision::new(0, 1.35),
             );
         }
-        (self.position + carried_ball_lead(self))
-            .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+        // A neutral controlling touch carries the ball a little ahead. With pass-anticipation on,
+        // the first touch is made PURPOSEFUL: flick it onto an onside team-mate's forward run, or —
+        // under a bearing-down marker — push it into space away from his momentum to retain it.
+        let neutral = (self.position + carried_ball_lead(self))
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        snapshot.first_touch_directional_target_for(self.id, neutral)
     }
 
     fn human_shoot_or_carry_action(
@@ -2952,6 +3169,31 @@ impl PlayerAgent {
                     observation,
                     belief,
                     vec!["receive-pending-pass".to_string()],
+                    single_action_option("recover"),
+                    &action,
+                    "recover",
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint,
+                };
+            }
+        }
+
+        // Anticipate where the in-flight pass is going and race for it: a defender jumps
+        // the lane to intercept (gated by an LP/IPM position budget so it stays in shape),
+        // or a second attacker crashes a contested reception. Off by default; pure
+        // movement intent (no RNG), so baseline play is unchanged when disabled.
+        if !has_ball {
+            if let Some((target, sprint)) = snapshot.pass_contest_intent_for(self.id) {
+                let action = SoccerAction::MoveTo(target);
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state,
+                    observation,
+                    belief,
+                    vec!["anticipate-pass".to_string(), "contest-reception".to_string()],
                     single_action_option("recover"),
                     &action,
                     "recover",

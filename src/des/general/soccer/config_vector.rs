@@ -576,6 +576,39 @@ mod tests {
             assert!(m.reward.is_finite() && m.nstep_return.is_finite());
             assert!(!m.action.is_empty());
         }
+        // The whole point is to relate a decision to how it turned out: at least
+        // one captured moment must carry a non-zero n-step outcome, or the
+        // similarity→outcome retrieval signal is dead. (Guards the silent-zero
+        // regression where the outcome join lost its transition stream.)
+        assert!(
+            moments.iter().any(|m| m.nstep_return != 0.0),
+            "captured moments must carry a realised outcome, not all zeros"
+        );
+    }
+
+    /// Capture must be self-sufficient: with full-game learning OFF but
+    /// `retrieval.capture_enabled` ON (a dedicated corpus-builder), moments are
+    /// still captured AND still carry realised outcomes — the n-step join retains
+    /// its own transition stream rather than free-riding on full-game learning.
+    #[test]
+    fn config_moments_capture_without_full_game_learning() {
+        let mut cfg = MatchConfig::default();
+        cfg.full_game_learning_enabled = false;
+        cfg.retrieval.capture_enabled = true;
+        cfg.retrieval.outcome_horizon = 10;
+        let mut sim = SoccerMatch::default_11v11(cfg);
+        for _ in 0..120 {
+            sim.run_time_step();
+        }
+        let moments = sim.config_moments();
+        assert!(
+            !moments.is_empty(),
+            "capture must work with full-game learning disabled"
+        );
+        assert!(
+            moments.iter().any(|m| m.nstep_return != 0.0),
+            "outcomes must be populated even without full-game learning"
+        );
     }
 
     #[test]

@@ -377,6 +377,17 @@ const CARRIER_ADVANCE_STEPUP_FRACTION: f64 = 0.4; // close this share of the goa
                                                   // and trips the anti-bunchball swarm cap. ~2.8yd keeps them within the 3.1yd tackle
                                                   // reach while staying off the ball so they jockey rather than dogpile.
 const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
+/// Depth-scaled pressing aggression in our own defensive third. The closer an
+/// opponent carrier gets to our own goal, the less a defender can afford to sit
+/// off and contain — letting a dribbler stroll into the box uncontested is worse
+/// than the risk of stepping up. `own_goal_press_urgency` ramps 0 at the edge of
+/// our defensive third up to 1 just outside our six-yard area, and scales how far
+/// we relax the engage speed-threshold and the lone-defender (no-cover) contain
+/// caution. It is 0 at/above the third edge, so midfield and our shallow half stay
+/// byte-identical to the contain baseline.
+const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
+const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
+const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
 /// channel from the ball. Lets receivers balance open space with a direct route
@@ -647,6 +658,11 @@ const TEAMWORK_PROGRESS_NEAR_BALL_PLAYERS: usize = 5;
 const TEAMWORK_PROGRESS_MIN_RELOCATION_YARDS: f64 = 0.08;
 const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
 const GOAL_REWARD_POINTS: f64 = 100.0;
+/// Reduced reward pool for a goal scored directly off a turnover — a single
+/// scoring-team player touched the ball between winning it from the opponent and
+/// finishing. There is no build-up play to credit, only the steal-and-finish, so
+/// the goal distributes 30 points instead of the full [`GOAL_REWARD_POINTS`].
+const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 30.0;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
@@ -817,6 +833,28 @@ const BACKWARD_PASS_MIN_FORWARD_YARDS: f64 = 1.0;
 // ~openness 0.2 on the (distance-2.5)/7.5 openness curve: a backward ball is only safe
 // to a teammate with at least this much space from the nearest opponent.
 const BACKWARD_PASS_COVERED_RADIUS_YARDS: f64 = 4.0;
+// A short backward drop (≤5yd) keeps the ball safe and recyclable; a LONG backward pass
+// (>5yd) concedes territory and should be a last resort. The escalating per-yard demerit for
+// the long retreat itself lives in `long_backward_pass_penalty` (LONG_BACKWARD_PASS_*); this
+// cap additionally replaces the (8yd-optimal) length-PREFERENCE bonus for backward balls with
+// a SHORT-favouring curve (`backward_pass_length_preference`) so a 3-5yd drop isn't treated as
+// "sub-optimal length" relative to a longer backward ball.
+const BACKWARD_PASS_SHORT_MAX_YARDS: f64 = 5.0;
+// Backward pass-length preference fades from full (at the 5yd short cap) to zero over this
+// many additional yards.
+const BACKWARD_PASS_LENGTH_FADE_BAND_YARDS: f64 = 18.0;
+// Tactical anti-recycle rule ("men behind the ball"), from the attacking team's perspective
+// while in possession. If FEWER than this many opposing players are goal-side of the ball
+// (between the ball and the goal we are attacking) the opponent has committed numbers forward —
+// a settled back four + keeper is exactly 5 — so a long backward recycle needlessly relieves
+// that committed press and hands back the territory they have vacated.
+const BACKWARD_RECYCLE_OPP_BEHIND_COUNT: usize = 5;
+// In that situation a backward pass may travel at most this far (a short reset to a supporting
+// player is still fine); a longer backward ball is vetoed …
+const BACKWARD_RECYCLE_MAX_BACKWARD_YARDS: f64 = 3.0;
+// … UNLESS there are fewer than this many attacking players ahead of the ball, i.e. there is no
+// real forward outlet — then a backward ball is the only safe option and the restriction lifts.
+const BACKWARD_RECYCLE_MIN_FORWARD_ATTACKERS: usize = 2;
 // The constant forward "lead the runner into space" bias tapers to zero over this much space
 // remaining to the attacking goal line, so a receiver near the box isn't led past the byline.
 const RECEPTION_FORWARD_BIAS_TAPER_YARDS: f64 = 28.0;
@@ -863,6 +901,15 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
+// A short backward reset (3–5yd back to a supporting player) is a normal, useful ball;
+// slinging it 6+ yards backward concedes real territory and should be distinctly worse.
+// Beyond this backward distance, an escalating per-yard demerit kicks in so a 3–5yd
+// backward pass is preferred over a long backward one whenever both are on offer.
+const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
+// Per-yard demerit for every yard a backward pass travels beyond LONG_BACKWARD_PASS_YARDS.
+const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 0.85;
+// Cap so an extreme backward ball can't single-handedly dominate the ranking score.
+const LONG_BACKWARD_PASS_PENALTY_MAX: f64 = 6.5;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -1451,6 +1498,41 @@ const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
 // the ball (the primary presser) is exempt — someone still closes the ball down.
 const DEFENSIVE_GOAL_SIDE_MIN_YARDS: f64 = 1.5;
 const DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS: f64 = 10.0;
+// Position-swap / cross-through guard. Players "switching positions" and "running
+// past each other" is an artefact: off the ball a player should never steer a
+// straight line that carries it PAST a teammate (ending up on the far side of
+// them). The guard tests the path from the player's current position to its
+// movement target: if that path passes within `CORRIDOR_HALF_WIDTH` of a teammate
+// AND the target lies `BEYOND_MARGIN` yds beyond that teammate along the travel
+// direction (a genuine swap, not merely arriving alongside), the target is
+// truncated to stop `STOP_SHORT` yds short of the nearest such teammate — never
+// going backward. Only fires for moves longer than `MIN_TRAVEL`; the teammate
+// must be at least `MIN_AHEAD` yds up the path to count as "in the way".
+//
+// Legitimate exceptions are exempt, matching real football: a man-marking /
+// tracking run (its target lands within `MARK_RADIUS` of an opponent), a quick
+// exchange tight to the ball (the player or its target is within
+// `BALL_EXCHANGE` of the ball — handoffs and give-and-gos), running past the
+// ball carrier itself, and roaming set-piece movement (the caller's `roam` flag).
+const CROSS_THROUGH_MIN_TRAVEL_YARDS: f64 = 1.5;
+const CROSS_THROUGH_CORRIDOR_HALF_WIDTH_YARDS: f64 = 2.0;
+const CROSS_THROUGH_MIN_AHEAD_YARDS: f64 = 1.0;
+const CROSS_THROUGH_BEYOND_MARGIN_YARDS: f64 = 1.0;
+const CROSS_THROUGH_STOP_SHORT_YARDS: f64 = 2.5;
+const CROSS_THROUGH_MARK_RADIUS_YARDS: f64 = 3.0;
+const CROSS_THROUGH_BALL_EXCHANGE_YARDS: f64 = 6.0;
+// The guard only polices a crossed teammate who is actually MOVING (running past
+// each other / swapping). A stationary teammate merely standing in the straight
+// line to open space is handled by the spacing / occupied-space shape score,
+// which routes the run around them — truncating there would wrongly freeze a run
+// into genuine space. ~2 yps ≈ 4 mph, a clear jog.
+const CROSS_THROUGH_MATE_MIN_SPEED_YPS: f64 = 2.0;
+// ...and only when the crossed teammate is converging/cutting across rather than
+// LEADING us up the same line. If its velocity projected on our travel direction
+// exceeds this, we are trailing it in single file (a retreating line, a runner we
+// follow), which is not a swap. A genuine "running past each other" has a small or
+// negative along-path component (head-on, or a lateral cut). ~1 yps tolerance.
+const CROSS_THROUGH_MATE_LEAD_YPS: f64 = 1.0;
 // Territorial spacing discipline. "Cover territory" is a fundamental of both
 // attacking and defending: two teammates in the same small patch add no value.
 // Players are expected to keep at least this much space between them — but this
@@ -1806,6 +1888,29 @@ const LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS: f64 = 8.0;
 // speed. Otherwise ONE defender claims it and the others peel off goalside into space.
 const LOOSE_BALL_SHIELD_PRESSURE_RADIUS_YARDS: f64 = 4.0;
 const LOOSE_BALL_SHIELD_CLOSING_YPS: f64 = 3.0;
+// ---- Off-ball pass-reception belief / hand-off (anticipate the trajectory; best man receives) ----
+// When a ground pass is in flight, the receiving team predicts where it will arrive and the
+// genuinely best-placed team-mate goes to meet it. A team-mate is only treated as a live contender
+// for the reception when within this range of the predicted arrival point — beyond it he has no
+// realistic chance and keeps his shape rather than chasing a lost cause.
+const PASS_CONTEST_ENGAGE_RADIUS_YARDS: f64 = 30.0;
+// The intended receiver believes (a strong, ~80%-confident prior) the ball is for HIM, so he
+// keeps committing hard to it UNLESS a team-mate is clearly quicker to the arrival point — only
+// then does he realise he is beaten and back off, letting the closer man take it. This is the
+// margin (seconds) by which a team-mate must beat his own arrival before he defers; it is
+// generous precisely because his belief that the ball is his is strong.
+const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
+// ---- First touch: retain position / flick onto a runner ----
+// Length (yards) of a directional settling touch — short, so the ball stays under control.
+const FIRST_TOUCH_RETAIN_PUSH_YARDS: f64 = 2.2;
+// A retaining first touch is steered into space AWAY from the nearest marker only when that marker
+// is within this range AND genuinely bearing down (its momentum points at the receiver); with no
+// such pressure a neutral controlling touch is fine.
+const FIRST_TOUCH_MARKER_PRESSURE_RADIUS_YARDS: f64 = 6.0;
+// A first-time flick onto a team-mate's run is taken only when a team-mate is making a forward run
+// into space within this range, at least _MIN_AHEAD ahead, and the short lane to him is clear.
+const FIRST_TOUCH_FLICK_RUNNER_MAX_YARDS: f64 = 18.0;
+const FIRST_TOUCH_FLICK_RUNNER_MIN_AHEAD_YARDS: f64 = 3.0;
 // How far to the open SIDE (lateral) a peeled-off, non-retrieving player opens up while
 // dropping goalside of the loose ball, so it shows for the next pass instead of hugging it.
 const LOOSE_BALL_PEEL_LATERAL_YARDS: f64 = 7.0;
@@ -1860,8 +1965,9 @@ const ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS: f64 = 1.5;
 const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// While supporting an unpressured carrier, an off-ball attacker edges his support point
 /// up to this many yards ahead of his current position (capped onside) so he actively
-/// pushes up with the free carrier instead of standing still.
-const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 4.0;
+/// pushes up with the free carrier instead of standing still. A bigger push gets more
+/// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
+const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 7.0;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
@@ -1894,10 +2000,14 @@ const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
 /// The wall needs at least this much space to turn the ball around first-time.
 const WALL_PASS_PARTNER_MIN_SPACE_YARDS: f64 = 2.0;
 /// A one-two commitment lapses this many seconds after the give if the return never comes.
-const WALL_PASS_RUN_TTL_SECONDS: f64 = 1.8;
+/// Longer than a single touch so the runner genuinely COMMITS to the give-and-go (bursts
+/// past his man and holds the line of the run waiting for the return) rather than abandoning
+/// it the instant the wall doesn't return it first-time.
+const WALL_PASS_RUN_TTL_SECONDS: f64 = 2.4;
 /// Base appetite to attempt an available wall pass (scaled by quality, pressure, skill,
-/// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare.
-const WALL_PASS_BASE_APPETITE: f64 = 0.30;
+/// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare — the
+/// one-two is a primary attacking route, so when a clean combination is on it is taken often.
+const WALL_PASS_BASE_APPETITE: f64 = 0.46;
 /// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
 /// looking to combine — lift the appetite hard.
 const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
@@ -1972,6 +2082,12 @@ const GK_HANDLING_DISTRIBUTION_LANE_RADIUS_YARDS: f64 = 2.5;
 /// Hurried forced clearance speed (yds/s) when a keeper overruns the handling
 /// limit without distributing — a firm punt upfield, not a gentle drop.
 const GK_HANDLING_FORCED_CLEARANCE_YPS: f64 = 26.0;
+/// How far in front of the keeper (toward his facing) the ball sits while it is
+/// gathered in his hands — a tucked carry, not a dribble that orbits his body.
+const GK_HANDLING_BALL_TUCK_YARDS: f64 = 0.5;
+/// Launch altitude (yards) of a keeper's forced clearance punt — lofted so it
+/// clears the press over a presser's head rather than rolling into the channel.
+const GK_HANDLING_FORCED_CLEARANCE_ALTITUDE_YARDS: f64 = 3.0;
 /// After a goal, hold a brief celebration (ball settling in the net, players
 /// reacting) before resetting to the kickoff, so the goal sequence completes on
 /// screen instead of cutting straight to centre.
@@ -2142,7 +2258,20 @@ const ADVERSARIAL_EMBEDDING_MIN_SCORE: f32 = 0.72;
 const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
-const SOCCER_NEURAL_FEATURE_DIM: usize = 160;
+/// Base per-decision feature count: everything except the whole-field block below.
+const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 160;
+/// Whole-field "moment of all 22" block appended to every decision's feature vector:
+/// for the actor's team then the opponents (each ordered by player id), the
+/// actor-relative canonical (forward, lateral) position and (forward, lateral) velocity
+/// of every player on the pitch — so the learned value/critic conditions on the grid +
+/// motion vector of all 22, not just local aggregates. 22 players × 4 channels.
+const SOCCER_NEURAL_FIELD_MOTION_PLAYERS: usize = 22;
+const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 4;
+const SOCCER_NEURAL_FIELD_MOTION_DIM: usize =
+    SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+/// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` migrate by zero-padding the block.
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -2232,6 +2361,7 @@ const SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE: usize = 153;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61, 62, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96, 97, 102, 103, 106, 107, 108, 109,
     110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153,
+    SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -2470,6 +2600,10 @@ fn default_formation_lp_enabled() -> bool {
 }
 
 fn default_local_mpc_enabled() -> bool {
+    false
+}
+
+fn default_pass_anticipation_enabled() -> bool {
     false
 }
 
@@ -3879,6 +4013,12 @@ pub struct SoccerDecisionContext {
     pub actor_velocity: Vec2,
     #[serde(default)]
     pub actor_acceleration: Vec2,
+    /// Whole-field "moment of all 22": actor-relative canonical (forward, lateral)
+    /// position + (forward, lateral) velocity for the actor's team then the opponents,
+    /// each ordered by player id. Length `SOCCER_NEURAL_FIELD_MOTION_DIM`. Lets the
+    /// neural value/critic condition each decision on every player's grid spot + vector.
+    #[serde(default)]
+    pub field_player_motion: Vec<f32>,
     #[serde(default)]
     pub ball_position: Vec2,
     #[serde(default)]
@@ -11468,6 +11608,13 @@ pub struct MatchConfig {
     pub formation_lp_enabled: bool,
     #[serde(default = "default_local_mpc_enabled")]
     pub local_mpc_enabled: bool,
+    /// Off-ball pass-trajectory anticipation: both teams predict an in-flight pass's
+    /// reception point and race to win it (the best-placed attacker supports the
+    /// reception; the best-placed defender steps to intercept), with defenders gated
+    /// by a position budget against their formation-LP/IPM ideal so they are not drawn
+    /// out of shape. Off by default (play unchanged); on in `live_gameplay`.
+    #[serde(default = "default_pass_anticipation_enabled")]
+    pub pass_anticipation_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
     pub local_mpc_max_players_per_team: usize,
     #[serde(default = "default_tactical_learning_weights")]
@@ -11521,6 +11668,7 @@ impl Default for MatchConfig {
             full_game_learning_enabled: true,
             formation_lp_enabled: true,
             local_mpc_enabled: false,
+            pass_anticipation_enabled: default_pass_anticipation_enabled(),
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             tactical_learning: SoccerTacticalLearningWeights::default(),
             spacing: SoccerSpacingParams::default(),
@@ -11567,6 +11715,7 @@ impl MatchConfig {
             full_game_learning_enabled: true,
             formation_lp_enabled: true,
             local_mpc_enabled: true,
+            pass_anticipation_enabled: true,
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             // Full synergy in real games: the neural value/actor TRAIN (threaded) AND
             // feed back into selection (Additive blend + actor-critic) so the nets
@@ -12948,6 +13097,14 @@ fn tactical_directive_for_team(
     } else {
         StrategyLane::Center
     };
+    // Combination play (one-twos / give-and-goes) is the right penetration tool IN the final
+    // third, where a quick wall pass breaks a settled block. A through-ball / pull-wide is the
+    // tool from the MIDDLE third, where the over-the-top / switch creates the entry. So in the
+    // final third, attacking play commits to a give-and-go by lane — which both biases the
+    // value head toward combinations and lifts the carrier's wall-pass appetite (player.rs),
+    // making the one-two a deliberate team strategy rather than a rarely-selected option.
+    let in_final_third =
+        has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length / 3.0;
     let attack_strategy = if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
     } else if build_up_phase {
@@ -12963,6 +13120,12 @@ fn tactical_directive_for_team(
             StrategyLane::Left => TeamAttackStrategy::OverloadLeftIsolateRight,
             StrategyLane::Right => TeamAttackStrategy::OverloadRightIsolateLeft,
             StrategyLane::Center => TeamAttackStrategy::CentralDoubleOneTwo,
+        }
+    } else if attacking_phase && in_final_third {
+        match ball_side {
+            StrategyLane::Left => TeamAttackStrategy::OneTwoLeftRelease,
+            StrategyLane::Right => TeamAttackStrategy::OneTwoRightRelease,
+            StrategyLane::Center => TeamAttackStrategy::GiveAndGoCentral,
         }
     } else if attacking_phase {
         match ball_side {
@@ -14060,6 +14223,47 @@ fn soccer_decision_target_point(
     (point, target_player)
 }
 
+/// Build the whole-field "moment of all 22" block for `actor_id` on `actor_team`: the
+/// actor-relative position and velocity of every player, rotated into the actor team's
+/// attacking frame (so the block is identical for Home and Away — the same canonical
+/// orientation the retrieval moment vector uses), ordered own-team then opponents and
+/// each by ascending player id so every player keeps a fixed slot across ticks. Fixed
+/// length `SOCCER_NEURAL_FIELD_MOTION_DIM`; any missing player leaves trailing zeros.
+/// Pure arithmetic over the snapshot — cheap enough to run for every decision.
+fn soccer_field_player_motion_block(
+    snapshot: &WorldSnapshot,
+    actor_id: usize,
+    actor_team: Team,
+) -> Vec<f32> {
+    let actor_pos = snapshot
+        .player_position(actor_id)
+        .unwrap_or(snapshot.ball.position);
+    // +y is always the actor team's attack direction; x is mirrored with it so left/right
+    // is consistent for both teams (a 180° rotation for the side defending +y).
+    let dir = actor_team.attack_dir();
+    let mut ordered: Vec<(usize, bool)> = snapshot
+        .players
+        .iter()
+        .map(|player| (player.id, player.team == actor_team))
+        .collect();
+    // Own team (true) first, then opponents; each by ascending id for a stable layout.
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut block = Vec::with_capacity(SOCCER_NEURAL_FIELD_MOTION_DIM);
+    for (id, _own) in ordered {
+        if block.len() >= SOCCER_NEURAL_FIELD_MOTION_DIM {
+            break;
+        }
+        let pos = snapshot.player_position(id).unwrap_or(actor_pos);
+        let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
+        let rel = pos - actor_pos;
+        block.push(soccer_neural_scaled(rel.y * dir, 60.0) as f32);
+        block.push(soccer_neural_scaled(rel.x * dir, 40.0) as f32);
+        block.push(soccer_neural_scaled(vel.y * dir, 10.0) as f32);
+        block.push(soccer_neural_scaled(vel.x * dir, 10.0) as f32);
+    }
+    block
+}
+
 fn soccer_decision_context_for(
     player_id: usize,
     team: Team,
@@ -14197,6 +14401,7 @@ fn soccer_decision_context_for(
         actor_position,
         actor_velocity,
         actor_acceleration,
+        field_player_motion: soccer_field_player_motion_block(before, player_id, team),
         ball_position: before.ball.position,
         ball_velocity: before.ball.velocity,
         ball_acceleration: before.ball.acceleration,
@@ -28146,7 +28351,7 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_action_family_features(action);
     let context = &transition.decision_context;
     let nearest_defender = context.nearest_defenders.first();
-    let features = [
+    let base_features: [f64; SOCCER_NEURAL_BASE_FEATURE_DIM] = [
         soccer_neural_team_feature(transition.team),
         soccer_neural_role_feature(transition.role),
         soccer_neural_phase_feature(state.phase),
@@ -28547,6 +28752,22 @@ fn soccer_neural_transition_features_with_action(
         // control, not just team-shape LP, influenced the sample.
         soccer_neural_bool(transition.tactical_trace.local_mpc_guidance),
     ];
+    // Append the whole-field block so the value/critic conditions each decision on the
+    // grid + motion vector of all 22. Older nets (input_dim == base) migrate by
+    // zero-padding this tail (see SOCCER_NEURAL_LEGACY_FEATURE_DIMS), so any slot left
+    // unfilled — a short/absent block — must stay 0.
+    let mut features = [0.0_f64; SOCCER_NEURAL_FEATURE_DIM];
+    features[..SOCCER_NEURAL_BASE_FEATURE_DIM].copy_from_slice(&base_features);
+    for (slot, value) in features[SOCCER_NEURAL_BASE_FEATURE_DIM..]
+        .iter_mut()
+        .zip(transition.decision_context.field_player_motion.iter())
+    {
+        *slot = if value.is_finite() {
+            f64::from(*value)
+        } else {
+            0.0
+        };
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -38101,6 +38322,7 @@ fn tracking_frame_to_world_snapshot(
         ),
         formation_lp_enabled: config.formation_lp_enabled,
         local_mpc_enabled: config.local_mpc_enabled,
+        pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
             frame.clock_seconds.max(0.0)
@@ -42480,8 +42702,24 @@ fn modulated_pass_speed_yps(
     let speed =
         (raw_speed_yps + (desired_speed - raw_speed_yps) * fit) * (1.0 + noise).clamp(0.78, 1.24);
     let aerial_carry_floor = if flight.is_aerial() {
-        // Lowered so short/medium aerials aren't forced to fly fast (a big overhit source).
-        mph_to_yps((13.0 + (distance / 5.5).clamp(0.0, 14.0)).min(28.0))
+        // HANG-TIME CEILING. The arc is decoupled from time (altitude is a function of
+        // horizontal progress, not gravity), so the ONLY thing keeping a lofted ball aloft
+        // for a believable span is its horizontal pace: hang time = distance / speed. A slow
+        // long ball therefore floats absurdly. Bound it to what a real projectile reaching the
+        // same apex would do: a ball lobbed to apex `h` is airborne for t = 2·√(2h/g). That
+        // gives ~2.2s for a 20ft loft and ~2.7s for the 30ft ceiling — so the MINIMUM launch
+        // speed is `distance / that_hang_time`. Long balls are forced to be driven; short
+        // chips stay gentle (a 15yd chip's floor is only ~14mph), so this isn't an overhit
+        // source — it purely kills the float. Mirrors the apex formula in
+        // `pass_ball_altitude_yards` (sans the per-pass scoop seed; scoops returned above).
+        let apex_yards = (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + distance.max(0.0) * 0.074)
+            .clamp(5.0, MAX_LOFT_APEX_YARDS);
+        let apex_meters = apex_yards * METERS_PER_YARD;
+        const GRAVITY_MPS2: f64 = 9.81;
+        let hang_time = 2.0 * (2.0 * apex_meters / GRAVITY_MPS2).sqrt();
+        let hang_time_floor = distance / hang_time.max(0.35);
+        let lively_floor = mph_to_yps(13.0);
+        hang_time_floor.max(lively_floor)
     } else {
         mph_to_yps(4.0)
     };
@@ -43840,6 +44078,22 @@ fn pass_length_preference(dist: f64) -> f64 {
     (1.0 - (dist - PASS_LENGTH_OPTIMAL_YARDS) / fade_band).clamp(0.0, 1.0)
 }
 
+/// Length preference for a BACKWARD pass. Unlike the forward/lateral curve (which peaks at
+/// the 8yd "optimal" length), a backward ball is safest when it's a SHORT drop: full
+/// preference up to the 5yd short cap, then fading to zero as the retreat lengthens. This
+/// stops the engine treating a long (e.g. 8yd) backward pass as "optimal length".
+fn backward_pass_length_preference(dist: f64) -> f64 {
+    if !dist.is_finite() || dist <= 0.0 {
+        return 0.0;
+    }
+    if dist <= BACKWARD_PASS_SHORT_MAX_YARDS {
+        1.0
+    } else {
+        (1.0 - (dist - BACKWARD_PASS_SHORT_MAX_YARDS) / BACKWARD_PASS_LENGTH_FADE_BAND_YARDS)
+            .clamp(0.0, 1.0)
+    }
+}
+
 fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     if !forward_yards.is_finite() || !weight.is_finite() {
         return 0.0;
@@ -43850,6 +44104,19 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     } else {
         forward_yards * weight * BACKWARD_PASS_VALUE_MULTIPLIER
     }
+}
+
+/// Escalating demerit for a *long* backward pass. Returns 0 for forward, square, or
+/// short-backward (≤5yd) balls so a 3–5yd reset is untouched, then grows per-yard
+/// (capped) for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
+/// `forward_yards` is signed attacking-direction progress (negative = backward).
+fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= 0.0 {
+        return 0.0;
+    }
+    let backward_yards = -forward_yards;
+    ((backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
+        .min(LONG_BACKWARD_PASS_PENALTY_MAX)
 }
 
 fn lateral_pass_penalty(forward_yards: f64, aerial: bool) -> f64 {
@@ -45173,7 +45440,9 @@ fn pressure_bucket(nearest_opponent_distance: f64) -> u8 {
     distance_bucket(pressure, &[0.15, 0.35, 0.60, 0.82])
 }
 
-fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAgent> {
+// `rng` is retained for signature stability; squad skills are now deterministic
+// per shirt (`SkillProfile::for_shirt`), so no randomness is drawn here.
+fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerAgent> {
     let home_layout = vec![
         (
             "Home GK".to_string(),
@@ -45281,7 +45550,17 @@ fn default_players(config: &MatchConfig, rng: &mut SeededRandom) -> Vec<PlayerAg
                 dizziness: 0.0,
                 anaerobic_load: 0.0,
                 incoming_ball: None,
-                skills: SkillProfile::blended(id, role, rng),
+                // Deterministic, position-only skills: every player is the same
+                // overall standard, shaped by their shirt (1–11) and identical
+                // between the two teams, so neither side starts with a skill edge
+                // and both learn from an equal footing. We still advance the shared
+                // RNG exactly as the historical randomized build did (drawing and
+                // discarding a `blended` profile) so that equalizing skills does
+                // not resequence any *other* stochastic match state.
+                skills: {
+                    let _discarded_randomized = SkillProfile::blended(id, role, _rng);
+                    SkillProfile::for_shirt(shirt, role)
+                },
                 fatigue: 0.0,
                 controller_slot: None,
                 preferences,

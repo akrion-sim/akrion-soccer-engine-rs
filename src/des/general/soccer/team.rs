@@ -3194,6 +3194,22 @@ fn soccer_formation_lp_apply_strategy_profile(
                 weights.space_occupation *= 1.3;
                 weights.expected_goal *= 1.15;
             }
+            // Quick combinations through the lines (wall passes / one-twos / third-man /
+            // half-space): penetrate a settled block straight to a shot. They live or die on
+            // clean give-and-return lanes, so value clean passing lanes alongside the goal
+            // threat they create. (Previously these fell into the no-op catch-all and so had
+            // no value-head identity at all.)
+            GiveAndGoCentral
+            | OneTwoLeftRelease
+            | OneTwoRightRelease
+            | CentralDoubleOneTwo
+            | ThirdManRunCentral
+            | HalfSpaceComboLeft
+            | HalfSpaceComboRight => {
+                weights.expected_goal *= 1.18;
+                weights.progression *= 1.12;
+                weights.passing_lane_quality *= 1.15;
+            }
             _ => {}
         }
     }

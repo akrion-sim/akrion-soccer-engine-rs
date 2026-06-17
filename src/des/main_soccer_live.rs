@@ -224,6 +224,18 @@ where
             );
         }
     }
+    // How close to the ball a player must be to run the per-player MPC (the "active
+    // subset"). Default ~14yd keeps it near the ball; raise it past the pitch diagonal to
+    // have ALL 22 plan their execution through the field-aware QP. There is ample per-tick
+    // budget for it (the field loop is a small fraction of the step), so this is safe.
+    if let Some(radius) = env_positive_f64(
+        &lookup,
+        "SOCCER_LIVE_MPC_ACTIVE_RADIUS",
+        "SOCCER_MPC_ACTIVE_RADIUS",
+    ) {
+        cfg.match_config.mpc.active_radius_yards = radius;
+        println!("# soccer-live: MPC active radius set to {radius:.0}yd (all players within run the QP)");
+    }
     if let Some(max_bytes) = env_nonnegative_u64(
         &lookup,
         "SOCCER_LIVE_POLICY_AUTOLOAD_MAX_BYTES",
