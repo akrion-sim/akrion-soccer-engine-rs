@@ -536,6 +536,8 @@ fn player_mdp_mpc_comparison_trace(
             "shoot"
                 | "pass"
                 | "pass1"
+                | "switch-play"
+                | "recycle-reset"
                 | "aerial-pass"
                 | "aerial-pass1"
                 | "clearance"
@@ -556,6 +558,7 @@ fn player_mdp_mpc_comparison_trace(
                 | "run-in-behind"
                 | "shot-creation-run"
                 | "support-push-up"
+                | "press-cover"
                 | "defend"
                 | "hold"
                 | "recover"
@@ -1224,6 +1227,56 @@ impl PlayerAgent {
         let aerial_forward_runner_multiplier = observation
             .aerial_forward_runner_pass_multiplier
             .clamp(1.0, 1.50);
+        let reset_quality = (observation.expected_pass_completion.clamp(0.0, 1.0) * 0.42
+            + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.24
+            + open_support_fit * 0.22
+            + pressured_release_signal * 0.12)
+            .clamp(0.0, 1.0);
+        let recycle_reset_score = (self.preferences.pass_bias
+            * directive.pass_priority
+            * (0.36 + passing * 0.34)
+            * (0.74 + reset_quality * 0.38)
+            * (1.0
+                + own_half as u8 as f64 * 0.16
+                + pressure_urgency.max(pressure) * 0.18
+                + excessive_hold_pressure(observation, dribbling) * 0.22)
+            * floor_pass_patience_multiplier
+            * hold_release_multiplier
+            * crowded_pass_lift
+            * pressured_release_multiplier(observation))
+            .clamp(0.004, hold_release_score_cap);
+        options.push(AgentActionOptionTrace::new(
+            "recycle-reset",
+            recycle_reset_score,
+            pass_target_count > 0
+                && reset_quality >= 0.20
+                && !goal_attack_shot_blocks_alternatives,
+        ));
+        let switch_context = (flank_lane_fit * 0.36
+            + observation.attacking_overload_score.clamp(0.0, 1.0) * 0.18
+            + observation.team_spread_yards / field_width.max(1.0) * 0.18
+            + pressure_urgency.max(pressure) * 0.16
+            + observation.pass_curl_probability.clamp(0.0, 1.0) * 0.12)
+            .clamp(0.0, 1.0);
+        let switch_play_score = (self.preferences.pass_bias
+            * directive.pass_priority
+            * (0.34 + passing * 0.36 + ability01(self.skills.vision) * 0.18)
+            * (0.70
+                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.22
+                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.16
+                + switch_context * 0.34)
+            * floor_pass_patience_multiplier
+            * hold_release_multiplier
+            * crowded_pass_lift
+            * pressured_release_multiplier(observation))
+            .clamp(0.004, 0.98 * hold_release_multiplier.clamp(1.0, 1.28));
+        options.push(AgentActionOptionTrace::new(
+            "switch-play",
+            switch_play_score,
+            pass_target_count > 0
+                && observation.expected_pass_completion >= 0.24
+                && !goal_attack_shot_blocks_alternatives,
+        ));
         let flank_cross_context =
             flank_cross_context_score(observation, self.position, field_width);
         let flank_cross_legal_context =
@@ -3450,6 +3503,7 @@ impl PlayerAgent {
 
         if has_ball {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
+            let strategic_pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.striker_hold_up_flank_target_for(self.id);
             let mut action_options = self.possession_action_options(
@@ -3603,6 +3657,14 @@ impl PlayerAgent {
                 (
                     "killer-pass".to_string(),
                     action_option_score(&action_options, "killer-pass"),
+                ),
+                (
+                    "recycle-reset".to_string(),
+                    action_option_score(&action_options, "recycle-reset"),
+                ),
+                (
+                    "switch-play".to_string(),
+                    action_option_score(&action_options, "switch-play"),
                 ),
             ];
             if scoop_pass_option.is_some() {
@@ -3914,6 +3976,51 @@ impl PlayerAgent {
                                         flight: PassFlight::Floor,
                                     },
                                     "killer-pass".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "recycle-reset" => {
+                        order_names.push("recycle-reset".to_string());
+                        let reset_chance = action_option_score(&action_options, "recycle-reset");
+                        if let Some(target) =
+                            self.recycle_reset_target_for(snapshot, None, &strategic_pass_targets)
+                        {
+                            if rng.next_float()
+                                < time_window_probability(reset_chance, snapshot.dt_seconds)
+                            {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.46 + 0.22 * passing_skill,
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "recycle-reset".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "switch-play" => {
+                        order_names.push("switch-play".to_string());
+                        let switch_chance = action_option_score(&action_options, "switch-play");
+                        if let Some(target) =
+                            self.switch_play_target_for(snapshot, None, &strategic_pass_targets)
+                        {
+                            if rng.next_float()
+                                < time_window_probability(switch_chance, snapshot.dt_seconds)
+                            {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.62
+                                            + 0.24
+                                                * passing_skill
+                                                    .max(ability01(self.skills.flair_passing)),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "switch-play".to_string(),
                                 ));
                                 break;
                             }

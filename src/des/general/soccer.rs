@@ -2297,7 +2297,7 @@ const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
 /// Base per-decision feature count: everything except the whole-field block below.
-const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 160;
+const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 163;
 /// Whole-field "moment of all 22" block appended to every decision's feature vector:
 /// for the actor's team then the opponents (each ordered by player id), the
 /// actor-relative canonical (forward, lateral) position and (forward, lateral) velocity
@@ -2396,9 +2396,13 @@ const SOCCER_NEURAL_FEATURE_OPEN_SUPPORT_OUTLETS: usize = 131;
 /// distances/times behind it are advisory seeds, not hard rules. Appended as the
 /// newest feature; its index equals the previous `SOCCER_NEURAL_FEATURE_DIM`.
 const SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE: usize = 153;
+const SOCCER_NEURAL_FEATURE_LOCAL_MPC_GUIDANCE: usize = 159;
+const SOCCER_NEURAL_FEATURE_SWITCH_PLAY_ACTION: usize = 160;
+const SOCCER_NEURAL_FEATURE_RECYCLE_RESET_ACTION: usize = 161;
+const SOCCER_NEURAL_FEATURE_PRESS_COVER_ACTION: usize = 162;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61, 62, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96, 97, 102, 103, 106, 107, 108, 109,
-    110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153,
+    110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153, 160, 248,
     SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
@@ -8194,6 +8198,26 @@ fn normalize_soccer_action_label(action: &str) -> &str {
         "move" => "space",
         "pass1" | "pass2" | "pass3" => "pass",
         "aerial-pass1" | "aerial-pass2" | "aerial-pass3" => "aerial-pass",
+        "switch"
+        | "switch_play"
+        | "switchplay"
+        | "side-switch"
+        | "side_switch"
+        | "cross-field-pass"
+        | "cross_field_pass"
+        | "crossfieldpass" => "switch-play",
+        "recycle"
+        | "recycle_reset"
+        | "recyclereset"
+        | "reset-pass"
+        | "reset_pass"
+        | "short-reset"
+        | "short_reset"
+        | "backward-reset"
+        | "backward_reset" => "recycle-reset",
+        "press-cover" | "press_cover" | "presscover" | "cover-press" | "cover_press" => {
+            "press-cover"
+        }
         "killer" | "killer_pass" | "killerpass" | "through-pass" | "through_pass"
         | "throughpass" | "threaded-pass" | "threaded_pass" | "threadedpass" => "killer-pass",
         "low-cross"
@@ -8279,7 +8303,12 @@ const FLANK_OVERLAP_MIN_OPTION_SHARE: f64 = 1.0 / 3.0;
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     match normalize_soccer_action_label(action) {
-        "pass" | "first-time-pass" | "flank-low-cross" | "killer-pass" => Some(PassFlight::Floor),
+        "pass"
+        | "first-time-pass"
+        | "flank-low-cross"
+        | "killer-pass"
+        | "switch-play"
+        | "recycle-reset" => Some(PassFlight::Floor),
         "aerial-pass" | "flank-high-cross" => Some(PassFlight::Aerial),
         _ => None,
     }
@@ -28135,6 +28164,8 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
             | "pass"
             | "killer-pass"
             | "aerial-pass"
+            | "switch-play"
+            | "recycle-reset"
             | "flank-low-cross"
             | "flank-high-cross"
             | "route-one"
@@ -28143,8 +28174,14 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
             | "first-time-pass"
             | "clearance"
     );
-    let defense = matches!(action, "tackle" | "defend" | "defend-shape" | "defend-roam");
-    let support = matches!(action, "recover" | "control-touch" | "set-play-run")
+    let defense = matches!(
+        action,
+        "tackle" | "defend" | "defend-shape" | "defend-roam" | "press-cover"
+    );
+    let support = matches!(
+        action,
+        "recover" | "control-touch" | "set-play-run" | "recycle-reset"
+    )
         || is_attacking_support_action_label(action);
     (
         soccer_neural_bool(attack),
@@ -28172,6 +28209,9 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "route-one",
     "shoot",
     "tackle",
+    "switch-play",
+    "recycle-reset",
+    "press-cover",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
@@ -28197,12 +28237,15 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         "pass" | "first-time-pass" => "pass",
         "aerial-pass" => "aerial-pass",
         "killer-pass" | "threaded" => "killer-pass",
+        "switch-play" => "switch-play",
+        "recycle-reset" => "recycle-reset",
         "flank-low-cross" => "flank-low-cross",
         "flank-high-cross" => "flank-high-cross",
         "clearance" => "clearance",
         "route-one" => "route-one",
         "shoot" | "first-time-shot" | "first-time-header" => "shoot",
         "tackle" => "tackle",
+        "press-cover" => "press-cover",
         _ => return None,
     };
     SOCCER_POLICY_ACTIONS
@@ -28440,6 +28483,7 @@ fn soccer_neural_transition_features_with_action(
     } else {
         transition.state.player_grid
     };
+    let action_label = normalize_soccer_action_label(action);
     let (action_attack, action_defense, action_support) =
         soccer_neural_action_family_features(action);
     let context = &transition.decision_context;
@@ -28844,6 +28888,11 @@ fn soccer_neural_transition_features_with_action(
         // guidance so the neural value/actor heads can learn when constrained local
         // control, not just team-shape LP, influenced the sample.
         soccer_neural_bool(transition.tactical_trace.local_mpc_guidance),
+        // Decision-family indicators (indices 160-162, appended). The action hash is
+        // unique but not smooth; these expose the new policy families directly.
+        soccer_neural_bool(action_label == "switch-play"),
+        soccer_neural_bool(action_label == "recycle-reset"),
+        soccer_neural_bool(action_label == "press-cover"),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
     // grid + motion vector of all 22. Older nets (input_dim == base) migrate by
