@@ -11581,9 +11581,9 @@ fn midfield_line_holds_band_in_front_of_defenders() {
         .map(|p| p.id)
         .collect();
     let defs = &home[0..4];
-    let mids = &home[4..7];
+    let mids = &home[4..8];
     // Exclude all other home outfielders from the midfield/defence averages.
-    for &p in &home[7..] {
+    for &p in &home[8..] {
         sim.players[p].role = PlayerRole::Forward;
     }
     for &d in defs {
@@ -11592,28 +11592,207 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     }
     for &m in mids {
         sim.players[m].role = PlayerRole::Midfielder;
-        sim.players[m].position = Vec2::new(40.0, 35.0); // central zone, gap 5 < 15 min
+        sim.players[m].position = Vec2::new(40.0, 31.0);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 40.0);
     let snap = WorldSnapshot::from_match(&sim);
-    // Too close to the defenders in the central third -> midfield pushes up to >=15yd.
-    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 36.0));
+    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 31.0));
     assert!(
-        pushed.y > 36.0,
+        pushed.y > 31.5,
         "midfield should push up to its band in front of the defenders: {pushed:?}"
     );
 
-    // Far too far in front (gap 40 > 30 central max) -> pull back toward the band.
     for &m in mids {
-        sim.players[m].position = Vec2::new(40.0, 70.0);
+        sim.players[m].position = Vec2::new(40.0, 58.0);
     }
     let snap2 = WorldSnapshot::from_match(&sim);
-    let pulled = snap2.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 70.0));
+    let pulled = snap2.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 58.0));
     assert!(
-        pulled.y < 70.0,
+        pulled.y < 57.5,
         "midfield should drop back toward its band when too far ahead: {pulled:?}"
     );
+}
+
+#[test]
+fn forward_line_holds_band_in_front_of_midfielders() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for &m in mids {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(40.0, 50.0);
+    }
+    for &f in forwards {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(40.0, 52.0);
+    }
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 54.0);
+    let snap = WorldSnapshot::from_match(&sim);
+    let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 52.0));
+    assert!(
+        pushed.y > 52.5,
+        "strikers should push up to at least 3yd in front of midfield: {pushed:?}"
+    );
+
+    for &f in forwards {
+        sim.players[f].position = Vec2::new(40.0, 76.0);
+    }
+    let snap2 = WorldSnapshot::from_match(&sim);
+    let pulled = snap2.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 76.0));
+    assert!(
+        pulled.y < 75.5,
+        "strikers more than 20yd ahead of midfield should reconnect: {pulled:?}"
+    );
+}
+
+#[test]
+fn ball_proximity_nudge_pulls_midfielder_toward_ball_when_shape_allows() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 25,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 42.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 54.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 66.0);
+    }
+    sim.players[away_holder].position = Vec2::new(40.0, 68.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let player = mids[0];
+    let target = Vec2::new(18.0, 54.0);
+    let (adjusted, sprint) = snap.ball_proximity_adjusted_target(player, target);
+    assert!(
+        adjusted.distance(sim.ball.position) < target.distance(sim.ball.position) - 0.5,
+        "ordinary off-ball movement should be pulled toward the ball when spacing allows"
+    );
+    assert!(!sprint, "settled opponent possession should not force a loose-ball sprint");
+}
+
+#[test]
+fn ball_proximity_nudge_respects_forward_midfield_padding() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 26,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 50.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 53.0);
+    }
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 45.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let target = sim.players[forwards[0]].position;
+    let (adjusted, _) = snap.ball_proximity_adjusted_target(forwards[0], target);
+    assert!(
+        adjusted.distance(target) < 1e-6,
+        "ball pull must not collapse forwards inside the 3yd midfield padding: {adjusted:?}"
+    );
+}
+
+#[test]
+fn contested_loose_ball_proximity_nudge_pulls_direct_and_sprints() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 27,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_contester = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 38.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 48.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 62.0);
+    }
+    sim.players[away_contester].position = Vec2::new(41.0, 58.0);
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let player = mids[0];
+    let target = Vec2::new(18.0, 48.0);
+    let (adjusted, sprint) = snap.ball_proximity_adjusted_target(player, target);
+    assert!(
+        adjusted.distance(sim.ball.position) < target.distance(sim.ball.position) - 1.5,
+        "contested loose balls should pull support much more directly toward the ball"
+    );
+    assert!(sprint, "contested loose-ball pull should set sprint");
 }
 
 #[test]
@@ -34137,6 +34316,80 @@ fn pomdp_q_state_and_neural_features_track_role_line_cohesion() {
 }
 
 #[test]
+fn pomdp_q_state_and_neural_features_track_forward_midfield_gap() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    let striker = forwards[0];
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    for &m in mids {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(40.0, 48.0);
+    }
+    for &f in forwards {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(40.0, 82.0);
+    }
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = Vec2::new(70.0, 84.0);
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.players[away_holder].position = sim.ball.position;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(striker);
+    let state = snapshot.mdp_state_for_player(striker);
+    let key = SoccerQStateKey::from_parts(&state, &observation, Team::Home, PlayerRole::Forward);
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: striker,
+        team: Team::Home,
+        role: PlayerRole::Forward,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "attack-shape".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(striker),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+
+    assert!(
+        observation.role_line_deviation_yards > 12.0,
+        "forward line detached from midfield should expose role-line deviation: {observation:?}"
+    );
+    assert!(
+        observation.role_line_cohesion_score < 0.45,
+        "forward line detached from midfield should expose poor cohesion: {observation:?}"
+    );
+    assert!(key.role_line_deviation_bin >= 3);
+    assert!(key.role_line_cohesion_bin < 3);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_ROLE_LINE_COHESION] < 0.55,
+        "neural feature should expose striker-midfield cohesion loss"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_ROLE_LINE_PROXIMITY] < 0.55,
+        "neural feature should expose striker-midfield line detachment"
+    );
+}
+
+#[test]
 fn positional_exception_relief_softens_close_spacing_only_for_live_tactical_reasons() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
@@ -34833,7 +35086,7 @@ fn formation_stagger_layers_and_spreads_the_shape() {
         lp_slot(PlayerRole::Midfielder, 46.0, Vec2::new(42.0, 41.0)),
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 42.0)),
     ];
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0);
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS);
     let mean = |role: PlayerRole| {
         let v: Vec<f64> = slots
             .iter()
@@ -34901,13 +35154,68 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 58.0)),
     ];
     let before: Vec<Vec2> = slots.iter().map(|s| s.anchor).collect();
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0);
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS);
     for (slot, was) in slots.iter().zip(before) {
         assert!(
             (slot.anchor - was).len() < 1e-9,
             "a compliant shape must be left untouched"
         );
     }
+}
+
+#[test]
+fn formation_stagger_pulls_overstretched_layers_back_toward_band() {
+    fn lp_slot(role: PlayerRole, home_x: f64, anchor: Vec2) -> SoccerFormationLpSlotInput {
+        SoccerFormationLpSlotInput {
+            active: true,
+            player_id: 0,
+            role,
+            current: anchor,
+            velocity: Vec2::zero(),
+            acceleration: Vec2::zero(),
+            home_position: Vec2::new(home_x, anchor.y),
+            top_speed: 7.0,
+            max_acceleration: 10.0,
+            fatigue: 0.0,
+            anchor,
+            pressure_target: None,
+            speed_match_velocity_yps: 0.0,
+            pressure_weight: 0.0,
+            speed_match_weight: 0.0,
+            pair_weight: 0.1,
+            alignment_weight: 0.5,
+        }
+    }
+    let mut slots = vec![
+        lp_slot(PlayerRole::Defender, 34.0, Vec2::new(34.0, 40.0)),
+        lp_slot(PlayerRole::Defender, 46.0, Vec2::new(46.0, 40.0)),
+        lp_slot(PlayerRole::Midfielder, 34.0, Vec2::new(34.0, 70.0)),
+        lp_slot(PlayerRole::Midfielder, 46.0, Vec2::new(46.0, 70.0)),
+        lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 104.0)),
+    ];
+    let mean = |slots: &[SoccerFormationLpSlotInput], role: PlayerRole| {
+        let values: Vec<f64> = slots
+            .iter()
+            .filter(|slot| slot.role == role)
+            .map(|slot| slot.anchor.y)
+            .collect();
+        values.iter().sum::<f64>() / values.len() as f64
+    };
+    let mid_before = mean(&slots, PlayerRole::Midfielder);
+    let fwd_before = mean(&slots, PlayerRole::Forward);
+
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS);
+
+    let mid_after = mean(&slots, PlayerRole::Midfielder);
+    let fwd_after = mean(&slots, PlayerRole::Forward);
+    assert!(
+        mid_after < mid_before - 0.3,
+        "midfielders more than 18yd ahead of defenders should be pulled back"
+    );
+    assert!(
+        fwd_after < fwd_before - 0.2,
+        "forwards more than 20yd ahead of midfielders should be pulled back"
+    );
 }
 
 #[test]
