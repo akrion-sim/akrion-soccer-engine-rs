@@ -590,23 +590,6 @@ fn park_players_except(sim: &mut SoccerMatch, keep: &[usize]) {
     }
 }
 
-/// RAII guard that disables the always-on collective back-line ball band for the
-/// duration of a unit test that parks most of the back four (which would otherwise
-/// distort the holding centroid) to isolate an orthogonal mechanic. Resets on drop,
-/// including on assertion panic, so it never leaks to a reused test thread.
-struct BackLineBallBandDisableGuard;
-impl BackLineBallBandDisableGuard {
-    fn new() -> Self {
-        crate::des::general::soccer::world::set_back_line_ball_band_disabled_for_test(true);
-        BackLineBallBandDisableGuard
-    }
-}
-impl Drop for BackLineBallBandDisableGuard {
-    fn drop(&mut self) {
-        crate::des::general::soccer::world::set_back_line_ball_band_disabled_for_test(false);
-    }
-}
-
 fn two_home_outfield_indices(sim: &SoccerMatch) -> (usize, usize) {
     let ids: Vec<usize> = sim
         .players
@@ -1996,9 +1979,7 @@ fn pass_anticipation_flag_off_is_a_no_op() {
 #[test]
 fn pass_anticipation_defender_steps_onto_the_lane_to_intercept() {
     // A ground pass up the middle; an Away defender a couple of yards off the lane and
-    // in shape steps onto the lane AHEAD of the ball to cut it out. The scene parks the
-    // rest of the back line, so isolate this from the collective back-line ball band.
-    let _band_guard = BackLineBallBandDisableGuard::new();
+    // in shape steps onto the lane AHEAD of the ball to cut it out.
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
     let mut sim = pass_anticipation_scene(&[14], from, to, true);
@@ -2034,8 +2015,6 @@ fn pass_anticipation_defender_steps_onto_the_lane_to_intercept() {
 fn pass_anticipation_elects_a_single_presser() {
     // Two Away defenders both able to reach the lane and both in shape. Only the one
     // best-placed to reach the reception commits; the other keeps its shape (anti-swarm).
-    // The scene parks the rest of the back line, so isolate from the back-line ball band.
-    let _band_guard = BackLineBallBandDisableGuard::new();
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
     let mut sim = pass_anticipation_scene(&[14, 15], from, to, true);
@@ -7364,6 +7343,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DEFAULT_FIELD_LENGTH_YARDS,
         DefensiveCoverProfile::default(),
         attacking_overload,
+        false,
     );
     let high = tactical_directive_for_team(
         Team::Home,
@@ -7375,6 +7355,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DEFAULT_FIELD_LENGTH_YARDS,
         DefensiveCoverProfile::default(),
         attacking_overload,
+        false,
     );
     let no_possession = tactical_directive_for_team(
         Team::Home,
@@ -7386,6 +7367,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DEFAULT_FIELD_LENGTH_YARDS,
         DefensiveCoverProfile::default(),
         attacking_overload,
+        false,
     );
 
     assert_eq!(
@@ -7736,6 +7718,7 @@ fn team_brain_detects_attacking_numbers_up_and_raises_urgency() {
         DEFAULT_FIELD_LENGTH_YARDS,
         DefensiveCoverProfile::default(),
         AttackingOverloadProfile::default(),
+        false,
     );
     let urgent = tactical_directive_for_team(
         Team::Home,
@@ -7747,6 +7730,7 @@ fn team_brain_detects_attacking_numbers_up_and_raises_urgency() {
         DEFAULT_FIELD_LENGTH_YARDS,
         DefensiveCoverProfile::default(),
         overload,
+        false,
     );
     let mut rng = mulberry32(909);
     sim.central_brain.run_time_step(&snapshot, &mut rng);
@@ -9088,6 +9072,7 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
             foremost_attacker_y: Some(33.0),
         },
         AttackingOverloadProfile::default(),
+        false,
     );
     let aggressive = tactical_directive_for_team(
         Team::Home,
@@ -9103,6 +9088,7 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
             foremost_attacker_y: Some(33.0),
         },
         AttackingOverloadProfile::default(),
+        false,
     );
 
     assert_eq!(conservative.defensive_cover_target, 3);
@@ -34306,9 +34292,10 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
-    // The named feature indices all live in the base block, which stays at 160; the
-    // whole-field "moment of all 22" block is appended after it.
-    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 160);
+    // The named feature indices all live in the base block (now 163: the three
+    // strategic-action channels switch-play/recycle-reset/press-cover are appended at
+    // 160-162); the whole-field "moment of all 22" block is appended after that.
+    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 163);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM
@@ -34369,9 +34356,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     mpc_transition.tactical_trace.local_mpc_guidance = true;
     let mpc_features = soccer_neural_transition_features(&mpc_transition);
     assert_eq!(
-        // The MPC-refinement bit is the last BASE feature; the whole-field "moment of
-        // all 22" block is appended after it, so reference it by its real index.
-        mpc_features[SOCCER_NEURAL_BASE_FEATURE_DIM - 1],
+        // Reference the MPC-refinement bit by its real index — it is no longer the last
+        // base feature (the strategic-action channels at 160-162 now follow it).
+        mpc_features[SOCCER_NEURAL_FEATURE_LOCAL_MPC_GUIDANCE],
         1.0,
         "the value/actor heads should see the MPC-refinement bit as a distinct feature"
     );
@@ -38414,12 +38401,10 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
 
 #[test]
 fn defensive_assignment_uses_permuted_genome_line_band() {
-    // This test isolates the per-player evolved genome band by parking the rest of
-    // the back line deep. The always-on collective back-line ball band would
-    // otherwise pull the lone live defender up toward the ball (its centroid is
-    // dominated by the parked teammates), washing out the genome distinction — so
-    // disable that collective rule for this isolation test.
-    let _band_guard = BackLineBallBandDisableGuard::new();
+    // Isolates the per-player evolved genome band (the `defensive_assignment_for`
+    // clamp) by parking the rest of the back line deep. The collective back-line
+    // cushion lives on the off-ball intent chain, not this path, so it does not
+    // interfere here.
     let target_y_for_band = |permutation_index: usize| {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let defender = 2;
@@ -38449,43 +38434,70 @@ fn defensive_assignment_uses_permuted_genome_line_band() {
 }
 
 #[test]
-fn back_line_ball_band_steps_a_stranded_line_up_toward_the_ball() {
-    // Full lineup (no parking): the Home back line sits deep while the ball is high up
-    // the pitch. The collective band must step the line UP to within 25yd of the ball,
-    // on the DEPTH axis only — so the defender keeps its vertical lane (no sideways yank).
+fn back_line_cushion_lets_one_wingback_overlap_while_holding_the_other_three() {
+    // Reconciled rule: in possession the back-line cushion grants exactly ONE exemption —
+    // an OVERLAPPING WINGBACK (an outside back clearly ahead of the line). That player is
+    // left alone to bomb forward while the other three are still pulled up toward a high
+    // ball. (Defending, the one exemption is instead the closest engager — covered
+    // separately by `defensive_line_cushion_allows_one_ball_defender_but_holds_other_three`.)
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    sim.ball.holder = None;
-    sim.ball.position = Vec2::new(40.0, 95.0);
-    sim.ball.velocity = Vec2::zero();
-    sim.ball.last_touch_team = Some(Team::Away);
-
-    let snapshot = WorldSnapshot::from_match(&sim);
-    // A CENTRAL Home defender (not one of the two outside backs, which can be exempt).
-    let cb = sim
+    let defenders: Vec<usize> = sim
         .players
         .iter()
         .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
-        .min_by(|a, b| {
-            (a.home_position.x - 40.0)
-                .abs()
-                .partial_cmp(&(b.home_position.x - 40.0).abs())
-                .unwrap()
+        .map(|p| p.id)
+        .collect();
+    assert!(defenders.len() >= 4, "need a back four");
+    // The widest-home-x defender is an outside back; the most central is a holder.
+    let right_back = *defenders
+        .iter()
+        .max_by(|&&a, &&b| {
+            sim.players[a]
+                .home_position
+                .x
+                .total_cmp(&sim.players[b].home_position.x)
         })
+        .unwrap();
+    let center_back = *defenders
+        .iter()
+        .min_by(|&&a, &&b| {
+            (sim.players[a].home_position.x - 40.0)
+                .abs()
+                .total_cmp(&(sim.players[b].home_position.x - 40.0).abs())
+        })
+        .unwrap();
+    // Deep, flat line except the right back, who has overlapped high up the flank.
+    for &d in &defenders {
+        sim.players[d].position = Vec2::new(sim.players[d].home_position.x, 20.0);
+    }
+    sim.players[right_back].position = Vec2::new(sim.players[right_back].home_position.x, 78.0);
+    // Home in possession with the ball high up the pitch.
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
         .map(|p| p.id)
         .unwrap();
-    let home = sim.players[cb].home_position;
+    sim.players[holder].position = Vec2::new(50.0, 90.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(50.0, 90.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    // The overlapping wingback is the one exemption: its decided move is untouched.
+    let wb_target = Vec2::new(sim.players[right_back].home_position.x, 80.0);
+    let wb_adjusted = snap.defensive_line_cushion_adjusted_target(right_back, wb_target);
     assert!(
-        home.y < 60.0,
-        "precondition: the central defender starts deep: home={home:?}"
+        (wb_adjusted.y - wb_target.y).abs() < 1e-6,
+        "the overlapping wingback is exempt and not pulled back: {wb_adjusted:?}"
     );
-    let target = snapshot.shape_guarded_movement_point(cb, home, &[], home, false);
+    // A holding central defender is still pulled UP toward the high ball.
+    let cb_target = Vec2::new(sim.players[center_back].home_position.x, 22.0);
+    let cb_adjusted = snap.defensive_line_cushion_adjusted_target(center_back, cb_target);
     assert!(
-        target.y > home.y + 10.0,
-        "the stranded back line should step up toward a high ball: home={home:?} target={target:?}"
-    );
-    assert!(
-        (target.x - home.x).abs() < 1.0,
-        "the band must not shove the defender out of its vertical lane: home={home:?} target={target:?}"
+        cb_adjusted.y > cb_target.y + 1.0,
+        "a holding defender steps up toward the high ball: {cb_adjusted:?}"
     );
 }
 
@@ -47739,10 +47751,6 @@ fn nearest_defender_engages_fast_carrier_instead_of_containing() {
 
 #[test]
 fn close_to_goal_carrier_pulls_nearest_defender_out_of_retreat() {
-    // Every other Home outfielder is parked far upfield to isolate the lone defender's
-    // contain/press behaviour, which distorts the holding centroid — so isolate this
-    // from the collective back-line ball band.
-    let _band_guard = BackLineBallBandDisableGuard::new();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     // No covering defender behind: every other Home outfielder is far upfield, so
     // the selected defender must contain/press by position rather than by lunge.

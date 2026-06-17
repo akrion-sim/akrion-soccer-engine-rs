@@ -1504,6 +1504,21 @@ fn default_spacing_params() -> SoccerSpacingParams {
     SoccerSpacingParams::default()
 }
 
+// Serde defaults for the snapshot-side execution-feasibility fields (kept here so
+// the bare-name `#[serde(default = "…")]` paths resolve in the `world` submodule,
+// exactly like `default_spacing_params`).
+fn default_execution_feasibility_fallback() -> bool {
+    true
+}
+
+fn default_execution_min_confidence() -> f64 {
+    0.15
+}
+
+fn default_execution_redecide_max_attempts() -> usize {
+    2
+}
+
 const VERTICAL_LANE_COUNT: usize = 4;
 const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 7.5;
 const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 2.8;
@@ -1650,20 +1665,23 @@ const PREFERRED_DEFENDER_DEPTH_YARDS: f64 = 8.5;
 const DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS: f64 = 25.0;
 const DEFENSIVE_GOAL_LINE_HARD_BUFFER_YARDS: f64 = 4.0;
 const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
-// Back-line "stay connected to the ball" band, measured on the CENTROID of the
-// holding back line (not per-player) along the DEPTH axis: the average defender
-// position must sit between 1 and 25 yards goal-side of the ball. This is the
-// strongest off-ball movement
-// nudge — it re-aims every tick to close the entire out-of-band deficit so the
-// line converges within ~2s (it does not have to actually reach it; locomotion
-// caps the per-tick step). At most ONE wingback may break the band (overlap
-// forward); the other three defenders must follow it. See
-// `WorldSnapshot::back_four_ball_band_target`.
-const BACK_LINE_BALL_BAND_MAX_YARDS: f64 = 25.0;
-const BACK_LINE_BALL_BAND_MIN_YARDS: f64 = 1.0;
-// A wingback is only granted the single exemption once it is genuinely overlapping
-// — this far forward of the rest of the back line. Otherwise all four comply.
+// In possession, a single wingback (one of the two outside backs) is granted the one
+// back-line-band exemption — but only once it is genuinely overlapping, i.e. this far
+// forward of the rest of the back line. Otherwise all four carry the band. The band
+// itself (centroid distance, genome scaling, goal-shrink, 2s consistency horizon) lives
+// in `defensive_line_cushion_adjusted_target`; this only selects the one player allowed
+// to break it. See `WorldSnapshot::overlapping_wingback_exempt_defender`.
 const BACK_LINE_WINGBACK_RUN_MARGIN_YARDS: f64 = 4.0;
+// Strategic carrier passes (reset/switch). A reset is square or backward (never a
+// forward ball); switching the play is a long, roughly-level ball that must travel
+// well across the pitch to the opposite flank. Nominal floor-pass speed used only to
+// gate the lane clearance for these selectors.
+const STRATEGIC_PASS_NOMINAL_SPEED_YPS: f64 = 18.0;
+const RECYCLE_RESET_MIN_FORWARD_YARDS: f64 = -45.0;
+const RECYCLE_RESET_MAX_FORWARD_YARDS: f64 = 2.0;
+const SWITCH_PLAY_MIN_FORWARD_YARDS: f64 = -10.0;
+const SWITCH_PLAY_MAX_FORWARD_YARDS: f64 = 14.0;
+const SWITCH_PLAY_MIN_LATERAL_YARDS: f64 = 22.0;
 const DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.65;
 const DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.05;
 // Ball protection (0 = exposed/pushed-ahead at speed, 1 = shielded at the feet).
@@ -3421,8 +3439,15 @@ impl TeamAttackStrategy {
             | DecoyFarSideCutbackLeft
             | DecoyFarSideCutbackRight
             | DragDefenderOpenChannelLeft
-            | DragDefenderOpenChannelRight => StrategyLayer::Pair,
-            ThirdManRunCentral | CentralDoubleOneTwo | HalfSpaceComboLeft | HalfSpaceComboRight => {
+            | DragDefenderOpenChannelRight
+            | BackheelDisguisedRelease
+            | BylineCrossLeftToPenaltySpot
+            | BylineCrossRightToPenaltySpot => StrategyLayer::Pair,
+            ThirdManRunCentral
+            | CentralDoubleOneTwo
+            | HalfSpaceComboLeft
+            | HalfSpaceComboRight
+            | AerialFlickOnRelease => {
                 StrategyLayer::Triangle
             }
             _ => StrategyLayer::Team,
@@ -11498,6 +11523,40 @@ pub struct SoccerMpcConfig {
     /// quarter of this.
     #[serde(default = "default_soccer_mpc_keepout_weight")]
     pub keepout_weight: f64,
+    /// Execution-feasibility fallback (Tier-2 executor → MDP re-decision). The
+    /// MDP/POMDP policy may commit to a movement (carry/dribble/run) that, once the
+    /// short 3-D point-mass solve looks ahead around live traffic, the player cannot
+    /// actually pull off — boxed in, or the cut/acceleration the action demands
+    /// exceeds his skill given his current velocity. When this is on, such an action
+    /// is **vetoed and handed back to the policy**, which then takes its best
+    /// *executable* alternative (e.g. lay it off / shield instead of forcing the
+    /// carry). Unlike `tier2_player_enabled` (which only reshapes the speed profile),
+    /// this changes the discrete DECISION. On by default; the veto fires rarely
+    /// (only when execution confidence falls below `execution_min_confidence`), so
+    /// ordinary play is unchanged. Set false to disable (e.g. byte-parity baselines).
+    #[serde(default = "default_true_bool")]
+    pub execution_feasibility_fallback: bool,
+    /// Execution confidence in `[0, 1]` below which the chosen movement action is
+    /// vetoed. Low by design (default 0.15) so only genuinely doomed executions are
+    /// kicked back — keeping the veto rate under ~1% of carrier ticks.
+    #[serde(default = "default_soccer_execution_min_confidence")]
+    pub execution_min_confidence: f64,
+    /// Maximum times one decision may be re-handed-back to the policy in a single
+    /// tick before keeping the best-effort action (bounds the loop; default 2).
+    #[serde(default = "default_soccer_execution_redecide_max_attempts")]
+    pub execution_redecide_max_attempts: usize,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+fn default_soccer_execution_min_confidence() -> f64 {
+    0.15
+}
+
+fn default_soccer_execution_redecide_max_attempts() -> usize {
+    2
 }
 
 fn default_soccer_mpc_player_horizon() -> usize {
@@ -11551,6 +11610,9 @@ impl Default for SoccerMpcConfig {
             opponent_keepout_yards: default_soccer_mpc_opponent_keepout_yards(),
             teammate_keepout_yards: default_soccer_mpc_teammate_keepout_yards(),
             keepout_weight: default_soccer_mpc_keepout_weight(),
+            execution_feasibility_fallback: default_true_bool(),
+            execution_min_confidence: default_soccer_execution_min_confidence(),
+            execution_redecide_max_attempts: default_soccer_execution_redecide_max_attempts(),
         }
     }
 }
@@ -12937,6 +12999,7 @@ fn tactical_directive_for_team(
     field_length: f64,
     defensive_cover: DefensiveCoverProfile,
     attacking_overload: AttackingOverloadProfile,
+    just_regained: bool,
 ) -> TeamTacticalDirective {
     let has_ball = possession_team == Some(team);
     let defending = possession_team == Some(team.other());
@@ -13194,12 +13257,26 @@ fn tactical_directive_for_team(
     // making the one-two a deliberate team strategy rather than a rarely-selected option.
     let in_final_third =
         has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length / 3.0;
-    let attack_strategy = if !has_ball {
+    // Deep into the attacking quarter (near the byline) — the trigger for getting to the
+    // goal-line and crossing back to the penalty spot rather than a shorter overlap cross.
+    let deep_in_attack =
+        has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.18;
+    let attack_strategy = if just_regained {
+        // The instant we win it, break before the opponent re-organises: burst into the
+        // space their committed (now-stranded) shape just vacated.
+        TeamAttackStrategy::TransitionBurstOnRegain
+    } else if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
     } else if build_up_phase {
         TeamAttackStrategy::PatientPossessionProbe
     } else if flank_attack_policy.is_flank() {
         match ball_side {
+            StrategyLane::Left if deep_in_attack => {
+                TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+            }
+            StrategyLane::Right if deep_in_attack => {
+                TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            }
             StrategyLane::Left => TeamAttackStrategy::WingOverlapLeftCross,
             StrategyLane::Right => TeamAttackStrategy::WingOverlapRightCross,
             StrategyLane::Center => TeamAttackStrategy::HoldUpfieldUntilOpening,
@@ -13214,12 +13291,20 @@ fn tactical_directive_for_team(
         match ball_side {
             StrategyLane::Left => TeamAttackStrategy::OneTwoLeftRelease,
             StrategyLane::Right => TeamAttackStrategy::OneTwoRightRelease,
+            // A tight central pocket in the final third (no overload to exploit): the
+            // disguised backheel release springs a man the settled block has committed against.
+            StrategyLane::Center if overload_score < 0.25 => {
+                TeamAttackStrategy::BackheelDisguisedRelease
+            }
             StrategyLane::Center => TeamAttackStrategy::GiveAndGoCentral,
         }
     } else if attacking_phase {
         match ball_side {
             StrategyLane::Left => TeamAttackStrategy::PullWideLeftThenCenter,
             StrategyLane::Right => TeamAttackStrategy::PullWideRightThenCenter,
+            // Chasing the game from a central middle-third platform: go over the top with a
+            // flick-on to a runner instead of a ground through-ball.
+            StrategyLane::Center if trailing => TeamAttackStrategy::AerialFlickOnRelease,
             StrategyLane::Center => TeamAttackStrategy::QuickVerticalThroughBall,
         }
     } else {
@@ -38400,6 +38485,9 @@ fn tracking_frame_to_world_snapshot(
         ball_air_resistance: config.ball_air_resistance,
         ball_grass_resistance_yps2: config.ball_grass_resistance_yps2,
         ball_stop_speed_yps: config.ball_stop_speed_yps,
+        execution_feasibility_fallback: default_execution_feasibility_fallback(),
+        execution_min_confidence: default_execution_min_confidence(),
+        execution_redecide_max_attempts: default_execution_redecide_max_attempts(),
         ball: BallState {
             position: frame.ball_position,
             velocity: frame.ball_velocity.unwrap_or_default(),
@@ -38472,6 +38560,7 @@ fn tracking_frame_to_world_snapshot(
             config.field_length_yards,
             DefensiveCoverProfile::default(),
             AttackingOverloadProfile::default(),
+            false,
         ),
         away_directive: tactical_directive_for_team(
             Team::Away,
@@ -38483,6 +38572,7 @@ fn tracking_frame_to_world_snapshot(
             config.field_length_yards,
             DefensiveCoverProfile::default(),
             AttackingOverloadProfile::default(),
+            false,
         ),
         formation_lp_enabled: config.formation_lp_enabled,
         local_mpc_enabled: config.local_mpc_enabled,

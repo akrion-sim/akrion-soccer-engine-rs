@@ -638,6 +638,176 @@ impl PlayerAgent {
         (a1 - a0) / dt_seconds
     }
 
+    /// Open-team-mate selector shared by the strategic reset / switch-play passes. From
+    /// the ranked visible targets, pick the most-open team-mate (outfield, not self)
+    /// whose along-attack displacement from the carrier lies within `forward_range` and
+    /// whose lateral displacement is at least `min_lateral`; when `opposite_flank` it must
+    /// also sit on the far side of the pitch's centre line. Openness = distance to the
+    /// nearest opponent at the target, gated on a clear floor lane to the target.
+    fn strategic_open_target(
+        &self,
+        snapshot: &WorldSnapshot,
+        forward_range: (f64, f64),
+        min_lateral: f64,
+        opposite_flank: bool,
+        targets: &[usize],
+    ) -> Option<usize> {
+        let me = snapshot.players.iter().find(|p| p.id == self.id)?;
+        if snapshot.ball.holder != Some(self.id) || me.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let attack_dir = me.team.attack_dir();
+        let me_pos = snapshot.player_snapshot_position(me);
+        let opponents = me.team.other();
+        let center_x = snapshot.field_width * 0.5;
+        targets
+            .iter()
+            .copied()
+            .filter(|&id| id != self.id)
+            .filter_map(|target_id| {
+                let t = snapshot.players.iter().find(|p| p.id == target_id)?;
+                if t.team != me.team || t.role == PlayerRole::Goalkeeper {
+                    return None;
+                }
+                let tp = snapshot.player_snapshot_position(t);
+                let forward = (tp.y - me_pos.y) * attack_dir;
+                if forward < forward_range.0 || forward > forward_range.1 {
+                    return None;
+                }
+                if (tp.x - me_pos.x).abs() < min_lateral {
+                    return None;
+                }
+                if opposite_flank && (tp.x - center_x) * (me_pos.x - center_x) >= 0.0 {
+                    return None;
+                }
+                let (clear_now, _) = snapshot.pass_lane_clearance(
+                    me_pos,
+                    tp,
+                    opponents,
+                    PLAYER_CONTROL_RADIUS_YARDS,
+                    STRATEGIC_PASS_NOMINAL_SPEED_YPS,
+                );
+                if !clear_now {
+                    return None;
+                }
+                Some((target_id, snapshot.nearest_opponent_distance_at(me.team, tp)))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
+    }
+
+    /// A recycle / reset pass keeps the ball: square or backward (never forward), to the
+    /// most open team-mate, to escape pressure and rebuild the attack.
+    fn recycle_reset_target_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        _preferred: Option<usize>,
+        targets: &[usize],
+    ) -> Option<usize> {
+        self.strategic_open_target(
+            snapshot,
+            (
+                RECYCLE_RESET_MIN_FORWARD_YARDS,
+                RECYCLE_RESET_MAX_FORWARD_YARDS,
+            ),
+            0.0,
+            false,
+            targets,
+        )
+    }
+
+    /// Switching the play: a long, roughly-level ball to an open team-mate on the OPPOSITE
+    /// flank, to shift the opposition block across and open the far side of the pitch.
+    fn switch_play_target_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        _preferred: Option<usize>,
+        targets: &[usize],
+    ) -> Option<usize> {
+        self.strategic_open_target(
+            snapshot,
+            (SWITCH_PLAY_MIN_FORWARD_YARDS, SWITCH_PLAY_MAX_FORWARD_YARDS),
+            SWITCH_PLAY_MIN_LATERAL_YARDS,
+            true,
+            targets,
+        )
+    }
+
+    /// Re-decision after the execution-feasibility veto: the policy's chosen movement
+    /// cannot be executed with confidence, so take the best EXECUTABLE alternative the
+    /// player still has. Deterministic (no RNG) — the veto is rare and must not perturb
+    /// the shared draw stream. Returns `None` if nothing better is available, in which
+    /// case the caller keeps the best-effort action.
+    fn redecide_after_execution_veto(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        _directive: &TeamTacticalDirective,
+        action_options: &[AgentActionOptionTrace],
+        strategic_pass_targets: &[usize],
+        vetoed_label: &str,
+        passing_skill: f64,
+    ) -> Option<(SoccerAction, String)> {
+        // 1) Lay it off. The natural answer to "I can't carry it" is to release to the
+        //    best open team-mate. A floor pass is a ball-release, so it is always
+        //    executable (the point-mass movement veto never applies to it).
+        if vetoed_label != "lay-off-pass" {
+            if let Some(&target) = strategic_pass_targets.first() {
+                let pass_score = ["killer-pass", "pass1", "pass2", "pass3"]
+                    .iter()
+                    .map(|l| action_option_score(action_options, l))
+                    .fold(0.0_f64, f64::max);
+                if pass_score >= 0.05 {
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power: 0.55 + 0.30 * passing_skill,
+                            flight: PassFlight::Floor,
+                        },
+                        "lay-off-pass".to_string(),
+                    ));
+                }
+            }
+        }
+        // 2) Shield the ball — turn the body between ball and defender and hold. Minimal
+        //    movement, so verify it is itself executable before committing.
+        if vetoed_label != "protect-ball" {
+            let kind = DribbleMoveKind::ProtectBall;
+            let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+            let target =
+                snapshot.dribble_move_target_for_touch(self.id, self.home_position, kind, touch);
+            let shield = SoccerAction::DribbleMove { target, kind, touch };
+            if snapshot.action_execution_confidence(self.id, &shield)
+                >= snapshot.execution_min_confidence
+            {
+                return Some((shield, "protect-ball".to_string()));
+            }
+        }
+        // 3) Defender / keeper with no out: clear it (a ball-release).
+        if matches!(self.role, PlayerRole::Goalkeeper | PlayerRole::Defender)
+            && vetoed_label != "clearance"
+        {
+            let target = snapshot
+                .pressure_clearance_target_for(self.id)
+                .unwrap_or_else(|| {
+                    clearance_target_for_player(
+                        self.team,
+                        self.position,
+                        snapshot.field_width,
+                        snapshot.field_length,
+                    )
+                });
+            return Some((
+                SoccerAction::Clearance {
+                    target,
+                    power: 0.86 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.12,
+                },
+                "clearance".to_string(),
+            ));
+        }
+        None
+    }
+
     pub(crate) fn possession_action_options(
         &self,
         observation: &SoccerPomdpObservation,
@@ -1250,7 +1420,12 @@ impl PlayerAgent {
             recycle_reset_score,
             pass_target_count > 0
                 && reset_quality >= 0.20
-                && !goal_attack_shot_blocks_alternatives,
+                && !goal_attack_shot_blocks_alternatives
+                // A reset (square/backward) is a build-up tool, never the right call when a
+                // killer ball to goal is on or a shot is on — it must not drain the final
+                // ball or produce a backward outlet in the shooting window.
+                && !observation.threaded_goal_pass_available
+                && !must_shoot_near_goal(observation, self.role),
         ));
         let switch_context = (flank_lane_fit * 0.36
             + observation.attacking_overload_score.clamp(0.0, 1.0) * 0.18
@@ -1275,7 +1450,11 @@ impl PlayerAgent {
             switch_play_score,
             pass_target_count > 0
                 && observation.expected_pass_completion >= 0.24
-                && !goal_attack_shot_blocks_alternatives,
+                && !goal_attack_shot_blocks_alternatives
+                // Don't switch the play when a killer ball to goal is on or a shot is on —
+                // take the goal threat, don't drain it across the pitch.
+                && !observation.threaded_goal_pass_available
+                && !must_shoot_near_goal(observation, self.role),
         ));
         let flank_cross_context =
             flank_cross_context_score(observation, self.position, field_width);
@@ -1437,6 +1616,14 @@ impl PlayerAgent {
                 true,
             ));
         }
+        // An over-the-top flick-on is the committed maneuver — actively prize the early
+        // aerial ball into the target man so he can flick it on to the runner beyond.
+        let aerial_flick_strategy_multiplier =
+            if matches!(directive.attack_strategy, TeamAttackStrategy::AerialFlickOnRelease) {
+                1.35
+            } else {
+                1.0
+            };
         for rank in 0..aerial_pass_target_count.min(3) {
             let rank_weight = match rank {
                 0 => 0.82,
@@ -1478,6 +1665,7 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * high_cross_multiplier
                 * pressured_release_multiplier(observation)
+                * aerial_flick_strategy_multiplier
                 * rank_weight)
                 .clamp(0.004, 0.98 * hold_release_multiplier.clamp(1.0, 1.24));
             options.push(AgentActionOptionTrace::new(
@@ -3000,6 +3188,7 @@ impl PlayerAgent {
                         | TeamAttackStrategy::OneTwoLeftRelease
                         | TeamAttackStrategy::OneTwoRightRelease
                         | TeamAttackStrategy::CentralDoubleOneTwo
+                        | TeamAttackStrategy::BackheelDisguisedRelease
                 );
                 if give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY {
                     let action = SoccerAction::Pass {
@@ -3123,7 +3312,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
-                                    power: 0.66
+                                    power: 0.68
                                         + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                                     flight: PassFlight::Floor,
                                 },
@@ -3556,6 +3745,7 @@ impl PlayerAgent {
                         | TeamAttackStrategy::OneTwoLeftRelease
                         | TeamAttackStrategy::OneTwoRightRelease
                         | TeamAttackStrategy::CentralDoubleOneTwo
+                        | TeamAttackStrategy::BackheelDisguisedRelease
                 );
                 let goal_proximity = (1.0
                     - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
@@ -3970,7 +4160,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
-                                        power: 0.66
+                                        power: 0.68
                                             + 0.24
                                                 * passing_skill.max(ability01(self.skills.vision)),
                                         flight: PassFlight::Floor,
@@ -4132,7 +4322,7 @@ impl PlayerAgent {
                 } else {
                     None
                 };
-            let (action, action_label) = chosen.unwrap_or_else(|| {
+            let (mut action, mut action_label) = chosen.unwrap_or_else(|| {
                 let carry_to_create = shot_creation_carry_multiplier(&observation) > 1.28
                     && observation.forward_dribble_space_yards > 2.2;
                 let patient_carry = low_pressure_patient_carry_preferred(&observation);
@@ -4260,6 +4450,40 @@ impl PlayerAgent {
                     )
                 }
             });
+            // MDP↔MPC reconciliation of the DECISION (not just the movement profile): a
+            // good decision that cannot be executed well is no longer a good decision. The
+            // policy may have committed to a carry/dribble/run that the short 3-D point-mass
+            // solve — looking ~0.5 s ahead around live traffic — says the player cannot pull
+            // off (boxed in, or a reversal beyond his skill at this pace). In that rare case
+            // we hand the decision BACK to the policy and take its best EXECUTABLE
+            // alternative (typically: lay it off or shield instead of forcing the carry).
+            if snapshot.execution_feasibility_fallback_enabled() {
+                let min_conf = snapshot.execution_min_confidence;
+                let max_attempts = snapshot.execution_redecide_max_attempts;
+                let mut attempts = 0;
+                while attempts < max_attempts
+                    && snapshot.action_execution_confidence(self.id, &action) < min_conf
+                {
+                    match self.redecide_after_execution_veto(
+                        snapshot,
+                        &observation,
+                        &directive,
+                        &action_options,
+                        &strategic_pass_targets,
+                        &action_label,
+                        passing_skill,
+                    ) {
+                        Some((alt_action, alt_label)) => {
+                            order_names.push(format!("exec-veto:{}", action_label));
+                            action = alt_action;
+                            action_label = alt_label;
+                        }
+                        // No better executable option exists — keep the best-effort action.
+                        None => break,
+                    }
+                    attempts += 1;
+                }
+            }
             let sprint = matches!(action, SoccerAction::DribbleMove { .. })
                 && (self.role == PlayerRole::Forward
                     || observation.forward_dribble_space_yards > 3.0
@@ -4795,7 +5019,7 @@ impl PlayerAgent {
                     return Some((
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.66
+                            power: 0.68
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
                                         .max(ability01(self.skills.vision)),
@@ -4863,7 +5087,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.66
+                            power: 0.68
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
                                         .max(ability01(self.skills.vision)),

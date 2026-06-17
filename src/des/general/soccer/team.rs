@@ -119,10 +119,29 @@ pub enum TeamAttackStrategy {
     /// ball BACKWARDS to bait the opponent into stepping up to win it, which opens the space to
     /// then play forward. Very patient / low directness; the inviting backward ball is the point.
     PlayBackwardsToGoad,
+    /// Sell the obvious forward/square ball, then release the opposite way with a disguised
+    /// backheel / no-look once a defender has committed to the telegraphed lane. Short and
+    /// surprise-driven: the value is in the deception, not directness. Executes through the
+    /// existing body-facing backheel gate (a release the carrier's hips do not point at).
+    BackheelDisguisedRelease,
+    /// Direct aerial into a target player who does NOT control it but flicks it first-time
+    /// (a knock-down / flick-on) into the path of a runner breaking beyond the last line.
+    /// Two-touch-by-two-players combination over the top of a compact block.
+    AerialFlickOnRelease,
+    /// The instant possession is won, the new carrier accelerates away into the space the
+    /// opponent's committed shape just vacated, while the team pushes vertical — exploit the
+    /// transition before the opponent re-organises, rather than settling into possession.
+    TransitionBurstOnRegain,
+    /// Carry to the byline near the left corner flag to drag the cover, then whip the ball
+    /// back to the penalty-spot zone for an arriving attacker (a deep byline cross, distinct
+    /// from the shorter underlap cutback).
+    BylineCrossLeftToPenaltySpot,
+    /// Mirror of [`Self::BylineCrossLeftToPenaltySpot`] down the right.
+    BylineCrossRightToPenaltySpot,
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 33] = [
+    pub const ALL: [TeamAttackStrategy; 38] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -156,6 +175,11 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::HalfSpaceComboLeft,
         TeamAttackStrategy::HalfSpaceComboRight,
         TeamAttackStrategy::PlayBackwardsToGoad,
+        TeamAttackStrategy::BackheelDisguisedRelease,
+        TeamAttackStrategy::AerialFlickOnRelease,
+        TeamAttackStrategy::TransitionBurstOnRegain,
+        TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
+        TeamAttackStrategy::BylineCrossRightToPenaltySpot,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -193,6 +217,13 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::HalfSpaceComboLeft => "half-space-combo-left",
             TeamAttackStrategy::HalfSpaceComboRight => "half-space-combo-right",
             TeamAttackStrategy::PlayBackwardsToGoad => "play-backwards-to-goad",
+            TeamAttackStrategy::BackheelDisguisedRelease => "backheel-disguised-release",
+            TeamAttackStrategy::AerialFlickOnRelease => "aerial-flick-on-release",
+            TeamAttackStrategy::TransitionBurstOnRegain => "transition-burst-on-regain",
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot => "byline-cross-left-to-penalty-spot",
+            TeamAttackStrategy::BylineCrossRightToPenaltySpot => {
+                "byline-cross-right-to-penalty-spot"
+            }
         }
     }
 
@@ -239,6 +270,15 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::HalfSpaceComboRight => s(Right, Center, 3, 0.52),
             // Very patient, lowest directness: the whole point is an inviting backward ball.
             TeamAttackStrategy::PlayBackwardsToGoad => s(Center, Center, 7, 0.06),
+            // Quick disguised release — short, surprise, resolves where the defender ISN'T.
+            TeamAttackStrategy::BackheelDisguisedRelease => s(Center, Center, 2, 0.50),
+            // Over-the-top aerial then a first-time flick beyond the line: very direct.
+            TeamAttackStrategy::AerialFlickOnRelease => s(Center, Center, 2, 0.82),
+            // Pure transition: one or two vertical touches into vacated space, maximally direct.
+            TeamAttackStrategy::TransitionBurstOnRegain => s(Center, Center, 2, 0.90),
+            // Get to the byline wide, then whip it back central to the penalty spot.
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot => s(Left, Center, 3, 0.50),
+            TeamAttackStrategy::BylineCrossRightToPenaltySpot => s(Right, Center, 3, 0.50),
         }
     }
 }
@@ -3210,6 +3250,27 @@ fn soccer_formation_lp_apply_strategy_profile(
                 weights.progression *= 1.12;
                 weights.passing_lane_quality *= 1.15;
             }
+            // Disguised release: a deception that springs a teammate behind the committed
+            // defender — it lives on a clean (if unobvious) lane straight to a chance.
+            BackheelDisguisedRelease => {
+                weights.expected_goal *= 1.16;
+                weights.passing_lane_quality *= 1.2;
+                weights.progression *= 1.08;
+            }
+            // Over-the-top flick-on and the transition burst are both direct vertical
+            // penetration: prize progression and the chance it creates, accept the retention risk.
+            AerialFlickOnRelease | TransitionBurstOnRegain => {
+                weights.progression *= 1.32;
+                weights.expected_goal *= 1.2;
+                weights.retention *= 0.82;
+                weights.transition_risk *= 1.15;
+            }
+            // Byline cross to the penalty spot: get a man wide and free, occupy the box for
+            // the delivery, finish the chance.
+            BylineCrossLeftToPenaltySpot | BylineCrossRightToPenaltySpot => {
+                weights.space_occupation *= 1.3;
+                weights.expected_goal *= 1.18;
+            }
             _ => {}
         }
     }
@@ -4544,6 +4605,45 @@ impl CentralBrain {
                 _ => {}
             }
         }
+        // Primary-strategy scalar shaping: translate the committed maneuver into the
+        // continuous directive parameters the players already consume, so each new
+        // discrete decision actually changes play. The value head still scores the
+        // resulting state and MPC executes the resulting movement — this is just the
+        // bridge from "which option" to "what the 11 players do". Applied to the
+        // freshly-recomputed directive each tick, so the nudges never compound.
+        {
+            use TeamAttackStrategy::*;
+            match directive.attack_strategy {
+                TransitionBurstOnRegain => {
+                    // Break before they re-organise: carry over pass, more risk, support high.
+                    directive.carry_priority = (directive.carry_priority * 1.35).clamp(0.4, 1.6);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.12).clamp(0.2, 0.96);
+                    directive.pass_priority = (directive.pass_priority * 0.9).clamp(0.5, 1.6);
+                    directive.support_depth_yards =
+                        (directive.support_depth_yards + 3.0).clamp(6.0, 25.0);
+                }
+                BackheelDisguisedRelease => {
+                    // Quick disguised release: prize the pass, accept the deception risk.
+                    directive.pass_priority = (directive.pass_priority * 1.18).clamp(0.5, 1.6);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.08).clamp(0.2, 0.96);
+                }
+                AerialFlickOnRelease => {
+                    // Over-the-top flick: stretch a runner high, prize the (riskier) pass.
+                    directive.support_depth_yards =
+                        (directive.support_depth_yards + 4.0).clamp(6.0, 25.0);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
+                    directive.pass_priority = (directive.pass_priority * 1.1).clamp(0.5, 1.6);
+                }
+                BylineCrossLeftToPenaltySpot | BylineCrossRightToPenaltySpot => {
+                    // Get a man to the byline and stretch the pitch for the cutback to the spot.
+                    directive.flank_overlap_run_probability = directive
+                        .flank_overlap_run_probability
+                        .max(NESTED_OVERLAP_RUN_PROBABILITY);
+                    directive.width_yards = (directive.width_yards * 1.06).min(width * 0.96);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -4625,7 +4725,14 @@ impl CentralBrain {
         rng: &mut SeededRandom,
         embedding_signals: Option<&SoccerAdversarialEmbeddingSignals>,
     ) {
+        // Capture the prior controller before overwriting it so we can detect the exact
+        // tick possession flips to us — the trigger for an immediate transition burst.
+        let prev_possession = self.possession_team;
         self.possession_team = snapshot.possession_team();
+        let just_regained_home =
+            self.possession_team == Some(Team::Home) && prev_possession != Some(Team::Home);
+        let just_regained_away =
+            self.possession_team == Some(Team::Away) && prev_possession != Some(Team::Away);
         let y = snapshot.ball.position.y;
         self.phase = match self.possession_team {
             Some(Team::Home) if y > snapshot.field_length * 0.68 => TacticalPhase::HomeAttack,
@@ -4652,6 +4759,7 @@ impl CentralBrain {
             snapshot.field_length,
             home_cover,
             home_overload,
+            just_regained_home,
         );
         self.away_directive = tactical_directive_for_team(
             Team::Away,
@@ -4663,6 +4771,7 @@ impl CentralBrain {
             snapshot.field_length,
             away_cover,
             away_overload,
+            just_regained_away,
         );
         // Commit to the freshly-selected strategy and hold it for a window so teams
         // run a maneuver out instead of flip-flopping the discrete strategy each tick.

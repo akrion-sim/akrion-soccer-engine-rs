@@ -13303,6 +13303,16 @@ pub struct WorldSnapshot {
     /// snapshot-side shape helpers read the configurable+learnable values, not constants.
     #[serde(default = "default_spacing_params")]
     pub spacing_params: SoccerSpacingParams,
+    /// Execution-feasibility fallback parameters, copied from `config.mpc` so the
+    /// snapshot-side carrier decision can veto an un-executable movement and re-decide
+    /// (see [`WorldSnapshot::action_execution_confidence`]). `serde(default)` keeps
+    /// older serialized snapshots loadable (fallback on, threshold 0.15).
+    #[serde(default = "default_execution_feasibility_fallback")]
+    pub(crate) execution_feasibility_fallback: bool,
+    #[serde(default = "default_execution_min_confidence")]
+    pub(crate) execution_min_confidence: f64,
+    #[serde(default = "default_execution_redecide_max_attempts")]
+    pub(crate) execution_redecide_max_attempts: usize,
     #[serde(default = "default_ball_drag_per_tick")]
     pub ball_drag_per_tick: f64,
     #[serde(default = "default_ball_air_resistance")]
@@ -13585,27 +13595,6 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
 }
-#[cfg(test)]
-thread_local! {
-    /// Per-test, per-thread override so a unit test can isolate behavior that the
-    /// always-on back-line band would otherwise dominate. Thread-local (not the env
-    /// OnceLock) so it never races across libtest's parallel test threads.
-    static BACK_LINE_BALL_BAND_TEST_DISABLE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-pub(crate) fn set_back_line_ball_band_disabled_for_test(disabled: bool) {
-    BACK_LINE_BALL_BAND_TEST_DISABLE.with(|c| c.set(disabled));
-}
-fn dd_soccer_disable_back_line_ball_band() -> bool {
-    #[cfg(test)]
-    if BACK_LINE_BALL_BAND_TEST_DISABLE.with(|c| c.get()) {
-        return true;
-    }
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BACK_LINE_BALL_BAND").is_ok())
-}
 
 fn pending_pass_snapshot_from(
     pass: &PendingPass,
@@ -13828,6 +13817,132 @@ impl WorldSnapshot {
         Self::from_match_with_options(m, WorldSnapshotOptions::FULL)
     }
 
+    /// Whether the execution-feasibility fallback is active (config-gated, on by default).
+    pub(crate) fn execution_feasibility_fallback_enabled(&self) -> bool {
+        self.execution_feasibility_fallback
+    }
+
+    /// Confidence in `[0, 1]` that `player_id` can physically EXECUTE `action` over the
+    /// next short horizon, judged by a 3-D point-mass MPC rollout around live traffic.
+    /// Ball-release actions (pass / shoot / clearance / tackle / hold) are outside the
+    /// point-mass MOVEMENT remit and are always fully executable here (`1.0`); the veto
+    /// targets movement the player may not be able to pull off — boxed in by opponents,
+    /// or a cut/reversal his current velocity and skill cannot achieve in the window.
+    pub(crate) fn action_execution_confidence(
+        &self,
+        player_id: usize,
+        action: &SoccerAction,
+    ) -> f64 {
+        let target = match action {
+            SoccerAction::Dribble(t) => *t,
+            SoccerAction::DribbleMove { target, .. } => *target,
+            SoccerAction::MoveTo(t) => *t,
+            SoccerAction::ControlTouch { target } => *target,
+            SoccerAction::Pass { .. }
+            | SoccerAction::Clearance { .. }
+            | SoccerAction::RouteOne { .. }
+            | SoccerAction::Shoot { .. }
+            | SoccerAction::Tackle { .. }
+            | SoccerAction::HoldShape => return 1.0,
+        };
+        self.movement_execution_confidence(player_id, target)
+    }
+
+    /// Point-mass execution confidence for moving `player_id` toward `target`:
+    /// `obstacle_term × turn_term`, where `obstacle_term` is how much of the
+    /// *unobstructed* progress survives the live traffic over the horizon (≈1 in open
+    /// space regardless of pace; → 0 when walled off) and `turn_term` is whether the
+    /// heading change the move demands is achievable given the player's current speed
+    /// (a hard reversal at a sprint is low; running onto the ball is high).
+    fn movement_execution_confidence(&self, player_id: usize, target: Vec2) -> f64 {
+        use crate::des::general::mpc_point_mass::{
+            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
+        };
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return 1.0;
+        };
+        let pos = me.position;
+        let vel = me.velocity;
+        let to_target = target - pos;
+        let dist = to_target.len();
+        if dist < 0.75 {
+            return 1.0; // already on the spot — nothing to execute
+        }
+        let accel_cap = acceleration_yps2_from_score(me.skills.acceleration).max(0.5);
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        // ~0.5 s lookahead: long enough that "two ticks later it got harder" surfaces,
+        // short enough that constant-velocity opponent prediction is still meaningful.
+        let horizon = ((0.5 / dt).round() as usize).clamp(4, 16);
+
+        const OPP_KEEPOUT_YARDS: f64 = 2.0;
+        const MATE_KEEPOUT_YARDS: f64 = 1.0;
+        const KEEPOUT_WEIGHT: f64 = 40.0;
+        let obstacles: Vec<PlanarObstacle> = self
+            .players
+            .iter()
+            .filter(|p| p.id != player_id)
+            .map(|p| {
+                let (r, w) = if p.team == me.team {
+                    (MATE_KEEPOUT_YARDS, KEEPOUT_WEIGHT * 0.25)
+                } else {
+                    (OPP_KEEPOUT_YARDS, KEEPOUT_WEIGHT)
+                };
+                PlanarObstacle::fixed([p.position.x, p.position.y], r, w)
+            })
+            .collect();
+
+        let cfg = PlanarMpcConfig {
+            horizon,
+            dt,
+            a_max: accel_cap,
+            ..PlanarMpcConfig::default()
+        };
+        let Ok(mut controller) = PlanarPointMassMpc::new(cfg) else {
+            return 1.0;
+        };
+        let state = PlanarState {
+            pos: [pos.x, pos.y],
+            vel: [vel.x, vel.y],
+        };
+        let reference = PlanarReference::arrive([target.x, target.y]);
+
+        // Obstructed rollout — progress toward the target through the live traffic.
+        let _ = controller.control_with_obstacles(state, &[reference], &obstacles);
+        let obstructed_end = controller
+            .predicted_path(state)
+            .last()
+            .map(|p| Vec2::new(p[0], p[1]))
+            .unwrap_or(pos);
+        let obstructed_progress = (dist - obstructed_end.distance(target)).max(0.0);
+
+        // Free-space baseline — same dynamics, no traffic.
+        controller.reset();
+        let _ = controller.control(state, &[reference]);
+        let free_end = controller
+            .predicted_path(state)
+            .last()
+            .map(|p| Vec2::new(p[0], p[1]))
+            .unwrap_or(pos);
+        let free_progress = (dist - free_end.distance(target)).max(1e-3);
+
+        let obstacle_term = (obstructed_progress / free_progress).clamp(0.0, 1.0);
+
+        // Turn feasibility: only sharp REVERSALS at pace are hard. A normal cut is fine.
+        let speed = vel.len();
+        let turn_term = if speed < 2.0 {
+            1.0
+        } else {
+            let desired = to_target * (1.0 / dist);
+            let cur = vel * (1.0 / speed);
+            let cos = (desired.x * cur.x + desired.y * cur.y).clamp(-1.0, 1.0);
+            let reversal = (-cos).clamp(0.0, 1.0); // 0 at ≤90°, 1 at a full 180° about-face
+            let speed_factor = ((speed - 2.0) / 6.0).clamp(0.0, 1.0); // faster ⇒ harder to reverse
+            (1.0 - reversal * speed_factor).clamp(0.0, 1.0)
+        };
+
+        (obstacle_term * turn_term).clamp(0.0, 1.0)
+    }
+
     pub(crate) fn from_match_for_agent_decision(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::AGENT_DECISION)
     }
@@ -14025,6 +14140,9 @@ impl WorldSnapshot {
             field_width: m.config.field_width_yards,
             goal_width: m.config.goal_width_yards,
             spacing_params: m.config.spacing,
+            execution_feasibility_fallback: m.config.mpc.execution_feasibility_fallback,
+            execution_min_confidence: m.config.mpc.execution_min_confidence,
+            execution_redecide_max_attempts: m.config.mpc.execution_redecide_max_attempts,
             ball_drag_per_tick: m.config.ball_drag_per_tick,
             ball_air_resistance: m.config.ball_air_resistance,
             ball_grass_resistance_yps2: m.config.ball_grass_resistance_yps2,
@@ -20778,7 +20896,10 @@ impl WorldSnapshot {
             .or_else(|| self.possession_team())
             == Some(team)
         {
-            return None;
+            // In possession, the single break-the-line player is an OVERLAPPING WINGBACK,
+            // not a presser: one of the two outside backs may bomb forward while the
+            // other three hold the band. (Defending, below, it's the closest engager.)
+            return self.overlapping_wingback_exempt_defender(team);
         }
         let focus = self
             .ball
@@ -20798,6 +20919,69 @@ impl WorldSnapshot {
                     .then(a.id.cmp(&b.id))
             })
             .map(|p| p.id)
+    }
+
+    /// The single overlapping wingback the back-line band lets off the leash while the
+    /// team is in possession: the more-advanced of the two outside backs (the widest
+    /// pair by home x), but only once it is genuinely overlapping —
+    /// [`BACK_LINE_WINGBACK_RUN_MARGIN_YARDS`] clear of the rest of the line toward the
+    /// opponent goal. `None` keeps all four bound to the band (a flat back line never
+    /// loses a man "for free"). This is the attacking complement to the defending-phase
+    /// closest-engager exemption in [`Self::defensive_line_rule_exempt_defender`].
+    fn overlapping_wingback_exempt_defender(&self, team: Team) -> Option<usize> {
+        let defenders: Vec<&PlayerSnapshot> = self
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.role == PlayerRole::Defender)
+            .collect();
+        if defenders.len() < 3 {
+            return None;
+        }
+        let attack = team.attack_dir();
+        let fwd = |p: &PlayerSnapshot| self.player_snapshot_position(p).y * attack;
+        let widest = |pick_max: bool| -> Option<usize> {
+            defenders
+                .iter()
+                .copied()
+                .max_by(|a, b| {
+                    let (ax, bx) = if pick_max {
+                        (a.home_position.x, b.home_position.x)
+                    } else {
+                        (-a.home_position.x, -b.home_position.x)
+                    };
+                    ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|p| p.id)
+        };
+        let (left_back, right_back) = (widest(false), widest(true));
+        let candidate = match (left_back, right_back) {
+            (Some(l), Some(r)) if l != r => {
+                let lf = defenders.iter().find(|p| p.id == l).map(|p| fwd(p));
+                let rf = defenders.iter().find(|p| p.id == r).map(|p| fwd(p));
+                match (lf, rf) {
+                    (Some(lf), Some(rf)) => Some(if lf >= rf { l } else { r }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        candidate.filter(|&id| {
+            let others: Vec<f64> = defenders
+                .iter()
+                .filter(|p| p.id != id)
+                .map(|p| fwd(p))
+                .collect();
+            if others.is_empty() {
+                return false;
+            }
+            let others_mean = others.iter().sum::<f64>() / others.len() as f64;
+            let cand_fwd = defenders
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| fwd(p))
+                .unwrap_or(others_mean);
+            cand_fwd > others_mean + BACK_LINE_WINGBACK_RUN_MARGIN_YARDS
+        })
     }
 
     /// Keep the back four's AVERAGE position in its band relative to the ball (see the
@@ -24215,125 +24399,7 @@ impl WorldSnapshot {
         };
         let chosen = self.off_carrier_lane_target(player, chosen);
         let chosen = self.defensive_goal_side_target(player, chosen);
-        let chosen = self.teammate_cross_through_target(player, chosen);
-        // Strongest off-ball nudge, applied LAST so nothing downstream undoes it:
-        // keep the back line's centroid within 1..=25yd of the ball.
-        self.back_four_ball_band_target(player, chosen)
-    }
-
-    /// Keep the back four connected to the ball: the CENTROID of the holding back
-    /// line must stay between [`BACK_LINE_BALL_BAND_MIN_YARDS`] and
-    /// [`BACK_LINE_BALL_BAND_MAX_YARDS`] *goal-side* of the ball, measured on the
-    /// DEPTH (attack) axis only — line depth is what "stay connected to the ball"
-    /// means for a back four; lateral coverage stays with the vertical-lane /
-    /// man-tracking logic, so this never shoves a defender out of its lane. This is
-    /// the strongest off-ball movement nudge — it re-aims every tick to close the
-    /// entire out-of-band deficit (so the line aims to be consistent within ~2s; it
-    /// does not have to actually reach it — locomotion caps the per-tick step).
-    /// Exactly ONE wingback (the more-advanced of the two outside backs, once it is
-    /// genuinely overlapping) may break the band; the other three must follow it.
-    fn back_four_ball_band_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
-        if dd_soccer_disable_back_line_ball_band() || player.role != PlayerRole::Defender {
-            return target;
-        }
-        let defenders: Vec<&PlayerSnapshot> = self
-            .players
-            .iter()
-            .filter(|p| p.team == player.team && p.role == PlayerRole::Defender)
-            .collect();
-        // Need a recognizable back line (≥3) before the centroid rule is meaningful.
-        if defenders.len() < 3 {
-            return target;
-        }
-        // The two outside backs are the widest by home x. The more-advanced of them
-        // is the single permitted exemption — but only once it is genuinely overlapping
-        // (BACK_LINE_WINGBACK_RUN_MARGIN_YARDS ahead of the rest of the line).
-        let attack = player.team.attack_dir();
-        let fwd = |p: &PlayerSnapshot| self.player_snapshot_position(p).y * attack;
-        let left_back = defenders
-            .iter()
-            .min_by(|a, b| {
-                a.home_position
-                    .x
-                    .partial_cmp(&b.home_position.x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|p| p.id);
-        let right_back = defenders
-            .iter()
-            .max_by(|a, b| {
-                a.home_position
-                    .x
-                    .partial_cmp(&b.home_position.x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|p| p.id);
-        let candidate = match (left_back, right_back) {
-            (Some(l), Some(r)) if l != r => {
-                let lf = defenders.iter().find(|p| p.id == l).map(|p| fwd(p));
-                let rf = defenders.iter().find(|p| p.id == r).map(|p| fwd(p));
-                match (lf, rf) {
-                    (Some(lf), Some(rf)) => Some(if lf >= rf { l } else { r }),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        // Honor the exemption only if that wingback is genuinely ahead of the rest.
-        let exempt = candidate.filter(|&id| {
-            let others: Vec<f64> = defenders
-                .iter()
-                .filter(|p| p.id != id)
-                .map(|p| fwd(p))
-                .collect();
-            if others.is_empty() {
-                return false;
-            }
-            let others_mean = others.iter().sum::<f64>() / others.len() as f64;
-            let cand_fwd = defenders
-                .iter()
-                .find(|p| p.id == id)
-                .map(|p| fwd(p))
-                .unwrap_or(others_mean);
-            cand_fwd > others_mean + BACK_LINE_WINGBACK_RUN_MARGIN_YARDS
-        });
-        // The one player who overrides the band: leave its target untouched.
-        if exempt == Some(player.id) {
-            return target;
-        }
-        // Centroid of the HOLDING line (back four minus the exempt wingback) — "the
-        // other three must follow the rule still".
-        let holders: Vec<&PlayerSnapshot> = defenders
-            .iter()
-            .copied()
-            .filter(|p| Some(p.id) != exempt)
-            .collect();
-        if holders.is_empty() {
-            return target;
-        }
-        // The band is measured on the DEPTH (goal-side) axis only — the back four's
-        // connection to the ball is a line-depth concern. Lateral coverage is the job
-        // of the vertical-lane / man-tracking logic, so this never shoves a defender
-        // sideways out of its lane. `behind_gap` is how far the centroid sits on the
-        // own-goal side of the ball: we want it in [1, 25]yd.
-        let centroid_fwd =
-            holders.iter().map(|p| fwd(p)).sum::<f64>() / holders.len() as f64;
-        let ball_fwd = self.ball.position.y * attack;
-        let behind_gap = ball_fwd - centroid_fwd;
-        let target_gap =
-            behind_gap.clamp(BACK_LINE_BALL_BAND_MIN_YARDS, BACK_LINE_BALL_BAND_MAX_YARDS);
-        // The amount (signed, along the attack axis) the line must travel to bring the
-        // centroid back onto the band: +ve = step up toward the ball, -ve = drop back
-        // goal-side. Applying the FULL deficit to each holder re-centres the centroid
-        // on the boundary; re-evaluated every tick, the line keeps aiming for the band
-        // (locomotion caps the per-tick step, so it converges within ~2s rather than
-        // teleporting).
-        let shift_fwd = behind_gap - target_gap;
-        if shift_fwd.abs() < 1e-6 {
-            return target;
-        }
-        Vec2::new(target.x, target.y + attack * shift_fwd)
-            .clamp_to_pitch(self.field_width, self.field_length)
+        self.teammate_cross_through_target(player, chosen)
     }
 
     /// Position-swap / cross-through guard: stop an off-ball player from steering a
