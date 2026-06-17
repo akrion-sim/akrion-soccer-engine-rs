@@ -17265,7 +17265,7 @@ impl WorldSnapshot {
                     && self.nearest_opponent_distance_at(me.team, position)
                         <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
                 aim_point_and_anticipation
-                    .filter(|(aim_point, anticipation_clear)| {
+                    .filter(|(aim_point, _)| {
                         // Near the opponent goal, a FORWARD ball to a contested receiver is no
                         // longer hard-vetoed just because a defender wins the race to the
                         // (often aggressively LED) reception point. A contested reception there
@@ -17299,45 +17299,22 @@ impl WorldSnapshot {
                         } else {
                             reception_won
                         };
-                        let lane_risk_tolerated = if require_reception_won && !*anticipation_clear {
-                            let receiver_velocity =
-                                self.player_velocity(p.id).unwrap_or(p.velocity);
-                            let receiver_forward_velocity =
-                                receiver_velocity.y * me.team.attack_dir();
-                            let receiver_forward_run =
-                                (anticipated_position.y - position.y) * me.team.attack_dir();
-                            let current_openness = pass_receiver_openness_for_snapshots(
-                                &self.players,
-                                me.team,
-                                position,
+                        // A defender whose CURRENT run carries it into the lane before the
+                        // ball arrives will cut out an ordinary visible pass — hide that option
+                        // (threaded/killer balls still consider it, with the risk priced in).
+                        // A defender merely ABLE to lunge in stays visible-but-penalised below
+                        // (the `anticipation_penalty`); this gate is the committed-cut-out case.
+                        let committed_cutout = require_reception_won
+                            && self.pass_lane_committed_cutout(
+                                me_position,
+                                *aim_point,
+                                me.team.other(),
+                                2.5,
+                                nominal_speed,
                             );
-                            let future_openness = pass_receiver_openness_for_snapshots(
-                                &self.players,
-                                me.team,
-                                anticipated_position,
-                            );
-                            let runner_escaping_marker = receiver_forward_velocity >= 2.4
-                                && receiver_forward_run >= 4.0
-                                && future_openness >= current_openness + 0.45
-                                && future_openness >= 0.58;
-                            let aim_yards_to_goal =
-                                (me.team.goal_y(self.field_length) - aim_point.y).abs();
-                            let carrier_yards_to_goal =
-                                (me.team.goal_y(self.field_length) - me_position.y).abs();
-                            let final_third_goal_thread = forward_pass
-                                && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
-                                && aim_yards_to_goal <= self.field_length / 3.0
-                                && carrier_yards_to_goal - aim_yards_to_goal >= 8.0
-                                && receiver_forward_velocity >= 1.0;
-                            runner_escaping_marker || final_third_goal_thread
-                        } else {
-                            false
-                        };
-                        let lane_clear_through_flight =
-                            !require_reception_won || *anticipation_clear || lane_risk_tolerated;
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || race_won)
-                            && lane_clear_through_flight
+                            && !committed_cutout
                             && !backward_into_coverage
                             && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
@@ -17355,8 +17332,8 @@ impl WorldSnapshot {
             .map(|p| {
                 let (p, position, pass_point, anticipation_clear) = p;
                 // Defender drifting into the lane (clear now, not for the whole flight):
-                // a penalty for the threaded/killer candidate set. Ordinary visible pass
-                // options were already vetoed above when `require_reception_won` is true.
+                // a penalty, not a veto — an open forward option can still win, but a safer
+                // ball is preferred when the scores are close.
                 let anticipation_penalty = if anticipation_clear { 0.0 } else { 2.4 };
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let dist = me_position.distance(position);
@@ -22651,6 +22628,66 @@ impl WorldSnapshot {
             }
         }
         (true, clear_through_flight)
+    }
+
+    /// True if a defender's CURRENT trajectory carries it into the pass corridor before the
+    /// ball passes its nearest point on the lane — a committed, high-confidence cut-out.
+    ///
+    /// This is deliberately stricter than [`Self::pass_lane_clearance`]'s `clear_through_flight`
+    /// flag, which uses each defender's worst-case SPRINT reach (so it fires for any defender
+    /// who *could* lunge into the lane). That worst-case reach is the right basis to PRICE a
+    /// pass (the `anticipation_penalty`), but too coarse to HIDE the option outright: a
+    /// defender merely standing near the lane, or marking the receiver, would suppress an
+    /// otherwise sensible ball ("price, don't hide"). A committed cut-out instead requires the
+    /// opponent to actually be MOVING into the lane right now — projecting its current velocity
+    /// puts it inside the corridor by the time the ball arrives — which is what should remove an
+    /// ordinary visible pass option from consideration. Stationary lane-sitters are handled
+    /// separately by [`Self::pass_lane_has_set_interceptor`].
+    fn pass_lane_committed_cutout(
+        &self,
+        from: Vec2,
+        to: Vec2,
+        defending_team: Team,
+        radius: f64,
+        ball_speed_yps: f64,
+    ) -> bool {
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            return false;
+        }
+        let dir = lane * (1.0 / lane_len);
+        let speed = ball_speed_yps.max(1.0);
+        self.players
+            .iter()
+            .filter(|p| p.team == defending_team)
+            .any(|p| {
+                let position = self.player_snapshot_position(p);
+                let velocity = self.player_velocity(p.id).unwrap_or(p.velocity);
+                // Only a defender genuinely moving (not a stationary lane-sitter / marker)
+                // can be a committed cut-out; the slow/static case is a set interceptor.
+                if velocity.len() < SLOW_OPPONENT_INTERCEPT_YPS {
+                    return false;
+                }
+                // Project along the defender's CURRENT heading, but never faster than it can
+                // physically sprint — coarse/noisy tracking deltas can imply impossible
+                // speeds, and a player cannot cut out a ball faster than it can run.
+                let speed_cap = player_top_speed_yps(p.role, &p.skills)
+                    * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                    * MovementGait::Sprint.speed_multiplier();
+                let run = if velocity.len() > speed_cap {
+                    velocity.normalized() * speed_cap
+                } else {
+                    velocity
+                };
+                // When does the ball reach this defender's nearest point on the lane?
+                let along = (position - from).dot(dir).clamp(0.0, lane_len);
+                let t_ball = along / speed;
+                // If projecting that run carries the defender inside the corridor by the time
+                // the ball arrives, it cuts the ball out.
+                let projected = position + run * t_ball;
+                segment_distance_to_point(from, to, projected) <= radius
+            })
     }
 
     /// True if a SET opponent (moving slower than ~4 mph) sits in the pass lane `from`→
