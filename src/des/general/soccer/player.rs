@@ -502,6 +502,8 @@ pub struct PlayerAgent {
 
 const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
 const MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS: f64 = 6.0;
+const MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS: f64 = 16.0;
+const MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE: f64 = 0.18;
 
 fn player_mdp_mpc_comparison_trace(
     snapshot: &WorldSnapshot,
@@ -564,6 +566,87 @@ fn player_mdp_mpc_comparison_trace(
                 | "recover"
                 | "move"
         );
+    let mpc_reselect_candidate = matches!(
+        label,
+        "wall-pass"
+            | "corner-flag-cross"
+            | "vertical-attack"
+            | "vacate-space"
+            | "surprise-pass"
+            | "flick-on"
+            | "turnover-burst"
+            | "flank-low-cross"
+            | "flank-high-cross"
+            | "aerial-pass"
+            | "aerial-pass1"
+            | "pass"
+            | "pass1"
+            | "killer-pass"
+            | "switch-play"
+            | "recycle-reset"
+            | "dribble"
+            | "carry-forward"
+            | "carry-out-left"
+            | "carry-out-right"
+            | "protect-ball"
+            | "side-step"
+            | "run-in-behind"
+            | "shot-creation-run"
+            | "overlap-run"
+            | "support-push-up"
+            | "support-roam"
+            | "support-shape"
+    );
+    let execution_skill = match label {
+        "corner-flag-cross" | "flank-low-cross" | "flank-high-cross" => {
+            ability01(player.skills.crossing_left.max(player.skills.crossing_right)) * 0.58
+                + ability01(player.skills.passing_completion_rate) * 0.28
+                + ability01(player.skills.vision) * 0.14
+        }
+        "surprise-pass" | "flick-on" => {
+            ability01(player.skills.flair_passing) * 0.42
+                + ability01(player.skills.first_touch) * 0.34
+                + ability01(player.skills.passing_completion_rate) * 0.24
+        }
+        "wall-pass"
+        | "pass"
+        | "pass1"
+        | "killer-pass"
+        | "switch-play"
+        | "recycle-reset"
+        | "aerial-pass"
+        | "aerial-pass1" => {
+            ability01(player.skills.passing_completion_rate) * 0.56
+                + ability01(player.skills.vision) * 0.28
+                + ability01(player.skills.first_touch) * 0.16
+        }
+        _ => {
+            ability01(player.skills.acceleration) * 0.42
+                + ability01(player.skills.top_speed) * 0.34
+                + ability01(player.skills.dribbling) * 0.24
+        }
+    }
+    .clamp(0.0, 1.0);
+    let mpc_horizon_seconds = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+    let reachable_delta_yards = (player.velocity.len() * mpc_horizon_seconds
+        + 0.5
+            * acceleration_yps2_from_score(player.skills.acceleration)
+            * mpc_horizon_seconds
+            * mpc_horizon_seconds
+        + execution_skill * 1.6)
+        .max(0.75);
+    let execution_gap = (target_delta_yards - reachable_delta_yards).max(0.0);
+    let execution_confidence = ((1.0 - execution_gap / MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS)
+        .clamp(0.0, 1.0)
+        * (0.42 + execution_skill * 0.58)
+        * player.decision_confidence.clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+    let reselect_after_mpc_low_confidence = mpc_reselect_candidate
+        && target_delta_yards.is_finite()
+        && target_delta_yards >= MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS
+        && velocity_delta_yps.is_finite()
+        && velocity_delta_yps >= reachable_delta_yards / mpc_horizon_seconds.max(1e-6)
+        && execution_confidence < MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE;
     let blended_target = if blend_eligible {
         mdp_target.map(|target| {
             ((target + mpc_target) * 0.5)
@@ -572,10 +655,13 @@ fn player_mdp_mpc_comparison_trace(
     } else {
         None
     };
-    let deviation_recorded = target_delta_yards >= MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS
+    let deviation_recorded = reselect_after_mpc_low_confidence
+        || target_delta_yards >= MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS
         || velocity_delta_yps >= 1.0
         || semantic_mismatch;
-    let decision = if blend_eligible {
+    let decision = if reselect_after_mpc_low_confidence {
+        "reselect-mdp-after-mpc-low-confidence"
+    } else if blend_eligible {
         "blend-continuous-candidate"
     } else if semantic_mismatch {
         "reject-blend-semantic-mismatch"
@@ -597,6 +683,17 @@ fn player_mdp_mpc_comparison_trace(
         deviation_recorded,
         decision: decision.to_string(),
     })
+}
+
+fn mpc_reselects_candidate(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action: &SoccerAction,
+    action_label: &str,
+) -> bool {
+    let action_target = player.action_target_trace(action, snapshot);
+    player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
+        .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
 }
 
 impl PlayerAgent {
@@ -929,6 +1026,33 @@ impl PlayerAgent {
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 }
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, 1.46);
+        let vertical_attack_legal = carry_forward_legal
+            && self.role != PlayerRole::Goalkeeper
+            && observation.yards_to_goal < observation.yards_to_own_goal
+            && observation.forward_dribble_space_yards >= 2.0
+            && !goal_attack_shot_blocks_alternatives;
+        let vertical_attack_score = (carry_forward_score
+            * (0.62
+                + offensive_urgency * 0.42
+                + goal_attack * 0.34
+                + forward_space_fit * 0.30
+                + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.18)
+            * (1.0 - pressure * 0.16).clamp(0.76, 1.0))
+        .clamp(0.01, 1.48);
+        let fresh_turnover_fit =
+            (1.0 - observation.perceived_time_on_ball_seconds / 0.85).clamp(0.0, 1.0);
+        let turnover_burst_legal = carry_forward_legal
+            && fresh_turnover_fit > 0.0
+            && observation.forward_dribble_space_yards >= 1.0
+            && self.role != PlayerRole::Goalkeeper;
+        let turnover_burst_score = (carry_forward_score
+            * (0.52
+                + fresh_turnover_fit * 0.76
+                + pressure_rising * 0.22
+                + forward_space_fit * 0.26
+                + offensive_urgency * 0.16)
+            * (1.0 + ability01(self.skills.acceleration) * 0.24))
+        .clamp(0.01, 1.60);
         let carry_out_legal = observation.forward_dribble_space_yards >= 0.8
             && !goal_attack_shot_blocks_alternatives
             && !goalmouth_carry_forced;
@@ -1122,6 +1246,16 @@ impl PlayerAgent {
             AgentActionOptionTrace::new("dribble", dribble_score, true),
             AgentActionOptionTrace::new("carry-forward", carry_forward_score, carry_forward_legal),
             AgentActionOptionTrace::new(
+                "vertical-attack",
+                vertical_attack_score,
+                vertical_attack_legal,
+            ),
+            AgentActionOptionTrace::new(
+                "turnover-burst",
+                turnover_burst_score,
+                turnover_burst_legal,
+            ),
+            AgentActionOptionTrace::new(
                 "carry-out-left",
                 carry_out_left_score,
                 carry_out_left_legal,
@@ -1237,7 +1371,7 @@ impl PlayerAgent {
             * (0.36 + passing * 0.34)
             * (0.74 + reset_quality * 0.38)
             * (1.0
-                + own_half as u8 as f64 * 0.16
+                + if own_half { 0.16 } else { 0.0 }
                 + pressure_urgency.max(pressure) * 0.18
                 + excessive_hold_pressure(observation, dribbling) * 0.22)
             * floor_pass_patience_multiplier
@@ -1336,6 +1470,64 @@ impl PlayerAgent {
             "flank-high-cross",
             high_cross_score,
             aerial_pass_target_count > 0 && flank_cross_legal_context,
+        ));
+        let corner_flag_cross_score = (low_cross_score.max(high_cross_score)
+            * (0.72
+                + flank_cross_context * 0.34
+                + flank_lane_fit * 0.18
+                + goal_attack * 0.12
+                + directive.flank_overlap_run_probability * 0.10))
+        .clamp(0.01, 0.96);
+        options.push(AgentActionOptionTrace::new(
+            "corner-flag-cross",
+            corner_flag_cross_score,
+            (pass_target_count > 0 || aerial_pass_target_count > 0) && flank_cross_legal_context,
+        ));
+        let surprise_pass_score = (self.preferences.pass_bias
+            * directive.pass_priority
+            * (0.18
+                + ability01(self.skills.flair_passing) * 0.46
+                + passing * 0.18
+                + ability01(self.skills.vision) * 0.16)
+            * (0.74
+                + pressure_urgency.max(pressure) * 0.22
+                + goal_attack * 0.18
+                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.18)
+            * floor_pass_patience_multiplier
+            * hold_release_multiplier
+            * pressured_release_multiplier(observation))
+        .clamp(0.01, 0.84);
+        options.push(AgentActionOptionTrace::new(
+            "surprise-pass",
+            surprise_pass_score,
+            pass_target_count > 0
+                && !goal_attack_shot_blocks_alternatives
+                && (pressure_urgency.max(pressure) >= 0.18
+                    || goal_attack >= 0.10
+                    || ability01(self.skills.flair_passing) >= 0.54),
+        ));
+        let incoming_aerial = matches!(
+            observation.incoming_ball_kind,
+            IncomingBallKind::AerialCross | IncomingBallKind::AerialPass
+        );
+        let flick_on_score = (self.preferences.pass_bias
+            * directive.pass_priority
+            * (0.20
+                + ability01(self.skills.first_touch) * 0.34
+                + ability01(self.skills.flair_passing) * 0.20
+                + aerial_duel_skill_from_agent(self) * 0.22)
+            * (0.72
+                + observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.18
+                + observation.best_aerial_pass_receiver_openness.clamp(0.0, 1.0) * 0.18
+                + observation.aerial_forward_runner_pass_multiplier.clamp(1.0, 1.50) * 0.10)
+            * aerial_pass_patience_multiplier
+            * aerial_forward_runner_multiplier
+            * pressured_release_multiplier(observation))
+        .clamp(0.01, 0.88);
+        options.push(AgentActionOptionTrace::new(
+            "flick-on",
+            flick_on_score,
+            aerial_pass_target_count > 0 && observation.first_touch_available && incoming_aerial,
         ));
         let killer_pass_range_fit = killer_pass_goal_range_fit(observation);
         let killer_pass_goal_pressure = observation
@@ -1633,6 +1825,8 @@ impl PlayerAgent {
                 "aerial-pass3",
                 "dribble",
                 "carry-forward",
+                "vertical-attack",
+                "turnover-burst",
                 "carry-out-left",
                 "carry-out-right",
                 "protect-ball",
@@ -1640,6 +1834,9 @@ impl PlayerAgent {
                 "fake-left-cut-right",
                 "fake-right-cut-left",
                 "hold-up-flank",
+                "corner-flag-cross",
+                "surprise-pass",
+                "flick-on",
             ] {
                 scale_legal_option_score(&mut options, label, recycle_multiplier);
             }
@@ -1676,6 +1873,7 @@ impl PlayerAgent {
         &self,
         observation: &SoccerPomdpObservation,
         pass_target_count: usize,
+        aerial_pass_target_count: usize,
     ) -> Vec<AgentActionOptionTrace> {
         let is_aerial = matches!(
             observation.incoming_ball_kind,
@@ -1693,6 +1891,7 @@ impl PlayerAgent {
         };
         let shot_legal = first_time_shot_decision_is_qualified_for_role(observation, self.role);
         let pass_legal = pass_target_count > 0;
+        let flick_on_legal = is_aerial && aerial_pass_target_count > 0;
         let quick_pressure_bonus = 1.0
             + observation.perceived_pressure.clamp(0.0, 1.0) * 0.24
             + observation.decision_urgency.clamp(0.0, 1.0) * 0.18;
@@ -1731,6 +1930,17 @@ impl PlayerAgent {
                 "first-time-pass",
                 (observation.first_time_pass_score * quick_pressure_bonus * 0.86).clamp(0.02, 0.88),
                 pass_legal,
+            ),
+            AgentActionOptionTrace::new(
+                "flick-on",
+                (observation.first_time_pass_score
+                    * quick_pressure_bonus
+                    * (0.34
+                        + ability01(self.skills.first_touch) * 0.30
+                        + ability01(self.skills.flair_passing) * 0.18
+                        + aerial_duel_skill_from_agent(self) * 0.18))
+                .clamp(0.02, 0.82),
+                flick_on_legal,
             ),
             AgentActionOptionTrace::new(
                 control_label,
@@ -1953,6 +2163,42 @@ impl PlayerAgent {
             false,
             &special_targets,
         );
+        let mut vacate_support = snapshot.attacking_support_movement_for_with_targets(
+            self.id,
+            self.home_position,
+            true,
+            &special_targets,
+        );
+        vacate_support.action_label = "vacate-space";
+        let vacate_target = snapshot.shape_guarded_support_point(
+            self.id,
+            vacate_support.point,
+            &[open, self.home_position],
+            self.home_position,
+            true,
+        );
+        let current_teammate_pressure =
+            snapshot.teammate_occupied_space_pressure_at(self.team, current, Some(self.id));
+        let target_teammate_pressure =
+            snapshot.teammate_occupied_space_pressure_at(self.team, vacate_target, Some(self.id));
+        let vacate_relief = (current_teammate_pressure - target_teammate_pressure).max(0.0);
+        if self.role != PlayerRole::Goalkeeper
+            && (current_teammate_pressure >= 0.18
+                || holder_pressure_urgency >= 0.16
+                || shape_support_urgency >= 0.14)
+        {
+            options.push(AgentActionOptionTrace::new(
+                "vacate-space",
+                special_score(
+                    vacate_target,
+                    0.34 + vacate_relief * 0.82
+                        + current_teammate_pressure * 0.28
+                        + shape_support_urgency * 0.20
+                        + holder_pressure_urgency * 0.24,
+                ),
+                true,
+            ));
+        }
         let home_x = self.home_position.x.clamp(0.0, snapshot.field_width);
         let wide_home =
             home_x < snapshot.field_width * 0.34 || home_x > snapshot.field_width * 0.66;
@@ -2133,10 +2379,19 @@ impl PlayerAgent {
                     .clamp(0.04, 0.82),
             )
         };
+        let press_cover_legal = self.role != PlayerRole::Goalkeeper && holder_context.is_some();
+        let press_cover_score = ((0.10
+            + press * 0.32
+            + defending * 0.18
+            + aggression * 0.12
+            + tackle_contact_fit * 0.18)
+            * (0.70 + defensive_mindedness * 0.30))
+            .clamp(0.02, 0.92);
         let mut options = vec![
             AgentActionOptionTrace::new("tackle", tackle_score, tackle_legal),
             AgentActionOptionTrace::new("defend-shape", shape_score, true),
             AgentActionOptionTrace::new("defend-roam", roam_score, true),
+            AgentActionOptionTrace::new("press-cover", press_cover_score, press_cover_legal),
         ];
         if self.role == PlayerRole::Goalkeeper {
             ensure_min_legal_option_probability(&mut options, "defend-shape", 0.97);
@@ -3033,7 +3288,12 @@ impl PlayerAgent {
 
         if has_ball && observation.first_touch_available {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
-            let action_options = self.first_touch_action_options(&observation, pass_targets.len());
+            let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
+            let action_options = self.first_touch_action_options(
+                &observation,
+                pass_targets.len(),
+                aerial_pass_targets.len(),
+            );
             if goal_attack_shot_blocks_alternatives(&observation, self.role) {
                 let is_aerial = matches!(
                     observation.incoming_ball_kind,
@@ -3141,6 +3401,21 @@ impl PlayerAgent {
                                 flight: PassFlight::Floor,
                             },
                             "first-time-pass".to_string(),
+                        ));
+                        break;
+                    }
+                    "flick-on" if !aerial_pass_targets.is_empty() => {
+                        let target = aerial_pass_targets[0];
+                        chosen = Some((
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.46
+                                    + 0.26
+                                        * aerial_duel_skill_from_agent(self)
+                                            .max(ability01(self.skills.first_touch)),
+                                flight: PassFlight::Aerial,
+                            },
+                            "flick-on".to_string(),
                         ));
                         break;
                     }
@@ -3411,6 +3686,7 @@ impl PlayerAgent {
             }
         }
 
+        let mut learned_mpc_reselect_label: Option<String> = None;
         if let Some(plan) = learned_plan {
             if let Some((action, action_label)) =
                 self.action_from_learned_plan(plan, snapshot, &observation)
@@ -3483,21 +3759,34 @@ impl PlayerAgent {
                         };
                     }
                 }
-                self.last_decision = Some(self.decision_trace(
-                    snapshot,
-                    mdp_state,
-                    observation,
-                    belief,
-                    vec!["learned-policy".to_string(), plan.action.clone()],
-                    single_action_option(&action_label),
-                    &action,
-                    action_label,
-                ));
-                return PlayerIntent {
-                    player_id: self.id,
-                    action,
-                    sprint: false,
-                };
+                if mpc_reselects_candidate(snapshot, self, &action, &action_label) {
+                    learned_mpc_reselect_label = Some(action_label.clone());
+                } else {
+                    if action_label == "wall-pass" {
+                        if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
+                            self.one_two = Some(OneTwoRun {
+                                wall_partner: plan.wall_partner,
+                                launch_clock_seconds: snapshot.clock_seconds,
+                                return_target: plan.return_target,
+                            });
+                        }
+                    }
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state,
+                        observation,
+                        belief,
+                        vec!["learned-policy".to_string(), plan.action.clone()],
+                        single_action_option(&action_label),
+                        &action,
+                        action_label,
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
             }
         }
 
@@ -3611,6 +3900,14 @@ impl PlayerAgent {
                     action_option_score(&action_options, "carry-forward"),
                 ),
                 (
+                    "vertical-attack".to_string(),
+                    action_option_score(&action_options, "vertical-attack"),
+                ),
+                (
+                    "turnover-burst".to_string(),
+                    action_option_score(&action_options, "turnover-burst"),
+                ),
+                (
                     "carry-out-left".to_string(),
                     action_option_score(&action_options, "carry-out-left"),
                 ),
@@ -3655,6 +3952,10 @@ impl PlayerAgent {
                     action_option_score(&action_options, "flank-high-cross"),
                 ),
                 (
+                    "corner-flag-cross".to_string(),
+                    action_option_score(&action_options, "corner-flag-cross"),
+                ),
+                (
                     "killer-pass".to_string(),
                     action_option_score(&action_options, "killer-pass"),
                 ),
@@ -3666,13 +3967,19 @@ impl PlayerAgent {
                     "switch-play".to_string(),
                     action_option_score(&action_options, "switch-play"),
                 ),
-            ];
-            if scoop_pass_option.is_some() {
-                weighted_ops.push((
+                (
+                    "surprise-pass".to_string(),
+                    action_option_score(&action_options, "surprise-pass"),
+                ),
+                (
                     "scoop-pass".to_string(),
                     action_option_score(&action_options, "scoop-pass"),
-                ));
-            }
+                ),
+                (
+                    "flick-on".to_string(),
+                    action_option_score(&action_options, "flick-on"),
+                ),
+            ];
             if wall_pass_option.is_some() {
                 weighted_ops.push((
                     "wall-pass".to_string(),
@@ -3689,6 +3996,9 @@ impl PlayerAgent {
             }
             let ops = weighted_fisher_yates_order(weighted_ops, rng);
             let mut order_names = Vec::with_capacity(ops.len());
+            if let Some(label) = learned_mpc_reselect_label.as_deref() {
+                order_names.push(format!("learned-mpc-reselect:{}", label));
+            }
             let mut chosen = None;
             for op in ops {
                 match op.as_str() {
@@ -3740,6 +4050,32 @@ impl PlayerAgent {
                                     touch,
                                 },
                                 kind.label().to_string(),
+                            ));
+                            break;
+                        }
+                    }
+                    "vertical-attack" | "turnover-burst" => {
+                        let kind = DribbleMoveKind::CarryForward;
+                        order_names.push(op.to_string());
+                        let carry_chance = action_option_score(&action_options, op.as_str());
+                        if rng.next_float()
+                            < time_window_probability(carry_chance, snapshot.dt_seconds)
+                        {
+                            let touch =
+                                snapshot.choose_dribble_touch_decision_for(self.id, kind, rng);
+                            let target = snapshot.dribble_move_target_for_touch(
+                                self.id,
+                                self.home_position,
+                                kind,
+                                touch,
+                            );
+                            chosen = Some((
+                                SoccerAction::DribbleMove {
+                                    target,
+                                    kind,
+                                    touch,
+                                },
+                                op.to_string(),
                             ));
                             break;
                         }
@@ -3958,6 +4294,39 @@ impl PlayerAgent {
                             }
                         }
                     }
+                    "corner-flag-cross" => {
+                        order_names.push("corner-flag-cross".to_string());
+                        let cross_chance =
+                            action_option_score(&action_options, "corner-flag-cross");
+                        if rng.next_float()
+                            < time_window_probability(cross_chance, snapshot.dt_seconds)
+                        {
+                            let crossing = ability01(
+                                self.skills.crossing_left.max(self.skills.crossing_right),
+                            );
+                            if let Some(target) = pass_targets.first().copied() {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.62 + 0.28 * crossing.max(passing_skill),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "corner-flag-cross".to_string(),
+                                ));
+                                break;
+                            } else if let Some(target) = aerial_pass_targets.first().copied() {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.66 + 0.28 * crossing.max(passing_skill),
+                                        flight: PassFlight::Aerial,
+                                    },
+                                    "corner-flag-cross".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
                     "killer-pass" => {
                         order_names.push("killer-pass".to_string());
                         let killer_chance = action_option_score(&action_options, "killer-pass");
@@ -4028,8 +4397,11 @@ impl PlayerAgent {
                     }
                     "scoop-pass" => {
                         order_names.push("scoop-pass".to_string());
-                        if let Some((scoop_target, scoop_chance)) = scoop_pass_option {
-                            if rng.next_float() < scoop_chance {
+                        let scoop_chance = action_option_score(&action_options, "scoop-pass");
+                        if let Some((scoop_target, _)) = scoop_pass_option {
+                            if rng.next_float()
+                                < time_window_probability(scoop_chance, snapshot.dt_seconds)
+                            {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(scoop_target),
@@ -4037,6 +4409,51 @@ impl PlayerAgent {
                                         flight: PassFlight::Scoop,
                                     },
                                     "scoop-pass".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "surprise-pass" => {
+                        order_names.push("surprise-pass".to_string());
+                        let surprise_chance =
+                            action_option_score(&action_options, "surprise-pass");
+                        if let Some(target) = pass_targets.first().copied() {
+                            if rng.next_float()
+                                < time_window_probability(surprise_chance, snapshot.dt_seconds)
+                            {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.50
+                                            + 0.22
+                                                * passing_skill
+                                                    .max(ability01(self.skills.flair_passing)),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "surprise-pass".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "flick-on" => {
+                        order_names.push("flick-on".to_string());
+                        let flick_chance = action_option_score(&action_options, "flick-on");
+                        if let Some(target) = aerial_pass_targets.first().copied() {
+                            if rng.next_float()
+                                < time_window_probability(flick_chance, snapshot.dt_seconds)
+                            {
+                                chosen = Some((
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.46
+                                            + 0.26
+                                                * aerial_duel_skill_from_agent(self)
+                                                    .max(ability01(self.skills.first_touch)),
+                                        flight: PassFlight::Aerial,
+                                    },
+                                    "flick-on".to_string(),
                                 ));
                                 break;
                             }
@@ -4132,7 +4549,7 @@ impl PlayerAgent {
                 } else {
                     None
                 };
-            let (action, action_label) = chosen.unwrap_or_else(|| {
+            let (mut action, mut action_label) = chosen.unwrap_or_else(|| {
                 let carry_to_create = shot_creation_carry_multiplier(&observation) > 1.28
                     && observation.forward_dribble_space_yards > 2.2;
                 let patient_carry = low_pressure_patient_carry_preferred(&observation);
@@ -4260,6 +4677,331 @@ impl PlayerAgent {
                     )
                 }
             });
+            if mpc_reselects_candidate(snapshot, self, &action, &action_label) {
+                let rejected_label = normalize_soccer_action_label(&action_label).to_string();
+                order_names.push(format!("mpc-reselect:{}", action_label));
+                if rejected_label == "wall-pass" {
+                    self.one_two = None;
+                }
+                let fallback = action_options
+                    .iter()
+                    .filter(|option| option.legal && option.score > 0.0)
+                    .filter(|option| {
+                        let label = normalize_soccer_action_label(&option.label);
+                        label != rejected_label && label != "wall-pass"
+                    })
+                    .filter_map(|option| {
+                        let label = if option.label == "scoop-pass" {
+                            "scoop-pass"
+                        } else {
+                            normalize_soccer_action_label(&option.label)
+                        };
+                        let candidate = match label {
+                            "shoot"
+                                if shot_decision_is_qualified_for_role(&observation, self.role)
+                                    || speculative_long_shot_is_qualified(
+                                        &observation,
+                                        self.role,
+                                        shooting_skill,
+                                    ) =>
+                            {
+                                Some((
+                                    SoccerAction::Shoot {
+                                        power: shot_power_for_skill(shooting_skill),
+                                    },
+                                    "shoot".to_string(),
+                                ))
+                            }
+                            "pass" => {
+                                let rank = option
+                                    .label
+                                    .trim_start_matches("pass")
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|n| n.checked_sub(1))
+                                    .unwrap_or(0);
+                                pass_targets.get(rank).copied().map(|target| {
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.58 + 0.32 * passing_skill,
+                                            flight: PassFlight::Floor,
+                                        },
+                                        format!("pass{}", rank + 1),
+                                    )
+                                })
+                            }
+                            "aerial-pass" => {
+                                let rank = option
+                                    .label
+                                    .trim_start_matches("aerial-pass")
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|n| n.checked_sub(1))
+                                    .unwrap_or(0);
+                                aerial_pass_targets.get(rank).copied().map(|target| {
+                                    let crossing = ability01(
+                                        self.skills.crossing_left.max(self.skills.crossing_right),
+                                    );
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.56 + 0.28 * crossing.max(passing_skill),
+                                            flight: PassFlight::Aerial,
+                                        },
+                                        format!("aerial-pass{}", rank + 1),
+                                    )
+                                })
+                            }
+                            "killer-pass" => snapshot
+                                .killer_pass_target_for(self.id, &pass_targets)
+                                .map(|target| {
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.66
+                                                + 0.24
+                                                    * passing_skill
+                                                        .max(ability01(self.skills.vision)),
+                                            flight: PassFlight::Floor,
+                                        },
+                                        "killer-pass".to_string(),
+                                    )
+                                }),
+                            "recycle-reset" => self
+                                .recycle_reset_target_for(snapshot, None, &strategic_pass_targets)
+                                .map(|target| {
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.46 + 0.22 * passing_skill,
+                                            flight: PassFlight::Floor,
+                                        },
+                                        "recycle-reset".to_string(),
+                                    )
+                                }),
+                            "switch-play" => self
+                                .switch_play_target_for(snapshot, None, &strategic_pass_targets)
+                                .map(|target| {
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.62
+                                                + 0.24
+                                                    * passing_skill
+                                                        .max(ability01(self.skills.flair_passing)),
+                                            flight: PassFlight::Floor,
+                                        },
+                                        "switch-play".to_string(),
+                                    )
+                                }),
+                            "flank-low-cross" => pass_targets.first().copied().map(|target| {
+                                let crossing = ability01(
+                                    self.skills.crossing_left.max(self.skills.crossing_right),
+                                );
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.60 + 0.26 * crossing.max(passing_skill),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "flank-low-cross".to_string(),
+                                )
+                            }),
+                            "flank-high-cross" => {
+                                aerial_pass_targets.first().copied().map(|target| {
+                                    let crossing = ability01(
+                                        self.skills.crossing_left.max(self.skills.crossing_right),
+                                    );
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.64 + 0.28 * crossing.max(passing_skill),
+                                            flight: PassFlight::Aerial,
+                                        },
+                                        "flank-high-cross".to_string(),
+                                    )
+                                })
+                            }
+                            "corner-flag-cross" => pass_targets
+                                .first()
+                                .copied()
+                                .map(|target| {
+                                    let crossing = ability01(
+                                        self.skills.crossing_left.max(self.skills.crossing_right),
+                                    );
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.62 + 0.28 * crossing.max(passing_skill),
+                                            flight: PassFlight::Floor,
+                                        },
+                                        "corner-flag-cross".to_string(),
+                                    )
+                                })
+                                .or_else(|| {
+                                    aerial_pass_targets.first().copied().map(|target| {
+                                        let crossing = ability01(
+                                            self.skills
+                                                .crossing_left
+                                                .max(self.skills.crossing_right),
+                                        );
+                                        (
+                                            SoccerAction::Pass {
+                                                target_player: Some(target),
+                                                power: 0.66 + 0.28 * crossing.max(passing_skill),
+                                                flight: PassFlight::Aerial,
+                                            },
+                                            "corner-flag-cross".to_string(),
+                                        )
+                                    })
+                                }),
+                            "scoop-pass" => scoop_pass_option.map(|(target, _)| {
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.5,
+                                        flight: PassFlight::Scoop,
+                                    },
+                                    "scoop-pass".to_string(),
+                                )
+                            }),
+                            "surprise-pass" => pass_targets
+                                .first()
+                                .copied()
+                                .map(|target| {
+                                    (
+                                        SoccerAction::Pass {
+                                            target_player: Some(target),
+                                            power: 0.50
+                                                + 0.22
+                                                    * passing_skill
+                                                        .max(ability01(self.skills.flair_passing)),
+                                            flight: PassFlight::Floor,
+                                        },
+                                        "surprise-pass".to_string(),
+                                    )
+                                }),
+                            "flick-on" => aerial_pass_targets.first().copied().map(|target| {
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.46
+                                            + 0.26
+                                                * aerial_duel_skill_from_agent(self)
+                                                    .max(ability01(self.skills.first_touch)),
+                                        flight: PassFlight::Aerial,
+                                    },
+                                    "flick-on".to_string(),
+                                )
+                            }),
+                            "vertical-attack" | "turnover-burst" => {
+                                let kind = DribbleMoveKind::CarryForward;
+                                let touch =
+                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                Some((
+                                    SoccerAction::DribbleMove {
+                                        target: snapshot.dribble_move_target_for_touch(
+                                            self.id,
+                                            self.home_position,
+                                            kind,
+                                            touch,
+                                        ),
+                                        kind,
+                                        touch,
+                                    },
+                                    label.to_string(),
+                                ))
+                            }
+                            "dribble" => {
+                                let kind = deterministic_dribble_move_kind(snapshot.tick, self.id);
+                                let touch =
+                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                Some((
+                                    SoccerAction::DribbleMove {
+                                        target: snapshot.dribble_move_target_for_touch(
+                                            self.id,
+                                            self.home_position,
+                                            kind,
+                                            touch,
+                                        ),
+                                        kind,
+                                        touch,
+                                    },
+                                    kind.label().to_string(),
+                                ))
+                            }
+                            "carry-forward" | "carry-out-left" | "carry-out-right"
+                            | "protect-ball" => {
+                                let kind = match label {
+                                    "carry-forward" => DribbleMoveKind::CarryForward,
+                                    "carry-out-left" => DribbleMoveKind::CarryOutLeft,
+                                    "carry-out-right" => DribbleMoveKind::CarryOutRight,
+                                    _ => DribbleMoveKind::ProtectBall,
+                                };
+                                let kind =
+                                    goal_approach_dribble_kind(kind, &observation, self.role);
+                                let touch =
+                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                Some((
+                                    SoccerAction::DribbleMove {
+                                        target: snapshot.dribble_move_target_for_touch(
+                                            self.id,
+                                            self.home_position,
+                                            kind,
+                                            touch,
+                                        ),
+                                        kind,
+                                        touch,
+                                    },
+                                    kind.label().to_string(),
+                                ))
+                            }
+                            "clearance" => Some((
+                                SoccerAction::Clearance {
+                                    target: snapshot
+                                        .pressure_clearance_target_for(self.id)
+                                        .unwrap_or_else(|| {
+                                            clearance_target_for_player(
+                                                self.team,
+                                                self.position,
+                                                snapshot.field_width,
+                                                snapshot.field_length,
+                                            )
+                                        }),
+                                    power: 0.88
+                                        + observation.perceived_pressure.clamp(0.0, 1.0) * 0.10,
+                                },
+                                "clearance".to_string(),
+                            )),
+                            "route-one" => Some((
+                                SoccerAction::RouteOne {
+                                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(
+                                        || {
+                                            route_one_target_for_actor(
+                                                self.team,
+                                                self.position,
+                                                snapshot.field_width,
+                                                snapshot.field_length,
+                                                self.role,
+                                            )
+                                        },
+                                    ),
+                                    power: 0.80,
+                                },
+                                "route-one".to_string(),
+                            )),
+                            _ => None,
+                        };
+                        candidate.map(|candidate| (option.score, candidate))
+                    })
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, candidate)| candidate);
+                if let Some((fallback_action, fallback_label)) = fallback {
+                    action = fallback_action;
+                    action_label = fallback_label;
+                }
+            }
             let sprint = matches!(action, SoccerAction::DribbleMove { .. })
                 && (self.role == PlayerRole::Forward
                     || observation.forward_dribble_space_yards > 3.0
@@ -4369,6 +5111,16 @@ impl PlayerAgent {
                         target.action_label = "overlap-run";
                         Some(target)
                     }
+                    "vacate-space" => {
+                        let mut target = snapshot.attacking_support_movement_for_with_targets(
+                            self.id,
+                            self.home_position,
+                            true,
+                            &support_context.special_targets,
+                        );
+                        target.action_label = "vacate-space";
+                        Some(target)
+                    }
                     "support-roam" => Some(snapshot.attacking_support_movement_for_with_targets(
                         self.id,
                         self.home_position,
@@ -4386,7 +5138,10 @@ impl PlayerAgent {
                     snapshot.attacking_support_movement_for_with_targets(
                         self.id,
                         self.home_position,
-                        matches!(first_support_label.as_str(), "support-roam" | "overlap-run"),
+                        matches!(
+                            first_support_label.as_str(),
+                            "support-roam" | "overlap-run" | "vacate-space"
+                        ),
                         &support_context.special_targets,
                     )
                 });
@@ -4428,6 +5183,10 @@ impl PlayerAgent {
                         "defend-roam",
                         action_option_score(&action_options, "defend-roam"),
                     ),
+                    (
+                        "press-cover",
+                        action_option_score(&action_options, "press-cover"),
+                    ),
                 ],
                 rng,
             );
@@ -4465,13 +5224,16 @@ impl PlayerAgent {
                             }
                         }
                     }
-                    "defend-shape" | "defend-roam" => {
-                        let roam = op == "defend-roam";
+                    "defend-shape" | "defend-roam" | "press-cover" => {
+                        let press_cover = op == "press-cover";
+                        let roam = op == "defend-roam" || press_cover;
                         order_names.push(op.to_string());
                         let dist = self.position.distance(snapshot.ball.position);
                         let defend_radius = 3.0 + directive.press_intensity * 3.0;
                         let target = if self.role == PlayerRole::Goalkeeper {
                             snapshot.defensive_assignment_for(self.id, self.home_position, roam)
+                        } else if press_cover {
+                            snapshot.defensive_assignment_for(self.id, self.home_position, true)
                         } else if roam && dist < defend_radius {
                             snapshot.goal_side_defensive_target_for(self.id, snapshot.ball.position)
                         } else {
@@ -4507,7 +5269,8 @@ impl PlayerAgent {
                         let (target, push_up) =
                             snapshot.defensive_push_up_adjustment(self.id, target);
                         push_up_sprint = push_up;
-                        chosen = Some((SoccerAction::MoveTo(target), "defend".to_string()));
+                        let label = if press_cover { "press-cover" } else { "defend" };
+                        chosen = Some((SoccerAction::MoveTo(target), label.to_string()));
                         break;
                     }
                     _ => {}
@@ -4639,6 +5402,8 @@ impl PlayerAgent {
                                     | "shot-creation-run"
                                     | "overlap-run"
                                     | "support-push-up"
+                                    | "vertical-attack"
+                                    | "vacate-space"
                                     | "one-two-run"
                             ))
                         && matches!(self.role, PlayerRole::Midfielder | PlayerRole::Forward)
@@ -4695,7 +5460,7 @@ impl PlayerAgent {
         let label = normalize_soccer_action_label(&plan.action);
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
-            && label != "tackle"
+            && !matches!(label, "tackle" | "press-cover")
         {
             let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, false);
             let target = plan
@@ -4720,6 +5485,60 @@ impl PlayerAgent {
                     },
                     "shoot".to_string(),
                 ))
+            }
+            "wall-pass" if observation.has_ball => {
+                snapshot.wall_pass_option_for(self.id).map(|plan| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(plan.wall_partner),
+                            power: WALL_PASS_GIVE_POWER
+                                + 0.20 * ability01(self.skills.passing_completion_rate),
+                            flight: PassFlight::Floor,
+                        },
+                        "wall-pass".to_string(),
+                    )
+                })
+            }
+            "corner-flag-cross" if observation.has_ball => {
+                let floor_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                let aerial_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+                let crossing = ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+                plan.target_player
+                    .filter(|target| floor_targets.contains(target))
+                    .or_else(|| floor_targets.first().copied())
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.62
+                                    + 0.28
+                                        * crossing.max(ability01(
+                                            self.skills.passing_completion_rate,
+                                        )),
+                                flight: PassFlight::Floor,
+                            },
+                            "corner-flag-cross".to_string(),
+                        )
+                    })
+                    .or_else(|| {
+                        plan.target_player
+                            .filter(|target| aerial_targets.contains(target))
+                            .or_else(|| aerial_targets.first().copied())
+                            .map(|target| {
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.66
+                                            + 0.28
+                                                * crossing.max(ability01(
+                                                    self.skills.passing_completion_rate,
+                                                )),
+                                        flight: PassFlight::Aerial,
+                                    },
+                                    "corner-flag-cross".to_string(),
+                                )
+                            })
+                    })
             }
             "flank-low-cross" if observation.has_ball => {
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
@@ -4779,6 +5598,80 @@ impl PlayerAgent {
                         "flank-high-cross".to_string(),
                     )
                 })
+            }
+            "switch-play" if observation.has_ball => {
+                if !Self::learned_pass_viable(observation, PassFlight::Floor) {
+                    return None;
+                }
+                let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                let target =
+                    self.switch_play_target_for(snapshot, plan.target_player, &visible_targets);
+                target.map(|target| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power: 0.62
+                                + 0.24
+                                    * ability01(self.skills.passing_completion_rate)
+                                        .max(ability01(self.skills.flair_passing)),
+                            flight: PassFlight::Floor,
+                        },
+                        "switch-play".to_string(),
+                    )
+                })
+            }
+            "recycle-reset" if observation.has_ball => {
+                if !Self::learned_pass_viable(observation, PassFlight::Floor)
+                    || goal_attack_shot_blocks_alternatives(observation, self.role)
+                {
+                    return None;
+                }
+                let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                let target =
+                    self.recycle_reset_target_for(snapshot, plan.target_player, &visible_targets);
+                target.map(|target| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power: 0.46 + 0.22 * ability01(self.skills.passing_completion_rate),
+                            flight: PassFlight::Floor,
+                        },
+                        "recycle-reset".to_string(),
+                    )
+                })
+            }
+            "surprise-pass" if observation.has_ball => {
+                let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                snapshot
+                    .scoop_pass_target_for(self.id)
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.5,
+                                flight: PassFlight::Scoop,
+                            },
+                            "surprise-pass".to_string(),
+                        )
+                    })
+                    .or_else(|| {
+                        plan.target_player
+                            .filter(|target| visible_targets.contains(target))
+                            .or_else(|| visible_targets.first().copied())
+                            .map(|target| {
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.50
+                                            + 0.22
+                                                * ability01(self.skills.passing_completion_rate)
+                                                    .max(ability01(self.skills.flair_passing)),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "surprise-pass".to_string(),
+                                )
+                            })
+                    })
             }
             "pass" if observation.has_ball => {
                 // Veto a junk pass (covered/absent receiver) — defer to heuristic.
@@ -4900,6 +5793,25 @@ impl PlayerAgent {
                     )
                 })
             }
+            "flick-on" if observation.has_ball => {
+                let visible_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+                plan.target_player
+                    .filter(|target| visible_targets.contains(target))
+                    .or_else(|| visible_targets.first().copied())
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.46
+                                    + 0.26
+                                        * aerial_duel_skill_from_agent(self)
+                                            .max(ability01(self.skills.first_touch)),
+                                flight: PassFlight::Aerial,
+                            },
+                            "flick-on".to_string(),
+                        )
+                    })
+            }
             "first-time-shot" | "first-time-header"
                 if observation.has_ball
                     && observation.first_touch_available
@@ -5014,6 +5926,8 @@ impl PlayerAgent {
                 ))
             }
             "dribble"
+            | "vertical-attack"
+            | "turnover-burst"
             | "carry-forward"
             | "carry-out-left"
             | "carry-out-right"
@@ -5031,6 +5945,7 @@ impl PlayerAgent {
                     return Some(release);
                 }
                 let kind = match label {
+                    "vertical-attack" | "turnover-burst" => DribbleMoveKind::CarryForward,
                     "carry-forward" => DribbleMoveKind::CarryForward,
                     "carry-out-left" => DribbleMoveKind::CarryOutLeft,
                     "carry-out-right" => DribbleMoveKind::CarryOutRight,
@@ -5067,7 +5982,11 @@ impl PlayerAgent {
                         kind,
                         touch,
                     },
-                    kind.label().to_string(),
+                    if matches!(label, "vertical-attack" | "turnover-burst") {
+                        label.to_string()
+                    } else {
+                        kind.label().to_string()
+                    },
                 ))
             }
             "side-step" if observation.has_ball => {
@@ -5137,6 +6056,16 @@ impl PlayerAgent {
                     None
                 }
             }),
+            "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, true);
+                Some((
+                    SoccerAction::MoveTo(snapshot.goal_side_defensive_target_for(
+                        self.id,
+                        assignment,
+                    )),
+                    "press-cover".to_string(),
+                ))
+            }
             "check-to-ball" if !observation.has_ball => snapshot
                 .check_to_ball_target_for(self.id, self.home_position)
                 .map(|target| {
@@ -5183,10 +6112,10 @@ impl PlayerAgent {
                     )
                 }),
             "shot-creation-run" | "overlap-run" | "support-push-up" | "support-screen"
-            | "support-shape" | "support-roam"
+            | "support-shape" | "support-roam" | "vacate-space" | "vertical-attack"
                 if !observation.has_ball =>
             {
-                let roam = matches!(label, "support-roam" | "overlap-run");
+                let roam = matches!(label, "support-roam" | "overlap-run" | "vacate-space");
                 let support_target =
                     snapshot.attacking_support_movement_for(self.id, self.home_position, roam);
                 let target = if self.role == PlayerRole::Goalkeeper {
@@ -5226,6 +6155,77 @@ impl PlayerAgent {
             "hold" => Some((SoccerAction::MoveTo(self.home_position), "hold".to_string())),
             _ => None,
         }
+    }
+
+    fn switch_play_target_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        preferred: Option<usize>,
+        candidates: &[usize],
+    ) -> Option<usize> {
+        let passer_position = snapshot.player_position(self.id).unwrap_or(self.position);
+        let center_x = snapshot.field_width * 0.5;
+        let attack_dir = self.team.attack_dir();
+        let min_lateral = (snapshot.field_width * 0.24).max(12.0);
+        let score = |target_id: usize| -> Option<f64> {
+            let target_position = snapshot.player_position(target_id)?;
+            let lateral = (target_position.x - passer_position.x).abs();
+            let forward = (target_position.y - passer_position.y) * attack_dir;
+            let distance = target_position.distance(passer_position);
+            let crosses_midline =
+                (passer_position.x - center_x) * (target_position.x - center_x) < -6.0;
+            if distance < 10.0 || forward < -8.0 || (!crosses_midline && lateral < min_lateral) {
+                return None;
+            }
+            Some(
+                lateral * 0.070
+                    + forward.clamp(-4.0, 18.0) * 0.020
+                    + if crosses_midline { 1.0 } else { 0.0 },
+            )
+        };
+        if preferred.is_some_and(|target| score(target).is_some()) {
+            return preferred;
+        }
+        candidates
+            .iter()
+            .copied()
+            .filter_map(|target| score(target).map(|s| (target, s)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(target, _)| target)
+    }
+
+    fn recycle_reset_target_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        preferred: Option<usize>,
+        candidates: &[usize],
+    ) -> Option<usize> {
+        let passer_position = snapshot.player_position(self.id).unwrap_or(self.position);
+        let attack_dir = self.team.attack_dir();
+        let score = |target_id: usize| -> Option<f64> {
+            let target_position = snapshot.player_position(target_id)?;
+            let forward = (target_position.y - passer_position.y) * attack_dir;
+            let distance = target_position.distance(passer_position);
+            if !(2.0..=10.0).contains(&distance)
+                || forward > 1.5
+                || forward < -BACKWARD_PASS_SHORT_RESET_MAX_YARDS - 0.75
+            {
+                return None;
+            }
+            let backward_yards = (-forward).max(0.0);
+            let short_reset_fit =
+                (1.0 - (backward_yards - 4.0).abs() / 4.0).clamp(0.0, 1.0);
+            Some(short_reset_fit + (1.0 - distance / 10.0).clamp(0.0, 1.0) * 0.35)
+        };
+        if preferred.is_some_and(|target| score(target).is_some()) {
+            return preferred;
+        }
+        candidates
+            .iter()
+            .copied()
+            .filter_map(|target| score(target).map(|s| (target, s)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(target, _)| target)
     }
 
     /// Whether a learned-policy pass of `flight` is worth executing. A pass is
