@@ -399,6 +399,24 @@ const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.
 /// to goal (slips/through-balls). Purely additive — width/crossing positions
 /// keep their own bonus, so this never penalises wide runs that set up crosses.
 const FINAL_THIRD_GOAL_DIRECTNESS_WEIGHT: f64 = 0.06;
+/// "Create a vacuum": an off-ball attacker may make a forward run into only
+/// semi-open space when leaving its current pocket gives a trailing teammate a
+/// useful place to arrive into. The destination still has to be playable; this
+/// is a bounded bonus, not an override of pressure/offside/shape guards.
+const CREATE_VACUUM_MIN_FORWARD_YARDS: f64 = 5.0;
+const CREATE_VACUUM_FORWARD_REFERENCE_YARDS: f64 = 18.0;
+const CREATE_VACUUM_DEST_MIN_OPEN_SCORE: f64 = 5.0;
+const CREATE_VACUUM_DEST_FULL_OPEN_SCORE: f64 = 15.0;
+const CREATE_VACUUM_DEST_MIN_OPPONENT_DISTANCE_YARDS: f64 = 3.2;
+const CREATE_VACUUM_DEST_FULL_OPPONENT_DISTANCE_YARDS: f64 = 8.0;
+const CREATE_VACUUM_DEST_MAX_TEAMMATE_PRESSURE: f64 = 0.68;
+const CREATE_VACUUM_ORIGIN_MIN_OPEN_SCORE: f64 = 6.0;
+const CREATE_VACUUM_ORIGIN_FULL_OPEN_SCORE: f64 = 15.0;
+const CREATE_VACUUM_ORIGIN_MAX_TEAMMATE_PRESSURE: f64 = 0.82;
+const CREATE_VACUUM_FILLER_MIN_DISTANCE_YARDS: f64 = 4.0;
+const CREATE_VACUUM_FILLER_IDEAL_DISTANCE_YARDS: f64 = 10.0;
+const CREATE_VACUUM_FILLER_MAX_DISTANCE_YARDS: f64 = 18.0;
+const CREATE_VACUUM_MAX_BONUS: f64 = 2.6;
 const GOALKEEPER_CLEAR_SIGHTLINE_SAVE_CAP: f64 = 0.78;
 const GOALKEEPER_PARRY_MIN_YARDS: f64 = 2.0;
 const GOALKEEPER_PARRY_MAX_YARDS: f64 = 5.0;
@@ -1981,35 +1999,6 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 8.0;
-// "Create a vacuum" off-ball strategy. A forward run is valuable not only for the space it
-// ARRIVES in but for the space it VACATES: when an off-ball attacker who is occupying a
-// dangerous pocket (A) and being tightly marked runs forward to a semi-open spot (B), his
-// marker tends to follow — emptying A for a trailing team-mate to run onto. So an off-ball
-// attacker should make the forward run even when B is not the most open location, provided
-// vacating A genuinely opens exploitable space. The exploitation itself is emergent: once
-// the marker follows, A becomes open space the trailing team-mate's own support search finds.
-/// A defender must be within this many yards of the runner's current spot to count as a
-/// committed marker who will be dragged out of the pocket (no marker ⇒ nothing to vacate).
-const VACUUM_MARKER_DRAG_RADIUS_YARDS: f64 = 6.0;
-/// A trailing team-mate counts as able to exploit the vacated pocket only if he is at least
-/// this far GOAL-SIDE-BEHIND it (so his run onto it is forward and stays onside).
-const VACUUM_TRAILER_MIN_BEHIND_YARDS: f64 = 2.0;
-/// ...and no farther than this from the pocket (a run he can realistically complete in time).
-const VACUUM_TRAILER_MAX_RANGE_YARDS: f64 = 24.0;
-/// ...and at least this far from it (a team-mate already standing on the pocket is not a
-/// trailing runner — vacating it for him gains nothing).
-const VACUUM_TRAILER_MIN_RANGE_YARDS: f64 = 5.0;
-/// A candidate run only "vacates" the pocket if it leaves the current spot by at least this
-/// far AND is a forward run — a square/backward shuffle drags no marker upfield.
-const VACUUM_MIN_VACATE_YARDS: f64 = 4.0;
-const VACUUM_MIN_FORWARD_RUN_YARDS: f64 = 2.0;
-/// A forward run this long earns the full forward factor (longer runs drag the marker farther).
-const VACUUM_FORWARD_REFERENCE_YARDS: f64 = 9.0;
-/// Score weight of a fully-realized vacuum (dangerous pocket × tight marker × ready trailer ×
-/// committed forward run). Sized to tip a SEMI-open forward run over a slightly-more-open
-/// square option without ever luring a runner into a crowd (whose open-space deficit is far
-/// larger than this), so openness still dominates — the run is just no longer the ONLY factor.
-const VACUUM_CREATION_WEIGHT: f64 = 5.5;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.

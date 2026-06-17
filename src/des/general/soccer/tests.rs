@@ -3808,6 +3808,83 @@ fn possession_run_time_step_randomizes_internal_operation_order() {
 }
 
 #[test]
+fn possession_run_time_step_folds_scoop_pass_into_weighted_order() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_514,
+        ..Default::default()
+    });
+    let holder = 6;
+    let outlet = 8;
+    let lane_defender = 13;
+    let crowd_left = 14;
+    let crowd_right = 15;
+    park_players_except(
+        &mut sim,
+        &[holder, outlet, lane_defender, crowd_left, crowd_right],
+    );
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[holder].home_position = sim.ball.position;
+    sim.players[holder].incoming_ball = None;
+    sim.players[holder].skills.flair_passing = 10.0;
+    sim.players[holder].skills.passing = 10.0;
+    sim.players[holder].skills.vision = 10.0;
+    sim.players[outlet].position = Vec2::new(40.0, 65.5);
+    sim.players[outlet].home_position = sim.players[outlet].position;
+    sim.players[lane_defender].position = Vec2::new(40.0, 61.5);
+    sim.players[crowd_left].position = Vec2::new(36.0, 58.0);
+    sim.players[crowd_right].position = Vec2::new(44.0, 58.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.scoop_pass_target_for(holder),
+        Some(outlet),
+        "test setup should create a legal scoop-pass opportunity"
+    );
+
+    let mut first_ops = std::collections::BTreeSet::new();
+    let mut saw_scoop_in_order = false;
+    for seed in 0..100 {
+        let mut player = sim.players[holder].clone();
+        let _intent = player.run_time_step(&snapshot, None, None, &mut mulberry32(22_800 + seed));
+        let decision = player.last_decision.expect("possession decision trace");
+        assert!(
+            decision
+                .action_options
+                .iter()
+                .any(|option| option.label == "scoop-pass" && option.legal),
+            "scoop-pass should be exposed as a weighted legal option: {decision:?}"
+        );
+        if decision
+            .operation_order
+            .iter()
+            .any(|operation| operation == "scoop-pass")
+        {
+            saw_scoop_in_order = true;
+        }
+        if let Some(first) = decision.operation_order.first() {
+            first_ops.insert(first.clone());
+        }
+    }
+
+    assert!(
+        saw_scoop_in_order,
+        "weighted Fisher-Yates order should consider the legal scoop-pass"
+    );
+    assert!(
+        first_ops.contains("scoop-pass") && first_ops.len() > 1,
+        "scoop-pass should be weighted, not a guaranteed preemptive first operation: {first_ops:?}"
+    );
+}
+
+#[test]
 fn first_touch_run_time_step_randomizes_pass_or_control_order() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -31458,6 +31535,83 @@ fn player_collision_resolution_separates_body_overlap() {
 }
 
 #[test]
+fn tick_order_shuffle_is_reproducible_per_seed() {
+    // The per-tick operation-order shuffles draw from `tick_order_rng`, seeded purely from
+    // the match seed + tick (+ per-site salt) — never from entropy or the wall clock — so a
+    // match stays byte-reproducible for a fixed seed in BOTH modes. This guards the
+    // determinism the engine relies on for replay/learning against anyone reseeding the
+    // shuffles from a non-deterministic source.
+    let run = |disable: bool| -> Vec<f64> {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 4242,
+            disable_tick_order_shuffle: disable,
+            learning_enabled: false,
+            learning_logging_enabled: false,
+            ..MatchConfig::default()
+        });
+        for _ in 0..240 {
+            sim.run_time_step();
+        }
+        vec![
+            sim.score_home as f64,
+            sim.score_away as f64,
+            sim.ball.position.x,
+            sim.ball.position.y,
+            sim.players[5].position.x,
+            sim.players[5].position.y,
+            sim.players[16].position.x,
+            sim.players[16].position.y,
+        ]
+    };
+    assert_eq!(
+        run(false),
+        run(false),
+        "shuffle ON must be reproducible for a fixed seed"
+    );
+    assert_eq!(
+        run(true),
+        run(true),
+        "shuffle OFF must be reproducible for a fixed seed"
+    );
+}
+
+#[test]
+fn tick_order_shuffle_reorders_collision_pileups() {
+    // A 3-body pile-up settles order-dependently (the resolver is a single sweep). With the
+    // shuffle ON the resolution order AND the exact-overlap tie-break are seed-derived, so two
+    // different seeds settle the SAME pile differently; with it OFF the fixed index order makes
+    // the outcome seed-invariant. Proves the shuffle actually reorders work (not a no-op) and
+    // that disabling it restores one deterministic order — with no draw from the main RNG.
+    let pile = |seed: u32, disable: bool| -> Vec<f64> {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed,
+            disable_tick_order_shuffle: disable,
+            ..MatchConfig::default()
+        });
+        park_players_except(&mut sim, &[0, 1, 2]);
+        for id in [0usize, 1, 2] {
+            sim.players[id].position = Vec2::new(40.0, 60.0);
+            sim.players[id].velocity = Vec2::zero();
+        }
+        sim.resolve_player_collisions();
+        [0usize, 1, 2]
+            .iter()
+            .flat_map(|&id| [sim.players[id].position.x, sim.players[id].position.y])
+            .collect()
+    };
+    assert_eq!(
+        pile(1, true),
+        pile(7777, true),
+        "disabled order must be seed-invariant (fixed legacy order)"
+    );
+    assert_ne!(
+        pile(1, false),
+        pile(7777, false),
+        "shuffle should reorder the pile-up by seed"
+    );
+}
+
+#[test]
 fn loose_ball_contest_is_probabilistic_but_skill_weighted() {
     let mut stronger_wins = 0;
     let mut weaker_wins = 0;
@@ -33083,6 +33237,94 @@ fn candidate_occupancy_matches_existing_spacing_helpers() {
             ))
         .abs()
             < 1e-9
+    );
+}
+
+#[test]
+fn create_vacuum_run_bonus_rewards_semi_open_forward_decoy() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 6;
+    let runner = 9;
+    let filling_teammate = 8;
+    let nearby_marker = 14;
+    park_players_except(&mut sim, &[carrier, runner, filling_teammate, nearby_marker]);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(32.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[runner].position = Vec2::new(42.0, 62.0);
+    sim.players[runner].home_position = sim.players[runner].position;
+    sim.players[filling_teammate].position = Vec2::new(42.0, 53.5);
+    sim.players[filling_teammate].velocity = Vec2::new(0.0, 2.0);
+    let semi_open_run = Vec2::new(42.0, 74.0);
+    let cleaner_lateral_space = Vec2::new(58.0, 62.0);
+    sim.players[nearby_marker].position = semi_open_run + Vec2::new(3.8, 0.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let runner_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let semi_open_occupancy =
+        snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner));
+    let cleaner_occupancy =
+        snapshot.candidate_occupancy_at(Team::Home, cleaner_lateral_space, Some(runner));
+    let forward = (semi_open_run.y - sim.players[runner].position.y) * Team::Home.attack_dir();
+    let bonus = snapshot.attacking_vacuum_run_bonus(
+        runner_snapshot,
+        sim.players[runner].position,
+        semi_open_run,
+        semi_open_occupancy,
+        forward,
+    );
+    assert!(
+        semi_open_occupancy.open_space_score < cleaner_occupancy.open_space_score,
+        "test setup should make the forward run semi-open rather than the most open space"
+    );
+    assert!(
+        bonus > 0.25,
+        "forward decoy should earn a create-vacuum bonus despite only semi-open destination: {bonus}"
+    );
+
+    sim.players[filling_teammate].position = Vec2::new(8.0, 8.0);
+    let no_filler_snapshot = WorldSnapshot::from_match(&sim);
+    let no_filler_runner = no_filler_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let no_filler_bonus = no_filler_snapshot.attacking_vacuum_run_bonus(
+        no_filler_runner,
+        sim.players[runner].position,
+        semi_open_run,
+        no_filler_snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner)),
+        forward,
+    );
+    assert_eq!(
+        no_filler_bonus, 0.0,
+        "vacuum run needs a trailing teammate close enough to fill the vacated pocket"
+    );
+
+    sim.players[filling_teammate].position = Vec2::new(42.0, 53.5);
+    sim.players[nearby_marker].position = semi_open_run + Vec2::new(1.0, 0.0);
+    let smothered_snapshot = WorldSnapshot::from_match(&sim);
+    let smothered_runner = smothered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let smothered_bonus = smothered_snapshot.attacking_vacuum_run_bonus(
+        smothered_runner,
+        sim.players[runner].position,
+        semi_open_run,
+        smothered_snapshot.candidate_occupancy_at(Team::Home, semi_open_run, Some(runner)),
+        forward,
+    );
+    assert_eq!(
+        smothered_bonus, 0.0,
+        "create-vacuum run must not reward sprinting into fully smothered space"
     );
 }
 
@@ -36860,81 +37102,7 @@ fn marked_receiver_checks_to_ball_when_space_behind_opens() {
     );
 }
 
-// Build a "create a vacuum" scenario: Home in possession with an off-ball decoy (id 9) sitting
-// in a dangerous attacking-half pocket A, with opponents patrolling the forward zone (so a
-// forward run lands in SEMI-open space). The two vacuum preconditions are toggled independently:
-// `with_marker` — a defender tight enough on A to be dragged out of it when the decoy runs; and
-// `with_trailer` — a team-mate poised goal-side-behind A to attack the space the decoy vacates.
-// Returns (A, the decoy's chosen open-space target).
-fn vacuum_decoy_target(with_marker: bool, with_trailer: bool) -> (Vec2, Vec2) {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    let decoy = 9;
-    let trailer = 7;
-    let marker = 12;
-    sim.ball.holder = Some(6);
-    sim.ball.position = Vec2::new(40.0, 64.0);
-    sim.ball.last_touch_team = Some(Team::Home);
-    sim.players[6].position = sim.ball.position;
-    let a = Vec2::new(40.0, 80.0);
-    sim.players[decoy].position = a;
-    // Spread opponents across the decoy's candidate grid so openness is LOCAL (no artificial
-    // wide-open corner): the most open spot is square-left; the central-forward lane is only
-    // semi-open. Without a vacuum the decoy drifts to the most open (square) spot.
-    sim.players[13].position = Vec2::new(40.0, 95.0); // central-forward cover
-    sim.players[14].position = Vec2::new(52.0, 86.0); // forward-right cover
-    sim.players[15].position = Vec2::new(26.0, 92.0); // forward-left cover
-    sim.players[16].position = Vec2::new(58.0, 78.0); // right cover
-    sim.players[17].position = Vec2::new(30.0, 74.0); // square-left left semi-open, not wide open
-    // Tight marker on the decoy — the man dragged out of the pocket when the decoy runs.
-    sim.players[marker].position = if with_marker {
-        Vec2::new(41.0, 81.0)
-    } else {
-        Vec2::new(72.0, 64.0)
-    };
-    // The trailing team-mate, goal-side-behind A and in range — present only in the vacuum case.
-    sim.players[trailer].position = if with_trailer {
-        Vec2::new(40.0, 71.0)
-    } else {
-        Vec2::new(8.0, 64.0)
-    };
-    // Park the remaining players outside the candidate grid so they don't colour the search.
-    for id in [0usize, 1, 2, 3, 4, 5, 8, 10, 18, 19, 20, 21] {
-        sim.players[id].position = if id < 11 {
-            Vec2::new(8.0, 64.0)
-        } else {
-            Vec2::new(72.0, 64.0)
-        };
-    }
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let target = snapshot.open_space_for(decoy, sim.players[decoy].home_position);
-    (a, target)
-}
 
-#[test]
-fn create_a_vacuum_makes_the_decoy_run_forward_for_a_trailing_teammate() {
-    let (a, with) = vacuum_decoy_target(true, true);
-    let (_, without_trailer) = vacuum_decoy_target(true, false);
-    let (_, without_marker) = vacuum_decoy_target(false, true);
-    // With an exploitable trailing run, the decoy makes the forward run out of the pocket...
-    assert!(
-        with.y > a.y + 2.0,
-        "vacuum decoy should run forward out of the pocket: target={with:?}, A={a:?}"
-    );
-    // ...strictly more forward than when no team-mate can use the vacated space (only the
-    // trailer differs), proving the bonus — not geometry — drives the extra forward commitment.
-    assert!(
-        with.y > without_trailer.y + 2.0,
-        "an exploitable trailer should pull the decoy's run more forward: \
-         with_trailer={with:?}, without_trailer={without_trailer:?}"
-    );
-    // ...and strictly more forward than when no marker sits on the pocket to be dragged out of
-    // it (only the marker differs) — the other half of the vacuum precondition.
-    assert!(
-        with.y > without_marker.y + 2.0,
-        "a marker to drag is required for the vacuum: \
-         with_marker={with:?}, without_marker={without_marker:?}"
-    );
-}
 
 #[test]
 fn learned_support_policy_can_choose_check_to_ball() {
