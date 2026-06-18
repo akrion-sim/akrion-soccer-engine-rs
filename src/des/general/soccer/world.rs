@@ -37,7 +37,7 @@ pub(crate) const MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT: [[f64; VERTICAL_LANE_COUNT]
     [0.04, 0.11, 0.20, 0.24, 0.21, 0.13, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0],
     [0.0, 0.03, 0.07, 0.13, 0.20, 0.24, 0.20, 0.09, 0.04, 0.0, 0.0, 0.0],
     [0.0, 0.0, 0.0, 0.04, 0.09, 0.20, 0.24, 0.20, 0.13, 0.07, 0.03, 0.0],
-    [0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.05, 0.13, 0.21, 0.24, 0.20, 0.15],
+    [0.0, 0.0, 0.0, 0.0, 0.02, 0.05, 0.13, 0.21, 0.24, 0.20, 0.11, 0.04],
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -15381,7 +15381,7 @@ impl WorldSnapshot {
         )
     }
 
-    fn role_line_markov_slot_index_for_player(&self, player: &PlayerSnapshot) -> Option<usize> {
+    fn role_line_markov_slot_position_for_player(&self, player: &PlayerSnapshot) -> Option<f64> {
         if !matches!(player.role, PlayerRole::Defender | PlayerRole::Midfielder) {
             return None;
         }
@@ -15402,21 +15402,55 @@ impl WorldSnapshot {
         let rank = line.iter().position(|candidate| candidate.id == player.id)?;
         let denominator = line.len().saturating_sub(1).max(1) as f64;
         Some(
-            ((rank as f64 / denominator) * (MARKOV_LANE_SLOT_COUNT as f64 - 1.0)).round()
-                as usize,
+            ((rank as f64 / denominator) * (MARKOV_LANE_SLOT_COUNT as f64 - 1.0))
+                .clamp(0.0, MARKOV_LANE_SLOT_COUNT as f64 - 1.0),
         )
+    }
+
+    fn markov_lane_pmf_table_for_player(
+        &self,
+        player: &PlayerSnapshot,
+    ) -> Option<&'static [[f64; VERTICAL_LANE_COUNT]; MARKOV_LANE_SLOT_COUNT]> {
+        match player.role {
+            PlayerRole::Defender => Some(&DEFENDER_MARKOV_LANE_PMF_BY_SLOT),
+            PlayerRole::Midfielder => Some(&MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT),
+            _ => None,
+        }
     }
 
     fn markov_lane_pmf_row_for_player(
         &self,
         player: &PlayerSnapshot,
-    ) -> Option<&'static [f64; VERTICAL_LANE_COUNT]> {
-        let slot = self.role_line_markov_slot_index_for_player(player)?;
-        match player.role {
-            PlayerRole::Defender => Some(&DEFENDER_MARKOV_LANE_PMF_BY_SLOT[slot]),
-            PlayerRole::Midfielder => Some(&MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT[slot]),
-            _ => None,
+    ) -> Option<[f64; VERTICAL_LANE_COUNT]> {
+        let table = self.markov_lane_pmf_table_for_player(player)?;
+        let slot_position = self.role_line_markov_slot_position_for_player(player)?;
+        let lower = slot_position.floor() as usize;
+        let upper = slot_position.ceil().min(MARKOV_LANE_SLOT_COUNT as f64 - 1.0) as usize;
+        let t = slot_position - lower as f64;
+        let mut row = [0.0; VERTICAL_LANE_COUNT];
+        for lane in 0..VERTICAL_LANE_COUNT {
+            let lower_value = table[lower][lane];
+            let upper_value = table[upper][lane];
+            let lower_value = if lower_value.is_finite() {
+                lower_value.max(0.0)
+            } else {
+                0.0
+            };
+            let upper_value = if upper_value.is_finite() {
+                upper_value.max(0.0)
+            } else {
+                0.0
+            };
+            row[lane] = lower_value * (1.0 - t) + upper_value * t;
         }
+        let total = row.iter().sum::<f64>();
+        if total <= 1e-9 {
+            return None;
+        }
+        for value in &mut row {
+            *value = (*value / total).clamp(0.0, 1.0);
+        }
+        Some(row)
     }
 
     pub(crate) fn markov_lane_probability_for_player_target(
@@ -15428,11 +15462,7 @@ impl WorldSnapshot {
             return 0.0;
         };
         let lane = vertical_lane_index(target.x, self.field_width);
-        let total = row.iter().copied().filter(|p| p.is_finite()).sum::<f64>();
-        if total <= 1e-9 {
-            return 0.0;
-        }
-        (row[lane] / total).clamp(0.0, 1.0)
+        row[lane]
     }
 
     pub(crate) fn markov_lane_affinity_for_player_target(
@@ -15443,16 +15473,11 @@ impl WorldSnapshot {
         let Some(row) = self.markov_lane_pmf_row_for_player(player) else {
             return 0.0;
         };
-        let total = row.iter().copied().filter(|p| p.is_finite()).sum::<f64>();
-        if total <= 1e-9 {
-            return 0.0;
-        }
         let peak = row
             .iter()
             .copied()
-            .filter(|p| p.is_finite())
             .fold(0.0_f64, f64::max)
-            / total;
+            .clamp(0.0, 1.0);
         if peak <= 1e-9 {
             return 0.0;
         }
@@ -22102,14 +22127,60 @@ impl WorldSnapshot {
         intent
     }
 
+    fn shape_consistency_horizon_seconds_for_player_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        _baseline_seconds: f64,
+    ) -> f64 {
+        let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
+        let player_position = finite_pitch_point(
+            self.player_snapshot_position(player),
+            width,
+            length,
+            player.home_position,
+        );
+        let target = finite_pitch_point(target, width, length, player_position);
+        let ball_position = finite_pitch_point(
+            self.ball.position,
+            width,
+            length,
+            Vec2::new(width * 0.5, length * 0.5),
+        );
+        let ball_distance = player_position
+            .distance(ball_position)
+            .min(target.distance(ball_position));
+        let ball_distance_t = ((ball_distance - SHAPE_CONSISTENCY_CLOSE_BALL_YARDS)
+            / (SHAPE_CONSISTENCY_FAR_BALL_YARDS - SHAPE_CONSISTENCY_CLOSE_BALL_YARDS).max(1e-6))
+        .clamp(0.0, 1.0);
+        (SHAPE_CONSISTENCY_CLOSE_SECONDS
+            + (SHAPE_CONSISTENCY_FAR_SECONDS - SHAPE_CONSISTENCY_CLOSE_SECONDS) * ball_distance_t)
+            .max(1e-6)
+    }
+
+    fn shape_consistency_gain_for_player_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        baseline_seconds: f64,
+    ) -> f64 {
+        let horizon = self.shape_consistency_horizon_seconds_for_player_target(
+            player,
+            target,
+            baseline_seconds,
+        );
+        (baseline_seconds.max(1e-6) / horizon).clamp(0.75, 1.0)
+    }
+
     /// Keep the back four's AVERAGE position in its band relative to the ball (see the
     /// `DEFENSIVE_LINE_*` constants). For a defender's off-ball move, shifts its target along the
     /// attacking axis by the amount the line's average is outside the band, so the whole line
     /// steps up (in possession) or drops off (opponent has the ball upfield) together while
     /// keeping its left-right shape. While defending, exactly one closest defender may break the
     /// band to engage the ball; the remaining defenders carry the line rule. Every tick aims
-    /// those line-bound defenders at the correction needed for consistency inside the 2-second
-    /// horizon, while accepting that physics/traffic may make the actual arrival slower.
+    /// those line-bound defenders at the correction needed for ball-distance-aware consistency:
+    /// close ball means roughly 1 second, far ball roughly 5 seconds, while accepting that
+    /// physics/traffic may make the actual arrival slower.
     pub(crate) fn defensive_line_cushion_adjusted_target(
         &self,
         player_id: usize,
@@ -22181,11 +22252,14 @@ impl WorldSnapshot {
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
-        let horizon = DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let consistency_gain = self.shape_consistency_gain_for_player_target(
+            me,
+            target,
+            DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
+        );
         let current_delta = desired_avg_fwd - avg_fwd;
         let adjusted_fwd = if current_delta.abs() > 1e-6 {
-            let correction_yps = current_delta / horizon;
-            current_fwd + correction_yps * horizon
+            current_fwd + current_delta * consistency_gain
         } else {
             let peer_sum_fwd = line_defenders
                 .iter()
@@ -22199,7 +22273,7 @@ impl WorldSnapshot {
             if projected_delta.abs() < 1e-6 {
                 target_fwd
             } else {
-                target_fwd + projected_delta * line_count
+                target_fwd + projected_delta * line_count * consistency_gain
             }
         };
         let tactical_row_height = self.field_length.max(1.0) / f64::from(PITCH_GENOME_ROWS);
@@ -22307,9 +22381,15 @@ impl WorldSnapshot {
         let slot_step = desired_width / (n - 1.0).max(1.0);
         let slot_x = center - half + my_rank as f64 * slot_step;
         let current_x = self.player_snapshot_position(me).x.clamp(0.0, self.field_width);
-        let horizon = BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS.max(1e-6);
-        let mpc_slot_x = current_x + ((slot_x - current_x) / horizon) * horizon;
-        let proposed_x = target_x + (mpc_slot_x - target_x) * BACK_FOUR_LATERAL_GAIN;
+        let slot_target = Vec2::new(slot_x, self.player_snapshot_position(me).y);
+        let consistency_gain = self.shape_consistency_gain_for_player_target(
+            me,
+            slot_target,
+            BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS,
+        );
+        let mpc_slot_x = current_x + (slot_x - current_x) * consistency_gain;
+        let lateral_gain = (BACK_FOUR_LATERAL_GAIN * consistency_gain).clamp(0.25, 1.0);
+        let proposed_x = target_x + (mpc_slot_x - target_x) * lateral_gain;
         let legal_slack = ((slot_step - BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS)
             .min(BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS - slot_step)
             .max(0.0))
@@ -22385,7 +22465,13 @@ impl WorldSnapshot {
         // Fore-aft: flatten toward the line's average depth (kill the stagger).
         let avg_fwd = line.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / n;
         let me_fwd = fwd(self.player_snapshot_position(me));
-        let flat_fwd = fwd(target) + (avg_fwd - me_fwd) * BACK_FOUR_FLATTEN_GAIN;
+        let flatten_gain = BACK_FOUR_FLATTEN_GAIN
+            * self.shape_consistency_gain_for_player_target(
+                me,
+                target,
+                BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS,
+            );
+        let flat_fwd = fwd(target) + (avg_fwd - me_fwd) * flatten_gain;
         let adjusted_y = (flat_fwd * attack_dir).clamp(0.0, self.field_length);
         Vec2::new(pulled_x, adjusted_y)
     }
@@ -22413,8 +22499,9 @@ impl WorldSnapshot {
     }
 
     /// Keep the midfield line's AVERAGE 5-20yd IN FRONT of the back four.
-    /// Every tick aims the line at the correction needed for consistency inside
-    /// the 3-second horizon, while accepting that physics/traffic may delay arrival.
+    /// Every tick aims the line at the correction needed for ball-distance-aware consistency:
+    /// close ball means roughly 1 second, far ball roughly 5 seconds, while accepting that
+    /// physics/traffic may delay arrival.
     pub(crate) fn midfield_line_band_adjusted_target(
         &self,
         player_id: usize,
@@ -22458,10 +22545,13 @@ impl WorldSnapshot {
         let current_delta = desired_gap - gap;
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
-        let horizon = MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let consistency_gain = self.shape_consistency_gain_for_player_target(
+            me,
+            target,
+            MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS,
+        );
         let adjusted_fwd = if current_delta.abs() > 1e-6 {
-            let correction_yps = current_delta / horizon;
-            current_fwd + correction_yps * horizon
+            current_fwd + current_delta * consistency_gain
         } else {
             let peer_sum_fwd = mids
                 .iter()
@@ -22477,7 +22567,7 @@ impl WorldSnapshot {
             if projected_delta.abs() < 1e-6 {
                 return target;
             }
-            target_fwd + projected_delta * mid_count
+            target_fwd + projected_delta * mid_count * consistency_gain
         };
         let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
         return Vec2::new(target.x, adjusted_y);
@@ -22508,8 +22598,8 @@ impl WorldSnapshot {
     }
 
     /// Keep the striker/forward line's AVERAGE 5-20yd IN FRONT of the midfield line.
-    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 3-second
-    /// consistency horizon so 2-3 forwards stay connected without snapping.
+    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with the same
+    /// ball-distance-aware consistency horizon so 2-3 forwards stay connected without snapping.
     pub(crate) fn forward_line_band_adjusted_target(
         &self,
         player_id: usize,
@@ -22554,10 +22644,13 @@ impl WorldSnapshot {
         let current_delta = desired_gap - gap;
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
-        let horizon = STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let consistency_gain = self.shape_consistency_gain_for_player_target(
+            me,
+            target,
+            STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS,
+        );
         let adjusted_fwd = if current_delta.abs() > 1e-6 {
-            let correction_yps = current_delta / horizon;
-            current_fwd + correction_yps * horizon
+            current_fwd + current_delta * consistency_gain
         } else {
             let peer_sum_fwd = forwards
                 .iter()
@@ -22575,7 +22668,7 @@ impl WorldSnapshot {
             if projected_delta.abs() < 1e-6 {
                 return target;
             }
-            target_fwd + projected_delta * forward_count
+            target_fwd + projected_delta * forward_count * consistency_gain
         };
         let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
         return Vec2::new(target.x, adjusted_y);

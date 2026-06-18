@@ -12335,6 +12335,69 @@ fn forward_line_holds_band_in_front_of_midfielders() {
 }
 
 #[test]
+fn role_line_shape_consistency_is_more_urgent_near_the_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 124,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for &d in defs {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(30.0, 30.0);
+    }
+    for &m in mids {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(40.0, 30.0);
+    }
+    for &f in forwards {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(40.0, 51.0);
+    }
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 35.0);
+    let close_snapshot = WorldSnapshot::from_match(&sim);
+    let close_mid =
+        close_snapshot.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
+
+    sim.ball.position = Vec2::new(40.0, 110.0);
+    let far_snapshot = WorldSnapshot::from_match(&sim);
+    let far_mid = far_snapshot.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
+    assert!(
+        close_mid.y > far_mid.y + 1.0,
+        "midfield should shape up faster near the ball: close={close_mid:?} far={far_mid:?}"
+    );
+
+    for &m in mids {
+        sim.players[m].position = Vec2::new(40.0, 50.0);
+    }
+    for &f in forwards {
+        sim.players[f].position = Vec2::new(40.0, 51.0);
+    }
+    sim.ball.position = Vec2::new(40.0, 54.0);
+    let close_snapshot = WorldSnapshot::from_match(&sim);
+    let close_forward =
+        close_snapshot.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
+
+    sim.ball.position = Vec2::new(40.0, 112.0);
+    let far_snapshot = WorldSnapshot::from_match(&sim);
+    let far_forward =
+        far_snapshot.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
+    assert!(
+        close_forward.y > far_forward.y + 0.75,
+        "forwards should reconnect faster near the ball: close={close_forward:?} far={far_forward:?}"
+    );
+}
+
+#[test]
 fn ball_proximity_nudge_pulls_midfielder_toward_ball_when_shape_allows() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -35363,6 +35426,33 @@ fn defender_and_midfielder_markov_lane_affinities_sum_to_one() {
 }
 
 #[test]
+fn defender_and_midfielder_markov_lane_pmfs_are_mirrored_and_smooth() {
+    for (name, table) in [
+        ("defender", &DEFENDER_MARKOV_LANE_PMF_BY_SLOT),
+        ("midfielder", &MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT),
+    ] {
+        for slot in 0..table.len() {
+            let mirror_slot = table.len() - 1 - slot;
+            for lane in 0..VERTICAL_LANE_COUNT {
+                let mirror_lane = VERTICAL_LANE_COUNT - 1 - lane;
+                assert!(
+                    (table[slot][lane] - table[mirror_slot][mirror_lane]).abs() < 1e-9,
+                    "{name} slot {slot} lane {lane} must mirror slot {mirror_slot} lane {mirror_lane}"
+                );
+            }
+            let max_step = table[slot]
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_step <= 0.16,
+                "{name} slot {slot} PMF should transition smoothly between adjacent lanes, max_step={max_step}"
+            );
+        }
+    }
+}
+
+#[test]
 fn markov_lane_pmf_probability_is_separate_from_peak_affinity() {
     let sim = SoccerMatch::default_11v11(MatchConfig::default());
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -35409,6 +35499,61 @@ fn markov_lane_pmf_probability_is_separate_from_peak_affinity() {
     );
     assert!(
         (snapshot.markov_lane_affinity_for_player_target(left_midfielder, mid_peak) - 1.0).abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn markov_lane_pmf_interpolates_for_non_four_player_role_lines() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let mut defenders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    defenders.sort_by(|a, b| {
+        sim.players[*a]
+            .home_position
+            .x
+            .total_cmp(&sim.players[*b].home_position.x)
+    });
+    assert_eq!(defenders.len(), 4, "test setup expects a back four");
+    let right_back = defenders[3];
+    let middle_defender = defenders[1];
+    sim.players[right_back].role = PlayerRole::Forward;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let lane_center = |lane: usize| {
+        let (left, right) = vertical_lane_bounds(lane, snapshot.field_width);
+        (left + right) * 0.5
+    };
+    let player = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == middle_defender)
+        .unwrap();
+    let left_center_peak = Vec2::new(lane_center(5), player.home_position.y);
+    let right_center_peak = Vec2::new(lane_center(6), player.home_position.y);
+
+    assert!(
+        (snapshot.markov_lane_probability_for_player_target(player, left_center_peak) - 0.23)
+            .abs()
+            < 1e-9,
+        "three-player defender line should interpolate the middle slot between LCB and RCB"
+    );
+    assert!(
+        (snapshot.markov_lane_probability_for_player_target(player, right_center_peak) - 0.23)
+            .abs()
+            < 1e-9,
+        "interpolated middle slot should be symmetric across the centre lanes"
+    );
+    assert!(
+        (snapshot.markov_lane_affinity_for_player_target(player, left_center_peak) - 1.0).abs()
+            < 1e-9
+    );
+    assert!(
+        (snapshot.markov_lane_affinity_for_player_target(player, right_center_peak) - 1.0).abs()
             < 1e-9
     );
 }
@@ -37535,6 +37680,30 @@ fn wingback_push_is_smoothly_boosted_by_space_and_midfield_cover() {
                 && covered_rb_target.y > covered_center_back_line + 2.0,
             "outside backs should remain ahead of the center-back line: lb={covered_target:?} rb={covered_rb_target:?} cb_line={covered_center_back_line}"
         );
+}
+
+#[test]
+fn wingback_advance_odds_keep_thirty_percent_extra_upfield_bias() {
+    let prior_raised_bias = 2.05;
+    assert!(
+        (WINGBACK_ADVANCE_ODDS_MULTIPLIER - prior_raised_bias * 1.30).abs() < 1e-9,
+        "wingback odds should stay 30% above the prior raised bias"
+    );
+    let center_back_probability = 0.4;
+    let wingback_probability = probability_with_odds_multiplier(
+        center_back_probability,
+        WINGBACK_ADVANCE_ODDS_MULTIPLIER,
+    );
+    let prior_wingback_probability =
+        probability_with_odds_multiplier(center_back_probability, prior_raised_bias);
+    assert!(wingback_probability > prior_wingback_probability);
+
+    let center_back_odds = center_back_probability / (1.0 - center_back_probability);
+    let wingback_odds = wingback_probability / (1.0 - wingback_probability);
+    assert!(
+        (wingback_odds / center_back_odds - WINGBACK_ADVANCE_ODDS_MULTIPLIER).abs() < 1e-9,
+        "wingback probability should be implemented as an odds multiplier"
+    );
 }
 
 #[test]

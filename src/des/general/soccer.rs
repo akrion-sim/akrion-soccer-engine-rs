@@ -456,9 +456,9 @@ const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
 const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
 const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
 // Wing-backs push forward MORE often than central defenders — the back line should
-// not move as a symmetric block. Raised so the outside backs bomb on while the
-// centre-backs hold (see also central_defender_forward_blocked / defender depth).
-const WINGBACK_ADVANCE_ODDS_MULTIPLIER: f64 = 2.05;
+// not move as a symmetric block. This keeps the outside-back odds 30% above the
+// prior raised bias while the centre-backs hold (see also central_defender_forward_blocked).
+const WINGBACK_ADVANCE_ODDS_MULTIPLIER: f64 = 2.665;
 // Central-defender lane: |home_x - centre| within this fraction of the width is a
 // centre-back (the complement of is_wide_defender's 0.28/0.72 split).
 const CENTRAL_DEFENDER_LANE_HALF_FRACTION: f64 = 0.22;
@@ -1219,6 +1219,10 @@ const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
 const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
 const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
 const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
+const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
+const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
+const SHAPE_CONSISTENCY_FAR_SECONDS: f64 = 5.0;
 // In possession the line may push up, but no more than ~5yd past the halfway line.
 const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
