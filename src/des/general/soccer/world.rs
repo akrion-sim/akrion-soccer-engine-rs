@@ -22260,8 +22260,8 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the striker/forward line's AVERAGE 2-20yd IN FRONT of the midfield line.
-    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 5-second
+    /// Keep the striker/forward line's AVERAGE 5-20yd IN FRONT of the midfield line.
+    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 3-second
     /// consistency horizon so 2-3 forwards stay connected without snapping.
     pub(crate) fn forward_line_band_adjusted_target(
         &self,

@@ -1621,15 +1621,20 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // Ideal *relative* role positions, so the team travels up and down the pitch as a
 // cohesive unit. These are statistical-distance seeds (min enforced, ideal
 // targeted) that shape the formation-LP anchors; the LP/learners refine them.
-// Forward layering (measured along the team's attack direction):
-const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 1.0;
+// Forward layering (measured along the team's attack direction). Goal-to-goal the
+// team holds three staggered lines: the midfield AVERAGE sits 5-20yd ahead of the
+// defensive AVERAGE, and the striker AVERAGE sits 5-20yd ahead of the midfield
+// AVERAGE (raised 2026-06-18 from 1-20 / 2-20 to a clearer 5-20 / 5-20). The lines
+// may be eventually consistent — a 3s grace before the band is enforced strictly —
+// so a transient stagger while transitioning is fine, a sustained collapse is not.
+const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 5.0;
 const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
-const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 5.0;
-const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
-const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 2.0;
+const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
+const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 5.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 6.5;
-const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 5.0;
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
+const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 
@@ -3112,6 +3117,13 @@ fn role_vertical_lane_range(
 }
 
 fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
+    // Strength of the pull back into the home lane (0 = free, 1 = hard). These were
+    // tuned against the OLD ~20yd quarter-pitch lanes; the grid now has 12 lanes
+    // (~6.7yd), so the same commitment clamps ~3x tighter. Scaled DOWN to compensate
+    // (2026-06-18): net discipline is still tighter than the old 4-lane band (a
+    // narrower channel), but a defender can still step out of its lane to close down
+    // the ball or a full-back can overlap in possession. Defending > in-possession
+    // (you hold your channel off the ball; you stretch wide when attacking).
     match role {
         PlayerRole::Goalkeeper => 1.0,
         PlayerRole::Defender if in_possession => 0.90,
