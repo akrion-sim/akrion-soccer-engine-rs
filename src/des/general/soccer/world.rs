@@ -4378,6 +4378,9 @@ impl SoccerMatch {
                         learned_plan.as_ref(),
                         &mut self.rng,
                     );
+                    // A committed loose-ball chaser sprints to the intercept point (attack
+                    // the ball) — applied before the shape pipeline so it isn't damped away.
+                    let intent = self.players[actor].committed_chaser_sprint_guarantee(&snapshot, intent);
                     // Loose-ball-chaser exemption (used by both spacing nudges below).
                     // EXEMPT a player committed to winning a live loose ball — on a 50/50
                     // the closest two teammates are deliberately sent to contest the SAME
@@ -8061,13 +8064,17 @@ impl SoccerMatch {
         }
         let attack_dir = me.team.attack_dir();
         let fwd = |position: Vec2| position.y * attack_dir;
+        // Ramp urgency from 0 at the deadband up to 1.0 at FULL_ERROR. It must NOT start
+        // at sprint level: a defender a few yards out of its band should ADJUST calmly
+        // (sidestep, facing the ball), not sprint+turn-to-run. Only a genuinely stranded
+        // line (large error, e.g. caught well up the pitch) reaches the sprint threshold.
         let urgency_for_error = |error: f64| {
             if error <= ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS {
                 0.0
             } else {
-                (ROLE_LINE_CONSISTENCY_URGENCY_BASE
-                    + error / ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS
-                        * (1.0 - ROLE_LINE_CONSISTENCY_URGENCY_BASE))
+                ((error - ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS)
+                    / (ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS
+                        - ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS))
                     .clamp(0.0, 1.0)
             }
         };

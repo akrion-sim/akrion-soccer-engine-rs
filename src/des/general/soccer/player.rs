@@ -3668,14 +3668,36 @@ impl PlayerAgent {
     ) -> PlayerIntent {
         let mdp_state = snapshot.mdp_state_for_player(self.id);
         let observation = snapshot.observation_for(self.id);
-        self.run_time_step_with_context(
+        let intent = self.run_time_step_with_context(
             snapshot,
             mdp_state,
             observation,
             human_input,
             learned_plan,
             rng,
-        )
+        );
+        self.committed_chaser_sprint_guarantee(snapshot, intent)
+    }
+
+    /// A committed loose-ball chaser already steers to the intercept point via the normal
+    /// recovery logic — make it SPRINT there (attack the ball before settling into support
+    /// shape). Kept as a post-step so it doesn't bypass the weighted recovery options /
+    /// 50-50 two-competitor logic the way an early-return short-circuit would.
+    pub(crate) fn committed_chaser_sprint_guarantee(
+        &self,
+        snapshot: &WorldSnapshot,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
+        if let SoccerAction::MoveTo(target) = intent.action {
+            if self.role != PlayerRole::Goalkeeper
+                && snapshot.ball.holder.is_none()
+                && snapshot.is_committed_loose_ball_chaser(self.id)
+                && self.position.distance(target) > 1.0
+            {
+                intent.sprint = true;
+            }
+        }
+        intent
     }
 
     pub fn run_time_step_with_context(
@@ -4437,30 +4459,6 @@ impl PlayerAgent {
                     sprint,
                 };
             }
-        }
-
-        if !has_ball
-            && snapshot.ball.holder.is_none()
-            && snapshot.is_committed_loose_ball_chaser(self.id)
-        {
-            let target = snapshot.loose_ball_recovery_target_for(self.id);
-            let action = SoccerAction::MoveTo(target);
-            self.last_decision = Some(self.decision_trace(
-                snapshot,
-                mdp_state,
-                observation,
-                belief,
-                vec!["loose-ball-commit".to_string(), "recover".to_string()],
-                single_action_option("recover"),
-                &action,
-                "recover",
-            ));
-            return PlayerIntent {
-                player_id: self.id,
-                action,
-                sprint: self.role != PlayerRole::Goalkeeper
-                    && self.position.distance(target) > 1.0,
-            };
         }
 
         let mut learned_mpc_reselect_label: Option<String> = None;
