@@ -46,7 +46,7 @@ Useful search starters:
 
 ```sh
 git grep -n "must\\|never\\|illegal\\|hard\\|penalty\\|bonus\\|clamp" src/des/general/soccer
-git grep -n "operation_order\\|weighted_fisher_yates_order\\|scheduled_index" src/des/general/soccer
+git grep -n "operation_order\\|weighted_agentic_order\\|scheduled_index" src/des/general/soccer
 git grep -n "rng.next_float\\|time_window_probability\\|probability" src/des/general/soccer
 git grep -n "team_brain\\|home_brain\\|away_brain\\|central_brain" src/des/general/soccer
 git grep -n "OfficialKind\\|referee\\|offside" src/des/general/soccer
@@ -132,9 +132,9 @@ Important distinction:
 
 - Canonicalization is good when identity must disappear, such as the
   `config_vector.rs` 22-player plus ball retrieval vector.
-- Randomized or weighted scheduling can be good when equally plausible actors or
-  actions compete for first chance, but it must only choose ordering or
-  exploration. It must not be the cause of a football outcome.
+- Deterministic weighted scheduling can be good when equally plausible actors or
+  actions compete for first chance, but the score must come from match state and
+  must not be an act-of-god draw.
 - Deterministic tie-breaks are good when replay stability matters, but the
   tie-break must be stated and tested.
 
@@ -142,17 +142,16 @@ Method:
 
 - Search for `.iter().find`, `.max_by`, `.min_by`, `sort_by`, `partial_cmp`,
   `.enumerate()`, `first`, `last`, and direct player-index assumptions.
-- Classify each order dependence as canonical, replay-stable, weighted-random,
-  or accidental.
-- For accidental order, prefer a seeded Fisher-Yates or weighted Fisher-Yates
-  choice only when the order itself is the artifact being varied. Existing
-  player, central-brain, ball, and official traces already use
-  `weighted_fisher_yates_order` and expose `operation_order`.
-- Preserve determinism by seeding from match state, tick, actor id, action
-  context, or the existing runtime RNG. Record the order in traces.
-- Add a permutation test: reverse or shuffle the players while preserving the
-  soccer state. The selected outcome should stay the same unless randomness is
-  intentionally part of the rule.
+- Classify each order dependence as canonical, replay-stable, agentic-scored,
+  deterministic trace-only, or accidental.
+- For accidental order, prefer explicit agentic scoring for player-brain action
+  order. Existing central-brain, ball, official, and player traces should expose
+  scored `operation_order` without randomizing the chosen football outcome.
+- Preserve determinism from match state, tick, actor id, and action context.
+  Record the order in traces.
+- Add a permutation test: reverse or reorder the players while preserving the
+  soccer state. The selected outcome should stay the same unless the changed
+  state itself justifies a different agentic order.
 
 Focused test filters to consider:
 
@@ -166,8 +165,9 @@ Exit criteria:
 
 - Every order-dependent decision has a reason: canonicalization, stable replay,
   or fair weighted selection.
-- Liveness telemetry shows more than one first operation/full order when the
-  state has multiple plausible choices.
+- Liveness telemetry shows `playerOperationOrderAgenticOk`,
+  `centralBrainOperationOrderAgenticOk`, `ballOperationOrderAgenticOk`, and
+  `officialOperationOrderAgenticOk`.
 
 ## Task: Remove Act-Of-God Outcome Causes
 
@@ -178,7 +178,8 @@ be lost, saved, blocked, curled, mis-hit, fouled, or controlled.
 
 Allowed uses:
 
-- Fair ordering or exploration, when the trace records the order.
+- Agentic ordering or exploration, when the trace records the order and the
+  choice remains a function of state, value, visits, urgency, and role.
 - Deterministic state-derived variation seeded by tick/player/action context,
   when it only chooses a stable tactic or setup detail.
 - Training/search sampling outside live match outcome resolution.
@@ -209,6 +210,9 @@ git grep -n "heavy-touch\\|dispossession\\|tackle\\|shot-blocked\\|save\\|parry\
 - Convert event rolls into deterministic contests or thresholds over those
   causes. Keep the old probability function only if it has become a score, not
   a coin flip.
+- Player-brain action commitment should be deterministic from option scores,
+  pressure, urgency, role, and `dt`; do not use fresh RNG to decide whether a
+  live player shoots, dribbles, clears, tackles, or passes.
 - Add a seed-independence regression when the same state should now resolve the
   same way across RNG seeds.
 
@@ -252,6 +256,81 @@ Exit criteria:
   `3/2/1` while still increasing distance from the nearest defender.
 - Focused tests assert jerk bounds and pressured escape behavior.
 
+## Task: Audit Back-Four Depth And High-Line Ceiling
+
+Goal: the four defenders should stay connected to the ball without pressing the
+whole line recklessly high. The full back-four average `y` should normally sit
+2-30 yards goal-side of the ball, measured against the ball's current `y`, but
+that average must not press more than 5 yards into the opponent half. That
+5-yard opponent-half ceiling is the explicit exception to the 30-yard ball
+cushion.
+
+Method:
+
+- Inspect `defensive_line_cushion_adjusted_target` and any downstream line
+  clamps. The final defender target must honor the opponent-half ceiling for
+  both Home and Away.
+- Check the full four-defender average, even when only the non-exempt defenders
+  receive the corrective target.
+- Verify high-ball scenarios where the ball is far in the opponent half; the
+  defender target may be more than 30 yards behind the ball there, by design.
+- Verify strikers in possession stay free to continue behind the enemy line with
+  the ball, while non-holder strikers are given onside recovery targets within
+  the 3-second grace model.
+
+Focused test filters to consider:
+
+```sh
+cargo test -q --lib back_four
+cargo test -q --lib defensive_line
+```
+
+Exit criteria:
+
+- Home defenders never receive a line target above midfield plus 5 yards.
+- Away defenders never receive a line target below midfield minus 5 yards.
+- The 2-30 yard ball cushion still applies whenever it does not conflict with
+  that high-line ceiling.
+- Non-holder strikers are target-clamped goal-side of the opponent back-four /
+  offside line, while a striker with the ball beyond that line is not pulled
+  back by support-shape logic.
+
+## Task: Audit Two-Second Teammate Spacing
+
+Goal: outfield teammates should converge toward a Euclidean 5-10 yard spacing
+band in open play, with a 3-6 yard exception inside either 18-yard box. The
+correction should be predictive: a player chooses a two-second path using teammates' current
+position, velocity, and acceleration, not only their instantaneous positions.
+
+Method:
+
+- Check both territory/proximity clocks and final movement-target guards. They
+  should share the 5-10 yard open-play and 3-6 yard box contract.
+- Verify predictive spacing samples the path over a 2-second horizon and
+  projects teammate position from current position, velocity, and acceleration.
+- Ensure spacing relief does not invert team layers: midfielders and forwards
+  should prefer lateral relief when a naive away vector would pull them backward
+  through their own line.
+- Keep committed actors exempt where appropriate: ball holder, intended pass
+  receiver, human-controlled player, keeper, and committed loose-ball chaser.
+
+Focused test filters to consider:
+
+```sh
+cargo test -q --lib teammate_spacing
+cargo test -q --lib teammate_territory_spacing
+cargo test -q --lib possession_shape_pushes_back_four_up_and_staggers_midfield_pair
+```
+
+Exit criteria:
+
+- Open-play pair targets clear the 5-yard lower edge without treating exactly
+  5 yards as the ideal; 5-10 yards should score as the healthy band.
+- Box pair targets clear the 3-yard lower edge and treat 3-6 yards as the
+  legitimate congested-box band.
+- Spacing adjustments preserve role-line ordering and do not create frantic
+  accelerations or target oscillation.
+
 ## Task: Verify Referee, Team Brains, Ball, And 22 Players
 
 Goal: prove the live match has all expected agents alive, scheduled, aware of the
@@ -276,8 +355,9 @@ Method:
 - Verify official agents have `OfficialDecisionTrace` and non-empty
   `operation_order`, and assistants expose offside-line awareness.
 - Verify the ball agent records action and `operation_order`.
-- In playback liveness JSON, check randomized-order booleans for player,
-  central brain, ball, and officials.
+- In playback liveness JSON, check `playerOperationOrderAgenticOk`,
+  `centralBrainOperationOrderAgenticOk`, `ballOperationOrderAgenticOk`, and
+  `officialOperationOrderAgenticOk`.
 
 Focused test filters to consider:
 
@@ -294,7 +374,9 @@ Exit criteria:
 - The frame contract reports 22 tracked players and 3 tracked officials.
 - The home and away brain snapshots each track their own side.
 - All finite numeric fields stay finite.
-- Operation-order sampling is not fixed when there are enough samples to vary.
+- Player operation-order sampling is agentic/scored. Central brain, ball, and
+  official operation-order sampling is not fixed when there are enough samples
+  to vary.
 - Any missing trace has a named reason, such as human input, disabled trace
   capture, or a deliberately inactive actor.
 

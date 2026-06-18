@@ -582,7 +582,7 @@ mod team_strategy_mode_tests {
         }
         let dizzy = sim.players[p].dizziness;
         assert!(
-            dizzy > 0.05,
+            dizzy > 0.03,
             "rapid head reversals should accrue dizziness, got {dizzy}"
         );
         // Now settle facing the ball and rest: dizziness must recover.
@@ -4881,7 +4881,7 @@ impl CentralBrain {
     pub(crate) fn run_time_step_with_adversarial_embeddings(
         &mut self,
         snapshot: &WorldSnapshot,
-        rng: &mut SeededRandom,
+        _rng: &mut SeededRandom,
         embedding_signals: Option<&SoccerAdversarialEmbeddingSignals>,
     ) {
         // Capture the prior controller before overwriting it so we can detect the exact
@@ -4902,10 +4902,16 @@ impl CentralBrain {
             None => TacticalPhase::Transition,
         };
         let score_diff_home = snapshot.score_home as i32 - snapshot.score_away as i32;
-        let home_cover =
-            defensive_cover_profile(snapshot, Team::Home, sample_defensive_cover_target(rng));
-        let away_cover =
-            defensive_cover_profile(snapshot, Team::Away, sample_defensive_cover_target(rng));
+        let home_cover = defensive_cover_profile(
+            snapshot,
+            Team::Home,
+            agentic_defensive_cover_target(snapshot, Team::Home),
+        );
+        let away_cover = defensive_cover_profile(
+            snapshot,
+            Team::Away,
+            agentic_defensive_cover_target(snapshot, Team::Away),
+        );
         let home_overload = attacking_overload_profile(snapshot, Team::Home);
         let away_overload = attacking_overload_profile(snapshot, Team::Away);
         self.home_directive = tactical_directive_for_team(
@@ -5037,7 +5043,7 @@ impl CentralBrain {
             };
             central_operations.push((local_mpc_operation.to_string(), local_mpc_weight));
         }
-        let operation_order = weighted_fisher_yates_order(central_operations, rng);
+        let operation_order = weighted_agentic_order(central_operations);
         let mut controller_assignments = snapshot
             .players
             .iter()

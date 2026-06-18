@@ -339,7 +339,7 @@
       <div class="section">Match</div>
       <div class="metric"><span>Phase</span><b id="phase">Kickoff</b></div>
       <div class="metric"><span>Central Brain</span><b id="centralBrain">22p 3o Loose</b></div>
-      <div class="metric"><span>Agent Order</span><b id="agentOrder">shuffle pending</b></div>
+      <div class="metric"><span>Agent Order</span><b id="agentOrder">schedule pending</b></div>
       <div class="metric"><span>Home Brain</span><b id="homeBrain">P0.00 R0.00</b></div>
       <div class="metric"><span>Away Brain</span><b id="awayBrain">P0.00 R0.00</b></div>
       <div class="metric"><span>Ball</span><b id="ballPhysics">0.0y/s 0.0y/s2</b></div>
@@ -955,10 +955,18 @@ function tacticalLivenessState() {
   const shotOk = meta.shotActivityOk == null ? (!sustainedShotWindow || shotAttempts > 0) : Boolean(meta.shotActivityOk);
   const openSpaceOk = meta.openSpaceSupportOk == null ? true : Boolean(meta.openSpaceSupportOk);
   const goalwardOk = meta.goalwardProgressOk == null ? true : Boolean(meta.goalwardProgressOk);
-  const centralBrainOperationOrderOk = meta.centralBrainOperationOrderRandomizedOk == null ? true : Boolean(meta.centralBrainOperationOrderRandomizedOk);
-  const operationOrderOk = meta.playerOperationOrderRandomizedOk == null ? true : Boolean(meta.playerOperationOrderRandomizedOk);
-  const ballOperationOrderOk = meta.ballOperationOrderRandomizedOk == null ? true : Boolean(meta.ballOperationOrderRandomizedOk);
-  const officialOperationOrderOk = meta.officialOperationOrderRandomizedOk == null ? true : Boolean(meta.officialOperationOrderRandomizedOk);
+  const centralBrainOperationOrderOk = meta.centralBrainOperationOrderAgenticOk == null
+    ? (meta.centralBrainOperationOrderRandomizedOk == null ? true : Boolean(meta.centralBrainOperationOrderRandomizedOk))
+    : Boolean(meta.centralBrainOperationOrderAgenticOk);
+  const operationOrderOk = meta.playerOperationOrderAgenticOk == null
+    ? (meta.playerOperationOrderRandomizedOk == null ? true : Boolean(meta.playerOperationOrderRandomizedOk))
+    : Boolean(meta.playerOperationOrderAgenticOk);
+  const ballOperationOrderOk = meta.ballOperationOrderAgenticOk == null
+    ? (meta.ballOperationOrderRandomizedOk == null ? true : Boolean(meta.ballOperationOrderRandomizedOk))
+    : Boolean(meta.ballOperationOrderAgenticOk);
+  const officialOperationOrderOk = meta.officialOperationOrderAgenticOk == null
+    ? (meta.officialOperationOrderRandomizedOk == null ? true : Boolean(meta.officialOperationOrderRandomizedOk))
+    : Boolean(meta.officialOperationOrderAgenticOk);
   const decisionModelOk = meta.playerDecisionModelTraceOk == null ? true : Boolean(meta.playerDecisionModelTraceOk);
   const movementGaitOk = meta.movementGaitVarietyOk == null ? true : Boolean(meta.movementGaitVarietyOk);
   const agentAccountingOk = meta.agentAccountingOk == null ? true : Boolean(meta.agentAccountingOk);
@@ -1030,10 +1038,10 @@ function tacticalLivenessTitle() {
   if (!live.shotOk) parts.push("45s+ run has no shots");
   if (!live.openSpaceOk) parts.push("20s+ run has no off-ball open-space support");
   if (!live.goalwardOk) parts.push("multi-frame run has no goalward ball progress");
-  if (!live.centralBrainOperationOrderOk) parts.push("central brain internal operation order did not vary");
-  if (!live.operationOrderOk) parts.push("player internal operation order did not vary");
-  if (!live.ballOperationOrderOk) parts.push("ball internal operation order did not vary");
-  if (!live.officialOperationOrderOk) parts.push("official internal operation order did not vary");
+  if (!live.centralBrainOperationOrderOk) parts.push("central brain internal operation order was not agentic");
+  if (!live.operationOrderOk) parts.push("player internal operation order was not agentic");
+  if (!live.ballOperationOrderOk) parts.push("ball internal operation order was not agentic");
+  if (!live.officialOperationOrderOk) parts.push("official internal operation order was not agentic");
   if (!live.decisionModelOk) parts.push("player MDP/POMDP decision traces are incomplete");
   if (!live.movementGaitOk) parts.push("player movement stayed in too few gait bands");
   if (!live.agentAccountingOk) parts.push("agent roster/schedule accounting is incomplete");
@@ -1336,7 +1344,7 @@ function agentScheduleCoverageLabel(schedule) {
 }
 function agentScheduleSummaryLabel(f) {
   const s = agentScheduleSummaryForFrame(f);
-  if (!s || Number(s.totalAgents || 0) <= 0) return "shuffle pending";
+  if (!s || Number(s.totalAgents || 0) <= 0) return "schedule pending";
   const central = Number(s.centralBrainCount || 0) > 0 ? "C+" : "";
   const ball = Number(s.ballCount || 0) > 0 ? "/B" : "";
   const expected = Number(s.expectedTotalAgents || 0);
