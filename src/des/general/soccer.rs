@@ -918,6 +918,15 @@ const PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS: f64 = 7.0;
 // far) and down a reasonably clear lane — never straight to a marked man / into a blocked lane.
 const FORWARD_OUTLET_MIN_RECEIVER_OPENNESS: f64 = 0.45;
 const FORWARD_OUTLET_LANE_HALF_WIDTH_YARDS: f64 = 2.0;
+// A pass with NO resolved receiver ("to nobody in particular") is only a legitimate ball into
+// space — a deliberate forward delivery for runners to chase — never a square/short giveaway.
+// It qualifies only when played FORWARD, within this cone of the line from the passer to the
+// centre of the opponent's goal, AND travelling more than the minimum below. Anything shorter
+// or more lateral/backward with no intended receiver is a giveaway, so the carrier keeps the
+// ball and re-decides instead of launching it nowhere. (A pass aimed AT a teammate — even a
+// short square/back ball — is unaffected; only receiver-less balls are gated.)
+const PASS_TO_NOBODY_MAX_CONE_DEGREES: f64 = 70.0;
+const PASS_TO_NOBODY_MIN_YARDS: f64 = 25.0;
 // Playing out from your OWN penalty box under pressure. A defender on the ball in the box with
 // an opponent within this radius shouldn't play a tiny 1-2yd pass or square the ball across the
 // goal — it should go wide to a flank (or at least a safe 3+yd lateral ball). These shape the
@@ -1063,6 +1072,46 @@ const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 4.5;
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
 const FAILED_DISPOSSESSION_PENALTY_POINTS: f64 = 2.0;
 const LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS: f64 = FAILED_DISPOSSESSION_PENALTY_POINTS;
+// --- Slide tackle (a committed, high-variance defensive challenge) ---------------
+// A slide tackle is a LAST-DITCH lunge a defender throws at a ball-carrier who is
+// moving too fast to be contained on foot. It reaches further than a standing
+// challenge and wins the ball more often, but committing the body is all-or-nothing:
+// MISS and the defender is flat on the grass, out of the play, for ~2 seconds while
+// the attacker carries the ball past unchallenged.
+//
+// Reach band (yards): a slide extends the contact envelope beyond a standing tackle's
+// (~1.85yd), but the defender must already be close enough to launch the lunge — you
+// cannot slide a ball that is 4 yards away.
+const SLIDE_TACKLE_MIN_REACH_YARDS: f64 = 1.0;
+const SLIDE_TACKLE_MAX_REACH_YARDS: f64 = 2.9;
+// The slide wins the ball more often than a standing tackle: its computed steal
+// probability is boosted and it is judged against a lower success threshold (the
+// standing tackle clears at >= 0.54).
+const SLIDE_TACKLE_SUCCESS_BOOST: f64 = 1.45;
+const SLIDE_TACKLE_SUCCESS_THRESHOLD: f64 = 0.42;
+// ...but committing the body off the floor fouls far more readily than staying on
+// the feet (relevant whenever fouls are enabled; see `FOUL_PROBABILITY_SCALE`).
+const SLIDE_TACKLE_FOUL_BOOST: f64 = 1.7;
+// A miss puts the defender on the ground for a uniform 1.75-2.25s of real play.
+const SLIDE_TACKLE_RECOVERY_MIN_SECONDS: f64 = 1.75;
+const SLIDE_TACKLE_RECOVERY_MAX_SECONDS: f64 = 2.25;
+// A committed challenge that misses (and grounds the defender) is costlier to the
+// team than a standing whiff: it is the one that opens the team up.
+const FAILED_SLIDE_TACKLE_PENALTY_POINTS: f64 = FAILED_DISPOSSESSION_PENALTY_POINTS * 1.6;
+// The carrier must genuinely be running for a slide to make sense — you do not slide
+// a stationary/shielding holder (that is a standing challenge). Min holder speed (yps).
+const SLIDE_TACKLE_MIN_HOLDER_SPEED_YPS: f64 = 4.5;
+// Only commit when the advancing-carrier urgency model favours committing over
+// containing (> 1.0 = nearest presser to a carrier driving at our goal / deep danger);
+// a lone last defender being told to contain (urgency < 1.0) must NOT gamble a slide.
+const SLIDE_TACKLE_MIN_COMMIT_URGENCY: f64 = 1.0;
+const SLIDE_TACKLE_MAX_DECISION_PROBABILITY: f64 = 0.85;
+// A tackle can only take the BALL, and the ball is carried in front of the holder. A
+// defender trailing the holder (holder's body between the defender and the led ball)
+// cannot win it with ANY tackle. This is the dot(toDefender, toBall) cutoff below which
+// the defender counts as "behind" the carrier: only the rear hemisphere is blocked, so
+// a level/side challenge is still allowed.
+const TACKLE_BEHIND_CARRIER_DOT: f64 = -0.15;
 const UNTARGETED_LONG_BALL_RECOVERY_REWARD_POINTS: f64 = 5.2;
 const UNTARGETED_LONG_BALL_LOSS_PENALTY_POINTS: f64 = 2.6;
 const BEATEN_BY_DRIBBLE_PENALTY_POINTS: f64 = 3.0;
@@ -1672,18 +1721,22 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // targeted) that shape the formation-LP anchors; the LP/learners refine them.
 // Forward layering (measured along the team's attack direction). Goal-to-goal the
 // team holds three staggered lines: the midfield AVERAGE sits 5-20yd ahead of the
-// defensive AVERAGE, and the striker AVERAGE sits 5-20yd ahead of the midfield
-// AVERAGE (raised 2026-06-18 from 1-20 / 2-20 to a clearer 5-20 / 5-20). The lines
-// may be eventually consistent — a ball-distance-scaled grace before the band is
-// enforced strictly — so a transient stagger while transitioning is fine, a sustained
-// collapse is not.
-const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 5.0;
+// defensive AVERAGE, and the striker AVERAGE sits 3-20yd ahead of the midfield
+// AVERAGE, with an IDEAL resting separation of 8yd for each step (raised 2026-06-18
+// from 1-20 / 2-20, then refined to a 3-20 band around an 8yd ideal). The lines are
+// eventually consistent — a ball-distance-scaled grace before the band is enforced —
+// so a transient stagger while transitioning is fine, a sustained collapse is not. The
+// IDEAL (the 8yd resting target the line settles at) is applied while OUT OF POSSESSION
+// only: a compact, press-ready block that rides up off the line behind it. In our own
+// possession we hold just the hard band so the attack can stretch (otherwise an 8+8
+// stack would pull the forwards back onto the ball during our build-up).
+const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 3.0;
 const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
-const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 10.0;
+const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 5.0;
+const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 11.0;
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
@@ -2877,6 +2930,10 @@ fn default_local_mpc_enabled() -> bool {
 
 fn default_pass_anticipation_enabled() -> bool {
     false
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM: usize = 3;
@@ -8593,6 +8650,8 @@ fn normalize_soccer_action_label(action: &str) -> &str {
         "press-cover" | "press_cover" | "presscover" | "cover-press" | "cover_press" => {
             "press-cover"
         }
+        "slide-tackle" | "slide_tackle" | "slidetackle" | "slide" | "sliding-tackle"
+        | "sliding_tackle" | "slide-challenge" => "slide-tackle",
         "killer" | "killer_pass" | "killerpass" | "through-pass" | "through_pass"
         | "throughpass" | "threaded-pass" | "threaded_pass" | "threadedpass" => "killer-pass",
         "low-cross"
@@ -12193,6 +12252,13 @@ pub struct MatchConfig {
     /// so disabling them is byte-identical to the legacy order).
     #[serde(default)]
     pub disable_tick_order_shuffle: bool,
+    /// Force the committed slide-tackle mechanic OFF for THIS match, independent of the
+    /// process-wide `DD_SOCCER_DISABLE_SLIDE_TACKLE` env flag. Default `false` => slide
+    /// tackles are live. Slide tackles only ever fire in genuine last-ditch windows (a
+    /// fast carrier driving at goal that the defender can reach but not contain), so a
+    /// disabled match is byte-identical to one where no such window arises.
+    #[serde(default)]
+    pub disable_slide_tackle: bool,
     pub max_human_players: usize,
     pub seed: u32,
 }
@@ -12232,6 +12298,7 @@ impl Default for MatchConfig {
             adversarial_embedding_exploitation_enabled: true,
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
             disable_tick_order_shuffle: false,
+            disable_slide_tackle: false,
             max_human_players: 4,
             seed: 2026,
         }
@@ -39179,6 +39246,7 @@ fn tracking_frame_to_world_snapshot(
                 learned_policy: None,
                 recent_reward: None,
                 one_two: None,
+                slide_recovery_seconds: 0.0,
             }
         })
         .collect::<Vec<_>>();
@@ -39296,6 +39364,7 @@ fn tracking_frame_to_world_snapshot(
         formation_lp_enabled: config.formation_lp_enabled,
         local_mpc_enabled: config.local_mpc_enabled,
         trace_mdp_mpc_comparison: true,
+        slide_tackle_enabled: slide_tackle_enabled(config),
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
@@ -40522,6 +40591,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         last_decision: None,
         decision_confidence: 1.0,
         one_two: player.one_two,
+        slide_recovery_seconds: player.slide_recovery_seconds,
     }
 }
 
@@ -40675,6 +40745,67 @@ fn dribble_dispossession_kind_multiplier(kind: DribbleMoveKind) -> f64 {
 
 fn tackle_success_probability(defender: &SkillProfile, attacker: &SkillProfile) -> f64 {
     dribble_dispossession_probability(defender, attacker, DefenderDribbleResponse::Commit)
+}
+
+/// Probability that a committed SLIDE tackle wins the ball cleanly — the standing
+/// steal chance, boosted (a full-stretch lunge takes the ball more often than a
+/// standing poke). Capped below 1 so a slide is never a certainty.
+fn slide_tackle_success_probability(defender: &SkillProfile, attacker: &SkillProfile) -> f64 {
+    (tackle_success_probability(defender, attacker) * SLIDE_TACKLE_SUCCESS_BOOST).clamp(0.0, 0.97)
+}
+
+/// Probability a slide tackle is a foul — the standing-tackle foul model scaled up,
+/// because leaving the feet is intrinsically mistimable. (No-op while fouls are
+/// disabled via `FOUL_PROBABILITY_SCALE`, but kept correct for when they are on.)
+fn slide_tackle_foul_probability(
+    defender: &SkillProfile,
+    attacker: &SkillProfile,
+    contact_distance: f64,
+    contact_speed: f64,
+) -> f64 {
+    (tackle_foul_probability(defender, attacker, contact_distance, contact_speed)
+        * SLIDE_TACKLE_FOUL_BOOST)
+        .clamp(0.0, 0.97)
+}
+
+/// Whether a defender at `defender_pos` is BEHIND the ball-carrier — in the rear
+/// hemisphere relative to where the ball is being carried (the holder→ball lead, or the
+/// holder's motion when the ball is at the feet). The ball is led in front of the body,
+/// so a trailing defender cannot reach it: NO tackle (standing or sliding) wins the ball
+/// from here. Returns `false` when front cannot be determined (a stationary holder with
+/// the ball at its feet) — that case is governed by the body-shield test instead.
+fn carried_ball_behind_defender(
+    holder_pos: Vec2,
+    holder_velocity: Vec2,
+    ball_pos: Vec2,
+    defender_pos: Vec2,
+) -> bool {
+    let lead = ball_pos - holder_pos;
+    let front = if lead.len() > 0.4 {
+        lead
+    } else if holder_velocity.len() > 0.5 {
+        holder_velocity
+    } else {
+        return false;
+    };
+    let to_def = defender_pos - holder_pos;
+    if to_def.len() < 1e-3 {
+        return false;
+    }
+    to_def.normalized().dot(front.normalized()) < TACKLE_BEHIND_CARRIER_DOT
+}
+
+fn dd_soccer_disable_slide_tackle() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
+}
+
+/// Whether the committed slide-tackle mechanic is live for this match: on unless the
+/// process-wide env flag or the per-match config field disables it. Defined on the
+/// parent module so both the decision (`player`) and execution (`world`) layers see it.
+fn slide_tackle_enabled(config: &MatchConfig) -> bool {
+    !dd_soccer_disable_slide_tackle() && !config.disable_slide_tackle
 }
 
 fn tackle_foul_probability(
@@ -42381,6 +42512,32 @@ fn angle_between_vectors_degrees(a: Vec2, b: Vec2) -> f64 {
     }
     let cos = (a.dot(b) / (al * bl)).clamp(-1.0, 1.0);
     cos.acos().to_degrees()
+}
+
+/// Whether an UNTARGETED pass (one with no resolved receiver) is a legitimate ball into
+/// open space rather than a giveaway. It qualifies only when played FORWARD — within
+/// `PASS_TO_NOBODY_MAX_CONE_DEGREES` of the line from the passer to the centre of the
+/// opponent's goal — AND travelling more than `PASS_TO_NOBODY_MIN_YARDS`. A shorter, lateral,
+/// or backward ball aimed at nobody is disallowed (the carrier should keep possession). Passes
+/// played TO a specific teammate are never gated by this — only receiver-less balls.
+fn pass_to_nobody_is_legal(
+    origin: Vec2,
+    aim: Vec2,
+    team: Team,
+    field_width: f64,
+    field_length: f64,
+) -> bool {
+    let pass_vector = aim - origin;
+    if pass_vector.len() <= PASS_TO_NOBODY_MIN_YARDS {
+        return false;
+    }
+    let goal = Vec2::new(field_width * 0.5, team.goal_y(field_length));
+    let to_goal = goal - origin;
+    if to_goal.len() <= 1e-6 {
+        // Standing on the opponent's goal line — any onward ball is effectively at goal.
+        return true;
+    }
+    angle_between_vectors_degrees(pass_vector, to_goal) <= PASS_TO_NOBODY_MAX_CONE_DEGREES
 }
 
 fn vision_range_yards(vision: f64) -> f64 {
@@ -46734,6 +46891,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 last_decision: None,
                 decision_confidence: 1.0,
                 one_two: None,
+                slide_recovery_seconds: 0.0,
             });
         }
     }

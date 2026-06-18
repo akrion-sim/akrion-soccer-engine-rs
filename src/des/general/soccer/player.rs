@@ -519,6 +519,13 @@ pub struct PlayerAgent {
     /// [`OneTwoRun`]. `None` when not engaged in a give-and-go.
     #[serde(default)]
     pub one_two: Option<OneTwoRun>,
+    /// Seconds remaining flat on the ground after a MISSED slide tackle. While `> 0`
+    /// the player is prone: it makes no decision, holds its position, and cannot
+    /// challenge — so the attacker carries the ball past it unopposed. Drawn uniformly
+    /// from `[SLIDE_TACKLE_RECOVERY_MIN_SECONDS, SLIDE_TACKLE_RECOVERY_MAX_SECONDS]`
+    /// on the miss and bled down by `dt` each live tick. `0.0` = on its feet.
+    #[serde(default)]
+    pub slide_recovery_seconds: f64,
 }
 
 const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
@@ -1130,6 +1137,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
                 | "clearance"
                 | "route-one"
                 | "tackle"
+                | "slide-tackle"
                 | "control-touch"
         );
     let blend_eligible = !semantic_mismatch
@@ -3153,6 +3161,77 @@ impl PlayerAgent {
         options
     }
 
+    /// The opponent carrier this defender would throw a committed SLIDE tackle at this
+    /// tick, plus the per-second appetite for doing so, or `None`. A slide is the
+    /// last-ditch challenge — reserved for a carrier moving too fast to contain on foot
+    /// who is driving at our goal — so the gate is deliberately narrow:
+    ///
+    /// * keeper never slides (outfield); a keeper holding the ball in hand is untouchable;
+    /// * the carrier must be inside the slide-lunge reach band but not at point-blank
+    ///   (where a standing steal already serves);
+    /// * the defender must NOT be behind the carrier — no tackle wins a ball that is led
+    ///   in front of the holder's body (the user's hard rule);
+    /// * the carrier must actually be running fast (you do not slide a shielding holder);
+    /// * the advancing-carrier urgency model must favour COMMITTING over containing — a
+    ///   lone last defender told to contain must stay on his feet (a missed slide there
+    ///   springs a clean run on goal).
+    ///
+    /// Returns `None` (drawing no RNG) whenever any gate fails, so a defender not in a
+    /// genuine last-ditch window never perturbs the decision RNG stream.
+    pub(crate) fn slide_tackle_decision(&self, snapshot: &WorldSnapshot) -> Option<(usize, f64)> {
+        if !snapshot.slide_tackle_enabled || self.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_id = snapshot.ball.holder?;
+        let holder = snapshot.players.iter().find(|p| p.id == holder_id)?;
+        if holder.team != self.team.other() {
+            return None;
+        }
+        let holder_pos = snapshot.player_snapshot_position(holder);
+        if holder.role == PlayerRole::Goalkeeper
+            && snapshot.point_in_own_penalty_area(holder.team, holder_pos)
+        {
+            return None;
+        }
+        let distance = self.position.distance(holder_pos);
+        if distance < SLIDE_TACKLE_MIN_REACH_YARDS || distance > SLIDE_TACKLE_MAX_REACH_YARDS {
+            return None;
+        }
+        // No tackle wins the ball from behind the carrier — the body shields the led ball.
+        if snapshot.tackle_blocked_from_behind(holder_id, self.position) {
+            return None;
+        }
+        // You do not slide a stationary/shielding holder — only one running away from
+        // (or at) you faster than you can stay with on your feet.
+        let holder_speed = snapshot
+            .player_velocity(holder_id)
+            .unwrap_or(holder.velocity)
+            .len();
+        if holder_speed < SLIDE_TACKLE_MIN_HOLDER_SPEED_YPS {
+            return None;
+        }
+        // Commit only when the model rates committing over containing (the same urgency
+        // that drives the standing lunge): >1.0 = nearest presser to a carrier driving at
+        // our goal with cover behind, or deep danger near our own goal.
+        let urgency = snapshot.advancing_carrier_steal_urgency(self.id);
+        if urgency < SLIDE_TACKLE_MIN_COMMIT_URGENCY {
+            return None;
+        }
+        let commit01 =
+            ((urgency - SLIDE_TACKLE_MIN_COMMIT_URGENCY) / CARRIER_ADVANCE_STEAL_BOOST).clamp(0.0, 1.0);
+        if commit01 <= 0.0 {
+            return None;
+        }
+        let defending = ability01(self.skills.defending);
+        let aggression = ability01(self.skills.aggression);
+        let directive = snapshot.tactical_directive(self.team);
+        let appetite = ((defending * 0.34 + aggression * 0.50)
+            * directive.press_intensity
+            * commit01)
+            .clamp(0.0, SLIDE_TACKLE_MAX_DECISION_PROBABILITY);
+        (appetite > 0.0).then_some((holder_id, appetite))
+    }
+
     pub(crate) fn immediate_defensive_steal_target(
         &self,
         snapshot: &WorldSnapshot,
@@ -3373,7 +3452,8 @@ impl PlayerAgent {
                 None,
                 None,
             ),
-            SoccerAction::Tackle { target_player } => {
+            SoccerAction::Tackle { target_player }
+            | SoccerAction::SlideTackle { target_player } => {
                 let point = snapshot
                     .player_position(*target_player)
                     .unwrap_or(snapshot.ball.position);
@@ -4492,6 +4572,39 @@ impl PlayerAgent {
                     action,
                     sprint: false,
                 };
+            }
+        }
+
+        // Last-ditch committed challenge: throw a SLIDE tackle at a fast carrier driving
+        // at our goal that this defender can reach but not contain on its feet. The gate
+        // (`slide_tackle_decision`) is narrow and draws from the decision RNG ONLY when a
+        // genuine slide window is open, so ordinary play stays parity-preserved (and is
+        // byte-identical when the mechanic is disabled). Placed after the standing
+        // immediate-steal so a clean, risk-free steal is always preferred to a gamble.
+        if !has_ball && snapshot.controlled_possession_team() == Some(self.team.other()) {
+            if let Some((holder, appetite)) = self.slide_tackle_decision(snapshot) {
+                if rng.next_float() < time_window_probability(appetite, snapshot.dt_seconds) {
+                    let action = SoccerAction::SlideTackle {
+                        target_player: holder,
+                    };
+                    let action_options =
+                        self.defensive_action_options(snapshot, &directive, snapshot.dt_seconds);
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state,
+                        observation,
+                        belief,
+                        vec!["last-ditch".to_string(), "slide-tackle".to_string()],
+                        action_options,
+                        &action,
+                        "slide-tackle",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: true,
+                    };
+                }
             }
         }
 
@@ -6173,8 +6286,16 @@ impl PlayerAgent {
                     .collect(),
                 rng,
             );
-            let should_recover =
-                fifty_fifty_duel || action_option_score(&loose_options, "recover") > 0.0;
+            // A defender genuinely placed to cut an in-flight ground pass on its lane ALWAYS
+            // steps to intercept — it is not subject to the anti-swarm "recover" legality cap
+            // (closer-teammates), which otherwise let a ground pass roll right past a defender
+            // 1–3yd off the lane while it deferred to a team-mate and held shape. `loose_ball_target`
+            // already resolves to the lane cut-point for such a player.
+            let lane_interceptor = self.role != PlayerRole::Goalkeeper
+                && snapshot.pending_pass_lane_cut_target_for(self.id).is_some();
+            let should_recover = lane_interceptor
+                || fifty_fifty_duel
+                || action_option_score(&loose_options, "recover") > 0.0;
             action_options = loose_options;
             order_names.extend(loose_order);
             if should_recover {
@@ -6308,7 +6429,7 @@ impl PlayerAgent {
         let label = normalize_soccer_action_label(&plan.action);
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
-            && !matches!(label, "tackle" | "press-cover")
+            && !matches!(label, "tackle" | "slide-tackle" | "press-cover")
         {
             let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, false);
             let target = plan
@@ -6904,6 +7025,17 @@ impl PlayerAgent {
                     None
                 }
             }),
+            // A learned/retrieved plan can elect a slide, but it must clear the same
+            // last-ditch legality gate as the heuristic (enabled, in reach, not from
+            // behind, fast carrier, commit-warranted) — no summoning an illegal slide.
+            "slide-tackle" => self.slide_tackle_decision(snapshot).map(|(holder, _)| {
+                (
+                    SoccerAction::SlideTackle {
+                        target_player: holder,
+                    },
+                    "slide-tackle".to_string(),
+                )
+            }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
                 let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, true);
                 Some((
@@ -7331,6 +7463,12 @@ pub enum SoccerAction {
     Tackle {
         target_player: usize,
     },
+    /// A committed, off-the-feet challenge: higher chance to win the ball than a
+    /// standing tackle, but a miss leaves the defender on the ground (see
+    /// [`PlayerAgent::slide_recovery_seconds`]) for ~2s while the attacker advances.
+    SlideTackle {
+        target_player: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -7434,6 +7572,7 @@ impl SoccerAction {
             SoccerAction::RouteOne { .. } => "route-one".to_string(),
             SoccerAction::Shoot { .. } => "shoot".to_string(),
             SoccerAction::Tackle { .. } => "tackle".to_string(),
+            SoccerAction::SlideTackle { .. } => "slide-tackle".to_string(),
         }
     }
 }

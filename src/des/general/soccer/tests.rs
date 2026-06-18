@@ -12314,6 +12314,94 @@ fn nearby_player_cuts_an_in_flight_ground_pass_on_its_lane() {
 }
 
 #[test]
+fn lane_cutter_steps_in_even_when_teammates_are_closer_to_the_lane_point() {
+    // The remaining gap: a defender perfectly placed beside an in-flight ground pass was being
+    // PEELED OFF goalside by the loose-ball anti-swarm retriever election whenever a team-mate
+    // scored marginally closer to that same lane point — so the ball rolled right past it 1-3yd
+    // away and nobody contested. A genuine lane interceptor must step onto the lane regardless of
+    // the retriever election.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 91,
+        ..Default::default()
+    });
+    let passer = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let receiver = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper && p.id != passer)
+        .map(|p| p.id)
+        .unwrap();
+    let away: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let (cutter, closer_a, closer_b) = (away[0], away[1], away[2]);
+    park_players_except(&mut sim, &[passer, receiver, cutter, closer_a, closer_b]);
+
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[receiver].position = Vec2::new(40.0, 70.0);
+    // The cutter sits 1.5yd off the lane (foot of perpendicular ~(40, 60)).
+    let cutter_pos = Vec2::new(41.5, 60.0);
+    sim.players[cutter].position = cutter_pos;
+    // Two team-mates are even CLOSER to that exact lane point, so the anti-swarm election would
+    // hand them the retriever role and tell the cutter to peel off goalside (the bug).
+    sim.players[closer_a].position = Vec2::new(40.0, 60.4);
+    sim.players[closer_b].position = Vec2::new(40.0, 59.6);
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.ball.velocity = Vec2::new(0.0, 8.0);
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.pending_pass = Some(test_pending_pass(
+        Team::Home,
+        passer,
+        receiver,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(40.0, 70.0),
+    ));
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let lane_cut = snap
+        .pending_pass_lane_cut_target_for(cutter)
+        .expect("a defender within reach of the lane must register a lane cut");
+    assert!(
+        (lane_cut.x - 40.0).abs() < 0.2 && (lane_cut.y - 60.0).abs() < 2.0,
+        "lane cut should be the foot of perpendicular on the lane, got {lane_cut:?}"
+    );
+    assert!(
+        snap.is_committed_loose_ball_chaser(cutter),
+        "a genuine lane cutter is a committed chaser even when team-mates are closer to the lane point"
+    );
+    // The recovery target must be the lane point (x -> 40), NOT a goalside peel-off (which keeps
+    // the cutter on its own side at x >= 41.5 and drops it back behind the ball).
+    let recovery = snap.loose_ball_recovery_target_for(cutter);
+    assert!(
+        recovery.x <= 40.3,
+        "lane cutter must step ONTO the lane (x->40), not peel off goalside; got {recovery:?}"
+    );
+
+    let mut d = sim.players[cutter].clone();
+    let intent = d.run_time_step(&snap, None, None, &mut mulberry32(11));
+    match intent.action {
+        SoccerAction::MoveTo(target) => {
+            assert!(
+                (target.x - 40.0).abs() < (cutter_pos.x - 40.0).abs(),
+                "cutter should step toward the lane (x->40) to intercept, not retreat; target={target:?}"
+            );
+        }
+        other => panic!("lane cutter should move to cut the pass, got {other:?}"),
+    }
+}
+
+#[test]
 fn committed_loose_ball_chaser_attacks_ball_before_support_shape() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -13191,13 +13279,20 @@ fn no_target_forward_outlet_avoids_marked_teammate_and_opponents() {
     sim.players[marker].position = marker_pos; // right on the forward
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let target =
+    let (target, receiver) =
         snapshot.no_target_forward_outlet_target(passer, Vec2::new(40.0, 40.0), Team::Home);
     // The desperation forward ball must NOT be aimed at the marked man / the opponent on him.
     assert!(
             target.distance(marker_pos) > 4.0,
             "no-target forward outlet must avoid a marked teammate / opponent: target={target:?} marker={marker_pos:?}"
         );
+    // With the only advanced teammate tightly marked, the outlet falls back to open space —
+    // it does NOT adopt the marked man as the receiver (it stays a true ball into space).
+    assert_ne!(
+        receiver,
+        Some(marked_fwd),
+        "a marked teammate must not be adopted as the outlet receiver"
+    );
 }
 
 #[test]
@@ -63964,4 +64059,196 @@ fn weak_long_aerial_does_not_float_in_the_air() {
              the hang-time ceiling should keep it under ~2.7s"
         );
     }
+}
+
+#[test]
+fn slide_tackle_flag_defaults_on_and_respects_config() {
+    // The committed slide-tackle mechanic is live by default (unless the process-wide
+    // env flag is overriding it for an A-B/parity run), and a per-match config flag can
+    // always pin it off regardless.
+    if std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_err() {
+        assert!(slide_tackle_enabled(&MatchConfig::default()));
+    }
+    assert!(!slide_tackle_enabled(&MatchConfig {
+        disable_slide_tackle: true,
+        ..Default::default()
+    }));
+}
+
+#[test]
+fn slide_tackle_wins_the_ball_more_often_than_a_standing_tackle() {
+    // A full-stretch slide is more likely to win the ball than a standing poke: its
+    // computed steal probability strictly exceeds the standing tackle's for the same
+    // matchup (the tradeoff being the grounding risk on a miss, exercised elsewhere).
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = &sim.players[0].skills;
+    let attacker = &sim.players[11].skills;
+    let standing = tackle_success_probability(defender, attacker);
+    let slide = slide_tackle_success_probability(defender, attacker);
+    assert!(
+        slide > standing,
+        "slide ({slide:.3}) should beat standing ({standing:.3})"
+    );
+    assert!(slide <= 0.97);
+}
+
+#[test]
+fn no_tackle_wins_the_ball_from_behind_the_carrier() {
+    // The ball is led in front of the carrier; a defender trailing behind cannot win it
+    // with ANY tackle — standing or sliding. Both attempts leave possession with the
+    // carrier (the user's hard rule).
+    for action_is_slide in [false, true] {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let defender = 0;
+        let attacker = 11;
+        sim.players[attacker].position = Vec2::new(40.0, 60.0);
+        sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
+        sim.players[attacker].skills.dribbling = 9.5;
+        // Ball led ~2yd in front (the +y direction the carrier is driving).
+        sim.ball.position = Vec2::new(40.0, 62.0);
+        sim.ball.holder = Some(attacker);
+        // Defender trailing 1.8yd behind the carrier — within slide/standing reach.
+        sim.players[defender].position = Vec2::new(40.0, 58.2);
+
+        assert!(
+            sim.tackle_blocked_from_behind(attacker, sim.players[defender].position),
+            "defender behind the led ball should be blocked"
+        );
+
+        let action = if action_is_slide {
+            SoccerAction::SlideTackle {
+                target_player: attacker,
+            }
+        } else {
+            SoccerAction::Tackle {
+                target_player: attacker,
+            }
+        };
+        sim.apply_player_intent(PlayerIntent {
+            player_id: defender,
+            action,
+            sprint: true,
+        });
+        assert_eq!(
+            sim.ball.holder,
+            Some(attacker),
+            "a tackle from behind (slide={action_is_slide}) must not win the ball"
+        );
+    }
+}
+
+#[test]
+fn missed_slide_tackle_grounds_defender_for_uniform_recovery_window() {
+    // A slide that fails to win the ball (here forced by tackling from behind) puts the
+    // defender flat on the grass for a uniform 1.75-2.25s and costs the team the
+    // committed-challenge penalty.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 0;
+    let attacker = 11;
+    sim.players[attacker].position = Vec2::new(40.0, 60.0);
+    sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
+    sim.ball.position = Vec2::new(40.0, 62.0);
+    sim.ball.holder = Some(attacker);
+    sim.players[defender].position = Vec2::new(40.0, 58.2);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: defender,
+        action: SoccerAction::SlideTackle {
+            target_player: attacker,
+        },
+        sprint: true,
+    });
+
+    let recovery = sim.players[defender].slide_recovery_seconds;
+    assert!(
+        recovery >= SLIDE_TACKLE_RECOVERY_MIN_SECONDS && recovery <= SLIDE_TACKLE_RECOVERY_MAX_SECONDS,
+        "grounded for {recovery:.3}s, expected [{:.2}, {:.2}]",
+        SLIDE_TACKLE_RECOVERY_MIN_SECONDS,
+        SLIDE_TACKLE_RECOVERY_MAX_SECONDS
+    );
+    assert_eq!(sim.ball.holder, Some(attacker));
+    let defender_reward = sim
+        .reward_events
+        .iter()
+        .filter(|event| event.player_id == defender)
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert_eq!(defender_reward, -FAILED_SLIDE_TACKLE_PENALTY_POINTS);
+}
+
+#[test]
+fn clean_slide_tackle_from_in_front_can_win_the_ball() {
+    // Goal-side of a fast carrier with the ball led toward the defender (not shielded,
+    // not from behind): a strong defender's slide wins it cleanly and stays on its feet.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 0;
+    let attacker = 11;
+    sim.players[attacker].position = Vec2::new(40.0, 60.0);
+    sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
+    sim.players[attacker].skills.dribbling = 0.2;
+    sim.players[attacker].skills.first_touch = 0.2;
+    sim.players[attacker].skills.strength = 0.2;
+    sim.ball.position = Vec2::new(40.0, 61.5);
+    sim.ball.holder = Some(attacker);
+    // Defender goal-side (ahead in the carrier's direction of travel), in reach.
+    sim.players[defender].position = Vec2::new(40.0, 61.0);
+    sim.players[defender].skills.defending = 10.0;
+    sim.players[defender].skills.aggression = 9.0;
+    sim.players[defender].skills.strength = 9.0;
+
+    assert!(!sim.tackle_blocked_from_behind(attacker, sim.players[defender].position));
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: defender,
+        action: SoccerAction::SlideTackle {
+            target_player: attacker,
+        },
+        sprint: true,
+    });
+
+    assert_ne!(
+        sim.ball.holder,
+        Some(attacker),
+        "a clean slide from in front should take the ball off the carrier"
+    );
+    assert_eq!(
+        sim.players[defender].slide_recovery_seconds, 0.0,
+        "winning the ball means staying on your feet — no grounding"
+    );
+}
+
+#[test]
+fn grounded_defender_holds_position_until_recovered() {
+    // While grounded, a player makes no decision and does not move; the clock bleeds
+    // down by dt each tick and clears after the recovery window.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: false,
+        full_game_learning_enabled: false,
+        ..Default::default()
+    });
+    let grounded = 5;
+    let spot = Vec2::new(3.0, 3.0);
+    sim.players[grounded].position = spot;
+    sim.players[grounded].home_position = spot;
+    sim.players[grounded].velocity = Vec2::new(8.0, 0.0);
+    sim.players[grounded].slide_recovery_seconds = 2.0;
+
+    sim.run_time_step();
+    assert!(
+        sim.players[grounded].position.distance(spot) < 0.05,
+        "a grounded player must not move (was {:?})",
+        sim.players[grounded].position
+    );
+    assert!(sim.players[grounded].velocity.len() < 1e-6);
+    assert!(sim.players[grounded].slide_recovery_seconds < 2.0);
+
+    // Tick out the rest of the window; it must reach zero (back on its feet).
+    for _ in 0..40 {
+        if sim.players[grounded].slide_recovery_seconds <= 0.0 {
+            break;
+        }
+        sim.run_time_step();
+    }
+    assert_eq!(sim.players[grounded].slide_recovery_seconds, 0.0);
+    assert!(sim.players[grounded].position.distance(spot) < 0.05);
 }
