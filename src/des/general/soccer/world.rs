@@ -5,6 +5,7 @@
 //! snapshots, ball, and reward/learning helpers it drives.
 
 use super::*;
+use crate::des::general::mpc_point_mass::PlanarMpcConfig;
 use crate::des::general::soccer_genome::SoccerTeamGenome;
 
 const SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE: f64 = 2.0;
@@ -20,6 +21,9 @@ const OFF_BALL_POSSESSION_MIN_FORWARD_YARDS: f64 = 0.75;
 const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
 const INTENDED_PASS_TARGET_AWARENESS_PROBABILITY: f64 = 0.80;
 const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
+const MPC_LATENT_PASS_CHAIN_SINGLE_TARGET: f64 = 0.18;
+const MPC_LATENT_PASS_CHAIN_TWO_TARGET: f64 = 0.58;
+const MPC_LATENT_PASS_CHAIN_THREE_TARGET: f64 = 1.0;
 
 pub struct SoccerMatch {
     pub config: MatchConfig,
@@ -115,6 +119,8 @@ pub struct SoccerMatch {
     pub(crate) possession_chain: VecDeque<usize>,
     pub(crate) possession_chain_previous_touch_team: Option<Team>,
     pub(crate) completed_pass_chain: VecDeque<CompletedPassChainEntry>,
+    pub(crate) home_mpc_latent_objective: SoccerMpcLatentObjective,
+    pub(crate) away_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) possession_progress_tracker: Option<PossessionProgressTracker>,
     /// The most recent player to touch the ball — a simple "who last touched it"
     /// reference used to enforce the no-double-touch rule on restarts.
@@ -166,14 +172,6 @@ pub struct SoccerMatch {
     /// worse-positioned member of a too-close pair is entered here (the better-placed
     /// one holds its ground); both are "aware" via their running clocks.
     pub(crate) teammate_spacing_yield: HashMap<usize, usize>,
-    /// Inter-line band clocks: continuous seconds each midfielder/forward has spent
-    /// OUT of its required fore-aft band relative to the line behind it (midfielders
-    /// 2-18 yd ahead of the defensive line; strikers 3-20 yd ahead of the midfield
-    /// line). Accumulates while out of band, decays while in band. Once a player's
-    /// clock passes its line's grace window (`MIDFIELD_BAND_GRACE_SECONDS` /
-    /// `STRIKER_BAND_GRACE_SECONDS`) the fore-aft nudge escalates from a soft pull to a
-    /// strict correction, giving eventual consistency without snapping transient runs.
-    pub(crate) inter_line_band_clocks: HashMap<usize, f64>,
     pub(crate) defensive_clear_hold_trackers: HashMap<Team, DefensiveClearAndHoldTracker>,
     pub(crate) adversarial_moment_memory: VecDeque<SoccerMomentWindow>,
     pub(crate) retrieved_action_prior_cache: std::cell::RefCell<SoccerRetrievedActionPriorCache>,
@@ -954,6 +952,8 @@ impl SoccerMatch {
             possession_chain,
             possession_chain_previous_touch_team: None,
             completed_pass_chain: VecDeque::new(),
+            home_mpc_latent_objective: SoccerMpcLatentObjective::default(),
+            away_mpc_latent_objective: SoccerMpcLatentObjective::default(),
             last_touch_player: None,
             ball_stationary_ticks: 0,
             ball_stuck_anchor: Vec2::new(0.0, 0.0),
@@ -981,7 +981,6 @@ impl SoccerMatch {
             teammate_spacing_near_clocks: HashMap::new(),
             teammate_spacing_far_clocks: HashMap::new(),
             teammate_spacing_yield: HashMap::new(),
-            inter_line_band_clocks: HashMap::new(),
             defensive_clear_hold_trackers: HashMap::new(),
             adversarial_moment_memory: VecDeque::new(),
             retrieved_action_prior_cache: std::cell::RefCell::new(
@@ -3911,160 +3910,6 @@ impl SoccerMatch {
     /// line shifts coherently; each adjacent pair shares the correction (half the
     /// shortfall each) so it converges to the padding without either line
     /// over-shooting. Soft + capped — a nudge, never a hard constraint.
-    /// The fore-aft band correction for `(me_y, me_team, me_role)`: the signed Y delta
-    /// that would bring the player into its required depth band, sandwiched between the
-    /// lines around it, plus that line's grace window. Every outfield line is bounded:
-    /// the defence must stay at least the midfield minimum BEHIND the midfield line;
-    /// midfielders sit 2-18 yd ahead of the defence AND at least the striker minimum
-    /// behind the strikers; strikers sit 3-20 yd ahead of midfield. A `0.0` delta means
-    /// in-band. `None` for keepers, when no neighbour line is defined, or when the
-    /// neighbour lines have crossed (don't fight an impossible band). Works in an
-    /// "along-attack" coordinate (`y * attack_dir`) so larger always means more forward.
-    fn inter_line_band_correction(
-        &self,
-        me_y: f64,
-        me_team: Team,
-        me_role: PlayerRole,
-    ) -> Option<(f64, f64)> {
-        if matches!(me_role, PlayerRole::Goalkeeper) {
-            return None;
-        }
-        let attack = me_team.attack_dir();
-        // Mean of a role's line in along-attack coordinates (None if too sparse).
-        let line_mean_a = |role: PlayerRole| -> Option<f64> {
-            let mut sum = 0.0;
-            let mut cnt = 0usize;
-            for player in self
-                .players
-                .iter()
-                .filter(|player| player.team == me_team && player.role == role)
-            {
-                if player.position.y.is_finite() {
-                    sum += player.position.y * attack;
-                    cnt += 1;
-                }
-            }
-            (cnt >= FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS).then(|| sum / cnt as f64)
-        };
-        let (lo, hi, grace) = match me_role {
-            // Stay at least the midfield minimum BEHIND the midfield line; no deep cap.
-            PlayerRole::Defender => {
-                let hi = line_mean_a(PlayerRole::Midfielder)
-                    .map(|m| m - MIDFIELD_AHEAD_OF_DEFENSE_MIN_YARDS)?;
-                (f64::NEG_INFINITY, hi, MIDFIELD_BAND_GRACE_SECONDS)
-            }
-            PlayerRole::Midfielder => {
-                let def = line_mean_a(PlayerRole::Defender);
-                let fwd = line_mean_a(PlayerRole::Forward);
-                if def.is_none() && fwd.is_none() {
-                    return None;
-                }
-                let lo = def
-                    .map(|d| d + MIDFIELD_AHEAD_OF_DEFENSE_MIN_YARDS)
-                    .unwrap_or(f64::NEG_INFINITY);
-                let hi_def = def
-                    .map(|d| d + MIDFIELD_AHEAD_OF_DEFENSE_MAX_YARDS)
-                    .unwrap_or(f64::INFINITY);
-                let hi_fwd = fwd
-                    .map(|f| f - STRIKER_AHEAD_OF_MIDFIELD_MIN_YARDS)
-                    .unwrap_or(f64::INFINITY);
-                (lo, hi_def.min(hi_fwd), MIDFIELD_BAND_GRACE_SECONDS)
-            }
-            PlayerRole::Forward => {
-                let mid = line_mean_a(PlayerRole::Midfielder)?;
-                (
-                    mid + STRIKER_AHEAD_OF_MIDFIELD_MIN_YARDS,
-                    mid + STRIKER_AHEAD_OF_MIDFIELD_MAX_YARDS,
-                    STRIKER_BAND_GRACE_SECONDS,
-                )
-            }
-            PlayerRole::Goalkeeper => return None,
-        };
-        // Neighbour lines crossed (e.g. a sparse, scrambled shape): don't fight it.
-        if lo > hi {
-            return None;
-        }
-        let me_a = me_y * attack;
-        let clamped_a = me_a.clamp(lo, hi);
-        Some(((clamped_a - me_a) * attack, grace))
-    }
-
-    /// Per-player fore-aft band nudge (y only): pull a midfielder/striker toward its
-    /// band relative to the line behind it. Soft and capped while the player's
-    /// out-of-band clock is under the grace window; once it passes, the correction
-    /// becomes strict so the band is actually held. Keepers and the defensive anchor
-    /// line return `0.0`.
-    pub(crate) fn fore_aft_line_padding_nudge_y(
-        &self,
-        me_id: usize,
-        me_y: f64,
-        me_team: Team,
-        me_role: PlayerRole,
-    ) -> f64 {
-        let Some((corrective_y, grace)) = self.inter_line_band_correction(me_y, me_team, me_role)
-        else {
-            return 0.0;
-        };
-        if corrective_y.abs() < 1e-6 {
-            return 0.0;
-        }
-        let elapsed = self
-            .inter_line_band_clocks
-            .get(&me_id)
-            .copied()
-            .unwrap_or(0.0);
-        let (gain, max_nudge) = if elapsed >= grace {
-            (
-                INTER_LINE_BAND_STRICT_GAIN,
-                INTER_LINE_BAND_STRICT_MAX_NUDGE_YARDS,
-            )
-        } else {
-            (INTER_LINE_BAND_SOFT_GAIN, FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS)
-        };
-        (corrective_y * gain).clamp(-max_nudge, max_nudge)
-    }
-
-    /// Advance the inter-line band clocks from the settled end-of-tick positions:
-    /// accumulate while a midfielder/striker is out of its band relative to the line
-    /// behind it, decay (faster than it fills) while in band. Read next tick by
-    /// [`Self::fore_aft_line_padding_nudge_y`]. Mirrors the territory-spacing clocks.
-    pub(crate) fn update_inter_line_band_clocks(&mut self) {
-        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS);
-        // Snapshot (id, in_band) first so the immutable band reads don't alias the clock
-        // mutation below.
-        let states: Vec<(usize, bool)> = self
-            .players
-            .iter()
-            .filter(|player| {
-                player.role != PlayerRole::Goalkeeper && player.position.y.is_finite()
-            })
-            .filter_map(|player| {
-                self.inter_line_band_correction(player.position.y, player.team, player.role)
-                    .map(|(corrective_y, _grace)| (player.id, corrective_y.abs() < 1e-6))
-            })
-            .collect();
-        let decay = dt * INTER_LINE_BAND_CLOCK_DECAY_RATE;
-        let live: std::collections::HashSet<usize> = states.iter().map(|(id, _)| *id).collect();
-        for (id, in_band) in states {
-            if in_band {
-                let decayed = self
-                    .inter_line_band_clocks
-                    .get(&id)
-                    .map(|elapsed| elapsed - decay)
-                    .unwrap_or(0.0);
-                if decayed > 0.0 {
-                    self.inter_line_band_clocks.insert(id, decayed);
-                } else {
-                    self.inter_line_band_clocks.remove(&id);
-                }
-            } else {
-                *self.inter_line_band_clocks.entry(id).or_insert(0.0) += dt;
-            }
-        }
-        // Drop clocks for players no longer eligible (role change / left the pitch).
-        self.inter_line_band_clocks.retain(|id, _| live.contains(id));
-    }
-
     pub(crate) fn relational_shape_disciplined_intent(
         &self,
         mut intent: PlayerIntent,
@@ -4157,52 +4002,9 @@ impl SoccerMatch {
                 }
             }
         }
-        // Compactness toward the ball: every off-ball player the territory-spacing nudge
-        // has NOT already pinned at its teammate padding (those return above) drifts
-        // toward the ball, bounded. The inter-line band applied right after caps the
-        // forward drift and the spacing nudge caps the crowding, so the team compacts
-        // ONTO the ball without collapsing its lines or running into each other — "move
-        // to the ball until you reach your padding". A loose, CONTESTED ball pulls harder
-        // and more directly (go win it); a totally uncontested loose ball does not (no
-        // need to rush — keep shape).
-        let ball = self.ball.position;
-        let to_ball = ball - working;
-        let ball_dist = to_ball.len();
-        if ball_dist > BALL_COMPACTNESS_DEADZONE_YARDS {
-            let free_ball_contested = self.ball.holder.is_none()
-                && self.players.iter().any(|p| {
-                    p.team != me.team
-                        && p.role != PlayerRole::Goalkeeper
-                        && p.position.distance(ball) < FREE_BALL_CONTEST_RADIUS_YARDS
-                });
-            let (gain, max_pull) = if free_ball_contested {
-                (
-                    BALL_COMPACTNESS_GAIN * FREE_BALL_COMPACTNESS_GAIN_MULT,
-                    BALL_COMPACTNESS_MAX_NUDGE_YARDS * FREE_BALL_COMPACTNESS_MAX_MULT,
-                )
-            } else {
-                (BALL_COMPACTNESS_GAIN, BALL_COMPACTNESS_MAX_NUDGE_YARDS)
-            };
-            let pull = ((ball_dist - BALL_COMPACTNESS_DEADZONE_YARDS) * gain).min(max_pull);
-            let cand = working + to_ball.normalized() * pull;
-            if cand.x.is_finite() && cand.y.is_finite() {
-                let base_axis_pressure =
-                    self.teammate_axis_clump_pressure_at(me.team, working, Some(me.id));
-                let candidate_axis_pressure =
-                    self.teammate_axis_clump_pressure_at(me.team, cand, Some(me.id));
-                if candidate_axis_pressure
-                    <= base_axis_pressure + TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
-                {
-                    working = cand;
-                }
-            }
-        }
-        // Fore-aft (inter-line) band: cap the (now ball-pulled) target's depth into the
-        // line's band relative to the line directly behind it — midfielders 2-18 yd ahead
-        // of the defence, strikers 3-20 yd ahead of midfield — strictly once the player's
-        // out-of-band grace clock has elapsed. This is what stops the ball-attraction from
-        // collapsing the lines onto each other.
-        working.y += self.fore_aft_line_padding_nudge_y(me.id, working.y, me.team, me.role);
+        // NOTE: inter-line depth bands and ball-attraction compactness are owned by the
+        // dedicated team-line and ball-proximity stages in `run_time_step`; this method
+        // only does the lateral, intra-line relational cohesion pull above.
         if !working.x.is_finite() || !working.y.is_finite() {
             return intent;
         }
@@ -4796,9 +4598,6 @@ impl SoccerMatch {
         // positions and flag any over-grace pair's worse-positioned player to move on
         // the next tick.
         self.update_teammate_spacing_separation();
-        // Inter-line bands: advance each midfielder/striker's out-of-band clock so the
-        // fore-aft nudge can escalate to strict enforcement past the grace window.
-        self.update_inter_line_band_clocks();
         self.record_ball_position_history();
         self.shared_positions.sync_from_players_and_ball(
             &self.players,
@@ -5463,6 +5262,47 @@ impl SoccerMatch {
         }
     }
 
+    pub fn mpc_latent_objective(&self, team: Team) -> SoccerMpcLatentObjective {
+        match team {
+            Team::Home => self.home_mpc_latent_objective,
+            Team::Away => self.away_mpc_latent_objective,
+        }
+        .sanitized()
+    }
+
+    fn mpc_latent_objective_mut(&mut self, team: Team) -> &mut SoccerMpcLatentObjective {
+        match team {
+            Team::Home => &mut self.home_mpc_latent_objective,
+            Team::Away => &mut self.away_mpc_latent_objective,
+        }
+    }
+
+    fn update_mpc_latent_objective(
+        &mut self,
+        team: Team,
+        pass_chain_continuity: Option<f64>,
+        shot_pressure: Option<f64>,
+        goal_pressure: Option<f64>,
+    ) {
+        if !self.config.mpc.latent_objective_enabled {
+            return;
+        }
+        let current = self.mpc_latent_objective(team);
+        let target = SoccerMpcLatentObjective {
+            pass_chain_continuity: pass_chain_continuity
+                .map(finite_unit_interval)
+                .unwrap_or(current.pass_chain_continuity),
+            shot_pressure: shot_pressure
+                .map(finite_unit_interval)
+                .unwrap_or(current.shot_pressure),
+            goal_pressure: goal_pressure
+                .map(finite_unit_interval)
+                .unwrap_or(current.goal_pressure),
+        };
+        let updated = current.blended_with(target, self.config.mpc.latent_learning_rate);
+        *self.mpc_latent_objective_mut(team) = updated;
+    }
+
     pub(crate) fn update_possession_progress_milestones(
         &mut self,
         before: &WorldSnapshot,
@@ -5542,6 +5382,7 @@ impl SoccerMatch {
         self.record_possession_touch(receiver);
         self.note_completed_possession_pass(pass.team, pass.origin, self.ball.position);
         self.record_completed_pass_chain_entry(pass, receiver);
+        self.note_mpc_completed_pass_chain_latent(pass.team, receiver);
     }
 
     fn recent_completed_pass_chain_into(
@@ -5620,6 +5461,37 @@ impl SoccerMatch {
         // The entry above is now part of the chain, so a sterile run that ends on this pass
         // (the ball tapped around inside a tiny pocket without escaping) is penalized here.
         self.record_stagnant_pass_penalty(pass.team, Some(pass.from));
+    }
+
+    fn note_mpc_completed_pass_chain_latent(&mut self, team: Team, receiver: usize) {
+        let chain = self.recent_completed_pass_chain_into(team, receiver, 3);
+        let Some(_) = chain.first() else {
+            return;
+        };
+        let chain_target = match chain.len() {
+            0 => 0.0,
+            1 => MPC_LATENT_PASS_CHAIN_SINGLE_TARGET,
+            2 => MPC_LATENT_PASS_CHAIN_TWO_TARGET,
+            _ => MPC_LATENT_PASS_CHAIN_THREE_TARGET,
+        };
+        let forward_fit = (chain
+            .iter()
+            .map(|entry| entry.target_forward_yards.max(0.0))
+            .sum::<f64>()
+            / 30.0)
+            .clamp(0.0, 1.0);
+        let openness_fit = if chain.is_empty() {
+            0.0
+        } else {
+            chain
+                .iter()
+                .map(|entry| entry.receiver_openness.clamp(0.0, 1.0))
+                .sum::<f64>()
+                / chain.len() as f64
+        };
+        let latent_target = (chain_target * 0.70 + forward_fit * 0.20 + openness_fit * 0.10)
+            .clamp(0.0, 1.0);
+        self.update_mpc_latent_objective(team, Some(latent_target), None, None);
     }
 
     /// Size of the maximal run of trailing same-possession completed passes whose reception
@@ -5927,6 +5799,7 @@ impl SoccerMatch {
             .map(|w| w * scale)
             .collect();
         self.record_possession_reward_pattern(shooting_team, Some(shooter), &scaled);
+        self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
     /// Distance scale for a shot reward: full inside ~20 yds, reduced for every yard
@@ -6169,6 +6042,7 @@ impl SoccerMatch {
                 &GOAL_CHAIN_REWARD_PATTERN,
             );
         }
+        self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
     }
 
@@ -8825,6 +8699,95 @@ impl SoccerMatch {
         self.collision_aware_desired_velocity(player_id, target, mpc_speed)
     }
 
+    fn team_is_attacking_for_mpc_latent(&self, team: Team) -> bool {
+        self.ball
+            .holder
+            .and_then(|holder| self.players.get(holder).map(|player| player.team))
+            == Some(team)
+            || self
+                .pending_pass
+                .as_ref()
+                .is_some_and(|pass| pass.team == team)
+    }
+
+    fn mpc_latent_execution_objective(&self, team: Team) -> SoccerMpcLatentObjective {
+        if self.config.mpc.latent_objective_enabled && self.team_is_attacking_for_mpc_latent(team) {
+            self.mpc_latent_objective(team)
+        } else {
+            SoccerMpcLatentObjective::default()
+        }
+    }
+
+    fn mpc_latent_shaped_target(
+        &self,
+        team: Team,
+        target: Vec2,
+        latent: SoccerMpcLatentObjective,
+    ) -> Vec2 {
+        let max_bias = if self.config.mpc.latent_reference_bias_yards.is_finite() {
+            self.config.mpc.latent_reference_bias_yards.max(0.0)
+        } else {
+            default_soccer_mpc_latent_reference_bias_yards()
+        };
+        let bias_yards = max_bias * latent.combined_pressure();
+        if bias_yards <= 1e-9 {
+            return target;
+        }
+        let (field_width, field_length) =
+            sane_pitch_dimensions(self.config.field_width_yards, self.config.field_length_yards);
+        finite_pitch_point(
+            Vec2::new(target.x, target.y + team.attack_dir() * bias_yards),
+            field_width,
+            field_length,
+            target,
+        )
+    }
+
+    fn mpc_planar_config(
+        &self,
+        horizon: usize,
+        dt: f64,
+        accel_cap: f64,
+        latent: SoccerMpcLatentObjective,
+    ) -> PlanarMpcConfig {
+        let base = PlanarMpcConfig::default();
+        let iters = ((horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+        let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5);
+        let weight_boost = if self.config.mpc.latent_weight_boost.is_finite() {
+            self.config.mpc.latent_weight_boost.clamp(0.0, 2.0)
+        } else {
+            default_soccer_mpc_latent_weight_boost()
+        };
+        let latent = latent.sanitized();
+        let pass = latent.pass_chain_continuity;
+        let shot = latent.shot_pressure;
+        let goal = latent.goal_pressure;
+        PlanarMpcConfig {
+            horizon,
+            dt,
+            q_pos: base.q_pos * (1.0 + weight_boost * (0.35 * pass + 0.25 * shot + 0.40 * goal)),
+            q_vel: base.q_vel * (1.0 + weight_boost * (0.60 * pass + 0.25 * shot + 0.15 * goal)),
+            qf_pos: base.qf_pos * (1.0 + weight_boost * (0.25 * pass + 0.35 * shot + 0.40 * goal)),
+            qf_vel: base.qf_vel * (1.0 + weight_boost * (0.45 * pass + 0.35 * shot + 0.20 * goal)),
+            a_max: accel_cap,
+            iters,
+            obstacle_decay_per_step,
+            ..base
+        }
+    }
+
+    fn mpc_config_stale(current: &PlanarMpcConfig, desired: &PlanarMpcConfig) -> bool {
+        current.horizon != desired.horizon
+            || (current.dt - desired.dt).abs() > 1e-9
+            || (current.q_pos - desired.q_pos).abs() > 1e-9
+            || (current.q_vel - desired.q_vel).abs() > 1e-9
+            || (current.qf_pos - desired.qf_pos).abs() > 1e-9
+            || (current.qf_vel - desired.qf_vel).abs() > 1e-9
+            || (current.a_max - desired.a_max).abs() > 1e-6
+            || current.iters != desired.iters
+            || (current.obstacle_decay_per_step - desired.obstacle_decay_per_step).abs() > 1e-12
+    }
+
     /// Run the player's receding-horizon MPC one step toward `target` and return
     /// the full dynamically-feasible velocity vector it plans for the next tick
     /// (direction *and* magnitude), capped to the heuristic `speed` envelope so it
@@ -8833,7 +8796,7 @@ impl SoccerMatch {
     /// across ticks. `None` on degenerate input (caller falls back to the policy).
     fn mpc_desired_velocity(&mut self, player_id: usize, target: Vec2, speed: f64) -> Option<Vec2> {
         use crate::des::general::mpc_point_mass::{
-            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
+            PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
         };
         let player = self.players.get(player_id)?;
         let pos = player.position;
@@ -8844,6 +8807,9 @@ impl SoccerMatch {
         let accel_cap = acceleration_yps2_from_score(player.skills.acceleration).max(0.5);
         let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
         let horizon = self.config.mpc.player_horizon.max(1);
+        let latent = self.mpc_latent_execution_objective(my_team);
+        let desired_cfg = self.mpc_planar_config(horizon, dt, accel_cap, latent);
+        let reference_target = self.mpc_latent_shaped_target(my_team, target, latent);
 
         // Field awareness: the controlled player is the MPC state; every other
         // player plus the ball becomes a moving soft keep-out, projected with
@@ -8859,27 +8825,11 @@ impl SoccerMatch {
             .get(&player_id)
             .map(|c| {
                 let cfg = c.config();
-                cfg.horizon != horizon
-                    || (cfg.dt - dt).abs() > 1e-9
-                    || (cfg.a_max - accel_cap).abs() > 1e-6
+                Self::mpc_config_stale(cfg, &desired_cfg)
             })
             .unwrap_or(true);
         if stale {
-            // More projected-gradient iterations for the longer (multi-second)
-            // horizon so a cold solve converges; warm-started ticks stop early.
-            let iters = ((horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
-            // Trust obstacle predictions with a ~1.5 s half-life (dt-robust), so the
-            // far end of a 3 s plan discounts constant-velocity opponent fiction.
-            let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5);
-            let cfg = PlanarMpcConfig {
-                horizon,
-                dt,
-                a_max: accel_cap,
-                iters,
-                obstacle_decay_per_step,
-                ..PlanarMpcConfig::default()
-            };
-            let controller = PlanarPointMassMpc::new(cfg).ok()?;
+            let controller = PlanarPointMassMpc::new(desired_cfg).ok()?;
             self.mpc_player_controllers.insert(player_id, controller);
         }
 
@@ -8888,7 +8838,7 @@ impl SoccerMatch {
             pos: [pos.x, pos.y],
             vel: [vel.x, vel.y],
         };
-        let reference = PlanarReference::arrive([target.x, target.y]);
+        let reference = PlanarReference::arrive([reference_target.x, reference_target.y]);
         let accel = controller.control_with_obstacles(state, &[reference], &obstacles);
         let next = Vec2::new(vel.x + accel[0] * dt, vel.y + accel[1] * dt);
         // Cap to the heuristic speed envelope (MPC may only equal or undercut it).
@@ -13623,6 +13573,134 @@ struct ForwardSupportContext {
     nearest_forward_teammate_distance_yards: f64,
 }
 
+fn first_touch_shape_prior_for_snapshot(
+    directive: &TeamTacticalDirective,
+    team_shape: TeamShapeObservation,
+    formation_lp_guidance: Option<&SoccerFormationLpPlayerGuidance>,
+) -> f64 {
+    let embedding_attack = directive
+        .adversarial_embedding_attack_score
+        .max(directive.neural_formation_attack_score)
+        .clamp(0.0, 1.0);
+    let overload = directive.attacking_overload_score.clamp(0.0, 1.0);
+    let pass_priority = ((directive.pass_priority - 0.70) / 0.72).clamp(0.0, 1.0);
+    let team_forward = (team_shape.forward_velocity_yps / 7.0).clamp(0.0, 1.0);
+    let support_density = (team_shape.players_near_ball as f64 / 5.0).clamp(0.0, 1.0);
+    let shape_width = (team_shape.spread_yards / 24.0).clamp(0.0, 1.0);
+    let lp = formation_lp_guidance
+        .map(|guidance| {
+            let target_forward =
+                ((guidance.target.y - guidance.current.y) * directive.team.attack_dir()
+                    / 8.0)
+                    .clamp(0.0, 1.0);
+            let local_mpc = if guidance.local_mpc_guidance { 1.0 } else { 0.0 };
+            let pressure_fit = guidance.pressure_weight.clamp(0.0, 1.0);
+            let speed_fit = guidance.speed_match_weight.clamp(0.0, 1.0);
+            let shape_clean = (1.0 - guidance.pair_error_yards / 8.0).clamp(0.0, 1.0);
+            (target_forward * 0.28
+                + local_mpc * 0.24
+                + pressure_fit * 0.16
+                + speed_fit * 0.12
+                + shape_clean * 0.20)
+                .clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0);
+    (embedding_attack * 0.20
+        + overload * 0.15
+        + pass_priority * 0.14
+        + team_forward * 0.16
+        + support_density * 0.12
+        + shape_width * 0.08
+        + lp * 0.24)
+        .clamp(0.0, 1.0)
+}
+
+fn first_time_pass_field_feasibility_for_snapshot(
+    visible_pass_targets: &[usize],
+    floor_pass_lane_score: f64,
+    best_floor_pass_quality: PassTargetQuality,
+    best_floor_pass_stride_fit: f64,
+    forward_support_context: ForwardSupportContext,
+    threaded_goal_pass_assessment: Option<KillerPassTargetAssessment>,
+    first_touch_shape_prior: f64,
+) -> f64 {
+    if visible_pass_targets.is_empty() {
+        return 0.0;
+    }
+    let target_density = (visible_pass_targets.len() as f64 / 3.0).clamp(0.0, 1.0);
+    let forward_options =
+        (forward_support_context.visible_forward_pass_options as f64 / 3.0).clamp(0.0, 1.0);
+    let forward_proximity =
+        (1.0 - forward_support_context.nearest_forward_teammate_distance_yards / 32.0)
+            .clamp(0.0, 1.0);
+    let forward_fit = (forward_options * 0.36
+        + forward_support_context
+            .best_forward_pass_receiver_openness
+            .clamp(0.0, 1.0)
+            * 0.42
+        + forward_proximity * 0.22)
+        .clamp(0.0, 1.0);
+    let target_fit = (best_floor_pass_quality.expected_completion.clamp(0.0, 1.0) * 0.34
+        + best_floor_pass_quality.receiver_openness.clamp(0.0, 1.0) * 0.24
+        + best_floor_pass_quality.stride_fit.clamp(0.0, 1.0) * 0.16
+        + best_floor_pass_stride_fit.clamp(0.0, 1.0) * 0.12
+        + floor_pass_lane_score.clamp(0.0, 1.0) * 0.14)
+        .clamp(0.0, 1.0);
+    let threaded_fit = threaded_goal_pass_assessment
+        .map(|assessment| {
+            (assessment.reception_window_score.clamp(0.0, 1.0) * 0.30
+                + assessment.receiver_openness.clamp(0.0, 1.0) * 0.22
+                + assessment.expected_completion.clamp(0.0, 1.0) * 0.20
+                + assessment.stride_fit.clamp(0.0, 1.0) * 0.16
+                + assessment.goal_channel_fit.clamp(0.0, 1.0) * 0.12)
+                .clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0);
+    (target_fit * 0.58
+        + forward_fit * 0.16
+        + threaded_fit * 0.14
+        + target_density * 0.04
+        + first_touch_shape_prior.clamp(0.0, 1.0) * 0.12)
+        .clamp(0.0, 1.0)
+}
+
+fn first_time_shot_field_feasibility_for_snapshot(
+    directive: &TeamTacticalDirective,
+    yards_to_goal: f64,
+    goal_angle_degrees: f64,
+    first_time_shot_block_probability: f64,
+    opposing_goalkeeper_out_of_position: f64,
+    first_touch_shape_prior: f64,
+) -> f64 {
+    let distance_fit = (1.0 - yards_to_goal / 34.0).clamp(0.0, 1.0);
+    let angle_fit = (goal_angle_degrees / 42.0).clamp(0.0, 1.0);
+    let block_fit = (1.0 - first_time_shot_block_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let overload = directive.attacking_overload_score.clamp(0.0, 1.0);
+    let attack_prior = directive
+        .adversarial_embedding_attack_score
+        .max(directive.neural_formation_attack_score)
+        .clamp(0.0, 1.0);
+    (distance_fit * 0.30
+        + angle_fit * 0.20
+        + block_fit * 0.24
+        + opposing_goalkeeper_out_of_position.clamp(0.0, 1.0) * 0.08
+        + overload * 0.07
+        + attack_prior * 0.06
+        + first_touch_shape_prior.clamp(0.0, 1.0) * 0.08)
+        .clamp(0.0, 1.0)
+}
+
+fn first_touch_release_score_with_field_feasibility(
+    technical_score: f64,
+    field_feasibility: f64,
+    shape_prior: f64,
+) -> f64 {
+    let field_feasibility = field_feasibility.clamp(0.0, 1.0);
+    let shape_prior = shape_prior.clamp(0.0, 1.0);
+    let gate = (0.28 + field_feasibility * 0.62 + shape_prior * 0.16).clamp(0.18, 1.14);
+    (technical_score.clamp(0.0, 1.0) * gate + field_feasibility * 0.08).clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KillerPassTargetAssessment {
     pub(crate) target_id: usize,
@@ -16612,6 +16690,9 @@ impl WorldSnapshot {
                 first_time_shot_score: 0.0,
                 first_time_pass_score: 0.0,
                 control_touch_score: 0.0,
+                first_time_pass_field_feasibility: 0.0,
+                first_time_shot_field_feasibility: 0.0,
+                first_touch_shape_prior: 0.0,
                 skill_top_speed: 0.0,
                 skill_acceleration: 0.0,
                 skill_stamina: 0.0,
@@ -16720,6 +16801,7 @@ impl WorldSnapshot {
         let team_directive = self.tactical_directive(me.team);
         let team_brain_mode = team_brain_mode_for(me.team, self.phase, self.possession_team());
         let team_shape = team_shape_observation_from_snapshot(self, me.team, self.ball.position);
+        let formation_lp_guidance = self.formation_lp_guidance_for(player_id);
         let goal = Vec2::new(self.field_width * 0.5, me.team.goal_y(self.field_length));
         let own_goal = Vec2::new(
             self.field_width * 0.5,
@@ -17049,6 +17131,8 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let yards_to_goal = (goal.y - me_position.y).abs();
+        let opponent_goal_angle_degrees = self.goal_angle_degrees(me_position, me.team);
         let incoming = me.incoming_ball.as_ref().filter(|context| {
             self.tick.saturating_sub(context.received_tick) <= FIRST_TOUCH_WINDOW_TICKS
         });
@@ -17092,36 +17176,79 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let first_touch_shape_prior = if first_touch_available {
+            first_touch_shape_prior_for_snapshot(team_directive, team_shape, formation_lp_guidance)
+        } else {
+            0.0
+        };
+        let first_time_pass_field_feasibility = if first_touch_available {
+            first_time_pass_field_feasibility_for_snapshot(
+                &visible_pass_targets,
+                floor_pass_lane_score,
+                best_floor_pass_quality,
+                best_floor_pass_stride_fit,
+                forward_support_context,
+                threaded_goal_pass_assessment,
+                first_touch_shape_prior,
+            )
+        } else {
+            0.0
+        };
+        let first_time_shot_field_feasibility = if first_touch_available {
+            first_time_shot_field_feasibility_for_snapshot(
+                team_directive,
+                yards_to_goal,
+                opponent_goal_angle_degrees,
+                first_time_shot_block_probability,
+                opposing_goalkeeper_out_of_position,
+                first_touch_shape_prior,
+            )
+        } else {
+            0.0
+        };
         let first_time_shot_score = if first_touch_available {
-            first_time_shot_score_for_player(
+            let technical_score = first_time_shot_score_for_player(
                 me,
                 incoming_kind,
                 first_time_shot_block_probability,
-                (goal.y - me_position.y).abs(),
-                self.goal_angle_degrees(me_position, me.team),
+                yards_to_goal,
+                opponent_goal_angle_degrees,
                 perceived_pressure,
+            );
+            first_touch_release_score_with_field_feasibility(
+                technical_score,
+                first_time_shot_field_feasibility,
+                first_touch_shape_prior,
             )
         } else {
             0.0
         };
         let first_time_pass_score = if first_touch_available {
-            first_time_pass_score_for_player(me, incoming_kind, perceived_pressure)
-        } else {
-            0.0
-        };
-        let control_touch_score = if first_touch_available {
-            control_touch_score_for_player(
-                me,
-                incoming_kind,
-                incoming_speed_yps,
-                perceived_pressure,
+            let technical_score =
+                first_time_pass_score_for_player(me, incoming_kind, perceived_pressure);
+            first_touch_release_score_with_field_feasibility(
+                technical_score,
+                first_time_pass_field_feasibility,
+                first_touch_shape_prior,
             )
         } else {
             0.0
         };
+        let control_touch_score = if first_touch_available {
+            let technical_score = control_touch_score_for_player(
+                me,
+                incoming_kind,
+                incoming_speed_yps,
+                perceived_pressure,
+            );
+            let release_field = first_time_pass_field_feasibility
+                .max(first_time_shot_field_feasibility)
+                .clamp(0.0, 1.0);
+            (technical_score + (1.0 - release_field) * 0.16).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let shot_lane_open = has_ball && shot_block_probability <= 0.34;
-        let yards_to_goal = (goal.y - me_position.y).abs();
-        let opponent_goal_angle_degrees = self.goal_angle_degrees(me_position, me.team);
         let forward_dribble_space_yards = if has_ball {
             self.forward_dribble_space_yards(player_id)
         } else {
@@ -17267,7 +17394,6 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let formation_lp_guidance = self.formation_lp_guidance_for(player_id);
         let formation_lp_recommended_move_yards = formation_lp_guidance
             .map(|guidance| finite_metric(guidance.recommended_move_yards))
             .unwrap_or(0.0);
@@ -17471,6 +17597,9 @@ impl WorldSnapshot {
             first_time_shot_score,
             first_time_pass_score,
             control_touch_score,
+            first_time_pass_field_feasibility,
+            first_time_shot_field_feasibility,
+            first_touch_shape_prior,
             skill_top_speed: me.skills.top_speed,
             skill_acceleration: me.skills.acceleration,
             skill_stamina: me.skills.stamina,

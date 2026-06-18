@@ -3541,52 +3541,9 @@ pub(crate) fn soccer_defensive_cross_arrival_mark_target(
 // --- Fore-aft (depth) inter-line padding -------------------------------------
 // `relational_shape_cohesion_target` only pulls a player toward its nearest HOME
 // neighbours — which, in a back-four / midfield-three / front-three, are
-// same-line teammates. That preserves LATERAL (intra-line) spacing but leaves
-// the FORE-AFT gaps BETWEEN the Defender / Midfielder / Forward lines with no
-// restoring force, so the lines drift together and compact vertically (the
-// "lines too close fore/aft" symptom). These bound a soft, capped, deadzoned
-// y-only nudge that keeps adjacent lines at least PADDING yards apart in depth.
-// A nudge, never a hard constraint — a ball pinging end-to-end must stay
-// chaseable, so we never pin a player against this.
-pub(crate) const FORE_AFT_LINE_PADDING_YARDS: f64 = 9.0;
-pub(crate) const FORE_AFT_LINE_PADDING_MAX_NUDGE_YARDS: f64 = 1.6;
-pub(crate) const FORE_AFT_LINE_PADDING_MIN_LINE_MEMBERS: usize = 2;
-
-// Strict inter-line bands (each line held relative to the line directly BEHIND it).
-// Midfielders sit 2-18 yd ahead of the defensive line; strikers 3-20 yd ahead of the
-// midfield line. Enforced per player with a grace window (3 s for the midfield line,
-// 5 s for the strikers): while a player is out of band its `inter_line_band_clocks`
-// timer runs, and once it passes the grace the nudge escalates from a soft pull to a
-// strict correction — eventual consistency that still allows brief, deliberate runs.
-pub(crate) const MIDFIELD_AHEAD_OF_DEFENSE_MIN_YARDS: f64 = 2.0;
-pub(crate) const MIDFIELD_AHEAD_OF_DEFENSE_MAX_YARDS: f64 = 18.0;
-pub(crate) const STRIKER_AHEAD_OF_MIDFIELD_MIN_YARDS: f64 = 3.0;
-pub(crate) const STRIKER_AHEAD_OF_MIDFIELD_MAX_YARDS: f64 = 20.0;
-pub(crate) const MIDFIELD_BAND_GRACE_SECONDS: f64 = 3.0;
-pub(crate) const STRIKER_BAND_GRACE_SECONDS: f64 = 5.0;
-// Soft (pre-grace) keeps the gentle, capped feel of the legacy padding; strict
-// (post-grace) corrects most of the violation in a tick so the band actually holds.
-pub(crate) const INTER_LINE_BAND_SOFT_GAIN: f64 = 0.5;
-pub(crate) const INTER_LINE_BAND_STRICT_GAIN: f64 = 0.9;
-pub(crate) const INTER_LINE_BAND_STRICT_MAX_NUDGE_YARDS: f64 = 8.0;
-// The clock decays faster than it fills so a brief dip into band doesn't reset a
-// sustained violation, but a genuine return to band clears it within ~2 s.
-pub(crate) const INTER_LINE_BAND_CLOCK_DECAY_RATE: f64 = 1.5;
-
-// Compactness toward the ball. Off-ball players continuously drift toward the ball,
-// bounded by their teammate padding (territory-spacing nudge) and their inter-line
-// band (fore-aft cap) — "move to the ball until you reach your padding". Within the
-// deadzone they are already close enough; beyond it the per-tick target bias is a
-// capped fraction of the over-distance.
-pub(crate) const BALL_COMPACTNESS_DEADZONE_YARDS: f64 = 8.0;
-pub(crate) const BALL_COMPACTNESS_GAIN: f64 = 0.18;
-pub(crate) const BALL_COMPACTNESS_MAX_NUDGE_YARDS: f64 = 3.0;
-// A loose ball with an opponent within this radius is contested — pull harder and more
-// directly to go win it. A totally uncontested loose ball gets the ordinary (calmer) pull.
-pub(crate) const FREE_BALL_CONTEST_RADIUS_YARDS: f64 = 12.0;
-pub(crate) const FREE_BALL_COMPACTNESS_GAIN_MULT: f64 = 1.8;
-pub(crate) const FREE_BALL_COMPACTNESS_MAX_MULT: f64 = 1.6;
-
+// same-line teammates. That preserves LATERAL (intra-line) spacing; the FORE-AFT gaps
+// BETWEEN the Defender / Midfielder / Forward lines are owned by the pinned team-line
+// structure stage (`defensive_line_cushion` / `midfield_line_band` / `forward_line_band`).
 pub(crate) fn relational_shape_cohesion_target(
     roster: &[(usize, Team, PlayerRole, Vec2, Vec2)],
     me_id: usize,

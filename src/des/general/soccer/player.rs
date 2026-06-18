@@ -846,6 +846,89 @@ fn mpc_execution_estimate_for_action(
         return estimate;
     }
 
+    if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+        let observation = snapshot.observation_for(player.id);
+        let first_time = matches!(label, "first-time-shot" | "first-time-header");
+        let finish_skill = if label == "first-time-header" {
+            aerial_duel_skill_from_agent(player)
+        } else {
+            (ability01(
+                player
+                    .skills
+                    .right_foot_shot_power
+                    .max(player.skills.left_foot_shot_power),
+            ) * 0.62
+                + ability01(player.skills.shooting) * 0.26
+                + ability01(player.skills.first_touch) * 0.12)
+                .clamp(0.0, 1.0)
+        };
+        let shot_power = if first_time {
+            shot_power_for_finish_skill(finish_skill)
+        } else {
+            shot_power_for_skill(ability01(player.skills.shooting))
+        };
+        let shot_speed = shot_speed_yps_from_power(shot_power, &player.skills);
+        let frame_fit = observation.shot_on_frame_probability.clamp(0.0, 1.0);
+        let keeper_fit = observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0);
+        let block_fit = (1.0 - observation.shot_block_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let angle_fit = (observation.opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0);
+        let first_touch_fit = if first_time {
+            observation.first_time_shot_score.clamp(0.0, 1.0)
+        } else {
+            0.72
+        };
+        let body_fit = if first_time {
+            ball_context.body_mechanics_fit
+        } else {
+            (0.72 + ball_context.body_mechanics_fit * 0.28).clamp(0.0, 1.0)
+        };
+        estimate.execution_probability = ((0.04
+            + frame_fit * 0.26
+            + keeper_fit * 0.22
+            + block_fit * 0.20
+            + angle_fit * 0.08
+            + finish_skill * 0.10
+            + first_touch_fit * 0.10)
+            * body_fit)
+            .clamp(0.0, 0.99);
+        estimate.recommended_speed_yps = shot_speed;
+        estimate.recommended_curve = if observation.shot_curl_probability >= 0.36 {
+            if current.x >= snapshot.field_width * 0.5 {
+                "left"
+            } else {
+                "right"
+            }
+        } else {
+            "none"
+        };
+        estimate.recommended_curve_bend_yards = if estimate.recommended_curve == "none" {
+            0.0
+        } else {
+            (0.45 + observation.yards_to_goal / 28.0).clamp(0.45, 2.2)
+        };
+        estimate.recommended_spin_rps =
+            (estimate.recommended_curve_bend_yards / observation.yards_to_goal.max(1.0)
+                * shot_speed.max(1.0)
+                * 0.38)
+                .clamp(0.0, 8.0);
+        estimate.reselect_reason =
+            if first_time && ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60
+            {
+                "mpc-ball-touch-window-closing"
+            } else if first_time && observation.first_time_shot_score < 0.20 {
+                "mpc-first-time-shot-low-contact"
+            } else if observation.shot_block_probability >= SHOT_BLOCK_BAILOUT_MAX_PROBABILITY {
+                "mpc-shot-blocked"
+            } else if estimate.execution_probability
+                < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+            {
+                "mpc-shot-low-execution"
+            } else {
+                ""
+            };
+        return estimate;
+    }
+
     if matches!(
         label,
         "dribble"
@@ -1062,9 +1145,12 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
             | "aerial-pass1"
             | "pass"
             | "pass1"
+            | "first-time-pass"
             | "killer-pass"
             | "switch-play"
             | "recycle-reset"
+            | "first-time-shot"
+            | "first-time-header"
             | "dribble"
             | "carry-forward"
             | "carry-out-left"
@@ -1092,6 +1178,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         "wall-pass"
         | "pass"
         | "pass1"
+        | "first-time-pass"
         | "killer-pass"
         | "switch-play"
         | "recycle-reset"
@@ -1100,6 +1187,16 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
             ability01(player.skills.passing_completion_rate) * 0.56
                 + ability01(player.skills.vision) * 0.28
                 + ability01(player.skills.first_touch) * 0.16
+        }
+        "first-time-shot" | "first-time-header" => {
+            ability01(player.skills.shooting) * 0.42
+                + ability01(
+                    player
+                        .skills
+                        .right_foot_shot_power
+                        .max(player.skills.left_foot_shot_power),
+                ) * 0.32
+                + ability01(player.skills.first_touch) * 0.26
         }
         _ => {
             ability01(player.skills.acceleration) * 0.42
@@ -2448,6 +2545,15 @@ impl PlayerAgent {
         let quick_pressure_bonus = 1.0
             + observation.perceived_pressure.clamp(0.0, 1.0) * 0.24
             + observation.decision_urgency.clamp(0.0, 1.0) * 0.18;
+        let pass_field_fit = observation.first_time_pass_field_feasibility.clamp(0.0, 1.0);
+        let shot_field_fit = observation.first_time_shot_field_feasibility.clamp(0.0, 1.0);
+        let shape_prior = observation.first_touch_shape_prior.clamp(0.0, 1.0);
+        let pass_field_multiplier = (0.72 + pass_field_fit * 0.30 + shape_prior * 0.08)
+            .clamp(0.46, 1.10);
+        let shot_field_multiplier = (0.70 + shot_field_fit * 0.32 + shape_prior * 0.08)
+            .clamp(0.44, 1.10);
+        let control_field_multiplier =
+            (1.0 + (1.0 - pass_field_fit.max(shot_field_fit)) * 0.18).clamp(1.0, 1.18);
         let killer_pressure = observation
             .killer_pass_goal_pressure
             .max(killer_pass_goal_pressure_score(observation))
@@ -2463,6 +2569,7 @@ impl PlayerAgent {
             && killer_pressure >= 0.32;
         let killer_pass_score = (observation.first_time_pass_score
             * quick_pressure_bonus
+            * pass_field_multiplier
             * (0.72
                 + killer_pressure * 0.66
                 + threaded_quality * 0.28
@@ -2475,19 +2582,28 @@ impl PlayerAgent {
         let mut options = vec![
             AgentActionOptionTrace::new(
                 shot_label,
-                (observation.first_time_shot_score * quick_pressure_bonus * 0.52).clamp(0.01, 0.64),
+                (observation.first_time_shot_score
+                    * quick_pressure_bonus
+                    * shot_field_multiplier
+                    * 0.52)
+                    .clamp(0.01, 0.64),
                 shot_legal,
             ),
             AgentActionOptionTrace::new("killer-pass", killer_pass_score, killer_pass_legal),
             AgentActionOptionTrace::new(
                 "first-time-pass",
-                (observation.first_time_pass_score * quick_pressure_bonus * 0.86).clamp(0.02, 0.88),
+                (observation.first_time_pass_score
+                    * quick_pressure_bonus
+                    * pass_field_multiplier
+                    * 0.86)
+                    .clamp(0.02, 0.88),
                 pass_legal,
             ),
             AgentActionOptionTrace::new(
                 "flick-on",
                 (observation.first_time_pass_score
                     * quick_pressure_bonus
+                    * pass_field_multiplier
                     * (0.34
                         + ability01(self.skills.first_touch) * 0.30
                         + ability01(self.skills.flair_passing) * 0.18
@@ -2497,7 +2613,9 @@ impl PlayerAgent {
             ),
             AgentActionOptionTrace::new(
                 control_label,
-                (observation.control_touch_score * (1.12 - observation.perceived_pressure * 0.18))
+                (observation.control_touch_score
+                    * control_field_multiplier
+                    * (1.12 - observation.perceived_pressure * 0.18))
                     .clamp(0.02, 0.95),
                 true,
             ),
@@ -3848,6 +3966,7 @@ impl PlayerAgent {
                 pass_targets.len(),
                 aerial_pass_targets.len(),
             );
+            let mut forced_first_touch_order = Vec::new();
             if goal_attack_shot_blocks_alternatives(&observation, self.role) {
                 let is_aerial = matches!(
                     observation.incoming_ball_kind,
@@ -3870,24 +3989,32 @@ impl PlayerAgent {
                 } else {
                     "first-time-shot"
                 };
-                self.last_decision = Some(self.decision_trace(
-                    snapshot,
-                    mdp_state,
-                    observation,
-                    belief,
-                    vec![
+                if mpc_reselects_candidate(snapshot, self, &action, action_label) {
+                    forced_first_touch_order.extend([
                         "first-touch-goalmouth-window".to_string(),
                         "must-shoot".to_string(),
-                    ],
-                    single_action_option(action_label),
-                    &action,
-                    action_label,
-                ));
-                return PlayerIntent {
-                    player_id: self.id,
-                    action,
-                    sprint: false,
-                };
+                        format!("first-touch-mpc-reselect:{action_label}"),
+                    ]);
+                } else {
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state,
+                        observation,
+                        belief,
+                        vec![
+                            "first-touch-goalmouth-window".to_string(),
+                            "must-shoot".to_string(),
+                        ],
+                        single_action_option(action_label),
+                        &action,
+                        action_label,
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
             }
             let weighted_ops = action_options
                 .iter()
@@ -3899,7 +4026,8 @@ impl PlayerAgent {
                 })
                 .collect::<Vec<_>>();
             let ops = weighted_fisher_yates_order(weighted_ops, rng);
-            let mut order_names = Vec::with_capacity(ops.len());
+            let mut order_names = forced_first_touch_order;
+            order_names.reserve(ops.len());
             let mut chosen = None;
             for op in ops {
                 order_names.push(op.clone());
@@ -3922,55 +4050,95 @@ impl PlayerAgent {
                                     .max(self.skills.left_foot_shot_power),
                             )
                         };
-                        chosen = Some((
-                            SoccerAction::Shoot {
-                                power: shot_power_for_finish_skill(finish_skill),
-                            },
-                            normalize_soccer_action_label(&op).to_string(),
-                        ));
+                        let candidate_label = normalize_soccer_action_label(&op).to_string();
+                        let candidate_action = SoccerAction::Shoot {
+                            power: shot_power_for_finish_skill(finish_skill),
+                        };
+                        if mpc_reselects_candidate(
+                            snapshot,
+                            self,
+                            &candidate_action,
+                            &candidate_label,
+                        ) {
+                            order_names.push(format!(
+                                "first-touch-mpc-reselect:{candidate_label}"
+                            ));
+                            continue;
+                        }
+                        chosen = Some((candidate_action, candidate_label));
                         break;
                     }
                     "killer-pass" if !pass_targets.is_empty() => {
                         if let Some(target) =
                             snapshot.killer_pass_target_for(self.id, &pass_targets)
                         {
-                            chosen = Some((
-                                SoccerAction::Pass {
-                                    target_player: Some(target),
-                                    power: 0.66
-                                        + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                                    flight: PassFlight::Floor,
-                                },
-                                "killer-pass".to_string(),
-                            ));
+                            let candidate_label = "killer-pass".to_string();
+                            let candidate_action = SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.66
+                                    + 0.24 * passing_skill.max(ability01(self.skills.vision)),
+                                flight: PassFlight::Floor,
+                            };
+                            if mpc_reselects_candidate(
+                                snapshot,
+                                self,
+                                &candidate_action,
+                                &candidate_label,
+                            ) {
+                                order_names.push(format!(
+                                    "first-touch-mpc-reselect:{candidate_label}"
+                                ));
+                                continue;
+                            }
+                            chosen = Some((candidate_action, candidate_label));
                             break;
                         }
                     }
                     "first-time-pass" if !pass_targets.is_empty() => {
                         let target = pass_targets[0];
-                        chosen = Some((
-                            SoccerAction::Pass {
-                                target_player: Some(target),
-                                power: 0.54 + 0.30 * passing_skill,
-                                flight: PassFlight::Floor,
-                            },
-                            "first-time-pass".to_string(),
-                        ));
+                        let candidate_label = "first-time-pass".to_string();
+                        let candidate_action = SoccerAction::Pass {
+                            target_player: Some(target),
+                            power: 0.54 + 0.30 * passing_skill,
+                            flight: PassFlight::Floor,
+                        };
+                        if mpc_reselects_candidate(
+                            snapshot,
+                            self,
+                            &candidate_action,
+                            &candidate_label,
+                        ) {
+                            order_names.push(format!(
+                                "first-touch-mpc-reselect:{candidate_label}"
+                            ));
+                            continue;
+                        }
+                        chosen = Some((candidate_action, candidate_label));
                         break;
                     }
                     "flick-on" if !aerial_pass_targets.is_empty() => {
                         let target = aerial_pass_targets[0];
-                        chosen = Some((
-                            SoccerAction::Pass {
-                                target_player: Some(target),
-                                power: 0.46
-                                    + 0.26
-                                        * aerial_duel_skill_from_agent(self)
-                                            .max(ability01(self.skills.first_touch)),
-                                flight: PassFlight::Aerial,
-                            },
-                            "flick-on".to_string(),
-                        ));
+                        let candidate_label = "flick-on".to_string();
+                        let candidate_action = SoccerAction::Pass {
+                            target_player: Some(target),
+                            power: 0.46
+                                + 0.26
+                                    * aerial_duel_skill_from_agent(self)
+                                        .max(ability01(self.skills.first_touch)),
+                            flight: PassFlight::Aerial,
+                        };
+                        if mpc_reselects_candidate(
+                            snapshot,
+                            self,
+                            &candidate_action,
+                            &candidate_label,
+                        ) {
+                            order_names.push(format!(
+                                "first-touch-mpc-reselect:{candidate_label}"
+                            ));
+                            continue;
+                        }
+                        chosen = Some((candidate_action, candidate_label));
                         break;
                     }
                     "control-touch" => {
