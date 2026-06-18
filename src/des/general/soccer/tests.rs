@@ -647,6 +647,144 @@ fn mpc_pass_execution_prices_lane_and_ball_recipe() {
 }
 
 #[test]
+fn holder_cannot_strike_ball_during_first_touch_settle() {
+    // Regression ("a ghost kicked the ball"): a player who has just won a loose ball
+    // is its `holder` immediately, but a ball won from a stretched trap is still
+    // 1.4–2.8yd out being drawn to the feet over the first-touch settle. Striking it
+    // in that window launched the ball from out there with no player visibly at it.
+    // The strike must wait until the ball has settled within reach.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 74.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let pass = SoccerAction::Pass {
+        target_player: Some(receiver),
+        power: 0.7,
+        flight: PassFlight::Floor,
+    };
+
+    // Ball still ~2yd from the holder's feet (mid-settle): the strike is gated — the
+    // holder keeps possession and the ball is NOT launched.
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 2.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: pass.clone(),
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder,
+        Some(passer),
+        "holder must keep the ball while it is still settling to the feet"
+    );
+    assert!(
+        sim.ball.velocity.len() < 1.0,
+        "ball must not be struck mid-settle (ghost kick); v = {:?}",
+        sim.ball.velocity
+    );
+    assert!(
+        sim.pending_pass.is_none(),
+        "no pass should have launched mid-settle"
+    );
+
+    // Ball now settled at the feet: the same strike releases normally.
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 0.4);
+    sim.ball.velocity = Vec2::zero();
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: pass,
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder, None,
+        "a settled ball at the feet must be released by a strike"
+    );
+    assert!(
+        sim.ball.velocity.len() > 1.0,
+        "a settled strike must launch the ball; v = {:?}",
+        sim.ball.velocity
+    );
+}
+
+#[test]
+fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
+    // Rule B: a forward that lingers offside past the 3s grace is pulled back onside,
+    // unless it is through on goal with the ball / being played in, the opponent last
+    // touched the ball, or it is in its own half.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 77,
+        ..Default::default()
+    });
+    let striker = 9; // Home forward, attacks +y
+    park_players_except(&mut sim, &[striker]);
+    sim.players[striker].role = PlayerRole::Forward;
+    sim.players[striker].team = Team::Home;
+    // Away offside line: keeper deepest (y=118), one defender at y=82 (the 2nd-last =
+    // the offside line), the rest pushed up the pitch so they don't form the line.
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    // Striker offside: opponents' half (>60), beyond the 2nd-last line (82) and the ball.
+    sim.players[striker].position = Vec2::new(40.0, 90.0);
+    sim.ball.position = Vec2::new(40.0, 70.0);
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
+
+    let target = sim
+        .striker_offside_recovery_target(striker)
+        .expect("offside striker beyond grace should be recovered onside");
+    assert!(target.y < 82.0, "recovery must be onside of the 2nd-last line: {target:?}");
+    assert!(target.y < 90.0, "recovery must pull the striker back (lower y): {target:?}");
+
+    // Within grace: not yet recovered (free to make the run).
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS - 0.5);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "within the grace window the striker keeps its run"
+    );
+
+    // Opponent last touched the ball: cannot be offside.
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
+    sim.ball.last_touch_team = Some(Team::Away);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "cannot be offside off the opponents' touch"
+    );
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    // Through on goal WITH the ball: exempt.
+    sim.ball.holder = Some(striker);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "a striker through with the ball is exempt"
+    );
+    sim.ball.holder = None;
+
+    // In its own half: cannot be offside.
+    sim.players[striker].position = Vec2::new(40.0, 50.0);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "cannot be offside in its own half"
+    );
+}
+
+#[test]
 fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -34900,8 +35038,12 @@ fn flank_cross_arrival_support_reward_prefers_box_arrival_runs() {
         &SoccerTacticalLearningWeights::default(),
     );
 
+    // Margin 0.7 (was 0.75): the attack spacing band's "too isolated" ceiling was
+    // widened (ATTACK_SPACING_MAX 10 -> 17) so attackers can stretch, which makes a
+    // small drift away marginally less penalised. The box-arrival run is still strongly
+    // preferred (closing ~0.95 vs drifting ~0.20); only the absolute margin tightened.
     assert!(
-            closing_reward > drifting_reward + 0.75,
+            closing_reward > drifting_reward + 0.7,
             "cross-arrival support run should be learned as better than drifting away: closing={closing_reward} drifting={drifting_reward}"
         );
     assert!(

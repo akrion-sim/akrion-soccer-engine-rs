@@ -7629,6 +7629,73 @@ impl SoccerMatch {
         }
     }
 
+    /// Rule B helper: if a FORWARD has lingered in a genuine offside position beyond the
+    /// `OFFSIDE_GRACE_SECONDS` window, return the spot to jog back to to get onside;
+    /// otherwise `None`. "Offside" is the real thing — in the opponents' half, beyond the
+    /// 2nd-last opponent (the keeper counts as a defender) AND beyond the ball, with our
+    /// team the last to touch it. A striker through on goal WITH the ball, or the intended
+    /// receiver of an in-flight pass, is exempt and keeps its run.
+    pub(crate) fn striker_offside_recovery_target(&self, player_id: usize) -> Option<Vec2> {
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if me.role != PlayerRole::Forward {
+            return None;
+        }
+        // Through on goal WITH the ball, or being played in — keep the run.
+        if self.ball.holder == Some(player_id) {
+            return None;
+        }
+        if self.pending_pass.as_ref().and_then(|pass| pass.target) == Some(player_id) {
+            return None;
+        }
+        // Can't be offside off the opponents' touch — only when our team last played it.
+        if self.ball.last_touch_team != Some(me.team) {
+            return None;
+        }
+        // Must have lingered offside past the grace window (offside_clocks accrue only in
+        // the opponents' half, beyond the line and the ball — see update_offside_lingering).
+        if self.offside_clocks.get(&player_id).copied().unwrap_or(0.0) <= OFFSIDE_GRACE_SECONDS {
+            return None;
+        }
+        // Confirm STILL offside now (guards a stale clock from a prior possession): in the
+        // opponents' half, beyond the 2nd-last opponent (keeper included), beyond the ball.
+        let pos = me.position;
+        let attack_dir = me.team.attack_dir();
+        let half_line = self.config.field_length_yards * 0.5;
+        if (pos.y - half_line) * attack_dir <= 0.0 {
+            return None;
+        }
+        let mut opp_ys: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team.other())
+            .map(|p| p.position.y)
+            .collect();
+        if opp_ys.len() < 2 {
+            return None;
+        }
+        // index 1 = the second-last opponent in the attacking direction.
+        match me.team {
+            Team::Home => {
+                opp_ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))
+            }
+            Team::Away => {
+                opp_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            }
+        }
+        let line_y = opp_ys[1];
+        let beyond_line = (pos.y - line_y) * attack_dir > 0.0;
+        let beyond_ball = (pos.y - self.ball.position.y) * attack_dir > 0.0;
+        if !beyond_line || !beyond_ball {
+            return None;
+        }
+        // Jog back to just onside of the 2nd-last line, holding lateral position.
+        let onside_y = line_y - STRIKER_ONSIDE_BUFFER_YARDS * attack_dir;
+        Some(
+            Vec2::new(pos.x, onside_y)
+                .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards),
+        )
+    }
+
     pub(crate) fn apply_player_intent(&mut self, intent: PlayerIntent) {
         if intent.player_id >= self.players.len() {
             return;
@@ -7674,6 +7741,52 @@ impl SoccerMatch {
         }
         let player_pos = self.players[player_id].position;
         let player_team = self.players[player_id].team;
+        // First-touch settle gate: a holder is the ball's owner (`has_ball`) the
+        // instant control is won, but a ball won from a stretched trap is still 1.4–2.8yd
+        // out being drawn to the feet over ~2 ticks (see CONTROL_FIRST_TOUCH_SETTLE_*).
+        // Striking it in that window launched the ball from out there (or teleported it
+        // onto the feet first) — a "ghost kick" with no player visibly at the ball. Until
+        // the ball has settled within strike reach, downgrade any ball-RELEASE to a
+        // settling touch: step onto the ball and keep possession; `sync_held_ball_to_holder`
+        // draws it smoothly to the feet, and the strike fires cleanly a tick later.
+        if self.ball.holder == Some(player_id)
+            && matches!(
+                intent.action,
+                SoccerAction::Pass { .. }
+                    | SoccerAction::Clearance { .. }
+                    | SoccerAction::RouteOne { .. }
+                    | SoccerAction::Shoot { .. }
+            )
+            && player_pos.distance(self.ball.position) > CONTROLLED_STRIKE_REACH_YARDS
+        {
+            let ball_pos = self.ball.position;
+            self.move_player_towards(player_id, ball_pos, false);
+            let settle_facing =
+                facing_bucket_from_vector(ball_pos - self.players[player_id].position);
+            if settle_facing != FacingBucket::Unknown {
+                self.players[player_id].action_facing = settle_facing;
+            }
+            return;
+        }
+        // Rule B (striker onside discipline): a forward that has loitered in an offside
+        // position beyond the 3s grace is pulled back onside — at a jog, no forced sprint
+        // (soft, eventual consistency). Offside here is the real thing (opponents' half,
+        // beyond the 2nd-last opponent incl. the keeper, beyond the ball, our ball last).
+        // A striker through ON GOAL WITH THE BALL, or the target of an in-flight pass, is
+        // exempt and keeps its run. Overrides off-ball movement only.
+        if matches!(
+            intent.action,
+            SoccerAction::HoldShape
+                | SoccerAction::MoveTo(_)
+                | SoccerAction::Dribble(_)
+                | SoccerAction::DribbleMove { .. }
+                | SoccerAction::ControlTouch { .. }
+        ) {
+            if let Some(onside) = self.striker_offside_recovery_target(player_id) {
+                self.move_player_towards(player_id, onside, false);
+                return;
+            }
+        }
         match intent.action {
             SoccerAction::HoldShape => {
                 let target = self.players[player_id].home_position;
@@ -9963,13 +10076,19 @@ impl SoccerMatch {
     /// Falls back to the single intended-target offside if no broader candidate list was
     /// recorded (e.g. a pass constructed directly in a test).
     fn effective_offside_candidates(&self) -> Vec<PendingOffside> {
-        let Some(pass) = self.pending_pass.as_ref() else {
-            return Vec::new();
-        };
-        if !pass.offside_candidates.is_empty() {
-            return pass.offside_candidates.clone();
+        if let Some(pass) = self.pending_pass.as_ref() {
+            if !pass.offside_candidates.is_empty() {
+                return pass.offside_candidates.clone();
+            }
+            return pass.offside.clone().into_iter().collect();
         }
-        pass.offside.clone().into_iter().collect()
+        // No pending pass, but an untargeted long ball (clearance / route-one / hoof) is
+        // still a ball played by our team — a teammate offside when it was launched is
+        // flagged if they receive it.
+        if let Some(flight) = self.ball.untargeted_long_ball_flight.as_ref() {
+            return flight.offside_candidates.clone();
+        }
+        Vec::new()
     }
 
     pub(crate) fn call_pending_offside_interference_before_control_if_needed(
@@ -10020,16 +10139,19 @@ impl SoccerMatch {
                 let incoming_context = self.pending_pass.as_ref().map(|pass| {
                     incoming_context_from_pass(pass, holder, self.ball.velocity.len(), self.tick)
                 });
+                // Capture the offside candidates BEFORE the untargeted-long-ball flight is
+                // cleared below (for an untargeted ball the candidates live on the flight,
+                // so reading them after the clear would always come back empty).
+                let offside_candidates_at_control = self.effective_offside_candidates();
                 self.ball.holder = Some(holder);
                 self.ball.altitude_yards = 0.0;
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 self.ball.last_touch_team = Some(holder_team);
-                // Any attacker who was offside at the moment of the pass and is now the one
-                // controlling the ball is interfering with play — flag them, not only the
-                // pass's intended target.
-                if let Some(offside) = self
-                    .effective_offside_candidates()
+                // Any attacker who was offside at the moment the ball was played and is now
+                // the one controlling it is interfering with play — flag them, not only a
+                // targeted pass's intended receiver.
+                if let Some(offside) = offside_candidates_at_control
                     .into_iter()
                     .find(|offside| offside.target == holder && offside.team == holder_team)
                 {
@@ -11920,9 +12042,11 @@ impl SoccerMatch {
         };
         let ball_y = after.ball.position.y;
         let attack_dir = attacking_team.attack_dir();
+        let half_line = after.field_length * 0.5;
         let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
-        // An attacker is in an offside position when they are beyond both the
-        // second-last defender line and the ball in the attacking direction.
+        // An attacker is in an offside position when they are, IN THE OPPONENTS' HALF,
+        // beyond both the second-last defender line and the ball in the attacking
+        // direction. (You cannot be offside in your own half — Law 11.)
         let states: Vec<(usize, bool, f64)> = self
             .players
             .iter()
@@ -11930,7 +12054,9 @@ impl SoccerMatch {
             .map(|p| {
                 let pos_y = after.player_position(p.id).unwrap_or(p.position).y;
                 let beyond_line = (pos_y - line_y) * attack_dir;
-                let offside = beyond_line > 0.0 && (pos_y - ball_y) * attack_dir > 0.0;
+                let in_opp_half = (pos_y - half_line) * attack_dir > 0.0;
+                let offside =
+                    in_opp_half && beyond_line > 0.0 && (pos_y - ball_y) * attack_dir > 0.0;
                 // Yards past the last-defender line — the distance dimension.
                 (p.id, offside, beyond_line.max(0.0))
             })
@@ -12424,6 +12550,10 @@ impl SoccerMatch {
         if self.ball.holder != Some(player_id) {
             return;
         }
+        // Offside candidates at the moment of the hoof (positions/ball still at the
+        // launcher's feet), captured before the ball is launched so a teammate who was
+        // offside when it was played is flagged if they go on to receive it.
+        let offside_candidates = WorldSnapshot::from_match(self).offside_candidates_for_pass(player_id);
         let player = &self.players[player_id];
         let player_team = player.team;
         let player_pos = player.position;
@@ -12452,6 +12582,7 @@ impl SoccerMatch {
             target,
             launch_speed_yps: speed,
             distance_yards: player_pos.distance(target),
+            offside_candidates,
         });
         self.players[player_id].incoming_ball = None;
         self.pending_pass = None;
@@ -22517,7 +22648,19 @@ impl WorldSnapshot {
         if let Some(target) = target {
             let adjusted = self.defensive_line_cushion_adjusted_target(intent.player_id, target);
             if adjusted.distance(target) > 1e-6 {
-                intent.sprint = true;
+                // 3s grace / eventual consistency: only SPRINT to recover the band when the
+                // correction is large. A small drift (a couple of yards) is closed at the
+                // defender's own walk/jog pace inside the grace window, not a frantic
+                // sprint-snap on every micro-correction.
+                let travel = self
+                    .players
+                    .iter()
+                    .find(|p| p.id == intent.player_id)
+                    .map(|p| self.player_snapshot_position(p).distance(adjusted))
+                    .unwrap_or(0.0);
+                if travel > DEFENSIVE_LINE_GRACE_JOG_YARDS {
+                    intent.sprint = true;
+                }
                 match &mut intent.action {
                     SoccerAction::HoldShape => intent.action = SoccerAction::MoveTo(adjusted),
                     SoccerAction::MoveTo(target)
