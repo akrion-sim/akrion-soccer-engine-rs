@@ -35079,6 +35079,55 @@ fn defenders_and_midfielders_preserve_vertical_lanes_by_phase() {
 }
 
 #[test]
+fn lane_affinity_pmf_is_markovian_and_role_shaped() {
+    // Strikers: no lane affinity at all (free to roam).
+    assert!(lane_affinity_distribution(PlayerRole::Forward, 6.0).is_none());
+    assert_eq!(lane_affinity_strength(PlayerRole::Forward, false), 0.0);
+    assert_eq!(lane_affinity_strength(PlayerRole::Forward, true), 0.0);
+
+    // Defenders, midfielders and the keeper get a proper PMF over the 12 lanes that
+    // sums to 1.0 (Markovian), peaked at their home lane, at every home position.
+    for role in [
+        PlayerRole::Defender,
+        PlayerRole::Midfielder,
+        PlayerRole::Goalkeeper,
+    ] {
+        for home_lane in [0.0, 3.0, 5.5, 8.0, 11.0] {
+            let dist = lane_affinity_distribution(role, home_lane).unwrap();
+            let sum: f64 = dist.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "{role:?}@{home_lane} sum={sum}");
+            let peak = dist.iter().cloned().fold(f64::MIN, f64::max);
+            let peak_lane = dist.iter().position(|&v| v == peak).unwrap();
+            assert!(
+                (peak_lane as f64 - home_lane).abs() <= 1.0,
+                "{role:?} peak lane {peak_lane} should sit at home lane {home_lane}"
+            );
+        }
+    }
+
+    // Defenders hold a TIGHTER channel than midfielders (more mass on the home lane).
+    let def = lane_affinity_distribution(PlayerRole::Defender, 5.0).unwrap();
+    let mid = lane_affinity_distribution(PlayerRole::Midfielder, 5.0).unwrap();
+    assert!(
+        def[5] > mid[5],
+        "defender channel should be tighter than midfielder: def={} mid={}",
+        def[5],
+        mid[5]
+    );
+
+    // In possession the pull halves (until the ball is given away).
+    for role in [PlayerRole::Defender, PlayerRole::Midfielder] {
+        let out_of_possession = lane_affinity_strength(role, false);
+        let in_possession = lane_affinity_strength(role, true);
+        assert!(
+            (in_possession - out_of_possession * LANE_AFFINITY_IN_POSSESSION_SCALE).abs() < 1e-9,
+            "{role:?} in-possession affinity should be halved"
+        );
+        assert!(in_possession < out_of_possession);
+    }
+}
+
+#[test]
 fn pomdp_q_state_and_neural_features_track_lane_and_teammate_congestion() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let midfielder = 6;

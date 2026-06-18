@@ -3117,13 +3117,10 @@ fn role_vertical_lane_range(
 }
 
 fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
-    // Strength of the pull back into the home lane (0 = free, 1 = hard). These were
-    // tuned against the OLD ~20yd quarter-pitch lanes; the grid now has 12 lanes
-    // (~6.7yd), so the same commitment clamps ~3x tighter. Scaled DOWN to compensate
-    // (2026-06-18): net discipline is still tighter than the old 4-lane band (a
-    // narrower channel), but a defender can still step out of its lane to close down
-    // the ball or a full-back can overlap in possession. Defending > in-possession
-    // (you hold your channel off the ball; you stretch wide when attacking).
+    // Legacy scalar pull back into the home lane (0 = free, 1 = hard), tuned to the
+    // current 4-lane (~20yd quarter-pitch) `VERTICAL_LANE_COUNT`. The richer
+    // per-player 12-lane Markovian affinity (`lane_affinity_distribution` /
+    // `lane_affinity_strength`) is being layered in to replace this.
     match role {
         PlayerRole::Goalkeeper => 1.0,
         PlayerRole::Defender if in_possession => 0.90,
@@ -3132,6 +3129,84 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
         PlayerRole::Midfielder => 0.80,
         PlayerRole::Forward if in_possession => 0.0,
         PlayerRole::Forward => 0.70,
+    }
+}
+
+// ---- Markovian per-player lane affinity over the 12 grid lanes -------------------
+// Each outfielder's *zonal proclivity* is a probability distribution over the 12
+// vertical grid lanes (PITCH_GENOME_LANES) that sums to 1.0 — a true PMF, so it is
+// Markovian. It is a smooth bell centred on the player's home lane: defenders hold a
+// tight channel, midfielders a broad one, strikers have NONE (they roam freely). The
+// distribution is the resting zonal shape; two things override it (handled elsewhere
+// as movement RELIEF, not here): a defender man-marking snaps onto its runner, and an
+// attacker makes cutting runs into open space. And in possession the affinity's PULL
+// halves (`lane_affinity_strength`) until the ball is given away — the team stretches.
+const LANE_AFFINITY_LANE_COUNT: usize =
+    crate::des::general::soccer_genome::PITCH_GENOME_LANES as usize;
+const LANE_AFFINITY_SIGMA_DEFENDER: f64 = 1.3;
+const LANE_AFFINITY_SIGMA_MIDFIELDER: f64 = 2.0;
+const LANE_AFFINITY_SIGMA_KEEPER: f64 = 0.6;
+const LANE_AFFINITY_BASE_STRENGTH_DEFENDER: f64 = 0.80;
+const LANE_AFFINITY_BASE_STRENGTH_MIDFIELDER: f64 = 0.80;
+const LANE_AFFINITY_BASE_STRENGTH_KEEPER: f64 = 1.0;
+/// In possession the team spreads and roams, so lane affinity's pull / tie-break
+/// weight drops to this fraction until possession is lost (the PMF *shape* is
+/// unchanged — only its influence). The user's "affinity disappears by 50%".
+const LANE_AFFINITY_IN_POSSESSION_SCALE: f64 = 0.5;
+
+/// `home_x` -> a continuous lane coordinate in `0..LANE_AFFINITY_LANE_COUNT`.
+fn lane_affinity_home_lane(home_x: f64, field_width: f64) -> f64 {
+    let width = field_width.max(1.0);
+    let lane_width = width / LANE_AFFINITY_LANE_COUNT as f64;
+    (home_x / lane_width).clamp(0.0, (LANE_AFFINITY_LANE_COUNT - 1) as f64)
+}
+
+/// The Markovian lane-affinity PMF for a player whose home lane is `home_lane`
+/// (continuous, lane 0 = left touchline). Returns `None` for strikers, who have no
+/// lane affinity at all. The returned array always sums to ~1.0.
+fn lane_affinity_distribution(
+    role: PlayerRole,
+    home_lane: f64,
+) -> Option<[f64; LANE_AFFINITY_LANE_COUNT]> {
+    let sigma = match role {
+        PlayerRole::Forward => return None,
+        PlayerRole::Goalkeeper => LANE_AFFINITY_SIGMA_KEEPER,
+        PlayerRole::Defender => LANE_AFFINITY_SIGMA_DEFENDER,
+        PlayerRole::Midfielder => LANE_AFFINITY_SIGMA_MIDFIELDER,
+    };
+    let center = home_lane.clamp(0.0, (LANE_AFFINITY_LANE_COUNT - 1) as f64);
+    let two_sigma_sq = (2.0 * sigma * sigma).max(1e-6);
+    let mut dist = [0.0f64; LANE_AFFINITY_LANE_COUNT];
+    let mut total = 0.0;
+    for (lane, slot) in dist.iter_mut().enumerate() {
+        let d = lane as f64 - center;
+        let weight = (-(d * d) / two_sigma_sq).exp();
+        *slot = weight;
+        total += weight;
+    }
+    if total > 0.0 {
+        for slot in dist.iter_mut() {
+            *slot /= total;
+        }
+    }
+    Some(dist)
+}
+
+/// How strongly the lane-affinity PMF pulls / counts in the who-engages tie-break:
+/// the base zonal strength, halved while the player's team is in possession (the team
+/// stretches), zero for strikers. The man-mark / cutting-run "snap" out of the lane is
+/// a separate movement relief, not a change to this strength.
+fn lane_affinity_strength(role: PlayerRole, in_possession: bool) -> f64 {
+    let base = match role {
+        PlayerRole::Forward => return 0.0,
+        PlayerRole::Goalkeeper => LANE_AFFINITY_BASE_STRENGTH_KEEPER,
+        PlayerRole::Defender => LANE_AFFINITY_BASE_STRENGTH_DEFENDER,
+        PlayerRole::Midfielder => LANE_AFFINITY_BASE_STRENGTH_MIDFIELDER,
+    };
+    if in_possession {
+        base * LANE_AFFINITY_IN_POSSESSION_SCALE
+    } else {
+        base
     }
 }
 
