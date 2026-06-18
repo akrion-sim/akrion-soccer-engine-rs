@@ -1282,8 +1282,10 @@ impl SoccerMatch {
     }
 
     fn adversarial_embedding_exploitation_active(&self) -> bool {
-        self.config.learning_enabled
-            && self.config.adversarial_embedding_exploitation_enabled
+        // Exploiting a retrieved moment corpus to bias decisions is a DECISION-time
+        // feature, gated by its own flag — it is independent of online TRAINING
+        // (`learning_enabled`), so a live game running a frozen snapshot still uses it.
+        self.config.adversarial_embedding_exploitation_enabled
             && self.sanitized_adversarial_moment_memory_limit() > 0
             && !self.adversarial_moment_memory.is_empty()
     }
@@ -4730,8 +4732,7 @@ impl SoccerMatch {
             let interval = self.config.learning_interval_ticks.max(1);
             let capture_full_game =
                 self.config.learning_enabled && self.config.full_game_learning_enabled;
-            let cadence_learning_due = !capture_full_game
-                && (interval <= 1 || self.tick as usize % interval == 0);
+            let cadence_learning_due = interval <= 1 || self.tick as usize % interval == 0;
             let learning_due = self.is_done()
                 || period_start.is_some()
                 || has_significant_learning_event
