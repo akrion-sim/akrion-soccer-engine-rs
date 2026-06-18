@@ -8356,7 +8356,13 @@ impl SoccerMatch {
         // Defensive recovery: when the opponent threatens and we're not goalside,
         // sprint back at full effort (max near a back-line 50:50).
         let recover_effort = self.defensive_recovery_effort(player_id);
-        let gait = if recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD {
+        // The recovery sprint only applies when the player is actually MOVING to recover.
+        // A player holding station (target ≈ current position) is resting — it must not be
+        // forced into a sprint by its line-consistency urgency (that would never let a
+        // stranded player recover stamina).
+        let gait = if recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD
+            && to_target.len() > DEFENSIVE_RECOVERY_MIN_MOVE_YARDS
+        {
             MovementGait::Sprint
         } else {
             classify_movement_gait(self.players[player_id].team, to_target, sprint, chased)
@@ -21748,62 +21754,16 @@ impl WorldSnapshot {
         {
             return target;
         }
-        let (genome_min_gap, genome_max_gap) = self.genome_for(me.team).defensive_line_band_yards();
-        let genome_max_gap = genome_max_gap.min(DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS);
-        let genome_min_gap = genome_min_gap.min(genome_max_gap);
-        let in_possession_max_gap = (genome_max_gap * DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
-            / DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS)
-            .clamp(genome_min_gap, genome_max_gap);
-        // Resolve the allowed band [min_gap, max_gap] for how far the line sits behind
-        // the ball. The genome permutes the hard standoff: neutral is 2..=30 yd,
-        // while tournament variants try min {1,2,3} and max values capped at 30.
-        let (min_gap, max_gap) = match self.controlled_possession_team() {
-            // In possession: keep the same push-up shape, scaled from the genome
-            // max so the neutral 30yd gene reproduces the historical in-possession cap.
-            Some(team) if team == me.team => (genome_min_gap, in_possession_max_gap),
-            // Opponent has the ball upfield: stay at least 2yd goal-side of the ball,
-            // but do not drop beyond the team's evolved maximum.
-            Some(_) => {
-                let settled = self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
-                    && self.ball.velocity.len() < DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS;
-                let lo = if settled {
-                    DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS
-                } else {
-                    DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS
-                };
-                (lo.min(genome_max_gap), genome_max_gap)
-            }
-            // Loose ball (no possession): stay inside the evolved standoff band.
-            None => (genome_min_gap, genome_max_gap),
-        };
-        // Shrink the cushion as the ball approaches our OWN goal: the line can never sit further
-        // behind the ball than (ball-from-own-goal − SAFETY), flooring at 3yd. At the 18yd box
-        // that ceiling is 3yd; well upfield it exceeds the nominal cushion and does nothing.
+        // THE RULE (simple, no regimes): the back four's AVERAGE sits 2-25yd behind
+        // (goal-side of) the ball — always, in or out of possession. The ONLY physical
+        // exception is the ball being so close to our own goal that 25yd behind it would
+        // be off the pitch, so the cushion can never exceed the ball's distance from our
+        // own goal line.
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
-        let goal_proximity_gap_ceiling = (ball_from_own_goal
-            - DEFENSIVE_LINE_GOAL_SHRINK_SAFETY_YARDS)
-            .max(DEFENSIVE_LINE_GAP_FLOOR_YARDS);
-        let max_gap = max_gap.min(goal_proximity_gap_ceiling);
-        let min_gap = min_gap.min(max_gap); // keep the band valid (min ≤ max) when it shrinks
-        // In possession the line prefers not to push more than ~5yd past halfway, but that
-        // preference must never make the hard 30yd ball cushion impossible.
-        let halfway_fwd = own_goal_fwd + self.field_length * 0.5;
-        let preferred_max_avg_fwd = halfway_fwd + DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS;
-        let required_max_avg_fwd = ball_fwd - max_gap;
-        let max_avg_fwd = preferred_max_avg_fwd.max(required_max_avg_fwd);
-        // Anchor the "never sit too deep" ceiling on where the ball is HEADED
-        // (predicted from its full kinematic state), not just where it is now: the
-        // line must never sit more than `max_gap` behind the projected ball. Pulls
-        // the line UP to anticipate, still capped at ~5yd into the opponent half.
-        let predicted_ball_fwd =
-            fwd(self.predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS));
-        let predicted_ceiling_avg_fwd = predicted_ball_fwd - max_gap;
-        let line_band_avg_fwd = |avg: f64| {
-            avg.clamp(ball_fwd - max_gap, ball_fwd - min_gap)
-                .max(predicted_ceiling_avg_fwd)
-                .min(max_avg_fwd)
-        };
+        let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
+        let min_behind = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind);
+        let line_band_avg_fwd = |avg: f64| avg.clamp(ball_fwd - max_behind, ball_fwd - min_behind);
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -21832,10 +21792,7 @@ impl WorldSnapshot {
         let row_band = tactical_row_height * BACK_FOUR_ROW_COHESION_ROWS;
         let cohesive_fwd =
             adjusted_fwd.clamp(desired_avg_fwd - row_band, desired_avg_fwd + row_band);
-        let banded_fwd = cohesive_fwd
-            .clamp(ball_fwd - max_gap, ball_fwd - min_gap)
-            .max(predicted_ceiling_avg_fwd)
-            .min(max_avg_fwd);
+        let banded_fwd = cohesive_fwd.clamp(ball_fwd - max_behind, ball_fwd - min_behind);
         let adjusted_y = (banded_fwd * attack_dir).clamp(0.0, self.field_length);
         let in_possession = self
             .controlled_possession_team()

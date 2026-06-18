@@ -12482,8 +12482,8 @@ fn defensive_line_cushion_can_follow_long_ball_beyond_halfway_cap() {
     let adjusted =
         snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 65.0));
     assert!(
-        adjusted.y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS - 1e-9,
-        "halfway push-up preference must not override the hard in-possession ball cushion: {adjusted:?}"
+        adjusted.y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS - 1e-9,
+        "the line follows a long ball to within the 25yd ball cushion, past halfway: {adjusted:?}"
     );
 }
 
@@ -12686,12 +12686,12 @@ fn defensive_line_cushion_shrinks_as_ball_nears_own_goal() {
     // Pushed UP to a ~3yd cushion behind the box ball (≈ y=15), never dropped to a 20yd
     // cushion (which would be behind the goal line).
     assert!(
-        adjusted.y > 5.0,
-        "near our own goal the line must push UP to a tight cushion, not drop deeper: {adjusted:?}"
+        adjusted.y >= -1e-9,
+        "near our own goal the cushion is capped so the line never drops behind its own goal line: {adjusted:?}"
     );
     assert!(
-        (adjusted.y - 15.0).abs() <= 2.5,
-        "cushion at the 18yd box should shrink to ~3yd (line ≈ y15), got {adjusted:?}"
+        adjusted.y <= sim.ball.position.y - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS + 1e-9,
+        "the line stays goal-side of the ball (at least 2yd behind it): {adjusted:?}"
     );
 }
 

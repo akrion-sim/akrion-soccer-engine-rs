@@ -293,7 +293,7 @@ const KICKOFF_DEFENSIVE_PERTURB_YARDS: f64 = 2.5;
 // on the halfway line) — same rule as in open play, applied to the dead-ball shape
 // so the line doesn't start 30-40yd deep. And no two defenders should start on top
 // of each other.
-const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
 const KICKOFF_DEFENDER_MIN_SPACING_YARDS: f64 = 3.0;
 const SHOT_SAVE_DEPTH_YARDS: f64 = 1.6;
 // How far either side of the goal centre the keeper will hold position while tracking the
@@ -1174,6 +1174,8 @@ const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
 // permute the min over {1,2,3}yd and max over values capped at 30yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
+// THE rule: the back four's average sits 2-25yd behind (goal-side of) the ball, always.
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).
@@ -1690,7 +1692,7 @@ const PREFERRED_DEFENDER_DEPTH_YARDS: f64 = 8.5;
 // defensive third) they may still drop to the 6-yard buffer.
 const DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS: f64 = 25.0;
 const DEFENSIVE_GOAL_LINE_HARD_BUFFER_YARDS: f64 = 4.0;
-const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
 // In possession, a single wingback (one of the two outside backs) is granted the one
 // back-line-band exemption — but only once it is genuinely overlapping, i.e. this far
 // forward of the rest of the back line. Otherwise all four carry the band. The band
@@ -2203,6 +2205,9 @@ const CARRIER_UNPRESSURED_HARD_STANDOFF_YARDS: f64 = TEAMMATE_SPACING_NEAR_RADIU
 // gait is forced to a sprint.
 const DEFENSIVE_RECOVERY_BACK_LINE_RADIUS_YARDS: f64 = 10.0;
 const DEFENSIVE_RECOVERY_SPRINT_THRESHOLD: f64 = 0.6;
+// The recovery sprint only fires while actually moving to recover; a near-stationary
+// hold (rest) is never forced to sprint, so a stranded player can recover stamina.
+const DEFENSIVE_RECOVERY_MIN_MOVE_YARDS: f64 = 0.75;
 // Below this ball-proximity urgency a calm, distant player jogs rather than runs.
 const GAIT_CALM_URGENCY_THRESHOLD: f64 = 0.72;
 const CENTER_REF_BALL_CLEARANCE_YARDS: f64 = 7.0;
