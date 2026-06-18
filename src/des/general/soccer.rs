@@ -795,9 +795,15 @@ const PRESSURE_RISING_ENGAGE_YARDS: f64 = 12.0;
 // Reference closing ACCELERATION (yards/sec^2) that saturates the dynamic pressure term —
 // a hard burst onto you. Used by the granular pressure composite (location+velocity+accel).
 const GRANULAR_PRESSURE_REF_ACCEL_YPS2: f64 = 12.0;
-// How many seconds a fully-rising press (closing fast, in range) trims off the holder's
-// allowed on-ball dwell -- the lever that makes a holder pass SOONER under mounting pressure.
-const EXCESSIVE_HOLD_RISING_SHRINK_SECONDS: f64 = 1.4;
+// The holder's "release sooner" pressure is a SMOOTH, anticipatory ramp (no hard
+// cutoff): under mounting pressure the comfortable on-ball window eases down from the
+// skill-based base toward this soft floor (never clamped to a cliff), and the urge to
+// release begins rising while there is still time, so MEDIUM pressure already nudges an
+// earlier release and the carrier can pick a GOOD ball instead of dwelling to a hard
+// limit and being forced into a bad last-second pass. SPAN sets how gradually the ramp
+// saturates once the comfortable window is spent.
+const EXCESSIVE_HOLD_SOFT_FLOOR_SECONDS: f64 = 0.5;
+const EXCESSIVE_HOLD_RAMP_SPAN_SECONDS: f64 = 3.0;
 // Point 4: keep the carrier ~1.5-2yd off opponents in open play (dribbling straight
 // into a defender is a needless turnover); relax to a tight buffer in the final
 // third, where taking a man on is worth the risk.
@@ -40844,15 +40850,26 @@ fn excessive_hold_pressure_from_parts(
         .max(defensive_urgency)
         .max(perceived_pressure)
         .clamp(0.0, 1.0);
-    // A defender closing fast shrinks the time you can dwell on the ball: subtract
-    // from the allowed on-ball budget in proportion to how fast pressure is rising,
-    // so the holder is pushed to release sooner BEFORE the gap is already gone.
-    let allowed_seconds = (dribble_hold_base_seconds(dribbling)
-        - urgency * 1.55
-        - immediate_dispossession_risk.clamp(0.0, 1.0) * 1.00
-        - pressure_rising.clamp(0.0, 1.0) * EXCESSIVE_HOLD_RISING_SHRINK_SECONDS)
-        .clamp(0.55, ELITE_DRIBBLE_HOLD_BASE_SECONDS + 0.75);
-    ((actual_hold - allowed_seconds) / 3.2).clamp(0.0, 1.0)
+    // The comfortable on-ball window shrinks ADDITIVELY with pressure (each signal trims
+    // absolute seconds). Additive — not multiplicative — so an ELITE carrier's much
+    // longer base hold survives the same pressure (they keep more time than a journeyman),
+    // and a slightly stronger urgency coefficient than before means MEDIUM pressure
+    // already trims the window so the release comes sooner. A soft floor keeps it sane
+    // without being the behavioural cliff (the anticipatory smoothstep below is what
+    // removes the cliff).
+    let base = dribble_hold_base_seconds(dribbling);
+    let comfortable = (base
+        - urgency * 1.7
+        - immediate_dispossession_risk.clamp(0.0, 1.0) * 1.1
+        - pressure_rising.clamp(0.0, 1.0) * 1.4)
+        .max(EXCESSIVE_HOLD_SOFT_FLOOR_SECONDS);
+    // SMOOTH ramp (smoothstep, no kink): once the comfortable window is reached the urge
+    // to release rises gently — slowly at first (smoothstep's soft onset gives the
+    // anticipatory feel) then building over SPAN — instead of snapping on at a hard
+    // threshold. With `comfortable` itself shrinking as pressure mounts, the release urge
+    // arrives SOONER and more SMOOTHLY under medium-and-up pressure, so the carrier moves
+    // the ball on a good option rather than dwelling to a cliff and forcing a panic pass.
+    smoothstep_unit((actual_hold - comfortable) / EXCESSIVE_HOLD_RAMP_SPAN_SECONDS)
 }
 
 fn excessive_hold_pressure(observation: &SoccerPomdpObservation, dribbling: f64) -> f64 {
