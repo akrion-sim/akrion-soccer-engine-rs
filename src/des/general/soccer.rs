@@ -1637,6 +1637,32 @@ const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
+// Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
+// AND lateral spacing). The urgency to recover formation shape rises as the ball
+// nears: a line gets ~1s of grace to become consistent when the ball is close (snap
+// into shape) stretching to ~5s when the ball is far (drift back at leisure). Lerps
+// the grace seconds across the yard band between NEAR and FAR. Replaces the fixed
+// per-line consistency horizons in the formation stagger.
+const BALL_PROXIMITY_GRACE_NEAR_SECONDS: f64 = 1.0;
+const BALL_PROXIMITY_GRACE_FAR_SECONDS: f64 = 5.0;
+const BALL_PROXIMITY_GRACE_NEAR_YARDS: f64 = 12.0;
+const BALL_PROXIMITY_GRACE_FAR_YARDS: f64 = 45.0;
+
+/// The shape-recovery grace (seconds) for a line whose mean position is
+/// `distance_yards` from the ball: short (urgent) when close, long (relaxed) when far.
+fn ball_proximity_grace_seconds(distance_yards: f64) -> f64 {
+    let d = distance_yards.max(0.0);
+    if d <= BALL_PROXIMITY_GRACE_NEAR_YARDS {
+        BALL_PROXIMITY_GRACE_NEAR_SECONDS
+    } else if d >= BALL_PROXIMITY_GRACE_FAR_YARDS {
+        BALL_PROXIMITY_GRACE_FAR_SECONDS
+    } else {
+        let t = (d - BALL_PROXIMITY_GRACE_NEAR_YARDS)
+            / (BALL_PROXIMITY_GRACE_FAR_YARDS - BALL_PROXIMITY_GRACE_NEAR_YARDS);
+        BALL_PROXIMITY_GRACE_NEAR_SECONDS
+            + t * (BALL_PROXIMITY_GRACE_FAR_SECONDS - BALL_PROXIMITY_GRACE_NEAR_SECONDS)
+    }
+}
 
 fn role_layer_gap_band_error_yards(gap_yards: f64, min_yards: f64, max_yards: f64) -> f64 {
     if !gap_yards.is_finite() {

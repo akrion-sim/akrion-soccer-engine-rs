@@ -3995,7 +3995,14 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
     // spread, cohesive block. A proclivity, not a command: only violations are
     // nudged, and the result is just the LP's anchor target, balanced downstream.
     if std::env::var("DD_SOCCER_DISABLE_FORMATION_STAGGER").is_err() {
-        soccer_formation_lp_stagger_role_layers(&mut slots, team, width, length, dt);
+        soccer_formation_lp_stagger_role_layers(
+            &mut slots,
+            team,
+            width,
+            length,
+            dt,
+            snapshot.ball.position,
+        );
     }
     slots
 }
@@ -4013,9 +4020,12 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     width: f64,
     length: f64,
     dt_seconds: f64,
+    ball: Vec2,
 ) {
     let attack_dir = team.attack_dir();
     let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(0.0);
+    // Cap on the per-tick lateral correction so a very short (ball-near) grace can't
+    // overshoot the spacing band; the grace itself scales the rate below it.
     const LATERAL_STAGGER_CORRECTION: f64 = 0.6;
     let layer_shift = |gap: f64, min_gap: f64, max_gap: f64, horizon: f64| -> f64 {
         let desired_gap = gap.clamp(min_gap, max_gap);
@@ -4038,6 +4048,24 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         (count > 0).then(|| sum / count as f64)
     };
 
+    // Ball-proximity grace: a line's shape-recovery horizon is SHORT when the ball is
+    // near it (snap into shape) and LONG when far (relax) — the urgency to get into
+    // shape rises with the ball, in all directions.
+    let layer_mean_pos = |slots: &[SoccerFormationLpSlotInput], role: PlayerRole| -> Option<Vec2> {
+        let (sum, count) = slots
+            .iter()
+            .filter(|s| s.active && s.role == role)
+            .fold((Vec2::zero(), 0usize), |(sum, count), s| {
+                (sum + s.anchor, count + 1)
+            });
+        (count > 0).then(|| sum * (1.0 / count as f64))
+    };
+    let grace_for = |slots: &[SoccerFormationLpSlotInput], role: PlayerRole| -> f64 {
+        layer_mean_pos(slots, role)
+            .map(|p| ball_proximity_grace_seconds(p.distance(ball)))
+            .unwrap_or(BALL_PROXIMITY_GRACE_FAR_SECONDS)
+    };
+
     // Forward layering (advancement measured along the attack direction). Lift a
     // whole layer *uniformly* — by its mean's deficit — only when that mean sits
     // too close to (or behind) the line behind it. This preserves each player's
@@ -4052,7 +4080,7 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
             gap,
             MID_AHEAD_OF_DEF_MIN_YARDS,
             MID_AHEAD_OF_DEF_MAX_YARDS,
-            MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS,
+            grace_for(slots, PlayerRole::Midfielder),
         );
         if lift.abs() > 1e-6 {
             for s in slots
@@ -4073,7 +4101,7 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
             gap,
             STRIKER_AHEAD_OF_MID_MIN_YARDS,
             STRIKER_AHEAD_OF_MID_MAX_YARDS,
-            STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS,
+            grace_for(slots, PlayerRole::Forward),
         );
         if lift.abs() > 1e-6 {
             for s in slots
@@ -4086,20 +4114,25 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     }
 
     // Lateral spread within a line (identity = static home-x order, so a momentary
-    // overlap does not reshuffle the line).
+    // overlap does not reshuffle the line). The per-tick correction rate follows the
+    // SAME ball-proximity grace as the fore-aft layering (3*dt/grace, capped), so the
+    // line snaps laterally into band when the ball is near and eases when it is far.
+    let lateral_correction = |grace: f64| -> f64 {
+        (3.0 * dt / grace.max(1e-6)).clamp(0.0, LATERAL_STAGGER_CORRECTION)
+    };
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Defender,
         BACKLINE_LATERAL_MIN_YARDS,
         BACKLINE_LATERAL_MAX_YARDS,
-        LATERAL_STAGGER_CORRECTION,
+        lateral_correction(grace_for(slots, PlayerRole::Defender)),
     );
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Midfielder,
         MIDLINE_LATERAL_MIN_YARDS,
         f64::INFINITY,
-        LATERAL_STAGGER_CORRECTION,
+        lateral_correction(grace_for(slots, PlayerRole::Midfielder)),
     );
 
     for s in slots.iter_mut().filter(|s| s.active) {
