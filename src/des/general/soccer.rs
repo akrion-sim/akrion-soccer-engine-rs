@@ -1284,7 +1284,11 @@ const ATTACK_SPACING_MIN_YARDS: f64 = 5.0;
 const ATTACK_SPACING_IDEAL_YARDS: f64 = 10.0;
 const ATTACK_SPACING_MAX_YARDS: f64 = 15.0;
 const DEFENSE_SPACING_MIN_YARDS: f64 = 2.0;
-const DEFENSE_SPACING_IDEAL_YARDS: f64 = 4.0;
+// Ideal inter-player spacing while defending, raised 4 -> 5yd (2026-06-18, user: keep
+// ~5yd between players). This is the general off-ball spacing target the candidate
+// scorer pulls toward; the back four's own LATERAL band (1.5-8yd, adjacent pairs) is a
+// separate, tighter rule that still governs the defensive line specifically.
+const DEFENSE_SPACING_IDEAL_YARDS: f64 = 5.0;
 const DEFENSE_SPACING_MAX_YARDS: f64 = 8.0;
 const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
 // Territory discipline ("cover ground"). Two teammates packed into the same few yards
