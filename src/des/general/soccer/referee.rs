@@ -130,7 +130,7 @@ impl OfficialAgent {
         (a1 - a0) / dt_seconds
     }
 
-    pub(crate) fn run_time_step(&mut self, snapshot: &WorldSnapshot, rng: &mut SeededRandom) {
+    pub(crate) fn run_time_step(&mut self, snapshot: &WorldSnapshot, _rng: &mut SeededRandom) {
         let previous_velocity = self.velocity;
         let previous_acceleration = self.acceleration;
         let offside_line = assistant_offside_line_snapshot(snapshot, self.kind);
@@ -152,7 +152,24 @@ impl OfficialAgent {
                 ),
             ),
         };
-        let jitter = Vec2::new(rng.next_float() - 0.5, rng.next_float() - 0.5) * 0.25;
+        let ball_lane = ((snapshot.ball.position.x - snapshot.field_width * 0.5)
+            / (snapshot.field_width * 0.5).max(1.0))
+        .clamp(-1.0, 1.0);
+        let ball_depth = ((snapshot.ball.position.y - snapshot.field_length * 0.5)
+            / (snapshot.field_length * 0.5).max(1.0))
+        .clamp(-1.0, 1.0);
+        let ball_motion = if snapshot.ball.velocity.len() > 1e-6 {
+            snapshot.ball.velocity.normalized()
+        } else {
+            Vec2::zero()
+        };
+        let jitter = match self.kind {
+            OfficialKind::CenterReferee => {
+                Vec2::new(ball_lane * 0.16, ball_depth * 0.10) + ball_motion * 0.10
+            }
+            OfficialKind::AssistantRefereeNear => Vec2::new(0.0, ball_motion.y * 0.08),
+            OfficialKind::AssistantRefereeFar => Vec2::new(0.0, -ball_motion.y * 0.08),
+        };
         let target = official_position_bounds(
             self.kind,
             official_clearance_target(self.kind, base_target + jitter, self.position, snapshot),
@@ -430,13 +447,6 @@ pub(crate) fn official_agent_operation_order(
         OfficialKind::AssistantRefereeNear => 23,
         OfficialKind::AssistantRefereeFar => 37,
     };
-    let mut trace_rng = SeededRandom::new(
-        (tick as u32)
-            .wrapping_mul(2_246_822_519)
-            .wrapping_add((id as u32).wrapping_mul(326_648_991))
-            .wrapping_add((scheduled_index.unwrap_or(0) as u32).wrapping_mul(668_265_263))
-            .wrapping_add(kind_salt),
-    );
     let offside_weight = match kind {
         OfficialKind::CenterReferee => 0.42,
         OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => 1.48,
@@ -445,16 +455,23 @@ pub(crate) fn official_agent_operation_order(
         OfficialKind::CenterReferee => 1.42,
         OfficialKind::AssistantRefereeNear | OfficialKind::AssistantRefereeFar => 0.76,
     };
-    weighted_fisher_yates_order(
+    let stable_context_bias = 1.0
+        + (tick % 5) as f64 * 0.001
+        + id as f64 * 0.0001
+        + scheduled_index.unwrap_or(0) as f64 * 0.0001
+        + kind_salt as f64 * 0.00001;
+    weighted_agentic_order(
         vec![
             ("sense-ball".to_string(), 1.10),
-            ("sample-offside-line".to_string(), offside_weight),
-            ("choose-referee-target".to_string(), centroid_weight),
+            ("sample-offside-line".to_string(), offside_weight * stable_context_bias),
+            (
+                "choose-referee-target".to_string(),
+                centroid_weight * stable_context_bias,
+            ),
             ("avoid-player-lanes".to_string(), 0.94),
             ("clamp-duty-zone".to_string(), 1.24),
             ("update-kinematics".to_string(), 1.06),
         ],
-        &mut trace_rng,
     )
 }
 

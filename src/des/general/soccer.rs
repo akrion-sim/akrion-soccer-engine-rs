@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::des::general::des_base::neural_network::NeuralNetworkLike;
-use crate::des::general::general::fisher_yates_shuffle;
 use crate::des::general::lp::{solve_lp_clarabel, LPBasisWarmStart, LPProblem, LPStatus, Sense};
 use crate::des::general::mpc_point_mass::{
     PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
@@ -35,8 +34,6 @@ use crate::des::general::neural_network::{
 use crate::des::general::prng::{mulberry32, SeededRandom};
 use crate::des::general::qp::{solve_qp_active_set, QPOptions, QPStatus, QuadraticProgram};
 use crate::des::general::soccer_genome::{PITCH_GENOME_LANES, PITCH_GENOME_ROWS};
-use crate::des::shared::capabilities::RandomSource;
-
 mod referee;
 pub use referee::*;
 mod player;
@@ -303,9 +300,9 @@ const KICKOFF_CENTER_CIRCLE_RADIUS_YARDS: f64 = 10.0;
 const KICKOFF_DEFENSIVE_PERTURB_YARDS: f64 = 2.5;
 // At kickoff the back four must not sit deeper than this behind the ball (which is
 // on the halfway line) — same rule as in open play, applied to the dead-ball shape
-// so the line doesn't start 30-40yd deep. And no two defenders should start on top
+// so the line doesn't start 35-45yd deep. And no two defenders should start on top
 // of each other.
-const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 const KICKOFF_DEFENDER_MIN_SPACING_YARDS: f64 = 3.0;
 const SHOT_SAVE_DEPTH_YARDS: f64 = 1.6;
 // How far either side of the goal centre the keeper will hold position while tracking the
@@ -573,6 +570,15 @@ const LONG_SHOT_GK_TOTALLY_OUT: f64 = 0.80;
 const KILLER_PASS_MAX_YARDS_TO_GOAL: f64 = 52.0;
 const KILLER_PASS_MIN_FORWARD_YARDS: f64 = 4.0;
 const KILLER_PASS_MIN_RECEIVER_GOAL_GAIN_YARDS: f64 = 5.0;
+// A threaded ball whose GROUND lane is blocked by a defender is not hidden — it is lifted OVER
+// them onto the runner (a chip/clipped ball), provided a loft actually clears the block. The
+// aerial lane is tested with a tighter corridor (only a defender almost directly under the
+// flight could head it) and the resulting lane fit is priced BELOW a clean ground lane.
+const KILLER_PASS_LOFT_LANE_RADIUS_YARDS: f64 = 1.0;
+const KILLER_PASS_LOFT_LANE_FIT: f64 = 0.60;
+// Below this forward distance the lift is a delicate Scoop (~chip); beyond it, a driven Aerial
+// loft over the top to the runner breaking the line.
+const KILLER_PASS_LOFT_SHORT_MAX_YARDS: f64 = 10.0;
 const ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS: f64 = 34.0;
 const ATTACKING_DRIBBLE_SHOOTING_POCKET_YARDS: f64 = 12.0;
 const STRIKER_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.72;
@@ -792,10 +798,10 @@ const DRIBBLE_DWELL_RAMP_SECONDS: f64 = 3.0;
 const DRIBBLE_DWELL_DRIBBLE_DAMP: f64 = 0.28;
 const DRIBBLE_DWELL_RELEASE_LIFT: f64 = 0.22;
 // Anti-spasm: a holder commits to one dribble move-kind (and its touch) for this window
-// instead of re-rolling a fresh cut/feint/swivel every single tick. Without it the ball
+// instead of re-evaluating a fresh cut/feint/swivel every single tick. Without it the ball
 // jerks in a new direction each frame (the "spasm" look). ~0.45s is long enough to read as
-// one deliberate touch but short enough to still react. Stateless: the deterministic draws
-// are quantised to this window, so a committed move is stable across the window's ticks.
+// one deliberate touch but short enough to still react. Stateless: the state-scored touch
+// is quantized to this window, so a committed move is stable across the window's ticks.
 const DRIBBLE_COMMIT_WINDOW_TICKS: u64 = secs_to_ticks(0.45);
 // Rate-of-change-of-pressure ("d(pressure)/dt") signal. A nearest opponent closing at this
 // speed (a hard sprint straight at the holder) saturates the rising signal; it only counts
@@ -1133,11 +1139,6 @@ const BLOCKED_SHOT_SHOOTER_PENALTY_POINTS: f64 = 3.0;
 const DRIBBLE_BEAT_REWARD_POINTS: f64 = 6.0;
 const NUTMEG_BEAT_REWARD_POINTS: f64 = 7.0;
 const SIDE_STEP_BEAT_REWARD_POINTS: f64 = DRIBBLE_BEAT_REWARD_POINTS;
-const DRIBBLE_LEFT_CUT_CHANCE: f64 = 0.28;
-const DRIBBLE_RIGHT_CUT_CHANCE: f64 = 0.28;
-const DRIBBLE_CARRY_FORWARD_CHANCE: f64 = 0.28;
-const DRIBBLE_CARRY_OUT_LEFT_CHANCE: f64 = 0.06;
-const DRIBBLE_CARRY_OUT_RIGHT_CHANCE: f64 = 0.06;
 const DRIBBLE_CUT_LATERAL_YARDS: f64 = 1.0;
 const DRIBBLE_CUT_FORWARD_YARDS: f64 = 0.35;
 const DRIBBLE_NUTMEG_FORWARD_YARDS: f64 = 1.65;
@@ -1378,13 +1379,18 @@ const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
 // off. Both clocks run continuously and reset the instant the pair separates.
 //   within NEAR radius  -> NEAR grace
 //   within FAR radius   -> FAR grace
-// Inside either 18-yard box the radii shrink by one yard (tight finishing and
-// goalmouth defending is legitimately congested), so 3->2 and 2->1.
-const TEAMMATE_SPACING_NEAR_RADIUS_YARDS: f64 = 2.0;
-const TEAMMATE_SPACING_FAR_RADIUS_YARDS: f64 = 3.0;
-const TEAMMATE_SPACING_BOX_RADIUS_REDUCTION_YARDS: f64 = 1.0;
-const TEAMMATE_SPACING_NEAR_GRACE_SECONDS: f64 = 3.0;
-const TEAMMATE_SPACING_FAR_GRACE_SECONDS: f64 = 4.0;
+// Inside either 18-yard box the radii shrink by two yards (tight finishing and
+// goalmouth defending is legitimately congested), so the ordinary 5-yard lower
+// edge becomes 3 yards there.
+const TEAMMATE_SPACING_NEAR_RADIUS_YARDS: f64 = 3.0;
+const TEAMMATE_SPACING_FAR_RADIUS_YARDS: f64 = 5.0;
+const TEAMMATE_SPACING_BOX_RADIUS_REDUCTION_YARDS: f64 = 2.0;
+const TEAMMATE_SPACING_NEAR_GRACE_SECONDS: f64 = 2.0;
+const TEAMMATE_SPACING_FAR_GRACE_SECONDS: f64 = 2.0;
+const TEAMMATE_SPACING_CONSISTENCY_SECONDS: f64 = 2.0;
+const TEAMMATE_SPACING_PATH_SAMPLES: usize = 4;
+const TEAMMATE_SPACING_PATH_RELIEF_MARGIN_YARDS: f64 = 0.10;
+const TEAMMATE_SPACING_PATH_RELIEF_ITERATIONS: usize = 3;
 // The yielding player is encouraged out to just beyond the minimum spacing so it
 // actually clears the radius instead of hovering exactly on its edge.
 const TEAMMATE_SPACING_SEPARATION_MARGIN_YARDS: f64 = 0.75;
@@ -1630,8 +1636,8 @@ fn default_spacing_params() -> SoccerSpacingParams {
 }
 
 const VERTICAL_LANE_COUNT: usize = PITCH_FINE_GRID_COLUMNS;
-const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 7.5;
-const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 2.8;
+const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 5.0;
+const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 2.4;
 const TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY: f64 = 16.0;
 // Ball-carrier driving-lane keep-out. When a teammate is carrying the ball and
 // driving forward UNPRESSURED, off-ball teammates must not run into the narrow
@@ -1694,25 +1700,28 @@ const CROSS_THROUGH_MATE_MIN_SPEED_YPS: f64 = 2.0;
 const CROSS_THROUGH_MATE_LEAD_YPS: f64 = 1.0;
 // Territorial spacing discipline. "Cover territory" is a fundamental of both
 // attacking and defending: two teammates in the same small patch add no value.
-// Players are expected to keep at least this much space between them — but this
+// Players are expected to keep a 5-10 yard Euclidean band between them, with
+// 3-6 yards allowed inside either 18-yard box — but this
 // is a *seed* / proclivity, not a hard rule. It biases the LP shape, the
 // MDP/POMDP state, the neural value head, and a soft positional nudge; the
 // learners are free to settle on other distances when outcomes favour them.
 // A brief overlap (a handoff, a block, a double-team) is fine: it is tolerated
 // for a grace window that shrinks the tighter the overlap (see below).
-const TEAMMATE_MIN_SPACING_YARDS: f64 = 3.0;
+const TEAMMATE_MIN_SPACING_YARDS: f64 = 5.0;
+const TEAMMATE_MAX_SPACING_YARDS: f64 = 10.0;
 // Inside either 18-yard box, goalmouth congestion (finishing / defending crosses)
-// is legitimate, so the expected minimum tightens from 3 to 2 yards.
-const TEAMMATE_MIN_SPACING_BOX_YARDS: f64 = 2.0;
+// is legitimate, so the expected spacing band tightens from 5-10 to 3-6 yards.
+const TEAMMATE_MIN_SPACING_BOX_YARDS: f64 = 3.0;
+const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
 // The "hard" (tighter) overlap band is this fraction of the minimum-spacing
-// radius: ≈2.0 yd outside the box, ≈1.33 yd inside it. A hard overlap is policed
+// radius: about 3.33 yd outside the box, 2 yd inside it. A hard overlap is policed
 // sooner than a merely-soft one.
 const TEAMMATE_SPACING_HARD_FRACTION: f64 = 2.0 / 3.0;
 // Grace windows before a *sustained* overlap is flagged and one of the pair is
-// nudged to move. Within the soft (minimum-spacing) band: 4 s. Within the tighter
-// hard band: 3 s. Seeds — the policy may learn to hold closer/longer in context.
-const TEAMMATE_SPACING_SOFT_GRACE_SECONDS: f64 = 4.0;
-const TEAMMATE_SPACING_HARD_GRACE_SECONDS: f64 = 3.0;
+// nudged to move. The target is two seconds to become consistent with the spacing
+// contract; legitimate handoffs still fit inside that window.
+const TEAMMATE_SPACING_SOFT_GRACE_SECONDS: f64 = 2.0;
+const TEAMMATE_SPACING_HARD_GRACE_SECONDS: f64 = 2.0;
 // A separated pair cools its overlap clock back down at this multiple of real
 // time, so a single frame of separation does not instantly forgive a long camp,
 // but genuine dispersal clears the flag quickly.
@@ -1846,7 +1855,7 @@ const PREFERRED_DEFENDER_DEPTH_YARDS: f64 = 8.5;
 // defensive third) they may still drop to the 6-yard buffer.
 const DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS: f64 = 25.0;
 const DEFENSIVE_GOAL_LINE_HARD_BUFFER_YARDS: f64 = 4.0;
-const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // In possession, a single wingback (one of the two outside backs) is granted the one
 // back-line-band exemption — but only once it is genuinely overlapping, i.e. this far
 // forward of the rest of the back line. Otherwise all four carry the band. The band
@@ -1878,7 +1887,6 @@ const CONTESTABLE_PROTECTION_THRESHOLD: f64 = 0.5;
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
-const MIDFIELDER_DEEP_RETREAT_CHANCE: f64 = 0.25;
 const DEFENSIVE_LINE_BREAK_MIN_ADVANCEMENT_FROM_GOAL_YARDS: f64 = 6.0;
 const DEFENSIVE_LOW_LINE_BREAK_TRIGGER_GAP_YARDS: f64 = 12.0;
 const DEFENSIVE_LINE_BREAK_TRIGGER_GAP_YARDS: f64 = 42.0;
@@ -2353,7 +2361,7 @@ const GOAL_CELEBRATION_SECONDS: f64 = 2.5;
 // keeper, scaled by keeper openness and the pressure on the passer (offsets the backward-pass
 // penalty so it's a real outlet only when genuinely warranted).
 const GK_BACKPASS_OUTLET_BONUS: f64 = 3.2;
-// General teammate padding (3yd outside the box, 2yd inside) is a SOFT, breakable barrier
+// General teammate padding (5yd outside the box, 3yd inside) is a SOFT, breakable barrier
 // handled by the teammate-spacing clock system above. Layered on top, this is the one HARD
 // rule: when a team-mate is dribbling UNDER NO PRESSURE, no other teammate may run at them and
 // get inside this radius (outside the 18yd box) — never, not even briefly. Matches the existing
@@ -4850,7 +4858,7 @@ fn ensure_min_legal_option_family_probability(
     }
 }
 
-fn weighted_fisher_yates_weight(weight: f64) -> f64 {
+fn weighted_agentic_order_weight(weight: f64) -> f64 {
     if weight.is_finite() && weight > 0.0 {
         weight
     } else if weight.is_infinite() && weight.is_sign_positive() {
@@ -4860,25 +4868,17 @@ fn weighted_fisher_yates_weight(weight: f64) -> f64 {
     }
 }
 
-fn weighted_fisher_yates_order<T>(items: Vec<(T, f64)>, rng: &mut SeededRandom) -> Vec<T> {
+fn weighted_agentic_order<T>(items: Vec<(T, f64)>) -> Vec<T> {
     let mut keyed = Vec::with_capacity(items.len());
     for (ordinal, (item, weight)) in items.into_iter().enumerate() {
-        let weight = weighted_fisher_yates_weight(weight);
-        let tie_break = rng.next_float();
-        let priority = if weight > 0.0 {
-            let draw = rng.next_float().clamp(f64::MIN_POSITIVE, 1.0);
-            -draw.ln() / weight
-        } else {
-            f64::INFINITY
-        };
-        keyed.push((priority, tie_break, ordinal, item));
+        let weight = weighted_agentic_order_weight(weight);
+        keyed.push((weight, ordinal, item));
     }
     keyed.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then_with(|| a.1.total_cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
     });
-    keyed.into_iter().map(|(_, _, _, item)| item).collect()
+    keyed.into_iter().map(|(_, _, item)| item).collect()
 }
 
 fn time_window_probability(probability_at_reference_dt: f64, dt_seconds: f64) -> f64 {
@@ -6683,10 +6683,8 @@ pub struct SoccerQPolicyOptions {
 
 const SOCCER_Q_VALUE_LIMIT: f64 = 1_000_000.0;
 
-// Salts keep the two deterministic exploration draws (roll vs. action pick)
-// independent while remaining a pure function of (tick, player) for replay.
-const SOCCER_Q_EXPLORATION_ROLL_SALT: u64 = 0x5350_4f52_4552_4f4c;
-const SOCCER_Q_EXPLORATION_PICK_SALT: u64 = 0x5045_4943_4b45_5249;
+// Bounded candidate scan for deterministic exploration: when enabled, exploration
+// chooses a materially lower-visit legal action only if it remains close in value.
 const SOCCER_Q_EXPLORATION_CANDIDATES: usize = 12;
 
 fn soccer_q_sanitized_value(value: f64) -> Option<f64> {
@@ -8630,10 +8628,17 @@ fn normalize_soccer_action_label(action: &str) -> &str {
         | "backheel-pass"
         | "backheel_pass"
         | "backheelpass"
-        | "backheel"
-        | "scoop-pass"
+        | "backheel" => "surprise-pass",
+        "scoop-pass"
         | "scoop_pass"
-        | "scooppass" => "surprise-pass",
+        | "scooppass"
+        | "lob"
+        | "lob-pass"
+        | "lob_pass"
+        | "lobpass"
+        | "chip-pass"
+        | "chip_pass"
+        | "chippass" => "scoop-pass",
         "flick-on" | "flick_on" | "flickon" | "header-flick" | "header_flick" => "flick-on",
         "turnover-burst"
         | "turnover_burst"
@@ -8769,6 +8774,7 @@ fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
         | "killer-pass"
         | "switch-play"
         | "recycle-reset" => Some(PassFlight::Floor),
+        "scoop-pass" => Some(PassFlight::Scoop),
         "aerial-pass" | "flank-high-cross" | "flick-on" => Some(PassFlight::Aerial),
         _ => None,
     }
@@ -8843,78 +8849,6 @@ fn dribble_final_cut_kind(kind: DribbleMoveKind) -> DribbleMoveKind {
         DribbleMoveKind::FakeLeftCutRight => DribbleMoveKind::RightCut,
         DribbleMoveKind::FakeRightCutLeft => DribbleMoveKind::LeftCut,
         other => other,
-    }
-}
-
-fn choose_dribble_move_kind(rng: &mut SeededRandom) -> DribbleMoveKind {
-    let draw = rng.next_float();
-    let mut threshold = DRIBBLE_LEFT_CUT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::LeftCut;
-    }
-    threshold += DRIBBLE_RIGHT_CUT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::RightCut;
-    }
-    threshold += DRIBBLE_CARRY_FORWARD_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryForward;
-    }
-    threshold += DRIBBLE_CARRY_OUT_LEFT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryOutLeft;
-    }
-    threshold += DRIBBLE_CARRY_OUT_RIGHT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryOutRight;
-    }
-    DribbleMoveKind::Nutmeg
-}
-
-fn deterministic_dribble_move_kind(tick: u64, player_id: usize) -> DribbleMoveKind {
-    // Anti-spasm: quantise to the commitment window so the chosen cut/carry holds
-    // steady across ~0.45s instead of re-rolling a new direction every tick.
-    let tick = tick - tick % DRIBBLE_COMMIT_WINDOW_TICKS;
-    let mut value = tick
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add((player_id as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9));
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^= value >> 31;
-    let draw = (value % 10_000) as f64 / 10_000.0;
-    let mut threshold = DRIBBLE_LEFT_CUT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::LeftCut;
-    }
-    threshold += DRIBBLE_RIGHT_CUT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::RightCut;
-    }
-    threshold += DRIBBLE_CARRY_FORWARD_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryForward;
-    }
-    threshold += DRIBBLE_CARRY_OUT_LEFT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryOutLeft;
-    }
-    threshold += DRIBBLE_CARRY_OUT_RIGHT_CHANCE;
-    if draw < threshold {
-        return DribbleMoveKind::CarryOutRight;
-    }
-    DribbleMoveKind::Nutmeg
-}
-
-fn patient_carry_dribble_kind(tick: u64, player_id: usize) -> DribbleMoveKind {
-    let draw = deterministic_unit_draw(tick, player_id, 41);
-    if draw < 0.72 {
-        DribbleMoveKind::CarryForward
-    } else if draw < 0.86 {
-        DribbleMoveKind::CarryOutLeft
-    } else {
-        DribbleMoveKind::CarryOutRight
     }
 }
 
@@ -9017,25 +8951,6 @@ fn dribble_touch_angle_weight(kind: DribbleMoveKind, bucket: u8) -> f64 {
     (forward_weight * kind_weight * feint_bonus).max(0.01)
 }
 
-fn sample_dribble_touch_bucket(kind: DribbleMoveKind, draw01: f64) -> u8 {
-    let total = (0..DRIBBLE_TOUCH_ANGLE_BUCKETS)
-        .map(|bucket| dribble_touch_angle_weight(kind, bucket))
-        .sum::<f64>()
-        .max(1e-9);
-    let mut draw = draw01.clamp(0.0, 0.999_999) * total;
-    for bucket in 0..DRIBBLE_TOUCH_ANGLE_BUCKETS {
-        draw -= dribble_touch_angle_weight(kind, bucket);
-        if draw <= 0.0 {
-            return bucket;
-        }
-    }
-    DRIBBLE_TOUCH_ANGLE_BUCKETS - 1
-}
-
-fn choose_dribble_touch_bucket(kind: DribbleMoveKind, rng: &mut SeededRandom) -> u8 {
-    sample_dribble_touch_bucket(kind, rng.next_float())
-}
-
 fn deterministic_unit_draw(tick: u64, player_id: usize, salt: u64) -> f64 {
     let mut value = tick
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
@@ -9096,12 +9011,6 @@ fn probability_with_odds_multiplier(probability: f64, multiplier: f64) -> f64 {
     let odds = probability / (1.0 - probability);
     let adjusted_odds = odds * multiplier;
     (adjusted_odds / (1.0 + adjusted_odds)).clamp(0.0, 1.0)
-}
-
-fn deterministic_dribble_touch_bucket(tick: u64, player_id: usize, kind: DribbleMoveKind) -> u8 {
-    // Anti-spasm: hold the touch direction steady within the commitment window.
-    let tick = tick - tick % DRIBBLE_COMMIT_WINDOW_TICKS;
-    sample_dribble_touch_bucket(kind, deterministic_unit_draw(tick, player_id, 17))
 }
 
 fn is_untargeted_long_ball_action(action: &str) -> bool {
@@ -11177,12 +11086,6 @@ fn ball_agent_operation_order(
     action: &str,
     scheduled_index: Option<usize>,
 ) -> Vec<String> {
-    let mut trace_rng = SeededRandom::new(
-        (tick as u32)
-            .wrapping_mul(747_796_405)
-            .wrapping_add(BALL_AGENT_ID as u32)
-            .wrapping_add((scheduled_index.unwrap_or(0) as u32).wrapping_mul(2_891_336_453)),
-    );
     let shot_weight = if matches!(action, "shot-blocked" | "save" | "keeper-parry" | "goal") {
         1.60
     } else {
@@ -11199,17 +11102,18 @@ fn ball_agent_operation_order(
     } else {
         0.92
     };
-    weighted_fisher_yates_order(
+    let scheduled_bias = 1.0 + scheduled_index.unwrap_or(0) as f64 * 0.001;
+    let tick_bias = 1.0 + (tick % 7) as f64 * 0.001;
+    weighted_agentic_order(
         vec![
-            ("sync-holder".to_string(), holder_weight),
+            ("sync-holder".to_string(), holder_weight * scheduled_bias),
             ("apply-curl".to_string(), 1.02),
             ("apply-resistance".to_string(), 1.18),
-            ("advance-position".to_string(), 1.12),
-            ("resolve-shot".to_string(), shot_weight),
+            ("advance-position".to_string(), 1.12 * tick_bias),
+            ("resolve-shot".to_string(), shot_weight * tick_bias),
             ("resolve-boundary".to_string(), boundary_weight),
             ("resolve-control".to_string(), control_weight),
         ],
-        &mut trace_rng,
     )
 }
 
@@ -12258,11 +12162,9 @@ pub struct MatchConfig {
     pub adversarial_embedding_exploitation_enabled: bool,
     #[serde(default = "default_adversarial_moment_memory_limit")]
     pub adversarial_embedding_memory_limit: usize,
-    /// Force the per-tick operation-ORDER shuffles off for THIS match — a reproducible
-    /// fixed legacy order, independent of the process-wide `DD_SOCCER_DISABLE_TICK_ORDER_SHUFFLE`
-    /// env flag. Default `false` => shuffles on. Used by tests/tools that need to pin a
-    /// specific deterministic trajectory (the shuffles draw from an independent RNG stream,
-    /// so disabling them is byte-identical to the legacy order).
+    /// Deprecated compatibility field. Live-causal operation order is now semantic /
+    /// state-scored rather than randomized, so this flag is intentionally ignored while
+    /// remaining deserializable for older configs.
     #[serde(default)]
     pub disable_tick_order_shuffle: bool,
     /// Force the committed slide-tackle mechanic OFF for THIS match, independent of the
@@ -12914,6 +12816,8 @@ pub(crate) struct SoccerRewardEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SoccerRewardEventKind {
     Routine,
+    DribbleBeat,
+    DefensiveDispossession,
     TwoForwardPasses,
     ThreePassForwardNetGain,
     ShotOnTarget,
@@ -12925,7 +12829,9 @@ impl SoccerRewardEventKind {
     fn triggers_learning(self) -> bool {
         matches!(
             self,
-            SoccerRewardEventKind::TwoForwardPasses
+            SoccerRewardEventKind::DribbleBeat
+                | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::Goal
@@ -13295,18 +13201,31 @@ pub struct SoccerSetPlayTrainingArtifact {
     pub away_target_entries: Vec<SoccerQTargetEntry>,
 }
 
-fn sample_defensive_cover_target(rng: &mut SeededRandom) -> usize {
-    let roll = rng.next_float();
-    if roll < 0.10 {
-        0
-    } else if roll < 0.20 {
-        1
-    } else if roll < 0.50 {
-        2
-    } else if roll < 0.80 {
+fn agentic_defensive_cover_target(snapshot: &WorldSnapshot, team: Team) -> usize {
+    let possession = snapshot
+        .controlled_possession_team()
+        .or_else(|| snapshot.possession_team());
+    let own_goal_y = match team {
+        Team::Home => 0.0,
+        Team::Away => snapshot.field_length,
+    };
+    let distance_to_own_goal = (snapshot.ball.position.y - own_goal_y).abs();
+    let danger =
+        (1.0 - distance_to_own_goal / (snapshot.field_length * 0.5).max(1.0)).clamp(0.0, 1.0);
+    if possession == Some(team.other()) {
+        if danger >= 0.78 {
+            4
+        } else if danger >= 0.42 {
+            3
+        } else {
+            2
+        }
+    } else if possession == Some(team) {
+        if danger >= 0.65 { 2 } else { 1 }
+    } else if snapshot.ball.holder.is_none() {
         3
     } else {
-        4
+        2
     }
 }
 
@@ -13463,6 +13382,45 @@ fn attacking_overload_profile(snapshot: &WorldSnapshot, team: Team) -> Attacking
     }
 }
 
+fn best_team_attack_strategy(candidates: &[(TeamAttackStrategy, f64)], draw: f64) -> TeamAttackStrategy {
+    debug_assert!(!candidates.is_empty());
+    let mut best = candidates
+        .first()
+        .copied()
+        .unwrap_or((TeamAttackStrategy::default(), f64::NEG_INFINITY));
+    let mut total = 0.0;
+    for &(strategy, score) in candidates.iter().skip(1) {
+        let score = if score.is_finite() {
+            score
+        } else {
+            f64::NEG_INFINITY
+        };
+        if score > best.1 {
+            best = (strategy, score);
+        }
+    }
+    for &(_, score) in candidates {
+        if score.is_finite() && score > 0.0 {
+            total += score;
+        }
+    }
+    if total > 1e-9 {
+        let mut cursor = draw.clamp(0.0, 0.999_999) * total;
+        for &(strategy, score) in candidates {
+            let weight = if score.is_finite() && score > 0.0 {
+                score
+            } else {
+                0.0
+            };
+            if cursor <= weight {
+                return strategy;
+            }
+            cursor -= weight;
+        }
+    }
+    best.0
+}
+
 fn flank_attack_policy_for_team(
     team: Team,
     attacking_phase: bool,
@@ -13492,7 +13450,7 @@ fn flank_attack_policy_for_team(
     } else {
         0.06
     };
-    let flank_probability = (0.14
+    let flank_score = (0.14
         + width_fit * 0.28
         + progress.max(0.0) * 0.10
         + risk_tolerance * 0.14
@@ -13500,36 +13458,17 @@ fn flank_attack_policy_for_team(
         + phase_bonus
         + if own_half_possession { 0.06 } else { 0.0 })
     .clamp(0.10, 0.74);
-    let zone_x = ((ball_position.x / field_width.max(1.0)) * 8.0)
-        .floor()
-        .clamp(0.0, 7.0) as u64;
-    let zone_y = ((ball_position.y / field_length.max(1.0)) * 12.0)
-        .floor()
-        .clamp(0.0, 11.0) as u64;
-    let phase_key = if attacking_phase {
-        3
-    } else if build_up_phase {
-        2
-    } else {
-        1
-    };
-    let team_key = match team {
-        Team::Home => 0,
-        Team::Away => 1,
-    };
-    let zone_key = zone_x + zone_y * 17 + phase_key * 257;
-    if deterministic_unit_draw(zone_key, team_key, 211) >= flank_probability {
+    if flank_score < 0.45 {
         return FlankAttackPolicy::None;
     }
 
-    let high_cross_share = (0.32
+    let high_cross_score = (0.32
         + progress.max(0.0) * 0.24
         + overload_score * 0.18
         + risk_tolerance * 0.10
         + width_fit * 0.04)
         .clamp(0.24, 0.72);
-    let high_draw = deterministic_unit_draw(zone_x + zone_y * 19 + phase_key * 263, team_key, 223);
-    if high_draw < high_cross_share {
+    if high_cross_score >= 0.50 {
         FlankAttackPolicy::PlayDownFlankHighCross
     } else {
         FlankAttackPolicy::PlayDownFlankLowCross
@@ -13809,6 +13748,22 @@ fn tactical_directive_for_team(
     // goal-line and crossing back to the penalty spot rather than a shorter overlap cross.
     let deep_in_attack =
         has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.18;
+    let half_width = (field_width * 0.5).max(1.0);
+    let width_from_center = ((ball_position.x - field_width * 0.5).abs() / half_width).clamp(0.0, 1.0);
+    let central_fit = (1.0 - width_from_center).clamp(0.0, 1.0);
+    let left_lane_fit = ((field_width * 0.5 - ball_position.x) / half_width).clamp(0.0, 1.0);
+    let right_lane_fit = ((ball_position.x - field_width * 0.5) / half_width).clamp(0.0, 1.0);
+    let attack_progress =
+        ((ball_position.y - field_length * 0.5) * team.attack_dir() / (field_length * 0.5).max(1.0))
+            .clamp(-1.0, 1.0);
+    let pressure_fit = ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64
+        + 2.0)
+        / 5.0)
+        .clamp(0.0, 1.0);
+    let trailing_fit = if trailing { 1.0 } else { 0.0 };
+    let leading_fit = if leading { 1.0 } else { 0.0 };
+    let outside_own_half_fit = if own_half_possession { 0.0 } else { 1.0 };
+    let compact_possession = has_ball && attacking_overload.defenders > attacking_overload.attackers;
     let strategy_zone_x = ((ball_position.x / field_width.max(1.0)) * 12.0)
         .floor()
         .clamp(0.0, 11.0) as u64;
@@ -13826,8 +13781,6 @@ fn tactical_directive_for_team(
         + attacking_overload.attackers as u64 * 37
         + attacking_overload.defenders as u64 * 41;
     let strategy_draw = deterministic_unit_draw(strategy_key, strategy_team_key, 307);
-    let secondary_strategy_draw = deterministic_unit_draw(strategy_key, strategy_team_key, 331);
-    let compact_possession = has_ball && attacking_overload.defenders > attacking_overload.attackers;
     let attack_strategy = if just_regained {
         // The instant we win it, break before the opponent re-organises: burst into the
         // space their committed (now-stranded) shape just vacated.
@@ -13836,27 +13789,51 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::CounterTransitionVertical
     } else if build_up_phase {
         match ball_side {
-            StrategyLane::Left if strategy_draw < 0.24 => {
-                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
-            }
-            StrategyLane::Right if strategy_draw < 0.24 => {
-                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
-            }
-            StrategyLane::Center if compact_possession && strategy_draw < 0.36 => {
-                TeamAttackStrategy::PlayBackwardsToGoad
-            }
-            StrategyLane::Center if leading && strategy_draw < 0.42 => {
-                TeamAttackStrategy::RecycleViaKeeperReset
-            }
-            StrategyLane::Center if secondary_strategy_draw < 0.18 => {
-                TeamAttackStrategy::DrawPressThenPlayThrough
-            }
-            StrategyLane::Center if !own_half_possession && strategy_draw > 0.82 => {
-                TeamAttackStrategy::ExploitSpace
-            }
-            _ => TeamAttackStrategy::PatientPossessionProbe,
+            StrategyLane::Left => best_team_attack_strategy(&[
+                (TeamAttackStrategy::PatientPossessionProbe, 0.54 + leading_fit * 0.08),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalLeftRight,
+                    0.42 + left_lane_fit * 0.34 + pressure_fit * 0.12 + risk_tolerance * 0.06,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right => best_team_attack_strategy(&[
+                (TeamAttackStrategy::PatientPossessionProbe, 0.54 + leading_fit * 0.08),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalRightLeft,
+                    0.42 + right_lane_fit * 0.34 + pressure_fit * 0.12 + risk_tolerance * 0.06,
+                ),
+            ], strategy_draw),
+            StrategyLane::Center => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::PatientPossessionProbe,
+                    0.54 + leading_fit * 0.06 + if own_half_possession { 0.08 } else { 0.0 },
+                ),
+                (
+                    TeamAttackStrategy::PlayBackwardsToGoad,
+                    if compact_possession {
+                        0.70 + pressure_fit * 0.18
+                    } else {
+                        0.16
+                    },
+                ),
+                (
+                    TeamAttackStrategy::RecycleViaKeeperReset,
+                    0.20 + leading_fit * 0.42 + pressure_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DrawPressThenPlayThrough,
+                    0.34 + pressure_fit * 0.28 + risk_tolerance * 0.16,
+                ),
+                (
+                    TeamAttackStrategy::ExploitSpace,
+                    0.28
+                        + outside_own_half_fit * 0.24
+                        + attack_progress.max(0.0) * 0.24
+                        + risk_tolerance * 0.10,
+                ),
+            ], strategy_draw),
         }
-    } else if flank_attack_policy.is_flank() {
+    } else if flank_attack_policy.is_flank() && (!in_final_third || deep_in_attack) {
         match ball_side {
             StrategyLane::Left if deep_in_attack => {
                 TeamAttackStrategy::BylineCrossLeftToPenaltySpot
@@ -13864,109 +13841,219 @@ fn tactical_directive_for_team(
             StrategyLane::Right if deep_in_attack => {
                 TeamAttackStrategy::BylineCrossRightToPenaltySpot
             }
-            StrategyLane::Left if strategy_draw < 0.18 => TeamAttackStrategy::UnderlapLeftCutback,
-            StrategyLane::Left if strategy_draw < 0.34 => {
-                TeamAttackStrategy::DragDefenderOpenChannelLeft
-            }
-            StrategyLane::Left if strategy_draw < 0.50 => {
-                TeamAttackStrategy::DecoyFarSideCutbackLeft
-            }
-            StrategyLane::Left if strategy_draw < 0.66 => {
-                TeamAttackStrategy::PullWideLeftSwitchRight
-            }
-            StrategyLane::Left if strategy_draw < 0.80 => {
-                TeamAttackStrategy::PullWideLeftThenCenter
-            }
-            StrategyLane::Left => TeamAttackStrategy::WingOverlapLeftCross,
-            StrategyLane::Right if strategy_draw < 0.18 => {
-                TeamAttackStrategy::UnderlapRightCutback
-            }
-            StrategyLane::Right if strategy_draw < 0.34 => {
-                TeamAttackStrategy::DragDefenderOpenChannelRight
-            }
-            StrategyLane::Right if strategy_draw < 0.50 => {
-                TeamAttackStrategy::DecoyFarSideCutbackRight
-            }
-            StrategyLane::Right if strategy_draw < 0.66 => {
-                TeamAttackStrategy::PullWideRightSwitchLeft
-            }
-            StrategyLane::Right if strategy_draw < 0.80 => {
-                TeamAttackStrategy::PullWideRightThenCenter
-            }
-            StrategyLane::Right => TeamAttackStrategy::WingOverlapRightCross,
-            StrategyLane::Center if strategy_draw < 0.34 => {
-                TeamAttackStrategy::DirectLongDiagonalLeft
-            }
-            StrategyLane::Center if strategy_draw < 0.68 => {
-                TeamAttackStrategy::DirectLongDiagonalRight
-            }
-            StrategyLane::Center => TeamAttackStrategy::HoldUpfieldUntilOpening,
+            StrategyLane::Left => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::WingOverlapLeftCross,
+                    0.48 + left_lane_fit * 0.18 + attack_progress.max(0.0) * 0.14,
+                ),
+                (
+                    TeamAttackStrategy::UnderlapLeftCutback,
+                    0.42 + pressure_fit * 0.26 + central_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::DragDefenderOpenChannelLeft,
+                    0.40 + overload_score * 0.30 + left_lane_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DecoyFarSideCutbackLeft,
+                    0.36 + pressure_fit * 0.16 + trailing_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::PullWideLeftSwitchRight,
+                    0.38 + left_lane_fit * 0.30 + overload_score * 0.12,
+                ),
+                (
+                    TeamAttackStrategy::PullWideLeftThenCenter,
+                    0.38 + attack_progress.max(0.0) * 0.20 + central_fit * 0.10,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::WingOverlapRightCross,
+                    0.48 + right_lane_fit * 0.18 + attack_progress.max(0.0) * 0.14,
+                ),
+                (
+                    TeamAttackStrategy::UnderlapRightCutback,
+                    0.42 + pressure_fit * 0.26 + central_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::DragDefenderOpenChannelRight,
+                    0.40 + overload_score * 0.30 + right_lane_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DecoyFarSideCutbackRight,
+                    0.36 + pressure_fit * 0.16 + trailing_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::PullWideRightSwitchLeft,
+                    0.38 + right_lane_fit * 0.30 + overload_score * 0.12,
+                ),
+                (
+                    TeamAttackStrategy::PullWideRightThenCenter,
+                    0.38 + attack_progress.max(0.0) * 0.20 + central_fit * 0.10,
+                ),
+            ], strategy_draw),
+            StrategyLane::Center => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::HoldUpfieldUntilOpening,
+                    0.44 + pressure_fit * 0.18 + leading_fit * 0.06,
+                ),
+                (
+                    TeamAttackStrategy::DirectLongDiagonalLeft,
+                    0.42 + right_lane_fit * 0.20 + risk_tolerance * 0.14 + overload_score * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DirectLongDiagonalRight,
+                    0.42 + left_lane_fit * 0.20 + risk_tolerance * 0.14 + overload_score * 0.10,
+                ),
+            ], strategy_draw),
         }
     } else if overload_score > 0.55 {
         match ball_side {
-            StrategyLane::Left if strategy_draw < 0.34 => {
-                TeamAttackStrategy::OverloadLeftIsolateRight
-            }
-            StrategyLane::Left if strategy_draw < 0.60 => {
-                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
-            }
-            StrategyLane::Left => TeamAttackStrategy::DecoyFarSideCutbackLeft,
-            StrategyLane::Right if strategy_draw < 0.34 => {
-                TeamAttackStrategy::OverloadRightIsolateLeft
-            }
-            StrategyLane::Right if strategy_draw < 0.60 => {
-                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
-            }
-            StrategyLane::Right => TeamAttackStrategy::DecoyFarSideCutbackRight,
-            StrategyLane::Center if strategy_draw < 0.34 => TeamAttackStrategy::CentralDoubleOneTwo,
-            StrategyLane::Center if strategy_draw < 0.62 => TeamAttackStrategy::ThirdManRunCentral,
-            StrategyLane::Center => TeamAttackStrategy::DrawPressThenPlayThrough,
+            StrategyLane::Left => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::OverloadLeftIsolateRight,
+                    0.54 + overload_score * 0.28 + pressure_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalLeftRight,
+                    0.46 + left_lane_fit * 0.24 + risk_tolerance * 0.12,
+                ),
+                (
+                    TeamAttackStrategy::DecoyFarSideCutbackLeft,
+                    0.42 + trailing_fit * 0.10 + pressure_fit * 0.08,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::OverloadRightIsolateLeft,
+                    0.54 + overload_score * 0.28 + pressure_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalRightLeft,
+                    0.46 + right_lane_fit * 0.24 + risk_tolerance * 0.12,
+                ),
+                (
+                    TeamAttackStrategy::DecoyFarSideCutbackRight,
+                    0.42 + trailing_fit * 0.10 + pressure_fit * 0.08,
+                ),
+            ], strategy_draw),
+            StrategyLane::Center => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::CentralDoubleOneTwo,
+                    0.52 + overload_score * 0.24 + central_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::ThirdManRunCentral,
+                    0.50 + attack_progress.max(0.0) * 0.18 + risk_tolerance * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DrawPressThenPlayThrough,
+                    0.44 + pressure_fit * 0.20 + trailing_fit * 0.08,
+                ),
+            ], strategy_draw),
         }
     } else if attacking_phase && in_final_third {
         match ball_side {
-            StrategyLane::Left if strategy_draw < 0.24 => TeamAttackStrategy::HalfSpaceComboLeft,
-            StrategyLane::Left if strategy_draw < 0.44 => TeamAttackStrategy::UnderlapLeftCutback,
-            StrategyLane::Left => TeamAttackStrategy::OneTwoLeftRelease,
-            StrategyLane::Right if strategy_draw < 0.24 => TeamAttackStrategy::HalfSpaceComboRight,
-            StrategyLane::Right if strategy_draw < 0.44 => TeamAttackStrategy::UnderlapRightCutback,
-            StrategyLane::Right => TeamAttackStrategy::OneTwoRightRelease,
+            StrategyLane::Left => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::OneTwoLeftRelease,
+                    0.56 + risk_tolerance * 0.16 + overload_score * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::HalfSpaceComboLeft,
+                    0.50 + central_fit * 0.16 + attack_progress.max(0.0) * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::UnderlapLeftCutback,
+                    0.46 + pressure_fit * 0.20 + left_lane_fit * 0.08,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::OneTwoRightRelease,
+                    0.56 + risk_tolerance * 0.16 + overload_score * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::HalfSpaceComboRight,
+                    0.50 + central_fit * 0.16 + attack_progress.max(0.0) * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::UnderlapRightCutback,
+                    0.46 + pressure_fit * 0.20 + right_lane_fit * 0.08,
+                ),
+            ], strategy_draw),
             // A tight central pocket in the final third (no overload to exploit): the
             // disguised backheel release springs a man the settled block has committed against.
-            StrategyLane::Center if overload_score < 0.25 && strategy_draw < 0.36 => {
-                TeamAttackStrategy::BackheelDisguisedRelease
-            }
-            StrategyLane::Center if strategy_draw < 0.58 => TeamAttackStrategy::GiveAndGoCentral,
-            StrategyLane::Center if strategy_draw < 0.78 => TeamAttackStrategy::CentralDoubleOneTwo,
-            StrategyLane::Center => TeamAttackStrategy::ThirdManRunCentral,
+            StrategyLane::Center => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::GiveAndGoCentral,
+                    0.58 + risk_tolerance * 0.14 + pressure_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::CentralDoubleOneTwo,
+                    0.54 + overload_score * 0.22 + central_fit * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::ThirdManRunCentral,
+                    0.52 + attack_progress.max(0.0) * 0.18 + risk_tolerance * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::BackheelDisguisedRelease,
+                    if overload_score < 0.25 {
+                        0.66 + pressure_fit * 0.10
+                    } else {
+                        0.18
+                    },
+                ),
+            ], strategy_draw),
         }
     } else if attacking_phase {
         match ball_side {
-            StrategyLane::Left if strategy_draw < 0.20 => {
-                TeamAttackStrategy::PullWideLeftThenCenter
-            }
-            StrategyLane::Left if strategy_draw < 0.40 => {
-                TeamAttackStrategy::PullWideLeftSwitchRight
-            }
-            StrategyLane::Left if strategy_draw < 0.58 => {
-                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
-            }
-            StrategyLane::Left if strategy_draw < 0.76 => {
-                TeamAttackStrategy::DirectLongDiagonalRight
-            }
-            StrategyLane::Left => TeamAttackStrategy::DragDefenderOpenChannelLeft,
-            StrategyLane::Right if strategy_draw < 0.20 => {
-                TeamAttackStrategy::PullWideRightThenCenter
-            }
-            StrategyLane::Right if strategy_draw < 0.40 => {
-                TeamAttackStrategy::PullWideRightSwitchLeft
-            }
-            StrategyLane::Right if strategy_draw < 0.58 => {
-                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
-            }
-            StrategyLane::Right if strategy_draw < 0.76 => {
-                TeamAttackStrategy::DirectLongDiagonalLeft
-            }
-            StrategyLane::Right => TeamAttackStrategy::DragDefenderOpenChannelRight,
+            StrategyLane::Left => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::PullWideLeftThenCenter,
+                    0.46 + attack_progress.max(0.0) * 0.16 + central_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::PullWideLeftSwitchRight,
+                    0.44 + left_lane_fit * 0.26 + overload_score * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalLeftRight,
+                    0.42 + left_lane_fit * 0.22 + pressure_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DirectLongDiagonalRight,
+                    0.38 + trailing_fit * 0.20 + risk_tolerance * 0.16,
+                ),
+                (
+                    TeamAttackStrategy::DragDefenderOpenChannelLeft,
+                    0.44 + overload_score * 0.20 + pressure_fit * 0.08,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::PullWideRightThenCenter,
+                    0.46 + attack_progress.max(0.0) * 0.16 + central_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::PullWideRightSwitchLeft,
+                    0.44 + right_lane_fit * 0.26 + overload_score * 0.08,
+                ),
+                (
+                    TeamAttackStrategy::SwitchPlayDiagonalRightLeft,
+                    0.42 + right_lane_fit * 0.22 + pressure_fit * 0.10,
+                ),
+                (
+                    TeamAttackStrategy::DirectLongDiagonalLeft,
+                    0.38 + trailing_fit * 0.20 + risk_tolerance * 0.16,
+                ),
+                (
+                    TeamAttackStrategy::DragDefenderOpenChannelRight,
+                    0.44 + overload_score * 0.20 + pressure_fit * 0.08,
+                ),
+            ], strategy_draw),
             // Chasing the game from a central middle-third platform: go over the top with a
             // flick-on to a runner instead of a ground through-ball.
             StrategyLane::Center if trailing && strategy_draw < 0.50 => {
@@ -19267,7 +19354,10 @@ impl AgentScheduleIndexLookup {
 pub struct AgentScheduleSummary {
     pub total_agents: usize,
     pub expected_total_agents: usize,
+    // Legacy JSON name: this now counts deterministic field agents scheduled after
+    // the central brain, not a random shuffle.
     pub field_shuffle_agents: usize,
+    // Legacy JSON name retained for old stream consumers.
     pub expected_field_shuffle_agents: usize,
     pub unique_agents: usize,
     pub duplicate_agents: usize,
@@ -21207,7 +21297,7 @@ pub fn soccer_live_frame_accounting_report(frame: &MatchFrame) -> SoccerLiveFram
             format!(
                 "total {total_agents}, unique {unique_agents}, duplicates {duplicate_agents}, field {field_shuffle_agents}, centralFirst {central_brain_first}, ball {ball_scheduled}"
             ),
-            "live frame should expose the central brain plus shuffled players, officials, and ball agent",
+            "live frame should expose the central brain plus agentic players, officials, and ball agent",
         );
     }
     if frame.tick > 0 && frame.agent_schedule_summary.complete != schedule_complete {
@@ -21353,7 +21443,7 @@ pub fn soccer_live_frame_accounting_report(frame: &MatchFrame) -> SoccerLiveFram
                         decision.scheduled_index,
                         decision.operation_order.join(">")
                     ),
-                    "visible player trace should expose its internal operation order; schedule indices may be retained from an earlier Fisher-Yates order",
+                    "visible player trace should expose its internal operation order with schedule-index context",
                 );
             }
         }
@@ -23132,7 +23222,7 @@ fn soccer_accounting_check_agent_schedule(
             "firstAgent",
             format!("CentralBrain:{CENTRAL_BRAIN_AGENT_ID}"),
             actual,
-            "central brain should run before the shuffled field agents",
+            "central brain should run before the agentic field agents",
         );
     }
     if frame.central_brain.scheduled_index != Some(0) {
@@ -23350,7 +23440,7 @@ fn soccer_accounting_check_agent_schedule(
                 "playerScheduledIndex",
                 format!("{scheduled_index:?}"),
                 format!("{:?}", player.scheduled_index),
-                "player snapshot should expose its shuffled schedule index",
+                "player snapshot should expose its agentic schedule index",
             );
         }
     }
@@ -23377,7 +23467,7 @@ fn soccer_accounting_check_agent_schedule(
                 "officialScheduledIndex",
                 format!("{scheduled_index:?}"),
                 format!("{:?}", official.scheduled_index),
-                "official snapshot should expose its shuffled schedule index",
+                "official snapshot should expose its agentic schedule index",
             );
         }
         if let Some(decision) = official.last_decision.as_ref() {
@@ -24736,6 +24826,10 @@ pub struct SoccerPlaybackAgentContract {
     pub ball_run_time_step_enabled: bool,
     pub central_brain_runs_before_field_shuffle: bool,
     pub field_entities_use_fisher_yates: bool,
+    pub central_brain_operation_order_agentic: bool,
+    pub player_operation_order_agentic: bool,
+    pub official_operation_order_agentic: bool,
+    pub ball_operation_order_agentic: bool,
     pub player_operation_order_randomized: bool,
     pub official_operation_order_randomized: bool,
     pub ball_operation_order_randomized: bool,
@@ -25137,10 +25231,14 @@ fn soccer_playback_agent_contract() -> SoccerPlaybackAgentContract {
         official_run_time_step_enabled: true,
         ball_run_time_step_enabled: true,
         central_brain_runs_before_field_shuffle: true,
-        field_entities_use_fisher_yates: true,
-        player_operation_order_randomized: true,
-        official_operation_order_randomized: true,
-        ball_operation_order_randomized: true,
+        field_entities_use_fisher_yates: false,
+        central_brain_operation_order_agentic: true,
+        player_operation_order_agentic: true,
+        official_operation_order_agentic: true,
+        ball_operation_order_agentic: true,
+        player_operation_order_randomized: false,
+        official_operation_order_randomized: false,
+        ball_operation_order_randomized: false,
         central_brain_tracks_all_players: true,
         central_brain_tracks_all_officials: true,
         central_brain_tracks_ball_kinematics: true,
@@ -29048,6 +29146,7 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "turnover-burst",
     "first-time-pass",
     "first-time-shot",
+    "scoop-pass",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
@@ -29082,6 +29181,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         }
         "vacate-space" | "support-screen" => "vacate-space",
         "surprise-pass" => "surprise-pass",
+        "scoop-pass" => "scoop-pass",
         "flick-on" => "flick-on",
         "turnover-burst" => "turnover-burst",
         "switch-play" => "switch-play",
@@ -37271,6 +37371,18 @@ fn soccer_playback_tactical_liveness_json_with_frame_liveness(
     let goalward_progress_ok = summary.ticks < 5
         || !frame_liveness_known
         || frame_liveness.ball_goalward_progress_yards > 0.10;
+    let player_operation_order_agentic_ok = !frame_liveness_known
+        || frame_liveness.player_operation_order_samples < 3
+        || frame_liveness.player_operation_order_unique_full_orders >= 1;
+    let central_brain_operation_order_agentic_ok = !frame_liveness_known
+        || frame_liveness.central_brain_operation_order_samples < 3
+        || frame_liveness.central_brain_operation_order_unique_full_orders >= 1;
+    let ball_operation_order_agentic_ok = !frame_liveness_known
+        || frame_liveness.ball_operation_order_samples < 3
+        || frame_liveness.ball_operation_order_unique_full_orders >= 1;
+    let official_operation_order_agentic_ok = !frame_liveness_known
+        || frame_liveness.official_operation_order_samples < 3
+        || frame_liveness.official_operation_order_unique_full_orders >= 1;
     let player_operation_order_randomized_ok = !frame_liveness_known
         || frame_liveness.player_operation_order_samples < 3
         || frame_liveness.player_operation_order_unique_first_ops > 1
@@ -37387,9 +37499,13 @@ fn soccer_playback_tactical_liveness_json_with_frame_liveness(
         "shotActivityOk": !sustained_shot_window || shot_attempts > 0,
         "openSpaceSupportOk": open_space_support_ok,
         "goalwardProgressOk": goalward_progress_ok,
+        "centralBrainOperationOrderAgenticOk": central_brain_operation_order_agentic_ok,
         "centralBrainOperationOrderRandomizedOk": central_brain_operation_order_randomized_ok,
+        "playerOperationOrderAgenticOk": player_operation_order_agentic_ok,
         "playerOperationOrderRandomizedOk": player_operation_order_randomized_ok,
+        "ballOperationOrderAgenticOk": ball_operation_order_agentic_ok,
         "ballOperationOrderRandomizedOk": ball_operation_order_randomized_ok,
+        "officialOperationOrderAgenticOk": official_operation_order_agentic_ok,
         "officialOperationOrderRandomizedOk": official_operation_order_randomized_ok,
         "playerDecisionModelTraceOk": player_decision_model_trace_ok,
         "movementGaitVarietyOk": movement_gait_variety_ok,
@@ -41460,6 +41576,79 @@ fn speculative_long_shot_attempt_probability(
         + lane_fit * 0.042
         + observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.036)
         .clamp(0.0, 0.34);
+}
+
+fn contested_final_third_shot_is_qualified(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    shooting_skill: f64,
+) -> bool {
+    if role == PlayerRole::Goalkeeper
+        || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS
+        || observation.yards_to_goal < TEAMMATE_MUST_SHOOT_YARDS
+        || observation.opponent_goal_angle_degrees < 10.0
+    {
+        return false;
+    }
+    let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
+    if block_risk > 0.74 || observation.shot_on_frame_probability < 0.075 {
+        return false;
+    }
+    let outlet_quality = observation
+        .best_forward_pass_receiver_openness
+        .max(observation.best_pass_receiver_openness * 0.72)
+        .clamp(0.0, 1.0);
+    let urgency = observation
+        .offensive_urgency
+        .max(observation.decision_urgency)
+        .max(observation.pressure_urgency * 0.78)
+        .clamp(0.0, 1.0);
+    let role_floor = match role {
+        PlayerRole::Forward => 0.48,
+        PlayerRole::Midfielder => 0.58,
+        PlayerRole::Defender => 0.76,
+        PlayerRole::Goalkeeper => 1.0,
+    };
+    shooting_skill >= role_floor
+        && (urgency >= 0.30
+            || observation.goal_attack_window_score >= 0.12
+            || outlet_quality <= 0.42
+            || observation.visible_forward_pass_options == 0)
+}
+
+fn contested_final_third_shot_attempt_probability(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    shooting_skill: f64,
+) -> f64 {
+    if !contested_final_third_shot_is_qualified(observation, role, shooting_skill) {
+        return 0.0;
+    }
+    let distance_fit = ((SPECULATIVE_LONG_SHOT_MAX_YARDS - observation.yards_to_goal)
+        / (SPECULATIVE_LONG_SHOT_MAX_YARDS - TEAMMATE_MUST_SHOOT_YARDS).max(1e-6))
+    .clamp(0.0, 1.0);
+    let block_fit = (1.0 - observation.shot_block_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let on_frame_fit = (observation.shot_on_frame_probability
+        / SPECULATIVE_LONG_SHOT_MIN_ON_FRAME_PROBABILITY)
+        .clamp(0.0, 1.25);
+    let urgency = observation
+        .offensive_urgency
+        .max(observation.decision_urgency)
+        .max(observation.pressure_urgency * 0.78)
+        .clamp(0.0, 1.0);
+    let role_floor = match role {
+        PlayerRole::Forward => 0.18,
+        PlayerRole::Midfielder => 0.12,
+        PlayerRole::Defender => 0.04,
+        PlayerRole::Goalkeeper => 0.0,
+    };
+    (role_floor
+        + distance_fit * 0.16
+        + block_fit * 0.10
+        + on_frame_fit * 0.08
+        + shooting_skill.clamp(0.0, 1.0) * 0.08
+        + urgency * 0.08)
+        .clamp(0.0, 0.52)
 }
 
 fn goal_proximity_shot_pressure_score(
@@ -46888,14 +47077,13 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 anaerobic_load: 0.0,
                 incoming_ball: None,
                 // Deterministic, position-only skills: every player is the same
-                // overall standard, shaped by their shirt (1–11) and identical
+                // overall standard, shaped by their shirt (1-11) and identical
                 // between the two teams, so neither side starts with a skill edge
-                // and both learn from an equal footing. We still advance the shared
-                // RNG exactly as the historical randomized build did (drawing and
-                // discarding a `blended` profile) so that equalizing skills does
-                // not resequence any *other* stochastic match state.
+                // and both learn from an equal footing. The blended-profile call is
+                // retained only for signature compatibility; it no longer drives
+                // live-match randomness.
                 skills: {
-                    let _discarded_randomized = SkillProfile::blended(id, role, _rng);
+                    let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
                     SkillProfile::for_shirt(shirt, role)
                 },
                 fatigue: 0.0,
