@@ -12008,14 +12008,15 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     }
     for &m in mids {
         sim.players[m].role = PlayerRole::Midfielder;
-        sim.players[m].position = Vec2::new(40.0, 31.0);
+        sim.players[m].position = Vec2::new(40.0, 30.4);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 40.0);
     let snap = WorldSnapshot::from_match(&sim);
-    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 31.0));
+    // Gap 0.4yd is below the 1yd minimum -> push up into the 1-20yd band.
+    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.4));
     assert!(
-        pushed.y > 31.5,
+        pushed.y > 30.6,
         "midfield should push up to its band in front of the defenders: {pushed:?}"
     );
 
@@ -12051,15 +12052,16 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     }
     for &f in forwards {
         sim.players[f].role = PlayerRole::Forward;
-        sim.players[f].position = Vec2::new(40.0, 52.0);
+        sim.players[f].position = Vec2::new(40.0, 51.0);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 54.0);
     let snap = WorldSnapshot::from_match(&sim);
-    let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 52.0));
+    // Gap 1.0yd is below the 2yd minimum -> push up into the 2-20yd band.
+    let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
     assert!(
-        pushed.y > 52.5,
-        "strikers should push up to at least 3yd in front of midfield: {pushed:?}"
+        pushed.y > 51.5,
+        "strikers should push up to at least 2yd in front of midfield: {pushed:?}"
     );
 
     for &f in forwards {
