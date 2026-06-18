@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub const PITCH_GENOME_LANES: u8 = 12;
 pub const PITCH_GENOME_ROWS: u8 = 24;
 pub const DEF_LINE_MIN_DISTANCE_CHOICES_YARDS: [f64; 3] = [1.0, 2.0, 3.0];
-pub const DEF_LINE_MAX_DISTANCE_CHOICES_YARDS: [f64; 5] = [20.0, 22.0, 23.0, 24.0, 25.0];
+pub const DEF_LINE_MAX_DISTANCE_CHOICES_YARDS: [f64; 5] = [22.0, 24.0, 26.0, 28.0, 30.0];
 pub const DEF_LINE_BAND_PERMUTATION_COUNT: usize =
     DEF_LINE_MIN_DISTANCE_CHOICES_YARDS.len() * DEF_LINE_MAX_DISTANCE_CHOICES_YARDS.len();
 
@@ -195,7 +195,7 @@ impl Default for SoccerTeamGenome {
             formation: TeamFormation::F433,
             anchors: formation_anchors(TeamFormation::F433),
             def_line_min_dist_from_ball: 2.0,
-            def_line_max_dist_from_ball: 25.0,
+            def_line_max_dist_from_ball: 30.0,
             mid_gap_from_back4_own_half: 8.0,
             mid_gap_from_back4_opp_half: 12.0,
             striker_press_synchronized: true,

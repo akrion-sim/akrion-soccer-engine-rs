@@ -4439,6 +4439,30 @@ impl PlayerAgent {
             }
         }
 
+        if !has_ball
+            && snapshot.ball.holder.is_none()
+            && snapshot.is_committed_loose_ball_chaser(self.id)
+        {
+            let target = snapshot.loose_ball_recovery_target_for(self.id);
+            let action = SoccerAction::MoveTo(target);
+            self.last_decision = Some(self.decision_trace(
+                snapshot,
+                mdp_state,
+                observation,
+                belief,
+                vec!["loose-ball-commit".to_string(), "recover".to_string()],
+                single_action_option("recover"),
+                &action,
+                "recover",
+            ));
+            return PlayerIntent {
+                player_id: self.id,
+                action,
+                sprint: self.role != PlayerRole::Goalkeeper
+                    && self.position.distance(target) > 1.0,
+            };
+        }
+
         let mut learned_mpc_reselect_label: Option<String> = None;
         if let Some(plan) = learned_plan {
             if let Some((action, action_label)) =

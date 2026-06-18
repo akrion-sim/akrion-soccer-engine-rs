@@ -293,7 +293,7 @@ const KICKOFF_DEFENSIVE_PERTURB_YARDS: f64 = 2.5;
 // on the halfway line) — same rule as in open play, applied to the dead-ball shape
 // so the line doesn't start 30-40yd deep. And no two defenders should start on top
 // of each other.
-const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+const KICKOFF_BACK_FOUR_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 const KICKOFF_DEFENDER_MIN_SPACING_YARDS: f64 = 3.0;
 const SHOT_SAVE_DEPTH_YARDS: f64 = 1.6;
 // How far either side of the goal centre the keeper will hold position while tracking the
@@ -1164,28 +1164,31 @@ const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
-// along the attacking axis; the line normally sits BEHIND the ball). IN POSSESSION the line must
-// push up to within 20yd of the ball (don't lag deep). When the OPPONENT has the ball upfield the
-// line must instead sit OFF the ball: at least 20yd back if the ball is settled on the ground,
-// 15yd if it's airborne or moving (in transit). The LP/formation nudge shifts the whole line to
-// restore the band.
+// along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
+// keep the line at least 2yd goal-side of the ball and no more than 30yd behind it. The
+// LP/formation nudge shifts the whole line to restore the band.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min over {1,2,3}yd and max over values capped at 25yd.
+// permute the min over {1,2,3}yd and max over values capped at 30yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).
 const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 8.0;
-const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 20.0;
-const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 15.0;
+const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
+const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
 // the tighter in-possession cap.
-const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 25.0;
-// Below this speed (and on the ground) the ball counts as "settled" → the wider 20yd cushion.
+const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
+// Back-four row cohesion in the 24-row tactical grid. A row is 1/24 of pitch
+// length; line-bound defenders should stay within this many rows of the line
+// center so one fullback/centerback does not drift several rows away while the
+// average still looks legal.
+const BACK_FOUR_ROW_COHESION_ROWS: f64 = 1.5;
+// Below this speed (and on the ground) the ball counts as "settled" for the shared 2yd floor.
 const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
 // The cushion behind the ball MUST shrink as the ball nears the defenders' OWN goal -- you
 // cannot sit 20yd behind a ball that is only 18yd from your own line (that puts the line in
@@ -1194,7 +1197,8 @@ const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
 // the full nominal cushion as the ball moves upfield. Floored at 3yd, never negative.
 const DEFENSIVE_LINE_GOAL_SHRINK_SAFETY_YARDS: f64 = 15.0;
 const DEFENSIVE_LINE_GAP_FLOOR_YARDS: f64 = 3.0;
-// In possession the line may push up, but no more than ~5yd past the halfway line.
+// In possession the line prefers not to push up more than ~5yd past halfway, unless the
+// hard ball-cushion band requires it.
 const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
 // project the ball forward by this many seconds (position + velocity + accel + jerk)
@@ -1612,6 +1616,9 @@ const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 2.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 6.5;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 5.0;
+const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
+const ROLE_LINE_CONSISTENCY_URGENCY_BASE: f64 = 0.78;
+const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 6.0;
 
 fn role_layer_gap_band_error_yards(gap_yards: f64, min_yards: f64, max_yards: f64) -> f64 {
     if !gap_yards.is_finite() {
@@ -1676,7 +1683,7 @@ const PREFERRED_DEFENDER_DEPTH_YARDS: f64 = 8.5;
 // defensive third) they may still drop to the 6-yard buffer.
 const DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS: f64 = 25.0;
 const DEFENSIVE_GOAL_LINE_HARD_BUFFER_YARDS: f64 = 4.0;
-const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // In possession, a single wingback (one of the two outside backs) is granted the one
 // back-line-band exemption — but only once it is genuinely overlapping, i.e. this far
 // forward of the rest of the back line. Otherwise all four carry the band. The band
