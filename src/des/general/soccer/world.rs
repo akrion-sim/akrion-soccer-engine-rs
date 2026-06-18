@@ -24,6 +24,21 @@ const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
 const MPC_LATENT_PASS_CHAIN_SINGLE_TARGET: f64 = 0.18;
 const MPC_LATENT_PASS_CHAIN_TWO_TARGET: f64 = 0.58;
 const MPC_LATENT_PASS_CHAIN_THREE_TARGET: f64 = 1.0;
+const MARKOV_LANE_SLOT_COUNT: usize = 4;
+pub(crate) const DEFENDER_MARKOV_LANE_PMF_BY_SLOT: [[f64; VERTICAL_LANE_COUNT];
+    MARKOV_LANE_SLOT_COUNT] = [
+    [0.05, 0.15, 0.25, 0.30, 0.20, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.03, 0.07, 0.15, 0.22, 0.28, 0.18, 0.05, 0.02, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.02, 0.05, 0.18, 0.28, 0.22, 0.15, 0.07, 0.03, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.20, 0.30, 0.25, 0.15, 0.05],
+];
+pub(crate) const MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT: [[f64; VERTICAL_LANE_COUNT];
+    MARKOV_LANE_SLOT_COUNT] = [
+    [0.04, 0.11, 0.20, 0.24, 0.21, 0.13, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.03, 0.07, 0.13, 0.20, 0.24, 0.20, 0.09, 0.04, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.04, 0.09, 0.20, 0.24, 0.20, 0.13, 0.07, 0.03, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.02, 0.05, 0.13, 0.21, 0.24, 0.20, 0.15],
+];
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CachedAdversarialEmbeddingSignals {
@@ -4492,9 +4507,9 @@ impl SoccerMatch {
                     // Then hold the back four as a compact, FLAT, ball-side block (~4 lanes),
                     // each defender keeping its left-to-right slot.
                     let intent = snapshot.back_four_shape_adjusted_intent(intent);
-                    // Hold the midfield line 1-20yd in front of the back four.
+                    // Hold the midfield line 5-20yd in front of the back four.
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
-                    // Hold the striker line 2-20yd in front of the midfield line.
+                    // Hold the striker line 5-20yd in front of the midfield line.
                     let intent = snapshot.forward_line_band_adjusted_intent(intent);
                     // A forward/mid that chose to STAND while offside in our possession is a
                     // stranded goal-hanger; pull it straight back onside when the line-band
@@ -15366,6 +15381,160 @@ impl WorldSnapshot {
         )
     }
 
+    fn role_line_markov_slot_index_for_player(&self, player: &PlayerSnapshot) -> Option<usize> {
+        if !matches!(player.role, PlayerRole::Defender | PlayerRole::Midfielder) {
+            return None;
+        }
+        let mut line: Vec<&PlayerSnapshot> = self
+            .players
+            .iter()
+            .filter(|candidate| candidate.team == player.team && candidate.role == player.role)
+            .collect();
+        if line.len() < 2 {
+            return None;
+        }
+        line.sort_by(|a, b| {
+            a.home_position
+                .x
+                .total_cmp(&b.home_position.x)
+                .then(a.id.cmp(&b.id))
+        });
+        let rank = line.iter().position(|candidate| candidate.id == player.id)?;
+        let denominator = line.len().saturating_sub(1).max(1) as f64;
+        Some(
+            ((rank as f64 / denominator) * (MARKOV_LANE_SLOT_COUNT as f64 - 1.0)).round()
+                as usize,
+        )
+    }
+
+    fn markov_lane_pmf_row_for_player(
+        &self,
+        player: &PlayerSnapshot,
+    ) -> Option<&'static [f64; VERTICAL_LANE_COUNT]> {
+        let slot = self.role_line_markov_slot_index_for_player(player)?;
+        match player.role {
+            PlayerRole::Defender => Some(&DEFENDER_MARKOV_LANE_PMF_BY_SLOT[slot]),
+            PlayerRole::Midfielder => Some(&MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT[slot]),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn markov_lane_probability_for_player_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        let Some(row) = self.markov_lane_pmf_row_for_player(player) else {
+            return 0.0;
+        };
+        let lane = vertical_lane_index(target.x, self.field_width);
+        let total = row.iter().copied().filter(|p| p.is_finite()).sum::<f64>();
+        if total <= 1e-9 {
+            return 0.0;
+        }
+        (row[lane] / total).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn markov_lane_affinity_for_player_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        let Some(row) = self.markov_lane_pmf_row_for_player(player) else {
+            return 0.0;
+        };
+        let total = row.iter().copied().filter(|p| p.is_finite()).sum::<f64>();
+        if total <= 1e-9 {
+            return 0.0;
+        }
+        let peak = row
+            .iter()
+            .copied()
+            .filter(|p| p.is_finite())
+            .fold(0.0_f64, f64::max)
+            / total;
+        if peak <= 1e-9 {
+            return 0.0;
+        }
+        (self.markov_lane_probability_for_player_target(player, target) / peak).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn dynamic_lane_affinity_for_player_target(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        if player.role == PlayerRole::Goalkeeper {
+            return 0.5;
+        }
+        if player.role == PlayerRole::Forward {
+            return 0.0;
+        }
+        let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
+        let fallback = self.player_snapshot_position(player);
+        let target = finite_pitch_point(target, width, length, fallback);
+        let player_position = finite_pitch_point(fallback, width, length, player.home_position);
+        let ball_position =
+            finite_pitch_point(self.ball.position, width, length, Vec2::new(width * 0.5, length * 0.5));
+        let ball_speed = self.ball.velocity.len().clamp(0.0, 42.0);
+        let ball_acceleration = self.ball.acceleration.len().clamp(0.0, 72.0);
+        let lookahead = (0.45 + ball_speed / 42.0 + ball_acceleration / 96.0).clamp(0.45, 1.35);
+        let predicted_ball = self.predicted_ball_position(lookahead);
+        let lane_match = |a: usize, b: usize| -> f64 {
+            (1.0 - a.abs_diff(b) as f64 / 5.0).clamp(0.0, 1.0)
+        };
+        let player_lane = vertical_lane_index(player_position.x, width);
+        let home_lane = vertical_lane_index(player.home_position.x, width);
+        let target_lane = vertical_lane_index(target.x, width);
+        let ball_lane = vertical_lane_index(ball_position.x, width);
+        let predicted_lane = vertical_lane_index(predicted_ball.x, width);
+        let relief = self.positional_shape_exception_relief_for_player_target(player, target);
+        let static_fit = self.vertical_lane_fit_for_player_target(player, target, relief);
+        let possession_factor = if self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team())
+            == Some(player.team)
+        {
+            0.5
+        } else {
+            1.0
+        };
+        let markov_lane_affinity = self.markov_lane_affinity_for_player_target(player, target)
+            * (1.0 - relief.clamp(0.0, 0.85));
+        let player_to_ball_lane = lane_match(player_lane, predicted_lane) * 0.48
+            + lane_match(home_lane, predicted_lane) * 0.34
+            + lane_match(player_lane, ball_lane) * 0.18;
+        let target_to_ball_lane =
+            lane_match(target_lane, predicted_lane) * 0.68 + lane_match(target_lane, ball_lane) * 0.32;
+        let current_gap = player_lane.abs_diff(ball_lane) as f64;
+        let predicted_gap = player_lane.abs_diff(predicted_lane) as f64;
+        let flow_score = (0.5 + (current_gap - predicted_gap) * 0.18).clamp(0.15, 0.85);
+        let occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
+        let teammate_space = (1.0 - occupancy.teammate_occupied_space_pressure()).clamp(0.0, 1.0);
+        let open_space = (occupancy.open_space_score / 18.0).clamp(0.0, 1.0);
+        let field_config_score = teammate_space * 0.62 + open_space * 0.38;
+        ((markov_lane_affinity * 0.30
+            + static_fit.affinity_score * 0.22
+            + player_to_ball_lane * 0.20
+            + target_to_ball_lane * 0.12
+            + flow_score * 0.06
+            + field_config_score * 0.10)
+            * possession_factor)
+            .clamp(0.0, 1.0)
+    }
+
+    fn lane_biased_player_target_score(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        lane_discount_yards: f64,
+    ) -> f64 {
+        let distance = self.player_snapshot_position(player).distance(target);
+        distance
+            - self.dynamic_lane_affinity_for_player_target(player, target)
+                * lane_discount_yards.max(0.0)
+    }
+
     fn vertical_lane_penalty_for_player_target(
         &self,
         player: &PlayerSnapshot,
@@ -16204,9 +16373,9 @@ impl WorldSnapshot {
             .iter()
             .filter(|player| player.team == me.team && player.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                let da = self.player_snapshot_position(a).distance(carrier_position);
-                let db = self.player_snapshot_position(b).distance(carrier_position);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                self.lane_biased_player_target_score(a, carrier_position, 1.15)
+                    .total_cmp(&self.lane_biased_player_target_score(b, carrier_position, 1.15))
+                    .then(a.id.cmp(&b.id))
             })?;
         if closest.id != me.id {
             return None;
@@ -16262,9 +16431,9 @@ impl WorldSnapshot {
             .iter()
             .filter(|player| player.team == me.team && player.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                self.player_snapshot_position(a)
-                    .distance(holder_position)
-                    .total_cmp(&self.player_snapshot_position(b).distance(holder_position))
+                self.lane_biased_player_target_score(a, holder_position, 1.10)
+                    .total_cmp(&self.lane_biased_player_target_score(b, holder_position, 1.10))
+                    .then(a.id.cmp(&b.id))
             })?;
         if closest.id != me.id {
             return None;
@@ -16346,9 +16515,9 @@ impl WorldSnapshot {
             .iter()
             .filter(|p| p.team == me.team && p.role == PlayerRole::Defender)
             .min_by(|a, b| {
-                self.player_snapshot_position(a)
-                    .distance(runner_pos)
-                    .total_cmp(&self.player_snapshot_position(b).distance(runner_pos))
+                self.lane_biased_player_target_score(a, runner_pos, 1.05)
+                    .total_cmp(&self.lane_biased_player_target_score(b, runner_pos, 1.05))
+                    .then(a.id.cmp(&b.id))
             });
         if nearest.map(|p| p.id) != Some(me.id) {
             return target;
@@ -16438,9 +16607,9 @@ impl WorldSnapshot {
             .iter()
             .filter(|p| p.team == me.team && p.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                self.player_snapshot_position(a)
-                    .distance(carrier_position)
-                    .total_cmp(&self.player_snapshot_position(b).distance(carrier_position))
+                self.lane_biased_player_target_score(a, carrier_position, 1.15)
+                    .total_cmp(&self.lane_biased_player_target_score(b, carrier_position, 1.15))
+                    .then(a.id.cmp(&b.id))
             });
         if nearest.map(|p| p.id) != Some(me.id) {
             return 1.0;
@@ -16533,9 +16702,9 @@ impl WorldSnapshot {
             .iter()
             .filter(|p| p.team == me.team && p.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                self.player_snapshot_position(a)
-                    .distance(carrier)
-                    .total_cmp(&self.player_snapshot_position(b).distance(carrier))
+                self.lane_biased_player_target_score(a, carrier, 1.10)
+                    .total_cmp(&self.lane_biased_player_target_score(b, carrier, 1.10))
+                    .then(a.id.cmp(&b.id))
             })?;
         if nearest.id != me.id {
             return None;
@@ -16880,10 +17049,12 @@ impl WorldSnapshot {
     }
 
     pub fn mdp_state(&self) -> SoccerMdpState {
+        let ball_grid = pitch_grid_address(self.ball.position, self.field_width, self.field_length);
         SoccerMdpState {
             tick: self.tick,
-            ball_zone_x: zone(self.ball.position.x, self.field_width, 6),
-            ball_zone_y: zone(self.ball.position.y, self.field_length, 8),
+            ball_zone_x: ball_grid.tactical.x,
+            ball_zone_y: ball_grid.tactical.y,
+            ball_grid,
             player_grid: PitchGridAddress::default(),
             receive_facing: FacingBucket::Unknown,
             action_facing: FacingBucket::Unknown,
@@ -16910,6 +17081,7 @@ impl WorldSnapshot {
             return SoccerPomdpObservation {
                 player_id,
                 player_grid: PitchGridAddress::default(),
+                ball_grid: PitchGridAddress::default(),
                 receive_facing: FacingBucket::Unknown,
                 action_facing: FacingBucket::Unknown,
                 has_ball: false,
@@ -17407,6 +17579,7 @@ impl WorldSnapshot {
         let pass_eval_elapsed = phase_started.elapsed();
         let phase_started = Instant::now();
         let player_grid = pitch_grid_address(me_position, self.field_width, self.field_length);
+        let ball_grid = pitch_grid_address(self.ball.position, self.field_width, self.field_length);
         let real_pressure = pressure_from_nearest_distance(nearest_opponent_distance);
         let perceived_pressure =
             perceived_pressure_for_player(me, real_pressure, visible_opponents);
@@ -17837,6 +18010,7 @@ impl WorldSnapshot {
         let mut observation = SoccerPomdpObservation {
             player_id,
             player_grid,
+            ball_grid,
             receive_facing: me.receive_facing,
             action_facing,
             has_ball,
@@ -19663,6 +19837,11 @@ impl WorldSnapshot {
                 | TeamAttackStrategy::DrawPressThenPlayThrough
                 | TeamAttackStrategy::DirectLongDiagonalLeft
                 | TeamAttackStrategy::DirectLongDiagonalRight
+                | TeamAttackStrategy::AerialFlickOnRelease
+                | TeamAttackStrategy::TransitionBurstOnRegain
+                | TeamAttackStrategy::CentralDoubleOneTwo
+                | TeamAttackStrategy::HalfSpaceComboLeft
+                | TeamAttackStrategy::HalfSpaceComboRight
                 | TeamAttackStrategy::ThirdManRunCentral
         )
     }
@@ -20847,7 +21026,7 @@ impl WorldSnapshot {
     /// Retrieval priority for a loose ball: distance to where the ball is heading,
     /// shortened by how well the player's current stride/trajectory already commits
     /// toward it (the ball's path matching the player's run). Lower = better.
-    fn loose_ball_retrieval_score(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
+    pub(crate) fn loose_ball_retrieval_score(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
         let pos = self.player_snapshot_position(player);
         let to_target = target - pos;
         let dist = to_target.len();
@@ -20860,13 +21039,14 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT)
+        let lane_affinity = self.dynamic_lane_affinity_for_player_target(player, target);
+        dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT) - lane_affinity * 1.35
     }
 
     /// The single designated retriever is the teammate whose stride/trajectory best
     /// matches the ball's path (not merely the closest) — so one player commits and
     /// the rest hold their shape instead of three defenders swarming the ball.
-    fn is_primary_loose_ball_retriever(&self, player_id: usize, target: Vec2) -> bool {
+    pub(crate) fn is_primary_loose_ball_retriever(&self, player_id: usize, target: Vec2) -> bool {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return false;
         };
@@ -21678,9 +21858,8 @@ impl WorldSnapshot {
             .iter()
             .filter(|p| p.team == team && p.role == PlayerRole::Defender)
             .min_by(|a, b| {
-                self.player_snapshot_position(a)
-                    .distance(focus)
-                    .total_cmp(&self.player_snapshot_position(b).distance(focus))
+                self.lane_biased_player_target_score(a, focus, 1.05)
+                    .total_cmp(&self.lane_biased_player_target_score(b, focus, 1.05))
                     .then(a.id.cmp(&b.id))
             })
             .map(|p| p.id)
@@ -22040,6 +22219,9 @@ impl WorldSnapshot {
             self.field_width,
             in_possession,
         );
+        let adjusted_x = self
+            .back_four_horizontal_gap_adjusted_x(me, adjusted_x, exempt_defender)
+            .unwrap_or(adjusted_x);
         return Vec2::new(adjusted_x, adjusted_y);
     }
 
@@ -22075,9 +22257,74 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Hold the back four as a compact, FLAT, ball-side block: laterally a ~4-of-12-lane
-    /// block whose centre tracks the ball (shift-and-cover), fore-aft flattened to the
-    /// line's average depth. Preserves each defender's left-to-right order (no crossing).
+    fn back_four_horizontal_gap_adjusted_x(
+        &self,
+        me: &PlayerSnapshot,
+        target_x: f64,
+        exempt: Option<usize>,
+    ) -> Option<f64> {
+        if !target_x.is_finite()
+            || me.role != PlayerRole::Defender
+            || me.controller_slot.is_some()
+            || self.ball.holder == Some(me.id)
+            || exempt == Some(me.id)
+            || self.is_committed_loose_ball_chaser(me.id)
+        {
+            return None;
+        }
+        let mut line: Vec<(usize, Vec2, Vec2)> = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.role == PlayerRole::Defender && Some(p.id) != exempt)
+            .map(|p| (p.id, self.player_snapshot_position(p), p.home_position))
+            .collect();
+        if line.len() < 2 {
+            return None;
+        }
+        line.sort_by(|a, b| a.2.x.total_cmp(&b.2.x).then(a.0.cmp(&b.0)));
+        let n = line.len() as f64;
+        let my_rank = line.iter().position(|(id, _, _)| *id == me.id)?;
+
+        let ball_x = self.ball.position.x.clamp(0.0, self.field_width);
+        let raw_center = self.field_width * 0.5 * (1.0 - BACK_FOUR_BALL_SIDE_SHIFT)
+            + ball_x * BACK_FOUR_BALL_SIDE_SHIFT;
+        let lp_targets: Vec<f64> = line
+            .iter()
+            .filter_map(|(id, _, _)| self.formation_lp_guidance_for(*id).map(|guidance| guidance.target.x))
+            .filter(|x| x.is_finite())
+            .collect();
+        let lp_center = if lp_targets.is_empty() {
+            raw_center
+        } else {
+            lp_targets.iter().sum::<f64>() / lp_targets.len() as f64
+        };
+        let center_seed = raw_center * 0.55 + lp_center * 0.45;
+        let desired_width = BACK_FOUR_BLOCK_WIDTH_YARDS
+            .min(BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS * (n - 1.0))
+            .max(BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS * (n - 1.0));
+        let half = desired_width * 0.5;
+        let center = center_seed.clamp(half, self.field_width - half);
+        let slot_step = desired_width / (n - 1.0).max(1.0);
+        let slot_x = center - half + my_rank as f64 * slot_step;
+        let current_x = self.player_snapshot_position(me).x.clamp(0.0, self.field_width);
+        let horizon = BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS.max(1e-6);
+        let mpc_slot_x = current_x + ((slot_x - current_x) / horizon) * horizon;
+        let proposed_x = target_x + (mpc_slot_x - target_x) * BACK_FOUR_LATERAL_GAIN;
+        let legal_slack = ((slot_step - BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS)
+            .min(BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS - slot_step)
+            .max(0.0))
+            * 0.45;
+        Some(
+            proposed_x
+                .clamp(slot_x - legal_slack, slot_x + legal_slack)
+                .clamp(0.0, self.field_width),
+        )
+    }
+
+    /// Hold the back four as a compact, FLAT, ball-side block: laterally a 1.5-8yd
+    /// neighbour-gap block whose centre blends ball-side shift with the formation LP/IPM
+    /// target, fore-aft flattened to the line's average depth. Preserves each defender's
+    /// home left-to-right order (LWB, LCB, RCB, RWB; no crossing).
     /// The lone defender allowed to step out and engage the ball, the carrier, a committed
     /// loose-ball chaser, and human-controlled players are exempt. A bounded pull, not a snap.
     pub(crate) fn back_four_shape_adjusted_target(&self, player_id: usize, target: Vec2) -> Vec2 {
@@ -22092,12 +22339,6 @@ impl WorldSnapshot {
             || self.ball.holder == Some(player_id)
             || self.is_committed_loose_ball_chaser(player_id)
         {
-            return target;
-        }
-        // A compact ball-side block is a DEFENSIVE shape. When OUR team has the ball the
-        // back four must keep its width (full-backs push on to build/attack) — do not
-        // compact it. Only shape the block when defending or the ball is loose.
-        if self.controlled_possession_team() == Some(me.team) {
             return target;
         }
         let exempt = self.defensive_line_rule_exempt_defender(me.team);
@@ -22118,23 +22359,29 @@ impl WorldSnapshot {
         if line.len() < 2 {
             return target;
         }
-        // Sort left-to-right so each defender keeps its slot (never steers past a neighbour).
-        line.sort_by(|a, b| a.1.x.partial_cmp(&b.1.x).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by home slot so LWB/LCB/RCB/RWB recover their intended order even after a drift.
+        line.sort_by(|a, b| {
+            let ah = self
+                .players
+                .iter()
+                .find(|p| p.id == a.0)
+                .map(|p| p.home_position.x)
+                .unwrap_or(a.1.x);
+            let bh = self
+                .players
+                .iter()
+                .find(|p| p.id == b.0)
+                .map(|p| p.home_position.x)
+                .unwrap_or(b.1.x);
+            ah.total_cmp(&bh).then(a.0.cmp(&b.0))
+        });
         let n = line.len() as f64;
-        let Some(my_rank) = line.iter().position(|(id, _)| *id == player_id) else {
+        if !line.iter().any(|(id, _)| *id == player_id) {
             return target;
-        };
-        // Lateral: a compact block whose centre tracks the ball's x (retaining some
-        // centrality), each defender slotted in left-to-right order.
-        let ball_x = self.ball.position.x.clamp(0.0, self.field_width);
-        let half = BACK_FOUR_BLOCK_WIDTH_YARDS * 0.5;
-        let raw_center = self.field_width * 0.5 * (1.0 - BACK_FOUR_BALL_SIDE_SHIFT)
-            + ball_x * BACK_FOUR_BALL_SIDE_SHIFT;
-        let center = raw_center.clamp(half, self.field_width - half);
-        let slot_step = BACK_FOUR_BLOCK_WIDTH_YARDS / (n - 1.0).max(1.0);
-        let slot_x = center - half + my_rank as f64 * slot_step;
-        let pulled_x =
-            (target.x + (slot_x - target.x) * BACK_FOUR_LATERAL_GAIN).clamp(0.0, self.field_width);
+        }
+        let pulled_x = self
+            .back_four_horizontal_gap_adjusted_x(me, target.x, exempt)
+            .unwrap_or(target.x.clamp(0.0, self.field_width));
         // Fore-aft: flatten toward the line's average depth (kill the stagger).
         let avg_fwd = line.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / n;
         let me_fwd = fwd(self.player_snapshot_position(me));
@@ -22165,9 +22412,9 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the midfield line's AVERAGE 1-20yd IN FRONT of the back four.
+    /// Keep the midfield line's AVERAGE 5-20yd IN FRONT of the back four.
     /// Every tick aims the line at the correction needed for consistency inside
-    /// the 2-second horizon, while accepting that physics/traffic may delay arrival.
+    /// the 3-second horizon, while accepting that physics/traffic may delay arrival.
     pub(crate) fn midfield_line_band_adjusted_target(
         &self,
         player_id: usize,
@@ -22260,8 +22507,8 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the striker/forward line's AVERAGE 2-20yd IN FRONT of the midfield line.
-    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 5-second
+    /// Keep the striker/forward line's AVERAGE 5-20yd IN FRONT of the midfield line.
+    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with a 3-second
     /// consistency horizon so 2-3 forwards stay connected without snapping.
     pub(crate) fn forward_line_band_adjusted_target(
         &self,
@@ -23154,7 +23401,7 @@ impl WorldSnapshot {
             0.0
         };
         let base_gap = if wide { 15.0 } else { 21.0 };
-        let base_home_push = if wide { 23.0 } else { 19.0 };
+        let base_home_push = if wide { 25.0 } else { 19.0 };
         let behind_ball =
             self.ball.position.y - team.attack_dir() * (base_gap - wingback_push * 0.55).max(8.0);
         let home_push = home.y + team.attack_dir() * (base_home_push + wingback_push);
@@ -23192,7 +23439,12 @@ impl WorldSnapshot {
             Team::Home => target.y.max(line_y),
             Team::Away => target.y.min(line_y),
         };
-        self.clamp_to_role_position(player.id, target, home, false)
+        let mut clamped = self.clamp_to_role_position(player.id, target, home, false);
+        clamped.y = match player.team {
+            Team::Home => clamped.y.max(line_y),
+            Team::Away => clamped.y.min(line_y),
+        };
+        clamped.clamp_to_pitch(self.field_width, self.field_length)
     }
 
     fn defender_open_space_depth_yards(
@@ -25161,7 +25413,7 @@ impl WorldSnapshot {
             in_possession,
         );
         let lane_pull = (role_vertical_lane_commitment(me.role, in_possession)
-            * (1.0 - lane_relief.clamp(0.0, 0.85)))
+            * (1.0 - lane_relief.clamp(0.0, 0.65)))
         .clamp(0.0, 1.0);
         let blended = Vec2::new(
             blended.x + (lane_clamped_x - blended.x) * lane_pull,
@@ -25191,7 +25443,10 @@ impl WorldSnapshot {
                     Some(player_id),
                     tracking_relief,
                 ) * 0.55;
+                let dynamic_lane_affinity =
+                    self.dynamic_lane_affinity_for_player_target(me, candidate);
                 let score = compact_score * 0.45
+                    + dynamic_lane_affinity * 0.42
                     - candidate.distance(blended) * 0.055
                     - candidate.distance(mark) * 0.025
                     - lane_penalty
