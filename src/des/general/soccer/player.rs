@@ -4570,7 +4570,7 @@ impl PlayerAgent {
                                 target_player: Some(target),
                                 power: 0.66
                                     + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                                flight: PassFlight::Floor,
+                                flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                             };
                             if mpc_reselects_candidate(
                                 snapshot,
@@ -4930,7 +4930,7 @@ impl PlayerAgent {
         // immediate-steal so a clean, risk-free steal is always preferred to a gamble.
         if !has_ball && snapshot.controlled_possession_team() == Some(self.team.other()) {
             if let Some((holder, appetite)) = self.slide_tackle_decision(snapshot) {
-                if rng.next_float() < time_window_probability(appetite, snapshot.dt_seconds) {
+                if _rng.next_float() < time_window_probability(appetite, snapshot.dt_seconds) {
                     let action = SoccerAction::SlideTackle {
                         target_player: holder,
                     };
@@ -5686,7 +5686,7 @@ impl PlayerAgent {
                                         power: 0.66
                                             + 0.24
                                                 * passing_skill.max(ability01(self.skills.vision)),
-                                        flight: PassFlight::Floor,
+                                        flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                                     },
                                     "killer-pass".to_string(),
                                 ));
@@ -5963,7 +5963,7 @@ impl PlayerAgent {
                         SoccerAction::Pass {
                             target_player: Some(target),
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                            flight: PassFlight::Floor,
+                            flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
                         "killer-pass".to_string(),
                     )
@@ -5981,7 +5981,7 @@ impl PlayerAgent {
                         SoccerAction::Pass {
                             target_player: Some(target),
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                            flight: PassFlight::Floor,
+                            flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
                         "killer-pass".to_string(),
                     )
@@ -6141,7 +6141,7 @@ impl PlayerAgent {
                                                 + 0.24
                                                     * passing_skill
                                                         .max(ability01(self.skills.vision)),
-                                            flight: PassFlight::Floor,
+                                            flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                                         },
                                         "killer-pass".to_string(),
                                     )
@@ -7112,7 +7112,7 @@ impl PlayerAgent {
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
                                         .max(ability01(self.skills.vision)),
-                            flight: PassFlight::Floor,
+                            flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
                         },
                         "killer-pass".to_string(),
                     ));
@@ -7180,7 +7180,7 @@ impl PlayerAgent {
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
                                         .max(ability01(self.skills.vision)),
-                            flight: PassFlight::Floor,
+                            flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
                         },
                         "killer-pass".to_string(),
                     )

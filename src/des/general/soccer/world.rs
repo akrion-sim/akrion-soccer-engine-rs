@@ -4292,15 +4292,9 @@ impl SoccerMatch {
         self.stage_opening_kickoff_if_pending();
         self.maintain_one_two_commitments();
         self.maintain_slide_recoveries();
-        // Tokens for the per-tick order shuffles below (see
-        // `dd_soccer_disable_tick_order_shuffle`). Kept function-local because they
-        // exist only to be reordered by `fisher_yates_shuffle` within this step.
-        enum ContestResolutionPass {
-            DribbleHoldUp,
-            BodyCollision,
-        }
-        // Tokens for the per-tick soft nudge passes below. Their order is semantic:
-        // spacing/shape protections first, tactical lane/ball proximity last.
+        // Tokens for the per-tick soft nudge passes below. Their order is semantic
+        // (explicit, not randomized): spacing/shape protections first, tactical
+        // lane/ball proximity last.
         enum SoftNudge {
             AntiBunch,
             SnapshotSpacing,
@@ -19206,6 +19200,15 @@ impl WorldSnapshot {
             .map(|assessment| assessment.target_id)
     }
 
+    /// How the chosen killer pass should be played — `Floor` on a clean ground lane, otherwise
+    /// a `Scoop`/`Aerial` loft clipped over the defender blocking it. `Floor` when no killer
+    /// pass is on (the caller has already gated on availability).
+    pub fn killer_pass_flight_for(&self, player_id: usize, visible_targets: &[usize]) -> PassFlight {
+        self.killer_pass_target_assessment_for(player_id, visible_targets)
+            .map(|assessment| assessment.flight)
+            .unwrap_or(PassFlight::Floor)
+    }
+
     pub(crate) fn killer_pass_target_assessment_for(
         &self,
         player_id: usize,
@@ -19264,10 +19267,27 @@ impl WorldSnapshot {
                 if goal_gain < KILLER_PASS_MIN_RECEIVER_GOAL_GAIN_YARDS {
                     return None;
                 }
-                let lane_fit = if self.clear_line(me_position, reception, me.team.other(), 1.8) {
-                    1.0
+                // Ground lane clean? Then thread it on the floor. If it is blocked, do NOT hide
+                // the option — lift it OVER the defender onto the runner, but only when a loft
+                // actually clears the block (tighter aerial corridor). A genuinely smothered lane
+                // (blocked on the ground AND under the flight path) is still rejected below.
+                let ground_clear = self.clear_line(me_position, reception, me.team.other(), 1.8);
+                let (flight, lane_fit) = if ground_clear {
+                    (PassFlight::Floor, 1.0)
+                } else if self.clear_line(
+                    me_position,
+                    reception,
+                    me.team.other(),
+                    KILLER_PASS_LOFT_LANE_RADIUS_YARDS,
+                ) {
+                    let lofted = if forward <= KILLER_PASS_LOFT_SHORT_MAX_YARDS {
+                        PassFlight::Scoop
+                    } else {
+                        PassFlight::Aerial
+                    };
+                    (lofted, KILLER_PASS_LOFT_LANE_FIT)
                 } else {
-                    0.18
+                    (PassFlight::Floor, 0.18)
                 };
                 let quality = pass_target_quality_for_snapshot(
                     self,
@@ -19275,7 +19295,7 @@ impl WorldSnapshot {
                     me_position,
                     target,
                     target_position,
-                    PassFlight::Floor,
+                    flight,
                 );
                 if quality.expected_completion < 0.24 || lane_fit < 0.30 {
                     return None;
@@ -19331,6 +19351,7 @@ impl WorldSnapshot {
                     expected_completion: quality.expected_completion,
                     stride_fit: quality.stride_fit,
                     score,
+                    flight,
                 })
             })
             .max_by(|a, b| {

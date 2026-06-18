@@ -32,6 +32,9 @@ use crate::des::general::neural_network::{
     ActivationName, DenseLayerConfig, FeedForwardNetwork, RandomNetworkSpec,
 };
 use crate::des::general::prng::{mulberry32, SeededRandom};
+// `RandomSource` brings `.next_float()` etc. into scope for `SeededRandom`; re-exported here so
+// child modules (`world`, `player`) reach it via `use super::*`.
+use crate::des::shared::capabilities::RandomSource;
 use crate::des::general::qp::{solve_qp_active_set, QPOptions, QPStatus, QuadraticProgram};
 use crate::des::general::soccer_genome::{PITCH_GENOME_LANES, PITCH_GENOME_ROWS};
 mod referee;
@@ -1805,10 +1808,16 @@ fn role_layer_gap_band_error_yards(gap_yards: f64, min_yards: f64, max_yards: f6
 // must move — the others can), and it is only EVENTUALLY consistent: the LP nudges the
 // anchors back into band and MPC/locomotion carries the players there over ~seconds,
 // so the line is momentarily perfect but constantly striving back into place.
-const BACKLINE_LATERAL_MIN_YARDS: f64 = 1.5;
-const BACKLINE_LATERAL_MAX_YARDS: f64 = 8.0;
+// Counterparts in a line must HOLD their width, not bunch: the floor (`MIN`) keeps
+// adjacent same-line players a real channel apart, and the back-line ceiling (`MAX`)
+// is set near the formation's own home spacing (back four home gaps are ~17yd:
+// LB 14 / LCB 31 / RCB 49 / RB 66) so the line stays spread across the pitch instead
+// of being squeezed into a narrow central block. The line still compacts ball-side
+// (the absolute anchors track the ball); this band only bounds the RELATIVE gap.
+const BACKLINE_LATERAL_MIN_YARDS: f64 = 6.0;
+const BACKLINE_LATERAL_MAX_YARDS: f64 = 15.0;
 const BACKLINE_LATERAL_IDEAL_YARDS: f64 = 4.0;
-const MIDLINE_LATERAL_MIN_YARDS: f64 = 2.0;
+const MIDLINE_LATERAL_MIN_YARDS: f64 = 6.0;
 const MIDLINE_LATERAL_IDEAL_YARDS: f64 = 5.0;
 // Reward shaping for the territorial-overlap signal — kept small so match outcomes
 // (goals, possession) dominate and the policy can learn that a tight overlap is
@@ -3323,7 +3332,13 @@ fn role_vertical_lane_range(
         )
     };
     match role {
-        PlayerRole::Forward => (0, VERTICAL_LANE_COUNT.saturating_sub(1)),
+        // Forwards keep their freedom to drift and make runs, but not across the
+        // WHOLE pitch: a generous home-centred band (±3 of 12 lanes ≈ ±20yd) lets a
+        // striker work the centre and both half-spaces while still stopping it from
+        // wandering onto the opposite touchline and emptying the team's width. This is
+        // a containment guardrail only — forwards still carry no positive lane prior
+        // pulling them to a home channel (see `dynamic_lane_affinity_for_player_target`).
+        PlayerRole::Forward => centered_band(3),
         PlayerRole::Defender if in_possession => centered_band(2),
         PlayerRole::Defender => centered_band(1),
         PlayerRole::Midfielder if in_possession => centered_band(2),
@@ -3338,11 +3353,23 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
     // per-player lane affinity lives in `dynamic_lane_affinity_for_player_target`.
     match role {
         PlayerRole::Goalkeeper => 1.0,
-        PlayerRole::Defender if in_possession => 0.48,
+        // In possession the team must STRETCH the pitch, not collapse onto the ball:
+        // hold the width lane firmly (was 0.48 / 0.45). Above the 0.65 hard-lock
+        // threshold this snaps a player back to its lane once it drifts clear OUTSIDE
+        // its ~13yd in-possession band UNLESS it has a relief reason (an attacking run,
+        // tracking a mark, no outlet, covering a teammate, team urgency) — i.e. players
+        // only leave their primary lane for those already-specified reasons. Drift
+        // INSIDE the band is still free; this only bounds the band edge.
+        PlayerRole::Defender if in_possession => 0.66,
         PlayerRole::Defender => 0.92,
-        PlayerRole::Midfielder if in_possession => 0.45,
+        PlayerRole::Midfielder if in_possession => 0.66,
         PlayerRole::Midfielder => 0.90,
-        PlayerRole::Forward => 0.0,
+        // A light containment pull for forwards: enough to keep the lane clamp/penalty
+        // alive against a cross-pitch drift (commitment must be > 0 to engage at all),
+        // but well below the 0.65 hard-lock threshold and eroded by genuine attacking
+        // runs (`offensive_high_speed_run_relief`), so striker movement stays free.
+        PlayerRole::Forward if in_possession => 0.24,
+        PlayerRole::Forward => 0.40,
     }
 }
 
@@ -44377,7 +44404,7 @@ fn curl_acceleration_for_path(
     let travel_time = (distance / speed_yps).clamp(0.12, 3.5);
     let magnitude =
         (2.0 * bend_yards.abs() / (travel_time * travel_time)).clamp(0.0, MAX_BALL_CURL_YPS2);
-    lateral * side * magnitude
+    return lateral * side * magnitude
 }
 
 fn apply_ball_curl(velocity: Vec2, curl_acceleration: Vec2, dt_seconds: f64) -> Vec2 {
@@ -44389,9 +44416,9 @@ fn apply_ball_curl(velocity: Vec2, curl_acceleration: Vec2, dt_seconds: f64) -> 
     let lateral_accel = curl_acceleration - dir * dot(curl_acceleration, dir);
     let curved = velocity + lateral_accel * dt_seconds;
     if curved.len() <= 1e-6 {
-        velocity
+        return velocity
     } else {
-        curved.normalized() * speed
+        return curved.normalized() * speed
     }
 }
 
@@ -44402,7 +44429,7 @@ fn decayed_ball_curl(curl_acceleration: Vec2, dt_seconds: f64) -> Vec2 {
     let factor = (-BALL_CURL_DECAY_PER_SECOND * dt_seconds).exp();
     let decayed = curl_acceleration * factor;
     if decayed.len() < 0.025 {
-        Vec2::zero()
+        return Vec2::zero()
     } else {
         decayed
     }
@@ -44423,7 +44450,7 @@ fn player_reaction_time_seconds_from_traits(
     } else {
         0.21
     };
-    (0.44 - quickness * 0.18 + fatigue.clamp(0.0, 1.0) * 0.13).clamp(role_floor, 0.62)
+    return (0.44 - quickness * 0.18 + fatigue.clamp(0.0, 1.0) * 0.13).clamp(role_floor, 0.62)
 }
 
 fn goalkeeper_reaction_time_seconds(skills: &SkillProfile, fatigue: f64) -> f64 {
@@ -44506,7 +44533,7 @@ fn shot_block_probability_for_candidate(
         * readiness
         * quick_release_factor)
         .clamp(0.0, 0.92);
-    (probability >= 0.025).then_some((
+    return (probability >= 0.025).then_some((
         probability,
         block_position,
         distance_to_ball,
@@ -44534,7 +44561,7 @@ fn combine_shot_block_assessments(
     .clamp(0.0, 0.96);
     let mut best = assessments.remove(0);
     best.probability = combined;
-    Some(best)
+    return Some(best)
 }
 
 fn shot_block_assessment_for_agents(
@@ -44601,7 +44628,7 @@ fn shot_sightline_screen_probability_for_agents(
             .map(|(probability, _, _, _, _)| 1.0 - probability.clamp(0.0, 1.0))
         })
         .product::<f64>();
-    (1.0 - clear_probability).clamp(0.0, 1.0)
+    return (1.0 - clear_probability).clamp(0.0, 1.0)
 }
 
 fn shot_goalmouth_target_points(
@@ -44659,7 +44686,7 @@ fn shot_block_assessment_for_snapshot_target(
             })
         })
         .collect::<Vec<_>>();
-    combine_shot_block_assessments(assessments)
+    return combine_shot_block_assessments(assessments)
 }
 
 fn shot_block_assessment_for_snapshot(
@@ -44697,7 +44724,7 @@ fn shot_block_assessment_for_snapshot(
             Some(_) => {}
         }
     }
-    best
+    return best
 }
 
 fn shot_miss_window_yards(
@@ -44720,7 +44747,7 @@ fn triangular_abs_within_probability(bound: f64, window: f64) -> f64 {
         return 1.0;
     }
     let ratio = (bound / window).clamp(0.0, 1.0);
-    (2.0 * ratio - ratio * ratio).clamp(0.0, 1.0)
+    return (2.0 * ratio - ratio * ratio).clamp(0.0, 1.0)
 }
 
 fn shot_on_frame_probability(
@@ -44753,7 +44780,7 @@ fn noisy_shot_target_x(
     let distance_fit = (yards_to_goal.max(0.0) / 48.0).clamp(0.0, 1.0);
     let deterministic_pull = (skill_error * 0.56 + pressure * 0.30 + distance_fit * 0.24 - 0.42)
         .clamp(0.0, 0.62);
-    goal_center_x + deterministic_pull * miss_window
+    return goal_center_x + deterministic_pull * miss_window
 }
 
 /// Calibrated save probability vs shot distance (a mixed RV, piecewise-linear
@@ -44793,7 +44820,7 @@ fn goalkeeper_distance_save_baseline(shot_distance_yards: f64) -> f64 {
             return y0 + (y1 - y0) * t;
         }
     }
-    last.1
+    return last.1
 }
 
 /// Clamp where a keeper ends up after making a save to within its physical reach this tick
@@ -44812,9 +44839,9 @@ fn soccer_bounded_keeper_save_position(
         + GOALKEEPER_SAVE_DIVE_REACH_YARDS;
     let delta = save_position - keeper.position;
     if delta.len() <= reach {
-        save_position
+       return save_position
     } else {
-        keeper.position + delta.normalized() * reach
+        return keeper.position + delta.normalized() * reach
     }
 }
 
