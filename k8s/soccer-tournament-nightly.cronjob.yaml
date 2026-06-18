@@ -9,12 +9,16 @@
 #   * schedule "0 2 * * *" + spec.timeZone (k8s CronJobs are UTC unless timeZone
 #     is set; 2am LOCAL requires it).
 #   * concurrencyPolicy: Forbid — never overlap two tournaments.
-#   * activeDeadlineSeconds: 28800 (8h) — NOT a 7am stop. The full 128-team /
-#     60-min / T=2 bracket needs ~5.25h, which overran the old 5h cap and was
-#     hard-killed at 7am every night (never promoting a champion; verified
-#     2026-06-15 DeadlineExceeded on both clusters). Per the owner's call we now
-#     let it finish past the window; 8h is only a backstop so a genuine HANG can't
-#     run into the next day / block the next night (Forbid would skip it).
+#   * activeDeadlineSeconds: 28800 (8h) — NOT a 7am stop, and NOT the normal end.
+#     With 30-min matches (MATCH_SECONDS=1800) the full 128-team / T=2 bracket
+#     finishes in ~2.4h, so the 8h cap is now pure HANG-protection a healthy run
+#     never reaches. (At 60-min matches it needed >8h and was hard-killed at the
+#     halfway mark, promoting nothing — DB tournament id=46 stranded 'running',
+#     verified 2026-06-18.) Even if the cap ever fires, learning is no longer lost:
+#     SOFT_DEADLINE_SECONDS stops gracefully between waves and the run is marked
+#     status='partial' (banking its top-16 brains into the next generation's elite
+#     pool), and a run left 'running' by a hard kill is reconciled to 'partial' at
+#     the next run's start. So the night's learning ALWAYS feeds the GA.
 #
 # Runtime budget: the bracket runs independent fixtures in parallel on
 # SOCCER_TOURNAMENT_THREADS worker threads. Keep this at 2 by default so AWS EC2
@@ -158,9 +162,15 @@ spec:
                 # tournament lease, so total active match workers stay at 2.
                 - name: SOCCER_TOURNAMENT_LOCK_KEY
                   value: soccer-nightly-tournament
-                # 60-min matches -> ~4.7h at T=2 before clone/build (see header).
+                # 30-min matches -> ~2.4h at T=2 before clone/build (see header).
+                # Halved from 3600 (2026-06-18): the 60-min/128-team bracket needed
+                # >8h and was hard-killed at the halfway mark, promoting nothing
+                # (DB tournament id=46 stranded at status='running'). A 30-min match
+                # still carries ample possessions/goals for the neural value-critic
+                # and league-points fitness, and finishes well inside the window so a
+                # full champion + top-16 elite pool actually get promoted each night.
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
-                  value: "3600"
+                  value: "1800"
                 # Soft cap is measured from binary start, after clone/build; with
                 # the current ~4-5m build this leaves roughly 5m before the hard
                 # job cap for failure marking, lock release, salvage promotion,

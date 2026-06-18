@@ -1029,7 +1029,8 @@ impl SoccerLearningPgStore {
                 from des_soccer_tournament_team_brains b
                 where b.tournament_id = (
                   select id from des_soccer_tournaments
-                  where experiment_id = $1::text::uuid and status = 'completed'
+                  where experiment_id = $1::text::uuid
+                    and status in ('completed', 'partial')
                   order by created_at desc, id desc
                   limit 1
                 )
@@ -1080,7 +1081,8 @@ impl SoccerLearningPgStore {
                 from des_soccer_tournament_team_brains b
                 where b.tournament_id = (
                   select id from des_soccer_tournaments
-                  where experiment_id = $1::text::uuid and status = 'completed'
+                  where experiment_id = $1::text::uuid
+                    and status in ('completed', 'partial')
                   order by created_at desc, id desc
                   limit 1
                 )
@@ -1118,6 +1120,44 @@ impl SoccerLearningPgStore {
             });
         }
         Ok(pool)
+    }
+
+    /// Reclaim the learning from any tournament left `running` by a hard kill
+    /// (k8s `activeDeadlineSeconds`, OOM, node loss): a SIGKILLed run never gets to
+    /// `finish_tournament`, so its header stays `running` and its checkpointed
+    /// per-team brains are stranded — the elite pool only breeds from finished runs.
+    /// We hold the cross-cluster run lock here, so any `running` row for this
+    /// experiment is provably a zombie (no live run but ours, which has no header
+    /// yet). Flip them to `partial` so their top finishers feed the next generation.
+    /// Returns the number of headers reconciled. Idempotent.
+    pub fn reconcile_orphaned_running_tournaments(
+        &mut self,
+        experiment_id: &str,
+    ) -> Result<u64, String> {
+        self.ensure_connected()?;
+        {
+            let mut tx = self
+                .client
+                .transaction()
+                .map_err(|err| format!("begin tournament reconcile schema tx: {err}"))?;
+            ensure_soccer_tournament_tables(&mut tx)?;
+            tx.commit()
+                .map_err(|err| format!("commit tournament reconcile schema: {err}"))?;
+        }
+        let affected = self
+            .client
+            .execute(
+                r#"
+                update des_soccer_tournaments
+                set status = 'partial',
+                    finished_at = coalesce(finished_at, now()),
+                    updated_at = now()
+                where experiment_id = $1::text::uuid and status = 'running'
+                "#,
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("reconcile orphaned tournaments: {err}"))?;
+        Ok(affected)
     }
 
     pub fn load_latest_active_policy(

@@ -618,6 +618,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             "Soccer nightly learning tournament",
             &promote_config,
         )?;
+        // Reclaim any prior run left `running` by a hard kill (we hold the run lock,
+        // so those are provably zombies): flip them to `partial` BEFORE loading the
+        // elite pool so last night's stranded brains breed into this generation.
+        match store.reconcile_orphaned_running_tournaments(&eid) {
+            Ok(n) if n > 0 => {
+                println!("tournament_reconciled_orphans experiment={eid} count={n} status=partial")
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("tournament_reconcile_orphans_failed experiment={eid} error={err} (continuing)"),
+        }
         match store.load_latest_active_policy_metadata(&eid)? {
             Some(metadata) => {
                 parent_policy_version_id = Some(metadata.id.clone());
@@ -790,11 +800,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = match run_result {
         Ok(report) => report,
         Err(err) => {
-            eprintln!("tournament_failed error={err} persisted_matches={persisted_matches}");
+            // A soft-deadline stop (`check_deadline`) is a graceful partial finish, not a
+            // crash: the bracket simply ran out of wall-clock between waves. Mark it `partial`
+            // (NOT `failed`) so its checkpointed top finishers still feed the next generation's
+            // elite pool — the night's learning is banked, not discarded.
+            let deadline_stop = err.contains("deadline reached");
+            let finish_status = if deadline_stop { "partial" } else { "failed" };
+            eprintln!(
+                "tournament_{} error={err} persisted_matches={persisted_matches}",
+                if deadline_stop { "partial" } else { "failed" }
+            );
             if let (Some(store), Some(db_id)) = (store.as_mut(), tournament_db_id) {
                 let _ = store.finish_tournament(
                     db_id,
-                    "failed",
+                    finish_status,
                     None,
                     None,
                     None,
@@ -830,6 +849,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 tournament_lock_held,
                 &tournament_lock_key,
             );
+            // A graceful soft-deadline stop is a successful partial run (learning banked
+            // + salvage promoted), so exit 0 — only a genuine crash propagates an error.
+            if deadline_stop {
+                return Ok(());
+            }
             return Err(err.into());
         }
     };
