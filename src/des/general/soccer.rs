@@ -2341,7 +2341,7 @@ const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
 /// Base per-decision feature count: everything except the whole-field block below.
-const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 170;
+const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 180;
 /// Whole-field "moment of all 22" block appended to every decision's feature vector:
 /// for the actor's team then the opponents (each ordered by player id), the
 /// actor-relative canonical (forward, lateral) position and (forward, lateral) velocity
@@ -2451,10 +2451,20 @@ const SOCCER_NEURAL_FEATURE_VACATE_SPACE_ACTION: usize = 166;
 const SOCCER_NEURAL_FEATURE_SURPRISE_PASS_ACTION: usize = 167;
 const SOCCER_NEURAL_FEATURE_FLICK_ON_ACTION: usize = 168;
 const SOCCER_NEURAL_FEATURE_TURNOVER_BURST_ACTION: usize = 169;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_AVAILABLE: usize = 170;
+const SOCCER_NEURAL_FEATURE_INCOMING_BALL_SPEED: usize = 171;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_SCORE: usize = 172;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_SCORE: usize = 173;
+const SOCCER_NEURAL_FEATURE_CONTROL_TOUCH_SCORE: usize = 174;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_ACTION: usize = 175;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION: usize = 176;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_FIELD_FEASIBILITY: usize = 177;
+const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY: usize = 178;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR: usize = 179;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61, 62, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96, 97, 102, 103, 106, 107, 108, 109,
-    110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153, 160, 163, 248, 251,
-    SOCCER_NEURAL_BASE_FEATURE_DIM,
+    110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153, 160, 163, 170, 177, 248, 251, 258,
+    265, SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -3913,6 +3923,12 @@ pub struct SoccerPomdpObservation {
     pub one_touch_pass_feasibility: f64,
     #[serde(default = "one_touch_feasibility_default")]
     pub one_touch_shot_feasibility: f64,
+    #[serde(default)]
+    pub first_time_pass_field_feasibility: f64,
+    #[serde(default)]
+    pub first_time_shot_field_feasibility: f64,
+    #[serde(default)]
+    pub first_touch_shape_prior: f64,
     #[serde(default)]
     pub skill_top_speed: f64,
     #[serde(default)]
@@ -5702,7 +5718,15 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub first_time_shot_bin: u8,
     #[serde(default)]
+    pub first_time_pass_bin: u8,
+    #[serde(default)]
     pub control_touch_bin: u8,
+    #[serde(default)]
+    pub first_time_pass_field_bin: u8,
+    #[serde(default)]
+    pub first_time_shot_field_bin: u8,
+    #[serde(default)]
+    pub first_touch_shape_prior_bin: u8,
     // NOTE: the 22 per-player skill bins (top_speed, acceleration, stamina,
     // strength, height, weight, dribbling, aggression, foot-shot power, passing,
     // first_touch, flair, vision, crossing, goalkeeping, defending, shooting,
@@ -6138,9 +6162,25 @@ impl SoccerQStateKey {
                 observation.first_time_shot_score,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            first_time_pass_bin: distance_bucket(
+                observation.first_time_pass_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
             control_touch_bin: distance_bucket(
                 observation.control_touch_score,
                 &[0.15, 0.35, 0.60, 0.82],
+            ),
+            first_time_pass_field_bin: distance_bucket(
+                observation.first_time_pass_field_feasibility,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            first_time_shot_field_bin: distance_bucket(
+                observation.first_time_shot_field_feasibility,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            first_touch_shape_prior_bin: distance_bucket(
+                observation.first_touch_shape_prior,
+                &[0.12, 0.28, 0.48, 0.70],
             ),
             open_space_bin: distance_bucket(observation.open_space_score, &[8.0, 14.0, 22.0, 32.0]),
         }
@@ -6304,7 +6344,11 @@ impl SoccerQStateKey {
             && self.pending_pass_off_target_bin == other.pending_pass_off_target_bin
             && self.pending_pass_receiver_urgency_bin == other.pending_pass_receiver_urgency_bin
             && self.first_time_shot_bin == other.first_time_shot_bin
+            && self.first_time_pass_bin == other.first_time_pass_bin
             && self.control_touch_bin == other.control_touch_bin
+            && self.first_time_pass_field_bin == other.first_time_pass_field_bin
+            && self.first_time_shot_field_bin == other.first_time_shot_field_bin
+            && self.first_touch_shape_prior_bin == other.first_touch_shape_prior_bin
             && self.open_space_bin == other.open_space_bin
             && facing_bucket_matches(self.receive_facing, other.receive_facing)
             && facing_bucket_matches(self.action_facing, other.action_facing)
@@ -8405,6 +8449,10 @@ fn normalize_soccer_action_label(action: &str) -> &str {
         "route1" | "route-1" | "long-ball" | "longball" => "route-one",
         "hoof" | "hoofed-clearance" => "clearance",
         "header" => "first-time-header",
+        "one-touch-shot" | "one_touch_shot" | "onetouchshot" | "1-touch-shot" | "1touchshot"
+        | "first-touch-shot" | "first_touch_shot" | "firsttouchshot" => "first-time-shot",
+        "one-touch-pass" | "one_touch_pass" | "onetouchpass" | "1-touch-pass" | "1touchpass"
+        | "first-touch-pass" | "first_touch_pass" | "firsttouchpass" => "first-time-pass",
         "chest-control" => "control-touch",
         "sidestep" | "side_step" | "side-step-dribble" | "sidestep-dribble" => "side-step",
         "hold-up" | "holdup" | "hold_up" | "hold-up-dribble" | "hold-up-flank-dribble" => {
@@ -11564,12 +11612,13 @@ impl SoccerNeuralLearningConfig {
 }
 
 /// Model Predictive Control coupling. The learned MDP/POMDP policy and the
-/// formation LP own the *perennial* decisions (which intent, which shape); MPC is
-/// a short-horizon, real-time *execution* layer solved every tick by a numerical
-/// (projected-gradient QP) optimizer — never a neural net. It refines HOW a
-/// chosen intent is carried out (dynamically-feasible, accel-limited trajectories)
-/// rather than WHAT the intent is. Everything is off by default, so a run that
-/// does not opt in behaves byte-for-byte as before.
+/// formation LP own the perennial decisions (which intent, which shape); MPC is a
+/// short-horizon, real-time execution layer. Its base point-mass problem is the
+/// clean linear/convex case (linear dynamics, quadratic tracking, convex accel
+/// bound). Field-aware keep-outs add local soft obstacle penalties, so MPC remains
+/// a deadline-bounded execution optimizer rather than a global multi-pass planner.
+/// Everything is off by default, so a run that does not opt in behaves
+/// byte-for-byte as before.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerMpcConfig {
@@ -11637,6 +11686,71 @@ pub struct SoccerMpcConfig {
     /// quarter of this.
     #[serde(default = "default_soccer_mpc_keepout_weight")]
     pub keepout_weight: f64,
+    /// Feed learned, bounded outcome signals into the short-horizon MPC objective:
+    /// pass-chain continuity, shot pressure, and goal pressure. These are hidden
+    /// variables for execution only; the neural/MDP layer still chooses the action.
+    /// Off by default.
+    #[serde(default)]
+    pub latent_objective_enabled: bool,
+    /// Exponential update rate for each latent term when a relevant outcome lands.
+    #[serde(default = "default_soccer_mpc_latent_learning_rate")]
+    pub latent_learning_rate: f64,
+    /// Max yards of attack-direction reference shaping applied by the latent terms.
+    #[serde(default = "default_soccer_mpc_latent_reference_bias_yards")]
+    pub latent_reference_bias_yards: f64,
+    /// Max multiplier bump applied to positive quadratic tracking weights.
+    #[serde(default = "default_soccer_mpc_latent_weight_boost")]
+    pub latent_weight_boost: f64,
+}
+
+/// Runtime hidden variables that let outcome learning talk to the 3-second MPC
+/// execution layer without making MPC decide a whole possession. Values are kept
+/// in `[0, 1]` and only ever increase positive quadratic weights or nudge the
+/// reference a bounded distance in the attacking direction, preserving the convex
+/// base problem.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerMpcLatentObjective {
+    pub pass_chain_continuity: f64,
+    pub shot_pressure: f64,
+    pub goal_pressure: f64,
+}
+
+impl SoccerMpcLatentObjective {
+    fn sanitized(self) -> Self {
+        SoccerMpcLatentObjective {
+            pass_chain_continuity: finite_unit_interval(self.pass_chain_continuity),
+            shot_pressure: finite_unit_interval(self.shot_pressure),
+            goal_pressure: finite_unit_interval(self.goal_pressure),
+        }
+    }
+
+    fn blended_with(self, target: SoccerMpcLatentObjective, rate: f64) -> Self {
+        let current = self.sanitized();
+        let target = target.sanitized();
+        let rate = finite_unit_interval(rate);
+        SoccerMpcLatentObjective {
+            pass_chain_continuity: current.pass_chain_continuity * (1.0 - rate)
+                + target.pass_chain_continuity * rate,
+            shot_pressure: current.shot_pressure * (1.0 - rate) + target.shot_pressure * rate,
+            goal_pressure: current.goal_pressure * (1.0 - rate) + target.goal_pressure * rate,
+        }
+        .sanitized()
+    }
+
+    fn combined_pressure(self) -> f64 {
+        let s = self.sanitized();
+        (0.40 * s.pass_chain_continuity + 0.28 * s.shot_pressure + 0.32 * s.goal_pressure)
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn finite_unit_interval(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn default_soccer_mpc_player_horizon() -> usize {
@@ -11675,6 +11789,18 @@ fn default_soccer_mpc_keepout_weight() -> f64 {
     40.0
 }
 
+fn default_soccer_mpc_latent_learning_rate() -> f64 {
+    0.22
+}
+
+fn default_soccer_mpc_latent_reference_bias_yards() -> f64 {
+    1.8
+}
+
+fn default_soccer_mpc_latent_weight_boost() -> f64 {
+    0.35
+}
+
 impl Default for SoccerMpcConfig {
     fn default() -> Self {
         SoccerMpcConfig {
@@ -11690,6 +11816,10 @@ impl Default for SoccerMpcConfig {
             opponent_keepout_yards: default_soccer_mpc_opponent_keepout_yards(),
             teammate_keepout_yards: default_soccer_mpc_teammate_keepout_yards(),
             keepout_weight: default_soccer_mpc_keepout_weight(),
+            latent_objective_enabled: false,
+            latent_learning_rate: default_soccer_mpc_latent_learning_rate(),
+            latent_reference_bias_yards: default_soccer_mpc_latent_reference_bias_yards(),
+            latent_weight_boost: default_soccer_mpc_latent_weight_boost(),
         }
     }
 }
@@ -11964,6 +12094,7 @@ impl MatchConfig {
                 tier2_player_enabled: true,
                 reconcile_enabled: true,
                 field_aware_enabled: true,
+                latent_objective_enabled: true,
                 ..SoccerMpcConfig::default()
             },
             adversarial_embedding_exploitation_enabled: true,
@@ -28444,12 +28575,15 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "surprise-pass",
     "flick-on",
     "turnover-burst",
+    "first-time-pass",
+    "first-time-shot",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
 /// falls outside the policy vocabulary (rare set-piece roles / support actions —
-/// those simply don't train the actor). Dribble-carry, cut, and first-time
-/// variants collapse into their family.
+/// those simply don't train the actor). Dribble-carry and cut variants collapse into
+/// their family; first-touch pass/shot stay separate from ordinary pass/shoot because
+/// control-first is a mutually exclusive receiving decision.
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     let family = match normalize_soccer_action_label(action) {
         "hold" => "hold",
@@ -28466,7 +28600,8 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         | "fake-right-cut-left"
         | "side-step"
         | "protect-ball" => "dribble",
-        "pass" | "first-time-pass" => "pass",
+        "pass" => "pass",
+        "first-time-pass" => "first-time-pass",
         "aerial-pass" => "aerial-pass",
         "killer-pass" | "threaded" => "killer-pass",
         "wall-pass" => "wall-pass",
@@ -28482,7 +28617,8 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         "flank-high-cross" => "flank-high-cross",
         "clearance" => "clearance",
         "route-one" => "route-one",
-        "shoot" | "first-time-shot" | "first-time-header" => "shoot",
+        "shoot" => "shoot",
+        "first-time-shot" | "first-time-header" => "first-time-shot",
         "tackle" => "tackle",
         "press-cover" => "press-cover",
         _ => return None,
@@ -29127,7 +29263,7 @@ fn soccer_neural_transition_features_with_action(
         // guidance so the neural value/actor heads can learn when constrained local
         // control, not just team-shape LP, influenced the sample.
         soccer_neural_bool(transition.tactical_trace.local_mpc_guidance),
-        // Decision-family indicators (indices 160-169, appended). The action hash is
+        // Decision-family indicators (indices 160-179, appended). The action hash is
         // unique but not smooth; these expose the new policy families directly.
         soccer_neural_bool(action_label == "switch-play"),
         soccer_neural_bool(action_label == "recycle-reset"),
@@ -29139,6 +29275,24 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bool(action_label == "surprise-pass"),
         soccer_neural_bool(action_label == "flick-on"),
         soccer_neural_bool(action_label == "turnover-burst"),
+        // First-touch decision context (indices 170-174): one-touch pass/shot
+        // versus control-first is an exclusive receiving choice, so the value and
+        // actor heads need the same state signal the tabular policy sees.
+        soccer_neural_bool(state.first_touch_kind != IncomingBallKind::None),
+        soccer_neural_bin(state.incoming_ball_speed_bin, 5.0),
+        soccer_neural_bin(state.first_time_pass_bin, 5.0),
+        soccer_neural_bin(state.first_time_shot_bin, 5.0),
+        soccer_neural_bin(state.control_touch_bin, 5.0),
+        // First-touch action indicators (indices 175-176): separate policy
+        // families, not aliases of generic pass/shoot.
+        soccer_neural_bool(action_label == "first-time-pass"),
+        soccer_neural_bool(matches!(action_label, "first-time-shot" | "first-time-header")),
+        // First-touch field-shape feasibility (indices 177-179): distinguishes a
+        // one-touch release that the 22-player/ball picture says is on from a pure
+        // contact-skill coin flip. MPC still prices exact execution after selection.
+        soccer_neural_bin(state.first_time_pass_field_bin, 5.0),
+        soccer_neural_bin(state.first_time_shot_field_bin, 5.0),
+        soccer_neural_bin(state.first_touch_shape_prior_bin, 5.0),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
     // grid + motion vector of all 22. Older nets (input_dim == base) migrate by

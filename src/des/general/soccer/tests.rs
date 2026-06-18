@@ -194,6 +194,130 @@ fn field_aware_mpc_runs_a_full_match_without_breaking_physics() {
 }
 
 #[test]
+fn mpc_latent_objective_learns_from_pass_chains_shots_and_goals() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 5_152,
+        mpc: SoccerMpcConfig {
+            latent_objective_enabled: true,
+            latent_learning_rate: 0.5,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let home_ids: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+        .take(4)
+        .map(|player| player.id)
+        .collect();
+    assert!(home_ids.len() >= 4);
+
+    let pass1 = test_pending_pass(
+        Team::Home,
+        home_ids[0],
+        home_ids[1],
+        Vec2::new(24.0, 24.0),
+        Vec2::new(28.0, 31.0),
+    );
+    sim.ball.position = pass1.intended_target;
+    sim.record_completed_pass_reward(&pass1, home_ids[1]);
+    let after_one = sim.mpc_latent_objective(Team::Home);
+    assert!(after_one.pass_chain_continuity > 0.0);
+
+    let pass2 = test_pending_pass(
+        Team::Home,
+        home_ids[1],
+        home_ids[2],
+        pass1.intended_target,
+        Vec2::new(32.0, 39.0),
+    );
+    sim.ball.position = pass2.intended_target;
+    sim.record_completed_pass_reward(&pass2, home_ids[2]);
+    let after_two = sim.mpc_latent_objective(Team::Home);
+    assert!(after_two.pass_chain_continuity > after_one.pass_chain_continuity);
+
+    let pass3 = test_pending_pass(
+        Team::Home,
+        home_ids[2],
+        home_ids[3],
+        pass2.intended_target,
+        Vec2::new(34.0, 49.0),
+    );
+    sim.ball.position = pass3.intended_target;
+    sim.record_completed_pass_reward(&pass3, home_ids[3]);
+    let after_three = sim.mpc_latent_objective(Team::Home);
+    assert!(after_three.pass_chain_continuity > after_two.pass_chain_continuity);
+
+    sim.record_shot_on_target_rewards(Team::Home, home_ids[3]);
+    let after_shot = sim.mpc_latent_objective(Team::Home);
+    assert!(after_shot.shot_pressure > 0.0);
+
+    sim.record_goal_rewards(Team::Home, Some(home_ids[3]));
+    let after_goal = sim.mpc_latent_objective(Team::Home);
+    assert!(after_goal.goal_pressure > 0.0);
+    assert_eq!(
+        sim.mpc_latent_objective(Team::Away),
+        SoccerMpcLatentObjective::default()
+    );
+}
+
+#[test]
+fn mpc_latent_objective_shapes_controller_weights_but_keeps_short_horizon() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 5_153,
+        local_mpc_enabled: true,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            latent_objective_enabled: true,
+            latent_weight_boost: 0.5,
+            latent_reference_bias_yards: 2.0,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let holder = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("home outfield holder");
+    sim.home_mpc_latent_objective = SoccerMpcLatentObjective {
+        pass_chain_continuity: 1.0,
+        shot_pressure: 0.5,
+        goal_pressure: 0.25,
+    };
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    for _ in 0..5 {
+        sim.run_time_step();
+        if sim
+            .mpc_player_controllers
+            .iter()
+            .any(|(player_id, _)| sim.players[*player_id].team == Team::Home)
+        {
+            break;
+        }
+    }
+
+    let base = crate::des::general::mpc_point_mass::PlanarMpcConfig::default();
+    let cfg = sim
+        .mpc_player_controllers
+        .iter()
+        .find(|(player_id, _)| sim.players[**player_id].team == Team::Home)
+        .map(|(_, controller)| *controller.config())
+        .expect("home latent MPC controller");
+    assert_eq!(cfg.horizon, sim.config.mpc.player_horizon);
+    assert_eq!(cfg.iters, 90);
+    assert!(cfg.q_pos > base.q_pos);
+    assert!(cfg.q_vel > base.q_vel);
+    assert!(cfg.qf_pos > base.qf_pos);
+    assert!(cfg.qf_vel > base.qf_vel);
+}
+
+#[test]
 fn tier2_mpc_field_obstacles_use_player_and_ball_kinematics() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         seed: 5_151,
@@ -1216,6 +1340,64 @@ fn relational_shape_nudges_out_of_shape_player_back_into_the_unit() {
     assert_eq!(
         kept, cohesive,
         "a move that already holds shape is untouched"
+    );
+}
+
+#[test]
+fn relational_ball_compactness_refuses_same_pocket_teammate_clump() {
+    let mut config = MatchConfig::default();
+    config.spacing.relational_nudge_bias = 0.0;
+    let mut sim = SoccerMatch::default_11v11(config);
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 42.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 54.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 68.0);
+    }
+
+    let mover = mids[0];
+    let occupying_teammate = mids[1];
+    let target = Vec2::new(18.0, 54.0);
+    sim.players[mover].position = target;
+    sim.players[occupying_teammate].position = Vec2::new(20.9, 57.3);
+    sim.players[away_holder].position = Vec2::new(18.0, 74.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let intent = PlayerIntent {
+        player_id: mover,
+        action: SoccerAction::MoveTo(target),
+        sprint: false,
+    };
+    let SoccerAction::MoveTo(adjusted) = sim.relational_shape_disciplined_intent(intent).action
+    else {
+        panic!("expected a MoveTo");
+    };
+    assert!(
+        adjusted.distance(target) < 1e-6,
+        "ball compactness must not pull a player into a teammate's same x/y pocket: target={target:?} adjusted={adjusted:?}"
     );
 }
 
@@ -4243,6 +4425,198 @@ fn first_touch_run_time_step_randomizes_pass_or_control_order() {
     assert!(
         full_orders.len() >= 2,
         "first-touch run_time_step should not use one rigid operation order"
+    );
+}
+
+#[test]
+fn first_touch_observation_prices_field_shape_before_one_touch_release() {
+    let receiver = 7;
+    let outlet = 9;
+    let blocker = 13;
+    let build = |block_lane: bool| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 22_514,
+            ..Default::default()
+        });
+        let keep = if block_lane {
+            vec![receiver, outlet, blocker]
+        } else {
+            vec![receiver, outlet]
+        };
+        park_players_except(&mut sim, &keep);
+        sim.active_set_play = None;
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        sim.players[receiver].role = PlayerRole::Midfielder;
+        sim.players[receiver].position = Vec2::new(40.0, 58.0);
+        sim.players[receiver].home_position = sim.players[receiver].position;
+        sim.players[receiver].skills.first_touch = 7.8;
+        sim.players[receiver].skills.passing = 7.6;
+        sim.players[receiver].skills.passing_completion_rate = 7.8;
+        sim.players[receiver].skills.flair_passing = 7.0;
+        sim.players[outlet].team = Team::Home;
+        sim.players[outlet].role = PlayerRole::Forward;
+        sim.players[outlet].position = Vec2::new(42.0, 75.0);
+        sim.players[outlet].home_position = sim.players[outlet].position;
+        if block_lane {
+            sim.players[blocker].team = Team::Away;
+            sim.players[blocker].position = Vec2::new(41.0, 66.0);
+            sim.players[blocker].home_position = sim.players[blocker].position;
+        }
+        sim.ball.holder = Some(receiver);
+        sim.ball.position = sim.players[receiver].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[receiver].incoming_ball = Some(IncomingBallContext {
+            from_player: Some(6),
+            target_player: Some(receiver),
+            team: Some(Team::Home),
+            kind: IncomingBallKind::GroundPass,
+            origin: Some(Vec2::new(38.0, 42.0)),
+            intended_target: Some(sim.players[receiver].position),
+            speed_yps: 16.0,
+            distance_yards: 18.0,
+            received_tick: sim.tick,
+            is_cross: false,
+            is_aerial: false,
+        });
+        sim
+    };
+    let open = build(false);
+    let open_snapshot = WorldSnapshot::from_match(&open);
+    let open_observation = open_snapshot.observation_for(receiver);
+    assert!(open_observation.first_touch_available);
+    assert!(open_observation.first_time_pass_field_feasibility > 0.42);
+
+    let blocked = build(true);
+    let blocked_snapshot = WorldSnapshot::from_match(&blocked);
+    let blocked_observation = blocked_snapshot.observation_for(receiver);
+    assert!(blocked_observation.first_touch_available);
+    assert!(
+        open_observation.first_time_pass_field_feasibility
+            > blocked_observation.first_time_pass_field_feasibility + 0.18,
+        "POMDP should distinguish an open one-touch picture from a blocked-lane coin flip: open={open_observation:?} blocked={blocked_observation:?}"
+    );
+    assert!(
+        open_observation.first_time_pass_score > blocked_observation.first_time_pass_score,
+        "field feasibility should shape the first-time pass score before MPC executes it"
+    );
+    assert!(
+        blocked_observation.control_touch_score >= blocked_observation.first_time_pass_score,
+        "when the field picture is poor, controlling first should become competitive"
+    );
+}
+
+#[test]
+fn first_touch_mpc_vetoes_unplayable_one_touch_pass_and_controls_first() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_514,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let receiver = 7;
+    let outlet = 9;
+    park_players_except(&mut sim, &[receiver, outlet]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(40.0, 58.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].skills.first_touch = 1.1;
+    sim.players[receiver].skills.passing = 6.2;
+    sim.players[receiver].skills.passing_completion_rate = 6.4;
+    sim.players[receiver].skills.strength = 2.0;
+    sim.players[receiver].skills.dribbling = 2.0;
+    sim.players[receiver].skills.flair_passing = 2.0;
+    sim.players[outlet].team = Team::Home;
+    sim.players[outlet].role = PlayerRole::Forward;
+    sim.players[outlet].position = Vec2::new(42.0, 75.0);
+    sim.players[outlet].home_position = sim.players[outlet].position;
+    sim.ball.holder = Some(receiver);
+    sim.ball.position = sim.players[receiver].position;
+    sim.ball.velocity = Vec2::new(8.0, 18.0);
+    sim.ball.altitude_yards = 1.45;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[receiver].incoming_ball = Some(IncomingBallContext {
+        from_player: Some(6),
+        target_player: Some(receiver),
+        team: Some(Team::Home),
+        kind: IncomingBallKind::GroundPass,
+        origin: Some(Vec2::new(37.0, 42.0)),
+        intended_target: Some(sim.players[receiver].position),
+        speed_yps: 20.0,
+        distance_yards: 18.0,
+        received_tick: sim.tick,
+        is_cross: false,
+        is_aerial: false,
+    });
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, receiver, sim.players[receiver].position);
+    assert!(
+        !snapshot.ranked_visible_pass_targets(receiver, 3).is_empty(),
+        "setup needs a real one-touch pass target"
+    );
+    let mut observation = snapshot.observation_for(receiver);
+    assert!(observation.has_ball);
+    assert!(observation.first_touch_available);
+    observation.first_time_pass_score = 0.99;
+    observation.first_time_shot_score = 0.01;
+    observation.control_touch_score = 0.02;
+    observation.first_time_pass_field_feasibility = 0.98;
+    observation.first_time_shot_field_feasibility = 0.02;
+    observation.first_touch_shape_prior = 0.72;
+    observation.perceived_pressure = 0.76;
+    observation.immediate_dispossession_risk = 0.74;
+    observation.decision_urgency = 0.95;
+    observation.expected_pass_completion = 0.98;
+    observation.best_pass_receiver_openness = 0.98;
+
+    let mut saw_mpc_veto = false;
+    for seed in 0..128 {
+        let mut player = sim.players[receiver].clone();
+        let intent = player.run_time_step_with_context(
+            &snapshot,
+            snapshot.mdp_state_for_player(receiver),
+            observation.clone(),
+            None,
+            None,
+            &mut SeededRandom::new(22_800 + seed),
+        );
+        let decision = player.last_decision.expect("first-touch decision trace");
+        if decision
+            .operation_order
+            .iter()
+            .any(|op| op == "first-touch-mpc-reselect:first-time-pass")
+        {
+            saw_mpc_veto = true;
+            assert!(
+                decision
+                    .action_options
+                    .iter()
+                    .any(|option| option.label == "first-time-pass" && option.legal),
+                "MDP/POMDP should expose first-time pass as its own legal choice: {decision:?}"
+            );
+            assert!(
+                matches!(intent.action, SoccerAction::ControlTouch { .. }),
+                "after MPC vetoes the one-touch pass, the player should control first: {intent:?}"
+            );
+            assert_eq!(decision.action, "control-touch");
+            break;
+        }
+    }
+    assert!(
+        saw_mpc_veto,
+        "a dominant but unplayable first-time pass should be sent back by MPC for another first-touch decision"
     );
 }
 
@@ -11784,6 +12158,60 @@ fn ball_proximity_nudge_respects_forward_midfield_padding() {
         adjusted.distance(target) < 1e-6,
         "ball pull must not collapse forwards inside the 3yd midfield padding: {adjusted:?}"
     );
+}
+
+#[test]
+fn ball_proximity_nudge_rejects_same_pocket_teammate_clump() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 2601,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for (i, &d) in defs.iter().enumerate() {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(18.0 + i as f64 * 14.0, 42.0);
+    }
+    for (i, &m) in mids.iter().enumerate() {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(18.0 + i as f64 * 14.0, 54.0);
+    }
+    for (i, &f) in forwards.iter().enumerate() {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(32.0 + i as f64 * 16.0, 68.0);
+    }
+
+    let mover = mids[0];
+    let occupying_teammate = mids[1];
+    let target = Vec2::new(18.0, 54.0);
+    sim.players[mover].position = target;
+    sim.players[occupying_teammate].position = Vec2::new(20.9, 57.1);
+    sim.players[away_holder].position = Vec2::new(18.0, 60.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = sim.players[away_holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let (adjusted, sprint) = snap.ball_proximity_adjusted_target(mover, target);
+    assert!(
+        adjusted.distance(target) < 1e-6,
+        "ball pull must not accept a candidate that is radially legal but too close on both axes: target={target:?} adjusted={adjusted:?}"
+    );
+    assert!(!sprint, "settled opponent possession should not sprint");
 }
 
 #[test]
@@ -23144,6 +23572,40 @@ fn policy_action_index_maps_families_and_rejects_out_of_vocab() {
             .iter()
             .position(|&a| a == "turnover-burst")
     );
+    assert_eq!(
+        soccer_policy_action_index("one-touch-pass"),
+        SOCCER_POLICY_ACTIONS
+            .iter()
+            .position(|&a| a == "first-time-pass")
+    );
+    assert_eq!(
+        soccer_policy_action_index("first-time-pass"),
+        SOCCER_POLICY_ACTIONS
+            .iter()
+            .position(|&a| a == "first-time-pass")
+    );
+    assert_ne!(
+        soccer_policy_action_index("first-time-pass"),
+        soccer_policy_action_index("pass"),
+        "one-touch pass must be its own policy family, not generic pass"
+    );
+    assert_eq!(
+        soccer_policy_action_index("one-touch-shot"),
+        SOCCER_POLICY_ACTIONS
+            .iter()
+            .position(|&a| a == "first-time-shot")
+    );
+    assert_eq!(
+        soccer_policy_action_index("header"),
+        SOCCER_POLICY_ACTIONS
+            .iter()
+            .position(|&a| a == "first-time-shot")
+    );
+    assert_ne!(
+        soccer_policy_action_index("first-time-shot"),
+        soccer_policy_action_index("shoot"),
+        "one-touch shot must be its own policy family, not generic shoot"
+    );
     // Out-of-vocabulary support/role actions don't train the actor.
     assert_eq!(soccer_policy_action_index("support-roam"), None);
     assert_eq!(soccer_policy_action_index("taker"), None);
@@ -27056,6 +27518,15 @@ fn live_gameplay_defaults_keep_learning_threaded_and_bounded() {
     assert!(config.mpc.tier2_player_enabled);
     assert!(config.mpc.reconcile_enabled);
     assert!(config.mpc.field_aware_enabled);
+    assert_eq!(config.mpc.player_horizon, 45);
+    assert!(config.mpc.player_horizon <= 60);
+    assert!(config.mpc.active_radius_yards > 0.0);
+    assert!(config.mpc.active_radius_yards <= 14.0);
+    assert!(config.mpc.latent_objective_enabled);
+    assert!(config.mpc.latent_learning_rate > 0.0);
+    assert!(config.mpc.latent_learning_rate <= 1.0);
+    assert!(config.mpc.latent_reference_bias_yards > 0.0);
+    assert!(config.mpc.latent_weight_boost > 0.0);
     assert!(config.neural_learning.enabled);
     assert_eq!(
         config.neural_learning.backend,
@@ -27086,10 +27557,25 @@ fn live_gameplay_executes_tier2_mpc_and_records_reconciliation() {
         !sim.mpc_player_controllers.is_empty(),
         "live gameplay must instantiate Tier-2 MPC controllers for active players"
     );
+    assert!(
+        sim.mpc_player_controllers.len() < SOCCER_MATCH_PLAYER_COUNT,
+        "Tier-2 MPC must stay on an active subset, not all 22 players"
+    );
+    for controller in sim.mpc_player_controllers.values() {
+        let cfg = controller.config();
+        let expected_iters = ((cfg.horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+        assert_eq!(cfg.horizon, sim.config.mpc.player_horizon);
+        assert_eq!(cfg.iters, expected_iters);
+        assert_eq!(cfg.iters, 90);
+    }
     let stats = sim.mpc_reconcile_stats();
     assert!(
         stats.samples > 0,
         "live gameplay must record MDP/MPC reconciliation samples"
+    );
+    assert!(
+        stats.samples <= (SOCCER_MATCH_TEAM_PLAYER_COUNT as u64) * sim.tick,
+        "Tier-2 MPC should not solve for a full 22-player field every tick"
     );
     assert_eq!(
         stats.blended_samples + stats.deferred_to_policy_samples,
@@ -34959,7 +35445,7 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named feature indices all live in the base block; the
     // whole-field "moment of all 22" block is appended after it.
-    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 170);
+    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 180);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM
@@ -34976,6 +35462,20 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(SOCCER_NEURAL_FEATURE_SURPRISE_PASS_ACTION, 167);
     assert_eq!(SOCCER_NEURAL_FEATURE_FLICK_ON_ACTION, 168);
     assert_eq!(SOCCER_NEURAL_FEATURE_TURNOVER_BURST_ACTION, 169);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_AVAILABLE, 170);
+    assert_eq!(SOCCER_NEURAL_FEATURE_INCOMING_BALL_SPEED, 171);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_SCORE, 172);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_SCORE, 173);
+    assert_eq!(SOCCER_NEURAL_FEATURE_CONTROL_TOUCH_SCORE, 174);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_ACTION, 175);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION, 176);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_FIELD_FEASIBILITY, 177);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY, 178);
+    assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR, 179);
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&258));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&265));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&163));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&248));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&251));
@@ -35092,6 +35592,65 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         soccer_neural_transition_features_with_action(&mpc_transition, "transition-burst");
     assert_eq!(
         burst_features[SOCCER_NEURAL_FEATURE_TURNOVER_BURST_ACTION],
+        1.0
+    );
+    mpc_transition.observation.first_touch_available = true;
+    mpc_transition.observation.incoming_ball_kind = IncomingBallKind::GroundPass;
+    mpc_transition.observation.incoming_ball_speed_yps = 18.0;
+    mpc_transition.observation.first_time_pass_score = 0.88;
+    mpc_transition.observation.first_time_shot_score = 0.42;
+    mpc_transition.observation.control_touch_score = 0.21;
+    mpc_transition
+        .observation
+        .first_time_pass_field_feasibility = 0.83;
+    mpc_transition
+        .observation
+        .first_time_shot_field_feasibility = 0.31;
+    mpc_transition.observation.first_touch_shape_prior = 0.56;
+    let first_touch_key = SoccerQStateKey::from_parts(
+        &mpc_transition.state,
+        &mpc_transition.observation,
+        Team::Home,
+        role,
+    );
+    assert_eq!(first_touch_key.first_touch_kind, IncomingBallKind::GroundPass);
+    assert!(first_touch_key.incoming_ball_speed_bin > 0);
+    assert!(first_touch_key.first_time_pass_bin > first_touch_key.control_touch_bin);
+    assert!(first_touch_key.first_time_pass_field_bin > first_touch_key.first_time_shot_field_bin);
+    assert!(first_touch_key.first_touch_shape_prior_bin > 0);
+    let first_time_pass_features =
+        soccer_neural_transition_features_with_action(&mpc_transition, "first-time-pass");
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_AVAILABLE],
+        1.0
+    );
+    assert!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_SCORE]
+            > first_time_pass_features[SOCCER_NEURAL_FEATURE_CONTROL_TOUCH_SCORE],
+        "neural heads should see when the one-touch pass score dominates control-first"
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_ACTION],
+        1.0
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION],
+        0.0
+    );
+    assert!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_FIELD_FEASIBILITY]
+            > first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY],
+        "neural heads should see one-touch pass field feasibility separately from contact score"
+    );
+    assert!(first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR] > 0.0);
+    let first_time_shot_features =
+        soccer_neural_transition_features_with_action(&mpc_transition, "one-touch-shot");
+    assert_eq!(
+        first_time_shot_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_ACTION],
+        0.0
+    );
+    assert_eq!(
+        first_time_shot_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION],
         1.0
     );
 }
