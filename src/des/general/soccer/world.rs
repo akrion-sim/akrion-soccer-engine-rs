@@ -25,6 +25,12 @@ const MPC_LATENT_PASS_CHAIN_SINGLE_TARGET: f64 = 0.18;
 const MPC_LATENT_PASS_CHAIN_TWO_TARGET: f64 = 0.58;
 const MPC_LATENT_PASS_CHAIN_THREE_TARGET: f64 = 1.0;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CachedAdversarialEmbeddingSignals {
+    tick: u64,
+    signals: Option<SoccerAdversarialEmbeddingSignals>,
+}
+
 pub struct SoccerMatch {
     pub config: MatchConfig,
     pub tick: u64,
@@ -174,6 +180,10 @@ pub struct SoccerMatch {
     pub(crate) teammate_spacing_yield: HashMap<usize, usize>,
     pub(crate) defensive_clear_hold_trackers: HashMap<Team, DefensiveClearAndHoldTracker>,
     pub(crate) adversarial_moment_memory: VecDeque<SoccerMomentWindow>,
+    pub(crate) adversarial_moment_index_cache:
+        std::cell::RefCell<Option<SoccerMomentVectorIndex>>,
+    pub(crate) adversarial_embedding_signal_cache:
+        std::cell::RefCell<Option<CachedAdversarialEmbeddingSignals>>,
     pub(crate) retrieved_action_prior_cache: std::cell::RefCell<SoccerRetrievedActionPriorCache>,
     pub(crate) last_agent_schedule: Vec<AgentScheduleEntry>,
     pub(crate) controller_yield_stats: ControllerYieldStats,
@@ -983,6 +993,8 @@ impl SoccerMatch {
             teammate_spacing_yield: HashMap::new(),
             defensive_clear_hold_trackers: HashMap::new(),
             adversarial_moment_memory: VecDeque::new(),
+            adversarial_moment_index_cache: std::cell::RefCell::new(None),
+            adversarial_embedding_signal_cache: std::cell::RefCell::new(None),
             retrieved_action_prior_cache: std::cell::RefCell::new(
                 SoccerRetrievedActionPriorCache::default(),
             ),
@@ -1075,7 +1087,7 @@ impl SoccerMatch {
         &mut self,
         snapshot: SoccerNeuralNetworkSnapshot,
     ) -> Result<(), String> {
-        if !self.config.learning_enabled || !self.config.neural_learning.enabled {
+        if !self.config.neural_learning.enabled {
             self.neural_learner = None;
             return Ok(());
         }
@@ -1178,8 +1190,8 @@ impl SoccerMatch {
         snapshot: Option<SoccerNeuralNetworkSnapshot>,
         frozen: bool,
     ) -> Result<(), String> {
-        if !self.config.learning_enabled || !self.config.neural_learning.enabled {
-            // Neural learning disabled for this match: nothing to install.
+        if !self.config.neural_learning.enabled {
+            // Neural inference disabled for this match: nothing to install.
             match team {
                 Team::Home => self.neural_learner = None,
                 Team::Away => self.away_neural_learner = None,
@@ -1191,7 +1203,14 @@ impl SoccerMatch {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
                 SoccerNeuralLearner::from_network(&self.config, network)
             }
-            None => SoccerNeuralLearner::new(&self.config),
+            None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
+            None => {
+                match team {
+                    Team::Home => self.neural_learner = None,
+                    Team::Away => self.away_neural_learner = None,
+                }
+                return Ok(());
+            }
         };
         match team {
             Team::Home => {
@@ -1251,6 +1270,8 @@ impl SoccerMatch {
         while self.adversarial_moment_memory.len() > limit {
             self.adversarial_moment_memory.pop_front();
         }
+        *self.adversarial_moment_index_cache.get_mut() = None;
+        *self.adversarial_embedding_signal_cache.get_mut() = None;
         self.retrieved_action_prior_cache.get_mut().clear();
     }
 
@@ -1267,68 +1288,167 @@ impl SoccerMatch {
             && !self.adversarial_moment_memory.is_empty()
     }
 
-    fn adversarial_embedding_signals(&self) -> Option<SoccerAdversarialEmbeddingSignals> {
+    fn with_adversarial_moment_index<R>(
+        &self,
+        f: impl FnOnce(&SoccerMomentVectorIndex) -> R,
+    ) -> Option<R> {
         if !self.adversarial_embedding_exploitation_active() {
+            *self.adversarial_moment_index_cache.borrow_mut() = None;
             return None;
         }
-        let index =
-            SoccerMomentVectorIndex::from_window_iter(self.adversarial_moment_memory.iter());
+        let mut cache = self.adversarial_moment_index_cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(SoccerMomentVectorIndex::from_window_iter(
+                self.adversarial_moment_memory.iter(),
+            ));
+        }
+        let index = cache.as_ref()?;
         if index.status().entries == 0 {
             return None;
         }
+        Some(f(index))
+    }
 
-        let frame = tracking_frame_from_match(self);
-        let mut signals = SoccerAdversarialEmbeddingSignals::default();
-        for perspective_team in [Team::Home, Team::Away] {
-            let feature_vector = soccer_moment_feature_vector(
-                std::slice::from_ref(&frame),
-                perspective_team,
-                &self.config,
-            );
-            if feature_vector.is_empty() {
-                continue;
+    fn adversarial_embedding_signals(&self) -> Option<SoccerAdversarialEmbeddingSignals> {
+        if !self.adversarial_embedding_exploitation_active() {
+            *self.adversarial_embedding_signal_cache.borrow_mut() = None;
+            return None;
+        }
+
+        if let Some(cached) = *self.adversarial_embedding_signal_cache.borrow() {
+            if self.tick.saturating_sub(cached.tick) < ADVERSARIAL_EMBEDDING_SIGNAL_REFRESH_TICKS {
+                return cached.signals;
             }
-            let bucket =
-                soccer_moment_bucket_key("current_shape", perspective_team, &frame, &self.config);
+        }
+
+        let computed = self.with_adversarial_moment_index(|index| {
+            let frame = tracking_frame_from_match(self);
+            let mut signals = SoccerAdversarialEmbeddingSignals::default();
+            for perspective_team in [Team::Home, Team::Away] {
+                let feature_vector = soccer_moment_feature_vector(
+                    std::slice::from_ref(&frame),
+                    perspective_team,
+                    &self.config,
+                );
+                if feature_vector.is_empty() {
+                    continue;
+                }
+                let bucket =
+                    soccer_moment_bucket_key("current_shape", perspective_team, &frame, &self.config);
+                let response = index.search(&SoccerMomentIndexSearchRequest {
+                    bucket,
+                    feature_vector,
+                    limit: ADVERSARIAL_EMBEDDING_SEARCH_LIMIT,
+                    max_candidates: ADVERSARIAL_EMBEDDING_MAX_CANDIDATES
+                        .min(self.adversarial_moment_memory.len().max(1)),
+                    bucket_radius: ADVERSARIAL_EMBEDDING_BUCKET_RADIUS,
+                    same_label_only: false,
+                });
+                for hit in response.results {
+                    if hit.score < ADVERSARIAL_EMBEDDING_MIN_SCORE {
+                        continue;
+                    }
+                    let score = ((hit.score - ADVERSARIAL_EMBEDDING_MIN_SCORE)
+                        / (1.0 - ADVERSARIAL_EMBEDDING_MIN_SCORE))
+                        .clamp(0.0, 1.0) as f64;
+                    let contribution =
+                        score * soccer_moment_adversarial_label_weight(&hit.summary.label);
+                    if contribution <= 1e-9 {
+                        continue;
+                    }
+
+                    let attack_signal = signals.signal_for_mut(perspective_team);
+                    attack_signal.attack_score =
+                        (attack_signal.attack_score + contribution).clamp(0.0, 1.0);
+                    attack_signal.hits = attack_signal.hits.saturating_add(1);
+
+                    let defense_signal = signals.signal_for_mut(perspective_team.other());
+                    defense_signal.defense_score =
+                        (defense_signal.defense_score + contribution).clamp(0.0, 1.0);
+                    defense_signal.hits = defense_signal.hits.saturating_add(1);
+                }
+            }
+
+            if signals.home.hits == 0 && signals.away.hits == 0 {
+                None
+            } else {
+                Some(signals)
+            }
+        })
+        .flatten();
+
+        *self.adversarial_embedding_signal_cache.borrow_mut() =
+            Some(CachedAdversarialEmbeddingSignals {
+                tick: self.tick,
+                signals: computed,
+            });
+        computed
+    }
+
+    fn compute_retrieved_action_priors_for_team(&self, team: Team) -> Option<HashMap<String, f64>> {
+        self.with_adversarial_moment_index(|index| {
+            let frame = tracking_frame_from_match(self);
+            let feature_vector =
+                soccer_moment_feature_vector(std::slice::from_ref(&frame), team, &self.config);
+            if feature_vector.is_empty() {
+                return None;
+            }
+            let bucket = soccer_moment_bucket_key("current_shape", team, &frame, &self.config);
             let response = index.search(&SoccerMomentIndexSearchRequest {
                 bucket,
                 feature_vector,
-                limit: ADVERSARIAL_EMBEDDING_SEARCH_LIMIT,
-                max_candidates: ADVERSARIAL_EMBEDDING_MAX_CANDIDATES
+                limit: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_SEARCH_LIMIT,
+                max_candidates: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_MAX_CANDIDATES
                     .min(self.adversarial_moment_memory.len().max(1)),
                 bucket_radius: ADVERSARIAL_EMBEDDING_BUCKET_RADIUS,
                 same_label_only: false,
             });
+            let mut weighted: HashMap<String, (f64, f64)> = HashMap::new();
             for hit in response.results {
                 if hit.score < ADVERSARIAL_EMBEDDING_MIN_SCORE {
                     continue;
                 }
-                let score = ((hit.score - ADVERSARIAL_EMBEDDING_MIN_SCORE)
+                let similarity = ((hit.score - ADVERSARIAL_EMBEDDING_MIN_SCORE)
                     / (1.0 - ADVERSARIAL_EMBEDDING_MIN_SCORE))
                     .clamp(0.0, 1.0) as f64;
-                let contribution =
-                    score * soccer_moment_adversarial_label_weight(&hit.summary.label);
-                if contribution <= 1e-9 {
+                if similarity <= 1e-9 {
                     continue;
                 }
-
-                let attack_signal = signals.signal_for_mut(perspective_team);
-                attack_signal.attack_score =
-                    (attack_signal.attack_score + contribution).clamp(0.0, 1.0);
-                attack_signal.hits = attack_signal.hits.saturating_add(1);
-
-                let defense_signal = signals.signal_for_mut(perspective_team.other());
-                defense_signal.defense_score =
-                    (defense_signal.defense_score + contribution).clamp(0.0, 1.0);
-                defense_signal.hits = defense_signal.hits.saturating_add(1);
+                let Some(window) = self
+                    .adversarial_moment_memory
+                    .iter()
+                    .find(|window| window.summary.id == hit.summary.id)
+                else {
+                    continue;
+                };
+                for marker in &window.actions {
+                    let action = normalize_soccer_action_label(&marker.action).to_string();
+                    if action.is_empty() {
+                        continue;
+                    }
+                    if !marker.reward.is_finite() {
+                        continue;
+                    }
+                    let outcome =
+                        (marker.reward / SOCCER_MOMENT_REPLAY_SHOT_REWARD).clamp(-1.0, 1.0);
+                    let entry = weighted.entry(action).or_insert((0.0, 0.0));
+                    entry.0 += similarity * outcome;
+                    entry.1 += similarity;
+                }
             }
-        }
 
-        if signals.home.hits == 0 && signals.away.hits == 0 {
-            None
-        } else {
-            Some(signals)
-        }
+            let priors = weighted
+                .into_iter()
+                .filter_map(|(action, (sum, weight))| {
+                    (weight > 1e-9).then_some((
+                        action,
+                        (sum / weight) * SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE,
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            (!priors.is_empty()).then_some(priors)
+        })
+        .flatten()
     }
 
     fn retrieved_action_priors_for_team(&self, team: Team) -> Option<HashMap<String, f64>> {
@@ -1355,72 +1475,6 @@ impl SoccerMatch {
         priors
     }
 
-    fn compute_retrieved_action_priors_for_team(&self, team: Team) -> Option<HashMap<String, f64>> {
-        let index =
-            SoccerMomentVectorIndex::from_window_iter(self.adversarial_moment_memory.iter());
-        if index.status().entries == 0 {
-            return None;
-        }
-
-        let frame = tracking_frame_from_match(self);
-        let feature_vector =
-            soccer_moment_feature_vector(std::slice::from_ref(&frame), team, &self.config);
-        if feature_vector.is_empty() {
-            return None;
-        }
-        let bucket = soccer_moment_bucket_key("current_shape", team, &frame, &self.config);
-        let response = index.search(&SoccerMomentIndexSearchRequest {
-            bucket,
-            feature_vector,
-            limit: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_SEARCH_LIMIT,
-            max_candidates: ADVERSARIAL_EMBEDDING_ACTION_PRIOR_MAX_CANDIDATES
-                .min(self.adversarial_moment_memory.len().max(1)),
-            bucket_radius: ADVERSARIAL_EMBEDDING_BUCKET_RADIUS,
-            same_label_only: false,
-        });
-
-        let mut weighted: HashMap<String, (f64, f64)> = HashMap::new();
-        for hit in response.results {
-            if hit.score < ADVERSARIAL_EMBEDDING_MIN_SCORE {
-                continue;
-            }
-            let similarity = ((hit.score - ADVERSARIAL_EMBEDDING_MIN_SCORE)
-                / (1.0 - ADVERSARIAL_EMBEDDING_MIN_SCORE))
-                .clamp(0.0, 1.0) as f64;
-            if similarity <= 1e-9 {
-                continue;
-            }
-            let Some(window) = self
-                .adversarial_moment_memory
-                .iter()
-                .find(|window| window.summary.id == hit.summary.id)
-            else {
-                continue;
-            };
-            for marker in &window.actions {
-                let action = normalize_soccer_action_label(&marker.action).to_string();
-                if action.is_empty() {
-                    continue;
-                }
-                if !marker.reward.is_finite() {
-                    continue;
-                }
-                let outcome = (marker.reward / SOCCER_MOMENT_REPLAY_SHOT_REWARD).clamp(-1.0, 1.0);
-                let entry = weighted.entry(action).or_insert((0.0, 0.0));
-                entry.0 += similarity * outcome;
-                entry.1 += similarity;
-            }
-        }
-
-        let priors = weighted
-            .into_iter()
-            .filter_map(|(action, (sum, weight))| {
-                (weight > 1e-9)
-                    .then_some((action, (sum / weight) * SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE))
-            })
-            .collect::<HashMap<_, _>>();
-        (!priors.is_empty()).then_some(priors)
-    }
 
     /// NN → LP coupling. Scores each team's most-recent transition with the
     /// gradient-trained critic and squashes the value into an attack/defense
@@ -4548,7 +4602,9 @@ impl SoccerMatch {
                     };
                     let intent_player_id = intent.player_id;
                     self.apply_player_intent(intent);
-                    self.sync_held_ball_to_holder();
+                    if self.ball.holder == Some(intent_player_id) {
+                        self.sync_held_ball_to_holder();
+                    }
                     // Hold opponents off the ball until a held restart is played.
                     self.enforce_restart_keepout_for(intent_player_id);
                     // Block a shielded-out defender at the carrier's body so it cannot
@@ -4664,15 +4720,23 @@ impl SoccerMatch {
                 self.record_match_result_rewards_at(tick_start_snapshot.tick);
             }
             learning_defense_elapsed += phase_started.elapsed();
-            let has_tick_reward_events = self.reward_events.len() > reward_event_start;
+            let tick_reward_events = &self.reward_events[reward_event_start..];
+            let has_tick_reward_events = !tick_reward_events.is_empty();
+            let has_significant_learning_event =
+                Self::has_significant_learning_event(tick_reward_events);
+            let score_changed =
+                self.score_home != score_home_before || self.score_away != score_away_before;
             let period_start = self.config.period_start_after_tick(self.tick);
             let interval = self.config.learning_interval_ticks.max(1);
-            let learning_due = interval <= 1
-                || self.is_done()
-                || period_start.is_some()
-                || self.tick as usize % interval == 0;
             let capture_full_game =
                 self.config.learning_enabled && self.config.full_game_learning_enabled;
+            let cadence_learning_due = !capture_full_game
+                && (interval <= 1 || self.tick as usize % interval == 0);
+            let learning_due = self.is_done()
+                || period_start.is_some()
+                || has_significant_learning_event
+                || score_changed
+                || cadence_learning_due;
             // Retrieval capture must retain this episode's transitions itself: the
             // n-step outcome in `config_moments()` is summed from
             // `episode_learning_transitions`, so without this a corpus-builder that
@@ -4691,7 +4755,7 @@ impl SoccerMatch {
                     &next_snapshot,
                     score_home_before,
                     score_away_before,
-                    &self.reward_events[reward_event_start..],
+                    tick_reward_events,
                 );
                 learning_transition_elapsed += phase_started.elapsed();
                 if capture_full_game || capture_config_moments {
@@ -5142,6 +5206,25 @@ impl SoccerMatch {
     }
 
     fn record_reward_event_at(&mut self, tick: u64, player_id: usize, amount: f64) {
+        self.record_reward_event_at_with_kind(tick, player_id, amount, SoccerRewardEventKind::Routine);
+    }
+
+    fn record_reward_event_with_kind(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        self.record_reward_event_at_with_kind(self.tick, player_id, amount, kind);
+    }
+
+    fn record_reward_event_at_with_kind(
+        &mut self,
+        tick: u64,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.
@@ -5152,7 +5235,12 @@ impl SoccerMatch {
             tick,
             player_id,
             amount,
+            kind,
         });
+    }
+
+    pub(crate) fn has_significant_learning_event(events: &[SoccerRewardEvent]) -> bool {
+        events.iter().any(|event| event.kind.triggers_learning())
     }
 
     pub(crate) fn record_possession_touch(&mut self, player_id: usize) {
@@ -5449,6 +5537,84 @@ impl SoccerMatch {
         }
     }
 
+    fn queue_recent_significant_reward_transition(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        if !self.config.learning_enabled || amount <= 1e-9 || !amount.is_finite() {
+            return;
+        }
+        let Some(mut transition) = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .take_while(|transition| {
+                self.tick.saturating_sub(transition.tick) <= PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS
+            })
+            .find(|transition| {
+                transition.player_id == player_id
+                    && soccer_goal_credit_action_is_relevant(&transition.action)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        transition.reward = amount;
+        transition.done = false;
+        if transition.tick != self.tick {
+            self.record_reward_event_at_with_kind(transition.tick, player_id, amount, kind);
+        }
+        self.deferred_reward_transitions.push(transition);
+    }
+
+    fn record_significant_pass_chain_rewards(
+        &mut self,
+        chain: &[CompletedPassChainEntry],
+        total_amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        if chain.is_empty() || total_amount <= 1e-9 || !total_amount.is_finite() {
+            return;
+        }
+
+        let player_count = self.players.len();
+        let mut credits: Vec<(usize, f64)> = Vec::new();
+        let mut add_credit = |player_id: usize, amount: f64| {
+            if amount <= 1e-9 || player_id >= player_count {
+                return;
+            }
+            if let Some((_, total)) = credits
+                .iter_mut()
+                .find(|(existing_player, _)| *existing_player == player_id)
+            {
+                *total += amount;
+            } else {
+                credits.push((player_id, amount));
+            }
+        };
+
+        for (index, entry) in chain.iter().enumerate() {
+            let link_weight = match (chain.len(), index) {
+                (2, 0) => 0.56,
+                (2, 1) => 0.44,
+                (3, 0) => 0.44,
+                (3, 1) => 0.34,
+                (3, 2) => 0.22,
+                _ => 1.0 / chain.len() as f64,
+            };
+            let link_amount = total_amount * link_weight;
+            add_credit(entry.from, link_amount * 0.78);
+            add_credit(entry.to, link_amount * 0.22);
+        }
+
+        for (player_id, amount) in credits {
+            self.record_reward_event_with_kind(player_id, amount, kind);
+            self.queue_recent_significant_reward_transition(player_id, amount, kind);
+        }
+    }
+
     fn record_completed_pass_chain_entry(&mut self, pass: &PendingPass, receiver: usize) {
         let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
         if direction == PassDirectionBucket::Forward {
@@ -5476,6 +5642,27 @@ impl SoccerMatch {
             });
         while self.completed_pass_chain.len() > PASS_CHAIN_HISTORY_LIMIT {
             self.completed_pass_chain.pop_front();
+        }
+        let chain = self.recent_completed_pass_chain_into(pass.team, receiver, 3);
+        if chain.len() >= 2
+            && chain[0].direction == PassDirectionBucket::Forward
+            && chain[1].direction == PassDirectionBucket::Forward
+        {
+            self.record_significant_pass_chain_rewards(
+                &chain[..2],
+                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+                SoccerRewardEventKind::TwoForwardPasses,
+            );
+        }
+        if chain.len() >= 3 {
+            let net_forward_yards = (chain[0].end.y - chain[2].origin.y) * pass.team.attack_dir();
+            if net_forward_yards >= PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS {
+                self.record_significant_pass_chain_rewards(
+                    &chain[..3],
+                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS,
+                    SoccerRewardEventKind::ThreePassForwardNetGain,
+                );
+            }
         }
         // The entry above is now part of the chain, so a sterile run that ends on this pass
         // (the ball tapped around inside a tiny pocket without escaping) is penalized here.
@@ -5796,12 +5983,27 @@ impl SoccerMatch {
         primary_player: Option<usize>,
         pattern: &[f64],
     ) {
+        self.record_possession_reward_pattern_with_kind(
+            team,
+            primary_player,
+            pattern,
+            SoccerRewardEventKind::Routine,
+        );
+    }
+
+    fn record_possession_reward_pattern_with_kind(
+        &mut self,
+        team: Team,
+        primary_player: Option<usize>,
+        pattern: &[f64],
+        kind: SoccerRewardEventKind,
+    ) {
         if pattern.is_empty() {
             return;
         }
         let sequence = self.recent_possession_reward_sequence(team, primary_player, pattern.len());
         for (player_id, amount) in sequence.into_iter().zip(pattern.iter().copied()) {
-            self.record_reward_event(player_id, amount);
+            self.record_reward_event_with_kind(player_id, amount, kind);
         }
     }
 
@@ -5817,7 +6019,12 @@ impl SoccerMatch {
             .iter()
             .map(|w| w * scale)
             .collect();
-        self.record_possession_reward_pattern(shooting_team, Some(shooter), &scaled);
+        self.record_possession_reward_pattern_with_kind(
+            shooting_team,
+            Some(shooter),
+            &scaled,
+            SoccerRewardEventKind::ShotOnTarget,
+        );
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
@@ -5997,7 +6204,12 @@ impl SoccerMatch {
             transition.reward = amount;
             transition.done = false;
             if transition.tick != self.tick {
-                self.record_reward_event_at(transition.tick, transition.player_id, amount);
+                self.record_reward_event_at_with_kind(
+                    transition.tick,
+                    transition.player_id,
+                    amount,
+                    SoccerRewardEventKind::Goal,
+                );
             }
             self.deferred_reward_transitions.push(transition);
         }
@@ -6050,15 +6262,21 @@ impl SoccerMatch {
         if let Some(reward_points) =
             self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
         {
-            self.record_possession_reward_pattern(scoring_team, shooter, &[reward_points]);
+            self.record_possession_reward_pattern_with_kind(
+                scoring_team,
+                shooter,
+                &[reward_points],
+                SoccerRewardEventKind::Goal,
+            );
         } else if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
             );
-            self.record_possession_reward_pattern(
+            self.record_possession_reward_pattern_with_kind(
                 scoring_team,
                 shooter,
                 &GOAL_CHAIN_REWARD_PATTERN,
+                SoccerRewardEventKind::Goal,
             );
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
@@ -6094,7 +6312,12 @@ impl SoccerMatch {
             })
             .collect::<Vec<_>>();
         for (player_id, amount) in events {
-            self.record_reward_event_at(tick, player_id, amount);
+            self.record_reward_event_at_with_kind(
+                tick,
+                player_id,
+                amount,
+                SoccerRewardEventKind::MatchResult,
+            );
         }
     }
 
@@ -13639,6 +13862,8 @@ pub struct WorldSnapshot {
     pub formation_lp_enabled: bool,
     #[serde(default = "default_local_mpc_enabled")]
     pub local_mpc_enabled: bool,
+    #[serde(default)]
+    pub(crate) trace_mdp_mpc_comparison: bool,
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
@@ -13703,6 +13928,7 @@ pub(crate) struct SupportSpecialTargets {
 pub(crate) struct SupportActionContext {
     pub(crate) options: Vec<AgentActionOptionTrace>,
     pub(crate) special_targets: SupportSpecialTargets,
+    pub(crate) open: Vec2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -14175,6 +14401,7 @@ pub(crate) struct WorldSnapshotOptions {
     include_shared_histories: bool,
     include_player_decisions: bool,
     include_ball_history: bool,
+    trace_mdp_mpc_comparison: bool,
 }
 
 impl WorldSnapshotOptions {
@@ -14183,6 +14410,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: true,
         include_player_decisions: true,
         include_ball_history: true,
+        trace_mdp_mpc_comparison: true,
     };
 
     const AGENT_DECISION: Self = Self {
@@ -14190,6 +14418,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
+        trace_mdp_mpc_comparison: false,
     };
 
     pub(crate) const DEFENSIVE_OR_LOOSE_AGENT_DECISION: Self = Self {
@@ -14197,6 +14426,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
+        trace_mdp_mpc_comparison: false,
     };
 
     const LEARNING: Self = Self {
@@ -14204,6 +14434,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
+        trace_mdp_mpc_comparison: false,
     };
 
     const OFFICIAL_DECISION: Self = Self {
@@ -14211,6 +14442,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
+        trace_mdp_mpc_comparison: false,
     };
 
     const LIVE_HTTP_FRAME: Self = Self {
@@ -14218,6 +14450,7 @@ impl WorldSnapshotOptions {
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
+        trace_mdp_mpc_comparison: false,
     };
 }
 
@@ -14499,6 +14732,7 @@ impl WorldSnapshot {
             away_directive: m.central_brain.away_directive.clone(),
             formation_lp_enabled: m.config.formation_lp_enabled,
             local_mpc_enabled: m.config.local_mpc_enabled,
+            trace_mdp_mpc_comparison: options.trace_mdp_mpc_comparison,
             pass_anticipation_enabled: m.config.pass_anticipation_enabled,
             local_mpc_max_players_per_team: m.config.local_mpc_max_players_per_team,
             home_team_possession_seconds,

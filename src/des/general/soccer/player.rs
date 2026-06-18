@@ -2999,6 +2999,7 @@ impl PlayerAgent {
         SupportActionContext {
             options,
             special_targets,
+            open,
         }
     }
 
@@ -3242,8 +3243,11 @@ impl PlayerAgent {
         let scheduled_index = snapshot.scheduled_player_index(self.id);
         let action_label = action_label.into();
         let action_target = self.action_target_trace(action, snapshot);
-        let mdp_mpc_comparison =
-            player_mdp_mpc_comparison_trace(snapshot, self, &action_target, &action_label);
+        let mdp_mpc_comparison = if snapshot.trace_mdp_mpc_comparison {
+            player_mdp_mpc_comparison_trace(snapshot, self, &action_target, &action_label)
+        } else {
+            None
+        };
         AgentDecisionTrace {
             mdp_state,
             observation,
@@ -5871,7 +5875,7 @@ impl PlayerAgent {
                 .unwrap_or("support-shape")
                 .to_string();
             order_names.extend(support_order);
-            let support_open = snapshot.open_space_for(self.id, self.home_position);
+            let support_open = support_context.open;
             let guarded_support_special = |point: Vec2| {
                 snapshot.shape_guarded_support_point(
                     self.id,
