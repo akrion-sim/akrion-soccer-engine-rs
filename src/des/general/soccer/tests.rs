@@ -12008,14 +12008,14 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     }
     for &m in mids {
         sim.players[m].role = PlayerRole::Midfielder;
-        sim.players[m].position = Vec2::new(40.0, 31.0);
+        sim.players[m].position = Vec2::new(40.0, 30.0);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 40.0);
     let snap = WorldSnapshot::from_match(&sim);
-    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 31.0));
+    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
     assert!(
-        pushed.y > 31.5,
+        pushed.y > 30.5,
         "midfield should push up to its band in front of the defenders: {pushed:?}"
     );
 
@@ -12025,8 +12025,17 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     let snap2 = WorldSnapshot::from_match(&sim);
     let pulled = snap2.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 58.0));
     assert!(
-        pulled.y < 57.5,
-        "midfield should drop back toward its band when too far ahead: {pulled:?}"
+        pulled.y <= 50.5,
+        "midfield more than 20yd ahead should reconnect to its band: {pulled:?}"
+    );
+
+    sim.ball.holder = Some(mids[0]);
+    sim.ball.position = sim.players[mids[0]].position;
+    let snap3 = WorldSnapshot::from_match(&sim);
+    let holder_pulled = snap3.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 58.0));
+    assert!(
+        holder_pulled.y <= 50.5,
+        "midfield holder is no longer exempt from the 1-20yd line band: {holder_pulled:?}"
     );
 }
 
@@ -12051,15 +12060,15 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     }
     for &f in forwards {
         sim.players[f].role = PlayerRole::Forward;
-        sim.players[f].position = Vec2::new(40.0, 52.0);
+        sim.players[f].position = Vec2::new(40.0, 51.0);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 54.0);
     let snap = WorldSnapshot::from_match(&sim);
-    let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 52.0));
+    let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
     assert!(
-        pushed.y > 52.5,
-        "strikers should push up to at least 3yd in front of midfield: {pushed:?}"
+        pushed.y > 51.5,
+        "strikers should push up to at least 2yd in front of midfield: {pushed:?}"
     );
 
     for &f in forwards {
@@ -12068,8 +12077,18 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     let snap2 = WorldSnapshot::from_match(&sim);
     let pulled = snap2.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 76.0));
     assert!(
-        pulled.y < 75.5,
+        pulled.y <= 70.5,
         "strikers more than 20yd ahead of midfield should reconnect: {pulled:?}"
+    );
+
+    sim.ball.holder = Some(forwards[0]);
+    sim.ball.position = sim.players[forwards[0]].position;
+    let snap3 = WorldSnapshot::from_match(&sim);
+    let holder_pulled =
+        snap3.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 76.0));
+    assert!(
+        holder_pulled.y <= 70.5,
+        "forward holder is no longer exempt from the 2-20yd line band: {holder_pulled:?}"
     );
 }
 
@@ -12155,8 +12174,8 @@ fn ball_proximity_nudge_respects_forward_midfield_padding() {
     let target = sim.players[forwards[0]].position;
     let (adjusted, _) = snap.ball_proximity_adjusted_target(forwards[0], target);
     assert!(
-        adjusted.distance(target) < 1e-6,
-        "ball pull must not collapse forwards inside the 3yd midfield padding: {adjusted:?}"
+        adjusted.y >= 52.0 - 1e-6,
+        "ball pull must not collapse forwards inside the 2yd midfield padding: {adjusted:?}"
     );
 }
 

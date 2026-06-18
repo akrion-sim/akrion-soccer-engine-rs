@@ -1604,11 +1604,11 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // cohesive unit. These are statistical-distance seeds (min enforced, ideal
 // targeted) that shape the formation-LP anchors; the LP/learners refine them.
 // Forward layering (measured along the team's attack direction):
-const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 2.0;
-const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 18.0;
+const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 1.0;
+const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
 const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 5.0;
-const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
+const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
+const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 2.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 6.5;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 5.0;

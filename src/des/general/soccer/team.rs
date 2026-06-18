@@ -3991,7 +3991,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
 /// spread within the back line and the midfield. Only *violations* are corrected:
 /// compressed lines step up, stretched lines drop back, and compliant shapes are
 /// left untouched. Anchors remain soft LP targets, with movement/reach constraints
-/// downstream deciding how much of the 3s/5s consistency correction can be executed.
+/// downstream deciding how much of the 2s/5s consistency correction can be executed.
 pub(crate) fn soccer_formation_lp_stagger_role_layers(
     slots: &mut [SoccerFormationLpSlotInput],
     team: Team,
