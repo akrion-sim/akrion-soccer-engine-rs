@@ -6,6 +6,25 @@ use super::*;
 
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
 
+fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
+    matches!(
+        strategy,
+        TeamAttackStrategy::GiveAndGoCentral
+            | TeamAttackStrategy::OneTwoLeftRelease
+            | TeamAttackStrategy::OneTwoRightRelease
+            | TeamAttackStrategy::CentralDoubleOneTwo
+            | TeamAttackStrategy::BackheelDisguisedRelease
+    )
+}
+
+fn directive_requests_give_and_go(directive: &TeamTacticalDirective) -> bool {
+    is_give_and_go_strategy(directive.attack_strategy)
+        || directive
+            .pair_attack_strategy
+            .map(is_give_and_go_strategy)
+            .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillProfile {
@@ -2798,7 +2817,7 @@ impl PlayerAgent {
                 special_score(
                     target,
                     0.42 + ball_gain.min(8.0) * 0.030
-                        + shape_support_urgency * 2.0
+                        + shape_support_urgency * 2.6
                         + holder_pressure_urgency * 0.58,
                 ),
                 true,
@@ -3977,14 +3996,7 @@ impl PlayerAgent {
             // Named one-two / give-and-go strategies commit to the wall pass before
             // first-touch, killer/scoop, or generic pass selection can swallow it.
             if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
-                let give_and_go_strategy = matches!(
-                    directive.attack_strategy,
-                    TeamAttackStrategy::GiveAndGoCentral
-                        | TeamAttackStrategy::OneTwoLeftRelease
-                        | TeamAttackStrategy::OneTwoRightRelease
-                        | TeamAttackStrategy::CentralDoubleOneTwo
-                        | TeamAttackStrategy::BackheelDisguisedRelease
-                );
+                let give_and_go_strategy = directive_requests_give_and_go(directive);
                 if give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY {
                     let action = SoccerAction::Pass {
                         target_player: Some(plan.wall_partner),
@@ -4618,14 +4630,7 @@ impl PlayerAgent {
                 ));
             }
             let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
-                let give_and_go_strategy = matches!(
-                    directive.attack_strategy,
-                    TeamAttackStrategy::GiveAndGoCentral
-                        | TeamAttackStrategy::OneTwoLeftRelease
-                        | TeamAttackStrategy::OneTwoRightRelease
-                        | TeamAttackStrategy::CentralDoubleOneTwo
-                        | TeamAttackStrategy::BackheelDisguisedRelease
-                );
+                let give_and_go_strategy = directive_requests_give_and_go(directive);
                 let goal_proximity = (1.0
                     - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
                         .clamp(0.0, 1.0))

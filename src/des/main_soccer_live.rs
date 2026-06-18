@@ -224,21 +224,6 @@ where
             );
         }
     }
-    // Lane-affinity engagement tie-break: among otherwise equally-placed teammates, the
-    // one whose 12-lane affinity claims the ball's lane commits to chasing it and the
-    // rest hold their channel. On by default in live_gameplay; this override forces it
-    // on/off for an A/B (SOCCER_LANE_AFFINITY_ENGAGEMENT=0 reverts to the prior tie-break).
-    if let Some(enabled) = env_bool(
-        &lookup,
-        "SOCCER_LANE_AFFINITY_ENGAGEMENT",
-        "SOCCER_LANE_AFFINITY_TIEBREAK",
-    ) {
-        cfg.match_config.lane_affinity_engagement_enabled = enabled;
-        println!(
-            "# soccer-live: lane-affinity engagement tie-break {}",
-            if enabled { "ENABLED" } else { "DISABLED" }
-        );
-    }
     // How close to the ball a player must be to run the per-player MPC (the "active
     // subset"). Default ~14yd keeps it near the ball; raise it past the pitch diagonal to
     // have ALL 22 plan their execution through the field-aware QP. There is ample per-tick

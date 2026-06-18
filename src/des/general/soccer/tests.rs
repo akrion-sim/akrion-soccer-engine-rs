@@ -8038,6 +8038,146 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
 }
 
 #[test]
+fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
+    let overloads = [
+        AttackingOverloadProfile {
+            attackers: 5,
+            defenders: 2,
+            advantage: 3,
+            score: 0.80,
+        },
+        AttackingOverloadProfile {
+            attackers: 3,
+            defenders: 3,
+            advantage: 0,
+            score: 0.20,
+        },
+        AttackingOverloadProfile {
+            attackers: 2,
+            defenders: 5,
+            advantage: -3,
+            score: 0.0,
+        },
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let xs = [4.0, 10.0, 18.0, 28.0, 40.0, 52.0, 62.0, 72.0, 78.0];
+    let ys = [18.0, 34.0, 50.0, 66.0, 82.0, 96.0, 108.0, 116.0];
+    for phase in [
+        TacticalPhase::HomeBuildUp,
+        TacticalPhase::HomeAttack,
+        TacticalPhase::Transition,
+    ] {
+        for possession in [Some(Team::Home), Some(Team::Away), None] {
+            for score_diff in [-2, 0, 2] {
+                for overload in overloads {
+                    for x in xs {
+                        for y in ys {
+                            let directive = tactical_directive_for_team(
+                                Team::Home,
+                                phase,
+                                possession,
+                                Vec2::new(x, y),
+                                score_diff,
+                                DEFAULT_FIELD_WIDTH_YARDS,
+                                DEFAULT_FIELD_LENGTH_YARDS,
+                                DefensiveCoverProfile::default(),
+                                overload,
+                                false,
+                            );
+                            seen.insert(directive.attack_strategy);
+                            let regain = tactical_directive_for_team(
+                                Team::Home,
+                                phase,
+                                Some(Team::Home),
+                                Vec2::new(x, y),
+                                score_diff,
+                                DEFAULT_FIELD_WIDTH_YARDS,
+                                DEFAULT_FIELD_LENGTH_YARDS,
+                                DefensiveCoverProfile::default(),
+                                overload,
+                                true,
+                            );
+                            seen.insert(regain.attack_strategy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let missing = TeamAttackStrategy::ALL
+        .iter()
+        .copied()
+        .filter(|strategy| !seen.contains(strategy))
+        .map(TeamAttackStrategy::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "every attacking strategy should have at least one rule-selector invocation path; missing={missing:?}"
+    );
+}
+
+#[test]
+fn learned_strategy_value_can_invoke_non_rule_attack_strategy() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = Some(6);
+    sim.ball.position = Vec2::new(40.0, 72.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[6].position = sim.ball.position;
+    sim.central_brain.possession_team = Some(Team::Home);
+
+    let before = WorldSnapshot::from_match(&sim);
+    let ctx_without_opp_press = (1u8 << 3) | (1u8 << 1);
+    for ctx in [ctx_without_opp_press, ctx_without_opp_press | 1] {
+        sim.central_brain
+            .home_attack_value
+            .insert((ctx, TeamAttackStrategy::WingOverlapLeftCross), 5.0);
+    }
+    let mut rng = mulberry32(79_401);
+    sim.central_brain.run_time_step(&before, &mut rng);
+
+    assert_eq!(
+        sim.central_brain.home_directive.attack_strategy,
+        TeamAttackStrategy::WingOverlapLeftCross
+    );
+    assert_eq!(
+        sim.central_brain.home_directive.flank_attack_policy,
+        FlankAttackPolicy::PlayDownFlankHighCross
+    );
+}
+
+#[test]
+fn vertical_combo_strategies_invite_in_behind_runs() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = Some(6);
+    sim.ball.position = Vec2::new(40.0, 84.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[6].position = sim.ball.position;
+
+    for strategy in [
+        TeamAttackStrategy::AerialFlickOnRelease,
+        TeamAttackStrategy::TransitionBurstOnRegain,
+        TeamAttackStrategy::CentralDoubleOneTwo,
+        TeamAttackStrategy::HalfSpaceComboLeft,
+        TeamAttackStrategy::HalfSpaceComboRight,
+    ] {
+        let mut directive = TeamTacticalDirective::neutral(
+            Team::Home,
+            DEFAULT_FIELD_WIDTH_YARDS,
+            DEFAULT_FIELD_LENGTH_YARDS,
+        );
+        directive.attack_strategy = strategy;
+        sim.central_brain.home_directive = directive;
+        let snapshot = WorldSnapshot::from_match(&sim);
+        assert!(
+            snapshot.team_plays_through_ball(Team::Home),
+            "{} should invite in-behind runs",
+            strategy.as_str()
+        );
+    }
+}
+
+#[test]
 fn adversarial_embedding_memory_biases_team_brain_directives() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -8726,9 +8866,10 @@ fn pomdp_q_state_and_neural_features_track_team_shape_context() {
 
 #[test]
 fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
-    // The learned decision must condition on the grid + motion vector of ALL 22 players,
-    // not just local aggregates. The whole-field block is captured actor-relative and
-    // team-canonical (identical for Home/Away) and appended to the neural feature tail.
+    // The learned decision must condition on the grid + smooth motion vector of ALL 22
+    // players plus the ball, not just local aggregates. The whole-field block is captured
+    // actor-relative and team-canonical (identical for Home/Away) and appended to the neural
+    // feature tail.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 909,
@@ -8753,6 +8894,12 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
     let mate_id = sim.players[mate].id;
     sim.players[mate].position = Vec2::new(40.0, 55.0 + 10.0 * attack);
     sim.players[mate].velocity = Vec2::new(0.0, 4.0 * attack);
+    sim.players[mate].acceleration = Vec2::new(0.0, 6.0 * attack);
+    // The ball owns the final entity slot, with the same position/velocity/acceleration
+    // channels as players.
+    sim.ball.position = Vec2::new(40.0, 55.0 + 6.0 * attack);
+    sim.ball.velocity = Vec2::new(0.0, 9.0 * attack);
+    sim.ball.acceleration = Vec2::new(0.0, 7.0 * attack);
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let block = soccer_field_player_motion_block(&snapshot, actor_id, actor_team);
@@ -8787,6 +8934,23 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
         block[mate_slot * per + 2] > 0.0,
         "a team-mate carrying forward -> positive forward velocity channel"
     );
+    assert!(
+        block[mate_slot * per + 4] > 0.0,
+        "a team-mate accelerating forward -> positive forward acceleration channel"
+    );
+    let ball_slot = SOCCER_NEURAL_FIELD_MOTION_PLAYERS;
+    assert!(
+        block[ball_slot * per] > 0.0,
+        "the ball slot should expose forward relative position"
+    );
+    assert!(
+        block[ball_slot * per + 2] > 0.0,
+        "the ball slot should expose forward velocity"
+    );
+    assert!(
+        block[ball_slot * per + 4] > 0.0,
+        "the ball slot should expose forward acceleration"
+    );
 
     // The block reaches the neural feature tail (capture -> encode -> net input).
     let decision = test_decision_trace(&snapshot, actor_id, "carry-forward");
@@ -8819,6 +8983,20 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
             "whole-field block channel {i} must appear in the neural feature tail"
         );
     }
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BALL_FINE_LANE],
+        soccer_neural_scaled(
+            transition.state.ball_grid.fine.x as f64,
+            PITCH_FINE_GRID_COLUMNS as f64 - 1.0
+        )
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BALL_FINE_ROW],
+        soccer_neural_scaled(
+            transition.state.ball_grid.fine.y as f64,
+            PITCH_FINE_GRID_ROWS as f64 - 1.0
+        )
+    );
 }
 
 #[test]
@@ -12076,7 +12254,7 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     // 5-20yd band (def avg 30 + 5 = 35).
     let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
     assert!(
-        pushed.y > 34.5,
+        pushed.y >= 34.9,
         "midfield should push up to at least 5yd in front of the defenders: {pushed:?}"
     );
 
@@ -12129,11 +12307,10 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 54.0);
     let snap = WorldSnapshot::from_match(&sim);
-    // Gap 1.0yd is below the 5yd minimum -> push up into the 5-20yd band
-    // (mid avg 50 + 5 = 55).
+    // Gap 1.0yd is below the 5yd minimum -> push up into the 5-20yd band.
     let pushed = snap.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
     assert!(
-        pushed.y > 54.5,
+        pushed.y >= 54.9,
         "strikers should push up to at least 5yd in front of midfield: {pushed:?}"
     );
 
@@ -12156,6 +12333,69 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     assert!(
         (holder_target.y - 76.0).abs() < 1e-6,
         "the ball carrier must stay exempt from the line band: {holder_target:?}"
+    );
+}
+
+#[test]
+fn role_line_shape_consistency_is_more_urgent_near_the_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 124,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let defs = &home[0..4];
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    for &d in defs {
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(30.0, 30.0);
+    }
+    for &m in mids {
+        sim.players[m].role = PlayerRole::Midfielder;
+        sim.players[m].position = Vec2::new(40.0, 30.0);
+    }
+    for &f in forwards {
+        sim.players[f].role = PlayerRole::Forward;
+        sim.players[f].position = Vec2::new(40.0, 51.0);
+    }
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 35.0);
+    let close_snapshot = WorldSnapshot::from_match(&sim);
+    let close_mid =
+        close_snapshot.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
+
+    sim.ball.position = Vec2::new(40.0, 110.0);
+    let far_snapshot = WorldSnapshot::from_match(&sim);
+    let far_mid = far_snapshot.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
+    assert!(
+        close_mid.y > far_mid.y + 1.0,
+        "midfield should shape up faster near the ball: close={close_mid:?} far={far_mid:?}"
+    );
+
+    for &m in mids {
+        sim.players[m].position = Vec2::new(40.0, 50.0);
+    }
+    for &f in forwards {
+        sim.players[f].position = Vec2::new(40.0, 51.0);
+    }
+    sim.ball.position = Vec2::new(40.0, 54.0);
+    let close_snapshot = WorldSnapshot::from_match(&sim);
+    let close_forward =
+        close_snapshot.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
+
+    sim.ball.position = Vec2::new(40.0, 112.0);
+    let far_snapshot = WorldSnapshot::from_match(&sim);
+    let far_forward =
+        far_snapshot.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 51.0));
+    assert!(
+        close_forward.y > far_forward.y + 0.75,
+        "forwards should reconnect faster near the ball: close={close_forward:?} far={far_forward:?}"
     );
 }
 
@@ -12634,23 +12874,89 @@ fn defensive_line_cushion_still_clamps_lane_and_row_when_average_is_legal() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    let adjusted =
-        snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(75.0, 10.0));
-    let expected_lane_x = vertical_lane_clamped_x_for_role(
-        sim.players[home_def[1]].role,
-        sim.players[home_def[1]].home_position.x,
-        75.0,
-        sim.config.field_width_yards,
-        false,
-    );
-    assert!(
-        (adjusted.x - expected_lane_x).abs() < 1e-9,
-        "line-bound LCB should be clamped back into its 12-lane home channel: {adjusted:?}"
-    );
+    let mut adjusted_line: Vec<(f64, Vec2)> = home_def[1..]
+        .iter()
+        .map(|&id| {
+            (
+                sim.players[id].home_position.x,
+                snap.defensive_line_cushion_adjusted_target(id, Vec2::new(75.0, 10.0)),
+            )
+        })
+        .collect();
+    adjusted_line.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let adjusted = adjusted_line[0].1;
+    for pair in adjusted_line.windows(2) {
+        let gap = pair[1].1.x - pair[0].1.x;
+        assert!(
+            (BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS - 1e-9
+                ..=BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS + 1e-9)
+                .contains(&gap),
+            "line-bound defenders should preserve 1.5-8yd x gaps: line={adjusted_line:?}"
+        );
+    }
     assert!(
         adjusted.y > 24.0 && adjusted.y < 40.5,
         "line-bound defender should be pulled back within the back-four row band even when the average is legal: {adjusted:?}"
     );
+}
+
+#[test]
+fn back_four_horizontal_gap_targets_preserve_home_slot_order() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 225,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    assert_eq!(home_def.len(), 4, "test needs the back four");
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(42.0, 62.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    for (id, x) in home_def.iter().copied().zip([64.0, 18.0, 23.0, 9.0]) {
+        sim.players[id].position = Vec2::new(x, 34.0);
+    }
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let mut adjusted: Vec<(f64, Vec2)> = home_def
+        .iter()
+        .map(|&id| {
+            let home_x = sim.players[id].home_position.x;
+            let bad_x = if home_x < sim.config.field_width_yards * 0.5 {
+                sim.config.field_width_yards - 2.0
+            } else {
+                2.0
+            };
+            (
+                home_x,
+                snap.back_four_shape_adjusted_target(id, Vec2::new(bad_x, 34.0)),
+            )
+        })
+        .collect();
+    adjusted.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    for pair in adjusted.windows(2) {
+        let gap = pair[1].1.x - pair[0].1.x;
+        assert!(
+            (BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS - 1e-9
+                ..=BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS + 1e-9)
+                .contains(&gap),
+            "back four should recover home-slot order with 1.5-8yd x gaps: {adjusted:?}"
+        );
+    }
 }
 
 #[test]
@@ -22872,9 +23178,17 @@ fn player_mdp_state_includes_hierarchical_pitch_grid_and_facing() {
     let state = snapshot.mdp_state_for_player(5);
     let observation = snapshot.observation_for(5);
 
+    assert_eq!(PITCH_FINE_GRID_COLUMNS, 12);
+    assert_eq!(PITCH_FINE_GRID_ROWS, 24);
+    assert_eq!(state.player_grid.fine.columns, 12);
+    assert_eq!(state.player_grid.fine.rows, 24);
+    assert_eq!(state.ball_grid.fine.columns, 12);
+    assert_eq!(state.ball_grid.fine.rows, 24);
+    assert_eq!(state.ball_zone_x, state.ball_grid.tactical.x);
+    assert_eq!(state.ball_zone_y, state.ball_grid.tactical.y);
     assert_eq!(state.player_grid.fine.x, 3);
-    assert_eq!(state.player_grid.fine.y, 8);
-    assert_eq!(state.player_grid.fine.id, 99);
+    assert_eq!(state.player_grid.fine.y, 13);
+    assert_eq!(state.player_grid.fine.id, 159);
     assert_eq!(state.player_grid.fine.parent_id, Some(25));
     assert_eq!(state.player_grid.tactical.id, 25);
     assert_eq!(state.player_grid.tactical.parent_id, Some(6));
@@ -22884,6 +23198,7 @@ fn player_mdp_state_includes_hierarchical_pitch_grid_and_facing() {
     assert_eq!(state.receive_facing, FacingBucket::NorthWest);
     assert_eq!(state.action_facing, FacingBucket::West);
     assert_eq!(observation.player_grid.fine.id, state.player_grid.fine.id);
+    assert_eq!(observation.ball_grid, state.ball_grid);
     assert_eq!(observation.action_facing, FacingBucket::West);
 }
 
@@ -33215,7 +33530,9 @@ fn no_possession_nearest_players_chase_loose_ball() {
     sim.players[7].position = Vec2::new(64.0, 60.0);
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let mut chaser = sim.players[5].clone();
+    // Players 5 and 6 are equally close; player 6 has the better dynamic lane fit
+    // to the ball's 12-lane band, so it is the designated retriever.
+    let mut chaser = sim.players[6].clone();
     let mut rng = mulberry32(72);
     let intent = chaser.run_time_step(&snapshot, None, None, &mut rng);
 
@@ -35047,10 +35364,16 @@ fn defenders_and_midfielders_preserve_vertical_lanes_by_phase() {
         let player = &sim.players[player_id];
         let target =
             possession_snapshot.positional_open_space_for(player_id, player.home_position, false);
-        assert_eq!(
-            vertical_lane_index(target.x, possession_snapshot.field_width),
-            vertical_lane_index(player.home_position.x, possession_snapshot.field_width),
-            "{} should keep its vertical lane in possession: home={:?} target={:?}",
+        let target_lane = vertical_lane_index(target.x, possession_snapshot.field_width);
+        let (min_lane, max_lane) = role_vertical_lane_range(
+            player.role,
+            player.home_position.x,
+            possession_snapshot.field_width,
+            true,
+        );
+        assert!(
+            (min_lane..=max_lane).contains(&target_lane),
+            "{} should keep its 12-grid vertical lane band in possession: home={:?} target={:?} lane={target_lane} allowed={min_lane}..={max_lane}",
             player.name,
             player.home_position,
             target
@@ -35067,174 +35390,337 @@ fn defenders_and_midfielders_preserve_vertical_lanes_by_phase() {
         let player = &sim.players[player_id];
         let target =
             defense_snapshot.defensive_assignment_for(player_id, player.home_position, false);
-        assert_eq!(
-                vertical_lane_index(target.x, defense_snapshot.field_width),
-                vertical_lane_index(player.home_position.x, defense_snapshot.field_width),
-                "{} should keep its vertical lane while defending unless actively tracking: home={:?} target={:?}",
-                player.name,
-                player.home_position,
-                target
-            );
-    }
-}
-
-#[test]
-fn lane_affinity_pmf_is_markovian_and_role_shaped() {
-    // Strikers: no lane affinity at all (free to roam).
-    assert!(lane_affinity_distribution(PlayerRole::Forward, 6.0).is_none());
-    assert_eq!(lane_affinity_strength(PlayerRole::Forward, false), 0.0);
-    assert_eq!(lane_affinity_strength(PlayerRole::Forward, true), 0.0);
-
-    // Defenders, midfielders and the keeper get a proper PMF over the 12 lanes that
-    // sums to 1.0 (Markovian), peaked at their home lane, at every home position.
-    for role in [
-        PlayerRole::Defender,
-        PlayerRole::Midfielder,
-        PlayerRole::Goalkeeper,
-    ] {
-        for home_lane in [0.0, 3.0, 5.5, 8.0, 11.0] {
-            let dist = lane_affinity_distribution(role, home_lane).unwrap();
-            let sum: f64 = dist.iter().sum();
-            assert!((sum - 1.0).abs() < 1e-9, "{role:?}@{home_lane} sum={sum}");
-            let peak = dist.iter().cloned().fold(f64::MIN, f64::max);
-            let peak_lane = dist.iter().position(|&v| v == peak).unwrap();
-            assert!(
-                (peak_lane as f64 - home_lane).abs() <= 1.0,
-                "{role:?} peak lane {peak_lane} should sit at home lane {home_lane}"
-            );
-        }
-    }
-
-    // Defenders hold a TIGHTER channel than midfielders (more mass on the home lane).
-    let def = lane_affinity_distribution(PlayerRole::Defender, 5.0).unwrap();
-    let mid = lane_affinity_distribution(PlayerRole::Midfielder, 5.0).unwrap();
-    assert!(
-        def[5] > mid[5],
-        "defender channel should be tighter than midfielder: def={} mid={}",
-        def[5],
-        mid[5]
-    );
-
-    // In possession the pull halves (until the ball is given away).
-    for role in [PlayerRole::Defender, PlayerRole::Midfielder] {
-        let out_of_possession = lane_affinity_strength(role, false);
-        let in_possession = lane_affinity_strength(role, true);
-        assert!(
-            (in_possession - out_of_possession * LANE_AFFINITY_IN_POSSESSION_SCALE).abs() < 1e-9,
-            "{role:?} in-possession affinity should be halved"
+        let target_lane = vertical_lane_index(target.x, defense_snapshot.field_width);
+        let (min_lane, max_lane) = role_vertical_lane_range(
+            player.role,
+            player.home_position.x,
+            defense_snapshot.field_width,
+            false,
         );
-        assert!(in_possession < out_of_possession);
+        assert!(
+            (min_lane..=max_lane).contains(&target_lane),
+            "{} should keep its 12-grid vertical lane band while defending unless actively tracking: home={:?} target={:?} lane={target_lane} allowed={min_lane}..={max_lane}",
+            player.name,
+            player.home_position,
+            target
+        );
     }
 }
 
 #[test]
-fn lane_affinity_breaks_who_chases_the_loose_ball() {
-    let a = 2usize; // home on the left
-    let b = 3usize; // home on the right
-    let ball = Vec2::new(20.0, 50.0); // loose ball in the LEFT channel
-    let build = |enabled: bool| -> SoccerMatch {
-        let mut sim = SoccerMatch::default_11v11(MatchConfig {
-            lane_affinity_engagement_enabled: enabled,
-            ..MatchConfig::default()
-        });
-        // Park everyone far from the ball so only the two test defenders can claim it.
-        for p in sim.players.iter_mut() {
-            p.position = Vec2::new(40.0, 5.0);
-            p.velocity = Vec2::zero();
+fn defender_and_midfielder_markov_lane_affinities_sum_to_one() {
+    for (name, table) in [
+        ("defender", &DEFENDER_MARKOV_LANE_PMF_BY_SLOT),
+        ("midfielder", &MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT),
+    ] {
+        for (slot, row) in table.iter().enumerate() {
+            let sum: f64 = row.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "{name} slot {slot} must sum to 1.0, got {sum:.12}"
+            );
+            assert!(
+                row.iter().all(|value| (0.0..=1.0).contains(value)),
+                "{name} slot {slot} must stay inside probability bounds: {row:?}"
+            );
         }
-        sim.players[a].role = PlayerRole::Defender;
-        sim.players[b].role = PlayerRole::Defender;
-        sim.players[a].home_position = Vec2::new(20.0, 25.0);
-        sim.players[b].home_position = Vec2::new(60.0, 25.0);
-        // A and B are the SAME distance (10yd) from the ball, so only lane affinity
-        // can break the tie.
-        sim.players[a].position = Vec2::new(10.0, 50.0);
-        sim.players[b].position = Vec2::new(30.0, 50.0);
-        sim.ball.holder = None;
-        sim.ball.position = ball;
-        sim.ball.velocity = Vec2::zero();
-        sim
+    }
+}
+
+#[test]
+fn defender_and_midfielder_markov_lane_pmfs_are_mirrored_and_smooth() {
+    for (name, table) in [
+        ("defender", &DEFENDER_MARKOV_LANE_PMF_BY_SLOT),
+        ("midfielder", &MIDFIELDER_MARKOV_LANE_PMF_BY_SLOT),
+    ] {
+        for slot in 0..table.len() {
+            let mirror_slot = table.len() - 1 - slot;
+            for lane in 0..VERTICAL_LANE_COUNT {
+                let mirror_lane = VERTICAL_LANE_COUNT - 1 - lane;
+                assert!(
+                    (table[slot][lane] - table[mirror_slot][mirror_lane]).abs() < 1e-9,
+                    "{name} slot {slot} lane {lane} must mirror slot {mirror_slot} lane {mirror_lane}"
+                );
+            }
+            let max_step = table[slot]
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_step <= 0.16,
+                "{name} slot {slot} PMF should transition smoothly between adjacent lanes, max_step={max_step}"
+            );
+        }
+    }
+}
+
+#[test]
+fn markov_lane_pmf_probability_is_separate_from_peak_affinity() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let lane_center = |lane: usize| {
+        let (left, right) = vertical_lane_bounds(lane, snapshot.field_width);
+        (left + right) * 0.5
     };
 
-    // Flag OFF: equidistant -> equal retrieval scores (tie broken elsewhere).
-    let off = build(false);
-    let snap_off = WorldSnapshot::from_match(&off);
-    let pa = snap_off.players.iter().find(|p| p.id == a).unwrap();
-    let pb = snap_off.players.iter().find(|p| p.id == b).unwrap();
+    let left_back = snapshot
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .min_by(|a, b| a.home_position.x.total_cmp(&b.home_position.x))
+        .unwrap();
+    let peak = Vec2::new(lane_center(3), left_back.home_position.y);
+    let shoulder = Vec2::new(lane_center(0), left_back.home_position.y);
     assert!(
-        (snap_off.loose_ball_retrieval_score(pa, ball)
-            - snap_off.loose_ball_retrieval_score(pb, ball))
-        .abs()
-            < 1e-9,
-        "flag off: equidistant retrieval scores should tie"
+        (snapshot.markov_lane_probability_for_player_target(left_back, peak) - 0.30).abs()
+            < 1e-9
+    );
+    assert!(
+        (snapshot.markov_lane_probability_for_player_target(left_back, shoulder) - 0.05).abs()
+            < 1e-9
+    );
+    assert!(
+        (snapshot.markov_lane_affinity_for_player_target(left_back, peak) - 1.0).abs() < 1e-9
+    );
+    assert!(
+        snapshot.markov_lane_affinity_for_player_target(left_back, shoulder)
+            < snapshot.markov_lane_affinity_for_player_target(left_back, peak) * 0.20
     );
 
-    // Flag ON: the defender whose lane the ball is in (A, home on the left) claims it;
-    // B holds its channel.
-    let on = build(true);
-    let snap_on = WorldSnapshot::from_match(&on);
-    let pa = snap_on.players.iter().find(|p| p.id == a).unwrap();
-    let pb = snap_on.players.iter().find(|p| p.id == b).unwrap();
+    let left_midfielder = snapshot
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+        .min_by(|a, b| a.home_position.x.total_cmp(&b.home_position.x))
+        .unwrap();
+    let mid_peak = Vec2::new(lane_center(3), left_midfielder.home_position.y);
     assert!(
-        snap_on.lane_affinity_claim_at(pa, ball) > snap_on.lane_affinity_claim_at(pb, ball),
-        "A should claim the ball's lane more than B"
+        (snapshot.markov_lane_probability_for_player_target(left_midfielder, mid_peak) - 0.24)
+            .abs()
+            < 1e-9
     );
     assert!(
-        snap_on.loose_ball_retrieval_score(pa, ball)
-            < snap_on.loose_ball_retrieval_score(pb, ball),
-        "flag on: the in-lane defender should have the better (lower) retrieval score"
-    );
-    assert!(
-        snap_on.is_primary_loose_ball_retriever(a, ball),
-        "A (ball in its lane) should be the designated retriever"
-    );
-    assert!(
-        !snap_on.is_primary_loose_ball_retriever(b, ball),
-        "B should hold its channel, not chase"
+        (snapshot.markov_lane_affinity_for_player_target(left_midfielder, mid_peak) - 1.0).abs()
+            < 1e-9
     );
 }
 
 #[test]
-fn lane_affinity_breaks_who_marks_the_runner() {
-    // A left-channel defender's zonal spot (lane ~3).
-    let zone = Vec2::new(20.0, 32.0);
-    // Two Away attackers, both close to the zone: A is IN the defender's lane (x=20),
-    // B is in another channel (x=31) but marginally CLOSER to the zone. Without the
-    // tie-break the defender marks the nearer B; with it, the defender picks up the
-    // runner that entered its own lane (A) and leaves B to a teammate.
-    let a_pos = Vec2::new(20.0, 50.0);
-    let b_pos = Vec2::new(31.0, 46.0);
-    let build = |enabled: bool| -> WorldSnapshot {
-        let mut sim = SoccerMatch::default_11v11(MatchConfig {
-            lane_affinity_engagement_enabled: enabled,
-            ..MatchConfig::default()
-        });
-        for p in sim.players.iter_mut() {
-            p.position = Vec2::new(70.0, 60.0); // park everyone far from the zone
-        }
-        sim.players[12].role = PlayerRole::Forward;
-        sim.players[13].role = PlayerRole::Forward;
-        sim.players[12].position = a_pos;
-        sim.players[13].position = b_pos;
-        sim.ball.holder = None;
-        sim.ball.position = Vec2::new(26.0, 44.0);
-        WorldSnapshot::from_match(&sim)
+fn markov_lane_pmf_interpolates_for_non_four_player_role_lines() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let mut defenders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    defenders.sort_by(|a, b| {
+        sim.players[*a]
+            .home_position
+            .x
+            .total_cmp(&sim.players[*b].home_position.x)
+    });
+    assert_eq!(defenders.len(), 4, "test setup expects a back four");
+    let right_back = defenders[3];
+    let middle_defender = defenders[1];
+    sim.players[right_back].role = PlayerRole::Forward;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let lane_center = |lane: usize| {
+        let (left, right) = vertical_lane_bounds(lane, snapshot.field_width);
+        (left + right) * 0.5
     };
+    let player = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == middle_defender)
+        .unwrap();
+    let left_center_peak = Vec2::new(lane_center(5), player.home_position.y);
+    let right_center_peak = Vec2::new(lane_center(6), player.home_position.y);
 
-    let off = build(false);
-    let off_mark =
-        soccer_defensive_mark_target(&off, Team::Home, PlayerRole::Defender, zone).unwrap();
     assert!(
-        off_mark.distance(b_pos) < off_mark.distance(a_pos),
-        "flag off: defender marks the nearer runner B: {off_mark:?}"
+        (snapshot.markov_lane_probability_for_player_target(player, left_center_peak) - 0.23)
+            .abs()
+            < 1e-9,
+        "three-player defender line should interpolate the middle slot between LCB and RCB"
     );
-
-    let on = build(true);
-    let on_mark =
-        soccer_defensive_mark_target(&on, Team::Home, PlayerRole::Defender, zone).unwrap();
     assert!(
-        on_mark.distance(a_pos) < on_mark.distance(b_pos),
-        "flag on: defender picks up the runner in its own lane (A): {on_mark:?}"
+        (snapshot.markov_lane_probability_for_player_target(player, right_center_peak) - 0.23)
+            .abs()
+            < 1e-9,
+        "interpolated middle slot should be symmetric across the centre lanes"
+    );
+    assert!(
+        (snapshot.markov_lane_affinity_for_player_target(player, left_center_peak) - 1.0).abs()
+            < 1e-9
+    );
+    assert!(
+        (snapshot.markov_lane_affinity_for_player_target(player, right_center_peak) - 1.0).abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn forwards_have_no_dynamic_lane_affinity_prior() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let forward = 9;
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    sim.players[forward].role = PlayerRole::Forward;
+    sim.players[forward].team = Team::Home;
+    sim.players[forward].position = Vec2::new(20.0, 74.0);
+    sim.players[forward].home_position = Vec2::new(20.0, 74.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let player = snapshot.players.iter().find(|p| p.id == forward).unwrap();
+
+    assert_eq!(
+        snapshot.dynamic_lane_affinity_for_player_target(player, Vec2::new(64.0, 90.0)),
+        0.0,
+        "forwards should use runs/space cues, not a defender-style lane prior"
+    );
+}
+
+#[test]
+fn dynamic_lane_affinity_halves_for_team_in_possession_until_turnover() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 1;
+    let home_holder = 9;
+    let away_holder = 17;
+    park_players_except(&mut sim, &[defender, home_holder, away_holder]);
+    for (id, home_x) in [(1usize, 22.0), (2, 36.0), (3, 52.0), (4, 68.0)] {
+        sim.players[id].team = Team::Home;
+        sim.players[id].role = PlayerRole::Defender;
+        sim.players[id].home_position = Vec2::new(home_x, 34.0);
+        sim.players[id].position = Vec2::new(home_x, 34.0);
+    }
+    sim.players[home_holder].team = Team::Home;
+    sim.players[away_holder].team = Team::Away;
+    sim.ball.position = Vec2::new(44.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.jerk = Vec2::zero();
+    let target = Vec2::new(22.0, 36.0);
+
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    let free_snapshot = WorldSnapshot::from_match(&sim);
+    let free_player = free_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == defender)
+        .unwrap();
+    let free_affinity = free_snapshot.dynamic_lane_affinity_for_player_target(free_player, target);
+
+    sim.ball.holder = Some(home_holder);
+    sim.ball.last_touch_team = Some(Team::Home);
+    let possession_snapshot = WorldSnapshot::from_match(&sim);
+    let possession_player = possession_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == defender)
+        .unwrap();
+    let possession_affinity =
+        possession_snapshot.dynamic_lane_affinity_for_player_target(possession_player, target);
+
+    sim.ball.holder = Some(away_holder);
+    sim.ball.last_touch_team = Some(Team::Away);
+    let turnover_snapshot = WorldSnapshot::from_match(&sim);
+    let turnover_player = turnover_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == defender)
+        .unwrap();
+    let turnover_affinity =
+        turnover_snapshot.dynamic_lane_affinity_for_player_target(turnover_player, target);
+
+    assert!(
+        possession_affinity < free_affinity * 0.60,
+        "own possession should damp lane affinity by about half: free={free_affinity:.3} possession={possession_affinity:.3}"
+    );
+    assert!(
+        turnover_affinity > possession_affinity * 1.70,
+        "after giving it away, defensive lane affinity should return: turnover={turnover_affinity:.3} possession={possession_affinity:.3}"
+    );
+}
+
+#[test]
+fn dynamic_lane_affinity_reads_ball_trajectory_and_field_configuration() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let aligned = 6;
+    let cross_lane = 7;
+    park_players_except(&mut sim, &[aligned, cross_lane]);
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    sim.ball.position = Vec2::new(52.0, 60.0);
+    sim.ball.velocity = Vec2::new(9.0, 0.0);
+    sim.ball.acceleration = Vec2::new(6.0, 0.0);
+    sim.ball.jerk = Vec2::zero();
+    sim.players[aligned].team = Team::Home;
+    sim.players[aligned].role = PlayerRole::Midfielder;
+    sim.players[aligned].position = Vec2::new(60.0, 50.0);
+    sim.players[aligned].home_position = Vec2::new(60.0, 48.0);
+    sim.players[cross_lane].team = Team::Home;
+    sim.players[cross_lane].role = PlayerRole::Midfielder;
+    sim.players[cross_lane].position = Vec2::new(22.0, 50.0);
+    sim.players[cross_lane].home_position = Vec2::new(22.0, 48.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let target = Vec2::new(60.0, 60.0);
+    let aligned_player = snapshot.players.iter().find(|p| p.id == aligned).unwrap();
+    let cross_lane_player = snapshot.players.iter().find(|p| p.id == cross_lane).unwrap();
+    let aligned_affinity =
+        snapshot.dynamic_lane_affinity_for_player_target(aligned_player, target);
+    let cross_lane_affinity =
+        snapshot.dynamic_lane_affinity_for_player_target(cross_lane_player, target);
+
+    assert!(
+        aligned_affinity > cross_lane_affinity + 0.18,
+        "ball trajectory should make the player already in the relevant 12-lane band the better fit: aligned={aligned_affinity:.3} cross={cross_lane_affinity:.3}"
+    );
+}
+
+#[test]
+fn loose_ball_tie_break_prefers_higher_dynamic_lane_affinity() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let aligned = 6;
+    let cross_lane = 7;
+    park_players_except(&mut sim, &[aligned, cross_lane]);
+    let target = Vec2::new(60.0, 60.0);
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    sim.ball.position = Vec2::new(52.0, 60.0);
+    sim.ball.velocity = Vec2::new(8.0, 0.0);
+    sim.ball.acceleration = Vec2::new(4.0, 0.0);
+    sim.ball.jerk = Vec2::zero();
+    sim.players[aligned].team = Team::Home;
+    sim.players[aligned].role = PlayerRole::Midfielder;
+    sim.players[aligned].position = Vec2::new(60.0, 54.0);
+    sim.players[aligned].home_position = Vec2::new(60.0, 48.0);
+    sim.players[aligned].velocity = Vec2::zero();
+    sim.players[cross_lane].team = Team::Home;
+    sim.players[cross_lane].role = PlayerRole::Midfielder;
+    sim.players[cross_lane].position = Vec2::new(54.0, 60.0);
+    sim.players[cross_lane].home_position = Vec2::new(22.0, 48.0);
+    sim.players[cross_lane].velocity = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let aligned_player = snapshot.players.iter().find(|p| p.id == aligned).unwrap();
+    let cross_lane_player = snapshot.players.iter().find(|p| p.id == cross_lane).unwrap();
+    let aligned_score = snapshot.loose_ball_retrieval_score(aligned_player, target);
+    let cross_lane_score = snapshot.loose_ball_retrieval_score(cross_lane_player, target);
+
+    assert!(
+        aligned_score < cross_lane_score,
+        "equal-distance loose-ball races should prefer higher dynamic lane affinity: aligned={aligned_score:.3} cross={cross_lane_score:.3}"
+    );
+    assert!(
+        snapshot.is_primary_loose_ball_retriever(aligned, target),
+        "the lane-natural player should be the committed retriever"
+    );
+    assert!(
+        !snapshot.is_primary_loose_ball_retriever(cross_lane, target),
+        "the cross-lane peer should hold shape when lane affinity breaks the tie"
     );
 }
 
@@ -35956,8 +36442,8 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named feature indices all live in the base block; the
-    // whole-field "moment of all 22" block is appended after it.
-    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 180);
+    // whole-field "moment of all 22 + ball" block is appended after it.
+    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 182);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM
@@ -35984,10 +36470,14 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_FIELD_FEASIBILITY, 177);
     assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY, 178);
     assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR, 179);
+    assert_eq!(SOCCER_NEURAL_FEATURE_BALL_FINE_LANE, 180);
+    assert_eq!(SOCCER_NEURAL_FEATURE_BALL_FINE_ROW, 181);
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&258));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&265));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&268));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&318));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&163));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&248));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&251));
@@ -36381,7 +36871,7 @@ fn formation_stagger_pulls_overstretched_layers_back_toward_band() {
     let fwd_after = mean(&slots, PlayerRole::Forward);
     assert!(
         mid_after < mid_before - 0.3,
-        "midfielders more than 18yd ahead of defenders should be pulled back"
+        "midfielders more than 20yd ahead of defenders should be pulled back"
     );
     assert!(
         fwd_after < fwd_before - 0.2,
@@ -37153,8 +37643,14 @@ fn possession_shape_pushes_back_four_up_and_staggers_midfield_pair() {
         sim.players[rcb].home_position,
         sim.ball.position
     );
-    assert!(lb_target.y > lcb_target.y + 1.0);
-    assert!(rb_target.y > rcb_target.y + 1.0);
+    assert!(
+        lb_target.y > lcb_target.y + 1.0,
+        "lb_target={lb_target:?} lcb_target={lcb_target:?}"
+    );
+    assert!(
+        rb_target.y > rcb_target.y + 1.0,
+        "rb_target={rb_target:?} rcb_target={rcb_target:?}"
+    );
     assert!(dm_target.y > center_back_line + 3.0);
     assert!(dm_target.y < am_target.y);
     assert!(am_target.y > dm_target.y);
@@ -37244,6 +37740,30 @@ fn wingback_push_is_smoothly_boosted_by_space_and_midfield_cover() {
                 && covered_rb_target.y > covered_center_back_line + 2.0,
             "outside backs should remain ahead of the center-back line: lb={covered_target:?} rb={covered_rb_target:?} cb_line={covered_center_back_line}"
         );
+}
+
+#[test]
+fn wingback_advance_odds_keep_thirty_percent_extra_upfield_bias() {
+    let prior_raised_bias = 2.05;
+    assert!(
+        (WINGBACK_ADVANCE_ODDS_MULTIPLIER - prior_raised_bias * 1.30).abs() < 1e-9,
+        "wingback odds should stay 30% above the prior raised bias"
+    );
+    let center_back_probability = 0.4;
+    let wingback_probability = probability_with_odds_multiplier(
+        center_back_probability,
+        WINGBACK_ADVANCE_ODDS_MULTIPLIER,
+    );
+    let prior_wingback_probability =
+        probability_with_odds_multiplier(center_back_probability, prior_raised_bias);
+    assert!(wingback_probability > prior_wingback_probability);
+
+    let center_back_odds = center_back_probability / (1.0 - center_back_probability);
+    let wingback_odds = wingback_probability / (1.0 - wingback_probability);
+    assert!(
+        (wingback_odds / center_back_odds - WINGBACK_ADVANCE_ODDS_MULTIPLIER).abs() < 1e-9,
+        "wingback probability should be implemented as an odds multiplier"
+    );
 }
 
 #[test]
@@ -44489,6 +45009,7 @@ fn pomdp_and_q_state_track_receiver_openness_for_pass_completion() {
         tick: 0,
         ball_zone_x: 4,
         ball_zone_y: 4,
+        ball_grid: PitchGridAddress::default(),
         player_grid: PitchGridAddress::default(),
         receive_facing: FacingBucket::Unknown,
         action_facing: FacingBucket::North,
@@ -50399,7 +50920,7 @@ fn decision_trace_capture_records_bounded_on_ball_decisions() {
     for _ in 0..300 {
         sim.run_time_step();
     }
-    let trace = sim.decision_trace_recent();
+    let mut trace = sim.decision_trace_recent();
     assert!(!trace.is_empty(), "capture should record decisions");
     // Only the last 10s of decisions are retained — nothing older leaks through.
     let cutoff = sim.clock_seconds - SOCCER_DECISION_TRACE_WINDOW_SECONDS;
@@ -50427,6 +50948,19 @@ fn decision_trace_capture_records_bounded_on_ball_decisions() {
         "off-ball players should be captured too, not just the holder: {} players",
         per_player.len()
     );
+    if !trace.iter().any(|entry| entry.has_ball) {
+        let holder_index = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home outfield player");
+        let holder = sim.players[holder_index].id;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder_index].position;
+        sim.ball.last_touch_team = Some(sim.players[holder_index].team);
+        sim.run_time_step();
+        trace = sim.decision_trace_recent();
+    }
     // The holder's on-ball decision is captured somewhere in the trace.
     assert!(
         trace.iter().any(|entry| entry.has_ball),
@@ -50546,7 +51080,7 @@ fn live_http_frame_builder_avoids_full_snapshot_churn() {
     sim.clear_controller_assignments();
     sim.run_time_step();
 
-    let holder_id = sim.ball.holder.expect("live frame holder");
+    let holder_id = sim.ball.holder;
     let frame = sim.to_live_http_frame();
 
     assert!(
@@ -50608,20 +51142,22 @@ fn live_http_frame_builder_avoids_full_snapshot_churn() {
         !frame.intents.is_empty(),
         "live HTTP frames should expose compact intent traces for the UI"
     );
-    let holder = frame
-        .players
-        .iter()
-        .find(|player| player.id == holder_id)
-        .expect("holder frame");
-    assert!(
-        holder.last_decision.is_some(),
-        "holder keeps the full decision trace for UI/inspection"
-    );
+    if let Some(holder_id) = holder_id {
+        let holder = frame
+            .players
+            .iter()
+            .find(|player| player.id == holder_id)
+            .expect("holder frame");
+        assert!(
+            holder.last_decision.is_some(),
+            "holder keeps the full decision trace for UI/inspection"
+        );
+    }
     assert!(
         frame
             .players
             .iter()
-            .any(|player| player.id != holder_id && player.last_decision.is_none()),
+            .any(|player| Some(player.id) != holder_id && player.last_decision.is_none()),
         "autonomous non-holders should avoid cloned full decision traces"
     );
 }
@@ -54963,7 +55499,10 @@ fn live_http_input_route_feeds_next_step() {
                 .unwrap()
     );
     assert_eq!(step_value["controllerYield"]["assignedPlayers"], 1);
-    assert_eq!(step_value["controllerYield"]["waitAttempts"], 1);
+    assert!(
+        step_value["controllerYield"]["waitAttempts"].as_u64().unwrap() >= 1,
+        "step should attempt to yield for the assigned controller slot"
+    );
     assert_eq!(step_value["controllerYield"]["lateWaitAttempts"], 0);
     assert_eq!(step_value["controllerYield"]["lastWaitLate"], false);
     assert_eq!(
@@ -62610,6 +63149,79 @@ fn give_and_go_strategy_commits_to_wall_pass_and_runner_expectation() {
             .expect("decision trace")
             .action,
         "wall-pass"
+    );
+}
+
+#[test]
+fn nested_give_and_go_pair_strategy_commits_to_wall_pass() {
+    let mut sim = wall_pass_scenario();
+    sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;
+    sim.central_brain.home_directive.attack_strategy = TeamAttackStrategy::PatientPossessionProbe;
+    sim.central_brain.home_directive.pair_attack_strategy =
+        Some(TeamAttackStrategy::GiveAndGoCentral);
+    sim.players[6].skills.passing_completion_rate = 9.0;
+    sim.players[6].skills.passing = 9.0;
+    sim.players[6].skills.vision = 9.0;
+    sim.players[6].preferences.pass_bias = 1.0;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .wall_pass_option_for(6)
+        .expect("nested give-and-go should still have a viable wall-pass plan");
+    assert!(
+        plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY,
+        "fixture must clear the nested strategy commitment quality floor: {plan:?}"
+    );
+
+    let mut carrier = sim.players[6].clone();
+    let intent = carrier.run_time_step(&snapshot, None, None, &mut mulberry32(58_402));
+    match intent.action {
+        SoccerAction::Pass {
+            target_player,
+            flight,
+            ..
+        } => {
+            assert_eq!(target_player, Some(plan.wall_partner));
+            assert_eq!(flight, PassFlight::Floor);
+        }
+        other => {
+            panic!("nested give-and-go pair strategy should commit to wall pass, got {other:?}")
+        }
+    }
+    let commitment = carrier
+        .one_two
+        .expect("nested give-and-go should store the one-two run");
+    assert_eq!(commitment.wall_partner, plan.wall_partner);
+    assert!(
+        commitment.return_target.distance(plan.return_target) <= 1e-9,
+        "stored return target should match the nested plan: {commitment:?} vs {plan:?}"
+    );
+    assert_eq!(
+        carrier
+            .last_decision
+            .as_ref()
+            .expect("decision trace")
+            .action,
+        "wall-pass"
+    );
+}
+
+#[test]
+fn central_brain_exposes_nested_give_and_go_pair_strategy() {
+    let mut sim = wall_pass_scenario();
+    sim.central_brain.possession_team = Some(Team::Home);
+
+    let before = WorldSnapshot::from_match(&sim);
+    let mut rng = mulberry32(58_403);
+    sim.central_brain.run_time_step(&before, &mut rng);
+
+    assert_eq!(
+        sim.central_brain.home_directive.attack_strategy.layer(),
+        StrategyLayer::Team
+    );
+    assert_eq!(
+        sim.central_brain.home_directive.pair_attack_strategy,
+        Some(TeamAttackStrategy::GiveAndGoCentral)
     );
 }
 

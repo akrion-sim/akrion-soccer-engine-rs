@@ -623,6 +623,9 @@ pub struct TeamTacticalDirective {
     /// Active team-level attacking maneuver (semi-MDP option). Interruptible.
     #[serde(default)]
     pub attack_strategy: TeamAttackStrategy,
+    /// Co-active pair maneuver nested inside a team-layer attacking shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_attack_strategy: Option<TeamAttackStrategy>,
     /// Active team-level defensive maneuver (semi-MDP option). Interruptible.
     #[serde(default)]
     pub defense_strategy: TeamDefenseStrategy,
@@ -671,6 +674,7 @@ impl TeamTacticalDirective {
             risk_tolerance: 0.50,
             flank_attack_policy: FlankAttackPolicy::None,
             attack_strategy: TeamAttackStrategy::default(),
+            pair_attack_strategy: None,
             defense_strategy: TeamDefenseStrategy::default(),
             flank_overlap_run_probability: 0.0,
             adversarial_embedding_attack_score: 0.0,
@@ -3360,23 +3364,8 @@ pub(crate) fn soccer_defensive_mark_target(
             0.0
         };
         let goal_threat_bonus = (70.0 - distance_to_goal).max(0.0) * 0.025;
-        // Lane-affinity engagement tie-break (gated): a defender prefers to pick up the
-        // opponent who has entered ITS lane (and yields opponents in a teammate's channel
-        // to that teammate, who claims them more strongly), so marking is distributed by
-        // lane instead of two defenders converging on the same runner. The opponent's team
-        // has the ball here, so this defender is out of possession (full lane strength).
-        let lane_claim_bonus = if snapshot.lane_affinity_engagement_enabled {
-            soccer_lane_affinity_claim(defender_role, zone.x, opponent_position.x, width, false)
-                * LANE_AFFINITY_ENGAGEMENT_TIE_BREAK_YARDS
-        } else {
-            0.0
-        };
-        let score = zone_distance
-            - role_threat
-            - holder_bonus
-            - goal_lane_bonus
-            - goal_threat_bonus
-            - lane_claim_bonus;
+        let score =
+            zone_distance - role_threat - holder_bonus - goal_lane_bonus - goal_threat_bonus;
         if score < best_score {
             best_mark = Some((opponent_position, opponent.role));
             best_score = score;
@@ -3735,7 +3724,7 @@ fn soccer_formation_lp_anchor(
         } else {
             0.12 + weights.defensive_compactness * 0.16
         };
-        let mut pull = base_pull * (1.0 - lane_commitment * 0.46).clamp(0.30, 1.0);
+        let mut pull = base_pull * (1.0 - lane_commitment * 0.62).clamp(0.20, 1.0);
         // The back four tracks the ball laterally more than lane discipline alone; wide
         // defenders (wing-backs) shuttle the most.
         if player.role == PlayerRole::Defender {
@@ -3749,7 +3738,7 @@ fn soccer_formation_lp_anchor(
         x = x * (1.0 - pull) + (width * 0.5 + ball_lane_pull * width * 0.28) * pull;
         let lane_x =
             vertical_lane_clamped_x_for_role(player.role, home_position.x, x, width, in_possession);
-        x = x * (1.0 - lane_commitment * 0.28) + lane_x * (lane_commitment * 0.28);
+        x = x * (1.0 - lane_commitment * 0.48) + lane_x * (lane_commitment * 0.48);
     }
 
     let mut zone = Vec2::new(x, y).clamp_to_pitch(width, length);
@@ -4671,23 +4660,40 @@ impl CentralBrain {
             // heuristic prior + learning + hysteresis), but we never interpolate.
             let rule_candidate = directive.attack_strategy;
             let held = commitment.attack;
-            let chosen = if !commitment.set || rule_candidate == held {
-                rule_candidate
-            } else {
-                let v_rule = value.get(&(ctx, rule_candidate)).copied().unwrap_or(0.0);
+            let v_rule = value.get(&(ctx, rule_candidate)).copied().unwrap_or(0.0);
+            let mut chosen = rule_candidate;
+            let mut chosen_score = STRATEGY_RULE_PRIOR + STRATEGY_VALUE_WEIGHT * v_rule;
+            if commitment.set && rule_candidate != held {
                 let v_held = value.get(&(ctx, held)).copied().unwrap_or(0.0);
-                let rule_score = STRATEGY_RULE_PRIOR + STRATEGY_VALUE_WEIGHT * v_rule;
                 let held_score = STRATEGY_HELD_HYSTERESIS + STRATEGY_VALUE_WEIGHT * v_held;
-                if held_score > rule_score {
-                    held
-                } else {
-                    rule_candidate
+                if held_score > chosen_score {
+                    chosen = held;
+                    chosen_score = held_score;
                 }
-            };
+            }
+            for learned_strategy in TeamAttackStrategy::ALL {
+                if learned_strategy == rule_candidate
+                    || (commitment.set && learned_strategy == held)
+                    || !has_ball && learned_strategy != TeamAttackStrategy::CounterTransitionVertical
+                {
+                    continue;
+                }
+                let learned_value = value.get(&(ctx, learned_strategy)).copied().unwrap_or(0.0);
+                if learned_value <= 1e-9 {
+                    continue;
+                }
+                let learned_score =
+                    STRATEGY_RULE_PRIOR * 0.82 + STRATEGY_VALUE_WEIGHT * learned_value;
+                if learned_score > chosen_score {
+                    chosen = learned_strategy;
+                    chosen_score = learned_score;
+                }
+            }
             directive.attack_strategy = chosen;
             commitment.attack = chosen;
             commitment.defense = directive.defense_strategy;
             commitment.sub = select_nested_sub_maneuver(chosen, ball_x, width, has_ball);
+            directive.pair_attack_strategy = commitment.sub;
             commitment.review_tick = tick.saturating_add(STRATEGY_COMMIT_TICKS);
             commitment.committed_has_ball = has_ball;
             commitment.advantage_at_commit = advantage;
@@ -4695,6 +4701,7 @@ impl CentralBrain {
             commitment.set = true;
         } else {
             directive.attack_strategy = commitment.attack;
+            directive.pair_attack_strategy = commitment.sub;
             directive.defense_strategy = commitment.defense;
         }
         // Execute the nested Pair maneuver concurrently with the Team shape by
@@ -4745,8 +4752,27 @@ impl CentralBrain {
                     directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
                     directive.pass_priority = (directive.pass_priority * 1.1).clamp(0.5, 1.6);
                 }
+                WingOverlapLeftCross | WingOverlapRightCross => {
+                    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+                    directive.flank_overlap_run_probability = directive
+                        .flank_overlap_run_probability
+                        .max(NESTED_OVERLAP_RUN_PROBABILITY);
+                    directive.width_yards = (directive.width_yards * 1.04).min(width * 0.96);
+                }
+                UnderlapLeftCutback
+                | UnderlapRightCutback
+                | DecoyFarSideCutbackLeft
+                | DecoyFarSideCutbackRight => {
+                    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankLowCross;
+                    directive.flank_overlap_run_probability = directive
+                        .flank_overlap_run_probability
+                        .max(NESTED_OVERLAP_RUN_PROBABILITY);
+                    directive.width_yards = (directive.width_yards * 1.03).min(width * 0.96);
+                    directive.pass_priority = (directive.pass_priority * 1.08).clamp(0.5, 1.6);
+                }
                 BylineCrossLeftToPenaltySpot | BylineCrossRightToPenaltySpot => {
                     // Get a man to the byline and stretch the pitch for the cutback to the spot.
+                    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
                     directive.flank_overlap_run_probability = directive
                         .flank_overlap_run_probability
                         .max(NESTED_OVERLAP_RUN_PROBABILITY);

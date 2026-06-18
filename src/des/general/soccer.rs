@@ -34,6 +34,7 @@ use crate::des::general::neural_network::{
 };
 use crate::des::general::prng::{mulberry32, SeededRandom};
 use crate::des::general::qp::{solve_qp_active_set, QPOptions, QPStatus, QuadraticProgram};
+use crate::des::general::soccer_genome::{PITCH_GENOME_LANES, PITCH_GENOME_ROWS};
 use crate::des::shared::capabilities::RandomSource;
 
 mod referee;
@@ -431,8 +432,11 @@ const CONTROLLER_INPUT_LATE_YIELD_SLICE_MS: u64 = DEFAULT_CONTROLLER_DEBOUNCE_MS
 const CONTROLLER_INPUT_LATE_YIELD_BUDGET_MS: u64 = CONTROLLER_INPUT_YIELD_MS;
 const SOCCER_MAX_HUMAN_CONTROLLER_SLOTS: usize = 4;
 const FIRST_TOUCH_WINDOW_TICKS: u64 = secs_to_ticks(0.3);
-const PITCH_FINE_GRID_COLUMNS: usize = 12;
-const PITCH_FINE_GRID_ROWS: usize = 16;
+// The policy-facing fine grid is the same tactical genome grid: 12 lanes across
+// the pitch by 24 goal-to-goal rows. MDP/POMDP snapshots, target preferences,
+// playback traces, and neural grid features all flow through this address.
+const PITCH_FINE_GRID_COLUMNS: usize = PITCH_GENOME_LANES as usize;
+const PITCH_FINE_GRID_ROWS: usize = PITCH_GENOME_ROWS as usize;
 const PITCH_TACTICAL_GRID_COLUMNS: usize = 6;
 const PITCH_TACTICAL_GRID_ROWS: usize = 8;
 const PITCH_MACRO_GRID_COLUMNS: usize = 3;
@@ -452,9 +456,9 @@ const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
 const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
 const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
 // Wing-backs push forward MORE often than central defenders — the back line should
-// not move as a symmetric block. Raised so the outside backs bomb on while the
-// centre-backs hold (see also central_defender_forward_blocked / defender depth).
-const WINGBACK_ADVANCE_ODDS_MULTIPLIER: f64 = 2.05;
+// not move as a symmetric block. This keeps the outside-back odds 30% above the
+// prior raised bias while the centre-backs hold (see also central_defender_forward_blocked).
+const WINGBACK_ADVANCE_ODDS_MULTIPLIER: f64 = 2.665;
 // Central-defender lane: |home_x - centre| within this fraction of the width is a
 // centre-back (the complement of is_wide_defender's 0.28/0.72 split).
 const CENTRAL_DEFENDER_LANE_HALF_FRACTION: f64 = 0.22;
@@ -1212,6 +1216,13 @@ const BACK_FOUR_BLOCK_WIDTH_YARDS: f64 = 22.0;
 const BACK_FOUR_BALL_SIDE_SHIFT: f64 = 0.6;
 const BACK_FOUR_LATERAL_GAIN: f64 = 0.78;
 const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
+const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
+const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
+const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
+const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
+const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
+const SHAPE_CONSISTENCY_FAR_SECONDS: f64 = 5.0;
 // In possession the line may push up, but no more than ~5yd past the halfway line.
 const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
@@ -1523,7 +1534,7 @@ fn default_spacing_params() -> SoccerSpacingParams {
     SoccerSpacingParams::default()
 }
 
-const VERTICAL_LANE_COUNT: usize = 4;
+const VERTICAL_LANE_COUNT: usize = PITCH_FINE_GRID_COLUMNS;
 const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 7.5;
 const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 2.8;
 const TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY: f64 = 16.0;
@@ -1625,15 +1636,16 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // team holds three staggered lines: the midfield AVERAGE sits 5-20yd ahead of the
 // defensive AVERAGE, and the striker AVERAGE sits 5-20yd ahead of the midfield
 // AVERAGE (raised 2026-06-18 from 1-20 / 2-20 to a clearer 5-20 / 5-20). The lines
-// may be eventually consistent — a 3s grace before the band is enforced strictly —
-// so a transient stagger while transitioning is fine, a sustained collapse is not.
+// may be eventually consistent — a ball-distance-scaled grace before the band is
+// enforced strictly — so a transient stagger while transitioning is fine, a sustained
+// collapse is not.
 const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 5.0;
 const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
-const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
+const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 10.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 5.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 11.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
@@ -2409,16 +2421,19 @@ const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
 /// Base per-decision feature count: everything except the whole-field block below.
-const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 180;
-/// Whole-field "moment of all 22" block appended to every decision's feature vector:
-/// for the actor's team then the opponents (each ordered by player id), the
-/// actor-relative canonical (forward, lateral) position and (forward, lateral) velocity
-/// of every player on the pitch — so the learned value/critic conditions on the grid +
-/// motion vector of all 22, not just local aggregates. 22 players × 4 channels.
+const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 182;
+/// Whole-field "moment of all 22 + ball" block appended to every decision's feature
+/// vector: for the actor's team then the opponents (each ordered by player id),
+/// followed by the ball, the actor-relative canonical (forward, lateral) position,
+/// velocity, and acceleration. This lets the learned value/critic condition on the
+/// 12-lane/24-row grid plus the smooth motion vector of all field entities, not
+/// just local aggregates.
 const SOCCER_NEURAL_FIELD_MOTION_PLAYERS: usize = 22;
-const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 4;
-const SOCCER_NEURAL_FIELD_MOTION_DIM: usize =
-    SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+const SOCCER_NEURAL_FIELD_MOTION_BALLS: usize = 1;
+const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 6;
+const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
+    + SOCCER_NEURAL_FIELD_MOTION_BALLS)
+    * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` migrate by zero-padding the block.
 const SOCCER_NEURAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
@@ -2529,10 +2544,55 @@ const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION: usize = 176;
 const SOCCER_NEURAL_FEATURE_FIRST_TIME_PASS_FIELD_FEASIBILITY: usize = 177;
 const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY: usize = 178;
 const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR: usize = 179;
+const SOCCER_NEURAL_FEATURE_BALL_FINE_LANE: usize = 180;
+const SOCCER_NEURAL_FEATURE_BALL_FINE_ROW: usize = 181;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
-    61, 62, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96, 97, 102, 103, 106, 107, 108, 109,
-    110, 111, 112, 113, 115, 117, 118, 119, 125, 131, 137, 153, 160, 163, 170, 177, 248, 251, 258,
-    265, SOCCER_NEURAL_BASE_FEATURE_DIM,
+    61,
+    62,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
+    93,
+    94,
+    96,
+    97,
+    102,
+    103,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    115,
+    117,
+    118,
+    119,
+    125,
+    131,
+    137,
+    153,
+    160,
+    163,
+    170,
+    177,
+    248,
+    251,
+    258,
+    265,
+    268,
+    180,
+    318,
+    SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -2778,10 +2838,6 @@ fn default_local_mpc_enabled() -> bool {
 }
 
 fn default_pass_anticipation_enabled() -> bool {
-    false
-}
-
-fn default_lane_affinity_engagement_enabled() -> bool {
     false
 }
 
@@ -3141,136 +3197,37 @@ fn role_vertical_lane_range(
     in_possession: bool,
 ) -> (usize, usize) {
     let home_lane = vertical_lane_index(home_x, field_width);
+    let clamp_lane = |lane: isize| -> usize {
+        lane.clamp(0, VERTICAL_LANE_COUNT.saturating_sub(1) as isize) as usize
+    };
+    let centered_band = |radius: isize| -> (usize, usize) {
+        (
+            clamp_lane(home_lane as isize - radius),
+            clamp_lane(home_lane as isize + radius),
+        )
+    };
     match role {
-        PlayerRole::Forward if in_possession => (0, VERTICAL_LANE_COUNT.saturating_sub(1)),
-        PlayerRole::Forward if home_lane < VERTICAL_LANE_COUNT / 2 => {
-            (0, VERTICAL_LANE_COUNT / 2 - 1)
-        }
-        PlayerRole::Forward => (
-            VERTICAL_LANE_COUNT / 2,
-            VERTICAL_LANE_COUNT.saturating_sub(1),
-        ),
-        _ => (home_lane, home_lane),
+        PlayerRole::Forward => (0, VERTICAL_LANE_COUNT.saturating_sub(1)),
+        PlayerRole::Defender if in_possession => centered_band(2),
+        PlayerRole::Defender => centered_band(1),
+        PlayerRole::Midfielder if in_possession => centered_band(2),
+        PlayerRole::Midfielder => centered_band(1),
+        PlayerRole::Goalkeeper => (home_lane, home_lane),
     }
 }
 
 fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
-    // Legacy scalar pull back into the home lane (0 = free, 1 = hard), tuned to the
-    // current 4-lane (~20yd quarter-pitch) `VERTICAL_LANE_COUNT`. The richer
-    // per-player 12-lane Markovian affinity (`lane_affinity_distribution` /
-    // `lane_affinity_strength`) is being layered in to replace this.
+    // Scalar pull back into the home lane (0 = free, 1 = hard), tuned to the 4-lane
+    // (~20yd quarter-pitch) `VERTICAL_LANE_COUNT`. The richer, ball/field-config-aware
+    // per-player lane affinity lives in `dynamic_lane_affinity_for_player_target`.
     match role {
         PlayerRole::Goalkeeper => 1.0,
-        PlayerRole::Defender if in_possession => 0.90,
-        PlayerRole::Defender => 0.80,
-        PlayerRole::Midfielder if in_possession => 0.70,
-        PlayerRole::Midfielder => 0.80,
-        PlayerRole::Forward if in_possession => 0.0,
-        PlayerRole::Forward => 0.70,
+        PlayerRole::Defender if in_possession => 0.48,
+        PlayerRole::Defender => 0.92,
+        PlayerRole::Midfielder if in_possession => 0.45,
+        PlayerRole::Midfielder => 0.90,
+        PlayerRole::Forward => 0.0,
     }
-}
-
-// ---- Markovian per-player lane affinity over the 12 grid lanes -------------------
-// Each outfielder's *zonal proclivity* is a probability distribution over the 12
-// vertical grid lanes (PITCH_GENOME_LANES) that sums to 1.0 — a true PMF, so it is
-// Markovian. It is a smooth bell centred on the player's home lane: defenders hold a
-// tight channel, midfielders a broad one, strikers have NONE (they roam freely). The
-// distribution is the resting zonal shape; two things override it (handled elsewhere
-// as movement RELIEF, not here): a defender man-marking snaps onto its runner, and an
-// attacker makes cutting runs into open space. And in possession the affinity's PULL
-// halves (`lane_affinity_strength`) until the ball is given away — the team stretches.
-const LANE_AFFINITY_LANE_COUNT: usize =
-    crate::des::general::soccer_genome::PITCH_GENOME_LANES as usize;
-const LANE_AFFINITY_SIGMA_DEFENDER: f64 = 1.3;
-const LANE_AFFINITY_SIGMA_MIDFIELDER: f64 = 2.0;
-const LANE_AFFINITY_SIGMA_KEEPER: f64 = 0.6;
-const LANE_AFFINITY_BASE_STRENGTH_DEFENDER: f64 = 0.80;
-const LANE_AFFINITY_BASE_STRENGTH_MIDFIELDER: f64 = 0.80;
-const LANE_AFFINITY_BASE_STRENGTH_KEEPER: f64 = 1.0;
-/// In possession the team spreads and roams, so lane affinity's pull / tie-break
-/// weight drops to this fraction until possession is lost (the PMF *shape* is
-/// unchanged — only its influence). The user's "affinity disappears by 50%".
-const LANE_AFFINITY_IN_POSSESSION_SCALE: f64 = 0.5;
-/// Max yards of "head start" the lane-affinity tie-break grants in the who-engages
-/// score: a player gets up to this much subtracted from its distance-like engagement
-/// score, scaled by its affinity-claim (PMF mass × strength) on the ball's lane. Small
-/// on purpose so it only flips otherwise-close decisions ("if nothing else decides it").
-const LANE_AFFINITY_ENGAGEMENT_TIE_BREAK_YARDS: f64 = 4.0;
-
-/// `home_x` -> a continuous lane coordinate in `0..LANE_AFFINITY_LANE_COUNT`.
-fn lane_affinity_home_lane(home_x: f64, field_width: f64) -> f64 {
-    let width = field_width.max(1.0);
-    let lane_width = width / LANE_AFFINITY_LANE_COUNT as f64;
-    (home_x / lane_width).clamp(0.0, (LANE_AFFINITY_LANE_COUNT - 1) as f64)
-}
-
-/// The Markovian lane-affinity PMF for a player whose home lane is `home_lane`
-/// (continuous, lane 0 = left touchline). Returns `None` for strikers, who have no
-/// lane affinity at all. The returned array always sums to ~1.0.
-fn lane_affinity_distribution(
-    role: PlayerRole,
-    home_lane: f64,
-) -> Option<[f64; LANE_AFFINITY_LANE_COUNT]> {
-    let sigma = match role {
-        PlayerRole::Forward => return None,
-        PlayerRole::Goalkeeper => LANE_AFFINITY_SIGMA_KEEPER,
-        PlayerRole::Defender => LANE_AFFINITY_SIGMA_DEFENDER,
-        PlayerRole::Midfielder => LANE_AFFINITY_SIGMA_MIDFIELDER,
-    };
-    let center = home_lane.clamp(0.0, (LANE_AFFINITY_LANE_COUNT - 1) as f64);
-    let two_sigma_sq = (2.0 * sigma * sigma).max(1e-6);
-    let mut dist = [0.0f64; LANE_AFFINITY_LANE_COUNT];
-    let mut total = 0.0;
-    for (lane, slot) in dist.iter_mut().enumerate() {
-        let d = lane as f64 - center;
-        let weight = (-(d * d) / two_sigma_sq).exp();
-        *slot = weight;
-        total += weight;
-    }
-    if total > 0.0 {
-        for slot in dist.iter_mut() {
-            *slot /= total;
-        }
-    }
-    Some(dist)
-}
-
-/// How strongly the lane-affinity PMF pulls / counts in the who-engages tie-break:
-/// the base zonal strength, halved while the player's team is in possession (the team
-/// stretches), zero for strikers. The man-mark / cutting-run "snap" out of the lane is
-/// a separate movement relief, not a change to this strength.
-fn lane_affinity_strength(role: PlayerRole, in_possession: bool) -> f64 {
-    let base = match role {
-        PlayerRole::Forward => return 0.0,
-        PlayerRole::Goalkeeper => LANE_AFFINITY_BASE_STRENGTH_KEEPER,
-        PlayerRole::Defender => LANE_AFFINITY_BASE_STRENGTH_DEFENDER,
-        PlayerRole::Midfielder => LANE_AFFINITY_BASE_STRENGTH_MIDFIELDER,
-    };
-    if in_possession {
-        base * LANE_AFFINITY_IN_POSSESSION_SCALE
-    } else {
-        base
-    }
-}
-
-/// A lane-affinity CLAIM: how strongly a player whose lateral channel is centred on
-/// `center_x` claims the lane that `point_x` falls in — its 12-lane PMF mass there
-/// scaled by the current strength (halved in possession). 0 for strikers. The shared
-/// core of the engagement tie-break (who chases a loose ball / who marks a runner).
-pub(crate) fn soccer_lane_affinity_claim(
-    role: PlayerRole,
-    center_x: f64,
-    point_x: f64,
-    field_width: f64,
-    in_possession: bool,
-) -> f64 {
-    let Some(dist) = lane_affinity_distribution(role, lane_affinity_home_lane(center_x, field_width))
-    else {
-        return 0.0;
-    };
-    let lane = (lane_affinity_home_lane(point_x, field_width).round() as usize)
-        .min(dist.len().saturating_sub(1));
-    dist[lane] * lane_affinity_strength(role, in_possession)
 }
 
 fn vertical_lane_deviation_yards(
@@ -3301,7 +3258,7 @@ fn vertical_lane_fit_for_role_target(
     relief: f64,
 ) -> VerticalLaneFit {
     let commitment =
-        role_vertical_lane_commitment(role, in_possession) * (1.0 - relief.clamp(0.0, 0.85));
+        role_vertical_lane_commitment(role, in_possession) * (1.0 - relief.clamp(0.0, 0.65));
     if commitment <= 1e-9 {
         return VerticalLaneFit {
             affinity_score: 1.0,
@@ -3603,6 +3560,8 @@ pub struct SoccerMdpState {
     pub ball_zone_x: usize,
     pub ball_zone_y: usize,
     #[serde(default)]
+    pub ball_grid: PitchGridAddress,
+    #[serde(default)]
     pub player_grid: PitchGridAddress,
     #[serde(default)]
     pub receive_facing: FacingBucket,
@@ -3778,6 +3737,8 @@ pub struct SoccerPomdpObservation {
     pub player_id: usize,
     #[serde(default)]
     pub player_grid: PitchGridAddress,
+    #[serde(default)]
+    pub ball_grid: PitchGridAddress,
     #[serde(default)]
     pub receive_facing: FacingBucket,
     #[serde(default)]
@@ -4350,10 +4311,11 @@ pub struct SoccerDecisionContext {
     pub actor_velocity: Vec2,
     #[serde(default)]
     pub actor_acceleration: Vec2,
-    /// Whole-field "moment of all 22": actor-relative canonical (forward, lateral)
-    /// position + (forward, lateral) velocity for the actor's team then the opponents,
-    /// each ordered by player id. Length `SOCCER_NEURAL_FIELD_MOTION_DIM`. Lets the
-    /// neural value/critic condition each decision on every player's grid spot + vector.
+    /// Whole-field "moment of all 22 + ball": actor-relative canonical (forward,
+    /// lateral) position + velocity + acceleration for the actor's team then the
+    /// opponents, each ordered by player id, followed by the ball. Length
+    /// `SOCCER_NEURAL_FIELD_MOTION_DIM`. Lets the neural value/critic condition
+    /// each decision on every player's grid spot + smooth motion vector.
     #[serde(default)]
     pub field_player_motion: Vec<f32>,
     #[serde(default)]
@@ -12147,13 +12109,6 @@ pub struct MatchConfig {
     /// out of shape. Off by default (play unchanged); on in `live_gameplay`.
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
-    /// Lane-affinity engagement tie-break: when two teammates are otherwise equally
-    /// suited to chase the ball (or mark a runner), the one whose 12-lane affinity
-    /// claims that lane commits and the rest hold their channel — "the player whose
-    /// lane the ball is in goes." A small, smooth bias that only flips otherwise-close
-    /// decisions. Off by default (play unchanged); on in `live_gameplay`.
-    #[serde(default = "default_lane_affinity_engagement_enabled")]
-    pub lane_affinity_engagement_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
     pub local_mpc_max_players_per_team: usize,
     #[serde(default = "default_tactical_learning_weights")]
@@ -12215,7 +12170,6 @@ impl Default for MatchConfig {
             formation_lp_enabled: true,
             local_mpc_enabled: false,
             pass_anticipation_enabled: default_pass_anticipation_enabled(),
-            lane_affinity_engagement_enabled: default_lane_affinity_engagement_enabled(),
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             tactical_learning: SoccerTacticalLearningWeights::default(),
             spacing: SoccerSpacingParams::default(),
@@ -12266,7 +12220,6 @@ impl MatchConfig {
             formation_lp_enabled: true,
             local_mpc_enabled: true,
             pass_anticipation_enabled: true,
-            lane_affinity_engagement_enabled: true,
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             // Live gameplay prioritizes responsiveness: no online backprop in the
             // frame loop, but an installed neural value/actor can still feed back into
@@ -13681,20 +13634,21 @@ fn tactical_directive_for_team(
     } else {
         width_factor
     };
-    let width_yards: f64 = (field_width * width_factor).clamp(
-        // In build-up (keeper/defense in possession deep) the team spreads WIDE so the
-        // wing-backs open up on the flanks as outlets for the keeper, instead of
-        // pinching in centrally.
-        field_width
-            * if build_up_phase {
-                0.74
-            } else if has_ball {
-                0.56
-            } else {
-                0.34
-            },
-        field_width * if has_ball { 0.94 } else { 0.72 },
-    );
+    // In build-up (keeper/defense in possession deep) the team spreads WIDE so the
+    // wing-backs open up on the flanks as outlets for the keeper, instead of
+    // pinching in centrally. If a caller supplies an inconsistent build-up/no-ball
+    // phase, keep the clamp total rather than panicking on min > max.
+    let max_width_factor: f64 = if has_ball { 0.94 } else { 0.72 };
+    let raw_min_width_factor: f64 = if build_up_phase && has_ball {
+        0.74
+    } else if has_ball {
+        0.56
+    } else {
+        0.34
+    };
+    let min_width_factor = raw_min_width_factor.min(max_width_factor);
+    let width_yards: f64 =
+        (field_width * width_factor).clamp(field_width * min_width_factor, field_width * max_width_factor);
     let shot_base: f64 =
         20.0 + if attacking_phase { 2.4 } else { 0.0 } + if trailing { 2.0 } else { 0.0 }
             - if leading { 1.2 } else { 0.0 }
@@ -13723,6 +13677,25 @@ fn tactical_directive_for_team(
     // goal-line and crossing back to the penalty spot rather than a shorter overlap cross.
     let deep_in_attack =
         has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.18;
+    let strategy_zone_x = ((ball_position.x / field_width.max(1.0)) * 12.0)
+        .floor()
+        .clamp(0.0, 11.0) as u64;
+    let strategy_zone_y = ((ball_position.y / field_length.max(1.0)) * 24.0)
+        .floor()
+        .clamp(0.0, 23.0) as u64;
+    let strategy_team_key = match team {
+        Team::Home => 0,
+        Team::Away => 1,
+    };
+    let strategy_score_key = (score_diff_for_team.clamp(-4, 4) + 4) as u64;
+    let strategy_key = strategy_zone_x
+        + strategy_zone_y * 13
+        + strategy_score_key * 313
+        + attacking_overload.attackers as u64 * 37
+        + attacking_overload.defenders as u64 * 41;
+    let strategy_draw = deterministic_unit_draw(strategy_key, strategy_team_key, 307);
+    let secondary_strategy_draw = deterministic_unit_draw(strategy_key, strategy_team_key, 331);
+    let compact_possession = has_ball && attacking_overload.defenders > attacking_overload.attackers;
     let attack_strategy = if just_regained {
         // The instant we win it, break before the opponent re-organises: burst into the
         // space their committed (now-stranded) shape just vacated.
@@ -13730,7 +13703,24 @@ fn tactical_directive_for_team(
     } else if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
     } else if build_up_phase {
-        TeamAttackStrategy::PatientPossessionProbe
+        match ball_side {
+            StrategyLane::Left if strategy_draw < 0.24 => {
+                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
+            }
+            StrategyLane::Right if strategy_draw < 0.24 => {
+                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
+            }
+            StrategyLane::Center if compact_possession && strategy_draw < 0.36 => {
+                TeamAttackStrategy::PlayBackwardsToGoad
+            }
+            StrategyLane::Center if leading && strategy_draw < 0.42 => {
+                TeamAttackStrategy::RecycleViaKeeperReset
+            }
+            StrategyLane::Center if secondary_strategy_draw < 0.18 => {
+                TeamAttackStrategy::DrawPressThenPlayThrough
+            }
+            _ => TeamAttackStrategy::PatientPossessionProbe,
+        }
     } else if flank_attack_policy.is_flank() {
         match ball_side {
             StrategyLane::Left if deep_in_attack => {
@@ -13739,34 +13729,130 @@ fn tactical_directive_for_team(
             StrategyLane::Right if deep_in_attack => {
                 TeamAttackStrategy::BylineCrossRightToPenaltySpot
             }
+            StrategyLane::Left if strategy_draw < 0.18 => TeamAttackStrategy::UnderlapLeftCutback,
+            StrategyLane::Left if strategy_draw < 0.34 => {
+                TeamAttackStrategy::DragDefenderOpenChannelLeft
+            }
+            StrategyLane::Left if strategy_draw < 0.50 => {
+                TeamAttackStrategy::DecoyFarSideCutbackLeft
+            }
+            StrategyLane::Left if strategy_draw < 0.66 => {
+                TeamAttackStrategy::PullWideLeftSwitchRight
+            }
+            StrategyLane::Left if strategy_draw < 0.80 => {
+                TeamAttackStrategy::PullWideLeftThenCenter
+            }
             StrategyLane::Left => TeamAttackStrategy::WingOverlapLeftCross,
+            StrategyLane::Right if strategy_draw < 0.18 => {
+                TeamAttackStrategy::UnderlapRightCutback
+            }
+            StrategyLane::Right if strategy_draw < 0.34 => {
+                TeamAttackStrategy::DragDefenderOpenChannelRight
+            }
+            StrategyLane::Right if strategy_draw < 0.50 => {
+                TeamAttackStrategy::DecoyFarSideCutbackRight
+            }
+            StrategyLane::Right if strategy_draw < 0.66 => {
+                TeamAttackStrategy::PullWideRightSwitchLeft
+            }
+            StrategyLane::Right if strategy_draw < 0.80 => {
+                TeamAttackStrategy::PullWideRightThenCenter
+            }
             StrategyLane::Right => TeamAttackStrategy::WingOverlapRightCross,
+            StrategyLane::Center if strategy_draw < 0.34 => {
+                TeamAttackStrategy::DirectLongDiagonalLeft
+            }
+            StrategyLane::Center if strategy_draw < 0.68 => {
+                TeamAttackStrategy::DirectLongDiagonalRight
+            }
             StrategyLane::Center => TeamAttackStrategy::HoldUpfieldUntilOpening,
         }
     } else if overload_score > 0.55 {
         match ball_side {
-            StrategyLane::Left => TeamAttackStrategy::OverloadLeftIsolateRight,
-            StrategyLane::Right => TeamAttackStrategy::OverloadRightIsolateLeft,
-            StrategyLane::Center => TeamAttackStrategy::CentralDoubleOneTwo,
+            StrategyLane::Left if strategy_draw < 0.34 => {
+                TeamAttackStrategy::OverloadLeftIsolateRight
+            }
+            StrategyLane::Left if strategy_draw < 0.60 => {
+                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
+            }
+            StrategyLane::Left => TeamAttackStrategy::DecoyFarSideCutbackLeft,
+            StrategyLane::Right if strategy_draw < 0.34 => {
+                TeamAttackStrategy::OverloadRightIsolateLeft
+            }
+            StrategyLane::Right if strategy_draw < 0.60 => {
+                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
+            }
+            StrategyLane::Right => TeamAttackStrategy::DecoyFarSideCutbackRight,
+            StrategyLane::Center if strategy_draw < 0.34 => TeamAttackStrategy::CentralDoubleOneTwo,
+            StrategyLane::Center if strategy_draw < 0.62 => TeamAttackStrategy::ThirdManRunCentral,
+            StrategyLane::Center => TeamAttackStrategy::DrawPressThenPlayThrough,
         }
     } else if attacking_phase && in_final_third {
         match ball_side {
+            StrategyLane::Left if strategy_draw < 0.24 => TeamAttackStrategy::HalfSpaceComboLeft,
+            StrategyLane::Left if strategy_draw < 0.44 => TeamAttackStrategy::UnderlapLeftCutback,
             StrategyLane::Left => TeamAttackStrategy::OneTwoLeftRelease,
+            StrategyLane::Right if strategy_draw < 0.24 => TeamAttackStrategy::HalfSpaceComboRight,
+            StrategyLane::Right if strategy_draw < 0.44 => TeamAttackStrategy::UnderlapRightCutback,
             StrategyLane::Right => TeamAttackStrategy::OneTwoRightRelease,
             // A tight central pocket in the final third (no overload to exploit): the
             // disguised backheel release springs a man the settled block has committed against.
-            StrategyLane::Center if overload_score < 0.25 => {
+            StrategyLane::Center if overload_score < 0.25 && strategy_draw < 0.36 => {
                 TeamAttackStrategy::BackheelDisguisedRelease
             }
-            StrategyLane::Center => TeamAttackStrategy::GiveAndGoCentral,
+            StrategyLane::Center if strategy_draw < 0.58 => TeamAttackStrategy::GiveAndGoCentral,
+            StrategyLane::Center if strategy_draw < 0.78 => TeamAttackStrategy::CentralDoubleOneTwo,
+            StrategyLane::Center => TeamAttackStrategy::ThirdManRunCentral,
         }
     } else if attacking_phase {
         match ball_side {
-            StrategyLane::Left => TeamAttackStrategy::PullWideLeftThenCenter,
-            StrategyLane::Right => TeamAttackStrategy::PullWideRightThenCenter,
+            StrategyLane::Left if strategy_draw < 0.20 => {
+                TeamAttackStrategy::PullWideLeftThenCenter
+            }
+            StrategyLane::Left if strategy_draw < 0.40 => {
+                TeamAttackStrategy::PullWideLeftSwitchRight
+            }
+            StrategyLane::Left if strategy_draw < 0.58 => {
+                TeamAttackStrategy::SwitchPlayDiagonalLeftRight
+            }
+            StrategyLane::Left if strategy_draw < 0.76 => {
+                TeamAttackStrategy::DirectLongDiagonalRight
+            }
+            StrategyLane::Left => TeamAttackStrategy::DragDefenderOpenChannelLeft,
+            StrategyLane::Right if strategy_draw < 0.20 => {
+                TeamAttackStrategy::PullWideRightThenCenter
+            }
+            StrategyLane::Right if strategy_draw < 0.40 => {
+                TeamAttackStrategy::PullWideRightSwitchLeft
+            }
+            StrategyLane::Right if strategy_draw < 0.58 => {
+                TeamAttackStrategy::SwitchPlayDiagonalRightLeft
+            }
+            StrategyLane::Right if strategy_draw < 0.76 => {
+                TeamAttackStrategy::DirectLongDiagonalLeft
+            }
+            StrategyLane::Right => TeamAttackStrategy::DragDefenderOpenChannelRight,
             // Chasing the game from a central middle-third platform: go over the top with a
             // flick-on to a runner instead of a ground through-ball.
-            StrategyLane::Center if trailing => TeamAttackStrategy::AerialFlickOnRelease,
+            StrategyLane::Center if trailing && strategy_draw < 0.50 => {
+                TeamAttackStrategy::AerialFlickOnRelease
+            }
+            StrategyLane::Center if compact_possession && strategy_draw < 0.24 => {
+                TeamAttackStrategy::PlayBackwardsToGoad
+            }
+            StrategyLane::Center if strategy_draw < 0.30 => {
+                TeamAttackStrategy::BaitOffsideThenThroughBall
+            }
+            StrategyLane::Center if strategy_draw < 0.46 => {
+                TeamAttackStrategy::DrawPressThenPlayThrough
+            }
+            StrategyLane::Center if strategy_draw < 0.62 => TeamAttackStrategy::ThirdManRunCentral,
+            StrategyLane::Center if strategy_draw < 0.72 => {
+                TeamAttackStrategy::DirectLongDiagonalLeft
+            }
+            StrategyLane::Center if strategy_draw < 0.88 => {
+                TeamAttackStrategy::DirectLongDiagonalRight
+            }
             StrategyLane::Center => TeamAttackStrategy::QuickVerticalThroughBall,
         }
     } else {
@@ -13802,6 +13888,7 @@ fn tactical_directive_for_team(
         risk_tolerance,
         flank_attack_policy,
         attack_strategy,
+        pair_attack_strategy: None,
         defense_strategy,
         flank_overlap_run_probability,
         adversarial_embedding_attack_score: 0.0,
@@ -14859,12 +14946,12 @@ fn soccer_decision_target_point(
     (point, target_player)
 }
 
-/// Build the whole-field "moment of all 22" block for `actor_id` on `actor_team`: the
-/// actor-relative position and velocity of every player, rotated into the actor team's
-/// attacking frame (so the block is identical for Home and Away — the same canonical
-/// orientation the retrieval moment vector uses), ordered own-team then opponents and
-/// each by ascending player id so every player keeps a fixed slot across ticks. Fixed
-/// length `SOCCER_NEURAL_FIELD_MOTION_DIM`; any missing player leaves trailing zeros.
+/// Build the whole-field "moment of all 22 + ball" block for `actor_id` on
+/// `actor_team`: actor-relative position, velocity, and acceleration of every
+/// player plus the ball, rotated into the actor team's attacking frame (so the
+/// block is identical for Home and Away — the same canonical orientation the
+/// retrieval moment vector uses). Players are ordered own-team then opponents,
+/// each by ascending player id, and the ball occupies the final fixed slot.
 /// Pure arithmetic over the snapshot — cheap enough to run for every decision.
 fn soccer_field_player_motion_block(
     snapshot: &WorldSnapshot,
@@ -14885,19 +14972,47 @@ fn soccer_field_player_motion_block(
     // Own team (true) first, then opponents; each by ascending id for a stable layout.
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut block = Vec::with_capacity(SOCCER_NEURAL_FIELD_MOTION_DIM);
+    let mut player_slots = 0usize;
     for (id, _own) in ordered {
-        if block.len() >= SOCCER_NEURAL_FIELD_MOTION_DIM {
+        if player_slots >= SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
             break;
         }
         let pos = snapshot.player_position(id).unwrap_or(actor_pos);
         let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
-        let rel = pos - actor_pos;
-        block.push(soccer_neural_scaled(rel.y * dir, 60.0) as f32);
-        block.push(soccer_neural_scaled(rel.x * dir, 40.0) as f32);
-        block.push(soccer_neural_scaled(vel.y * dir, 10.0) as f32);
-        block.push(soccer_neural_scaled(vel.x * dir, 10.0) as f32);
+        let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
+        push_soccer_field_motion_entity(&mut block, pos, vel, acc, actor_pos, dir);
+        player_slots += 1;
     }
+    for _ in player_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
+        block.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+    }
+    push_soccer_field_motion_entity(
+        &mut block,
+        snapshot.ball.position,
+        snapshot.ball.velocity,
+        snapshot.ball.acceleration,
+        actor_pos,
+        dir,
+    );
+    debug_assert_eq!(block.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
     block
+}
+
+fn push_soccer_field_motion_entity(
+    block: &mut Vec<f32>,
+    position: Vec2,
+    velocity: Vec2,
+    acceleration: Vec2,
+    actor_pos: Vec2,
+    attack_dir: f64,
+) {
+    let rel = position - actor_pos;
+    block.push(soccer_neural_scaled(rel.y * attack_dir, 60.0) as f32);
+    block.push(soccer_neural_scaled(rel.x * attack_dir, 40.0) as f32);
+    block.push(soccer_neural_scaled(velocity.y * attack_dir, 10.0) as f32);
+    block.push(soccer_neural_scaled(velocity.x * attack_dir, 10.0) as f32);
+    block.push(soccer_neural_scaled(acceleration.y * attack_dir, 12.0) as f32);
+    block.push(soccer_neural_scaled(acceleration.x * attack_dir, 12.0) as f32);
 }
 
 fn soccer_decision_context_for(
@@ -29077,6 +29192,13 @@ fn soccer_neural_transition_features_with_action(
     } else {
         transition.state.player_grid
     };
+    let ball_grid = if transition.state.ball_grid.fine.level == PitchGridLevel::WholePitch
+        && obs.ball_grid.fine.level != PitchGridLevel::WholePitch
+    {
+        obs.ball_grid
+    } else {
+        transition.state.ball_grid
+    };
     let action_label = normalize_soccer_action_label(action);
     let (action_attack, action_defense, action_support) =
         soccer_neural_action_family_features(action);
@@ -29512,6 +29634,14 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bin(state.first_time_pass_field_bin, 5.0),
         soccer_neural_bin(state.first_time_shot_field_bin, 5.0),
         soccer_neural_bin(state.first_touch_shape_prior_bin, 5.0),
+        // Ball fine-grid lane/row (indices 180-181): keep the explicit 12-lane /
+        // 24-row ball address in the MDP/POMDP neural input without putting the
+        // high-cardinality ball cell in the tabular Q-key.
+        soccer_neural_scaled(
+            ball_grid.fine.x as f64,
+            PITCH_FINE_GRID_COLUMNS as f64 - 1.0,
+        ),
+        soccer_neural_scaled(ball_grid.fine.y as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
     // grid + motion vector of all 22. Older nets (input_dim == base) migrate by
@@ -34305,7 +34435,6 @@ pub fn run_soccer_set_play_trial(request: SoccerSetPlayTrialRequest) -> SoccerSe
         .spot
         .unwrap_or_else(|| default_set_play_spot(&config, request.restart, request.team));
     let start_tick = sim.tick;
-    let start_clock = sim.clock_seconds;
     let start_score = match request.team {
         Team::Home => sim.score_home,
         Team::Away => sim.score_away,
@@ -34332,7 +34461,7 @@ pub fn run_soccer_set_play_trial(request: SoccerSetPlayTrialRequest) -> SoccerSe
         scored: score_delta_for_team > 0,
         score_delta_for_team,
         ticks: sim.tick.saturating_sub(start_tick),
-        simulated_seconds: sim.clock_seconds - start_clock,
+        simulated_seconds: sim.tick.saturating_sub(start_tick) as f64 * dt,
         summary,
         learning,
         events: sim.events,
@@ -39107,7 +39236,6 @@ fn tracking_frame_to_world_snapshot(
         local_mpc_enabled: config.local_mpc_enabled,
         trace_mdp_mpc_comparison: true,
         pass_anticipation_enabled: config.pass_anticipation_enabled,
-        lane_affinity_engagement_enabled: config.lane_affinity_engagement_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
             frame.clock_seconds.max(0.0)
