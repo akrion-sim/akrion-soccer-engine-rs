@@ -112,6 +112,9 @@ pub enum TeamAttackStrategy {
     DirectLongDiagonalLeft,
     DirectLongDiagonalRight,
     PatientPossessionProbe,
+    /// Identify the biggest receivable pocket either in front of or behind the defensive line,
+    /// then send off-ball attackers sprinting into it so the carrier has a progressive pass.
+    ExploitSpace,
     CounterTransitionVertical,
     HalfSpaceComboLeft,
     HalfSpaceComboRight,
@@ -141,7 +144,7 @@ pub enum TeamAttackStrategy {
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 38] = [
+    pub const ALL: [TeamAttackStrategy; 39] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -171,6 +174,7 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::DirectLongDiagonalLeft,
         TeamAttackStrategy::DirectLongDiagonalRight,
         TeamAttackStrategy::PatientPossessionProbe,
+        TeamAttackStrategy::ExploitSpace,
         TeamAttackStrategy::CounterTransitionVertical,
         TeamAttackStrategy::HalfSpaceComboLeft,
         TeamAttackStrategy::HalfSpaceComboRight,
@@ -213,6 +217,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::DirectLongDiagonalLeft => "direct-long-diagonal-left",
             TeamAttackStrategy::DirectLongDiagonalRight => "direct-long-diagonal-right",
             TeamAttackStrategy::PatientPossessionProbe => "patient-possession-probe",
+            TeamAttackStrategy::ExploitSpace => "exploit-space",
             TeamAttackStrategy::CounterTransitionVertical => "counter-transition-vertical",
             TeamAttackStrategy::HalfSpaceComboLeft => "half-space-combo-left",
             TeamAttackStrategy::HalfSpaceComboRight => "half-space-combo-right",
@@ -265,6 +270,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::DirectLongDiagonalLeft => s(Center, Left, 1, 0.90),
             TeamAttackStrategy::DirectLongDiagonalRight => s(Center, Right, 1, 0.90),
             TeamAttackStrategy::PatientPossessionProbe => s(Center, Center, 6, 0.18),
+            TeamAttackStrategy::ExploitSpace => s(Center, Center, 2, 0.72),
             TeamAttackStrategy::CounterTransitionVertical => s(Center, Center, 2, 0.85),
             TeamAttackStrategy::HalfSpaceComboLeft => s(Left, Center, 3, 0.52),
             TeamAttackStrategy::HalfSpaceComboRight => s(Right, Center, 3, 0.52),
@@ -3269,6 +3275,13 @@ fn soccer_formation_lp_apply_strategy_profile(
             OverloadLeftIsolateRight | OverloadRightIsolateLeft => {
                 weights.numerical_superiority *= 1.4;
                 weights.space_occupation *= 1.2;
+            }
+            ExploitSpace => {
+                weights.space_occupation *= 1.45;
+                weights.progression *= 1.22;
+                weights.passing_lane_quality *= 1.18;
+                weights.expected_goal *= 1.10;
+                weights.retention *= 1.04;
             }
             WingOverlapLeftCross
             | WingOverlapRightCross
