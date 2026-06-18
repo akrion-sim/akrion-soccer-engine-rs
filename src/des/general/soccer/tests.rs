@@ -35128,6 +35128,73 @@ fn lane_affinity_pmf_is_markovian_and_role_shaped() {
 }
 
 #[test]
+fn lane_affinity_breaks_who_chases_the_loose_ball() {
+    let a = 2usize; // home on the left
+    let b = 3usize; // home on the right
+    let ball = Vec2::new(20.0, 50.0); // loose ball in the LEFT channel
+    let build = |enabled: bool| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            lane_affinity_engagement_enabled: enabled,
+            ..MatchConfig::default()
+        });
+        // Park everyone far from the ball so only the two test defenders can claim it.
+        for p in sim.players.iter_mut() {
+            p.position = Vec2::new(40.0, 5.0);
+            p.velocity = Vec2::zero();
+        }
+        sim.players[a].role = PlayerRole::Defender;
+        sim.players[b].role = PlayerRole::Defender;
+        sim.players[a].home_position = Vec2::new(20.0, 25.0);
+        sim.players[b].home_position = Vec2::new(60.0, 25.0);
+        // A and B are the SAME distance (10yd) from the ball, so only lane affinity
+        // can break the tie.
+        sim.players[a].position = Vec2::new(10.0, 50.0);
+        sim.players[b].position = Vec2::new(30.0, 50.0);
+        sim.ball.holder = None;
+        sim.ball.position = ball;
+        sim.ball.velocity = Vec2::zero();
+        sim
+    };
+
+    // Flag OFF: equidistant -> equal retrieval scores (tie broken elsewhere).
+    let off = build(false);
+    let snap_off = WorldSnapshot::from_match(&off);
+    let pa = snap_off.players.iter().find(|p| p.id == a).unwrap();
+    let pb = snap_off.players.iter().find(|p| p.id == b).unwrap();
+    assert!(
+        (snap_off.loose_ball_retrieval_score(pa, ball)
+            - snap_off.loose_ball_retrieval_score(pb, ball))
+        .abs()
+            < 1e-9,
+        "flag off: equidistant retrieval scores should tie"
+    );
+
+    // Flag ON: the defender whose lane the ball is in (A, home on the left) claims it;
+    // B holds its channel.
+    let on = build(true);
+    let snap_on = WorldSnapshot::from_match(&on);
+    let pa = snap_on.players.iter().find(|p| p.id == a).unwrap();
+    let pb = snap_on.players.iter().find(|p| p.id == b).unwrap();
+    assert!(
+        snap_on.lane_affinity_claim_at(pa, ball) > snap_on.lane_affinity_claim_at(pb, ball),
+        "A should claim the ball's lane more than B"
+    );
+    assert!(
+        snap_on.loose_ball_retrieval_score(pa, ball)
+            < snap_on.loose_ball_retrieval_score(pb, ball),
+        "flag on: the in-lane defender should have the better (lower) retrieval score"
+    );
+    assert!(
+        snap_on.is_primary_loose_ball_retriever(a, ball),
+        "A (ball in its lane) should be the designated retriever"
+    );
+    assert!(
+        !snap_on.is_primary_loose_ball_retriever(b, ball),
+        "B should hold its channel, not chase"
+    );
+}
+
+#[test]
 fn pomdp_q_state_and_neural_features_track_lane_and_teammate_congestion() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let midfielder = 6;

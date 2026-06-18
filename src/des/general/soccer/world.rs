@@ -13867,6 +13867,8 @@ pub struct WorldSnapshot {
     pub(crate) trace_mdp_mpc_comparison: bool,
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
+    #[serde(default = "default_lane_affinity_engagement_enabled")]
+    pub lane_affinity_engagement_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
     pub local_mpc_max_players_per_team: usize,
     #[serde(default)]
@@ -14735,6 +14737,7 @@ impl WorldSnapshot {
             local_mpc_enabled: m.config.local_mpc_enabled,
             trace_mdp_mpc_comparison: options.trace_mdp_mpc_comparison,
             pass_anticipation_enabled: m.config.pass_anticipation_enabled,
+            lane_affinity_engagement_enabled: m.config.lane_affinity_engagement_enabled,
             local_mpc_max_players_per_team: m.config.local_mpc_max_players_per_team,
             home_team_possession_seconds,
             away_team_possession_seconds,
@@ -20847,7 +20850,23 @@ impl WorldSnapshot {
     /// Retrieval priority for a loose ball: distance to where the ball is heading,
     /// shortened by how well the player's current stride/trajectory already commits
     /// toward it (the ball's path matching the player's run). Lower = better.
-    fn loose_ball_retrieval_score(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
+    /// A player's lane-affinity CLAIM (0..~1) on the lane that `point` falls in: its
+    /// 12-lane PMF mass there, scaled by the current lane-affinity strength (halved in
+    /// possession). 0 for strikers (no lane affinity). Higher = "this is my channel".
+    pub(crate) fn lane_affinity_claim_at(&self, player: &PlayerSnapshot, point: Vec2) -> f64 {
+        let in_possession = self.controlled_possession_team() == Some(player.team);
+        let Some(dist) = lane_affinity_distribution(
+            player.role,
+            lane_affinity_home_lane(player.home_position.x, self.field_width),
+        ) else {
+            return 0.0;
+        };
+        let lane = (lane_affinity_home_lane(point.x, self.field_width).round() as usize)
+            .min(dist.len().saturating_sub(1));
+        dist[lane] * lane_affinity_strength(player.role, in_possession)
+    }
+
+    pub(crate) fn loose_ball_retrieval_score(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
         let pos = self.player_snapshot_position(player);
         let to_target = target - pos;
         let dist = to_target.len();
@@ -20860,13 +20879,23 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT)
+        let base = dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT);
+        // Lane-affinity engagement tie-break (gated): give the player whose 12-lane
+        // affinity claims the ball's lane a small score reduction, so among otherwise
+        // equally-placed teammates the one in whose channel the ball sits commits and
+        // the rest hold their lanes. Lower score = more likely to be the retriever.
+        if self.lane_affinity_engagement_enabled {
+            base - self.lane_affinity_claim_at(player, target)
+                * LANE_AFFINITY_ENGAGEMENT_TIE_BREAK_YARDS
+        } else {
+            base
+        }
     }
 
     /// The single designated retriever is the teammate whose stride/trajectory best
     /// matches the ball's path (not merely the closest) — so one player commits and
     /// the rest hold their shape instead of three defenders swarming the ball.
-    fn is_primary_loose_ball_retriever(&self, player_id: usize, target: Vec2) -> bool {
+    pub(crate) fn is_primary_loose_ball_retriever(&self, player_id: usize, target: Vec2) -> bool {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return false;
         };

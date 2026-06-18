@@ -2755,6 +2755,10 @@ fn default_pass_anticipation_enabled() -> bool {
     false
 }
 
+fn default_lane_affinity_engagement_enabled() -> bool {
+    false
+}
+
 const DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM: usize = 3;
 
 fn default_local_mpc_max_players_per_team() -> usize {
@@ -3161,6 +3165,11 @@ const LANE_AFFINITY_BASE_STRENGTH_KEEPER: f64 = 1.0;
 /// weight drops to this fraction until possession is lost (the PMF *shape* is
 /// unchanged — only its influence). The user's "affinity disappears by 50%".
 const LANE_AFFINITY_IN_POSSESSION_SCALE: f64 = 0.5;
+/// Max yards of "head start" the lane-affinity tie-break grants in the who-engages
+/// score: a player gets up to this much subtracted from its distance-like engagement
+/// score, scaled by its affinity-claim (PMF mass × strength) on the ball's lane. Small
+/// on purpose so it only flips otherwise-close decisions ("if nothing else decides it").
+const LANE_AFFINITY_ENGAGEMENT_TIE_BREAK_YARDS: f64 = 4.0;
 
 /// `home_x` -> a continuous lane coordinate in `0..LANE_AFFINITY_LANE_COUNT`.
 fn lane_affinity_home_lane(home_x: f64, field_width: f64) -> f64 {
@@ -12092,6 +12101,13 @@ pub struct MatchConfig {
     /// out of shape. Off by default (play unchanged); on in `live_gameplay`.
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
+    /// Lane-affinity engagement tie-break: when two teammates are otherwise equally
+    /// suited to chase the ball (or mark a runner), the one whose 12-lane affinity
+    /// claims that lane commits and the rest hold their channel — "the player whose
+    /// lane the ball is in goes." A small, smooth bias that only flips otherwise-close
+    /// decisions. Off by default (play unchanged); on in `live_gameplay`.
+    #[serde(default = "default_lane_affinity_engagement_enabled")]
+    pub lane_affinity_engagement_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
     pub local_mpc_max_players_per_team: usize,
     #[serde(default = "default_tactical_learning_weights")]
@@ -12153,6 +12169,7 @@ impl Default for MatchConfig {
             formation_lp_enabled: true,
             local_mpc_enabled: false,
             pass_anticipation_enabled: default_pass_anticipation_enabled(),
+            lane_affinity_engagement_enabled: default_lane_affinity_engagement_enabled(),
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             tactical_learning: SoccerTacticalLearningWeights::default(),
             spacing: SoccerSpacingParams::default(),
@@ -12203,6 +12220,7 @@ impl MatchConfig {
             formation_lp_enabled: true,
             local_mpc_enabled: true,
             pass_anticipation_enabled: true,
+            lane_affinity_engagement_enabled: true,
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
             // Live gameplay prioritizes responsiveness: no online backprop in the
             // frame loop, but an installed neural value/actor can still feed back into
@@ -39043,6 +39061,7 @@ fn tracking_frame_to_world_snapshot(
         local_mpc_enabled: config.local_mpc_enabled,
         trace_mdp_mpc_comparison: true,
         pass_anticipation_enabled: config.pass_anticipation_enabled,
+        lane_affinity_engagement_enabled: config.lane_affinity_engagement_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
             frame.clock_seconds.max(0.0)
