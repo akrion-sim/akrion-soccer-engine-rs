@@ -1652,7 +1652,15 @@ fn role_layer_gap_band_error_yards(gap_yards: f64, min_yards: f64, max_yards: f6
 
 // Lateral spread within a line (adjacent players ordered by home-x): centre-backs
 // and centre-back-to-wing-back, and the midfield line.
-const BACKLINE_LATERAL_MIN_YARDS: f64 = 2.0;
+// Adjacent same-line lateral (x = sideline-to-sideline) spacing, held as a BAND:
+// each neighbouring pair stays `MIN`..`MAX` yd apart, in static home-x order (so the
+// back four reads LWB < LCB < RCB < RWB left-to-right and never reshuffles). The band
+// is a group constraint distributed symmetrically across the line (no single player
+// must move — the others can), and it is only EVENTUALLY consistent: the LP nudges the
+// anchors back into band and MPC/locomotion carries the players there over ~seconds,
+// so the line is momentarily perfect but constantly striving back into place.
+const BACKLINE_LATERAL_MIN_YARDS: f64 = 1.5;
+const BACKLINE_LATERAL_MAX_YARDS: f64 = 8.0;
 const BACKLINE_LATERAL_IDEAL_YARDS: f64 = 4.0;
 const MIDLINE_LATERAL_MIN_YARDS: f64 = 2.0;
 const MIDLINE_LATERAL_IDEAL_YARDS: f64 = 5.0;

@@ -4076,12 +4076,14 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         slots,
         PlayerRole::Defender,
         BACKLINE_LATERAL_MIN_YARDS,
+        BACKLINE_LATERAL_MAX_YARDS,
         LATERAL_STAGGER_CORRECTION,
     );
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Midfielder,
         MIDLINE_LATERAL_MIN_YARDS,
+        f64::INFINITY,
         LATERAL_STAGGER_CORRECTION,
     );
 
@@ -4090,13 +4092,18 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     }
 }
 
-/// Push adjacent same-line anchors apart (in x) when they are closer than
-/// `min_gap`, symmetrically and scaled by `correction`. Adjacency is by the
-/// static home-x identity order. Idempotent on an already-spread line.
+/// Hold adjacent same-line anchors within a lateral (x) BAND `[min_gap, max_gap]`:
+/// push a pair apart when closer than `min_gap`, pull them together when wider than
+/// `max_gap`, symmetrically (both move, so the correction is shared across the line —
+/// no single player must give way) and scaled by `correction`. Adjacency is by the
+/// static home-x identity order, so the line keeps its left-to-right ordering and a
+/// momentary overlap does not reshuffle it. Idempotent on an already-in-band line.
+/// Pass `f64::INFINITY` as `max_gap` to enforce the minimum only.
 fn soccer_formation_lp_spread_line_x(
     slots: &mut [SoccerFormationLpSlotInput],
     role: PlayerRole,
     min_gap: f64,
+    max_gap: f64,
     correction: f64,
 ) {
     let mut idx: Vec<usize> = (0..slots.len())
@@ -4116,8 +4123,10 @@ fn soccer_formation_lp_spread_line_x(
         let left = idx[w - 1];
         let right = idx[w];
         let dx = slots[right].anchor.x - slots[left].anchor.x;
-        if dx < min_gap {
-            let push = (min_gap - dx) * 0.5 * correction;
+        let desired = dx.clamp(min_gap, max_gap);
+        let delta = desired - dx;
+        if delta.abs() > 1e-9 {
+            let push = delta * 0.5 * correction;
             slots[left].anchor.x -= push;
             slots[right].anchor.x += push;
         }

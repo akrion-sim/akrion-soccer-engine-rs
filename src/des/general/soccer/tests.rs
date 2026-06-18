@@ -36147,10 +36147,11 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
             alignment_weight: 0.5,
         }
     }
-    // Already well-spread and well-layered: nothing should move.
+    // Already well-spread and well-layered: nothing should move. The defender pair
+    // sits 6yd apart — inside the 1.5-8yd lateral band — so the back line is compliant.
     let mut slots = vec![
-        lp_slot(PlayerRole::Defender, 34.0, Vec2::new(34.0, 40.0)),
-        lp_slot(PlayerRole::Defender, 46.0, Vec2::new(46.0, 40.0)),
+        lp_slot(PlayerRole::Defender, 37.0, Vec2::new(37.0, 40.0)),
+        lp_slot(PlayerRole::Defender, 43.0, Vec2::new(43.0, 40.0)),
         lp_slot(PlayerRole::Midfielder, 34.0, Vec2::new(34.0, 48.0)),
         lp_slot(PlayerRole::Midfielder, 46.0, Vec2::new(46.0, 48.0)),
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 58.0)),
@@ -36161,6 +36162,52 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
         assert!(
             (slot.anchor - was).len() < 1e-9,
             "a compliant shape must be left untouched"
+        );
+    }
+}
+
+#[test]
+fn back_four_holds_lateral_band_and_order() {
+    fn def(home_x: f64, anchor_x: f64) -> SoccerFormationLpSlotInput {
+        SoccerFormationLpSlotInput {
+            active: true,
+            player_id: 0,
+            role: PlayerRole::Defender,
+            current: Vec2::new(anchor_x, 40.0),
+            velocity: Vec2::zero(),
+            acceleration: Vec2::zero(),
+            home_position: Vec2::new(home_x, 40.0),
+            top_speed: 7.0,
+            max_acceleration: 10.0,
+            fatigue: 0.0,
+            anchor: Vec2::new(anchor_x, 40.0),
+            pressure_target: None,
+            speed_match_velocity_yps: 0.0,
+            pressure_weight: 0.0,
+            speed_match_weight: 0.0,
+            pair_weight: 0.1,
+            alignment_weight: 0.5,
+        }
+    }
+    // A broken back line (home order LWB<LCB<RCB<RWB): a 12yd gap (too wide), a 0.5yd
+    // overlap (too tight) and another big gap. Striving back over many ticks (eventual
+    // consistency) it should settle every adjacent pair inside the 1.5-8yd band while
+    // keeping the left-to-right order.
+    let mut slots = vec![
+        def(10.0, 10.0),
+        def(30.0, 22.0),
+        def(50.0, 22.5),
+        def(70.0, 70.0),
+    ];
+    for _ in 0..500 {
+        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS);
+    }
+    let xs: Vec<f64> = slots.iter().map(|s| s.anchor.x).collect();
+    for w in 1..xs.len() {
+        let gap = xs[w] - xs[w - 1];
+        assert!(
+            gap >= BACKLINE_LATERAL_MIN_YARDS - 0.05 && gap <= BACKLINE_LATERAL_MAX_YARDS + 0.05,
+            "adjacent defender gap {gap:.3} should settle within the 1.5-8yd band: {xs:?}"
         );
     }
 }
