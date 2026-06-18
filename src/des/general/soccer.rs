@@ -1280,16 +1280,19 @@ const COACH_POSITION_HINT_ARRIVAL_YARDS: f64 = 1.5;
 const DEFENSIVE_RELAXATION_THREAT_YARDS: f64 = 48.0;
 const NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS: f64 = 10.0;
 const SETTLED_POSSESSION_SECONDS: f64 = 5.0;
+// Inter-player off-ball spacing band, measured as EUCLIDEAN (straight-line) distance
+// to the nearest teammate — NOT the x-axis gap (the candidate scorer reads
+// `nearest_teammate_distance = sqrt(dx^2 + dy^2)`). User (2026-06-18): keep a 5-10yd
+// comfortable band between players, in possession or defending. The band is a soft
+// pull the positioning scorer optimises toward, not a hard cap; the back four's own
+// LATERAL band (1.5-8yd along x, adjacent pairs) is a separate, tighter rule for the
+// defensive line.
 const ATTACK_SPACING_MIN_YARDS: f64 = 5.0;
-const ATTACK_SPACING_IDEAL_YARDS: f64 = 10.0;
-const ATTACK_SPACING_MAX_YARDS: f64 = 15.0;
-const DEFENSE_SPACING_MIN_YARDS: f64 = 2.0;
-// Ideal inter-player spacing while defending, raised 4 -> 5yd (2026-06-18, user: keep
-// ~5yd between players). This is the general off-ball spacing target the candidate
-// scorer pulls toward; the back four's own LATERAL band (1.5-8yd, adjacent pairs) is a
-// separate, tighter rule that still governs the defensive line specifically.
-const DEFENSE_SPACING_IDEAL_YARDS: f64 = 5.0;
-const DEFENSE_SPACING_MAX_YARDS: f64 = 8.0;
+const ATTACK_SPACING_IDEAL_YARDS: f64 = 7.0;
+const ATTACK_SPACING_MAX_YARDS: f64 = 10.0;
+const DEFENSE_SPACING_MIN_YARDS: f64 = 5.0;
+const DEFENSE_SPACING_IDEAL_YARDS: f64 = 7.0;
+const DEFENSE_SPACING_MAX_YARDS: f64 = 10.0;
 const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
 // Territory discipline ("cover ground"). Two teammates packed into the same few yards
 // add no attacking or defensive value, so beyond a brief grace window — long enough
