@@ -101,6 +101,11 @@ fn default_match_config_preserves_initial_runtime_contract() {
     assert_eq!(config.human_slots(), 4);
     assert!(config.learning_enabled);
     assert!(config.learning_logging_enabled);
+    assert_eq!(config.learning_interval_ticks, default_learning_interval_ticks());
+    assert_eq!(
+        config.policy_train_max_transitions_per_tick,
+        default_policy_train_max_transitions_per_tick()
+    );
     assert!(config.full_game_learning_enabled);
 
     let sim = SoccerMatch::default_11v11(config);
@@ -14921,6 +14926,11 @@ fn live_server_default_uses_ten_minute_soft_realtime_match() {
         config.neural_learning.backend,
         SoccerNeuralLearningBackend::Threaded
     );
+    assert_eq!(
+        config.neural_learning.train_every_ticks,
+        LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS
+    );
+    assert_eq!(config.neural_learning.max_batches_per_tick, 1);
     // The live demo keeps retrieval enabled; it remains inert until moment memory
     // is loaded, then provides bounded whole-field action priors.
     assert!(config.adversarial_embedding_exploitation_enabled);
@@ -27685,7 +27695,15 @@ fn live_gameplay_defaults_keep_learning_threaded_and_bounded() {
     assert_eq!(config.human_slots(), 4);
     assert!(config.learning_enabled);
     assert!(config.learning_logging_enabled);
-    assert!(config.full_game_learning_enabled);
+    assert_eq!(
+        config.learning_interval_ticks,
+        LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS
+    );
+    assert_eq!(
+        config.policy_train_max_transitions_per_tick,
+        LIVE_GAMEPLAY_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK
+    );
+    assert!(!config.full_game_learning_enabled);
     assert!(config.formation_lp_enabled);
     assert!(config.local_mpc_enabled);
     assert_eq!(
@@ -27710,6 +27728,11 @@ fn live_gameplay_defaults_keep_learning_threaded_and_bounded() {
         config.neural_learning.backend,
         SoccerNeuralLearningBackend::Threaded
     );
+    assert_eq!(
+        config.neural_learning.train_every_ticks,
+        LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS
+    );
+    assert_eq!(config.neural_learning.max_batches_per_tick, 1);
     assert!(config.adversarial_embedding_exploitation_enabled);
     // Synergy must be ACTIVE in real games, not just trained-and-ignored: the
     // neural value/actor blend into MDP/POMDP action selection, and the trained

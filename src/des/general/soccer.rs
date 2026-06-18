@@ -1677,8 +1677,8 @@ const TEAM_URGENCY_SHAPE_RELIEF_FULL_COMMIT_YARDS: f64 = 26.0;
 const DEFENDER_LINE_COHESION_TOLERANCE_YARDS: f64 = 3.8;
 const MIDFIELDER_LINE_COHESION_TOLERANCE_YARDS: f64 = 6.2;
 const ROLE_LINE_COHESION_DECAY_YARDS: f64 = 18.0;
-const FORMATION_LP_DEFENDER_LINE_Y_WEIGHT: f64 = 0.28;
-const FORMATION_LP_MIDFIELDER_LINE_Y_WEIGHT: f64 = 0.16;
+const FORMATION_LP_DEFENDER_LINE_Y_WEIGHT: f64 = 0.42;
+const FORMATION_LP_MIDFIELDER_LINE_Y_WEIGHT: f64 = 0.28;
 const POSITIONAL_SHAPE_REWARD_CLAMP: f64 = 0.85;
 const PRESSURED_SUPPORT_SPRINT_URGENCY: f64 = 0.34;
 const DEFENSIVE_GOAL_LINE_BUFFER_YARDS: f64 = 6.0;
@@ -2315,6 +2315,7 @@ const SOCCER_MOMENT_HISTORY_LIMIT: usize = 24;
 const SOCCER_MOMENT_ACTION_LIMIT: usize = 12;
 const SOCCER_MOMENT_FEATURE_FRAME_SAMPLES: usize = 8;
 const SOCCER_MOMENT_EMBEDDER_VERSION: &str = "soccer-moment-local-v4";
+const ADVERSARIAL_EMBEDDING_SIGNAL_REFRESH_TICKS: u64 = 5;
 const SOCCER_MOMENT_ROLE_ALIGNED_PLAYERS: usize = 22;
 const SOCCER_MOMENT_FEATURES_PER_ENTITY: usize = 6;
 const SOCCER_MOMENT_FEATURES_PER_FRAME: usize =
@@ -2327,6 +2328,11 @@ const SOCCER_MATCH_OFFICIAL_COUNT: usize = 3;
 const SOCCER_MATCH_ASSISTANT_REFEREE_COUNT: usize = 2;
 const SOCCER_FORMATION_LP_CONTEXT_FEATURES: usize = 64;
 const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
+// Formation targets are tactical priors, not collision physics; refreshing them
+// every other tick keeps first-tick guidance immediate while avoiding needless
+// LP problem rebuilds at full 15Hz.
+const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
+const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.
@@ -2492,6 +2498,9 @@ const DEFAULT_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.015;
 const DEFAULT_SOCCER_NEURAL_BATCH_SIZE: usize = 16;
 const DEFAULT_SOCCER_NEURAL_TRAIN_EVERY_TICKS: usize = secs_to_ticks(0.4) as usize;
 const DEFAULT_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 2;
+const LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS: usize = secs_to_ticks(0.5) as usize;
+const LIVE_GAMEPLAY_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK: usize = 8;
+const LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS: usize = secs_to_ticks(1.0) as usize;
 const DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS: usize = 24;
 const DEFAULT_SOCCER_NEURAL_TARGET_SCALE: f64 = 30.0;
 const DEFAULT_SOCCER_NEURAL_MAX_PENDING_BATCHES: usize = 32;
@@ -12084,8 +12093,10 @@ impl MatchConfig {
         MatchConfig {
             learning_enabled: true,
             learning_logging_enabled: true,
-            learning_interval_ticks: 1,
-            full_game_learning_enabled: true,
+            learning_interval_ticks: LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS,
+            policy_train_max_transitions_per_tick:
+                LIVE_GAMEPLAY_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK,
+            full_game_learning_enabled: false,
             formation_lp_enabled: true,
             local_mpc_enabled: true,
             pass_anticipation_enabled: true,
@@ -12097,6 +12108,8 @@ impl MatchConfig {
             neural_learning: SoccerNeuralLearningConfig {
                 enabled: true,
                 backend: SoccerNeuralLearningBackend::Threaded,
+                train_every_ticks: LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS,
+                max_batches_per_tick: 1,
                 lp_coupling_enabled: true,
                 ..SoccerNeuralLearningConfig::default()
             },
@@ -38901,6 +38914,7 @@ fn tracking_frame_to_world_snapshot(
         ),
         formation_lp_enabled: config.formation_lp_enabled,
         local_mpc_enabled: config.local_mpc_enabled,
+        trace_mdp_mpc_comparison: true,
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {

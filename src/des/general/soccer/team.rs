@@ -4748,8 +4748,17 @@ fn central_brain_team_advantage(snapshot: &WorldSnapshot, team: Team) -> f64 {
 pub(crate) fn central_brain_formation_lp_operation_label(
     formation_lp_enabled: bool,
 ) -> &'static str {
-    if formation_lp_enabled {
+    central_brain_formation_lp_operation_label_for_tick(formation_lp_enabled, formation_lp_enabled)
+}
+
+pub(crate) fn central_brain_formation_lp_operation_label_for_tick(
+    formation_lp_enabled: bool,
+    refreshed_this_tick: bool,
+) -> &'static str {
+    if formation_lp_enabled && refreshed_this_tick {
         "solve-formation-lp"
+    } else if formation_lp_enabled {
+        "reuse-formation-lp"
     } else {
         "skip-formation-lp"
     }
@@ -4857,16 +4866,25 @@ impl CentralBrain {
             self.away_directive.neural_formation_defense_score = away_defense;
         }
         let mut local_mpc_solved_players = 0usize;
+        let formation_lp_refresh_due = snapshot.tick % SOCCER_FORMATION_LP_REFRESH_TICKS == 0
+            || self.home_formation_lp.last_guidance.is_empty()
+            || self.away_formation_lp.last_guidance.is_empty()
+            || self.last_decision.as_ref().is_some_and(|decision| {
+                decision.ball_position.distance(snapshot.ball.position)
+                    >= SOCCER_FORMATION_LP_BALL_REFRESH_YARDS
+            });
         let formation_lp_operation = if snapshot.formation_lp_enabled {
-            let home_directive = self.home_directive.clone();
-            self.home_formation_lp.solve_tick(snapshot, &home_directive);
+            if formation_lp_refresh_due {
+                let home_directive = self.home_directive.clone();
+                self.home_formation_lp.solve_tick(snapshot, &home_directive);
+                let away_directive = self.away_directive.clone();
+                self.away_formation_lp.solve_tick(snapshot, &away_directive);
+            }
             apply_formation_lp_directive_signal(
                 &mut self.home_directive,
                 &self.home_formation_lp.last_snapshot,
                 &self.home_formation_lp.last_guidance,
             );
-            let away_directive = self.away_directive.clone();
-            self.away_formation_lp.solve_tick(snapshot, &away_directive);
             apply_formation_lp_directive_signal(
                 &mut self.away_directive,
                 &self.away_formation_lp.last_snapshot,
@@ -4885,11 +4903,11 @@ impl CentralBrain {
                         .apply_local_mpc_tick(snapshot, max_players),
                 );
             }
-            central_brain_formation_lp_operation_label(true)
+            central_brain_formation_lp_operation_label_for_tick(true, formation_lp_refresh_due)
         } else {
             self.home_formation_lp.disable_tick();
             self.away_formation_lp.disable_tick();
-            central_brain_formation_lp_operation_label(false)
+            central_brain_formation_lp_operation_label_for_tick(false, false)
         };
         let local_mpc_operation = central_brain_local_mpc_operation_label(
             snapshot.formation_lp_enabled && snapshot.local_mpc_enabled,
