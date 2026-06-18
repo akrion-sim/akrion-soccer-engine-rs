@@ -167,10 +167,16 @@ spec:
                 # and pod termination.
                 - name: SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
                   value: "17400"
+                # 64-team bracket (vs the 128 default). 128 @ T=2 overran the 8h cap
+                # every night; 64 finishes comfortably and leaves headroom for the
+                # CPU-starved AWS node. Power-of-two knockout still satisfied.
+                - name: SOCCER_TOURNAMENT_TEAMS
+                  value: "64"
                 # Parallel workers - keep == the CPU limit below. Each worker runs one
-                # full SoccerMatch at a time.
+                # full SoccerMatch at a time. T=12 OOM-killed the pod (12 concurrent
+                # matches + 64 brains blew past the 12Gi cap); 6 fits 16Gi.
                 - name: SOCCER_TOURNAMENT_THREADS
-                  value: "2"
+                  value: "6"
                 - name: SOCCER_TOURNAMENT_LEARNING_MODE
                   value: bilearning
                 - name: SOCCER_TOURNAMENT_SEED_FRACTION
@@ -180,18 +186,25 @@ spec:
                 - name: SOCCER_TOURNAMENT_SEED
                   value: "20260613"
               resources:
-                # Low scheduling floor so the job fits on busy nodes in both
-                # clusters. The CPU limit enforces the "2 games in parallel max"
-                # contract even if the node is otherwise idle.
+                # Low CPU scheduling floor so the job fits on busy nodes in both
+                # clusters: the AWS EC2 node runs ~96% of its 14 cores as CPU
+                # *requests*, so a cpu request of "1" can never be scheduled (the
+                # pod sat Pending for 6h+ on 2026-06-17). CPU is compressible, so a
+                # small request + a larger limit lets it burst into idle headroom.
+                #
+                # Memory request is deliberately ABOVE a Hetzner 8Gi worker's ~7.47Gi
+                # allocatable so the scheduler is forced onto a 32Gi control-plane
+                # node — it must NOT land on a small worker where the 16Gi limit
+                # would OOM-kill it. Fits inside AWS's ~41Gi free.
                 requests:
-                  cpu: "1"
-                  memory: 4Gi
+                  cpu: 250m
+                  memory: 8Gi
                 limits:
-                  # cpu == SOCCER_TOURNAMENT_THREADS (2). The tournament holds 128
-                  # neural brains + up to THREADS concurrent live matches; keep the
-                  # memory cap below half of a 32Gi Hetzner node.
-                  cpu: "2"
-                  memory: 12Gi
+                  # cpu == SOCCER_TOURNAMENT_THREADS (6). The tournament holds the
+                  # 64-team neural brain pool + up to THREADS concurrent live
+                  # matches; 16Gi (== half a 32Gi node) survived where 12Gi OOM'd.
+                  cpu: "6"
+                  memory: 16Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities:
