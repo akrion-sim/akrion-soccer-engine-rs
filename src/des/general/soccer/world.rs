@@ -4437,8 +4437,8 @@ impl SoccerMatch {
                     // Hold the striker line 2-20yd in front of the midfield line.
                     let intent = snapshot.forward_line_band_adjusted_intent(intent);
                     // A forward/mid that chose to STAND while offside in our possession is a
-                    // stranded goal-hanger; pull it straight back onside (the band/onside
-                    // clamps above only reshape a MoveTo, never a HoldShape).
+                    // stranded goal-hanger; pull it straight back onside when the line-band
+                    // stage did not already convert the hold into a shape-restoring run.
                     let intent = snapshot.offside_standing_recovery_adjusted_intent(intent);
                     // While the ball is in transit, a player who can't get it drops goalside of
                     // where the ball is GOING (anticipated possession), not where it is now.
@@ -21712,7 +21712,7 @@ impl WorldSnapshot {
 
     /// Keep the midfield line's AVERAGE 1-20yd IN FRONT of the back four.
     /// Every tick aims the line at the correction needed for consistency inside
-    /// the 3-second horizon, while accepting that physics/traffic may delay arrival.
+    /// the 2-second horizon, while accepting that physics/traffic may delay arrival.
     pub(crate) fn midfield_line_band_adjusted_target(
         &self,
         player_id: usize,
@@ -21727,6 +21727,8 @@ impl WorldSnapshot {
         if me.role != PlayerRole::Midfielder || me.controller_slot.is_some() {
             return target;
         }
+        // The ball carrier is committed to the ball — never band-reposition a dribbler off
+        // the ball (the "no exceptions" rule governs OFF-BALL shape, not the carrier).
         if self.ball.holder == Some(player_id) {
             return target;
         }
@@ -21779,34 +21781,34 @@ impl WorldSnapshot {
         return Vec2::new(target.x, adjusted_y);
     }
 
-    /// Applies [`Self::midfield_line_band_adjusted_target`] to a decided off-ball move.
-    /// No action-type exception: a midfielder that decides to HOLD a position breaking
-    /// the band is pulled back into it (converted to a corrective move) just like a
-    /// moving one, so a retreated line cannot simply sit there.
+    /// Applies [`Self::midfield_line_band_adjusted_target`] to movement-like decisions
+    /// and converts `HoldShape` into a move when the line average is out of band.
     fn midfield_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
-        match intent.action {
-            SoccerAction::MoveTo(target) => {
-                let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, target);
-                if adjusted.distance(target) > 1e-6 {
-                    intent.sprint = true;
+        let target = match &intent.action {
+            SoccerAction::HoldShape => self
+                .players
+                .iter()
+                .find(|p| p.id == intent.player_id)
+                .map(|p| self.player_snapshot_position(p)),
+            SoccerAction::MoveTo(target)
+            | SoccerAction::Dribble(target)
+            | SoccerAction::ControlTouch { target }
+            | SoccerAction::DribbleMove { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(target) = target {
+            let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+                match &mut intent.action {
+                    SoccerAction::HoldShape => intent.action = SoccerAction::MoveTo(adjusted),
+                    SoccerAction::MoveTo(target)
+                    | SoccerAction::Dribble(target)
+                    | SoccerAction::ControlTouch { target }
+                    | SoccerAction::DribbleMove { target, .. } => *target = adjusted,
+                    _ => {}
                 }
-                intent.action = SoccerAction::MoveTo(adjusted);
             }
-            SoccerAction::HoldShape => {
-                if let Some(current) = self
-                    .players
-                    .iter()
-                    .find(|p| p.id == intent.player_id)
-                    .map(|p| self.player_snapshot_position(p))
-                {
-                    let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, current);
-                    if adjusted.distance(current) > 0.25 {
-                        intent.action = SoccerAction::MoveTo(adjusted);
-                        intent.sprint = true;
-                    }
-                }
-            }
-            _ => {}
         }
         return intent;
     }
@@ -21828,6 +21830,8 @@ impl WorldSnapshot {
         if me.role != PlayerRole::Forward || me.controller_slot.is_some() {
             return target;
         }
+        // The ball carrier is committed to the ball — never band-reposition a dribbler off
+        // the ball (the "no exceptions" rule governs OFF-BALL shape, not the carrier).
         if self.ball.holder == Some(player_id) {
             return target;
         }
@@ -21883,34 +21887,34 @@ impl WorldSnapshot {
         return Vec2::new(target.x, adjusted_y);
     }
 
-    /// Applies [`Self::forward_line_band_adjusted_target`] to a decided off-ball move.
-    /// No action-type exception: a forward that decides to HOLD a position breaking the
-    /// band is pulled back into it (converted to a corrective move) just like a moving
-    /// one, so a retreated striker line cannot simply sit too deep.
+    /// Applies [`Self::forward_line_band_adjusted_target`] to movement-like decisions
+    /// and converts `HoldShape` into a move when the line average is out of band.
     fn forward_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
-        match intent.action {
-            SoccerAction::MoveTo(target) => {
-                let adjusted = self.forward_line_band_adjusted_target(intent.player_id, target);
-                if adjusted.distance(target) > 1e-6 {
-                    intent.sprint = true;
+        let target = match &intent.action {
+            SoccerAction::HoldShape => self
+                .players
+                .iter()
+                .find(|p| p.id == intent.player_id)
+                .map(|p| self.player_snapshot_position(p)),
+            SoccerAction::MoveTo(target)
+            | SoccerAction::Dribble(target)
+            | SoccerAction::ControlTouch { target }
+            | SoccerAction::DribbleMove { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(target) = target {
+            let adjusted = self.forward_line_band_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 1e-6 {
+                intent.sprint = true;
+                match &mut intent.action {
+                    SoccerAction::HoldShape => intent.action = SoccerAction::MoveTo(adjusted),
+                    SoccerAction::MoveTo(target)
+                    | SoccerAction::Dribble(target)
+                    | SoccerAction::ControlTouch { target }
+                    | SoccerAction::DribbleMove { target, .. } => *target = adjusted,
+                    _ => {}
                 }
-                intent.action = SoccerAction::MoveTo(adjusted);
             }
-            SoccerAction::HoldShape => {
-                if let Some(current) = self
-                    .players
-                    .iter()
-                    .find(|p| p.id == intent.player_id)
-                    .map(|p| self.player_snapshot_position(p))
-                {
-                    let adjusted = self.forward_line_band_adjusted_target(intent.player_id, current);
-                    if adjusted.distance(current) > 0.25 {
-                        intent.action = SoccerAction::MoveTo(adjusted);
-                        intent.sprint = true;
-                    }
-                }
-            }
-            _ => {}
         }
         return intent;
     }

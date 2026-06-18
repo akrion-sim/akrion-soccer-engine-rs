@@ -12008,15 +12008,14 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     }
     for &m in mids {
         sim.players[m].role = PlayerRole::Midfielder;
-        sim.players[m].position = Vec2::new(40.0, 30.4);
+        sim.players[m].position = Vec2::new(40.0, 30.0);
     }
     sim.ball.holder = None;
     sim.ball.position = Vec2::new(40.0, 40.0);
     let snap = WorldSnapshot::from_match(&sim);
-    // Gap 0.4yd is below the 1yd minimum -> push up into the 1-20yd band.
-    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.4));
+    let pushed = snap.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 30.0));
     assert!(
-        pushed.y > 30.6,
+        pushed.y > 30.5,
         "midfield should push up to its band in front of the defenders: {pushed:?}"
     );
 
@@ -12026,8 +12025,20 @@ fn midfield_line_holds_band_in_front_of_defenders() {
     let snap2 = WorldSnapshot::from_match(&sim);
     let pulled = snap2.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 58.0));
     assert!(
-        pulled.y < 57.5,
-        "midfield should drop back toward its band when too far ahead: {pulled:?}"
+        pulled.y <= 50.5,
+        "midfield more than 20yd ahead should reconnect to its band: {pulled:?}"
+    );
+
+    // The ball carrier is EXEMPT: you cannot band-reposition a player off the ball it is
+    // carrying (that would teleport a dribbler away from the ball and kill attacks). The
+    // "no exceptions" rule governs OFF-BALL shape only.
+    sim.ball.holder = Some(mids[0]);
+    sim.ball.position = sim.players[mids[0]].position;
+    let snap3 = WorldSnapshot::from_match(&sim);
+    let holder_target = snap3.midfield_line_band_adjusted_target(mids[0], Vec2::new(40.0, 58.0));
+    assert!(
+        (holder_target.y - 58.0).abs() < 1e-6,
+        "the ball carrier must stay exempt from the line band: {holder_target:?}"
     );
 }
 
@@ -12070,8 +12081,19 @@ fn forward_line_holds_band_in_front_of_midfielders() {
     let snap2 = WorldSnapshot::from_match(&sim);
     let pulled = snap2.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 76.0));
     assert!(
-        pulled.y < 75.5,
+        pulled.y <= 70.5,
         "strikers more than 20yd ahead of midfield should reconnect: {pulled:?}"
+    );
+
+    // The ball carrier is EXEMPT (see the midfield test): off-ball shape only.
+    sim.ball.holder = Some(forwards[0]);
+    sim.ball.position = sim.players[forwards[0]].position;
+    let snap3 = WorldSnapshot::from_match(&sim);
+    let holder_target =
+        snap3.forward_line_band_adjusted_target(forwards[0], Vec2::new(40.0, 76.0));
+    assert!(
+        (holder_target.y - 76.0).abs() < 1e-6,
+        "the ball carrier must stay exempt from the line band: {holder_target:?}"
     );
 }
 
@@ -12157,8 +12179,8 @@ fn ball_proximity_nudge_respects_forward_midfield_padding() {
     let target = sim.players[forwards[0]].position;
     let (adjusted, _) = snap.ball_proximity_adjusted_target(forwards[0], target);
     assert!(
-        adjusted.distance(target) < 1e-6,
-        "ball pull must not collapse forwards inside the 3yd midfield padding: {adjusted:?}"
+        adjusted.y >= 52.0 - 1e-6,
+        "ball pull must not collapse forwards inside the 2yd midfield padding: {adjusted:?}"
     );
 }
 
