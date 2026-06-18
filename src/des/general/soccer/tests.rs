@@ -12694,7 +12694,11 @@ fn defensive_line_cushion_drops_off_and_pushes_up_with_the_ball() {
 }
 
 #[test]
-fn defensive_line_cushion_can_follow_long_ball_beyond_halfway_cap() {
+fn defensive_line_cushion_caps_press_at_five_yards_into_opponent_half() {
+    // Ball deep in the opponents' half (y=100, field 120 -> halfway 60). The plain
+    // 2-25yd band would let the back four follow up to y=75; the opponent-half ceiling
+    // (halfway + 5 = 65) overrides it, so an over-committed line (avg y=80) is pulled
+    // BACK rather than allowed to sit at 80 (which the 25yd band alone would permit).
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 25,
@@ -12717,7 +12721,7 @@ fn defensive_line_cushion_can_follow_long_ball_beyond_halfway_cap() {
         .unwrap();
     for &d in &home_def {
         sim.players[d].role = PlayerRole::Defender;
-        sim.players[d].position = Vec2::new(30.0, 65.0);
+        sim.players[d].position = Vec2::new(30.0, 80.0);
     }
     sim.players[home_holder].position = Vec2::new(40.0, 100.0);
     sim.ball.holder = Some(home_holder);
@@ -12726,12 +12730,18 @@ fn defensive_line_cushion_can_follow_long_ball_beyond_halfway_cap() {
     sim.ball.altitude_yards = 0.0;
     sim.ball.last_touch_team = Some(Team::Home);
 
+    let halfway = sim.config.field_length_yards * 0.5;
+    let ceiling = halfway + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS; // 65 for a 120yd pitch
     let snap = WorldSnapshot::from_match(&sim);
-    let adjusted =
-        snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 65.0));
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 80.0));
     assert!(
-        adjusted.y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS - 1e-9,
-        "the line follows a long ball to within the 25yd ball cushion, past halfway: {adjusted:?}"
+        adjusted.y < 80.0 - 1.0,
+        "the opponent-half ceiling should pull an over-committed back line BACK (the 25yd \
+         band alone would leave it at 80 since the ball is at 100): {adjusted:?}"
+    );
+    assert!(
+        adjusted.y >= ceiling - 1e-6,
+        "the line is pulled toward — not past — the 5yd-into-opp-half ceiling ({ceiling}): {adjusted:?}"
     );
 }
 

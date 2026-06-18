@@ -1190,6 +1190,12 @@ const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
 // THE rule: the back four's average sits 2-25yd behind (goal-side of) the ball, always.
 const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+// Hard cap on how far the back four's AVERAGE may press upfield: never more than this
+// far into the opponents' half, regardless of how deep the ball is. This is the
+// exception to the 25yd rule — with the ball deep in the opponents' half the 2-25yd
+// band would otherwise drag the line well upfield; this pins the line's average to at
+// most 5yd past the halfway line so the back four never over-commits.
+const DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS: f64 = 5.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).

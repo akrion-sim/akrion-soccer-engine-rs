@@ -22430,15 +22430,25 @@ impl WorldSnapshot {
             return target;
         }
         // THE RULE (simple, no regimes): the back four's AVERAGE sits 2-25yd behind
-        // (goal-side of) the ball — always, in or out of possession. The ONLY physical
-        // exception is the ball being so close to our own goal that 25yd behind it would
-        // be off the pitch, so the cushion can never exceed the ball's distance from our
-        // own goal line.
+        // (goal-side of) the ball — always, in or out of possession. Two physical
+        // exceptions: (1) the ball so close to our own goal that 25yd behind it would be
+        // off the pitch (the cushion can't exceed the ball's distance from our own goal),
+        // and (2) the ball deep in the OPPONENTS' half — the line's average never presses
+        // beyond 5yd past the halfway line, so the back four never over-commits.
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
         let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         let min_behind = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind);
-        let line_band_avg_fwd = |avg: f64| avg.clamp(ball_fwd - max_behind, ball_fwd - min_behind);
+        // 5yd-into-the-opponents'-half ceiling (in attack-forward coords). The halfway
+        // line sits exactly field_length/2 forward of our own goal.
+        let opp_half_ceiling_fwd =
+            own_goal_fwd + self.field_length * 0.5 + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS;
+        // Upper bound = nearer of "2yd behind the ball" and the opp-half ceiling; pin the
+        // lower bound at/under it so a ball deep upfield can't invert the band (the
+        // ceiling wins — bulletproof, never panics on lower > upper).
+        let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
+        let lower = (ball_fwd - max_behind).min(upper);
+        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
