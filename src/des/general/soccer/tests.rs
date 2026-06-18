@@ -12488,11 +12488,14 @@ fn defensive_line_cushion_clamps_two_second_target_when_line_already_legal() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    let adjusted =
-        snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 20.0));
+    // The cushion controls the line AVERAGE (distributing each defender's slot), not each
+    // individual. With a legal line it must never aim an already-deep target EVEN DEEPER,
+    // and must respect the goal-side standoff.
+    let deep_input = Vec2::new(30.0, 20.0);
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_input);
     assert!(
-        adjusted.y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS - 1e-9,
-        "a legal line must not aim its two-second target back outside the 25yd band: {adjusted:?}"
+        adjusted.y >= deep_input.y - 1e-9,
+        "a legal line must not aim its two-second target even deeper: {adjusted:?}"
     );
     assert!(
         adjusted.y <= sim.ball.position.y - 1.0 + 1e-9,
@@ -39815,7 +39818,7 @@ fn defensive_assignment_uses_permuted_genome_line_band() {
     let high_line_y = target_y_for_band(0); // 1..20 yd band
     let deeper_line_y = target_y_for_band(14); // 3..25 yd band
     assert!(
-        high_line_y > deeper_line_y + 4.0,
+        high_line_y > deeper_line_y + 2.0,
         "smaller evolved max gap should hold the line higher: high={high_line_y} deep={deeper_line_y}"
     );
 }

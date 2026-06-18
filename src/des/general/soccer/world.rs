@@ -4432,6 +4432,9 @@ impl SoccerMatch {
                     // within 20yd in possession; sit >=20yd off (15yd in transit) when the
                     // opponent has the ball upfield.
                     let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
+                    // Then hold the back four as a compact, FLAT, ball-side block (~4 lanes),
+                    // each defender keeping its left-to-right slot.
+                    let intent = snapshot.back_four_shape_adjusted_intent(intent);
                     // Hold the midfield line 1-20yd in front of the back four.
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
                     // Hold the striker line 2-20yd in front of the midfield line.
@@ -4487,6 +4490,11 @@ impl SoccerMatch {
                             _ => intent,
                         };
                     }
+                    // The back-four block gets the final say on defender shape over the soft
+                    // cluster (relational cohesion would otherwise pull the four back out to
+                    // their WIDE formation slots). Per-defender slot assignment is stable to
+                    // re-apply (unlike the average-based line bands).
+                    let intent = snapshot.back_four_shape_adjusted_intent(intent);
                     // --- Hard safety / shape overrides (PINNED LAST — these MUST win) ---
                     // Ball played IN BEHIND our back line: this has FINAL say over shape — the
                     // keeper sweeps and the two nearest defenders sprint/run goalside to recover
@@ -21710,6 +21718,96 @@ impl WorldSnapshot {
         return intent;
     }
 
+    /// Hold the back four as a compact, FLAT, ball-side block: laterally a ~4-of-12-lane
+    /// block whose centre tracks the ball (shift-and-cover), fore-aft flattened to the
+    /// line's average depth. Preserves each defender's left-to-right order (no crossing).
+    /// The lone defender allowed to step out and engage the ball, the carrier, a committed
+    /// loose-ball chaser, and human-controlled players are exempt. A bounded pull, not a snap.
+    pub(crate) fn back_four_shape_adjusted_target(&self, player_id: usize, target: Vec2) -> Vec2 {
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return target;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return target;
+        };
+        if me.role != PlayerRole::Defender
+            || me.controller_slot.is_some()
+            || self.ball.holder == Some(player_id)
+            || self.is_committed_loose_ball_chaser(player_id)
+        {
+            return target;
+        }
+        // A compact ball-side block is a DEFENSIVE shape. When OUR team has the ball the
+        // back four must keep its width (full-backs push on to build/attack) — do not
+        // compact it. Only shape the block when defending or the ball is loose.
+        if self.controlled_possession_team() == Some(me.team) {
+            return target;
+        }
+        let exempt = self.defensive_line_rule_exempt_defender(me.team);
+        if exempt == Some(player_id) {
+            return target;
+        }
+        let attack_dir = me.team.attack_dir();
+        let fwd = |p: Vec2| p.y * attack_dir;
+        // The structured block = defenders other than the one stepping out to engage.
+        let mut line: Vec<(usize, Vec2)> = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == me.team && p.role == PlayerRole::Defender && Some(p.id) != exempt
+            })
+            .map(|p| (p.id, self.player_snapshot_position(p)))
+            .collect();
+        if line.len() < 2 {
+            return target;
+        }
+        // Sort left-to-right so each defender keeps its slot (never steers past a neighbour).
+        line.sort_by(|a, b| a.1.x.partial_cmp(&b.1.x).unwrap_or(std::cmp::Ordering::Equal));
+        let n = line.len() as f64;
+        let Some(my_rank) = line.iter().position(|(id, _)| *id == player_id) else {
+            return target;
+        };
+        // Lateral: a compact block whose centre tracks the ball's x (retaining some
+        // centrality), each defender slotted in left-to-right order.
+        let ball_x = self.ball.position.x.clamp(0.0, self.field_width);
+        let half = BACK_FOUR_BLOCK_WIDTH_YARDS * 0.5;
+        let raw_center = self.field_width * 0.5 * (1.0 - BACK_FOUR_BALL_SIDE_SHIFT)
+            + ball_x * BACK_FOUR_BALL_SIDE_SHIFT;
+        let center = raw_center.clamp(half, self.field_width - half);
+        let slot_step = BACK_FOUR_BLOCK_WIDTH_YARDS / (n - 1.0).max(1.0);
+        let slot_x = center - half + my_rank as f64 * slot_step;
+        let pulled_x =
+            (target.x + (slot_x - target.x) * BACK_FOUR_LATERAL_GAIN).clamp(0.0, self.field_width);
+        // Fore-aft: flatten toward the line's average depth (kill the stagger).
+        let avg_fwd = line.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / n;
+        let me_fwd = fwd(self.player_snapshot_position(me));
+        let flat_fwd = fwd(target) + (avg_fwd - me_fwd) * BACK_FOUR_FLATTEN_GAIN;
+        let adjusted_y = (flat_fwd * attack_dir).clamp(0.0, self.field_length);
+        Vec2::new(pulled_x, adjusted_y)
+    }
+
+    /// Applies [`Self::back_four_shape_adjusted_target`] to a defender's off-ball move; a
+    /// defender HOLDING a position that breaks the block is converted to a corrective move.
+    fn back_four_shape_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+        let current = match &intent.action {
+            SoccerAction::MoveTo(target) => Some(*target),
+            SoccerAction::HoldShape => self
+                .players
+                .iter()
+                .find(|p| p.id == intent.player_id)
+                .map(|p| self.player_snapshot_position(p)),
+            _ => None,
+        };
+        if let Some(target) = current {
+            let adjusted = self.back_four_shape_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 0.25 {
+                intent.sprint = true;
+                intent.action = SoccerAction::MoveTo(adjusted);
+            }
+        }
+        return intent;
+    }
+
     /// Keep the midfield line's AVERAGE 1-20yd IN FRONT of the back four.
     /// Every tick aims the line at the correction needed for consistency inside
     /// the 2-second horizon, while accepting that physics/traffic may delay arrival.
@@ -21784,30 +21882,22 @@ impl WorldSnapshot {
     /// Applies [`Self::midfield_line_band_adjusted_target`] to movement-like decisions
     /// and converts `HoldShape` into a move when the line average is out of band.
     fn midfield_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
-        let target = match &intent.action {
+        // Only reshape genuine off-ball positioning: a MoveTo, or a HoldShape that is out
+        // of band. NOT Dribble/ControlTouch/etc. — those are going to the BALL.
+        let current = match &intent.action {
+            SoccerAction::MoveTo(target) => Some(*target),
             SoccerAction::HoldShape => self
                 .players
                 .iter()
                 .find(|p| p.id == intent.player_id)
                 .map(|p| self.player_snapshot_position(p)),
-            SoccerAction::MoveTo(target)
-            | SoccerAction::Dribble(target)
-            | SoccerAction::ControlTouch { target }
-            | SoccerAction::DribbleMove { target, .. } => Some(*target),
             _ => None,
         };
-        if let Some(target) = target {
+        if let Some(target) = current {
             let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, target);
-            if adjusted.distance(target) > 1e-6 {
+            if adjusted.distance(target) > 0.25 {
                 intent.sprint = true;
-                match &mut intent.action {
-                    SoccerAction::HoldShape => intent.action = SoccerAction::MoveTo(adjusted),
-                    SoccerAction::MoveTo(target)
-                    | SoccerAction::Dribble(target)
-                    | SoccerAction::ControlTouch { target }
-                    | SoccerAction::DribbleMove { target, .. } => *target = adjusted,
-                    _ => {}
-                }
+                intent.action = SoccerAction::MoveTo(adjusted);
             }
         }
         return intent;
@@ -21890,30 +21980,22 @@ impl WorldSnapshot {
     /// Applies [`Self::forward_line_band_adjusted_target`] to movement-like decisions
     /// and converts `HoldShape` into a move when the line average is out of band.
     fn forward_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
-        let target = match &intent.action {
+        // Only reshape genuine off-ball positioning: a MoveTo, or a HoldShape that is out
+        // of band. NOT Dribble/ControlTouch/etc. — those are going to the BALL.
+        let current = match &intent.action {
+            SoccerAction::MoveTo(target) => Some(*target),
             SoccerAction::HoldShape => self
                 .players
                 .iter()
                 .find(|p| p.id == intent.player_id)
                 .map(|p| self.player_snapshot_position(p)),
-            SoccerAction::MoveTo(target)
-            | SoccerAction::Dribble(target)
-            | SoccerAction::ControlTouch { target }
-            | SoccerAction::DribbleMove { target, .. } => Some(*target),
             _ => None,
         };
-        if let Some(target) = target {
+        if let Some(target) = current {
             let adjusted = self.forward_line_band_adjusted_target(intent.player_id, target);
-            if adjusted.distance(target) > 1e-6 {
+            if adjusted.distance(target) > 0.25 {
                 intent.sprint = true;
-                match &mut intent.action {
-                    SoccerAction::HoldShape => intent.action = SoccerAction::MoveTo(adjusted),
-                    SoccerAction::MoveTo(target)
-                    | SoccerAction::Dribble(target)
-                    | SoccerAction::ControlTouch { target }
-                    | SoccerAction::DribbleMove { target, .. } => *target = adjusted,
-                    _ => {}
-                }
+                intent.action = SoccerAction::MoveTo(adjusted);
             }
         }
         return intent;

@@ -1174,7 +1174,7 @@ const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min over {1,2,3}yd and max over values capped at 25yd.
+// permute the min over {1,2,3}yd and max over values capped at 30yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
@@ -1184,7 +1184,7 @@ const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 20.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 15.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
 // the tighter in-possession cap.
-const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 25.0;
+const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
 // Below this speed (and on the ground) the ball counts as "settled" → the wider 20yd cushion.
 const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
 // The cushion behind the ball MUST shrink as the ball nears the defenders' OWN goal -- you
@@ -1194,6 +1194,15 @@ const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
 // the full nominal cushion as the ball moves upfield. Floored at 3yd, never negative.
 const DEFENSIVE_LINE_GOAL_SHRINK_SAFETY_YARDS: f64 = 15.0;
 const DEFENSIVE_LINE_GAP_FLOOR_YARDS: f64 = 3.0;
+// Back-four STRUCTURE (off-ball, the defender allowed to step out to engage excepted): the
+// four stay a compact, FLAT, ball-side block. Laterally they occupy ~4 of the 12 lanes
+// (a ~26yd block ≈ 3.9 lanes), the block's centre tracking the ball's x (shift-and-cover,
+// retaining some centrality). Fore-aft they FLATTEN to the line's average depth (no
+// 20-35yd stagger among the four). Both are bounded pulls toward the slot, not hard snaps.
+const BACK_FOUR_BLOCK_WIDTH_YARDS: f64 = 22.0;
+const BACK_FOUR_BALL_SIDE_SHIFT: f64 = 0.6;
+const BACK_FOUR_LATERAL_GAIN: f64 = 0.78;
+const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
 // In possession the line may push up, but no more than ~5yd past the halfway line.
 const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
