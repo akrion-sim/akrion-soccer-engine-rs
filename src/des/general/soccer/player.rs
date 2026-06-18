@@ -4196,8 +4196,17 @@ impl PlayerAgent {
 
         if !has_ball {
             if let Some(assignment) = snapshot.active_set_play_assignment_for(self.id) {
+                // The taker's set-play assignment target is the dead-ball spot itself.
+                // While they actually hold the ball, the held-restart branch above governs
+                // them (deliver after the routine delay). Reaching here as the taker means
+                // they no longer hold it — they've already played the restart. Do NOT drag
+                // them back to the spot: that pins the kicker at the corner flag, shuffling
+                // around a ball they are barred from re-touching by the no-double-touch
+                // guard (the "ghost kick" at the corner). They've delivered; let them fall
+                // through and rejoin open play.
+                let is_taker = assignment.role == SoccerSetPlayAssignmentRole::Taker;
                 let distance = self.position.distance(assignment.target);
-                if distance > 0.35 {
+                if !is_taker && distance > 0.35 {
                     let action = SoccerAction::MoveTo(assignment.target);
                     self.last_decision = Some(self.decision_trace(
                         snapshot,

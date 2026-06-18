@@ -74,6 +74,12 @@ pub struct SoccerLearningPgCompletedRunRetentionPrune {
     pub deleted_delta_rows: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SoccerLearningPgMomentVectorRetentionPrune {
+    pub soft_deleted_moment_embeddings: u64,
+    pub soft_deleted_config_moments: u64,
+}
+
 const POSTGRES_MAX_QUERY_PARAMETERS: usize = 65_535;
 const SOCCER_COMPLETED_RUN_HEADER_PARAMETER_COUNT: usize = 22;
 const SOCCER_RUN_DELTA_PARAMETER_COUNT: usize = 16;
@@ -84,6 +90,7 @@ const SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
+pub const SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS: i64 = 10;
 
 const SOCCER_PG_CONNECT_DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const SOCCER_PG_CONNECT_BASE_BACKOFF_MILLIS: u64 = 200;
@@ -107,6 +114,34 @@ const SOCCER_RUN_DELTA_ON_CONFLICT_CLAUSE: &str =
     " on conflict (run_id, team, entry_kind, state_hash, action, \
 target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
 do nothing";
+const SOCCER_MOMENT_EMBEDDING_SEARCH_SQL: &str = "\
+select team, action, reward_micros, value_micros, tick, \
+(embedding <=> $1::vector) as distance \
+from des_soccer_moment_embeddings \
+where ($2::text is null or team = $2) \
+  and deleted_at is null \
+order by embedding <=> $1::vector \
+limit $3";
+const SOCCER_CONFIG_MOMENT_SEARCH_SQL: &str = "\
+select team, role, action, reward_micros, nstep_return_micros, value_micros, \
+tick, features, (embedding <=> $1::vector) as distance \
+from des_soccer_config_moments \
+where ($2::text is null or team = $2) \
+  and deleted_at is null \
+order by embedding <=> $1::vector \
+limit $3";
+const SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL: &str = "\
+update des_soccer_moment_embeddings \
+set deleted_at = now() \
+where deleted_at is null \
+  and created_at < now() - ($2::bigint * interval '1 day') \
+  and ($1::text is null or experiment_id = $1::text::uuid)";
+const SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL: &str = "\
+update des_soccer_config_moments \
+set deleted_at = now() \
+where deleted_at is null \
+  and created_at < now() - ($2::bigint * interval '1 day') \
+  and ($1::text is null or experiment_id = $1::text::uuid)";
 
 const _: () = {
     assert!(
@@ -1596,6 +1631,11 @@ impl SoccerLearningPgStore {
                 Some(experiment_id),
                 &game.config_moments,
             )?;
+            soft_delete_old_moment_vectors_in_transaction(
+                &mut tx,
+                Some(experiment_id),
+                SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
+            )?;
         }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run: {err}"))?;
@@ -1667,6 +1707,11 @@ impl SoccerLearningPgStore {
             tx.execute(&sql, &params)
                 .map_err(|err| format!("insert soccer moment embeddings: {err}"))?;
         }
+        soft_delete_old_moment_vectors_in_transaction(
+            &mut tx,
+            experiment_id,
+            SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
+        )?;
         tx.commit()
             .map_err(|err| format!("commit soccer moment embeddings: {err}"))?;
         Ok(moments.len())
@@ -1710,12 +1755,7 @@ impl SoccerLearningPgStore {
         let rows = self
             .client
             .query(
-                "select team, action, reward_micros, value_micros, tick, \
-                 (embedding <=> $1::vector) as distance \
-                 from des_soccer_moment_embeddings \
-                 where ($2::text is null or team = $2) \
-                 order by embedding <=> $1::vector \
-                 limit $3",
+                SOCCER_MOMENT_EMBEDDING_SEARCH_SQL,
                 &[&query_text, &team_filter, &limit],
             )
             .map_err(|err| format!("search soccer moment embeddings: {err}"))?;
@@ -1757,6 +1797,11 @@ impl SoccerLearningPgStore {
             .map_err(|err| format!("begin config moment transaction: {err}"))?;
         ensure_soccer_config_moment_tables(&mut tx)?;
         insert_config_moments_in_transaction(&mut tx, run_id, experiment_id, moments)?;
+        soft_delete_old_moment_vectors_in_transaction(
+            &mut tx,
+            experiment_id,
+            SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
+        )?;
         tx.commit()
             .map_err(|err| format!("commit soccer config moments: {err}"))?;
         Ok(moments.len())
@@ -1797,12 +1842,7 @@ impl SoccerLearningPgStore {
         let rows = self
             .client
             .query(
-                "select team, role, action, reward_micros, nstep_return_micros, value_micros, \
-                 tick, features, (embedding <=> $1::vector) as distance \
-                 from des_soccer_config_moments \
-                 where ($2::text is null or team = $2) \
-                 order by embedding <=> $1::vector \
-                 limit $3",
+                SOCCER_CONFIG_MOMENT_SEARCH_SQL,
                 &[&query_text, &team_filter, &limit],
             )
             .map_err(|err| format!("search soccer config moments: {err}"))?;
@@ -1870,6 +1910,13 @@ impl SoccerLearningPgStore {
                 }
             }
             run_ids.extend(chunk_run_ids);
+        }
+        if has_config_moments {
+            soft_delete_old_moment_vectors_in_transaction(
+                &mut tx,
+                Some(experiment_id),
+                SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
+            )?;
         }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run batch: {err}"))?;
@@ -1939,6 +1986,36 @@ impl SoccerLearningPgStore {
             deleted_runs,
             deleted_delta_rows,
         })
+    }
+
+    /// Mark old pgvector soccer moment rows as deleted without removing the raw
+    /// rows. Retrieval paths filter `deleted_at is null`, while operators can
+    /// inspect or hard-purge these rows later if needed.
+    pub fn soft_delete_old_moment_vectors(
+        &mut self,
+        experiment_id: Option<&str>,
+    ) -> Result<SoccerLearningPgMomentVectorRetentionPrune, String> {
+        self.soft_delete_moment_vectors_older_than_days(
+            experiment_id,
+            SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
+        )
+    }
+
+    pub fn soft_delete_moment_vectors_older_than_days(
+        &mut self,
+        experiment_id: Option<&str>,
+        older_than_days: i64,
+    ) -> Result<SoccerLearningPgMomentVectorRetentionPrune, String> {
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin soccer moment-vector retention transaction: {err}"))?;
+        let prune =
+            soft_delete_old_moment_vectors_in_transaction(&mut tx, experiment_id, older_than_days)?;
+        tx.commit()
+            .map_err(|err| format!("commit soccer moment-vector retention: {err}"))?;
+        Ok(prune)
     }
 
     pub fn insert_set_play_training_artifact(
@@ -3690,6 +3767,38 @@ fn config_moment_values_clause(rows: usize) -> String {
     clause
 }
 
+fn soccer_moment_vector_retention_limit_days(days: i64) -> Option<i64> {
+    (days > 0).then_some(days)
+}
+
+fn soft_delete_old_moment_vectors_in_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    experiment_id: Option<&str>,
+    older_than_days: i64,
+) -> Result<SoccerLearningPgMomentVectorRetentionPrune, String> {
+    let Some(older_than_days) = soccer_moment_vector_retention_limit_days(older_than_days) else {
+        return Ok(SoccerLearningPgMomentVectorRetentionPrune::default());
+    };
+    ensure_soccer_moment_embedding_tables(tx)?;
+    ensure_soccer_config_moment_tables(tx)?;
+    let soft_deleted_moment_embeddings = tx
+        .execute(
+            SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL,
+            &[&experiment_id, &older_than_days],
+        )
+        .map_err(|err| format!("soft-delete old soccer moment embeddings: {err}"))?;
+    let soft_deleted_config_moments = tx
+        .execute(
+            SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL,
+            &[&experiment_id, &older_than_days],
+        )
+        .map_err(|err| format!("soft-delete old soccer config moments: {err}"))?;
+    Ok(SoccerLearningPgMomentVectorRetentionPrune {
+        soft_deleted_moment_embeddings,
+        soft_deleted_config_moments,
+    })
+}
+
 /// Schema for persisted configuration moments — the retrieval corpus. Mirrors the
 /// moment-embedding table but adds the role, the n-step outcome return, and the
 /// raw `features real[]` (the canonical per-player floats kept for an exact
@@ -3713,10 +3822,13 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
           embedding vector({dim}) not null,
           features real[] not null,
           created_at timestamptz not null default now(),
+          deleted_at timestamptz,
           constraint des_soccer_config_moments_team_chk check (team in ('home','away')),
           constraint des_soccer_config_moments_features_len_chk
             check (array_length(features, 1) in ({legacy_features}, {features}))
         );
+        alter table des_soccer_config_moments
+          add column if not exists deleted_at timestamptz;
         alter table des_soccer_config_moments
           drop constraint if exists des_soccer_config_moments_features_len_chk;
         alter table des_soccer_config_moments
@@ -3726,6 +3838,12 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
           on des_soccer_config_moments using hnsw (embedding vector_cosine_ops);
         create index if not exists des_soccer_config_moments_run_idx
           on des_soccer_config_moments (run_id);
+        create index if not exists des_soccer_config_moments_live_created_idx
+          on des_soccer_config_moments (experiment_id, created_at)
+          where deleted_at is null;
+        create index if not exists des_soccer_config_moments_deleted_idx
+          on des_soccer_config_moments (deleted_at)
+          where deleted_at is not null;
         "#,
         dim = SOCCER_MOMENT_EMBEDDING_DIM,
         legacy_features = CONFIG_FEATURE_DIM_V1,
@@ -3750,12 +3868,21 @@ fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> 
           value_micros bigint,
           embedding vector({dim}) not null,
           created_at timestamptz not null default now(),
+          deleted_at timestamptz,
           constraint des_soccer_moment_embeddings_team_chk check (team in ('home','away'))
         );
+        alter table des_soccer_moment_embeddings
+          add column if not exists deleted_at timestamptz;
         create index if not exists des_soccer_moment_embeddings_hnsw
           on des_soccer_moment_embeddings using hnsw (embedding vector_cosine_ops);
         create index if not exists des_soccer_moment_embeddings_run_idx
           on des_soccer_moment_embeddings (run_id);
+        create index if not exists des_soccer_moment_embeddings_live_created_idx
+          on des_soccer_moment_embeddings (experiment_id, created_at)
+          where deleted_at is null;
+        create index if not exists des_soccer_moment_embeddings_deleted_idx
+          on des_soccer_moment_embeddings (deleted_at)
+          where deleted_at is not null;
         "#,
         dim = SOCCER_MOMENT_EMBEDDING_DIM
     ))
@@ -4396,6 +4523,47 @@ mod tests {
         assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
         assert_eq!(CONFIG_FEATURE_DIM, 164);
         assert!(CONFIG_FEATURE_DIM > CONFIG_FEATURE_DIM_V1);
+    }
+
+    #[test]
+    fn default_moment_vector_retention_soft_deletes_after_ten_days() {
+        assert_eq!(SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS, 10);
+        assert_eq!(soccer_moment_vector_retention_limit_days(10), Some(10));
+        assert_eq!(soccer_moment_vector_retention_limit_days(0), None);
+        assert_eq!(soccer_moment_vector_retention_limit_days(-1), None);
+    }
+
+    #[test]
+    fn moment_vector_search_queries_ignore_soft_deleted_rows() {
+        for sql in [
+            SOCCER_MOMENT_EMBEDDING_SEARCH_SQL,
+            SOCCER_CONFIG_MOMENT_SEARCH_SQL,
+        ] {
+            assert!(
+                sql.contains("deleted_at is null"),
+                "live vector search must exclude soft-deleted rows: {sql}"
+            );
+            assert!(
+                sql.contains("order by embedding <=> $1::vector"),
+                "ANN ordering must stay vector-distance based: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn moment_vector_retention_queries_soft_delete_old_live_rows() {
+        for sql in [
+            SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL,
+            SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL,
+        ] {
+            let normalized = sql.to_ascii_lowercase();
+            assert!(normalized.starts_with("update "));
+            assert!(!normalized.contains("delete from"));
+            assert!(normalized.contains("set deleted_at = now()"));
+            assert!(normalized.contains("where deleted_at is null"));
+            assert!(normalized.contains("created_at < now() - ($2::bigint * interval '1 day')"));
+            assert!(normalized.contains("experiment_id = $1::text::uuid"));
+        }
     }
 
     #[test]

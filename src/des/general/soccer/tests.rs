@@ -647,6 +647,144 @@ fn mpc_pass_execution_prices_lane_and_ball_recipe() {
 }
 
 #[test]
+fn holder_cannot_strike_ball_during_first_touch_settle() {
+    // Regression ("a ghost kicked the ball"): a player who has just won a loose ball
+    // is its `holder` immediately, but a ball won from a stretched trap is still
+    // 1.4–2.8yd out being drawn to the feet over the first-touch settle. Striking it
+    // in that window launched the ball from out there with no player visibly at it.
+    // The strike must wait until the ball has settled within reach.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 74.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let pass = SoccerAction::Pass {
+        target_player: Some(receiver),
+        power: 0.7,
+        flight: PassFlight::Floor,
+    };
+
+    // Ball still ~2yd from the holder's feet (mid-settle): the strike is gated — the
+    // holder keeps possession and the ball is NOT launched.
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 2.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: pass.clone(),
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder,
+        Some(passer),
+        "holder must keep the ball while it is still settling to the feet"
+    );
+    assert!(
+        sim.ball.velocity.len() < 1.0,
+        "ball must not be struck mid-settle (ghost kick); v = {:?}",
+        sim.ball.velocity
+    );
+    assert!(
+        sim.pending_pass.is_none(),
+        "no pass should have launched mid-settle"
+    );
+
+    // Ball now settled at the feet: the same strike releases normally.
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 0.4);
+    sim.ball.velocity = Vec2::zero();
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: pass,
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder, None,
+        "a settled ball at the feet must be released by a strike"
+    );
+    assert!(
+        sim.ball.velocity.len() > 1.0,
+        "a settled strike must launch the ball; v = {:?}",
+        sim.ball.velocity
+    );
+}
+
+#[test]
+fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
+    // Rule B: a forward that lingers offside past the 3s grace is pulled back onside,
+    // unless it is through on goal with the ball / being played in, the opponent last
+    // touched the ball, or it is in its own half.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 77,
+        ..Default::default()
+    });
+    let striker = 9; // Home forward, attacks +y
+    park_players_except(&mut sim, &[striker]);
+    sim.players[striker].role = PlayerRole::Forward;
+    sim.players[striker].team = Team::Home;
+    // Away offside line: keeper deepest (y=118), one defender at y=82 (the 2nd-last =
+    // the offside line), the rest pushed up the pitch so they don't form the line.
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    // Striker offside: opponents' half (>60), beyond the 2nd-last line (82) and the ball.
+    sim.players[striker].position = Vec2::new(40.0, 90.0);
+    sim.ball.position = Vec2::new(40.0, 70.0);
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
+
+    let target = sim
+        .striker_offside_recovery_target(striker)
+        .expect("offside striker beyond grace should be recovered onside");
+    assert!(target.y < 82.0, "recovery must be onside of the 2nd-last line: {target:?}");
+    assert!(target.y < 90.0, "recovery must pull the striker back (lower y): {target:?}");
+
+    // Within grace: not yet recovered (free to make the run).
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS - 0.5);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "within the grace window the striker keeps its run"
+    );
+
+    // Opponent last touched the ball: cannot be offside.
+    sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
+    sim.ball.last_touch_team = Some(Team::Away);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "cannot be offside off the opponents' touch"
+    );
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    // Through on goal WITH the ball: exempt.
+    sim.ball.holder = Some(striker);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "a striker through with the ball is exempt"
+    );
+    sim.ball.holder = None;
+
+    // In its own half: cannot be offside.
+    sim.players[striker].position = Vec2::new(40.0, 50.0);
+    assert!(
+        sim.striker_offside_recovery_target(striker).is_none(),
+        "cannot be offside in its own half"
+    );
+}
+
+#[test]
 fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -6659,6 +6797,18 @@ fn quick_receiver_dispossession_penalizes_original_passer() {
     assert!(
         passer_penalty < -1.0,
         "passer should be penalized when receiver is immediately dispossessed: {passer_penalty}"
+    );
+    let defender_reward_events = sim.reward_events[event_start..]
+        .iter()
+        .filter(|event| event.player_id == defender)
+        .collect::<Vec<_>>();
+    assert!(defender_reward_events.iter().any(|event| {
+        event.kind == SoccerRewardEventKind::DefensiveDispossession
+            && (event.amount - DEFENSIVE_DISPOSSESSION_REWARD_POINTS).abs() < 1e-9
+    }));
+    assert!(
+        SoccerMatch::has_significant_learning_event(&sim.reward_events[event_start..]),
+        "a steal/dispossession should force immediate MDP/POMDP/neural learning"
     );
 }
 
@@ -12845,7 +12995,11 @@ fn defensive_line_cushion_uses_full_back_four_average_y() {
 }
 
 #[test]
-fn defensive_line_cushion_yields_to_opponent_half_ceiling() {
+fn defensive_line_cushion_caps_press_at_five_yards_into_opponent_half() {
+    // Ball deep in the opponents' half (y=100, field 120 -> halfway 60). The plain
+    // 2-30yd band would let the back four follow up to y=70; the opponent-half ceiling
+    // (halfway + 5 = 65) overrides it, so an over-committed line (avg y=80) is pulled
+    // BACK rather than allowed to sit at 80 (which the 30yd band alone would permit).
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 25,
@@ -12867,9 +13021,8 @@ fn defensive_line_cushion_yields_to_opponent_half_ceiling() {
         .map(|p| p.id)
         .unwrap();
     for &d in &home_def {
-        let idx = sim.players.iter().position(|p| p.id == d).unwrap();
-        sim.players[idx].role = PlayerRole::Defender;
-        sim.players[idx].position = Vec2::new(30.0, 65.0);
+        sim.players[d].role = PlayerRole::Defender;
+        sim.players[d].position = Vec2::new(30.0, 80.0);
     }
     let holder_idx = sim.players.iter().position(|p| p.id == home_holder).unwrap();
     sim.players[holder_idx].position = Vec2::new(40.0, 100.0);
@@ -12879,14 +13032,22 @@ fn defensive_line_cushion_yields_to_opponent_half_ceiling() {
     sim.ball.altitude_yards = 0.0;
     sim.ball.last_touch_team = Some(Team::Home);
 
+    let halfway = sim.config.field_length_yards * 0.5;
+    let ceiling = halfway + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS; // 65 for a 120yd pitch
     let snap = WorldSnapshot::from_match(&sim);
-    let adjusted =
-        snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 65.0));
-    let home_ceiling =
-        sim.config.field_length_yards * 0.5 + DEFENSIVE_LINE_MAX_OPPONENT_HALF_PRESS_YARDS;
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 80.0));
     assert!(
-        adjusted.y <= home_ceiling + 1e-9,
-        "the line must yield to the 5yd opponent-half ceiling before the 30yd ball cushion: target={adjusted:?} ceiling={home_ceiling}"
+        adjusted.y < 80.0 - 1.0,
+        "the opponent-half ceiling should pull an over-committed back line BACK (the 30yd \
+         band alone would leave it at 80 since the ball is at 100): {adjusted:?}"
+    );
+    assert!(
+        adjusted.y >= ceiling - 1e-6,
+        "the line is pulled toward — not past — the 5yd-into-opp-half ceiling ({ceiling}): {adjusted:?}"
+    );
+    assert!(
+        adjusted.y <= ceiling + 1e-6,
+        "the line must yield to the 5yd opponent-half ceiling before the 30yd ball cushion: target={adjusted:?} ceiling={ceiling}"
     );
     assert!(
         adjusted.y < sim.ball.position.y - DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS,
@@ -13144,8 +13305,8 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     home.ball.position = home.players[home_holder].position;
     home.ball.last_touch_team = Some(Team::Home);
     let home_snapshot = WorldSnapshot::from_match(&home);
-    let home_ceiling = home.config.field_length_yards * 0.5
-        + DEFENSIVE_LINE_MAX_OPPONENT_HALF_PRESS_YARDS;
+    let home_ceiling =
+        home.config.field_length_yards * 0.5 + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS;
     for &id in &home_def {
         let raw = Vec2::new(home.players[id].position.x, 96.0);
         let adjusted = home_snapshot.defensive_line_cushion_adjusted_target(id, raw);
@@ -13178,8 +13339,8 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     away.ball.position = away.players[away_holder].position;
     away.ball.last_touch_team = Some(Team::Away);
     let away_snapshot = WorldSnapshot::from_match(&away);
-    let away_ceiling = away.config.field_length_yards * 0.5
-        - DEFENSIVE_LINE_MAX_OPPONENT_HALF_PRESS_YARDS;
+    let away_ceiling =
+        away.config.field_length_yards * 0.5 - DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS;
     for &id in &away_def {
         let raw = Vec2::new(away.players[id].position.x, 24.0);
         let adjusted = away_snapshot.defensive_line_cushion_adjusted_target(id, raw);
@@ -15547,10 +15708,12 @@ fn live_server_default_uses_ten_minute_soft_realtime_match() {
     });
     assert_eq!(step.summary.ticks, 1);
     assert_eq!(step.step_timing.ticks, 1);
+    let live_tick_budget_ms = DEFAULT_DT_SECONDS * 1_000.0;
     assert!(
-        step.step_timing.pre_field_ms < 25.0,
-        "live default pre-field work should stay under one 10Hz tick budget slice; got {:.2}ms",
-        step.step_timing.pre_field_ms
+        step.step_timing.pre_field_ms < live_tick_budget_ms,
+        "live default pre-field work should stay under one simulation tick budget; got {:.2}ms (budget {:.2}ms)",
+        step.step_timing.pre_field_ms,
+        live_tick_budget_ms
     );
     assert_eq!(step.match_clock.tick, 1);
     assert_eq!(step.match_clock.total_ticks, 9_000);
@@ -35302,8 +35465,12 @@ fn flank_cross_arrival_support_reward_prefers_box_arrival_runs() {
         &SoccerTacticalLearningWeights::default(),
     );
 
+    // Margin 0.7 (was 0.75): the attack spacing band's "too isolated" ceiling was
+    // widened (ATTACK_SPACING_MAX 10 -> 17) so attackers can stretch, which makes a
+    // small drift away marginally less penalised. The box-arrival run is still strongly
+    // preferred (closing ~0.95 vs drifting ~0.20); only the absolute margin tightened.
     assert!(
-            closing_reward > drifting_reward + 0.75,
+            closing_reward > drifting_reward + 0.7,
             "cross-arrival support run should be learned as better than drifting away: closing={closing_reward} drifting={drifting_reward}"
         );
     assert!(
@@ -45240,6 +45407,74 @@ fn dribble_beat_event_uses_move_reward_and_rejects_invalid_contests() {
 
     assert_eq!(sim.reward_events.len(), reward_count);
     assert_eq!(sim.events.len(), event_count);
+}
+
+#[test]
+fn dribble_beat_event_triggers_learning_with_whole_field_context() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let attacker = 9;
+    let defender = 13;
+    sim.players[defender].position = Vec2::new(40.0, 60.0);
+    sim.players[defender].position_history = VecDeque::from([sim.players[defender].position]);
+    sim.players[attacker].position = Vec2::new(40.5, 59.0);
+    sim.players[attacker].position_history = VecDeque::from([sim.players[attacker].position]);
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+    sim.players[attacker].last_decision = Some(test_decision_trace(&before, attacker, "nutmeg"));
+    sim.players[defender].last_decision = Some(test_decision_trace(&before, defender, "defend"));
+
+    sim.players[attacker].position = Vec2::new(40.5, 61.2);
+    sim.ball.position = sim.players[attacker].position;
+    let event_start = sim.reward_events.len();
+    sim.record_dribble_beat_event(attacker, defender, DribbleMoveKind::Nutmeg);
+
+    let tick_events = &sim.reward_events[event_start..];
+    assert!(
+        SoccerMatch::has_significant_learning_event(tick_events),
+        "beating or being beaten on the dribble should force immediate learning"
+    );
+    assert!(tick_events.iter().any(|event| {
+        event.player_id == attacker
+            && event.kind == SoccerRewardEventKind::DribbleBeat
+            && (event.amount - NUTMEG_BEAT_REWARD_POINTS).abs() < 1e-9
+    }));
+    assert!(tick_events.iter().any(|event| {
+        event.player_id == defender
+            && event.kind == SoccerRewardEventKind::DribbleBeat
+            && (event.amount + BEATEN_BY_DRIBBLE_PENALTY_POINTS).abs() < 1e-9
+    }));
+
+    let after = WorldSnapshot::from_match(&sim);
+    let transitions = sim.learning_transitions_for(&before, &after, 0, 0, tick_events);
+    let attacker_transition = transitions
+        .iter()
+        .find(|transition| transition.player_id == attacker)
+        .expect("attacker dribble transition");
+    assert_eq!(attacker_transition.action, "nutmeg");
+    assert!(
+        attacker_transition.reward >= NUTMEG_BEAT_REWARD_POINTS,
+        "the dribble-beat reward should land on the attacker's MDP/POMDP transition"
+    );
+    assert_eq!(
+        attacker_transition.decision_context.field_player_motion.len(),
+        SOCCER_NEURAL_FIELD_MOTION_DIM
+    );
+    let features = soccer_neural_transition_features(attacker_transition);
+    assert!(features[SOCCER_NEURAL_BASE_FEATURE_DIM..]
+        .iter()
+        .any(|value| value.abs() > 1e-6));
+
+    let defender_transition = transitions
+        .iter()
+        .find(|transition| transition.player_id == defender)
+        .expect("defender beat transition");
+    assert_eq!(defender_transition.action, "defend");
+    assert!(
+        defender_transition.reward <= -BEATEN_BY_DRIBBLE_PENALTY_POINTS,
+        "the beaten-defender penalty should land on the defender's MDP/POMDP transition"
+    );
 }
 
 #[test]

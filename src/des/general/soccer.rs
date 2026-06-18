@@ -80,6 +80,16 @@ const PLAYER_CONTROL_RADIUS_YARDS: f64 = 1.55;
 // settles to the feet over ~2 ticks (a realistic first touch). Comfortably above
 // the dribble carry lead (0.92yd) so ordinary carrying tracks the feet exactly.
 const CONTROL_FIRST_TOUCH_SETTLE_MAX_STEP_YARDS: f64 = 1.4;
+// Maximum ball-to-feet distance at which a holder may STRIKE the ball (pass, shoot,
+// clear, route-one). During the first-touch settle above, the holder is the ball's
+// owner (`has_ball`) while the ball is still 1.4–2.8yd out being drawn in. Letting
+// them strike in that window launched the ball from out there / teleported it onto
+// the feet first — a "ghost kick" with no player visibly at the ball. A strike is
+// only legal once the ball has settled to within this reach; until then the holder
+// takes a settling touch. Set above the dribble carry lead (0.92yd) and orbit max
+// (1.10yd) so ordinary carrying/dribbling release is never blocked, but below the
+// settle-window distances so a not-yet-controlled ball can't be booted.
+const CONTROLLED_STRIKE_REACH_YARDS: f64 = 1.6;
 // Physical reach caps for contesting a moving ball. A fast ball that only nicks
 // the skill-based control radius is unreachable: a player can close at most a
 // lunge (`INTERCEPT_LUNGE_REACH_YARDS`) plus the ground they cover while the ball
@@ -1182,10 +1192,17 @@ const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
 // THE rule: the back four's average sits 2-30yd behind (goal-side of) the ball, always.
 const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
-// Exception to the 30yd cushion: the back-four average may not press more than 5yd
-// into the opponent half. When the ball is high, staying under this ceiling is more
-// important than being within 30yd of the ball.
-const DEFENSIVE_LINE_MAX_OPPONENT_HALF_PRESS_YARDS: f64 = 5.0;
+// Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
+// band when it must travel more than this to reach its band-corrected slot. A smaller
+// correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
+// instead of a frantic sprint-snap. Sized so a comfortable jog closes it within grace.
+const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
+// Hard cap on how far the back four's AVERAGE may press upfield: never more than this
+// far into the opponents' half, regardless of how deep the ball is. This is the
+// exception to the 25yd rule — with the ball deep in the opponents' half the 2-25yd
+// band would otherwise drag the line well upfield; this pins the line's average to at
+// most 5yd past the halfway line so the back four never over-commits.
+const DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS: f64 = 5.0;
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).
@@ -1270,12 +1287,23 @@ const COACH_POSITION_HINT_ARRIVAL_YARDS: f64 = 1.5;
 const DEFENSIVE_RELAXATION_THREAT_YARDS: f64 = 48.0;
 const NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS: f64 = 10.0;
 const SETTLED_POSSESSION_SECONDS: f64 = 5.0;
+// Inter-player off-ball spacing band, measured as EUCLIDEAN (straight-line) distance
+// to the nearest teammate — NOT the x-axis gap (the candidate scorer reads
+// `nearest_teammate_distance = sqrt(dx^2 + dy^2)`). MIN is the FLOOR (penalised below
+// it for packing too tight); MAX is the "too isolated" ceiling (above it the scorer
+// penalises and pulls the player back toward teammates), peaking at IDEAL between.
+// User (2026-06-18) wanted "keep ~5yd between players" — that is the MIN floor, NOT a
+// ceiling: capping ATTACK MAX at 10 forbade legitimate width (wingers, runners in
+// behind sit 12-18yd off the nearest teammate) and collapsed the attacking shape onto
+// the ball. So ATTACK keeps the 5yd floor but stretches (ideal 10, isolate-past 17);
+// DEFENDING stays compact (5/7/10). The back four's own LATERAL band (1.5-8yd along x,
+// adjacent pairs) is a separate, tighter rule for the defensive line.
 const ATTACK_SPACING_MIN_YARDS: f64 = 5.0;
 const ATTACK_SPACING_IDEAL_YARDS: f64 = 10.0;
-const ATTACK_SPACING_MAX_YARDS: f64 = 15.0;
+const ATTACK_SPACING_MAX_YARDS: f64 = 17.0;
 const DEFENSE_SPACING_MIN_YARDS: f64 = 5.0;
-const DEFENSE_SPACING_IDEAL_YARDS: f64 = 10.0;
-const DEFENSE_SPACING_MAX_YARDS: f64 = 15.0;
+const DEFENSE_SPACING_IDEAL_YARDS: f64 = 7.0;
+const DEFENSE_SPACING_MAX_YARDS: f64 = 10.0;
 const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
 // Territory discipline ("cover ground"). Two teammates packed into the same few yards
 // add no attacking or defensive value, so beyond a brief grace window — long enough
@@ -8999,6 +9027,12 @@ pub(crate) struct UntargetedLongBallFlight {
     target: Vec2,
     launch_speed_yps: f64,
     distance_yards: f64,
+    // Teammates of the launcher who were in an offside position when this untargeted
+    // ball (clearance / route-one / hoof) was played. There is no `pending_pass` for an
+    // untargeted ball, so these are carried here so a forward who receives it offside is
+    // still flagged (Law 11 applies to any ball played by your own team).
+    #[serde(default, skip)]
+    offside_candidates: Vec<PendingOffside>,
 }
 
 #[derive(Clone, Debug)]
@@ -12693,6 +12727,8 @@ pub(crate) struct SoccerRewardEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SoccerRewardEventKind {
     Routine,
+    DribbleBeat,
+    DefensiveDispossession,
     TwoForwardPasses,
     ThreePassForwardNetGain,
     ShotOnTarget,
@@ -12704,7 +12740,9 @@ impl SoccerRewardEventKind {
     fn triggers_learning(self) -> bool {
         matches!(
             self,
-            SoccerRewardEventKind::TwoForwardPasses
+            SoccerRewardEventKind::DribbleBeat
+                | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::Goal
