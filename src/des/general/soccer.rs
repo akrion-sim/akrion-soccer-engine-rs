@@ -3227,6 +3227,26 @@ fn lane_affinity_strength(role: PlayerRole, in_possession: bool) -> f64 {
     }
 }
 
+/// A lane-affinity CLAIM: how strongly a player whose lateral channel is centred on
+/// `center_x` claims the lane that `point_x` falls in — its 12-lane PMF mass there
+/// scaled by the current strength (halved in possession). 0 for strikers. The shared
+/// core of the engagement tie-break (who chases a loose ball / who marks a runner).
+pub(crate) fn soccer_lane_affinity_claim(
+    role: PlayerRole,
+    center_x: f64,
+    point_x: f64,
+    field_width: f64,
+    in_possession: bool,
+) -> f64 {
+    let Some(dist) = lane_affinity_distribution(role, lane_affinity_home_lane(center_x, field_width))
+    else {
+        return 0.0;
+    };
+    let lane = (lane_affinity_home_lane(point_x, field_width).round() as usize)
+        .min(dist.len().saturating_sub(1));
+    dist[lane] * lane_affinity_strength(role, in_possession)
+}
+
 fn vertical_lane_deviation_yards(
     target_x: f64,
     role: PlayerRole,

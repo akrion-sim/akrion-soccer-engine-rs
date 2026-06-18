@@ -3360,8 +3360,23 @@ pub(crate) fn soccer_defensive_mark_target(
             0.0
         };
         let goal_threat_bonus = (70.0 - distance_to_goal).max(0.0) * 0.025;
-        let score =
-            zone_distance - role_threat - holder_bonus - goal_lane_bonus - goal_threat_bonus;
+        // Lane-affinity engagement tie-break (gated): a defender prefers to pick up the
+        // opponent who has entered ITS lane (and yields opponents in a teammate's channel
+        // to that teammate, who claims them more strongly), so marking is distributed by
+        // lane instead of two defenders converging on the same runner. The opponent's team
+        // has the ball here, so this defender is out of possession (full lane strength).
+        let lane_claim_bonus = if snapshot.lane_affinity_engagement_enabled {
+            soccer_lane_affinity_claim(defender_role, zone.x, opponent_position.x, width, false)
+                * LANE_AFFINITY_ENGAGEMENT_TIE_BREAK_YARDS
+        } else {
+            0.0
+        };
+        let score = zone_distance
+            - role_threat
+            - holder_bonus
+            - goal_lane_bonus
+            - goal_threat_bonus
+            - lane_claim_bonus;
         if score < best_score {
             best_mark = Some((opponent_position, opponent.role));
             best_score = score;

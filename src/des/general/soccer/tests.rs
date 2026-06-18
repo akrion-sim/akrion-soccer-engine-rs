@@ -35195,6 +35195,50 @@ fn lane_affinity_breaks_who_chases_the_loose_ball() {
 }
 
 #[test]
+fn lane_affinity_breaks_who_marks_the_runner() {
+    // A left-channel defender's zonal spot (lane ~3).
+    let zone = Vec2::new(20.0, 32.0);
+    // Two Away attackers, both close to the zone: A is IN the defender's lane (x=20),
+    // B is in another channel (x=31) but marginally CLOSER to the zone. Without the
+    // tie-break the defender marks the nearer B; with it, the defender picks up the
+    // runner that entered its own lane (A) and leaves B to a teammate.
+    let a_pos = Vec2::new(20.0, 50.0);
+    let b_pos = Vec2::new(31.0, 46.0);
+    let build = |enabled: bool| -> WorldSnapshot {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            lane_affinity_engagement_enabled: enabled,
+            ..MatchConfig::default()
+        });
+        for p in sim.players.iter_mut() {
+            p.position = Vec2::new(70.0, 60.0); // park everyone far from the zone
+        }
+        sim.players[12].role = PlayerRole::Forward;
+        sim.players[13].role = PlayerRole::Forward;
+        sim.players[12].position = a_pos;
+        sim.players[13].position = b_pos;
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(26.0, 44.0);
+        WorldSnapshot::from_match(&sim)
+    };
+
+    let off = build(false);
+    let off_mark =
+        soccer_defensive_mark_target(&off, Team::Home, PlayerRole::Defender, zone).unwrap();
+    assert!(
+        off_mark.distance(b_pos) < off_mark.distance(a_pos),
+        "flag off: defender marks the nearer runner B: {off_mark:?}"
+    );
+
+    let on = build(true);
+    let on_mark =
+        soccer_defensive_mark_target(&on, Team::Home, PlayerRole::Defender, zone).unwrap();
+    assert!(
+        on_mark.distance(a_pos) < on_mark.distance(b_pos),
+        "flag on: defender picks up the runner in its own lane (A): {on_mark:?}"
+    );
+}
+
+#[test]
 fn pomdp_q_state_and_neural_features_track_lane_and_teammate_congestion() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let midfielder = 6;

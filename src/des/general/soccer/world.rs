@@ -20855,15 +20855,13 @@ impl WorldSnapshot {
     /// possession). 0 for strikers (no lane affinity). Higher = "this is my channel".
     pub(crate) fn lane_affinity_claim_at(&self, player: &PlayerSnapshot, point: Vec2) -> f64 {
         let in_possession = self.controlled_possession_team() == Some(player.team);
-        let Some(dist) = lane_affinity_distribution(
+        soccer_lane_affinity_claim(
             player.role,
-            lane_affinity_home_lane(player.home_position.x, self.field_width),
-        ) else {
-            return 0.0;
-        };
-        let lane = (lane_affinity_home_lane(point.x, self.field_width).round() as usize)
-            .min(dist.len().saturating_sub(1));
-        dist[lane] * lane_affinity_strength(player.role, in_possession)
+            player.home_position.x,
+            point.x,
+            self.field_width,
+            in_possession,
+        )
     }
 
     pub(crate) fn loose_ball_retrieval_score(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
