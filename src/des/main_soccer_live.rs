@@ -311,7 +311,10 @@ mod tests {
             cfg.match_config.total_ticks(),
             (DEFAULT_DURATION_SECONDS / DEFAULT_DT_SECONDS).round() as u64,
         );
-        assert!(cfg.match_config.learning_enabled);
+        // The live demo runs a FROZEN trained policy: the neural snapshot is loaded and
+        // used for decisions, but there is no online training (that happens in headless
+        // self-play / tournaments). So learning + its logging are off; the net stays on.
+        assert!(!cfg.match_config.learning_enabled);
         assert!(!cfg.match_config.learning_logging_enabled);
         assert!(cfg.match_config.neural_learning.enabled);
         assert_eq!(cfg.policy_autoload_max_bytes, 768 * 1024 * 1024);
