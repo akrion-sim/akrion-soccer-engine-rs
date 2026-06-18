@@ -2435,6 +2435,23 @@ impl PlayerAgent {
         let quick_pressure_bonus = 1.0
             + observation.perceived_pressure.clamp(0.0, 1.0) * 0.24
             + observation.decision_urgency.clamp(0.0, 1.0) * 0.18;
+        // Physical one-touch feasibility gate: scale each first-time option by how
+        // cleanly this ball can actually be struck/redirected in one touch, and HARD
+        // suppress (≈veto) it below the coin-flip threshold so a settling touch wins.
+        // Near-identity (≈1.0) for a routine ground ball; bites awkward/fast/aerial ones.
+        let pass_feasibility = observation.one_touch_pass_feasibility.clamp(0.0, 1.0);
+        let shot_feasibility = observation.one_touch_shot_feasibility.clamp(0.0, 1.0);
+        let pass_feasibility_gate = if pass_feasibility < ONE_TOUCH_VETO_FEASIBILITY {
+            pass_feasibility * ONE_TOUCH_VETO_SUPPRESSION
+        } else {
+            pass_feasibility
+        };
+        let shot_feasibility_gate = if shot_feasibility < ONE_TOUCH_VETO_FEASIBILITY {
+            shot_feasibility * ONE_TOUCH_VETO_SUPPRESSION
+        } else {
+            shot_feasibility
+        };
+        let one_touch_pass_blocked = pass_feasibility < ONE_TOUCH_VETO_FEASIBILITY;
         let killer_pressure = observation
             .killer_pass_goal_pressure
             .max(killer_pass_goal_pressure_score(observation))
@@ -2462,13 +2479,22 @@ impl PlayerAgent {
         let mut options = vec![
             AgentActionOptionTrace::new(
                 shot_label,
-                (observation.first_time_shot_score * quick_pressure_bonus * 0.52).clamp(0.01, 0.64),
+                (observation.first_time_shot_score * quick_pressure_bonus * 0.52 * shot_feasibility_gate)
+                    .clamp(0.0, 0.64),
                 shot_legal,
             ),
-            AgentActionOptionTrace::new("killer-pass", killer_pass_score, killer_pass_legal),
+            AgentActionOptionTrace::new(
+                "killer-pass",
+                killer_pass_score * pass_feasibility_gate,
+                killer_pass_legal,
+            ),
             AgentActionOptionTrace::new(
                 "first-time-pass",
-                (observation.first_time_pass_score * quick_pressure_bonus * 0.86).clamp(0.02, 0.88),
+                (observation.first_time_pass_score
+                    * quick_pressure_bonus
+                    * 0.86
+                    * pass_feasibility_gate)
+                    .clamp(0.0, 0.88),
                 pass_legal,
             ),
             AgentActionOptionTrace::new(
@@ -2478,8 +2504,9 @@ impl PlayerAgent {
                     * (0.34
                         + ability01(self.skills.first_touch) * 0.30
                         + ability01(self.skills.flair_passing) * 0.18
-                        + aerial_duel_skill_from_agent(self) * 0.18))
-                .clamp(0.02, 0.82),
+                        + aerial_duel_skill_from_agent(self) * 0.18)
+                    * pass_feasibility_gate)
+                .clamp(0.0, 0.82),
                 flick_on_legal,
             ),
             AgentActionOptionTrace::new(
@@ -2490,8 +2517,13 @@ impl PlayerAgent {
             ),
         ];
         if killer_pass_legal {
-            let floor = (0.24 + killer_pressure * 0.50 + threaded_quality * 0.12).clamp(0.34, 0.82);
-            ensure_min_legal_option_probability(&mut options, "killer-pass", floor);
+            // Only floor the killer ball up if it is physically on; a coin-flip
+            // one-touch through-ball must not be force-promoted over a settling touch.
+            if !one_touch_pass_blocked {
+                let floor =
+                    (0.24 + killer_pressure * 0.50 + threaded_quality * 0.12).clamp(0.34, 0.82);
+                ensure_min_legal_option_probability(&mut options, "killer-pass", floor);
+            }
             if killer_pressure >= 0.48 {
                 let recycle_multiplier = (1.0 - killer_pressure * 0.44).clamp(0.46, 1.0);
                 scale_legal_option_score(&mut options, "first-time-pass", recycle_multiplier);
@@ -2512,7 +2544,7 @@ impl PlayerAgent {
                 .perceived_pressure
                 .max(observation.immediate_dispossession_risk)
                 .clamp(0.0, 1.0);
-            if pressure >= 0.45 && pass_quality >= 0.5 {
+            if pressure >= 0.45 && pass_quality >= 0.5 && !one_touch_pass_blocked {
                 let dominance = (pressure * pass_quality).clamp(0.0, 1.0);
                 let first_time_floor = (0.40 + dominance * 0.50).clamp(0.40, 0.92);
                 ensure_min_legal_option_probability(

@@ -1294,18 +1294,19 @@ const TEAMMATE_SPACING_CLOCK_DECAY_RATE: f64 = 1.0;
 const RELATIONAL_SHAPE_NEIGHBORS: usize = 4;
 // Within this slack of the ideal relative offset the shape is "good enough" — no nudge,
 // no penalty. Roughly the half-width of the bands in the spec (2–6, 3–8, 3–10 …).
-const RELATIONAL_SHAPE_TOLERANCE_YARDS: f64 = 2.75;
+const RELATIONAL_SHAPE_TOLERANCE_YARDS: f64 = 2.25;
 // Bounded nudge toward the relationally-implied position: close this fraction of the
-// out-of-band error per tick, capped to this many yards, so it stays a gentle bias and
-// the player keeps making its own decision.
-const RELATIONAL_SHAPE_NUDGE_BIAS: f64 = 0.5;
-const RELATIONAL_SHAPE_MAX_NUDGE_YARDS: f64 = 1.25;
+// out-of-band error per tick, capped to this many yards. Tuned UP from 0.5/1.25: a
+// player that has drifted out of shape is pulled back toward its slot harder and faster
+// (the team holds its formation more tightly) while still keeping its own decision.
+const RELATIONAL_SHAPE_NUDGE_BIAS: f64 = 0.72;
+const RELATIONAL_SHAPE_MAX_NUDGE_YARDS: f64 = 2.6;
 // How strongly the formation-LP anchor is pulled toward the relational position (0 =
 // ignore, 1 = replace) at full out-of-band error. Small: the LP keeps owning the slot,
 // this only tilts a drifting player back toward relative-offset compliance. The pull
 // ramps from zero (in shape) to this cap as the out-of-band error reaches
 // `RELATIONAL_SHAPE_LP_ANCHOR_FULL_ERROR_YARDS`.
-const RELATIONAL_SHAPE_LP_ANCHOR_WEIGHT: f64 = 0.16;
+const RELATIONAL_SHAPE_LP_ANCHOR_WEIGHT: f64 = 0.26;
 const RELATIONAL_SHAPE_LP_ANCHOR_FULL_ERROR_YARDS: f64 = 8.0;
 // The LP re-anchoring only engages for a *genuinely* drifted player — the out-of-band
 // error must exceed this deadzone before the slot is tilted. Below it the gentle nudge
@@ -3903,6 +3904,15 @@ pub struct SoccerPomdpObservation {
     pub first_time_pass_score: f64,
     #[serde(default)]
     pub control_touch_score: f64,
+    /// Physical feasibility (0..1) of a clean ONE-touch pass / strike of the incoming
+    /// ball, from contact geometry (pace, height, turn angle) — see
+    /// [`one_touch_contact_feasibility`]. Scales the first-time option scores and vetoes
+    /// them when too low (the policy then takes a settling touch). 1.0 = no incoming /
+    /// trivial contact.
+    #[serde(default = "one_touch_feasibility_default")]
+    pub one_touch_pass_feasibility: f64,
+    #[serde(default = "one_touch_feasibility_default")]
+    pub one_touch_shot_feasibility: f64,
     #[serde(default)]
     pub skill_top_speed: f64,
     #[serde(default)]
@@ -12866,9 +12876,14 @@ fn sample_defensive_cover_target(rng: &mut SeededRandom) -> usize {
 }
 
 // A forward more advanced than the next-most-advanced opponent by more than this
-// (in yards along the attacking axis) is an isolated goal-hanger, not part of the
-// attacking line, and is ignored when anchoring the defensive cover line.
+// (in yards along the attacking axis) is isolated — not part of a coherent attacking
+// line — and (unless it is itself on/near the ball) is ignored when anchoring the
+// defensive cover line.
 const FOREMOST_ATTACKER_SUPPORT_GAP_YARDS: f64 = 16.0;
+// An attacker no more than this far goal-side of the ball is a live threat (on/about to
+// receive it) and always anchors the line, even alone. Only a lone attacker stranded
+// FURTHER goal-side than this, with no support, is treated as an ignorable goal-hanger.
+const FOREMOST_ATTACKER_BALL_THREAT_MARGIN_YARDS: f64 = 12.0;
 
 fn defensive_cover_profile(
     snapshot: &WorldSnapshot,
@@ -12877,38 +12892,42 @@ fn defensive_cover_profile(
 ) -> DefensiveCoverProfile {
     // The cover line is anchored to the most-advanced opponent attacker — but a LONE
     // forward stranded goal-side of our defence (a goal-hanger parked behind the keeper,
-    // far from any team-mate) must NOT define it: that drags the WHOLE block back onto
-    // our own goal (the "two teams separated" artefact). Pick the most-advanced
-    // *supported* attacker — one with another attacker within
-    // FOREMOST_ATTACKER_SUPPORT_GAP_YARDS along the attacking axis. An isolated forward
-    // is left to a single marker, not treated as the reference for the entire line.
-    // Degenerate fallback (every attacker isolated): the single most-advanced one.
+    // far from any team-mate AND far from the ball) must NOT define it: that drags the
+    // WHOLE block back onto our own goal (the "two teams separated" artefact). Anchor on
+    // the most-advanced attacker that is actually relevant: the ball carrier, OR an
+    // attacker on/near the ball (the live threat), OR one with another attacker within
+    // FOREMOST_ATTACKER_SUPPORT_GAP_YARDS along the attacking axis. A lone forward
+    // stranded well beyond the ball with no support is left to a single marker.
+    // Degenerate fallback (no attacker qualifies): the single most-advanced one.
     let opp_attack_dir = team.other().attack_dir();
-    let mut attacker_ys: Vec<f64> = snapshot
+    let ball_advancement = snapshot.ball.position.y * opp_attack_dir;
+    let ball_holder = snapshot.ball.holder;
+    // (id, y, advancement); advancement increases toward OUR goal.
+    let mut attackers: Vec<(usize, f64, f64)> = snapshot
         .players
         .iter()
         .filter(|player| player.team == team.other() && player.role != PlayerRole::Goalkeeper)
-        .filter_map(|player| snapshot.player_position(player.id).map(|position| position.y))
+        .filter_map(|player| {
+            snapshot
+                .player_position(player.id)
+                .map(|position| (player.id, position.y, position.y * opp_attack_dir))
+        })
         .collect();
-    // Most-advanced (deepest into our half, i.e. largest `y * opp_attack_dir`) first.
-    attacker_ys.sort_by(|a, b| {
-        (b * opp_attack_dir)
-            .partial_cmp(&(a * opp_attack_dir))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let foremost_attacker_y = attacker_ys
+    // Most-advanced (deepest into our half) first.
+    attackers.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let foremost_attacker_y = attackers
         .iter()
-        .enumerate()
-        .find(|(idx, &cand)| {
-            attacker_ys
-                .iter()
-                .enumerate()
-                .any(|(other_idx, &other)| {
-                    *idx != other_idx && (cand - other).abs() <= FOREMOST_ATTACKER_SUPPORT_GAP_YARDS
+        .find(|(id, _, advancement)| {
+            ball_holder == Some(*id)
+                || advancement - ball_advancement <= FOREMOST_ATTACKER_BALL_THREAT_MARGIN_YARDS
+                || attackers.iter().any(|(other_id, _, other_advancement)| {
+                    other_id != id
+                        && (advancement - other_advancement).abs()
+                            <= FOREMOST_ATTACKER_SUPPORT_GAP_YARDS
                 })
         })
-        .map(|(_, &cand)| cand)
-        .or_else(|| attacker_ys.first().copied());
+        .map(|(_, y, _)| *y)
+        .or_else(|| attackers.first().map(|(_, y, _)| *y));
 
     let actual = foremost_attacker_y
         .map(|attacker_y| {
@@ -41691,6 +41710,70 @@ fn control_touch_score_for_player(
         - pressure.clamp(0.0, 1.0) * 0.18
         - speed_penalty)
         .clamp(0.0, 1.0)
+}
+
+// --- One-touch contact feasibility (the "is this one-touch on, or a coin flip?" gate) -
+// The MDP/POMDP scores first-time pass/shot on skill + pressure but is blind to the
+// PHYSICS of meeting the ball: its height at contact, its pace, and how far you must
+// turn it. These factors give a physically-grounded success probability in [0, 1] that
+// scales the one-touch option scores and vetoes the option when it is too low (so the
+// policy falls back to a controlling touch). Pitch wetness is a hook for a future
+// surface-condition input; it defaults to dry (no effect) for now.
+const ONE_TOUCH_DEFAULT_PITCH_WETNESS: f64 = 0.0;
+// Below this feasibility a one-touch is a coin-flip — hard-suppress it so a settling
+// touch wins. Tuned so a normal ground ball at a comfortable pace stays ~1.0 (the gate
+// is near-identity for routine contacts and only bites awkward/fast/aerial/reverse ones).
+const ONE_TOUCH_VETO_FEASIBILITY: f64 = 0.30;
+const ONE_TOUCH_VETO_SUPPRESSION: f64 = 0.12;
+
+fn one_touch_feasibility_default() -> f64 {
+    1.0
+}
+
+/// Physical feasibility (0..1) of cleanly redirecting an incoming ball with ONE touch.
+/// Grounded in contact geometry rather than skill alone: the ball's pace and height at
+/// contact, plus (for a strike, where the target is unambiguous) the angle you must turn
+/// it through to hit the goal. First-touch skill widens every tolerance; pressure and a
+/// wet surface tighten them. `aerial_strike` = a volley/header that tolerates height
+/// (vs. a controlled ground pass that does not). `redirect_radians` is `None` when the
+/// outgoing direction is ambiguous (a pass could go many ways) and `Some(theta)` for a
+/// shot. A near-stationary ball at the feet is trivial — returns ~1.0.
+fn one_touch_contact_feasibility(
+    incoming_speed_yps: f64,
+    contact_height_yards: f64,
+    redirect_radians: Option<f64>,
+    first_touch_skill01: f64,
+    pressure01: f64,
+    wetness01: f64,
+    aerial_strike: bool,
+) -> f64 {
+    let skill = first_touch_skill01.clamp(0.0, 1.0);
+    let pressure = pressure01.clamp(0.0, 1.0);
+    let wetness = wetness01.clamp(0.0, 1.0);
+    // Pace: comfortable up to a skill-dependent threshold, then falls off. Skill in
+    // [0,1] lifts the comfortable pace ~10→18 yps and softens the decay.
+    let comfortable = 10.0 + 8.0 * skill;
+    let pace_excess = (incoming_speed_yps - comfortable).max(0.0);
+    let speed_factor = (1.0 - pace_excess / (30.0 + 22.0 * skill)).clamp(0.28, 1.0);
+    // Height: a controlled ground touch wants the ball low; a volley/header tolerates
+    // height. Measured from a knee-high ~0.3yd "free" band.
+    let height_excess = (contact_height_yards - 0.3).max(0.0);
+    let height_factor = if aerial_strike {
+        (1.0 - height_excess * 0.12).clamp(0.65, 1.0)
+    } else {
+        (1.0 - height_excess / (1.5 + 1.6 * skill)).clamp(0.12, 1.0)
+    };
+    // Turn angle (shots only): straight-on is free, reversing it is very hard.
+    let angle_factor = match redirect_radians {
+        Some(theta) => {
+            let turn = (theta.abs() / std::f64::consts::PI).clamp(0.0, 1.0);
+            (1.0 - turn * (1.0 - 0.45 * skill)).clamp(0.10, 1.0)
+        }
+        None => 1.0,
+    };
+    let pressure_factor = 1.0 - pressure * 0.12;
+    let wetness_factor = 1.0 - wetness * 0.15;
+    (speed_factor * height_factor * angle_factor * pressure_factor * wetness_factor).clamp(0.0, 1.0)
 }
 
 fn angle_between_vectors_degrees(a: Vec2, b: Vec2) -> f64 {

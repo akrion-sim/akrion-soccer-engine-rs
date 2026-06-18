@@ -16294,6 +16294,8 @@ impl WorldSnapshot {
                 first_time_shot_score: 0.0,
                 first_time_pass_score: 0.0,
                 control_touch_score: 0.0,
+                one_touch_pass_feasibility: 1.0,
+                one_touch_shot_feasibility: 1.0,
                 skill_top_speed: 0.0,
                 skill_acceleration: 0.0,
                 skill_stamina: 0.0,
@@ -16801,6 +16803,54 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Physical feasibility of a clean ONE-touch of this incoming ball: from its
+        // pace, its height at contact, and (for a strike) the angle we must turn it
+        // through to hit the goal. Lets the MDP/POMDP tell "this one-touch is on" from
+        // "this is a coin-flip"; consumed in `first_touch_action_options`.
+        let (one_touch_pass_feasibility, one_touch_shot_feasibility) = if first_touch_available {
+            let first_touch_skill01 = ability01(me.skills.first_touch);
+            let contact_height_yards = self.ball.altitude_yards.max(0.0);
+            let incoming_is_aerial = matches!(
+                incoming_kind,
+                IncomingBallKind::AerialPass | IncomingBallKind::AerialCross
+            );
+            // Direction the ball is travelling (fall back to origin→me when it is slow).
+            let travel = if self.ball.velocity.len() > 0.5 {
+                self.ball.velocity
+            } else {
+                incoming
+                    .and_then(|context| context.origin)
+                    .map(|origin| me_position - origin)
+                    .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir()))
+            };
+            let to_goal = goal - me_position;
+            let redirect_radians = if travel.len() > 1e-6 && to_goal.len() > 1e-6 {
+                Some(angle_between_vectors_degrees(travel, to_goal).to_radians())
+            } else {
+                None
+            };
+            let pass = one_touch_contact_feasibility(
+                incoming_speed_yps,
+                contact_height_yards,
+                None,
+                first_touch_skill01,
+                perceived_pressure,
+                ONE_TOUCH_DEFAULT_PITCH_WETNESS,
+                incoming_is_aerial,
+            );
+            let shot = one_touch_contact_feasibility(
+                incoming_speed_yps,
+                contact_height_yards,
+                redirect_radians,
+                first_touch_skill01,
+                perceived_pressure,
+                ONE_TOUCH_DEFAULT_PITCH_WETNESS,
+                true,
+            );
+            (pass, shot)
+        } else {
+            (1.0, 1.0)
+        };
         let shot_lane_open = has_ball && shot_block_probability <= 0.34;
         let yards_to_goal = (goal.y - me_position.y).abs();
         let opponent_goal_angle_degrees = self.goal_angle_degrees(me_position, me.team);
@@ -17153,6 +17203,8 @@ impl WorldSnapshot {
             first_time_shot_score,
             first_time_pass_score,
             control_touch_score,
+            one_touch_pass_feasibility,
+            one_touch_shot_feasibility,
             skill_top_speed: me.skills.top_speed,
             skill_acceleration: me.skills.acceleration,
             skill_stamina: me.skills.stamina,

@@ -9373,6 +9373,87 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
 }
 
 #[test]
+fn one_touch_feasibility_discriminates_easy_from_coin_flip() {
+    // Routine ground ball at a comfortable pace, no turn, decent first touch, dry, calm:
+    // a one-touch is clearly ON (gate ≈ identity).
+    let easy = one_touch_contact_feasibility(12.0, 0.0, None, 0.7, 0.0, 0.0, false);
+    assert!(easy > 0.85, "routine ground one-touch should be ~1.0, got {easy}");
+
+    // Fast, chest-high ball to a low-skill player under pressure: a coin-flip — must
+    // fall below the veto so a settling touch wins.
+    let hard = one_touch_contact_feasibility(30.0, 1.5, None, 0.3, 0.6, 0.0, false);
+    assert!(
+        hard < ONE_TOUCH_VETO_FEASIBILITY,
+        "fast chest-high one-touch under pressure should be vetoed, got {hard}"
+    );
+    assert!(hard < easy);
+
+    // A volley/header tolerates the same height far better than a controlled ground pass.
+    let strike_high = one_touch_contact_feasibility(18.0, 1.5, None, 0.6, 0.0, 0.0, true);
+    let pass_high = one_touch_contact_feasibility(18.0, 1.5, None, 0.6, 0.0, 0.0, false);
+    assert!(strike_high > pass_high);
+
+    // Turning a ball ~180° to hit the goal is much harder one-touch than striking it
+    // straight on.
+    let straight = one_touch_contact_feasibility(14.0, 0.2, Some(0.0), 0.6, 0.0, 0.0, true);
+    let reverse =
+        one_touch_contact_feasibility(14.0, 0.2, Some(std::f64::consts::PI), 0.6, 0.0, 0.0, true);
+    assert!(reverse < straight * 0.8, "reverse strike should be much harder");
+}
+
+#[test]
+fn defensive_cover_ignores_isolated_ball_less_goal_hanger() {
+    // Home defends y=0; Away attacks toward y=0. Away's outfield block sits as a
+    // coherent line ~y60, with the ball there (held by no one in particular), EXCEPT
+    // one forward parked on Home's goal line — a lone goal-hanger, NOT on the ball.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.last_touch_team = Some(Team::Away);
+    let mut x = 12.0;
+    let mut hung = false;
+    for player in sim
+        .players
+        .iter_mut()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+    {
+        if player.role == PlayerRole::Forward && !hung {
+            player.position = Vec2::new(40.0, 2.0); // stranded goal-hanger
+            hung = true;
+        } else {
+            player.position = Vec2::new(x, 60.0);
+            x += 5.0;
+        }
+    }
+    assert!(hung, "expected at least one forward to park as the goal-hanger");
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let profile = defensive_cover_profile(&snapshot, Team::Home, 2);
+    let foremost = profile.foremost_attacker_y.expect("an attacker exists");
+    // The supported block (~y60), not the stranded hanger at y2, sets the line.
+    assert!(
+        foremost > 40.0,
+        "isolated ball-less goal-hanger dragged the cover line to y={foremost}"
+    );
+
+    // But the SAME deep player, when it is the ball carrier, IS the live threat and
+    // must anchor the line (the defence has to step onto it).
+    let carrier_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && (p.position.y - 2.0).abs() < 1e-6)
+        .map(|p| p.id)
+        .expect("goal-hanger id");
+    sim.ball.holder = Some(carrier_id);
+    sim.ball.position = Vec2::new(40.0, 2.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let profile = defensive_cover_profile(&snapshot, Team::Home, 2);
+    assert!(
+        profile.foremost_attacker_y.expect("carrier") < 10.0,
+        "the lone ball CARRIER must anchor the line, not be ignored"
+    );
+}
+
+#[test]
 fn match_frame_exposes_central_brain_global_awareness() {
     let kickoff = SoccerMatch::default_11v11(MatchConfig::default()).to_frame();
     assert_eq!(kickoff.central_brain.possession_team, Some(Team::Home));
