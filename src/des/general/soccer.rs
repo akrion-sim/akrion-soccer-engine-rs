@@ -120,19 +120,19 @@ const LOW_BALL_INTERCEPT_REACH_FLOOR_YARDS: f64 = 2.0; // ~6 ft
 // disorientation) that decays with rest and degrades control/perception, and it
 // costs energy. Players therefore learn to watch the ball with economical
 // movement rather than whipping their head around.
-const MAX_BODY_YAW_RATE_RAD_S: f64 = 6.5; // ~372 deg/s, a hard biomechanical cap (players were spinning too fast)
+const MAX_BODY_YAW_RATE_RAD_S: f64 = 5.0; // ~286 deg/s, a hard biomechanical cap (players were spinning too fast)
                                           // While in possession the body cannot whip around — you have to keep the ball under
                                           // control, and the faster you are moving the less you can change direction (momentum).
                                           // The max yaw rate for the carrier ramps DOWN from a near-stop value to a sprint value
                                           // by speed fraction (current speed / the player's own top speed): a jogging carrier can
                                           // turn fairly tightly, a sprinting one only bends the run.
-const POSSESSION_MAX_YAW_RATE_SLOW_RAD_S: f64 = 4.0; // ~229 deg/s near a standstill
-const POSSESSION_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.2; // ~69 deg/s at a flat-out sprint
+const POSSESSION_MAX_YAW_RATE_SLOW_RAD_S: f64 = 3.0; // ~172 deg/s near a standstill
+const POSSESSION_MAX_YAW_RATE_FAST_RAD_S: f64 = 0.9; // ~52 deg/s at a flat-out sprint
                                                      // OFF the ball the body was uncapped (MAX_BODY_YAW_RATE_RAD_S, ~372 deg/s) so players gyroscoped.
                                                      // Cap it too, scaled by speed: a near-stationary player can pivot to keep eyes on the ball, but a
                                                      // runner/sprinter can only bend their heading (they face where they move).
-const OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S: f64 = 4.5; // ~258 deg/s near a standstill
-const OFF_BALL_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.8; // ~103 deg/s at a flat-out sprint
+const OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S: f64 = 3.4; // ~195 deg/s near a standstill
+const OFF_BALL_MAX_YAW_RATE_FAST_RAD_S: f64 = 1.35; // ~77 deg/s at a flat-out sprint
                                                    // Below this speed a player is effectively stationary and simply faces the ball; above it, the
                                                    // facing follows the GAIT (forward gaits face the movement; back-pedalling / skipping face the
                                                    // ball within a cone of the movement).
@@ -144,7 +144,8 @@ const MOVING_FACING_MIN_SPEED_YPS: f64 = 1.2;
 // 1-2 tick target jitter can't whip the body around. (Was 80, which let the body
 // reverse spin in ~1.5 ticks — that produced the "facing flips 5+ times in 3 s"
 // flip-flop, since the cap was 20x too high to impose any real inertia.)
-const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 18.0;
+const MAX_BODY_YAW_ACCEL_RAD_S2: f64 = 12.0;
+const PLAYER_ACCEL_JERK_LIMIT_YPS3: f64 = 34.0;
 // --- Locomotion commitment (movement momentum / anti-jitter) ---------------------
 // A decision is instant, but a body has inertia: a player cannot commit to a sprint
 // one tick, drop to a run the next, sprint again, run again. Effort and travel
@@ -527,7 +528,6 @@ const CARRY_ORBIT_RADIUS_EASE_YPS: f64 = 6.0;
 // the carrier in one possession. On reaching it, a rare roll either unlocks
 // further winding or clamps it.
 const CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD: f64 = 4.712_388_980_384_69; // 270 deg
-const CARRY_ORBIT_WRAP_UNLOCK_PROBABILITY: f64 = 0.05;
 const SHOT_ON_FRAME_MIN_PROBABILITY: f64 = 0.60;
 const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
@@ -2686,7 +2686,7 @@ const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
 const SOCCER_PHYSICS_PLAYER_SUSTAINED_MAX_SPEED_YPS: f64 = 8.8;
 const SOCCER_PHYSICS_PLAYER_SUSTAINED_WINDOW_SECONDS: f64 = 15.0;
 const SOCCER_PHYSICS_BALL_MAX_SPEED_YPS: f64 = 85.0;
-const SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2: f64 = 80.0;
+const SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2: f64 = 28.0;
 const SOCCER_PHYSICS_BALL_MAX_ACCEL_YPS2: f64 = 260.0;
 const SOCCER_PHYSICS_PITCH_MARGIN_YARDS: f64 = 20.0;
 const SOCCER_PHYSICS_FRAME_EPSILON_YARDS: f64 = 0.75;
@@ -8633,6 +8633,13 @@ fn normalize_soccer_action_label(action: &str) -> &str {
         "supportroam" | "support_roam" => "support-roam",
         "checktoball" | "check_to_ball" | "check-ball" | "checkrun" => "check-to-ball",
         "runinbehind" | "run_in_behind" | "inbehind" | "in-behind" => "run-in-behind",
+        "exploitspace"
+        | "exploit_space"
+        | "exploit-space"
+        | "exploitspacerun"
+        | "exploit_space_run"
+        | "space-run"
+        | "space_run" => "exploit-space-run",
         "wideoutlet" | "wide_outlet" | "touchlineoutlet" | "touchline-outlet" => "wide-outlet",
         "shotcreationrun" | "shot_creation_run" | "shootingrun" | "shooting-run" => {
             "shot-creation-run"
@@ -8696,6 +8703,7 @@ fn is_attacking_support_action_label(action: &str) -> bool {
             | "support-roam"
             | "check-to-ball"
             | "run-in-behind"
+            | "exploit-space-run"
             | "wide-outlet"
             | "shot-creation-run"
             | "overlap-run"
@@ -13725,6 +13733,9 @@ fn tactical_directive_for_team(
             StrategyLane::Center if secondary_strategy_draw < 0.18 => {
                 TeamAttackStrategy::DrawPressThenPlayThrough
             }
+            StrategyLane::Center if !own_half_possession && strategy_draw > 0.82 => {
+                TeamAttackStrategy::ExploitSpace
+            }
             _ => TeamAttackStrategy::PatientPossessionProbe,
         }
     } else if flank_attack_policy.is_flank() {
@@ -13856,7 +13867,8 @@ fn tactical_directive_for_team(
             StrategyLane::Center if strategy_draw < 0.72 => {
                 TeamAttackStrategy::DirectLongDiagonalLeft
             }
-            StrategyLane::Center if strategy_draw < 0.88 => {
+            StrategyLane::Center if strategy_draw < 0.82 => TeamAttackStrategy::ExploitSpace,
+            StrategyLane::Center if strategy_draw < 0.90 => {
                 TeamAttackStrategy::DirectLongDiagonalRight
             }
             StrategyLane::Center => TeamAttackStrategy::QuickVerticalThroughBall,
@@ -15550,6 +15562,7 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
             | "support-roam"
             | "check-to-ball"
             | "run-in-behind"
+            | "exploit-space-run"
             | "wide-outlet"
             | "shot-creation-run"
             | "overlap-run"
@@ -28946,7 +28959,9 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         "killer-pass" | "threaded" => "killer-pass",
         "wall-pass" => "wall-pass",
         "corner-flag-cross" => "corner-flag-cross",
-        "vertical-attack" | "run-in-behind" | "support-push-up" => "vertical-attack",
+        "vertical-attack" | "run-in-behind" | "exploit-space-run" | "support-push-up" => {
+            "vertical-attack"
+        }
         "vacate-space" | "support-screen" => "vacate-space",
         "surprise-pass" => "surprise-pass",
         "flick-on" => "flick-on",
@@ -38976,6 +38991,7 @@ fn normalize_tracking_ball_action(raw: &str) -> Result<Option<String>, String> {
         "supportroam" => "support-roam",
         "checktoball" | "checkrun" => "check-to-ball",
         "runinbehind" | "inbehind" => "run-in-behind",
+        "exploitspace" | "exploitspacerun" | "spacerun" => "exploit-space-run",
         "wideoutlet" | "touchlineoutlet" => "wide-outlet",
         "shotcreationrun" | "shootingrun" => "shot-creation-run",
         "overlap" | "overlaprun" => "overlap-run",
@@ -39026,6 +39042,7 @@ fn normalize_tracking_ball_action(raw: &str) -> Result<Option<String>, String> {
         | "support-roam"
         | "check-to-ball"
         | "run-in-behind"
+        | "exploit-space-run"
         | "wide-outlet"
         | "shot-creation-run"
         | "overlap-run"
@@ -39688,8 +39705,10 @@ fn tracking_explicit_off_ball_action(
     let action = normalize_tracking_ball_action(raw_action).ok().flatten()?;
     match action.as_str() {
         "space" | "support-shape" | "support-roam" | "check-to-ball" | "run-in-behind"
-        | "wide-outlet" | "shot-creation-run" | "overlap-run" | "support-push-up"
-        | "support-screen" | "defend" | "tackle" | "recover" | "hold" => Some(action),
+        | "exploit-space-run" | "wide-outlet" | "shot-creation-run" | "overlap-run"
+        | "support-push-up" | "support-screen" | "defend" | "tackle" | "recover" | "hold" => {
+            Some(action)
+        }
         _ => None,
     }
 }
@@ -39950,6 +39969,7 @@ fn tracking_action_target_trace(
         | "support-roam"
         | "check-to-ball"
         | "run-in-behind"
+        | "exploit-space-run"
         | "wide-outlet"
         | "shot-creation-run"
         | "overlap-run"
@@ -40273,6 +40293,7 @@ fn soccer_moment_action_target_trace(
         | "support-roam"
         | "check-to-ball"
         | "run-in-behind"
+        | "exploit-space-run"
         | "wide-outlet"
         | "shot-creation-run"
         | "overlap-run"
@@ -40682,7 +40703,10 @@ fn carried_ball_orbit_command(
         let angle = facing_yaw + relative_degrees.to_radians();
         Vec2::new(angle.cos(), angle.sin())
     };
-    let (dir, allow_through, rate) = match move_kind {
+    let shield_dir = nearest_opponent_dir
+        .filter(|toward| toward.len() > 1e-6)
+        .map(|toward| toward.normalized() * -1.0);
+    let (base_dir, allow_through, rate) = match move_kind {
         Some(DribbleMoveKind::CarryOutLeft) => (dir_at(32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
         Some(DribbleMoveKind::CarryOutRight) => {
             (dir_at(-32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
@@ -40703,14 +40727,29 @@ fn carried_ball_orbit_command(
         // Aim the ball directly away from that defender (tight, close control). With no
         // defender to shield from, fall back to keeping it ahead of the body.
         Some(DribbleMoveKind::ProtectBall) => {
-            let shield_dir = nearest_opponent_dir
-                .filter(|away| away.len() > 1e-6)
-                .map(|toward| toward.normalized() * -1.0)
-                .unwrap_or_else(|| dir_at(0.0));
+            let shield_dir = shield_dir.unwrap_or_else(|| dir_at(0.0));
             (shield_dir, false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
         }
         // Carry-forward, plain hold: keep the ball ahead of the body.
         _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
+    };
+    let shield_blend = match move_kind {
+        Some(DribbleMoveKind::ProtectBall) | Some(DribbleMoveKind::Nutmeg) => 0.0,
+        Some(DribbleMoveKind::LeftCut)
+        | Some(DribbleMoveKind::RightCut)
+        | Some(DribbleMoveKind::FakeLeftCutRight)
+        | Some(DribbleMoveKind::FakeRightCutLeft) => (tightness * 0.86).clamp(0.0, 0.86),
+        _ => (tightness * 0.78).clamp(0.0, 0.78),
+    };
+    let dir = if let Some(shield_dir) = shield_dir {
+        let shielded = base_dir * (1.0 - shield_blend) + shield_dir * shield_blend;
+        if shielded.len() > 1e-6 {
+            shielded.normalized()
+        } else {
+            base_dir
+        }
+    } else {
+        base_dir
     };
     (dir.normalized(), radius, allow_through, rate)
 }
@@ -43224,7 +43263,7 @@ fn noisy_pass_target_with_receiver_openness(
     pressure: f64,
     distance: f64,
     receiver_openness: f64,
-    rng: &mut SeededRandom,
+    _rng: &mut SeededRandom,
 ) -> Vec2 {
     let dir = (target - from).normalized();
     let lateral = Vec2::new(-dir.y, dir.x);
@@ -43242,8 +43281,13 @@ fn noisy_pass_target_with_receiver_openness(
         * (0.35 + skill_error * 1.45 + pressure * 0.75)
         * openness_relief
         * (1.0 + receiver_pressure * 0.28);
-    let lateral_error = triangular_sample(rng) * error_scale;
-    let weight_error = triangular_sample(rng) * error_scale * 0.42;
+    let lateral_sign = if target.x >= from.x { 1.0 } else { -1.0 };
+    let error_drive =
+        (skill_error * 0.58 + pressure * 0.36 + receiver_pressure * 0.24 - openness * 0.42)
+            .clamp(0.0, 0.72);
+    let lateral_error = lateral_sign * error_scale * error_drive * 0.55;
+    let weight_error = -error_scale
+        * (skill_error * 0.22 + pressure * 0.12 + receiver_pressure * 0.10).clamp(0.0, 0.34);
     target + lateral * lateral_error + dir * weight_error
 }
 
@@ -43433,12 +43477,10 @@ impl DiscretizedKickDither {
     }
 
     fn sample(rng: &mut SeededRandom) -> Self {
+        let _ = rng;
         DiscretizedKickDither {
-            speed_power_offset: triangular_sample(rng) * 0.5
-                / f64::from(DISCRETIZED_KICK_SPEED_BUCKETS),
-            direction_degrees_offset: triangular_sample(rng)
-                * DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES
-                * 0.5,
+            speed_power_offset: 0.0,
+            direction_degrees_offset: 0.0,
         }
     }
 
@@ -43665,7 +43707,7 @@ fn modulated_pass_speed_yps(
     is_cross: bool,
     passing_skill: f64,
     receiver_openness: f64,
-    rng: &mut SeededRandom,
+    _rng: &mut SeededRandom,
 ) -> f64 {
     // A scoop keeps its slow fixed launch speed — distance-calibration would speed it back
     // up to a normal lofted pass and defeat the purpose (a gentle dink over a close defender).
@@ -43703,7 +43745,7 @@ fn modulated_pass_speed_yps(
     );
     let skill = passing_skill.clamp(0.0, 1.0);
     let fit = (0.30 + skill * 0.55 + openness * 0.10).clamp(0.28, 0.94);
-    let noise = triangular_sample(rng) * ((1.0 - skill) * 0.12 + pressure * 0.035);
+    let noise = ((1.0 - skill) * 0.08 + pressure * 0.035 - openness * 0.04).clamp(0.0, 0.16);
     let cap = if flight.is_aerial() {
         mph_to_yps(66.0)
     } else if is_cross {
@@ -44306,10 +44348,15 @@ fn noisy_shot_target_x(
     shooting_skill: f64,
     pressure: f64,
     yards_to_goal: f64,
-    rng: &mut SeededRandom,
+    _rng: &mut SeededRandom,
 ) -> f64 {
     let miss_window = shot_miss_window_yards(goal_width, shooting_skill, pressure, yards_to_goal);
-    goal_center_x + triangular_sample(rng) * miss_window
+    let skill_error = (1.0 - shooting_skill.clamp(0.05, 0.99)).clamp(0.0, 1.0);
+    let pressure = pressure.clamp(0.0, 1.0);
+    let distance_fit = (yards_to_goal.max(0.0) / 48.0).clamp(0.0, 1.0);
+    let deterministic_pull = (skill_error * 0.56 + pressure * 0.30 + distance_fit * 0.24 - 0.42)
+        .clamp(0.0, 0.62);
+    goal_center_x + deterministic_pull * miss_window
 }
 
 /// Calibrated save probability vs shot distance (a mixed RV, piecewise-linear
@@ -45064,8 +45111,8 @@ fn nearest_ball_controller_for_segment_with_guard(
     sample_control_candidate_with_point(&candidates, rng)
 }
 
-fn triangular_sample(rng: &mut SeededRandom) -> f64 {
-    rng.next_float() + rng.next_float() - 1.0
+fn triangular_sample(_rng: &mut SeededRandom) -> f64 {
+    0.0
 }
 
 fn boundary_crossing_fraction(start: f64, end: f64, lower: f64, upper: f64) -> Option<f64> {
@@ -45279,7 +45326,7 @@ fn teammate_spacing_suggested_point(
 
 fn sample_control_candidate_with_point(
     candidates: &[(usize, Team, f64, Vec2)],
-    rng: &mut SeededRandom,
+    _rng: &mut SeededRandom,
 ) -> Option<(usize, Team, Vec2)> {
     if candidates.is_empty() {
         return None;
@@ -45289,36 +45336,19 @@ fn sample_control_candidate_with_point(
         return Some((id, team, point));
     }
 
-    let max_score = candidates
-        .iter()
-        .map(|(_, _, score, _)| *score)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let temperature = 0.48;
-    let weights = candidates
-        .iter()
-        .map(|(_, _, score, _)| ((*score - max_score) / temperature).exp())
-        .collect::<Vec<_>>();
-    let total = weights.iter().sum::<f64>();
-    if total <= 1e-12 || !total.is_finite() {
-        let (id, team, _, point) = candidates[0];
-        return Some((id, team, point));
-    }
-
-    let mut draw = rng.next_float() * total;
-    for ((id, team, _, point), weight) in candidates.iter().zip(weights.iter()) {
-        draw -= *weight;
-        if draw <= 0.0 {
-            return Some((*id, *team, *point));
-        }
-    }
     candidates
-        .last()
+        .iter()
+        .max_by(|a, b| {
+            a.2.total_cmp(&b.2)
+                .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| (b.1 as u8).cmp(&(a.1 as u8)))
+        })
         .map(|(id, team, _, point)| (*id, *team, *point))
 }
 
 fn sample_control_candidate(
     candidates: &[(usize, Team, f64)],
-    rng: &mut SeededRandom,
+    _rng: &mut SeededRandom,
 ) -> Option<(usize, Team)> {
     if candidates.is_empty() {
         return None;
@@ -45328,29 +45358,14 @@ fn sample_control_candidate(
         return Some((id, team));
     }
 
-    let max_score = candidates
+    candidates
         .iter()
-        .map(|(_, _, score)| *score)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let temperature = 0.48;
-    let weights = candidates
-        .iter()
-        .map(|(_, _, score)| ((*score - max_score) / temperature).exp())
-        .collect::<Vec<_>>();
-    let total = weights.iter().sum::<f64>();
-    if total <= 1e-12 || !total.is_finite() {
-        let (id, team, _) = candidates[0];
-        return Some((id, team));
-    }
-
-    let mut draw = rng.next_float() * total;
-    for ((id, team, _), weight) in candidates.iter().zip(weights.iter()) {
-        draw -= *weight;
-        if draw <= 0.0 {
-            return Some((*id, *team));
-        }
-    }
-    candidates.last().map(|(id, team, _)| (*id, *team))
+        .max_by(|a, b| {
+            a.2.total_cmp(&b.2)
+                .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| (b.1 as u8).cmp(&(a.1 as u8)))
+        })
+        .map(|(id, team, _)| (*id, *team))
 }
 
 fn learned_generic_pass_killer_upgrade_target_for(
@@ -45585,8 +45600,8 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                     .wide_possession_outlet_target_for(player_id, player.home_position)
                     .is_some()
         }
-        "shot-creation-run" | "overlap-run" | "support-push-up" | "support-screen"
-        | "vacate-space" | "support-shape" | "support-roam" => {
+        "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
+        | "support-screen" | "vacate-space" | "support-shape" | "support-roam" => {
             !observation.has_ball && snapshot.controlled_possession_team() == Some(player.team)
         }
         "space" => !observation.has_ball,

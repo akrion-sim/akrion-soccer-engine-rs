@@ -5,6 +5,8 @@
 use super::*;
 
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
+const STEAL_RISK_GOOD_OUTLET_PASS_LIFT: f64 = 1.05;
+const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
 
 fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
     matches!(
@@ -1566,6 +1568,28 @@ impl PlayerAgent {
         // defenders in possession, a fast-closing opponent increases that release lift
         // even before the gap has dropped below the 2-yard floor.
         let open_outlet_fit = observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+        let steal_pressure = pressure_urgency
+            .max(pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(pressure_rising * 0.90)
+            .max(defender_crowding)
+            .clamp(0.0, 1.0);
+        let good_escape_outlet_fit = floor_pass_quality
+            .max(aerial_pass_quality * 0.86)
+            .max(open_outlet_fit)
+            .max(open_support_fit * 0.72)
+            .clamp(0.0, 1.0);
+        let bad_escape_outlet_fit = (1.0 - good_escape_outlet_fit).clamp(0.0, 1.0);
+        let steal_risk_escape_lift =
+            (steal_pressure * bad_escape_outlet_fit).clamp(0.0, 1.0);
+        let steal_risk_good_outlet_pass_lift = (1.0
+            + steal_pressure * good_escape_outlet_fit * STEAL_RISK_GOOD_OUTLET_PASS_LIFT)
+            .clamp(1.0, 1.90);
+        let panic_pass_damp = (1.0
+            / (1.0 + steal_pressure * bad_escape_outlet_fit.powi(2) * 6.20))
+            .clamp(0.22, 1.0);
+        let closing_good_outlet_pass_lift =
+            (1.0 + pressure_rising * open_outlet_fit * 0.44).clamp(1.0, 1.38);
         let defender_closing_pass_lift = if self.role == PlayerRole::Defender {
             (1.0 + pressure_rising * DEFENDER_DRIBBLE_CLOSING_PASS_LIFT * open_outlet_fit)
                 .clamp(1.0, 1.42)
@@ -1574,7 +1598,9 @@ impl PlayerAgent {
         };
         let crowded_pass_lift = (1.0
             + defender_crowding * PASS_CROWDED_RELEASE_LIFT * open_outlet_fit)
-            * defender_closing_pass_lift;
+            * defender_closing_pass_lift
+            * closing_good_outlet_pass_lift
+            * steal_risk_good_outlet_pass_lift;
         // --- Positional dribble-risk appetite -----------------------------------------
         // Driving INTO pressure (taking a man on, carrying into traffic) is only worth the
         // risk for the most-advanced players — the three furthest forward. See
@@ -1582,11 +1608,7 @@ impl PlayerAgent {
         let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(observation.teammates_ahead);
         // How risky a dribble is right now: real pressure, a defender on top of the ball, or
         // a live chance of being dispossessed.
-        let dribble_risk = pressure_urgency
-            .max(observation.perceived_pressure)
-            .max(observation.immediate_dispossession_risk)
-            .max(defender_crowding)
-            .clamp(0.0, 1.0);
+        let dribble_risk = steal_pressure.max(observation.perceived_pressure).clamp(0.0, 1.0);
         // Deep carriers pay an escalating penalty for dribbling while at risk; the three
         // most-forward players keep their full take-on appetite (fit = 1 ⇒ no damp).
         let deep_pressure_dribble_damp =
@@ -1766,18 +1788,19 @@ impl PlayerAgent {
             (1.0 - observation.forward_dribble_space_yards / 6.0).clamp(0.0, 1.0)
         };
         let escape_urgency = (pressure_urgency.max(pressure) * forward_blocked).clamp(0.0, 1.0);
+        let steal_escape_urgency = escape_urgency.max(steal_risk_escape_lift).clamp(0.0, 1.0);
         // Lift the away-carry ceiling under escape pressure so a decisive break into
         // lateral space can outscore options that keep the holder pinned in the duel.
-        let carry_out_escape_ceiling = (0.96 + escape_urgency * 0.20).clamp(0.96, 1.16);
+        let carry_out_escape_ceiling = (0.96 + steal_escape_urgency * 0.26).clamp(0.96, 1.22);
         let carry_out_left_score = (carry_out_score
             * flank_drive_multiplier
             * (0.76 + (left_room / 18.0).clamp(0.0, 1.0) * 0.32)
-            * (1.0 + escape_urgency * (left_room / 12.0).clamp(0.0, 1.0) * 0.55))
+            * (1.0 + steal_escape_urgency * (left_room / 12.0).clamp(0.0, 1.0) * 0.66))
             .clamp(0.01, carry_out_escape_ceiling);
         let carry_out_right_score = (carry_out_score
             * flank_drive_multiplier
             * (0.76 + (right_room / 18.0).clamp(0.0, 1.0) * 0.32)
-            * (1.0 + escape_urgency * (right_room / 12.0).clamp(0.0, 1.0) * 0.55))
+            * (1.0 + steal_escape_urgency * (right_room / 12.0).clamp(0.0, 1.0) * 0.66))
             .clamp(0.01, carry_out_escape_ceiling);
         let carry_out_left_legal = carry_out_legal && left_room > 2.0;
         let carry_out_right_legal = carry_out_legal && right_room > 2.0;
@@ -1819,8 +1842,9 @@ impl PlayerAgent {
             + goal_side_shield * 0.34
             + own_half_retention
             + pressure_rising * 0.34
-            + pressured_no_outlet_shield * 0.30)
-            .clamp(0.88, 1.55);
+            + pressured_no_outlet_shield * 0.30
+            + steal_risk_escape_lift * STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT)
+            .clamp(0.88, 1.68);
         let protect_ball_score = (dribble_score
             * (0.12
                 + pressure_urgency.max(pressure) * 0.76
@@ -1828,6 +1852,7 @@ impl PlayerAgent {
                 + goal_side_shield * 0.46
                 + fresh_receipt_shield * 0.55
                 + pressured_no_outlet_shield * 0.60
+                + steal_risk_escape_lift * 0.82
                 + own_half_retention
                 // Rising pressure (a man bearing down) is exactly when you turn your
                 // body between him and the ball -- lift the shield's urgency hard.
@@ -1855,10 +1880,10 @@ impl PlayerAgent {
             * (0.30 + pressure_urgency.max(pressure) * 0.88)
             * (1.0
                 + (1.0 - observation.forward_dribble_space_yards / 14.0).clamp(0.0, 1.0) * 0.24
-                + escape_urgency * 0.55)
+                + steal_escape_urgency * 1.02)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, (0.82 + escape_urgency * 0.26).clamp(0.82, 1.08));
+            .clamp(0.01, (0.82 + steal_escape_urgency * 0.52).clamp(0.82, 1.34));
         let feint_legal =
             observation.nearest_opponent_distance <= 5.2 && pressure_urgency.max(pressure) >= 0.34;
         // Feints are already pressure-gated (feint_legal). Keep the ceiling low so a
@@ -1866,11 +1891,14 @@ impl PlayerAgent {
         // reserved for when they're genuinely needed under pressure. The calm-pass-focus
         // damp suppresses them further when an unpressured holder has a clean pass on.
         let feint_score = (dribble_score
-            * (0.22 + pressure_urgency * 0.66 + decision_urgency * 0.18)
+            * (0.22
+                + pressure_urgency * 0.66
+                + decision_urgency * 0.18
+                + steal_risk_escape_lift * 0.52)
             * (0.78 + dribbling * 0.28)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, 0.55);
+            .clamp(0.01, (0.55 + steal_escape_urgency * 0.28).clamp(0.55, 0.83));
         let hold_up_flank_score = ((self.preferences.dribble_bias
             * (0.46 + dribbling * 0.42 + ability01(self.skills.strength) * 0.18)
             * (0.74 + pressure * 0.18)
@@ -2268,6 +2296,7 @@ impl PlayerAgent {
                 * low_cross_multiplier
                 * crowded_pass_lift
                 * pressured_release_multiplier(observation)
+                * panic_pass_damp
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
             options.push(AgentActionOptionTrace::new(
@@ -2756,6 +2785,7 @@ impl PlayerAgent {
         let special_targets = SupportSpecialTargets {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
+            exploit_space: snapshot.exploit_space_run_target_for(self.id, self.home_position),
             wide_outlet: snapshot.wide_possession_outlet_target_for(self.id, self.home_position),
             flank_cross_arrival: snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position),
