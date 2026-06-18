@@ -1034,14 +1034,22 @@ const SHORT_PASS_BUILDUP_PENALTY: f64 = 2.8;
 // Scoop (lofted dink over a close defender): a teammate this far away, open on all sides by
 // this radius, with a defender within this distance of the direct lane.
 const SCOOP_PASS_MIN_RANGE_YARDS: f64 = 5.0;
-const SCOOP_PASS_MAX_RANGE_YARDS: f64 = 8.0;
-const SCOOP_PASS_RECEIVER_OPEN_RADIUS_YARDS: f64 = 4.0;
-const SCOOP_PASS_DEFENDER_LANE_RADIUS_YARDS: f64 = 1.8;
+// A delicate chip can comfortably clear a close defender onto a mate up to ~12yd away (was
+// 8.0, which — combined with the "open by 4yd" and "defender in the lane" gates below — made
+// the joint window geometrically near-impossible, so the scoop never fired in play).
+const SCOOP_PASS_MAX_RANGE_YARDS: f64 = 12.0;
+// The chip drops into a pocket: the receiver only needs ~3yd of space, not 4 (a 4yd ring while
+// a defender also sits in the lane is self-contradictory at these short ranges).
+const SCOOP_PASS_RECEIVER_OPEN_RADIUS_YARDS: f64 = 3.0;
+// A defender standing this far off the direct line still blocks a GROUND pass with their reach —
+// which is exactly what we lift the ball over (was 1.8, too tight to catch real blockers).
+const SCOOP_PASS_DEFENDER_LANE_RADIUS_YARDS: f64 = 2.4;
 // The carrier must be relatively surrounded (this many opponents within this radius) and the
-// receiver must sit within ±50° (a 100° cone) of the way the carrier is facing.
-const SCOOP_PASS_PASSER_CROWD_RADIUS_YARDS: f64 = 6.0;
+// receiver must sit within ±75° (a 150° cone) of the way the carrier is facing — a pressured
+// player chips across their body more than a tight ±50° allowed.
+const SCOOP_PASS_PASSER_CROWD_RADIUS_YARDS: f64 = 7.0;
 const SCOOP_PASS_PASSER_MIN_CROWD: usize = 2;
-const SCOOP_PASS_FACING_HALF_CONE_DEGREES: f64 = 50.0;
+const SCOOP_PASS_FACING_HALF_CONE_DEGREES: f64 = 75.0;
 const GOALMOUTH_CARRY_REWARD_POINTS: f64 = 1.35;
 const ENDLINE_DRIBBLE_TRAP_PENALTY_POINTS: f64 = 1.85;
 const LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS: f64 = 1.75;
@@ -2215,18 +2223,23 @@ const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
 // teammate and bursts past the man-to-beat into the onside space behind them; the wall
 // returns it first-time, led into the run. These seed the combination; the appetite to
 // attempt it (and the actual outcome) is emergent.
-/// The man-to-beat must sit within this many yards GOALSIDE/ahead of the carrier.
-const WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS: f64 = 7.0;
+/// The man-to-beat must sit within this many yards GOALSIDE/ahead of the carrier. Widened
+/// from 7.0: a one-two is the answer whenever a defender has stepped to engage, which starts
+/// a little further out than a tight 7yd — the narrow trigger zone was the main reason the
+/// combination so rarely became available.
+const WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS: f64 = 9.0;
 /// ...and within this lateral band of the carrier (he is in front, not out wide).
-const WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS: f64 = 4.5;
+const WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS: f64 = 6.0;
 /// ...and no further than this from the carrier (close enough that beating him matters).
-const WALL_PASS_MAN_TO_BEAT_RANGE_YARDS: f64 = 7.0;
+const WALL_PASS_MAN_TO_BEAT_RANGE_YARDS: f64 = 9.0;
 /// The burst run breaks into the channel this far to the side of the carrier.
 const WALL_PASS_RUN_CHANNEL_YARDS: f64 = 5.0;
 /// ...and this far forward (before the onside cap clamps it back behind the line).
 const WALL_PASS_RUN_FORWARD_YARDS: f64 = 12.0;
-/// The run must net at least this much ground toward goal to be worth attempting.
-const WALL_PASS_MIN_RUN_GAIN_YARDS: f64 = 6.0;
+/// The run must net at least this much ground toward goal to be worth attempting. Lowered
+/// from 6.0: near the box the onside cap legitimately clamps the burst short, so demanding a
+/// full 6yd net gain vetoed otherwise-good one-twos in the final third.
+const WALL_PASS_MIN_RUN_GAIN_YARDS: f64 = 4.0;
 /// Distance band carrier→wall for the lay-off (too short = no combination, too long =
 /// not a one-two).
 const WALL_PASS_GIVE_MIN_YARDS: f64 = 5.0;

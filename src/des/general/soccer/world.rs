@@ -4537,9 +4537,11 @@ impl SoccerMatch {
                     // Then hold the back four as a compact, FLAT, ball-side block (~4 lanes),
                     // each defender keeping its left-to-right slot.
                     let intent = snapshot.back_four_shape_adjusted_intent(intent);
-                    // Hold the midfield line 5-20yd in front of the back four.
+                    // Hold the midfield line 3-20yd in front of the back four (ideal 8
+                    // when defending).
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
-                    // Hold the striker line 5-20yd in front of the midfield line.
+                    // Hold the striker line 3-20yd in front of the midfield line (ideal 8
+                    // when defending).
                     let intent = snapshot.forward_line_band_adjusted_intent(intent);
                     // A forward/mid that chose to STAND while offside in our possession is a
                     // stranded goal-hanger; pull it straight back onside when the line-band
@@ -23134,7 +23136,8 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the midfield line's AVERAGE 5-20yd IN FRONT of the back four.
+    /// Keep the midfield line's AVERAGE 3-20yd IN FRONT of the back four, settling on an
+    /// 8yd ideal while out of possession.
     /// Every tick aims the line at the correction needed for ball-distance-aware consistency:
     /// close ball means roughly 1 second, far ball roughly 5 seconds, while accepting that
     /// physics/traffic may delay arrival.
@@ -23177,8 +23180,13 @@ impl WorldSnapshot {
         let mid_avg_fwd = mids.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / mids.len() as f64;
         let def_avg_fwd = defs.iter().sum::<f64>() / defs.len() as f64;
         let gap = mid_avg_fwd - def_avg_fwd; // midfield in front of the defenders
-        let desired_gap = gap.clamp(MID_AHEAD_OF_DEF_MIN_YARDS, MID_AHEAD_OF_DEF_MAX_YARDS);
-        let current_delta = desired_gap - gap;
+        // See `forward_line_band_adjusted_target`: hold the hard [MIN,MAX] band always,
+        // and settle on the IDEAL separation only while out of possession (a compact block
+        // that rides up off the back four). In our own possession we keep just the band so
+        // the midfield can push on without being stacked onto the defenders.
+        let defending = self.controlled_possession_team() != Some(me.team);
+        let hard_desired_gap =
+            gap.clamp(MID_AHEAD_OF_DEF_MIN_YARDS, MID_AHEAD_OF_DEF_MAX_YARDS);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
         let consistency_gain = self.shape_consistency_gain_for_player_target(
@@ -23186,9 +23194,34 @@ impl WorldSnapshot {
             target,
             MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS,
         );
-        let adjusted_fwd = if current_delta.abs() > 1e-6 {
-            current_fwd + current_delta * consistency_gain
+        let adjusted_fwd = if (hard_desired_gap - gap).abs() > 1e-6 {
+            // LINE out of band: reconnect. Defending → to the ideal stagger; in possession
+            // → just to the nearest band edge.
+            let reconnect_gap = if defending {
+                MID_AHEAD_OF_DEF_IDEAL_YARDS
+            } else {
+                hard_desired_gap
+            };
+            current_fwd + (reconnect_gap - gap) * consistency_gain
+        } else if defending {
+            // LINE in band while defending: gently bias the midfield AVERAGE toward the
+            // ideal separation, respecting this midfielder's own target (per-player share,
+            // no line-size multiplier).
+            let peer_sum_fwd = mids
+                .iter()
+                .filter(|(id, _)| *id != player_id)
+                .map(|(_, position)| fwd(*position))
+                .sum::<f64>();
+            let projected_avg_fwd = (peer_sum_fwd + target_fwd) / mids.len() as f64;
+            let projected_gap = projected_avg_fwd - def_avg_fwd;
+            let delta = MID_AHEAD_OF_DEF_IDEAL_YARDS - projected_gap;
+            if delta.abs() < 1e-6 {
+                return target;
+            }
+            target_fwd + delta * consistency_gain
         } else {
+            // LINE in band in possession: unchanged — only nudge if this midfielder's own
+            // target would push the line average out of the hard band.
             let peer_sum_fwd = mids
                 .iter()
                 .filter(|(id, _)| *id != player_id)
@@ -23233,9 +23266,10 @@ impl WorldSnapshot {
         return intent;
     }
 
-    /// Keep the striker/forward line's AVERAGE 5-20yd IN FRONT of the midfield line.
-    /// This mirrors [`Self::midfield_line_band_adjusted_target`] with the same
-    /// ball-distance-aware consistency horizon so 2-3 forwards stay connected without snapping.
+    /// Keep the striker/forward line's AVERAGE 3-20yd IN FRONT of the midfield line,
+    /// settling on an 8yd ideal while out of possession. This mirrors
+    /// [`Self::midfield_line_band_adjusted_target`] with the same ball-distance-aware
+    /// consistency horizon so 2-3 forwards stay connected without snapping.
     pub(crate) fn forward_line_band_adjusted_target(
         &self,
         player_id: usize,
