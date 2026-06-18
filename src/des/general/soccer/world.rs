@@ -1087,7 +1087,7 @@ impl SoccerMatch {
         &mut self,
         snapshot: SoccerNeuralNetworkSnapshot,
     ) -> Result<(), String> {
-        if !self.config.learning_enabled || !self.config.neural_learning.enabled {
+        if !self.config.neural_learning.enabled {
             self.neural_learner = None;
             return Ok(());
         }
@@ -1190,8 +1190,8 @@ impl SoccerMatch {
         snapshot: Option<SoccerNeuralNetworkSnapshot>,
         frozen: bool,
     ) -> Result<(), String> {
-        if !self.config.learning_enabled || !self.config.neural_learning.enabled {
-            // Neural learning disabled for this match: nothing to install.
+        if !self.config.neural_learning.enabled {
+            // Neural inference disabled for this match: nothing to install.
             match team {
                 Team::Home => self.neural_learner = None,
                 Team::Away => self.away_neural_learner = None,
@@ -1203,7 +1203,14 @@ impl SoccerMatch {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
                 SoccerNeuralLearner::from_network(&self.config, network)
             }
-            None => SoccerNeuralLearner::new(&self.config),
+            None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
+            None => {
+                match team {
+                    Team::Home => self.neural_learner = None,
+                    Team::Away => self.away_neural_learner = None,
+                }
+                return Ok(());
+            }
         };
         match team {
             Team::Home => {
@@ -4710,15 +4717,23 @@ impl SoccerMatch {
                 self.record_match_result_rewards_at(tick_start_snapshot.tick);
             }
             learning_defense_elapsed += phase_started.elapsed();
-            let has_tick_reward_events = self.reward_events.len() > reward_event_start;
+            let tick_reward_events = &self.reward_events[reward_event_start..];
+            let has_tick_reward_events = !tick_reward_events.is_empty();
+            let has_significant_learning_event =
+                Self::has_significant_learning_event(tick_reward_events);
+            let score_changed =
+                self.score_home != score_home_before || self.score_away != score_away_before;
             let period_start = self.config.period_start_after_tick(self.tick);
             let interval = self.config.learning_interval_ticks.max(1);
-            let learning_due = interval <= 1
-                || self.is_done()
-                || period_start.is_some()
-                || self.tick as usize % interval == 0;
             let capture_full_game =
                 self.config.learning_enabled && self.config.full_game_learning_enabled;
+            let cadence_learning_due = !capture_full_game
+                && (interval <= 1 || self.tick as usize % interval == 0);
+            let learning_due = self.is_done()
+                || period_start.is_some()
+                || has_significant_learning_event
+                || score_changed
+                || cadence_learning_due;
             // Retrieval capture must retain this episode's transitions itself: the
             // n-step outcome in `config_moments()` is summed from
             // `episode_learning_transitions`, so without this a corpus-builder that
@@ -4737,7 +4752,7 @@ impl SoccerMatch {
                     &next_snapshot,
                     score_home_before,
                     score_away_before,
-                    &self.reward_events[reward_event_start..],
+                    tick_reward_events,
                 );
                 learning_transition_elapsed += phase_started.elapsed();
                 if capture_full_game || capture_config_moments {
@@ -5188,6 +5203,25 @@ impl SoccerMatch {
     }
 
     fn record_reward_event_at(&mut self, tick: u64, player_id: usize, amount: f64) {
+        self.record_reward_event_at_with_kind(tick, player_id, amount, SoccerRewardEventKind::Routine);
+    }
+
+    fn record_reward_event_with_kind(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        self.record_reward_event_at_with_kind(self.tick, player_id, amount, kind);
+    }
+
+    fn record_reward_event_at_with_kind(
+        &mut self,
+        tick: u64,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.
@@ -5198,7 +5232,12 @@ impl SoccerMatch {
             tick,
             player_id,
             amount,
+            kind,
         });
+    }
+
+    pub(crate) fn has_significant_learning_event(events: &[SoccerRewardEvent]) -> bool {
+        events.iter().any(|event| event.kind.triggers_learning())
     }
 
     pub(crate) fn record_possession_touch(&mut self, player_id: usize) {
@@ -5495,6 +5534,84 @@ impl SoccerMatch {
         }
     }
 
+    fn queue_recent_significant_reward_transition(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        if !self.config.learning_enabled || amount <= 1e-9 || !amount.is_finite() {
+            return;
+        }
+        let Some(mut transition) = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .take_while(|transition| {
+                self.tick.saturating_sub(transition.tick) <= PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS
+            })
+            .find(|transition| {
+                transition.player_id == player_id
+                    && soccer_goal_credit_action_is_relevant(&transition.action)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        transition.reward = amount;
+        transition.done = false;
+        if transition.tick != self.tick {
+            self.record_reward_event_at_with_kind(transition.tick, player_id, amount, kind);
+        }
+        self.deferred_reward_transitions.push(transition);
+    }
+
+    fn record_significant_pass_chain_rewards(
+        &mut self,
+        chain: &[CompletedPassChainEntry],
+        total_amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        if chain.is_empty() || total_amount <= 1e-9 || !total_amount.is_finite() {
+            return;
+        }
+
+        let player_count = self.players.len();
+        let mut credits: Vec<(usize, f64)> = Vec::new();
+        let mut add_credit = |player_id: usize, amount: f64| {
+            if amount <= 1e-9 || player_id >= player_count {
+                return;
+            }
+            if let Some((_, total)) = credits
+                .iter_mut()
+                .find(|(existing_player, _)| *existing_player == player_id)
+            {
+                *total += amount;
+            } else {
+                credits.push((player_id, amount));
+            }
+        };
+
+        for (index, entry) in chain.iter().enumerate() {
+            let link_weight = match (chain.len(), index) {
+                (2, 0) => 0.56,
+                (2, 1) => 0.44,
+                (3, 0) => 0.44,
+                (3, 1) => 0.34,
+                (3, 2) => 0.22,
+                _ => 1.0 / chain.len() as f64,
+            };
+            let link_amount = total_amount * link_weight;
+            add_credit(entry.from, link_amount * 0.78);
+            add_credit(entry.to, link_amount * 0.22);
+        }
+
+        for (player_id, amount) in credits {
+            self.record_reward_event_with_kind(player_id, amount, kind);
+            self.queue_recent_significant_reward_transition(player_id, amount, kind);
+        }
+    }
+
     fn record_completed_pass_chain_entry(&mut self, pass: &PendingPass, receiver: usize) {
         let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
         if direction == PassDirectionBucket::Forward {
@@ -5522,6 +5639,27 @@ impl SoccerMatch {
             });
         while self.completed_pass_chain.len() > PASS_CHAIN_HISTORY_LIMIT {
             self.completed_pass_chain.pop_front();
+        }
+        let chain = self.recent_completed_pass_chain_into(pass.team, receiver, 3);
+        if chain.len() >= 2
+            && chain[0].direction == PassDirectionBucket::Forward
+            && chain[1].direction == PassDirectionBucket::Forward
+        {
+            self.record_significant_pass_chain_rewards(
+                &chain[..2],
+                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+                SoccerRewardEventKind::TwoForwardPasses,
+            );
+        }
+        if chain.len() >= 3 {
+            let net_forward_yards = (chain[0].end.y - chain[2].origin.y) * pass.team.attack_dir();
+            if net_forward_yards >= PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS {
+                self.record_significant_pass_chain_rewards(
+                    &chain[..3],
+                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS,
+                    SoccerRewardEventKind::ThreePassForwardNetGain,
+                );
+            }
         }
         // The entry above is now part of the chain, so a sterile run that ends on this pass
         // (the ball tapped around inside a tiny pocket without escaping) is penalized here.
@@ -5842,12 +5980,27 @@ impl SoccerMatch {
         primary_player: Option<usize>,
         pattern: &[f64],
     ) {
+        self.record_possession_reward_pattern_with_kind(
+            team,
+            primary_player,
+            pattern,
+            SoccerRewardEventKind::Routine,
+        );
+    }
+
+    fn record_possession_reward_pattern_with_kind(
+        &mut self,
+        team: Team,
+        primary_player: Option<usize>,
+        pattern: &[f64],
+        kind: SoccerRewardEventKind,
+    ) {
         if pattern.is_empty() {
             return;
         }
         let sequence = self.recent_possession_reward_sequence(team, primary_player, pattern.len());
         for (player_id, amount) in sequence.into_iter().zip(pattern.iter().copied()) {
-            self.record_reward_event(player_id, amount);
+            self.record_reward_event_with_kind(player_id, amount, kind);
         }
     }
 
@@ -5863,7 +6016,12 @@ impl SoccerMatch {
             .iter()
             .map(|w| w * scale)
             .collect();
-        self.record_possession_reward_pattern(shooting_team, Some(shooter), &scaled);
+        self.record_possession_reward_pattern_with_kind(
+            shooting_team,
+            Some(shooter),
+            &scaled,
+            SoccerRewardEventKind::ShotOnTarget,
+        );
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
@@ -6043,7 +6201,12 @@ impl SoccerMatch {
             transition.reward = amount;
             transition.done = false;
             if transition.tick != self.tick {
-                self.record_reward_event_at(transition.tick, transition.player_id, amount);
+                self.record_reward_event_at_with_kind(
+                    transition.tick,
+                    transition.player_id,
+                    amount,
+                    SoccerRewardEventKind::Goal,
+                );
             }
             self.deferred_reward_transitions.push(transition);
         }
@@ -6096,15 +6259,21 @@ impl SoccerMatch {
         if let Some(reward_points) =
             self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
         {
-            self.record_possession_reward_pattern(scoring_team, shooter, &[reward_points]);
+            self.record_possession_reward_pattern_with_kind(
+                scoring_team,
+                shooter,
+                &[reward_points],
+                SoccerRewardEventKind::Goal,
+            );
         } else if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
             );
-            self.record_possession_reward_pattern(
+            self.record_possession_reward_pattern_with_kind(
                 scoring_team,
                 shooter,
                 &GOAL_CHAIN_REWARD_PATTERN,
+                SoccerRewardEventKind::Goal,
             );
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
@@ -6140,7 +6309,12 @@ impl SoccerMatch {
             })
             .collect::<Vec<_>>();
         for (player_id, amount) in events {
-            self.record_reward_event_at(tick, player_id, amount);
+            self.record_reward_event_at_with_kind(
+                tick,
+                player_id,
+                amount,
+                SoccerRewardEventKind::MatchResult,
+            );
         }
     }
 

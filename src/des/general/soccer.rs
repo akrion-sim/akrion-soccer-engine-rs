@@ -1121,6 +1121,10 @@ const GOAL_CHAIN_REWARD_PATTERN: [f64; 5] = [30.0, 30.0, 20.0, 15.0, 5.0];
 const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 5] = [12.0, 12.0, 8.0, 6.0, 2.0];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
+const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 // --- Sterile vs. progressive passing WITHIN a retained possession (no turnover) ---
 // A handoff of the ball has a cost and every pass carries interception risk. A run of
 // STAGNANT_PASS_MIN_RUN+ completed passes whose ball travel never escapes this radius is
@@ -12091,8 +12095,8 @@ impl MatchConfig {
 
     pub fn live_gameplay() -> Self {
         MatchConfig {
-            learning_enabled: true,
-            learning_logging_enabled: true,
+            learning_enabled: false,
+            learning_logging_enabled: false,
             learning_interval_ticks: LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS,
             policy_train_max_transitions_per_tick:
                 LIVE_GAMEPLAY_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK,
@@ -12101,10 +12105,10 @@ impl MatchConfig {
             local_mpc_enabled: true,
             pass_anticipation_enabled: true,
             local_mpc_max_players_per_team: DEFAULT_LOCAL_MPC_MAX_PLAYERS_PER_TEAM,
-            // Full synergy in real games: the neural value/actor TRAIN (threaded) AND
-            // feed back into selection (Additive blend + actor-critic) so the nets
-            // integrate with the tabular MDP/POMDP policy, and the trained critic
-            // couples back to the LP (simplex/IPM) formation solver.
+            // Live gameplay prioritizes responsiveness: no online backprop in the
+            // frame loop, but an installed neural value/actor can still feed back into
+            // selection (Additive blend + actor-critic), and the trained critic can
+            // couple back to the LP (simplex/IPM) formation solver.
             neural_learning: SoccerNeuralLearningConfig {
                 enabled: true,
                 backend: SoccerNeuralLearningBackend::Threaded,
@@ -12656,6 +12660,30 @@ pub(crate) struct SoccerRewardEvent {
     tick: u64,
     player_id: usize,
     amount: f64,
+    kind: SoccerRewardEventKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerRewardEventKind {
+    Routine,
+    TwoForwardPasses,
+    ThreePassForwardNetGain,
+    ShotOnTarget,
+    Goal,
+    MatchResult,
+}
+
+impl SoccerRewardEventKind {
+    fn triggers_learning(self) -> bool {
+        matches!(
+            self,
+            SoccerRewardEventKind::TwoForwardPasses
+                | SoccerRewardEventKind::ThreePassForwardNetGain
+                | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::Goal
+                | SoccerRewardEventKind::MatchResult
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]

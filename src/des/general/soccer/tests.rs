@@ -14915,7 +14915,7 @@ fn live_server_default_uses_ten_minute_soft_realtime_match() {
     assert_eq!(config.total_ticks(), 9_000);
     assert_eq!(config.max_human_players, 4);
     assert_eq!(config.human_slots(), 4);
-    assert!(config.learning_enabled);
+    assert!(!config.learning_enabled);
     assert!(!config.learning_logging_enabled);
     assert!(!config.full_game_learning_enabled);
     // The live demo keeps the whole-field formation LP on so its guidance
@@ -21041,6 +21041,7 @@ fn realtime_session_step_json_round_trips() {
     let mut session = SoccerRealtimeSession::new(MatchConfig {
         duration_seconds: 1.0,
         learning_interval_ticks: 1,
+        full_game_learning_enabled: false,
         max_human_players: 2,
         seed: 12,
         ..Default::default()
@@ -26725,6 +26726,43 @@ fn neural_learning_resumes_from_saved_snapshot_weights() {
 }
 
 #[test]
+fn live_gameplay_installs_neural_snapshot_without_online_training() {
+    let training_config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            train_every_ticks: 1,
+            batch_size: 4,
+            max_batches_per_tick: 1,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 150_761,
+        ..Default::default()
+    };
+    let snapshot = SoccerMatch::default_11v11(training_config)
+        .learning_snapshot()
+        .neural_network
+        .expect("source neural snapshot");
+    let mut live = SoccerMatch::default_11v11(MatchConfig::live_gameplay())
+        .with_neural_network_snapshot(snapshot.clone())
+        .expect("live should install offline neural snapshot");
+    let before_steps = live.neural_training_steps_for(Team::Home);
+
+    live.run_time_step();
+
+    let installed = live
+        .learning_snapshot()
+        .neural_network
+        .expect("live neural snapshot remains installed");
+    assert_eq!(installed.parameter_count, snapshot.parameter_count);
+    assert_eq!(live.neural_training_steps_for(Team::Home), before_steps);
+    assert!(live.learning_transitions.is_empty());
+}
+
+#[test]
 fn neural_learning_rejects_snapshot_with_invalid_l2_norm() {
     let config = MatchConfig {
         duration_seconds: 0.2,
@@ -27686,15 +27724,15 @@ fn neural_learning_trains_on_threaded_backend() {
 }
 
 #[test]
-fn live_gameplay_defaults_keep_learning_threaded_and_bounded() {
+fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() {
     let config = MatchConfig::live_gameplay();
 
     assert_eq!(config.dt_seconds, DEFAULT_DT_SECONDS);
     assert_eq!(config.duration_seconds, DEFAULT_DURATION_SECONDS);
     assert_eq!(config.total_ticks(), 9_000);
     assert_eq!(config.human_slots(), 4);
-    assert!(config.learning_enabled);
-    assert!(config.learning_logging_enabled);
+    assert!(!config.learning_enabled);
+    assert!(!config.learning_logging_enabled);
     assert_eq!(
         config.learning_interval_ticks,
         LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS
@@ -29304,6 +29342,80 @@ fn shot_on_target_reward_assigns_scaled_chain_credit() {
     assert!(attacking_total > 0.0 && attacking_total <= 32.0 + 1e-9);
     assert!(attacking_total < SHOT_ON_TARGET_REWARD_POINTS);
     assert!(reward_for(7) > reward_for(5));
+}
+
+#[test]
+fn significant_forward_pass_chains_trigger_learning_and_backprop_credit() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 162,
+        learning_enabled: true,
+        ..Default::default()
+    });
+    sim.tick = 120;
+    sim.clock_seconds = 8.0;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    for (tick, player_id) in [(112, 5), (116, 7), (119, 9)] {
+        let observation = snapshot.observation_for(player_id);
+        sim.recent_learning_history
+            .push_back(SoccerLearningTransition {
+                tick,
+                player_id,
+                team: Team::Home,
+                role: sim.players[player_id].role,
+                state: snapshot.mdp_state_for_player(player_id),
+                observation: observation.clone(),
+                belief: belief_from_observation(&observation),
+                action: "pass".to_string(),
+                action_target: None,
+                decision_context: SoccerDecisionContext::default(),
+                tactical_trace: SoccerTacticalLearningTrace::default(),
+                reward: 0.0,
+                next_state: snapshot.mdp_state_for_player(player_id),
+                next_observation: observation,
+                done: false,
+            });
+    }
+
+    let pass1 = test_pending_pass(
+        Team::Home,
+        5,
+        7,
+        Vec2::new(35.0, 36.0),
+        Vec2::new(36.0, 44.0),
+    );
+    sim.ball.position = pass1.intended_target;
+    sim.record_completed_pass_reward(&pass1, 7);
+    assert!(!SoccerMatch::has_significant_learning_event(&sim.reward_events));
+
+    let pass2 = test_pending_pass(Team::Home, 7, 9, pass1.intended_target, Vec2::new(38.0, 53.0));
+    sim.ball.position = pass2.intended_target;
+    sim.record_completed_pass_reward(&pass2, 9);
+    assert!(sim
+        .reward_events
+        .iter()
+        .any(|event| event.kind == SoccerRewardEventKind::TwoForwardPasses));
+
+    let pass3 = test_pending_pass(Team::Home, 9, 10, pass2.intended_target, Vec2::new(41.0, 62.0));
+    sim.ball.position = pass3.intended_target;
+    sim.record_completed_pass_reward(&pass3, 10);
+    assert!(sim
+        .reward_events
+        .iter()
+        .any(|event| event.kind == SoccerRewardEventKind::ThreePassForwardNetGain));
+    assert!(SoccerMatch::has_significant_learning_event(&sim.reward_events));
+    assert!(sim
+        .deferred_reward_transitions
+        .iter()
+        .any(|transition| transition.player_id == 5
+            && transition.action == "pass"
+            && transition.reward > 0.0));
+    assert!(sim
+        .deferred_reward_transitions
+        .iter()
+        .any(|transition| transition.player_id == 9
+            && transition.action == "pass"
+            && transition.reward > 0.0));
 }
 
 #[test]
