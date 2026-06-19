@@ -9,6 +9,13 @@ const STEAL_RISK_GOOD_OUTLET_PASS_LIFT: f64 = 1.05;
 const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
+const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
+
+fn dd_soccer_disable_power_duration_ceiling() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_POWER_DURATION_CEILING").is_ok())
+}
 
 fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
     matches!(
@@ -1608,6 +1615,168 @@ impl PlayerAgent {
         let a0 = (v1 - v0) / dt_seconds;
         let a1 = (v2 - v1) / dt_seconds;
         (a1 - a0) / dt_seconds
+    }
+
+    pub(crate) fn update_body_orientation_dizziness_energy(
+        &mut self,
+        dt_seconds: f64,
+        ball_position: Vec2,
+        ball_holder: Option<usize>,
+    ) {
+        use std::f64::consts::{PI, TAU};
+
+        let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
+        let desired_dir = if ball_holder == Some(self.id) {
+            let raw = facing_bucket_to_vector(self.action_facing)
+                .filter(|v| v.len() > 1e-6)
+                .unwrap_or_else(|| Vec2::new(0.0, self.team.attack_dir()));
+            let forward = Vec2::new(0.0, self.team.attack_dir());
+            let blended = raw + forward * CARRIER_FORWARD_FACING_NUDGE;
+            let blended = if blended.len() > 1e-6 {
+                blended.normalized()
+            } else {
+                raw
+            };
+            let to_ball = ball_position - self.position;
+            let follow = if to_ball.len() > 1e-3 {
+                let to_ball_dir = to_ball.normalized();
+                blended * (1.0 - CARRIER_BALL_FACING_FOLLOW)
+                    + to_ball_dir * CARRIER_BALL_FACING_FOLLOW
+            } else {
+                blended
+            };
+            if follow.len() > 1e-6 {
+                follow.normalized()
+            } else {
+                blended
+            }
+        } else {
+            let to_ball = ball_position - self.position;
+            let ball_dir = if to_ball.len() > 1e-3 {
+                to_ball.normalized()
+            } else {
+                Vec2::new(0.0, self.team.attack_dir())
+            };
+            let velocity = self.velocity;
+            if velocity.len() < MOVING_FACING_MIN_SPEED_YPS {
+                ball_dir
+            } else {
+                let move_dir = velocity.normalized();
+                use std::f64::consts::FRAC_PI_2;
+                match self.movement_gait {
+                    MovementGait::Walk | MovementGait::Jog => {
+                        clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2)
+                    }
+                    MovementGait::Run => clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2 * 0.80),
+                    MovementGait::Sprint => {
+                        clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2 * 0.55)
+                    }
+                    MovementGait::BackWalk | MovementGait::BackJog | MovementGait::BackSkip => {
+                        clamp_dir_to_cone(ball_dir, move_dir * -1.0, FRAC_PI_2)
+                    }
+                    MovementGait::Skip | MovementGait::SideStep => {
+                        clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2)
+                    }
+                    MovementGait::Stand => ball_dir,
+                }
+            }
+        };
+
+        let desired_yaw = desired_dir.y.atan2(desired_dir.x);
+        let mut delta = desired_yaw - self.facing_yaw;
+        while delta > PI {
+            delta -= TAU;
+        }
+        while delta < -PI {
+            delta += TAU;
+        }
+
+        let max_rate_change = MAX_BODY_YAW_ACCEL_RAD_S2 * dt;
+        let top_speed = player_top_speed_yps(self.role, &self.skills).max(1e-6);
+        let speed_frac = (self.velocity.len() / top_speed).clamp(0.0, 1.0);
+        let max_yaw_rate = if ball_holder == Some(self.id) {
+            POSSESSION_MAX_YAW_RATE_SLOW_RAD_S
+                - speed_frac * (POSSESSION_MAX_YAW_RATE_SLOW_RAD_S - POSSESSION_MAX_YAW_RATE_FAST_RAD_S)
+        } else {
+            OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S
+                - speed_frac * (OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S - OFF_BALL_MAX_YAW_RATE_FAST_RAD_S)
+        };
+        let stopping_rate = (2.0 * MAX_BODY_YAW_ACCEL_RAD_S2 * delta.abs()).sqrt() * delta.signum();
+        let target_rate = stopping_rate.clamp(-max_yaw_rate, max_yaw_rate);
+        let new_rate = target_rate.clamp(self.yaw_rate - max_rate_change, self.yaw_rate + max_rate_change);
+        self.yaw_rate = new_rate;
+        let proposed_turn = (new_rate * dt).clamp(
+            -MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD,
+            MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD,
+        );
+        let actual_turn = if proposed_turn.abs() > delta.abs() {
+            delta
+        } else {
+            proposed_turn
+        };
+        self.facing_yaw += actual_turn;
+        while self.facing_yaw > PI {
+            self.facing_yaw -= TAU;
+        }
+        while self.facing_yaw < -PI {
+            self.facing_yaw += TAU;
+        }
+
+        let turn_rate = actual_turn.abs() / dt;
+        let accrual = (turn_rate - COMFORT_YAW_RATE_RAD_S).max(0.0) * DIZZINESS_GAIN_PER_RAD * dt;
+        self.dizziness =
+            ((self.dizziness + accrual) * (1.0 - DIZZINESS_RECOVERY_PER_SECOND * dt).max(0.0))
+                .clamp(0.0, DIZZINESS_MAX);
+
+        let rotation_fatigue = actual_turn.abs() * YAW_ENERGY_FATIGUE_PER_RAD;
+        let involvement_fatigue = if self.position.distance(ball_position) <= BALL_INVOLVEMENT_RADIUS_YARDS {
+            let intensity = match self.movement_gait {
+                MovementGait::Sprint => 1.0,
+                MovementGait::Run => 0.7,
+                _ => 0.35,
+            };
+            BALL_INVOLVEMENT_FATIGUE_PER_SECOND * intensity * dt
+        } else {
+            0.0
+        };
+        self.fatigue = (self.fatigue + rotation_fatigue + involvement_fatigue).clamp(0.0, 1.0);
+
+        if dd_soccer_disable_power_duration_ceiling() {
+            let burst_load = match self.movement_gait {
+                MovementGait::Sprint => ANAEROBIC_SPRINT_LOAD_PER_SECOND,
+                MovementGait::Run => ANAEROBIC_SPRINT_LOAD_PER_SECOND * 0.45,
+                _ => 0.0,
+            } * dt
+                + self.acceleration.len() * ANAEROBIC_ACCEL_LOAD_PER_YPS2 * dt;
+            self.anaerobic_load =
+                (self.anaerobic_load + burst_load - ANAEROBIC_RECOVERY_PER_SECOND * dt)
+                    .clamp(0.0, 1.0);
+        } else {
+            let cp = player_critical_power_w(&self.skills);
+            let w_prime_max = player_anaerobic_capacity_j(&self.skills);
+            let speed_yps = self.velocity.len();
+            let accel_forward_yps2 = if speed_yps > 0.5 {
+                dot(self.acceleration, self.velocity / speed_yps).max(0.0)
+            } else {
+                self.acceleration.len()
+            };
+            let demand = metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2);
+            let mut w_prime = (1.0 - self.anaerobic_load.clamp(0.0, 1.0)) * w_prime_max;
+            if demand >= cp {
+                let overshoot = demand - cp;
+                w_prime -= overshoot * dt;
+                let supra_cp_kj = overshoot * dt / 1000.0;
+                self.fatigue =
+                    (self.fatigue + supra_cp_kj * SUPRA_CP_AEROBIC_FATIGUE_PER_KJ).clamp(0.0, 1.0);
+            } else {
+                let mass_kg = player_weight_pounds(self.skills.weight_pounds) * KG_PER_POUND;
+                let restore = ((cp - demand) * ANAEROBIC_RECOVERY_GAIN)
+                    .min(ANAEROBIC_RECOVERY_CAP_W_PER_KG * mass_kg);
+                w_prime += restore * dt;
+            }
+            w_prime = w_prime.clamp(0.0, w_prime_max);
+            self.anaerobic_load = (1.0 - w_prime / w_prime_max).clamp(0.0, 1.0);
+        }
     }
 
     pub(crate) fn possession_action_options(
@@ -5025,6 +5194,31 @@ impl PlayerAgent {
                     single_action_option("recover"),
                     &action,
                     "recover",
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint,
+                };
+            }
+        }
+
+        if !has_ball {
+            if let Some((target, sprint)) = snapshot.controllable_ground_pass_trajectory_for(self.id)
+            {
+                let action = SoccerAction::MoveTo(target);
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state,
+                    observation,
+                    belief,
+                    vec![
+                        TRACE_REACTIVE_GROUND_PASS.to_string(),
+                        TRACE_TRAP_CONTROLLABLE_TRAJECTORY.to_string(),
+                    ],
+                    single_action_option(ACTION_LABEL_RECOVER),
+                    &action,
+                    ACTION_LABEL_RECOVER,
                 ));
                 return PlayerIntent {
                     player_id: self.id,

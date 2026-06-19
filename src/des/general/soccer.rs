@@ -79,6 +79,9 @@ pub const DEFAULT_BALL_GRASS_RESISTANCE_YPS2: f64 = 0.96;
 pub const DEFAULT_BALL_STOP_SPEED_YPS: f64 = 0.55;
 pub const DEFAULT_PLAYER_VISION_SKILL: f64 = 7.6;
 pub const DEFAULT_CONTROLLER_DEBOUNCE_MS: u64 = 4;
+const ACTION_LABEL_RECOVER: &str = "recover";
+const TRACE_REACTIVE_GROUND_PASS: &str = "reactive-ground-pass";
+const TRACE_TRAP_CONTROLLABLE_TRAJECTORY: &str = "trap-controllable-trajectory";
 const PLAYER_CONTROL_RADIUS_YARDS: f64 = 1.55;
 // First-touch settle cap: when a player gains control of a ball from a distance
 // (within the control radius but not at their feet), the held ball is drawn in to
@@ -115,6 +118,15 @@ const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
 // point (large ball-time-to-arrival) hands a distant defender a huge reach (sprint × seconds),
 // flagging defenders 25+ yd off the lane. Bounds the reach to a believable step-in radius.
 const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
+// During the launch tick, same-team bystanders ignore the first sliver of an outgoing pass so
+// the passer cannot ping it into a teammate standing on top of the kick animation. After this
+// progress, normal controllable-trajectory logic may take over.
+const PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS: f64 = 0.12;
+const REACTIVE_GROUND_PASS_MIN_SPEED_YPS: f64 = 1.0;
+const REACTIVE_GROUND_PASS_LOOKAHEAD_SECONDS: f64 = 1.40;
+const REACTIVE_GROUND_PASS_CLAIM_GAP_PENALTY_SECONDS_PER_YARD: f64 = 0.04;
+const REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS: f64 = 1e-3;
+const REACTIVE_GROUND_PASS_NUMERIC_EPSILON: f64 = 1e-6;
 // A ball flying overhead can only be contacted by players who can get up to it:
 // a standing reach plus a jump scaled by aerial ability. Higher balls fly over
 // grounded players (the correct "aerial pass passed through" behavior).
@@ -1251,17 +1263,17 @@ const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
 // along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line at least 2yd goal-side of the ball and no more than 30yd behind it. The
-// LP/formation nudge shifts the whole line to restore the band.
+// keep the line 5-25yd goal-side of the ball. The LP/formation nudge shifts the whole line to
+// restore the band, except inside the team's own emergency 5-yard goal-line zone where parity with
+// the ball is allowed.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min over {1,2,3}yd and max over values capped at 30yd.
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
-// THE rule: the back four's average sits 2-30yd behind (goal-side of) the ball, always.
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+// THE rule: the back four's average sits 5-25yd behind (goal-side of) the ball, always,
+// outside the team's own 5-yard emergency zone.
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -1274,10 +1286,10 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
-// The back-four band is suspended when the ball is within this of either goal line
-// (a ball on the end-line can't have the line sit just "behind" it without going
-// out of bounds).
-const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 8.0;
+// The back-four band is suspended only when the ball is inside the defending team's
+// own 5-yard emergency zone: a ball on the goal-line may be played level/parity
+// rather than forcing the line behind the end-line.
+const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 5.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
@@ -2099,6 +2111,10 @@ const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
 // touch that player before continuing to a later receiver. This is deliberately a
 // segment-level contact radius, not a scored reception preference.
 const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
+// Ground passes within this two-yard lane are controllable when reaction-delayed
+// reach says the player can trap them. Wider than body contact: it covers the step
+// or lunge onto a rolling pass that would otherwise ghost through a nearby player.
+const REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS: f64 = 2.0;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
 // looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
@@ -2291,10 +2307,13 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 10.0;
-/// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
-/// stays level/behind the line (timing the run) until the ball is actually played beyond it,
-/// rather than standing in an offside position.
+/// A staging run in behind is held this far ONSIDE of the second-last defender when
+/// strict legality is required.
 const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
+/// In open-space support movement, midfielders/forwards may stretch 0-3yd beyond
+/// the line. Offside enforcement still happens when the pass is played; this only
+/// lets the off-ball run use the full width/depth instead of camping a yard onside.
+const OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS: f64 = 3.0;
 // Wall-pass / one-two (give-and-go) geometry. A wall pass lays the ball off to a side-on
 // teammate and bursts past the man-to-beat into the onside space behind them; the wall
 // returns it first-time, led into the run. These seed the combination; the appetite to
@@ -46061,6 +46080,7 @@ fn nearest_ball_controller_for_segment_with_guard(
     let ball_segment_len = ball_segment.len();
     let mut candidates = Vec::new();
     let mut low_pass_body_contact: Option<(f64, f64, usize, Team, Vec2)> = None;
+    let mut reactive_ground_pass_trap: Option<(f64, f64, usize, Team, Vec2)> = None;
     for p in players {
         if same_tick_long_ball_launcher == Some(p.id) {
             continue;
@@ -46090,7 +46110,8 @@ fn nearest_ball_controller_for_segment_with_guard(
         if let Some(pass) = pending_pass {
             let is_target = pass.target == Some(p.id);
             let progress = pass_progress_along_path(pass, control_point);
-            let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
+            let same_tick_launch = current_tick <= pass.launch_tick
+                && progress < PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS;
             let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
             let contact_altitude = pass_altitude_at_point(pass, control_point);
             let same_team_launch_bystander =
@@ -46116,6 +46137,50 @@ fn nearest_ball_controller_for_segment_with_guard(
                         p.team,
                         control_point,
                     ));
+                }
+            }
+            if !is_target
+                && matches!(pass.flight, PassFlight::Floor)
+                && contact_altitude <= BALL_ROLLING_ALTITUDE_YARDS
+                && !is_own_outgoing_pass
+                && !same_team_launch_bystander
+                && body_contact_distance <= REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS
+            {
+                let pass_arrival = (pass.distance_yards
+                    / pass.launch_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS)
+                    * progress.clamp(0.0, 1.0))
+                .max(
+                    (control_point - previous_ball_pos).len()
+                        / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS),
+                );
+                let reaction_window = (pass_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+                    .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+                let player_speed = player_top_speed_yps(p.role, &p.skills)
+                    * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                    * MovementGait::Sprint.speed_multiplier();
+                let reach = INTERCEPT_LUNGE_REACH_YARDS + player_speed * reaction_window;
+                let cone_quality =
+                    player_facing_ball_control_multiplier(p, control_point, ball_speed);
+                if body_contact_distance <= reach
+                    && (cone_quality >= CONTROL_MIN_VIABLE_QUALITY
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                {
+                    let replace = reactive_ground_pass_trap.as_ref().is_none_or(
+                        |(best_projection, best_distance, _, _, _)| {
+                            control_projection < *best_projection - 1e-9
+                                || ((control_projection - *best_projection).abs() <= 1e-9
+                                    && body_contact_distance < *best_distance)
+                        },
+                    );
+                    if replace {
+                        reactive_ground_pass_trap = Some((
+                            control_projection,
+                            body_contact_distance,
+                            p.id,
+                            p.team,
+                            control_point,
+                        ));
+                    }
                 }
             }
         }
@@ -46150,7 +46215,8 @@ fn nearest_ball_controller_for_segment_with_guard(
                     }
                 }
             }
-            let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
+            let same_tick_launch = current_tick <= pass.launch_tick
+                && progress < PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS;
             if same_tick_launch && p.team == pass.team && !is_target {
                 control_radius *= 0.35;
             }
@@ -46338,7 +46404,21 @@ fn nearest_ball_controller_for_segment_with_guard(
             + aerial_score_bonus;
         candidates.push((p.id, p.team, score, control_point));
     }
-    if let Some((_, _, id, team, point)) = low_pass_body_contact {
+    let forced_ground_control = match (low_pass_body_contact, reactive_ground_pass_trap) {
+        (Some(low), Some(reactive)) => {
+            if reactive.0 < low.0 - 1e-9
+                || ((reactive.0 - low.0).abs() <= 1e-9 && reactive.1 < low.1)
+            {
+                Some(reactive)
+            } else {
+                Some(low)
+            }
+        }
+        (Some(low), None) => Some(low),
+        (None, Some(reactive)) => Some(reactive),
+        (None, None) => None,
+    };
+    if let Some((_, _, id, team, point)) = forced_ground_control {
         return Some((id, team, point));
     }
     sample_control_candidate_with_point(&candidates, rng)
@@ -47453,13 +47533,13 @@ fn default_agent_preferences(
         }
         PlayerRole::Midfielder if shirt == 8 => {
             preferences.pass_bias = 0.80;
-            preferences.open_space_bias = 0.86;
+            preferences.open_space_bias = 0.92;
             preferences.offensive_mindedness = 0.76;
             preferences.defensive_mindedness = 0.50;
         }
         PlayerRole::Midfielder => {
             preferences.pass_bias = 0.76;
-            preferences.open_space_bias = 0.82;
+            preferences.open_space_bias = 0.88;
             preferences.offensive_mindedness = 0.70;
             preferences.defensive_mindedness = 0.52;
         }
@@ -47467,6 +47547,7 @@ fn default_agent_preferences(
             preferences.shoot_bias = 0.78;
             preferences.pass_bias = 0.48;
             preferences.dribble_bias = 0.82;
+            preferences.open_space_bias = 0.94;
             preferences.offensive_mindedness = 0.88;
             preferences.defensive_mindedness = 0.30;
         }

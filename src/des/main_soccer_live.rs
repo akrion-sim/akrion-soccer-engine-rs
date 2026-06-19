@@ -5,6 +5,12 @@ use crate::des::general::soccer::{
 };
 
 pub const SOCCER_LIVE_REVIVAL_PORT: u16 = 5056;
+const LIVE_MPC_DEFAULT_PLAYER_HORIZON: usize = 12;
+const LIVE_MPC_MAX_PLAYER_HORIZON: usize = 45;
+const LIVE_MPC_DEFAULT_ACTIVE_RADIUS_YARDS: f64 = 5.0;
+const LIVE_LOCAL_MPC_DEFAULT_ENABLED: bool = false;
+const LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM: usize = 1;
+const LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 
 fn env_value<F>(lookup: &F, primary: &str, fallback: &str) -> Option<String>
 where
@@ -52,6 +58,13 @@ where
     env_value(lookup, primary, fallback)
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn env_nonnegative_usize<F>(lookup: &F, primary: &str, fallback: &str) -> Option<usize>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_value(lookup, primary, fallback).and_then(|raw| raw.parse::<usize>().ok())
 }
 
 fn env_nonnegative_f64<F>(lookup: &F, primary: &str, fallback: &str) -> Option<f64>
@@ -108,6 +121,11 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mut cfg = SoccerLiveServerConfig::default();
+    cfg.match_config.mpc.player_horizon = LIVE_MPC_DEFAULT_PLAYER_HORIZON;
+    cfg.match_config.mpc.active_radius_yards = LIVE_MPC_DEFAULT_ACTIVE_RADIUS_YARDS;
+    cfg.match_config.local_mpc_enabled = LIVE_LOCAL_MPC_DEFAULT_ENABLED;
+    cfg.match_config.local_mpc_max_players_per_team =
+        LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM;
     if let Some(host) = env_text(&lookup, "SOCCER_LIVE_HOST", "SOCCER_HOST") {
         cfg.host = host;
     }
@@ -212,9 +230,10 @@ where
     // MPC execution layer: when enabled, the per-player projected-gradient QP
     // (`PlanarPointMassMpc`) plans each active player's next-tick velocity, is made
     // field-aware (other players + ball as moving keep-outs), and is reconciled/blended
-    // with the neural-policy velocity. Off by default (byte-identical); this master
-    // toggle turns the whole stack on so the QP + neural net actually drive execution.
-    if let Some(mpc) = env_bool(&lookup, "SOCCER_LIVE_MPC", "SOCCER_MPC_ENABLED") {
+    // with the neural-policy velocity. The separate formation-local MPC is much more
+    // expensive in the live HTTP loop, so it stays opt-in and capped below.
+    let live_mpc = env_bool(&lookup, "SOCCER_LIVE_MPC", "SOCCER_MPC_ENABLED");
+    if let Some(mpc) = live_mpc {
         cfg.match_config.mpc.tier2_player_enabled = mpc;
         cfg.match_config.mpc.field_aware_enabled = mpc;
         cfg.match_config.mpc.reconcile_enabled = mpc;
@@ -224,10 +243,40 @@ where
             );
         }
     }
+    if let Some(local_mpc) = env_bool(
+        &lookup,
+        "SOCCER_LIVE_LOCAL_MPC",
+        "SOCCER_LOCAL_MPC",
+    ) {
+        cfg.match_config.local_mpc_enabled = local_mpc;
+    }
+    if let Some(max_players) = env_nonnegative_usize(
+        &lookup,
+        "SOCCER_LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+        "SOCCER_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+    ) {
+        cfg.match_config.local_mpc_max_players_per_team =
+            max_players.min(LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT);
+    }
+    if cfg.match_config.local_mpc_max_players_per_team == 0 || live_mpc == Some(false) {
+        cfg.match_config.local_mpc_enabled = false;
+    }
+    if cfg.match_config.local_mpc_enabled {
+        println!(
+            "# soccer-live: formation-local MPC enabled for up to {} player(s)/team",
+            cfg.match_config.local_mpc_max_players_per_team
+        );
+    }
+    if let Some(horizon) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_MPC_PLAYER_HORIZON",
+        "SOCCER_MPC_PLAYER_HORIZON",
+    ) {
+        cfg.match_config.mpc.player_horizon = horizon.min(LIVE_MPC_MAX_PLAYER_HORIZON);
+    }
     // How close to the ball a player must be to run the per-player MPC (the "active
-    // subset"). Default ~14yd keeps it near the ball; raise it past the pitch diagonal to
-    // have ALL 22 plan their execution through the field-aware QP. There is ample per-tick
-    // budget for it (the field loop is a small fraction of the step), so this is safe.
+    // subset"). The live default is tighter than the base match config because this
+    // path runs inside the HTTP frame loop; raise it only for profiling/heavier runs.
     if let Some(radius) = env_positive_f64(
         &lookup,
         "SOCCER_LIVE_MPC_ACTIVE_RADIUS",
@@ -368,22 +417,92 @@ mod tests {
         assert!(default_on.match_config.mpc.tier2_player_enabled);
         assert!(default_on.match_config.mpc.field_aware_enabled);
         assert!(default_on.match_config.mpc.reconcile_enabled);
+        assert_eq!(
+            default_on.match_config.mpc.player_horizon,
+            LIVE_MPC_DEFAULT_PLAYER_HORIZON
+        );
+        assert_eq!(
+            default_on.match_config.mpc.active_radius_yards,
+            LIVE_MPC_DEFAULT_ACTIVE_RADIUS_YARDS
+        );
+        assert!(!default_on.match_config.local_mpc_enabled);
+        assert_eq!(
+            default_on.match_config.local_mpc_max_players_per_team,
+            LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM
+        );
 
         // SOCCER_LIVE_MPC=0 turns the whole stack off (analytic path).
-        let off_vars = BTreeMap::from([("SOCCER_LIVE_MPC", "0")]);
+        let off_vars = BTreeMap::from([
+            ("SOCCER_LIVE_MPC", "0"),
+            ("SOCCER_LIVE_LOCAL_MPC", "1"),
+        ]);
         let off =
             live_server_config_from_lookup(|name| off_vars.get(name).map(|value| value.to_string()));
         assert!(!off.match_config.mpc.tier2_player_enabled);
         assert!(!off.match_config.mpc.field_aware_enabled);
         assert!(!off.match_config.mpc.reconcile_enabled);
+        assert!(!off.match_config.local_mpc_enabled);
 
-        // SOCCER_LIVE_MPC=1 keeps the whole QP + field-aware + neural-reconcile stack on.
+        // SOCCER_LIVE_MPC=1 keeps the active-player QP + field-aware + neural-reconcile
+        // stack on; formation-local MPC stays separate because it is heavier in live HTTP.
         let on_vars = BTreeMap::from([("SOCCER_LIVE_MPC", "1")]);
         let on =
             live_server_config_from_lookup(|name| on_vars.get(name).map(|value| value.to_string()));
         assert!(on.match_config.mpc.tier2_player_enabled);
         assert!(on.match_config.mpc.field_aware_enabled);
         assert!(on.match_config.mpc.reconcile_enabled);
+        assert!(!on.match_config.local_mpc_enabled);
+    }
+
+    #[test]
+    fn live_server_mpc_profile_is_lightweight_with_heavier_env_override() {
+        let vars = BTreeMap::from([
+            ("SOCCER_LIVE_MPC_PLAYER_HORIZON", "99"),
+            ("SOCCER_LIVE_MPC_ACTIVE_RADIUS", "18"),
+        ]);
+        let cfg =
+            live_server_config_from_lookup(|name| vars.get(name).map(|value| value.to_string()));
+
+        assert_eq!(
+            cfg.match_config.mpc.player_horizon,
+            LIVE_MPC_MAX_PLAYER_HORIZON
+        );
+        assert_eq!(cfg.match_config.mpc.active_radius_yards, 18.0);
+    }
+
+    #[test]
+    fn live_server_local_mpc_is_opt_in_and_capped() {
+        let vars = BTreeMap::from([
+            ("SOCCER_LIVE_LOCAL_MPC", "1"),
+            ("SOCCER_LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM", "4"),
+        ]);
+        let cfg =
+            live_server_config_from_lookup(|name| vars.get(name).map(|value| value.to_string()));
+        assert!(cfg.match_config.local_mpc_enabled);
+        assert_eq!(cfg.match_config.local_mpc_max_players_per_team, 4);
+
+        let clamped_vars = BTreeMap::from([
+            ("SOCCER_LIVE_LOCAL_MPC", "1"),
+            ("SOCCER_LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM", "99"),
+        ]);
+        let clamped = live_server_config_from_lookup(|name| {
+            clamped_vars.get(name).map(|value| value.to_string())
+        });
+        assert!(clamped.match_config.local_mpc_enabled);
+        assert_eq!(
+            clamped.match_config.local_mpc_max_players_per_team,
+            LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT
+        );
+
+        let zero_vars = BTreeMap::from([
+            ("SOCCER_LIVE_LOCAL_MPC", "1"),
+            ("SOCCER_LIVE_LOCAL_MPC_MAX_PLAYERS_PER_TEAM", "0"),
+        ]);
+        let zero = live_server_config_from_lookup(|name| {
+            zero_vars.get(name).map(|value| value.to_string())
+        });
+        assert!(!zero.match_config.local_mpc_enabled);
+        assert_eq!(zero.match_config.local_mpc_max_players_per_team, 0);
     }
 
     #[test]
