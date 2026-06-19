@@ -152,6 +152,8 @@ spec:
                 secretKeyRef:
                   name: dd-remote-rest-api-secrets
                   key: RDS_DATABASE_URL
+            - name: SOCCER_PG_TLS_INSECURE
+              value: "1"
             - name: SOCCER_REQUIRE_POSTGRES
               value: "true"
             - name: SOCCER_RUN_ID_PREFIX
