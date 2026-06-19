@@ -14889,6 +14889,11 @@ fn dd_soccer_disable_offball_settle() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OFFBALL_SETTLE").is_ok())
 }
+fn dd_soccer_disable_reception_urgency() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
 
 fn pending_pass_snapshot_from(
     pass: &PendingPass,
@@ -21258,12 +21263,22 @@ impl WorldSnapshot {
                 // ball"). Strong pull under pressure; a smaller but non-zero pull even when
                 // unpressured, so a free receiver still attacks the ball yet may let a low ball
                 // run a little onto a better foot.
+                // Urgency to MEET the ball: pull the reception point earlier along the flight so
+                // the receiver attacks the pass and controls it sooner, instead of backing off and
+                // letting it run to his feet ("dancing around the ball"). Strong under pressure;
+                // still firm when free. Decisive early arrival is also energy-cheaper than dithering
+                // (one committed approach vs. repeated stop-start re-adjustments near the ball).
+                let (pressured_early, free_early) = if dd_soccer_disable_reception_urgency() {
+                    (0.36, 0.22)
+                } else {
+                    (0.58, 0.42)
+                };
                 let pressure_early_touch_bonus = if pressured_reception {
-                    (1.0 - t / horizon.max(0.01)).clamp(0.0, 1.0) * 0.36
+                    (1.0 - t / horizon.max(0.01)).clamp(0.0, 1.0) * pressured_early
                 } else {
                     // Even a FREE receiver steps to meet the ball (receive with assurance,
                     // attack the pass) rather than waiting for it to arrive at their feet.
-                    (1.0 - t / horizon.max(0.01)).clamp(0.0, 1.0) * 0.22
+                    (1.0 - t / horizon.max(0.01)).clamp(0.0, 1.0) * free_early
                 };
                 let forward_receive =
                     ((candidate.y - current.y) * me.team.attack_dir()).clamp(-4.0, 12.0);
@@ -21305,11 +21320,44 @@ impl WorldSnapshot {
         self.player_snapshot_position(player).distance(target) / speed
     }
 
+    /// "In-position-ness" of controlling the ball at `point`, expressed as a time bonus (seconds)
+    /// subtracted from a candidate receiver's raw arrival time in the reception election. It rewards
+    /// the player who would control the ball where they are most useful for BOTH phases — close to
+    /// their formation-LP/IPM ideal slot (the LP solves the team's balanced offensive+defensive
+    /// shape) and in open space (an offensive outlet). Bounded to `RECEIVER_IN_POSITION_MAX_BONUS_SECONDS`
+    /// so it only ever decides genuinely close races: raw arrival time stays the primary factor (the
+    /// closest player to the ball still normally wins), and the most in-position player wins a tie.
+    fn pass_receiver_in_position_bonus(&self, player: &PlayerSnapshot, point: Vec2) -> f64 {
+        if dd_soccer_disable_reception_urgency() {
+            return 0.0;
+        }
+        // The formation LP/IPM ideal slot already balances the team's offensive AND defensive shape,
+        // so closeness of the would-be control point to it is the "most in-position for both phases"
+        // measure the user asked for. Kept to a cheap LP lookup + distance (no per-candidate space
+        // scan) since this runs inside the O(n^2) reception election each tick a pass is in flight;
+        // when the LP is inactive there is no in-position signal, so the election falls back to pure
+        // arrival time (the prior behaviour).
+        let Some(lp_ideal) = self.formation_lp_guidance_for(player.id).map(|g| g.target) else {
+            return 0.0;
+        };
+        let lp_fit = 1.0
+            - (point.distance(lp_ideal) / RECEIVER_IN_POSITION_LP_REFERENCE_YARDS).clamp(0.0, 1.0);
+        lp_fit * RECEIVER_IN_POSITION_MAX_BONUS_SECONDS
+    }
+
+    /// A candidate receiver's race time to `point` for the reception election: raw fatigue-adjusted
+    /// sprint time, discounted by a bounded in-position bonus (see [`Self::pass_receiver_in_position_bonus`])
+    /// so the most in-position team-mate wins a close call. Energy-neutral — it only changes WHO is
+    /// elected to attack the ball (one player), not how hard anyone runs.
+    fn pass_receiver_effective_arrival(&self, player: &PlayerSnapshot, point: Vec2) -> f64 {
+        self.snapshot_sprint_time_to(player, point) - self.pass_receiver_in_position_bonus(player, point)
+    }
+
     /// True when some non-keeper team-mate is clearly better placed to take the in-flight pass than
     /// its named receiver `named_id` — he reaches the arrival point at least the defer margin sooner
-    /// AND is within engage range of it. This is the cue for the named receiver to realise he is
-    /// beaten and back off; his belief that the ball is his is strong, so only a CLEAR winner
-    /// displaces him, and the gate guarantees a real replacement exists before he yields.
+    /// (in-position-adjusted) AND is within engage range of it. This is the cue for the named receiver
+    /// to realise he is beaten and back off; his belief that the ball is his is strong, so only a CLEAR
+    /// winner displaces him, and the gate guarantees a real replacement exists before he yields.
     fn teammate_clearly_better_placed_receiver(&self, named_id: usize) -> bool {
         let Some(pass) = self.pending_pass.as_ref() else {
             return false;
@@ -21320,7 +21368,7 @@ impl WorldSnapshot {
         let Some(named) = self.players.iter().find(|p| p.id == named_id) else {
             return false;
         };
-        let named_arrival = self.snapshot_sprint_time_to(named, arrival);
+        let named_arrival = self.pass_receiver_effective_arrival(named, arrival);
         self.players.iter().any(|p| {
             p.team == named.team
                 && p.id != named_id
@@ -21328,7 +21376,8 @@ impl WorldSnapshot {
                 && p.controller_slot.is_none()
                 && self.player_snapshot_position(p).distance(arrival)
                     <= PASS_CONTEST_ENGAGE_RADIUS_YARDS
-                && self.snapshot_sprint_time_to(p, arrival) + INTENDED_RECEIVER_DEFER_MARGIN_SECONDS
+                && self.pass_receiver_effective_arrival(p, arrival)
+                    + INTENDED_RECEIVER_DEFER_MARGIN_SECONDS
                     < named_arrival
         })
     }
@@ -21359,15 +21408,16 @@ impl WorldSnapshot {
         let named_arrival = pass
             .nearest_receiver
             .and_then(|id| self.players.iter().find(|p| p.id == id))
-            .map(|named| self.snapshot_sprint_time_to(named, arrival))
+            .map(|named| self.pass_receiver_effective_arrival(named, arrival))
             .unwrap_or(f64::INFINITY);
-        let my_arrival = self.snapshot_sprint_time_to(me, arrival);
+        let my_arrival = self.pass_receiver_effective_arrival(me, arrival);
         // I must be clearly quicker than the named receiver to displace him...
         if my_arrival + INTENDED_RECEIVER_DEFER_MARGIN_SECONDS >= named_arrival {
             return false;
         }
         // ...and the single best-placed team-mate to it (excluding the named receiver), so only one
-        // man peels onto the ball and the rest hold shape.
+        // man peels onto the ball and the rest hold shape. "Best-placed" is the in-position-adjusted
+        // race time, so the man most useful where he'd control it wins a close call.
         !self.players.iter().any(|p| {
             if p.team != me.team
                 || p.id == player_id
@@ -21377,7 +21427,7 @@ impl WorldSnapshot {
             {
                 return false;
             }
-            let p_arrival = self.snapshot_sprint_time_to(p, arrival);
+            let p_arrival = self.pass_receiver_effective_arrival(p, arrival);
             p_arrival < my_arrival - 1e-6
                 || ((p_arrival - my_arrival).abs() <= 1e-6 && p.id < player_id)
         })
