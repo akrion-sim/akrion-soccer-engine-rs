@@ -7,6 +7,8 @@ use super::*;
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
 const STEAL_RISK_GOOD_OUTLET_PASS_LIFT: f64 = 1.05;
 const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
+const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
+const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 
 fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
     matches!(
@@ -581,11 +583,93 @@ pub struct PlayerAgent {
     pub slide_recovery_seconds: f64,
 }
 
-const MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS: f64 = 0.75;
-const MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS: f64 = 6.0;
-const MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS: f64 = 16.0;
-const MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE: f64 = 0.18;
-const MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY: f64 = 0.34;
+fn mpc_reselect_candidate_label(label: &str) -> bool {
+    matches!(
+        label,
+        "shoot"
+            | "wall-pass"
+            | "corner-flag-cross"
+            | "vertical-attack"
+            | "vacate-space"
+            | "surprise-pass"
+            | "flick-on"
+            | "turnover-burst"
+            | "flank-low-cross"
+            | "flank-high-cross"
+            | "aerial-pass"
+            | "aerial-pass1"
+            | "pass"
+            | "pass1"
+            | "first-time-pass"
+            | "killer-pass"
+            | "switch-play"
+            | "recycle-reset"
+            | "first-time-shot"
+            | "first-time-header"
+            | "dribble"
+            | "carry-forward"
+            | "carry-out-left"
+            | "carry-out-right"
+            | "left-cut"
+            | "right-cut"
+            | "nutmeg"
+            | "fake-left-cut-right"
+            | "fake-right-cut-left"
+            | "protect-ball"
+            | "side-step"
+            | "hold-up-flank"
+            | "run-in-behind"
+            | "shot-creation-run"
+            | "overlap-run"
+            | "support-push-up"
+            | "support-roam"
+            | "support-shape"
+    )
+}
+
+fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
+    match label {
+        "corner-flag-cross" | "flank-low-cross" | "flank-high-cross" => {
+            ability01(player.skills.crossing_left.max(player.skills.crossing_right)) * 0.58
+                + ability01(player.skills.passing_completion_rate) * 0.28
+                + ability01(player.skills.vision) * 0.14
+        }
+        "surprise-pass" | "flick-on" => {
+            ability01(player.skills.flair_passing) * 0.42
+                + ability01(player.skills.first_touch) * 0.34
+                + ability01(player.skills.passing_completion_rate) * 0.24
+        }
+        "wall-pass"
+        | "pass"
+        | "pass1"
+        | "first-time-pass"
+        | "killer-pass"
+        | "switch-play"
+        | "recycle-reset"
+        | "aerial-pass"
+        | "aerial-pass1" => {
+            ability01(player.skills.passing_completion_rate) * 0.56
+                + ability01(player.skills.vision) * 0.28
+                + ability01(player.skills.first_touch) * 0.16
+        }
+        "shoot" | "first-time-shot" | "first-time-header" => {
+            ability01(player.skills.shooting) * 0.42
+                + ability01(
+                    player
+                        .skills
+                        .right_foot_shot_power
+                        .max(player.skills.left_foot_shot_power),
+                ) * 0.32
+                + ability01(player.skills.first_touch) * 0.26
+        }
+        _ => {
+            ability01(player.skills.acceleration) * 0.42
+                + ability01(player.skills.top_speed) * 0.34
+                + ability01(player.skills.dribbling) * 0.24
+        }
+    }
+    .clamp(0.0, 1.0)
+}
 
 #[derive(Clone, Debug, Default)]
 struct MpcExecutionEstimate {
@@ -918,7 +1002,9 @@ fn mpc_execution_estimate_for_action(
         } else if ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60 {
             "mpc-ball-touch-window-closing"
         } else if estimate.pass_completion_probability
-            < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+            < tunables()
+                .decision_mpc
+                .reselect_min_ball_execution_probability
         {
             "mpc-pass-low-completion"
         } else {
@@ -949,20 +1035,40 @@ fn mpc_execution_estimate_for_action(
             shot_power_for_skill(ability01(player.skills.shooting))
         };
         let shot_speed = shot_speed_yps_from_power(shot_power, &player.skills);
-        let frame_fit = observation.shot_on_frame_probability.clamp(0.0, 1.0);
-        let keeper_fit = observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0);
-        let block_fit = (1.0 - observation.shot_block_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let shot_mpc = shot_mpc_accuracy_estimate_for_snapshot(
+            snapshot,
+            player.id,
+            player.team,
+            &player.skills,
+            player.fatigue,
+            current,
+            player.velocity,
+            shot_speed,
+            first_time,
+            observation.perceived_pressure,
+        );
+        let frame_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.64
+            + shot_mpc.accuracy_probability * 0.36)
+            .clamp(0.0, 1.0);
+        let keeper_fit = (observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.58
+            + shot_mpc.goal_probability * 0.42)
+            .clamp(0.0, 1.0);
+        let block_fit = ((1.0 - observation.shot_block_probability.clamp(0.0, 1.0)) * 0.72
+            + (1.0 - shot_mpc.block_probability) * 0.28)
+            .clamp(0.0, 1.0);
         let angle_fit = (observation.opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0);
         let first_touch_fit = if first_time {
             observation.first_time_shot_score.clamp(0.0, 1.0)
         } else {
             0.72
         };
-        let body_fit = if first_time {
+        let mechanics_fit = if first_time {
             ball_context.body_mechanics_fit
         } else {
             (0.72 + ball_context.body_mechanics_fit * 0.28).clamp(0.0, 1.0)
         };
+        let body_fit =
+            mechanics_fit * (0.76 + shot_mpc.qp_target_fit * 0.24).clamp(0.55, 1.0);
         estimate.execution_probability = ((0.04
             + frame_fit * 0.26
             + keeper_fit * 0.22
@@ -973,6 +1079,11 @@ fn mpc_execution_estimate_for_action(
             * body_fit)
             .clamp(0.0, 0.99);
         estimate.recommended_speed_yps = shot_speed;
+        let shot_target_delta = shot_mpc.target_point - current;
+        if shot_target_delta.len() > 1e-6 {
+            estimate.recommended_angle_degrees =
+                shot_target_delta.y.atan2(shot_target_delta.x).to_degrees();
+        }
         estimate.recommended_curve = if observation.shot_curl_probability >= 0.36 {
             if current.x >= snapshot.field_width * 0.5 {
                 "left"
@@ -998,10 +1109,16 @@ fn mpc_execution_estimate_for_action(
                 "mpc-ball-touch-window-closing"
             } else if first_time && observation.first_time_shot_score < 0.20 {
                 "mpc-first-time-shot-low-contact"
-            } else if observation.shot_block_probability >= SHOT_BLOCK_BAILOUT_MAX_PROBABILITY {
+            } else if shot_mpc.qp_target_fit < 0.22 {
+                "mpc-shot-target-uncontrolled"
+            } else if observation.shot_block_probability
+                >= tunables().shooting.shot_block_bailout_max_probability
+            {
                 "mpc-shot-blocked"
             } else if estimate.execution_probability
-                < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+                < tunables()
+                    .decision_mpc
+                    .reselect_min_ball_execution_probability
             {
                 "mpc-shot-low-execution"
             } else {
@@ -1025,6 +1142,7 @@ fn mpc_execution_estimate_for_action(
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
+            | "hold-up-flank"
     ) {
         let target = action_target
             .as_ref()
@@ -1067,12 +1185,31 @@ fn mpc_execution_estimate_for_action(
             .clamp(0.0, 1.0);
         let pressure = dribble_spacing_pressure_for_role(player.role, nearest_distance)
             .max(pressure_from_nearest_distance(nearest_distance));
-        let target_space_fit = (target_clearance / 5.5).clamp(0.0, 1.0);
+        let dribble_mpc = dribble_mpc_control_estimate_for_snapshot(
+            snapshot,
+            player.id,
+            player.team,
+            player.role,
+            &player.skills,
+            player.fatigue,
+            current,
+            player.velocity,
+            target,
+            action_target
+                .as_ref()
+                .and_then(|target| target.dribble_touch)
+                .map(|touch| touch.distance_yards)
+                .unwrap_or_else(|| to_target.len()),
+        );
+        let target_space_fit = ((target_clearance / 5.5).clamp(0.0, 1.0) * 0.62
+            + dribble_mpc.control_probability * 0.38)
+            .clamp(0.0, 1.0);
         let touch_fit = action_target
             .as_ref()
             .and_then(|target| target.dribble_touch)
             .map(|touch| (1.0 - (touch.distance_yards - 2.2).abs() / 3.4).clamp(0.25, 1.0))
             .unwrap_or(0.72);
+        let qp_control_gate = (0.70 + dribble_mpc.qp_accel_fit * 0.30).clamp(0.50, 1.0);
         let forward_fit = normalized_target.dot(forward_dir).clamp(-0.4, 1.0);
         let left_prob = (0.16
             + dribble_skill * 0.34
@@ -1114,7 +1251,8 @@ fn mpc_execution_estimate_for_action(
         estimate.dribble_right_success_probability = right_prob;
         estimate.dribble_success_probability = (selected
             * (0.62 + movement_execution_confidence * 0.38)
-            * ball_context.body_mechanics_fit)
+            * ball_context.body_mechanics_fit
+            * qp_control_gate)
             .clamp(0.0, 0.99);
         estimate.execution_probability = estimate.dribble_success_probability;
         estimate.recommended_speed_yps = (to_target.len() / estimate.horizon_seconds.max(1e-6))
@@ -1134,8 +1272,12 @@ fn mpc_execution_estimate_for_action(
         estimate.reselect_reason =
             if ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60 {
                 "mpc-ball-touch-window-closing"
+            } else if dribble_mpc.control_probability < 0.18 {
+                "mpc-dribble-target-uncontrolled"
             } else if estimate.dribble_success_probability
-                < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY
+                < tunables()
+                    .decision_mpc
+                    .reselect_min_ball_execution_probability
             {
                 "mpc-dribble-low-success"
             } else {
@@ -1148,6 +1290,55 @@ fn mpc_execution_estimate_for_action(
         estimate.reselect_reason = "mpc-target-beyond-reachable-horizon";
     }
     estimate
+}
+
+fn direct_mpc_execution_estimate_for_candidate(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action_target: &Option<AgentActionTargetTrace>,
+    action_label: &str,
+) -> Option<MpcExecutionEstimate> {
+    let label = normalize_soccer_action_label(action_label);
+    if !mpc_reselect_candidate_label(label) {
+        return None;
+    }
+    let current = snapshot
+        .player_position(player.id)
+        .unwrap_or(player.position)
+        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+    let target_delta_yards = action_target
+        .as_ref()
+        .and_then(|target| target.point)
+        .map(|target| target.distance(current))
+        .unwrap_or(0.0);
+    let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+    let execution_skill = mpc_execution_skill_for_label(player, label);
+    let mpc_horizon_seconds = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+    let reachable_delta_yards = (player.velocity.len() * mpc_horizon_seconds
+        + 0.5
+            * acceleration_yps2_from_score(player.skills.acceleration)
+            * mpc_horizon_seconds
+            * mpc_horizon_seconds
+        + execution_skill * 1.6)
+        .max(0.75);
+    let execution_gap = (target_delta_yards - reachable_delta_yards).max(0.0);
+    let mpc_cfg = &tunables().decision_mpc;
+    let execution_confidence = ((1.0 - execution_gap / mpc_cfg.reselect_max_target_delta_yards)
+        .clamp(0.0, 1.0)
+        * (0.42 + execution_skill * 0.58)
+        * player.decision_confidence.clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+    Some(mpc_execution_estimate_for_action(
+        snapshot,
+        player,
+        action_target,
+        action_label,
+        current,
+        dt,
+        target_delta_yards,
+        reachable_delta_yards,
+        execution_confidence,
+    ))
 }
 
 pub(crate) fn player_mdp_mpc_comparison_trace(
@@ -1175,6 +1366,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         .unwrap_or(Vec2::zero());
     let velocity_delta_yps = (mdp_velocity - guidance.target_velocity).len();
     let label = normalize_soccer_action_label(action_label);
+    let mpc_cfg = &tunables().decision_mpc;
     let semantic_mismatch = mdp_target.is_none()
         || snapshot.ball.holder == Some(player.id)
         || player.role == PlayerRole::Goalkeeper
@@ -1195,7 +1387,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         );
     let blend_eligible = !semantic_mismatch
         && target_delta_yards.is_finite()
-        && target_delta_yards <= MDP_MPC_BLEND_MAX_TARGET_DELTA_YARDS
+        && target_delta_yards <= mpc_cfg.blend_max_target_delta_yards
         && matches!(
             label,
             "support-shape"
@@ -1212,81 +1404,8 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
                 | "recover"
                 | "move"
         );
-    let mpc_reselect_candidate = matches!(
-        label,
-        "wall-pass"
-            | "corner-flag-cross"
-            | "vertical-attack"
-            | "vacate-space"
-            | "surprise-pass"
-            | "flick-on"
-            | "turnover-burst"
-            | "flank-low-cross"
-            | "flank-high-cross"
-            | "aerial-pass"
-            | "aerial-pass1"
-            | "pass"
-            | "pass1"
-            | "first-time-pass"
-            | "killer-pass"
-            | "switch-play"
-            | "recycle-reset"
-            | "first-time-shot"
-            | "first-time-header"
-            | "dribble"
-            | "carry-forward"
-            | "carry-out-left"
-            | "carry-out-right"
-            | "protect-ball"
-            | "side-step"
-            | "run-in-behind"
-            | "shot-creation-run"
-            | "overlap-run"
-            | "support-push-up"
-            | "support-roam"
-            | "support-shape"
-    );
-    let execution_skill = match label {
-        "corner-flag-cross" | "flank-low-cross" | "flank-high-cross" => {
-            ability01(player.skills.crossing_left.max(player.skills.crossing_right)) * 0.58
-                + ability01(player.skills.passing_completion_rate) * 0.28
-                + ability01(player.skills.vision) * 0.14
-        }
-        "surprise-pass" | "flick-on" => {
-            ability01(player.skills.flair_passing) * 0.42
-                + ability01(player.skills.first_touch) * 0.34
-                + ability01(player.skills.passing_completion_rate) * 0.24
-        }
-        "wall-pass"
-        | "pass"
-        | "pass1"
-        | "first-time-pass"
-        | "killer-pass"
-        | "switch-play"
-        | "recycle-reset"
-        | "aerial-pass"
-        | "aerial-pass1" => {
-            ability01(player.skills.passing_completion_rate) * 0.56
-                + ability01(player.skills.vision) * 0.28
-                + ability01(player.skills.first_touch) * 0.16
-        }
-        "first-time-shot" | "first-time-header" => {
-            ability01(player.skills.shooting) * 0.42
-                + ability01(
-                    player
-                        .skills
-                        .right_foot_shot_power
-                        .max(player.skills.left_foot_shot_power),
-                ) * 0.32
-                + ability01(player.skills.first_touch) * 0.26
-        }
-        _ => {
-            ability01(player.skills.acceleration) * 0.42
-                + ability01(player.skills.top_speed) * 0.34
-                + ability01(player.skills.dribbling) * 0.24
-        }
-    }
-    .clamp(0.0, 1.0);
+    let mpc_reselect_candidate = mpc_reselect_candidate_label(label);
+    let execution_skill = mpc_execution_skill_for_label(player, label);
     let mpc_horizon_seconds = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
     let reachable_delta_yards = (player.velocity.len() * mpc_horizon_seconds
         + 0.5
@@ -1296,7 +1415,8 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         + execution_skill * 1.6)
         .max(0.75);
     let execution_gap = (target_delta_yards - reachable_delta_yards).max(0.0);
-    let execution_confidence = ((1.0 - execution_gap / MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS)
+    let mpc_cfg = &tunables().decision_mpc;
+    let execution_confidence = ((1.0 - execution_gap / mpc_cfg.reselect_max_target_delta_yards)
         .clamp(0.0, 1.0)
         * (0.42 + execution_skill * 0.58)
         * player.decision_confidence.clamp(0.0, 1.0))
@@ -1314,13 +1434,13 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
     );
     let reselect_after_mpc_low_confidence = mpc_reselect_candidate
         && ((target_delta_yards.is_finite()
-            && target_delta_yards >= MDP_MPC_RESELECT_MAX_TARGET_DELTA_YARDS
+            && target_delta_yards >= mpc_cfg.reselect_max_target_delta_yards
             && velocity_delta_yps.is_finite()
             && velocity_delta_yps >= reachable_delta_yards / mpc_horizon_seconds.max(1e-6)
-            && execution_confidence < MDP_MPC_RESELECT_MIN_EXECUTION_CONFIDENCE)
+            && execution_confidence < mpc_cfg.reselect_min_execution_confidence)
             || (!execution_estimate.reselect_reason.is_empty()
                 && execution_estimate.execution_probability
-                    < MDP_MPC_RESELECT_MIN_BALL_EXECUTION_PROBABILITY));
+                    < mpc_cfg.reselect_min_ball_execution_probability));
     let blended_target = if blend_eligible {
         mdp_target.map(|target| {
             ((target + mpc_target) * 0.5)
@@ -1330,7 +1450,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         None
     };
     let deviation_recorded = reselect_after_mpc_low_confidence
-        || target_delta_yards >= MDP_MPC_DEVIATION_TRACE_THRESHOLD_YARDS
+        || target_delta_yards >= mpc_cfg.deviation_trace_threshold_yards
         || velocity_delta_yps >= 1.0
         || semantic_mismatch;
     let decision = if reselect_after_mpc_low_confidence {
@@ -1393,8 +1513,25 @@ fn mpc_reselects_candidate(
     action_label: &str,
 ) -> bool {
     let action_target = player.action_target_trace(action, snapshot);
-    player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
+    if !snapshot
+        .formation_lp_guidance_for(player.id)
+        .is_some_and(|guidance| guidance.local_mpc_guidance)
+    {
+        return false;
+    }
+    if player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
         .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
+    {
+        return true;
+    }
+    direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
+        .is_some_and(|estimate| {
+            !estimate.reselect_reason.is_empty()
+                && estimate.execution_probability
+                    < tunables()
+                        .decision_mpc
+                        .reselect_min_ball_execution_probability
+        })
 }
 
 fn agentic_action_commitment(
@@ -2985,7 +3122,8 @@ impl PlayerAgent {
             ));
         }
         if let Some(target) = special_targets.in_behind {
-            let target = guarded_special_target(target);
+            let target =
+                snapshot.shape_guarded_support_point(self.id, target, &[], self.home_position, false);
             options.push(AgentActionOptionTrace::new(
                 "run-in-behind",
                 special_score(
@@ -3211,6 +3349,19 @@ impl PlayerAgent {
             scale_legal_option_score(&mut options, "support-shape", 0.82);
             scale_legal_option_score(&mut options, "support-roam", 0.88);
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", 0.58);
+        }
+        if flank_policy_active
+            && options
+                .iter()
+                .any(|option| option.legal && option.label == "overlap-run")
+        {
+            ensure_min_legal_option_probability(
+                &mut options,
+                "overlap-run",
+                directive
+                    .flank_overlap_run_probability
+                    .clamp(FLANK_OVERLAP_MIN_OPTION_SHARE, 0.72),
+            );
         }
         let options = normalize_action_options(options);
         SupportActionContext {
@@ -4114,19 +4265,33 @@ impl PlayerAgent {
     }
 
     /// A committed loose-ball chaser already steers to the intercept point via the normal
-    /// recovery logic — make it SPRINT there (attack the ball before settling into support
-    /// shape). Kept as a post-step so it doesn't bypass the weighted recovery options /
-    /// 50-50 two-competitor logic the way an early-return short-circuit would.
+    /// recovery logic — make it SPRINT there when the ball is live enough to reward it (attack
+    /// the ball before settling into support shape). Kept as a post-step so it doesn't bypass the
+    /// weighted recovery options / 50-50 two-competitor logic the way an early-return short-circuit
+    /// would, but bounded so tired players do not spend extra accelerations on long, low-value
+    /// chases.
     pub(crate) fn committed_chaser_sprint_guarantee(
         &self,
         snapshot: &WorldSnapshot,
         mut intent: PlayerIntent,
     ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
+            let distance = self.position.distance(target);
+            let lane_interceptor = snapshot.pending_pass_lane_cut_target_for(self.id).is_some();
+            let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
+            let moving_ball_to_attack =
+                snapshot.ball.velocity.len() >= COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS;
+            let economical_distance =
+                distance <= COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS || lane_interceptor;
+            let fatigue_allows =
+                self.fatigue <= SPRINT_CONSERVE_FATIGUE || lane_interceptor || fifty_fifty_duel;
             if self.role != PlayerRole::Goalkeeper
                 && snapshot.ball.holder.is_none()
                 && snapshot.is_committed_loose_ball_chaser(self.id)
-                && self.position.distance(target) > 1.0
+                && distance > 1.0
+                && economical_distance
+                && fatigue_allows
+                && (moving_ball_to_attack || lane_interceptor || fifty_fifty_duel)
             {
                 intent.sprint = true;
             }
@@ -7514,12 +7679,11 @@ impl PlayerAgent {
                 }),
             "run-in-behind" if !observation.has_ball => {
                 snapshot.in_behind_run_target_for(self.id).map(|target| {
-                    let open = snapshot.open_space_for(self.id, self.home_position);
                     (
                         SoccerAction::MoveTo(snapshot.shape_guarded_support_point(
                             self.id,
                             target,
-                            &[open, self.home_position],
+                            &[],
                             self.home_position,
                             false,
                         )),
