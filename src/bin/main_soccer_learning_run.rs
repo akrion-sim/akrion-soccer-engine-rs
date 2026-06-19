@@ -13,6 +13,7 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     SoccerConfigMomentInsert, SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend,
+    SoccerPassOutcomeSample,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
@@ -877,6 +878,7 @@ struct CompletedGame {
     starting_tactical_learning: SoccerTacticalLearningWeights,
     policies: SoccerTeamQPolicies,
     config_moments: Vec<SoccerConfigMomentInsert>,
+    pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     neural_network: Option<SoccerNeuralNetworkSnapshot>,
     elapsed_seconds: f64,
 }
@@ -1689,6 +1691,7 @@ fn run_game(
         .cloned()
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
+    let pass_outcome_samples = sim.drain_pass_outcome_samples();
     let mut artifact = sim.team_policy_artifact();
     let neural_network = if retain_neural_network_in_game_artifact {
         artifact.learning.neural_network.clone()
@@ -1715,6 +1718,7 @@ fn run_game(
         starting_tactical_learning,
         policies,
         config_moments,
+        pass_outcome_samples,
         neural_network,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })
@@ -1828,6 +1832,7 @@ fn soccer_learning_completed_game_from_completed(
         score,
         delta,
         config_moments: game.config_moments.clone(),
+        pass_outcome_samples: game.pass_outcome_samples.clone(),
         neural_network: None,
         elapsed_seconds: game.elapsed_seconds,
     }
@@ -3829,6 +3834,7 @@ mod tests {
             starting_tactical_learning,
             policies,
             config_moments: Vec::new(),
+            pass_outcome_samples: Vec::new(),
             neural_network: None,
             elapsed_seconds: 0.0,
         }
@@ -3879,6 +3885,7 @@ mod tests {
             starting_tactical_learning: SoccerTacticalLearningWeights::default(),
             policies,
             config_moments: Vec::new(),
+            pass_outcome_samples: Vec::new(),
             neural_network: None,
             elapsed_seconds: 0.0,
         };

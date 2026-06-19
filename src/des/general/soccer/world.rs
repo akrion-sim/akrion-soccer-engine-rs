@@ -13058,7 +13058,7 @@ impl SoccerMatch {
 
     /// Drain the accumulated pass-outcome samples (the cluster learner persists them to Postgres
     /// and trains [`SoccerPassCompletionHead`] on the pooled corpus).
-    pub(crate) fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
+    pub fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
         std::mem::take(&mut self.pass_outcome_samples)
     }
 
@@ -26694,8 +26694,10 @@ impl WorldSnapshot {
             ConfigWeightOptions {
                 // Weight by proximity to THIS pass's lane (from→to), so the learned features
                 // emphasise the players who actually decide whether it completes — those up the
-                // lane — and de-weight those near the ball but off it.
+                // lane — and de-weight those near the ball but off it. A mild along-path taper
+                // gives the early lane (most cuttable) more say than the target end.
                 ball_path: Some((from, to)),
+                ball_path_along_taper: 0.6,
                 ..ConfigWeightOptions::default()
             },
         );

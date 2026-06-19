@@ -12078,6 +12078,7 @@ impl SoccerRetrievalConfig {
             // The stored corpus weights by the ball point; an action-specific lane is supplied only
             // by the live capture/query that knows the planned trajectory.
             ball_path: None,
+            ball_path_along_taper: 0.0,
         }
     }
 }
