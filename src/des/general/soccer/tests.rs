@@ -27996,7 +27996,8 @@ fn neural_learning_pads_legacy_snapshot_team_shape_inputs() {
         .learning_snapshot()
         .neural_network
         .expect("initial neural snapshot");
-    let legacy_dim = SOCCER_NEURAL_LEGACY_FEATURE_DIMS[0];
+    let legacy_dim = 159;
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&legacy_dim));
     let removed_weights = legacy_snapshot.layers[0]
         .weights
         .len()
