@@ -4468,6 +4468,152 @@ impl PlayerAgent {
         intent
     }
 
+    fn rolling_ball_arrival_time_to_target(
+        &self,
+        snapshot: &WorldSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        let speed = snapshot.ball.velocity.len();
+        if speed <= REACTIVE_GROUND_PASS_NUMERIC_EPSILON {
+            return f64::INFINITY;
+        }
+        let ball_dir = snapshot.ball.velocity.normalized();
+        let along = (target - snapshot.ball.position).dot(ball_dir).max(0.0);
+        if along <= REACTIVE_GROUND_PASS_NUMERIC_EPSILON {
+            return 0.0;
+        }
+        let accel = dot(snapshot.ball.acceleration, ball_dir);
+        if accel.abs() <= REACTIVE_GROUND_PASS_NUMERIC_EPSILON {
+            return along / speed;
+        }
+        let discriminant = speed * speed + 2.0 * accel * along;
+        if discriminant < 0.0 {
+            return f64::INFINITY;
+        }
+        let root = discriminant.sqrt();
+        let t = (-speed + root) / accel;
+        if t.is_finite() && t >= 0.0 {
+            t
+        } else {
+            along / speed
+        }
+    }
+
+    fn pomdp_mpc_loose_ball_recovery_target(
+        &self,
+        snapshot: &WorldSnapshot,
+        early_control_target: Vec2,
+    ) -> Vec2 {
+        if snapshot.ball.holder.is_some()
+            || snapshot.pending_pass.is_some()
+            || snapshot.ball.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS
+            || snapshot.ball.velocity.len() < REACTIVE_GROUND_PASS_MIN_SPEED_YPS
+        {
+            return early_control_target;
+        }
+        let run_on_target = snapshot
+            .projected_loose_ball_target()
+            .unwrap_or(early_control_target);
+        if run_on_target.distance(early_control_target) <= POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS
+        {
+            return early_control_target;
+        }
+        let ball_arrival =
+            self.rolling_ball_arrival_time_to_target(snapshot, early_control_target);
+        if !ball_arrival.is_finite() {
+            return early_control_target;
+        }
+        let player_velocity = snapshot.player_velocity(self.id).unwrap_or(self.velocity);
+        let facing_fit = player_facing_ball_control_multiplier(
+            self,
+            early_control_target,
+            snapshot.ball.velocity.len(),
+        );
+        let mpc_fit = mpc_ball_control_execution_fit(
+            self.role,
+            &self.skills,
+            self.fatigue,
+            self.position,
+            player_velocity,
+            facing_fit,
+            early_control_target,
+            snapshot.ball.velocity,
+            ball_arrival,
+            REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS,
+        );
+        if mpc_fit.qp_accel_fit < MPC_BALL_CONTROL_MIN_QP_ACCEL_FIT {
+            return run_on_target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        }
+        let control_choice = pomdp_loose_ball_control_decision(
+            &self.skills,
+            self.decision_confidence,
+            self.position,
+            early_control_target,
+            run_on_target,
+            snapshot.ball.velocity,
+            snapshot.nearest_opponent_distance_at(self.team, early_control_target),
+            mpc_fit,
+            false,
+        );
+        control_choice
+            .target
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+    }
+
+    pub(crate) fn apply_post_decision_movement_discipline(
+        &self,
+        snapshot: &WorldSnapshot,
+        match_state: &SoccerMatch,
+        intent: PlayerIntent,
+    ) -> PlayerIntent {
+        debug_assert_eq!(
+            intent.player_id, self.id,
+            "movement-discipline intent must belong to the player applying it"
+        );
+        if intent.player_id != self.id {
+            return intent;
+        }
+
+        let intent = self.committed_chaser_sprint_guarantee(snapshot, intent);
+        let live_ball_attacker = snapshot.is_live_ball_attacker_for_movement_guards(intent.player_id);
+
+        let mut intent = intent;
+        if !dd_soccer_disable_anti_bunch() {
+            intent = snapshot.discipline_intent_against_bunchball(intent);
+        }
+        if !(dd_soccer_disable_spacing_nudge() || live_ball_attacker) {
+            intent = snapshot.nudge_intent_for_teammate_spacing(intent);
+        }
+
+        // Team-line structure. These are global geometry constraints, but the
+        // player accepts them after its own MDP/POMDP choice and before execution.
+        let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
+        let intent = snapshot.back_four_shape_adjusted_intent(intent);
+        let intent = snapshot.midfield_line_band_adjusted_intent(intent);
+        let intent = snapshot.forward_line_band_adjusted_intent(intent);
+        let intent = snapshot.offside_standing_recovery_adjusted_intent(intent);
+        let intent = snapshot.goalside_anticipation_adjusted_intent(intent);
+        let intent = snapshot.offside_trap_cover_adjusted_intent(intent);
+
+        let mut intent = intent;
+        if !live_ball_attacker {
+            intent = match_state.teammate_spacing_disciplined_intent(intent);
+            intent = match_state.relational_shape_disciplined_intent(intent);
+            intent = snapshot.teammate_lane_guard_adjusted_intent(intent);
+            intent = snapshot.ball_proximity_adjusted_intent(intent);
+        }
+
+        let intent = snapshot.back_four_shape_adjusted_intent(intent);
+        let intent = snapshot.ball_in_behind_recovery_adjusted_intent(intent);
+        let intent = snapshot.cross_through_disciplined_intent(intent);
+        let intent = snapshot.teammate_spacing_path_adjusted_intent(intent);
+        let intent = snapshot.weak_side_width_hold_adjusted_intent(intent);
+        let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
+        let intent = snapshot.midfield_line_band_adjusted_intent(intent);
+        let intent = snapshot.forward_line_band_adjusted_intent(intent);
+        snapshot.wingback_width_adjusted_intent(intent)
+    }
+
     pub fn run_time_step_with_context(
         &mut self,
         snapshot: &WorldSnapshot,
@@ -7110,6 +7256,8 @@ impl PlayerAgent {
             action_options = loose_options;
             order_names.extend(loose_order);
             if should_recover {
+                let movement_target =
+                    self.pomdp_mpc_loose_ball_recovery_target(snapshot, loose_ball_target);
                 // Win the race back to a ball that got away under pressure (notably
                 // the carrier's own long/heavy touch): if it's meaningfully ahead and
                 // an opponent is contesting / closing on it, sprint to it.
@@ -7119,15 +7267,16 @@ impl PlayerAgent {
                     .filter(|player| {
                         player.team != self.team && player.role != PlayerRole::Goalkeeper
                     })
-                    .map(|player| player.position.distance(loose_ball_target))
+                    .map(|player| player.position.distance(movement_target))
                     .fold(f64::INFINITY, f64::min);
                 loose_ball_pressured_sprint = self.role != PlayerRole::Goalkeeper
-                    && my_distance > LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS
+                    && self.position.distance(movement_target)
+                        > LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
                             <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
                 (
-                    SoccerAction::MoveTo(loose_ball_target),
+                    SoccerAction::MoveTo(movement_target),
                     "recover".to_string(),
                 )
             } else {

@@ -2121,6 +2121,26 @@ const REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS: f64 = 2.0;
 // looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
 // you still needs a turn first. (Below this, the facing/control-cone gate is waived.)
 const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 0.5;
+// MPC/QP execution gates for ball control. The analytic control radius decides whether a touch
+// is geometrically nearby; this layer only rejects touches whose bounded-acceleration solve is
+// effectively impossible. Risky-but-possible control stays an MDP/POMDP player choice.
+const MPC_BALL_CONTROL_MIN_QP_ACCEL_FIT: f64 = 0.10;
+const MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT: f64 = 0.08;
+const MPC_BALL_CONTROL_SCORE_WEIGHT: f64 = 0.46;
+// POMDP local choice: on a loose roller, a player may let the ball run across their body and
+// collect it later only when the intended recovery target is genuinely ahead on the ball's path
+// and opponents are not close enough to punish the delay.
+const POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS: f64 = 1.15;
+const POMDP_BALL_CONTROL_LET_RUN_AHEAD_FULL_YARDS: f64 = 5.0;
+const POMDP_BALL_CONTROL_LET_RUN_PRESSURE_MARGIN_YARDS: f64 = 1.35;
+const POMDP_BALL_CONTROL_TRAP_URGENCY_OPPONENT_YARDS: f64 = 4.0;
+const POMDP_BALL_CONTROL_TRAP_SCORE_MARGIN: f64 = 0.06;
+// Defensive steals use the same MPC/QP idea: deciding to tackle is MDP/POMDP, but the steal only
+// resolves if the defender can physically reach and control the ball under bounded acceleration.
+const MPC_STEAL_STANDING_MIN_QP_ACCEL_FIT: f64 = 0.10;
+const MPC_STEAL_SLIDE_MIN_QP_ACCEL_FIT: f64 = 0.06;
+const MPC_STEAL_SUCCESS_MULTIPLIER_FLOOR: f64 = 0.42;
+const MPC_STEAL_SUCCESS_MULTIPLIER_SPAN: f64 = 0.68;
 // Counterattack: with fewer than this many opponents ahead while in possession,
 // the break is on — off-ball players push forward into space (and sprint there).
 // Attack support: a teammate this far behind an advanced ball sprints forward to
@@ -43431,6 +43451,25 @@ struct DribbleMpcControlEstimate {
     space_margin_yards: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MpcBallControlExecutionFit {
+    pub(crate) probability: f64,
+    pub(crate) qp_accel_fit: f64,
+    pub(crate) velocity_match: f64,
+    pub(crate) facing_fit: f64,
+    pub(crate) miscontrol_risk: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LooseBallControlDecision {
+    pub(crate) trap_now: bool,
+    pub(crate) target: Vec2,
+    pub(crate) trap_now_score: f64,
+    pub(crate) let_run_score: f64,
+    pub(crate) mpc_control_probability: f64,
+    pub(crate) miscontrol_risk: f64,
+}
+
 fn bounded_accel_qp_control_fit(
     position: Vec2,
     velocity: Vec2,
@@ -43478,6 +43517,133 @@ fn bounded_accel_qp_control_fit(
         (1.0 - miss_yards / (control_radius * 2.2).max(1.0)).clamp(0.0, 1.0);
     let accel_economy = (1.0 - accel.len() / (accel_cap * 1.414).max(1.0)).clamp(0.0, 1.0);
     (position_fit * 0.74 + accel_economy * 0.26).clamp(0.0, 1.0)
+}
+
+pub(crate) fn mpc_ball_control_execution_fit(
+    role: PlayerRole,
+    skills: &SkillProfile,
+    fatigue: f64,
+    position: Vec2,
+    velocity: Vec2,
+    facing_fit: f64,
+    control_point: Vec2,
+    ball_velocity: Vec2,
+    ball_time_seconds: f64,
+    control_radius_yards: f64,
+) -> MpcBallControlExecutionFit {
+    let fatigue_factor = fatigue_speed_factor(skills.stamina, fatigue);
+    let top_speed = (player_top_speed_yps(role, skills) * fatigue_factor).max(0.85);
+    let distance = position.distance(control_point);
+    let horizon = ball_time_seconds
+        .max(distance / (top_speed * MovementGait::Sprint.speed_multiplier()).max(0.85))
+        .clamp(DEFAULT_DT_SECONDS, 0.90);
+    let accel_cap = acceleration_yps2_from_score(skills.acceleration) * fatigue_factor;
+    let control_radius = control_radius_yards.clamp(0.45, REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS);
+    let qp_accel_fit = bounded_accel_qp_control_fit(
+        position,
+        velocity,
+        control_point,
+        horizon,
+        accel_cap,
+        control_radius,
+        0.055,
+    );
+    let to_control = control_point - position;
+    let closing_fit = if to_control.len() > 1e-6 {
+        ((velocity.dot(to_control.normalized()) + 4.0) / 14.0).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let velocity_match =
+        (1.0 - ((velocity - ball_velocity).len() / 30.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let skill_fit = (ability01(skills.first_touch) * 0.42
+        + ability01(skills.dribbling) * 0.18
+        + ability01(skills.acceleration) * 0.26
+        + ability01(skills.strength) * 0.14)
+        .clamp(0.0, 1.0);
+    let probability = (0.04
+        + qp_accel_fit * 0.46
+        + skill_fit * 0.16
+        + facing_fit.clamp(0.0, 1.0) * 0.14
+        + velocity_match * 0.13
+        + closing_fit * 0.07)
+        .clamp(0.0, 0.99);
+    MpcBallControlExecutionFit {
+        probability,
+        qp_accel_fit,
+        velocity_match,
+        facing_fit: facing_fit.clamp(0.0, 1.0),
+        miscontrol_risk: (1.0 - probability).clamp(0.0, 1.0),
+    }
+}
+
+pub(crate) fn pomdp_loose_ball_control_decision(
+    skills: &SkillProfile,
+    decision_confidence: f64,
+    position: Vec2,
+    control_point: Vec2,
+    run_on_target: Vec2,
+    ball_velocity: Vec2,
+    nearest_opponent_distance: f64,
+    mpc_fit: MpcBallControlExecutionFit,
+    force_trap_urgent: bool,
+) -> LooseBallControlDecision {
+    let ball_speed = ball_velocity.len();
+    if force_trap_urgent || ball_speed <= REACTIVE_GROUND_PASS_MIN_SPEED_YPS {
+        return LooseBallControlDecision {
+            trap_now: true,
+            target: control_point,
+            trap_now_score: 1.0,
+            let_run_score: 0.0,
+            mpc_control_probability: mpc_fit.probability,
+            miscontrol_risk: mpc_fit.miscontrol_risk,
+        };
+    }
+
+    let ball_dir = ball_velocity.normalized();
+    let ahead = (run_on_target - control_point).dot(ball_dir);
+    let lateral = ((run_on_target - control_point) - ball_dir * ahead).len();
+    let run_ahead_fit = ((ahead - POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS)
+        / (POMDP_BALL_CONTROL_LET_RUN_AHEAD_FULL_YARDS
+            - POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    let run_line_fit = (1.0 - lateral / REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS)
+        .clamp(0.0, 1.0);
+    let run_intent = run_ahead_fit * run_line_fit;
+    let my_distance = position.distance(control_point);
+    let opponent_urgency = if nearest_opponent_distance.is_finite() {
+        (1.0
+            - ((nearest_opponent_distance - my_distance + POMDP_BALL_CONTROL_LET_RUN_PRESSURE_MARGIN_YARDS)
+                / POMDP_BALL_CONTROL_TRAP_URGENCY_OPPONENT_YARDS)
+                .clamp(0.0, 1.0))
+        .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let first_touch_risk = 1.0 - ability01(skills.first_touch);
+    let confidence = decision_confidence.clamp(0.2, 1.0);
+    let let_run_score = (run_intent
+        * (mpc_fit.miscontrol_risk * 0.54
+            + first_touch_risk * 0.24
+            + (ball_speed / 24.0).clamp(0.0, 1.0) * 0.22)
+        * (1.0 - opponent_urgency * 0.82)
+        * (0.70 + confidence * 0.30))
+        .clamp(0.0, 1.0);
+    let trap_now_score = (mpc_fit.probability * 0.66
+        + opponent_urgency * 0.42
+        + ability01(skills.first_touch) * 0.12
+        + confidence * 0.10)
+        .clamp(0.0, 1.0);
+    let trap_now = trap_now_score + POMDP_BALL_CONTROL_TRAP_SCORE_MARGIN >= let_run_score;
+    LooseBallControlDecision {
+        trap_now,
+        target: if trap_now { control_point } else { run_on_target },
+        trap_now_score,
+        let_run_score,
+        mpc_control_probability: mpc_fit.probability,
+        miscontrol_risk: mpc_fit.miscontrol_risk,
+    }
 }
 
 fn dribble_mpc_control_estimate_for_snapshot(
@@ -46009,6 +46175,30 @@ fn goalkeeper_for_players(players: &[PlayerAgent], team: Team) -> Option<usize> 
         .map(|player| player.id)
 }
 
+fn last_recover_target_for_player(player: &PlayerAgent) -> Option<Vec2> {
+    let decision = player.last_decision.as_ref()?;
+    let label = normalize_soccer_action_label(&decision.action);
+    if !matches!(label, ACTION_LABEL_RECOVER | "fifty-fifty-duel") {
+        return None;
+    }
+    decision
+        .action_target
+        .as_ref()
+        .and_then(|target| target.point)
+}
+
+fn nearest_opponent_distance_to_point(
+    players: &[PlayerAgent],
+    team: Team,
+    point: Vec2,
+) -> f64 {
+    players
+        .iter()
+        .filter(|player| player.team != team && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.position.distance(point))
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn nearest_ball_controller_for(
     current_tick: u64,
     ball_pos: Vec2,
@@ -46083,6 +46273,7 @@ fn nearest_ball_controller_for_segment_with_guard(
     let mut candidates = Vec::new();
     let mut low_pass_body_contact: Option<(f64, f64, usize, Team, Vec2)> = None;
     let mut reactive_ground_pass_trap: Option<(f64, f64, usize, Team, Vec2)> = None;
+    let mut rolling_loose_ball_trap: Option<(f64, f64, usize, Team, Vec2)> = None;
     for p in players {
         if same_tick_long_ball_launcher == Some(p.id) {
             continue;
@@ -46163,8 +46354,22 @@ fn nearest_ball_controller_for_segment_with_guard(
                 let reach = INTERCEPT_LUNGE_REACH_YARDS + player_speed * reaction_window;
                 let cone_quality =
                     player_facing_ball_control_multiplier(p, control_point, ball_speed);
+                let mpc_fit = mpc_ball_control_execution_fit(
+                    p.role,
+                    &p.skills,
+                    p.fatigue,
+                    p.position,
+                    p.velocity,
+                    cone_quality,
+                    control_point,
+                    ball_velocity,
+                    pass_arrival,
+                    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS,
+                );
                 if body_contact_distance <= reach
                     && (cone_quality >= CONTROL_MIN_VIABLE_QUALITY
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                    && (mpc_fit.qp_accel_fit >= MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT
                         || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
                 {
                     let replace = reactive_ground_pass_trap.as_ref().is_none_or(
@@ -46176,6 +46381,57 @@ fn nearest_ball_controller_for_segment_with_guard(
                     );
                     if replace {
                         reactive_ground_pass_trap = Some((
+                            control_projection,
+                            body_contact_distance,
+                            p.id,
+                            p.team,
+                            control_point,
+                        ));
+                    }
+                }
+            }
+        } else if ball_altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
+            && ball_speed >= REACTIVE_GROUND_PASS_MIN_SPEED_YPS
+            && ball_segment_len > REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS
+        {
+            let body_contact_distance = p.position.distance(control_point);
+            if body_contact_distance <= REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS {
+                let ball_arrival = (control_point - previous_ball_pos).len()
+                    / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+                let player_speed = player_top_speed_yps(p.role, &p.skills)
+                    * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                    * MovementGait::Sprint.speed_multiplier();
+                let reach = INTERCEPT_LUNGE_REACH_YARDS
+                    + player_speed * ball_arrival.clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+                let cone_quality =
+                    player_facing_ball_control_multiplier(p, control_point, ball_speed);
+                let mpc_fit = mpc_ball_control_execution_fit(
+                    p.role,
+                    &p.skills,
+                    p.fatigue,
+                    p.position,
+                    p.velocity,
+                    cone_quality,
+                    control_point,
+                    ball_velocity,
+                    ball_arrival,
+                    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS,
+                );
+                if body_contact_distance <= reach
+                    && (cone_quality >= CONTROL_MIN_VIABLE_QUALITY
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                    && (mpc_fit.qp_accel_fit >= MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                {
+                    let replace = rolling_loose_ball_trap.as_ref().is_none_or(
+                        |(best_projection, best_distance, _, _, _)| {
+                            control_projection < *best_projection - 1e-9
+                                || ((control_projection - *best_projection).abs() <= 1e-9
+                                    && body_contact_distance < *best_distance)
+                        },
+                    );
+                    if replace {
+                        rolling_loose_ball_trap = Some((
                             control_projection,
                             body_contact_distance,
                             p.id,
@@ -46392,6 +46648,33 @@ fn nearest_ball_controller_for_segment_with_guard(
                 continue;
             }
         }
+        let mut mpc_control_score_bonus = 0.0;
+        if low_ball
+            && ball_speed >= REACTIVE_GROUND_PASS_MIN_SPEED_YPS
+            && ball_segment_len > REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS
+            && !guaranteed_trap
+        {
+            let along = (control_point - previous_ball_pos).len();
+            let ball_contact_time = along / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+            let mpc_fit = mpc_ball_control_execution_fit(
+                p.role,
+                &p.skills,
+                p.fatigue,
+                p.position,
+                p.velocity,
+                cone_quality,
+                control_point,
+                ball_velocity,
+                ball_contact_time,
+                effective_radius.max(CONTROL_AT_FEET_TRAP_RADIUS_YARDS),
+            );
+            if mpc_fit.qp_accel_fit < MPC_BALL_CONTROL_MIN_QP_ACCEL_FIT {
+                continue;
+            }
+            mpc_control_score_bonus = mpc_fit.probability * MPC_BALL_CONTROL_SCORE_WEIGHT
+                + mpc_fit.qp_accel_fit * 0.18
+                + mpc_fit.velocity_match * 0.08;
+        }
         let to_ball = (control_point - player_control_position).normalized();
         let closing_speed = dot(p.velocity - ball_velocity, to_ball).clamp(-8.0, 8.0);
         // A guaranteed trap is scored by the ball's true closeness to the player's
@@ -46402,11 +46685,12 @@ fn nearest_ball_controller_for_segment_with_guard(
             + ability01(p.skills.first_touch) * 0.72
             + ability01(p.skills.aggression) * 0.18
             + closing_speed * 0.055
+            + mpc_control_score_bonus
             + pass_reception_score_bonus
             + aerial_score_bonus;
         candidates.push((p.id, p.team, score, control_point));
     }
-    let forced_ground_control = match (low_pass_body_contact, reactive_ground_pass_trap) {
+    let mut forced_ground_control = match (low_pass_body_contact, reactive_ground_pass_trap) {
         (Some(low), Some(reactive)) => {
             if reactive.0 < low.0 - 1e-9
                 || ((reactive.0 - low.0).abs() <= 1e-9 && reactive.1 < low.1)
@@ -46420,6 +46704,20 @@ fn nearest_ball_controller_for_segment_with_guard(
         (None, Some(reactive)) => Some(reactive),
         (None, None) => None,
     };
+    if let Some(rolling) = rolling_loose_ball_trap {
+        forced_ground_control = match forced_ground_control {
+            Some(existing) => {
+                if rolling.0 < existing.0 - 1e-9
+                    || ((rolling.0 - existing.0).abs() <= 1e-9 && rolling.1 < existing.1)
+                {
+                    Some(rolling)
+                } else {
+                    Some(existing)
+                }
+            }
+            None => Some(rolling),
+        };
+    }
     if let Some((_, _, id, team, point)) = forced_ground_control {
         return Some((id, team, point));
     }
