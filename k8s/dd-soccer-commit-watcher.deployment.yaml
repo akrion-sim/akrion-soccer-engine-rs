@@ -57,6 +57,13 @@ spec:
         app: dd-soccer-commit-watcher
     spec:
       serviceAccountName: dd-soccer-commit-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: watcher
           image: docker.io/library/rust:1.90-bookworm
@@ -64,8 +71,9 @@ spec:
           args:
             - |
               set -u
-              KCTL=/usr/local/bin/kubectl
-              REPO="https://github.com/ORESoftware/soccer-sim-game-engine.rs.git"
+              KCTL=/tmp/kubectl
+              SOCCER_REPO="https://github.com/ORESoftware/soccer-sim-game-engine.rs.git"
+              DES_REPO="https://github.com/ORESoftware/discrete-event-system.rs.git"
               NS=default
               CM=dd-soccer-commit-watcher-state
               LEARNER=deployment/dd-soccer-learning-rds-continuous
@@ -77,19 +85,71 @@ spec:
                 curl -fsSL -o "$KCTL" "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
                 chmod +x "$KCTL"
               fi
-              echo "commit-watcher up: repo=$REPO poll=${POLL}s kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
-              LAST="$($KCTL -n $NS get cm $CM -o jsonpath='{.data.lastSha}' 2>/dev/null || echo '')"
-              echo "seed lastSha=${LAST:-<none>}"
+
+              resolve_sha() {
+                repo="$1"
+                git ls-remote "$repo" refs/heads/main 2>/dev/null | awk '{print $1}' | head -1
+              }
+
+              state_value() {
+                key="$1"
+                $KCTL -n $NS get cm $CM -o "jsonpath={.data.${key}}" 2>/dev/null || true
+              }
+
+              write_state() {
+                key="$1"
+                soccer_sha="$2"
+                des_sha="$3"
+                tournament_job="${4:-}"
+                $KCTL -n $NS create cm $CM \
+                  --from-literal=lastKey="$key" \
+                  --from-literal=lastSoccerSha="$soccer_sha" \
+                  --from-literal=lastDesSha="$des_sha" \
+                  --from-literal=lastSha="$soccer_sha" \
+                  --from-literal=lastTournamentJob="$tournament_job" \
+                  --dry-run=client -o yaml | $KCTL -n $NS apply -f -
+              }
+
+              LAST_KEY="$(state_value lastKey)"
+              LEGACY_LAST_SOCCER="$(state_value lastSha)"
+              echo "commit-watcher up: soccer_repo=$SOCCER_REPO des_repo=$DES_REPO poll=${POLL}s kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
+              echo "seed lastKey=${LAST_KEY:-<none>} legacyLastSoccer=${LEGACY_LAST_SOCCER:-<none>}"
               while true; do
-                SHA="$(git ls-remote "$REPO" refs/heads/main 2>/dev/null | awk '{print $1}')"
-                if [ -n "$SHA" ] && [ "$SHA" != "$LAST" ]; then
-                  echo "$(date -u +%FT%TZ) NEW COMMIT $SHA (was ${LAST:-<none>}) -> redeploy learner + launch tournament"
+                SOCCER_SHA="$(resolve_sha "$SOCCER_REPO")"
+                DES_SHA="$(resolve_sha "$DES_REPO")"
+                if [ -z "$SOCCER_SHA" ] || [ -z "$DES_SHA" ]; then
+                  echo "$(date -u +%FT%TZ) WARN unable to resolve refs soccer=${SOCCER_SHA:-<empty>} des=${DES_SHA:-<empty>}"
+                  sleep "$POLL"
+                  continue
+                fi
+
+                KEY="${SOCCER_SHA}:${DES_SHA}"
+                if [ -z "$LAST_KEY" ]; then
+                  if [ -z "$LEGACY_LAST_SOCCER" ] || [ "$LEGACY_LAST_SOCCER" = "$SOCCER_SHA" ]; then
+                    echo "$(date -u +%FT%TZ) seed current refs without restart soccer=$SOCCER_SHA des=$DES_SHA"
+                    if write_state "$KEY" "$SOCCER_SHA" "$DES_SHA" ""; then
+                      LAST_KEY="$KEY"
+                    else
+                      echo "WARN state seed failed"
+                    fi
+                    sleep "$POLL"
+                    continue
+                  fi
+                  LAST_KEY="${LEGACY_LAST_SOCCER}:"
+                fi
+
+                if [ "$KEY" != "$LAST_KEY" ]; then
+                  SHORT="${SOCCER_SHA:0:7}-${DES_SHA:0:7}"
+                  JOB="dd-soccer-tournament-push-${SHORT}-$(date +%s)"
+                  echo "$(date -u +%FT%TZ) NEW COMMIT soccer=$SOCCER_SHA des=$DES_SHA (was $LAST_KEY) -> redeploy learner + launch tournament job=$JOB"
                   $KCTL -n $NS rollout restart "$LEARNER" || echo "WARN rollout restart failed"
-                  JOB="dd-soccer-tournament-push-$(echo "$SHA" | cut -c1-7)-$(date +%s)"
                   $KCTL -n $NS create job "$JOB" --from="$CRON" || echo "WARN tournament job create failed"
-                  $KCTL -n $NS create cm $CM --from-literal=lastSha="$SHA" --dry-run=client -o yaml | $KCTL -n $NS apply -f - || echo "WARN state update failed"
-                  LAST="$SHA"
-                  echo "$(date -u +%FT%TZ) done; now tracking $SHA"
+                  if write_state "$KEY" "$SOCCER_SHA" "$DES_SHA" "$JOB"; then
+                    LAST_KEY="$KEY"
+                    echo "$(date -u +%FT%TZ) done; now tracking soccer=$SOCCER_SHA des=$DES_SHA"
+                  else
+                    echo "WARN state update failed"
+                  fi
                 fi
                 sleep "$POLL"
               done
@@ -100,3 +160,8 @@ spec:
             limits:
               cpu: "250m"
               memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
