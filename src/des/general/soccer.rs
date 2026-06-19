@@ -2751,6 +2751,7 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     131,
     137,
     153,
+    159,
     160,
     163,
     170,
