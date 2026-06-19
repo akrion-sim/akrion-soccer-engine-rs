@@ -86,6 +86,7 @@ fn test_pending_pass(
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     }
 }
 
@@ -11623,6 +11624,7 @@ fn unpressured_receiver_steps_toward_the_ball_to_control_it_early() {
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -11946,6 +11948,7 @@ fn off_ball_no_chance_player_drops_goalside_of_anticipated_ball() {
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
     let snap = WorldSnapshot::from_match(&sim);
     // The brain wants to push upfield, ahead of where the ball is going.
@@ -12033,6 +12036,7 @@ fn lane_guard_preserves_goalside_drop_during_in_flight_pass() {
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -22378,6 +22382,7 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         receiver_velocity_at_launch: Some(sim.players[9].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
     sim.pending_shot = Some(PendingShot {
         team: Team::Home,
@@ -25949,6 +25954,7 @@ fn aerial_pass_interception_pressure_doubles_or_triples_near_landing() {
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     };
     let aerial = PendingPass {
         flight: PassFlight::Aerial,
@@ -26134,6 +26140,7 @@ fn pass_reach_interception_requires_defender_to_face_ball_path() {
         receiver_velocity_at_launch: Some(Vec2::zero()),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     };
     let previous_ball_pos = Vec2::new(40.0, 50.0);
     let ball_pos = Vec2::new(40.0, 60.0);
@@ -26233,6 +26240,7 @@ fn aerial_cross_reception_exposes_first_touch_header_and_control_choices() {
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     sim.apply_ball_outcome(BallStepOutcome::Controlled {
@@ -41177,6 +41185,7 @@ fn completed_pass_reward_reinforces_passer_anticipating_receiver_stride() {
         receiver_velocity_at_launch: Some(receiver_velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     };
     let feet_pass = pending_for_target(receiver_position);
     let stride_pass = pending_for_target(stride_target);
@@ -42062,6 +42071,7 @@ fn off_target_pending_pass_receiver_sprints_to_ball() {
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
     sim.players[12].position = Vec2::new(36.0, 64.0);
 
@@ -42138,6 +42148,7 @@ fn pressured_pending_pass_receiver_prioritizes_early_intercept_margin() {
             receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
             offside: None,
             offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
         });
         sim
     };
@@ -42204,6 +42215,7 @@ fn intended_pending_pass_target_uses_belief_urgency_floor() {
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -42271,6 +42283,7 @@ fn intended_pending_pass_target_backs_off_for_clearly_closer_teammate() {
         receiver_velocity_at_launch: Some(sim.players[intended].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -42324,6 +42337,7 @@ fn pressured_pending_pass_recovery_is_learned_as_rewarded_state_action() {
         receiver_velocity_at_launch: Some(sim.players[receiver].velocity),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     });
 
     let before = WorldSnapshot::from_match(&sim);
@@ -51922,6 +51936,7 @@ fn a_pass_target_cannot_capture_the_ball_while_its_feet_are_out_of_reach() {
         receiver_velocity_at_launch: Some(Vec2::new(0.0, 5.0)),
         offside: None,
         offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
     };
     let got = nearest_ball_controller_for_segment(
         1,
@@ -65934,4 +65949,64 @@ fn grounded_defender_holds_position_until_recovered() {
     }
     assert_eq!(sim.players[grounded].slide_recovery_seconds, 0.0);
     assert!(sim.players[grounded].position.distance(spot) < 0.05);
+}
+
+#[test]
+fn pass_completion_head_learns_separable_pattern() {
+    // The learned pass-completion model must actually learn: given samples where completion is a
+    // clean function of one feature, training should separate the two classes.
+    let sample = |signal: f32, completed: bool| {
+        let mut features = vec![0.0f32; SOCCER_PASS_COMPLETION_FEATURE_DIM];
+        // Use a couple of pass-feature slots (after the 256-d embedding) as the signal channel.
+        *features.last_mut().unwrap() = signal;
+        features[SOCCER_MOMENT_EMBEDDING_DIM] = signal;
+        SoccerPassOutcomeSample {
+            features,
+            completed,
+            own_half: true,
+        }
+    };
+    let mut samples = Vec::new();
+    for _ in 0..96 {
+        samples.push(sample(1.0, true));
+        samples.push(sample(0.0, false));
+    }
+    let mut head = SoccerPassCompletionHead::new(11);
+    for _ in 0..250 {
+        head.train(&samples, 0.05);
+    }
+    let p_complete = head.predict(&sample(1.0, true).features).unwrap();
+    let p_fail = head.predict(&sample(0.0, false).features).unwrap();
+    assert!(
+        p_complete > p_fail + 0.2,
+        "model should separate completed vs intercepted: complete={p_complete} fail={p_fail}"
+    );
+    assert!(head.training_steps() > 0);
+    // Malformed input is rejected, not panicked.
+    assert!(head.predict(&[0.0; 3]).is_none());
+}
+
+#[test]
+fn pass_outcome_samples_are_captured_during_play() {
+    // Phase 1 (the learning substrate): resolved passes must emit labelled training samples whose
+    // features are the 22+ball config embedding + pass features captured at launch.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 99,
+        ..MatchConfig::default()
+    });
+    for _ in 0..1200 {
+        sim.run_time_step();
+    }
+    assert!(
+        !sim.pass_outcome_samples.is_empty(),
+        "resolved passes should produce learning samples"
+    );
+    for sample in &sim.pass_outcome_samples {
+        assert_eq!(sample.features.len(), SOCCER_PASS_COMPLETION_FEATURE_DIM);
+        assert!(sample.features.iter().all(|v| v.is_finite()));
+    }
+    // Draining hands them off (to the cluster learner / Postgres) and clears the buffer.
+    let drained = sim.drain_pass_outcome_samples();
+    assert!(!drained.is_empty());
+    assert!(sim.pass_outcome_samples.is_empty());
 }
