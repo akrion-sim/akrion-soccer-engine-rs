@@ -4621,6 +4621,9 @@ impl SoccerMatch {
                     // recovery sprints and tracking/handoff runs are exempt by design.
                     let intent = snapshot.cross_through_disciplined_intent(intent);
                     let intent = snapshot.teammate_spacing_path_adjusted_intent(intent);
+                    // Stretch the pitch: the wide player on the flank away from the ball
+                    // holds its home channel rather than collapsing ball-side.
+                    let intent = snapshot.weak_side_width_hold_adjusted_intent(intent);
                     // Final no-exception role-layer assertion for movement targets: later
                     // route/spacing/safety stages may have rewritten targets, but the team
                     // lines must still aim back to the back-four / midfield / striker bands.
@@ -14804,6 +14807,11 @@ fn dd_soccer_disable_defensive_pushup() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP").is_ok())
 }
+fn dd_soccer_disable_weakside_width_hold() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WEAKSIDE_WIDTH_HOLD").is_ok())
+}
 fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -23267,10 +23275,31 @@ impl WorldSnapshot {
         let pulled_x = self
             .back_four_horizontal_gap_adjusted_x(me, target.x, exempt)
             .unwrap_or(target.x.clamp(0.0, self.field_width));
-        // Fore-aft: flatten toward the line's average depth (kill the stagger).
+        // Fore-aft parity. The flat line is a DEFENDING mechanic (the offside trap): only
+        // when WE genuinely control the ball do we let the four stagger — a wingback may
+        // overlap and bomb on. While the opponent has it OR the ball is a 50/50 with no
+        // controlled holder (loose), the back line forms up: we key on CONTROLLED
+        // possession (an actual holder), not last-touch, so a loose ball we last brushed
+        // still pulls the line together. In our own half, defending/contesting, we tighten
+        // to a true offside-trap line (strive for the SAME depth); higher up the gentler
+        // de-stagger is enough. The non-exempt defenders converge over the ~3s consistency
+        // horizon — eventual consistency, a bounded pull, never a snap. (One stepped-out
+        // defender is already removed via `exempt`, so this trims to the remaining three
+        // when a back is legitimately forward, e.g. an overlapping wingback.)
+        let in_possession = self.controlled_possession_team() == Some(me.team);
+        let line_avg_pos =
+            line.iter().map(|(_, p)| *p).fold(Vec2::new(0.0, 0.0), |acc, p| acc + p) / n;
+        let in_own_half = pass_origin_in_own_half(me.team, line_avg_pos, self.field_length);
+        let base_flatten_gain = if in_possession {
+            0.0
+        } else if in_own_half {
+            BACK_FOUR_OFFSIDE_TRAP_FLATTEN_GAIN
+        } else {
+            BACK_FOUR_FLATTEN_GAIN
+        };
         let avg_fwd = line.iter().map(|(_, p)| fwd(*p)).sum::<f64>() / n;
         let me_fwd = fwd(self.player_snapshot_position(me));
-        let flatten_gain = BACK_FOUR_FLATTEN_GAIN
+        let flatten_gain = base_flatten_gain
             * self.shape_consistency_gain_for_player_target(
                 me,
                 target,
@@ -24645,9 +24674,13 @@ impl WorldSnapshot {
         let base = if possession {
             let possession_width_fit =
                 (directive.width_yards / self.field_width.max(1.0)).clamp(0.45, 0.96);
+            // Anchor the support base mostly on the player's OWN home channel, not the
+            // ball's x. The old 0.50 floor let an off-ball player slide halfway across to
+            // the ball's lane, collapsing the team's width onto the ball. Holding the home
+            // channel keeps the pitch stretched and honours each player's lane affinity.
             let home_anchor =
-                (0.58 + (possession_width_fit - 0.62) * 0.78 + support_spread_bias * 0.035)
-                    .clamp(0.50, 0.82);
+                (0.62 + (possession_width_fit - 0.62) * 0.78 + support_spread_bias * 0.035)
+                    .clamp(0.62, 0.86);
             let ball_anchor = 1.0 - home_anchor;
             Vec2::new(
                 home.x * home_anchor + self.ball.position.x * ball_anchor,
@@ -24731,10 +24764,15 @@ impl WorldSnapshot {
                     let home_lane_fit = (1.0
                         - (p.x - home.x).abs() / (self.field_width * 0.42).max(1.0))
                     .clamp(0.0, 1.0);
-                    (lane_width * 0.38 + home_lane_fit * 0.34)
-                        * if correct_side { 1.0 } else { 0.46 }
+                    // Lane affinity: holding the player's OWN home channel (and, for wide
+                    // players, the touchline) has to compete with the open-space term
+                    // (~0..18), so weight it into points that matter. The old ~0.7-max
+                    // bonus was a rounding error next to open space, so every supporter
+                    // drifted infield onto the ball and the team lost its width.
+                    (lane_width * 0.85 + home_lane_fit * 2.6)
+                        * if correct_side { 1.0 } else { 0.40 }
                         // Don't hold width when the ball is well ahead — get forward.
-                        * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.55))
+                        * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.45))
                 } else {
                     0.0
                 };
@@ -24839,7 +24877,95 @@ impl WorldSnapshot {
         } else {
             best
         };
+        // Stretch the pitch: if this is the wide player on the flank away from the ball,
+        // hold its home channel instead of drifting ball-side into the bunch.
+        let best = self.weak_side_width_hold_target(me, best);
         self.clamp_forward_onside_support(me, best)
+    }
+
+    /// Weak-side width holder. In possession, a wide player (winger or wide
+    /// defender) whose home flank is OPPOSITE the ball pins its `x` back toward its
+    /// home channel rather than collapsing toward the ball — keeping the team
+    /// stretched and pinning the far full-back. Only the `x` is touched (depth is
+    /// whatever the support search chose), and it only ever pulls a target that has
+    /// drifted INFIELD of the home channel back out — it never drags a player further
+    /// infield, and never widens past its own channel. No-op for the ball-side wide
+    /// player (free to support/overlap), a near-central ball, the carrier, keepers,
+    /// out of possession, or when `DD_SOCCER_DISABLE_WEAKSIDE_WIDTH_HOLD` is set.
+    fn weak_side_width_hold_target(&self, me: &PlayerSnapshot, target: Vec2) -> Vec2 {
+        if dd_soccer_disable_weakside_width_hold()
+            || me.role == PlayerRole::Goalkeeper
+            || self.ball.holder == Some(me.id)
+        {
+            return target;
+        }
+        if self.possession_team() != Some(me.team) {
+            return target;
+        }
+        if !(self.is_wide_attacker(me) || self.is_wide_defender(me)) {
+            return target;
+        }
+        let mid = self.field_width * 0.5;
+        let home_side = (me.home_position.x - mid).signum();
+        if home_side == 0.0 {
+            return target;
+        }
+        let ball_side = (self.ball.position.x - mid).signum();
+        if ball_side == home_side {
+            return target;
+        }
+        let ball_offset = ((self.ball.position.x - mid).abs() / mid.max(1.0)).clamp(0.0, 1.0);
+        if ball_offset < WEAKSIDE_WIDTH_BALL_OFFSET_MIN {
+            return target;
+        }
+        let hold_x = me.home_position.x;
+        let pinned_x = if home_side < 0.0 {
+            target.x.min(hold_x)
+        } else {
+            target.x.max(hold_x)
+        };
+        let blend = (0.40 + ball_offset * 0.50).clamp(0.0, 0.90);
+        let new_x = target.x + (pinned_x - target.x) * blend;
+        Vec2::new(new_x, target.y).clamp_to_pitch(self.field_width, self.field_length)
+    }
+
+    /// Intent-level application of [`Self::weak_side_width_hold_target`]. The support
+    /// router reaches a wide player through many branches (wide-outlet, flank-cross
+    /// arrival, in-behind, check-to-ball, plain open space), so pinning width inside
+    /// one generator misses most of them; applying it to the settled MoveTo target
+    /// catches every branch. Exemptions mirror the other off-ball nudges.
+    pub(crate) fn weak_side_width_hold_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
+        let SoccerAction::MoveTo(target) = intent.action else {
+            return intent;
+        };
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return intent;
+        }
+        let Some(player) = self.players.iter().find(|p| p.id == intent.player_id) else {
+            return intent;
+        };
+        if player.role == PlayerRole::Goalkeeper
+            || player.controller_slot.is_some()
+            || self.ball.holder == Some(player.id)
+        {
+            return intent;
+        }
+        if self
+            .pending_pass
+            .as_ref()
+            .and_then(|pass| pass.target)
+            .is_some_and(|receiver| receiver == player.id)
+        {
+            return intent;
+        }
+        let held = self.weak_side_width_hold_target(player, target);
+        if held.distance(target) > 1e-6 {
+            intent.action = SoccerAction::MoveTo(held);
+        }
+        intent
     }
 
     fn forward_support_context_for(
@@ -26333,8 +26459,12 @@ impl WorldSnapshot {
             + directive.defensive_line_y * role_line_bias
             + ball_y * 0.18
             - (3.0 - line_forward_bias) * me.team.attack_dir();
+        // Retain most of the team's natural lateral width even when defending: the old
+        // 0.42 floor compressed a back four / block down to <half-pitch and emptied the
+        // flanks (the "everyone sucked onto the ball" vacuum). Hold the width so each
+        // player stays near its home lane/channel.
         let mut width_factor =
-            (directive.width_yards / self.field_width.max(1.0)).clamp(0.42, 0.88);
+            (directive.width_yards / self.field_width.max(1.0)).clamp(0.56, 0.92);
         if self.possession_team() == Some(me.team.other()) {
             let opponent_width_factor = (self.team_lateral_width_yards(me.team.other())
                 / self.field_width.max(1.0))
@@ -26347,7 +26477,7 @@ impl WorldSnapshot {
             let defensive_spread_bias = (home_lane * 0.58 + ball_lane * 0.24).clamp(-1.0, 1.0);
             let follow_width = (opponent_width_factor * DEFENSE_SPREAD_FOLLOW_RATIO
                 + defensive_spread_bias * 0.035)
-                .clamp(0.34, 0.74);
+                .clamp(0.52, 0.92);
             width_factor = width_factor.max(follow_width);
         }
         let mid_x = self.field_width * 0.5;

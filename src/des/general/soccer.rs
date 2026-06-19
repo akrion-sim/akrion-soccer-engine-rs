@@ -1308,6 +1308,11 @@ const BACK_FOUR_BLOCK_WIDTH_YARDS: f64 = 22.0;
 const BACK_FOUR_BALL_SIDE_SHIFT: f64 = 0.6;
 const BACK_FOUR_LATERAL_GAIN: f64 = 0.78;
 const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
+// Defending in our OWN half we tighten to a true offside-trap line: strive for the SAME
+// fore-aft depth (near-full flatten), not merely a reduced stagger. Still a bounded pull
+// converging over the 3s consistency horizon (eventual consistency), never a snap. On
+// offense the flat line is dropped entirely (a wingback may overlap, the four may stagger).
+const BACK_FOUR_OFFSIDE_TRAP_FLATTEN_GAIN: f64 = 0.9;
 const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
 const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
 const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
@@ -1377,7 +1382,12 @@ const ATTACK_SPACING_MAX_YARDS: f64 = 17.0;
 const DEFENSE_SPACING_MIN_YARDS: f64 = 5.0;
 const DEFENSE_SPACING_IDEAL_YARDS: f64 = 7.0;
 const DEFENSE_SPACING_MAX_YARDS: f64 = 10.0;
-const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
+// How much of the opponent's lateral stretch the defending block tracks. At 0.50 the
+// block sat at roughly HALF the attack's width, abandoning the far flank and collapsing
+// 22 players into a central "bunchball" vacuum. A defending team narrows ball-side but
+// must still honour the width of the pitch (track a stretched opponent and stay near home
+// lanes), so it tracks most of the opponent's spread, not half of it.
+const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.80;
 // Territory discipline ("cover ground"). Two teammates packed into the same few yards
 // add no attacking or defensive value, so beyond a brief grace window — long enough
 // for a legitimate handoff, screen/block, or double-team — one of the pair is told to
@@ -2019,6 +2029,12 @@ const ATTACKING_DEFENDER_PUSH_UP_YARDS: f64 = 8.0;
 // holds and covers when the opponent attacks the box. Downstream caps (halfway+5,
 // the goal-line buffer, line-break retreat) further bound it.
 const DEFENDER_LINE_FORWARD_BIAS_YARDS: f64 = 2.5;
+// Weak-side width holder. In possession, the wide player on the flank AWAY from the
+// ball should hold its home channel (stay wide/high) to stretch the opponent's back
+// line and pin the far full-back — NOT drift ball-side into the bunch. The ball must
+// be at least this lopsided (fraction of the half-width off-centre) before the far
+// flank is meaningfully a "weak side" worth pinning; below it both flanks are live.
+const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.18;
 // Defenders slide toward the ball laterally a touch more than before, and
 // wing-backs (wide defenders) slide much more — they are the ones who shuttle out
 // to the ball on their flank. Centre-backs get only a small amount: they hold
@@ -3364,9 +3380,9 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
         // tracking a mark, no outlet, covering a teammate, team urgency) — i.e. players
         // only leave their primary lane for those already-specified reasons. Drift
         // INSIDE the band is still free; this only bounds the band edge.
-        PlayerRole::Defender if in_possession => 0.66,
+        PlayerRole::Defender if in_possession => 0.76,
         PlayerRole::Defender => 0.92,
-        PlayerRole::Midfielder if in_possession => 0.66,
+        PlayerRole::Midfielder if in_possession => 0.76,
         PlayerRole::Midfielder => 0.90,
         // A light containment pull for forwards: enough to keep the lane clamp/penalty
         // alive against a cross-pitch drift (commitment must be > 0 to engage at all),
@@ -16378,7 +16394,7 @@ fn dense_soccer_transition_reward(
             if is_floor_pass {
                 let lane_open = before_obs.floor_pass_lane_score.clamp(0.0, 1.0);
                 if lane_open < BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD {
-                    reward -= BLOCKED_LANE_FLOOR_PASS_PENALTY_POINTS
+                    reward -= tunables().reward.blocked_lane_floor_pass_penalty_points
                         * (BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD - lane_open)
                         / BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD;
                 }
@@ -42254,7 +42270,7 @@ fn low_pressure_forced_pass_penalty_points(
     };
     let outcome_cost = if retained_possession { 0.36 } else { 1.0 };
 
-    (LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS
+    (tunables().reward.low_pressure_forced_pass_penalty_points
         * patience
         * poor_pass
         * (0.55 + carry_space * 0.45)
