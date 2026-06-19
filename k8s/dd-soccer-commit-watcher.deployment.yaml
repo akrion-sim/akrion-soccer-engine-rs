@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dd-soccer-commit-watcher
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dd-soccer-commit-watcher
+  namespace: default
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dd-soccer-commit-watcher
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: dd-soccer-commit-watcher
+    namespace: default
+roleRef:
+  kind: Role
+  name: dd-soccer-commit-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dd-soccer-commit-watcher
+  namespace: default
+  labels:
+    app: dd-soccer-commit-watcher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dd-soccer-commit-watcher
+  template:
+    metadata:
+      labels:
+        app: dd-soccer-commit-watcher
+    spec:
+      serviceAccountName: dd-soccer-commit-watcher
+      containers:
+        - name: watcher
+          image: docker.io/library/rust:1.90-bookworm
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -u
+              KCTL=/usr/local/bin/kubectl
+              REPO="https://github.com/ORESoftware/soccer-sim-game-engine.rs.git"
+              NS=default
+              CM=dd-soccer-commit-watcher-state
+              LEARNER=deployment/dd-soccer-learning-rds-continuous
+              CRON=cronjob/dd-soccer-tournament-nightly
+              POLL="${WATCH_POLL_SECONDS:-120}"
+              # install kubectl once (no per-poll download)
+              if [ ! -x "$KCTL" ]; then
+                V="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+                curl -fsSL -o "$KCTL" "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
+                chmod +x "$KCTL"
+              fi
+              echo "commit-watcher up: repo=$REPO poll=${POLL}s kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
+              LAST="$($KCTL -n $NS get cm $CM -o jsonpath='{.data.lastSha}' 2>/dev/null || echo '')"
+              echo "seed lastSha=${LAST:-<none>}"
+              while true; do
+                SHA="$(git ls-remote "$REPO" refs/heads/main 2>/dev/null | awk '{print $1}')"
+                if [ -n "$SHA" ] && [ "$SHA" != "$LAST" ]; then
+                  echo "$(date -u +%FT%TZ) NEW COMMIT $SHA (was ${LAST:-<none>}) -> redeploy learner + launch tournament"
+                  $KCTL -n $NS rollout restart "$LEARNER" || echo "WARN rollout restart failed"
+                  JOB="dd-soccer-tournament-push-$(echo "$SHA" | cut -c1-7)-$(date +%s)"
+                  $KCTL -n $NS create job "$JOB" --from="$CRON" || echo "WARN tournament job create failed"
+                  $KCTL -n $NS create cm $CM --from-literal=lastSha="$SHA" --dry-run=client -o yaml | $KCTL -n $NS apply -f - || echo "WARN state update failed"
+                  LAST="$SHA"
+                  echo "$(date -u +%FT%TZ) done; now tracking $SHA"
+                fi
+                sleep "$POLL"
+              done
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
