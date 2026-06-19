@@ -67,6 +67,45 @@ spec:
       containers:
         - name: watcher
           image: docker.io/library/rust:1.90-bookworm
+          env:
+            - name: WATCH_BRANCH
+              value: "learning"
+            - name: WATCH_DES_BRANCH
+              value: "main"
+            - name: WATCH_POLL_SECONDS
+              value: "120"
+            # Lightweight per-push tournaments so the OLD one keeps running in parallel
+            # with the NEW one within cluster capacity (the nightly cronjob stays the full
+            # 128-team run). Tune here.
+            - name: PUSH_TOURNAMENT_TEAMS
+              value: "24"
+            - name: PUSH_TOURNAMENT_GROUP_SIZE
+              value: "3"
+            - name: PUSH_TOURNAMENT_ADVANCERS
+              value: "1"
+            - name: PUSH_TOURNAMENT_THREADS
+              value: "2"
+            - name: PUSH_TOURNAMENT_MATCH_SECONDS
+              value: "600"
+            # CPU request tiny (compressible) so several co-schedule on the CPU-saturated
+            # AWS node; memory request RESERVES headroom so the scheduler never overcommits
+            # a node into OOM (a tournament that won't fit waits Pending — graceful).
+            - name: PUSH_TOURNAMENT_CPU_REQUEST
+              value: "50m"
+            - name: PUSH_TOURNAMENT_CPU_LIMIT
+              value: "2"
+            - name: PUSH_TOURNAMENT_MEM_REQUEST
+              value: "6Gi"
+            - name: PUSH_TOURNAMENT_MEM_LIMIT
+              value: "12Gi"
+            - name: PUSH_TOURNAMENT_TTL_SECONDS
+              value: "10800"
+            # Safety valve: don't pile up more than this many active push-tournaments per
+            # cluster (protects pod/etcd count + resources). Extra commits still rebuild the
+            # learner + record state; they just skip launching another tournament until the
+            # backlog drains.
+            - name: MAX_PARALLEL_PUSH_TOURNAMENTS
+              value: "5"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -78,17 +117,20 @@ spec:
               CM=dd-soccer-commit-watcher-state
               LEARNER=deployment/dd-soccer-learning-rds-continuous
               CRON=cronjob/dd-soccer-tournament-nightly
+              BRANCH="${WATCH_BRANCH:-learning}"
+              DES_BRANCH="${WATCH_DES_BRANCH:-main}"
               POLL="${WATCH_POLL_SECONDS:-120}"
-              # install kubectl once (no per-poll download)
+              MAXT="${MAX_PARALLEL_PUSH_TOURNAMENTS:-5}"
+              # one-time tooling install; rust:bookworm has git, curl, and python3.
               if [ ! -x "$KCTL" ]; then
                 V="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
                 curl -fsSL -o "$KCTL" "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
                 chmod +x "$KCTL"
               fi
-
               resolve_sha() {
                 repo="$1"
-                git ls-remote "$repo" refs/heads/main 2>/dev/null | awk '{print $1}' | head -1
+                branch="$2"
+                git ls-remote "$repo" "refs/heads/${branch}" 2>/dev/null | awk '{print $1}' | head -1
               }
 
               state_value() {
@@ -106,17 +148,48 @@ spec:
                   --from-literal=lastSoccerSha="$soccer_sha" \
                   --from-literal=lastDesSha="$des_sha" \
                   --from-literal=lastSha="$soccer_sha" \
+                  --from-literal=branch="$BRANCH" \
+                  --from-literal=desBranch="$DES_BRANCH" \
                   --from-literal=lastTournamentJob="$tournament_job" \
-                  --dry-run=client -o yaml | $KCTL -n $NS apply -f -
+                  --dry-run=client -o yaml | $KCTL -n $NS apply -f - >/dev/null
+              }
+
+              launch_tournament() {
+                soccer_sha="$1"
+                des_sha="$2"
+                active="$($KCTL -n $NS get jobs -l dd-soccer/push-tournament=true -o json 2>/dev/null | python3 -c 'import json, sys; print(sum(1 for item in json.load(sys.stdin).get("items", []) if item.get("status", {}).get("active", 0)))' 2>/dev/null || echo 0)"
+                if [ "${active:-0}" -ge "$MAXT" ]; then
+                  echo "  tournament backlog at cap ($active >= $MAXT) -> skip launch for soccer=$soccer_sha des=$des_sha (learner still rebuilt)"
+                  return 0
+                fi
+                short="${soccer_sha:0:7}-${des_sha:0:7}"
+                job="dd-soccer-tournament-push-${short}-$(date +%s)"
+                $KCTL -n $NS create job "$job" --from="$CRON" --dry-run=client -o json \
+                  | JOB="$job" \
+                    BRANCH="$BRANCH" \
+                    DES_BRANCH="$DES_BRANCH" \
+                    PUSH_TOURNAMENT_TEAMS="$PUSH_TOURNAMENT_TEAMS" \
+                    PUSH_TOURNAMENT_GROUP_SIZE="$PUSH_TOURNAMENT_GROUP_SIZE" \
+                    PUSH_TOURNAMENT_ADVANCERS="$PUSH_TOURNAMENT_ADVANCERS" \
+                    PUSH_TOURNAMENT_THREADS="$PUSH_TOURNAMENT_THREADS" \
+                    PUSH_TOURNAMENT_MATCH_SECONDS="$PUSH_TOURNAMENT_MATCH_SECONDS" \
+                    PUSH_TOURNAMENT_CPU_REQUEST="$PUSH_TOURNAMENT_CPU_REQUEST" \
+                    PUSH_TOURNAMENT_CPU_LIMIT="$PUSH_TOURNAMENT_CPU_LIMIT" \
+                    PUSH_TOURNAMENT_MEM_REQUEST="$PUSH_TOURNAMENT_MEM_REQUEST" \
+                    PUSH_TOURNAMENT_MEM_LIMIT="$PUSH_TOURNAMENT_MEM_LIMIT" \
+                    PUSH_TOURNAMENT_TTL_SECONDS="$PUSH_TOURNAMENT_TTL_SECONDS" \
+                    python3 -c 'import json, os, sys; job=json.load(sys.stdin); job.setdefault("metadata", {}).setdefault("labels", {})["dd-soccer/push-tournament"]="true"; spec=job.setdefault("spec", {}); spec["ttlSecondsAfterFinished"]=int(os.environ["PUSH_TOURNAMENT_TTL_SECONDS"]); template=spec.setdefault("template", {}); template.setdefault("metadata", {}).setdefault("labels", {})["dd-soccer/push-tournament"]="true"; pod_spec=template.setdefault("spec", {}); container=pod_spec.setdefault("containers", [{}])[0]; container["resources"]={"requests":{"cpu":os.environ["PUSH_TOURNAMENT_CPU_REQUEST"],"memory":os.environ["PUSH_TOURNAMENT_MEM_REQUEST"]},"limits":{"cpu":os.environ["PUSH_TOURNAMENT_CPU_LIMIT"],"memory":os.environ["PUSH_TOURNAMENT_MEM_LIMIT"]}}; drop=set("SOCCER_TOURNAMENT_LOCK_KEY SOCCER_SOURCE_REF SOCCER_ENGINE_SOURCE_REF SOCCER_DES_REF SOCCER_TOURNAMENT_TEAMS SOCCER_TOURNAMENT_GROUP_SIZE SOCCER_TOURNAMENT_ADVANCERS SOCCER_TOURNAMENT_THREADS SOCCER_TOURNAMENT_MATCH_SECONDS".split()); env=[entry for entry in container.get("env", []) if entry.get("name") not in drop]; env.extend([{"name":"SOCCER_TOURNAMENT_LOCK_KEY","value":os.environ["JOB"]},{"name":"SOCCER_SOURCE_REF","value":os.environ["BRANCH"]},{"name":"SOCCER_ENGINE_SOURCE_REF","value":os.environ["DES_BRANCH"]},{"name":"SOCCER_DES_REF","value":os.environ["DES_BRANCH"]},{"name":"SOCCER_TOURNAMENT_TEAMS","value":os.environ["PUSH_TOURNAMENT_TEAMS"]},{"name":"SOCCER_TOURNAMENT_GROUP_SIZE","value":os.environ["PUSH_TOURNAMENT_GROUP_SIZE"]},{"name":"SOCCER_TOURNAMENT_ADVANCERS","value":os.environ["PUSH_TOURNAMENT_ADVANCERS"]},{"name":"SOCCER_TOURNAMENT_THREADS","value":os.environ["PUSH_TOURNAMENT_THREADS"]},{"name":"SOCCER_TOURNAMENT_MATCH_SECONDS","value":os.environ["PUSH_TOURNAMENT_MATCH_SECONDS"]}]); container["env"]=env; json.dump(job, sys.stdout)' \
+                  | $KCTL -n $NS create -f - && echo "  launched $job (teams=$PUSH_TOURNAMENT_TEAMS ref=$BRANCH des=$DES_BRANCH lock=$job, parallel)" || echo "  WARN tournament create failed"
               }
 
               LAST_KEY="$(state_value lastKey)"
+              STATE_BRANCH="$(state_value branch)"
               LEGACY_LAST_SOCCER="$(state_value lastSha)"
-              echo "commit-watcher up: soccer_repo=$SOCCER_REPO des_repo=$DES_REPO poll=${POLL}s kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
-              echo "seed lastKey=${LAST_KEY:-<none>} legacyLastSoccer=${LEGACY_LAST_SOCCER:-<none>}"
+              echo "commit-watcher up: soccer_repo=$SOCCER_REPO branch=$BRANCH des_repo=$DES_REPO des_branch=$DES_BRANCH poll=${POLL}s maxParallelTournaments=$MAXT kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
+              echo "seed lastKey=${LAST_KEY:-<none>} stateBranch=${STATE_BRANCH:-<none>} legacyLastSoccer=${LEGACY_LAST_SOCCER:-<none>}"
               while true; do
-                SOCCER_SHA="$(resolve_sha "$SOCCER_REPO")"
-                DES_SHA="$(resolve_sha "$DES_REPO")"
+                SOCCER_SHA="$(resolve_sha "$SOCCER_REPO" "$BRANCH")"
+                DES_SHA="$(resolve_sha "$DES_REPO" "$DES_BRANCH")"
                 if [ -z "$SOCCER_SHA" ] || [ -z "$DES_SHA" ]; then
                   echo "$(date -u +%FT%TZ) WARN unable to resolve refs soccer=${SOCCER_SHA:-<empty>} des=${DES_SHA:-<empty>}"
                   sleep "$POLL"
@@ -124,6 +197,18 @@ spec:
                 fi
 
                 KEY="${SOCCER_SHA}:${DES_SHA}"
+                if [ "$STATE_BRANCH" != "$BRANCH" ]; then
+                  echo "$(date -u +%FT%TZ) seed tracked branch $BRANCH without restart soccer=$SOCCER_SHA des=$DES_SHA"
+                  if write_state "$KEY" "$SOCCER_SHA" "$DES_SHA" ""; then
+                    LAST_KEY="$KEY"
+                    STATE_BRANCH="$BRANCH"
+                  else
+                    echo "WARN branch state seed failed"
+                  fi
+                  sleep "$POLL"
+                  continue
+                fi
+
                 if [ -z "$LAST_KEY" ]; then
                   if [ -z "$LEGACY_LAST_SOCCER" ] || [ "$LEGACY_LAST_SOCCER" = "$SOCCER_SHA" ]; then
                     echo "$(date -u +%FT%TZ) seed current refs without restart soccer=$SOCCER_SHA des=$DES_SHA"
@@ -139,12 +224,11 @@ spec:
                 fi
 
                 if [ "$KEY" != "$LAST_KEY" ]; then
-                  SHORT="${SOCCER_SHA:0:7}-${DES_SHA:0:7}"
-                  JOB="dd-soccer-tournament-push-${SHORT}-$(date +%s)"
-                  echo "$(date -u +%FT%TZ) NEW COMMIT soccer=$SOCCER_SHA des=$DES_SHA (was $LAST_KEY) -> redeploy learner + launch tournament job=$JOB"
-                  $KCTL -n $NS rollout restart "$LEARNER" || echo "WARN rollout restart failed"
-                  $KCTL -n $NS create job "$JOB" --from="$CRON" || echo "WARN tournament job create failed"
-                  if write_state "$KEY" "$SOCCER_SHA" "$DES_SHA" "$JOB"; then
+                  echo "$(date -u +%FT%TZ) NEW COMMIT branch=$BRANCH soccer=$SOCCER_SHA des=$DES_SHA (was $LAST_KEY) -> redeploy learner + launch tournament"
+                  $KCTL -n $NS set env "$LEARNER" SOCCER_SOURCE_REF="$BRANCH" SOCCER_DES_REF="$DES_BRANCH" SOCCER_ENGINE_SOURCE_REF="$DES_BRANCH" --overwrite >/dev/null || echo "  WARN learner env update failed"
+                  $KCTL -n $NS rollout restart "$LEARNER" && echo "  learner restarted (rebuilds $BRANCH + DES $DES_BRANCH)" || echo "  WARN rollout restart failed"
+                  launch_tournament "$SOCCER_SHA" "$DES_SHA"
+                  if write_state "$KEY" "$SOCCER_SHA" "$DES_SHA" ""; then
                     LAST_KEY="$KEY"
                     echo "$(date -u +%FT%TZ) done; now tracking soccer=$SOCCER_SHA des=$DES_SHA"
                   else
