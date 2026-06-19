@@ -26691,7 +26691,13 @@ impl WorldSnapshot {
             self,
             team,
             SoccerConfigComparison::PositionAgnostic,
-            ConfigWeightOptions::default(),
+            ConfigWeightOptions {
+                // Weight by proximity to THIS pass's lane (from→to), so the learned features
+                // emphasise the players who actually decide whether it completes — those up the
+                // lane — and de-weight those near the ball but off it.
+                ball_path: Some((from, to)),
+                ..ConfigWeightOptions::default()
+            },
         );
         let embedding = config.embedding();
         let mut features: Vec<f32> = Vec::with_capacity(SOCCER_PASS_COMPLETION_FEATURE_DIM);
