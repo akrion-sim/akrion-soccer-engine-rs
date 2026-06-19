@@ -1270,6 +1270,11 @@ const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
 // instead of a frantic sprint-snap. Sized so a comfortable jog closes it within grace.
 const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
+// Same idea for EVERY off-ball line-shape adjuster (back four block, wingback width,
+// midfield + striker line bands): a player only SPRINTS to take up its shape slot when it
+// is genuinely far out of position. Smaller upkeep corrections are jogged inside the grace
+// window so the team isn't frantically sprint-snapping every tick (it conserves energy).
+const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield: never more than this
 // far into the opponents' half, regardless of how deep the ball is. This is the
 // exception to the 25yd rule — with the ball deep in the opponents' half the 2-25yd
@@ -1376,9 +1381,12 @@ const SETTLED_POSSESSION_SECONDS: f64 = 5.0;
 // the ball. So ATTACK keeps the 5yd floor but stretches (ideal 10, isolate-past 17);
 // DEFENDING stays compact (5/7/10). The back four's own LATERAL band (1.5-8yd along x,
 // adjacent pairs) is a separate, tighter rule for the defensive line.
-const ATTACK_SPACING_MIN_YARDS: f64 = 5.0;
-const ATTACK_SPACING_IDEAL_YARDS: f64 = 10.0;
-const ATTACK_SPACING_MAX_YARDS: f64 = 17.0;
+// On offense the team STRETCHES the pitch: a wider "happy" separation band so players hold
+// real distance between them (instead of bunching), rewarded up to the ideal and only pulled
+// back in past the max. Defending stays compact (below).
+const ATTACK_SPACING_MIN_YARDS: f64 = 7.0;
+const ATTACK_SPACING_IDEAL_YARDS: f64 = 15.0;
+const ATTACK_SPACING_MAX_YARDS: f64 = 24.0;
 const DEFENSE_SPACING_MIN_YARDS: f64 = 5.0;
 const DEFENSE_SPACING_IDEAL_YARDS: f64 = 7.0;
 const DEFENSE_SPACING_MAX_YARDS: f64 = 10.0;
@@ -1770,8 +1778,29 @@ const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
+// In possession the strikers are let off the leash to push forward and hold a high line —
+// pinning the opponent's back four and offering an advanced outlet — instead of being
+// dragged back onto the midfield band. They are still bounded (onside-capped elsewhere, and
+// this keeps the line from drifting so far it disconnects), just far higher than the
+// compact defending block. See `forward_line_band_adjusted_target`.
+const STRIKER_AHEAD_OF_MID_MAX_IN_POSSESSION_YARDS: f64 = 32.0;
+// The resting stagger ahead of midfield while defending — nudged up so the striker line
+// presses from a higher starting point ("push forward more").
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 11.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+// Wingback lateral (width) discipline by phase (off the ball, 3s eventual consistency):
+// - DEFENDING: pinch IN toward centre, but only as far as the wider (closer-to-touchline) of
+//   {the outermost opponent on that flank, the near edge of the 6-yard box} — never further,
+//   so the wide channel / box corner stays protected.
+// - IN POSSESSION: open OUT toward the touchline for attacking width, bombing wide when there
+//   is cover behind the ball (more than `WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN` team-mates
+//   goal-side of it), opening only moderately when cover is thin.
+// The 6-yard box (goal area) extends this far either side of each post.
+const SIX_YARD_BOX_DEPTH_YARDS: f64 = 6.0;
+const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
+const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 12.0;
+const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 4;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering

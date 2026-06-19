@@ -4630,6 +4630,10 @@ impl SoccerMatch {
                     let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
                     let intent = snapshot.midfield_line_band_adjusted_intent(intent);
                     let intent = snapshot.forward_line_band_adjusted_intent(intent);
+                    // Wingback width: pinch IN toward centre when defending, open OUT to the
+                    // flank in possession (more so with cover behind the ball). Final say on
+                    // wide-back x, after the back-four lateral re-apply above.
+                    let intent = snapshot.wingback_width_adjusted_intent(intent);
                     let player_decision_elapsed = phase_started.elapsed();
                     field_player_decision_elapsed += player_decision_elapsed;
                     match decision_context {
@@ -23079,8 +23083,21 @@ impl WorldSnapshot {
         };
         let tactical_row_height = self.field_length.max(1.0) / f64::from(PITCH_GENOME_ROWS);
         let row_band = tactical_row_height * BACK_FOUR_ROW_COHESION_ROWS;
-        let cohesive_fwd =
-            adjusted_fwd.clamp(desired_avg_fwd - row_band, desired_avg_fwd + row_band);
+        // Row-cohesion pins each defender within `row_band` of the line average — a
+        // DEFENDING guard against one back drifting off the shape. When WE genuinely
+        // control the ball the back four is free to stagger fore-aft (a centre-back may
+        // step into midfield, a wingback overlap and bomb on), so we lift the individual
+        // clamp on offense. We key on CONTROLLED possession (an actual holder), not
+        // last-touch, so a 50/50 we last brushed still forms up. The band AVERAGE pull
+        // above still applies — the whole line keeps pushing up / dropping off with the
+        // ball — only the per-defender stagger clamp is released. Mirrors the fore-aft
+        // gate in `back_four_shape_adjusted_target`.
+        let controls_ball = self.controlled_possession_team() == Some(me.team);
+        let cohesive_fwd = if controls_ball {
+            adjusted_fwd
+        } else {
+            adjusted_fwd.clamp(desired_avg_fwd - row_band, desired_avg_fwd + row_band)
+        };
         let banded_fwd = line_band_avg_fwd(cohesive_fwd);
         let adjusted_y = (banded_fwd * attack_dir).clamp(0.0, self.field_length);
         let in_possession = self
@@ -23325,11 +23342,185 @@ impl WorldSnapshot {
         if let Some(target) = current {
             let adjusted = self.back_four_shape_adjusted_target(intent.player_id, target);
             if adjusted.distance(target) > 0.25 {
-                intent.sprint = true;
+                // Shape upkeep is a calm JOG — only sprint when genuinely far out of
+                // position. Sprint-snapping every sub-yard correction is what made the team
+                // frantic and burned energy needlessly.
+                if let Some(pos) = self
+                    .players
+                    .iter()
+                    .find(|p| p.id == intent.player_id)
+                    .map(|p| self.player_snapshot_position(p))
+                {
+                    if pos.distance(adjusted) > LINE_SHAPE_SPRINT_TRAVEL_YARDS {
+                        intent.sprint = true;
+                    }
+                }
                 intent.action = SoccerAction::MoveTo(adjusted);
             }
         }
         return intent;
+    }
+
+    /// Wingback lateral (width) discipline by phase, off the ball. Only the wingback's x is
+    /// touched (fore-aft stays with the line bands); a bounded pull toward the target over the
+    /// 3s consistency horizon (eventual consistency), never a snap.
+    /// - DEFENDING (incl. a 50/50, keyed on CONTROLLED possession): pinch IN toward the centre,
+    ///   but only as far as the wider — closer to the touchline — of {the outermost opponent on
+    ///   this flank, the near edge of the 6-yard box}; so it covers a genuinely wide attacker
+    ///   yet never over-pinches past the box corner.
+    /// - IN POSSESSION: open OUT toward the touchline to stretch the attack, bombing fully wide
+    ///   when there is defensive cover behind the ball (more than
+    ///   [`WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN`] team-mates goal-side of it), opening only
+    ///   moderately when cover is thin.
+    /// Defending only ever pinches IN and possession only ever opens OUT — neither fights the
+    /// other phase's lateral intent. Carrier / human-controlled / committed chasers / set plays
+    /// are exempt.
+    pub(crate) fn wingback_width_adjusted_target(&self, player_id: usize, target: Vec2) -> Vec2 {
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return target;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return target;
+        };
+        if me.role != PlayerRole::Defender
+            || me.controller_slot.is_some()
+            || self.ball.holder == Some(player_id)
+            || self.is_committed_loose_ball_chaser(player_id)
+        {
+            return target;
+        }
+        let defenders: Vec<&PlayerSnapshot> = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.role == PlayerRole::Defender)
+            .collect();
+        if defenders.len() < 3 {
+            return target;
+        }
+        let center_x = self.field_width * 0.5;
+        // The two wingbacks = the widest back on each flank by home x.
+        let left_wb = defenders
+            .iter()
+            .min_by(|a, b| {
+                a.home_position
+                    .x
+                    .total_cmp(&b.home_position.x)
+                    .then(a.id.cmp(&b.id))
+            })
+            .map(|p| p.id);
+        let right_wb = defenders
+            .iter()
+            .max_by(|a, b| {
+                a.home_position
+                    .x
+                    .total_cmp(&b.home_position.x)
+                    .then(b.id.cmp(&a.id))
+            })
+            .map(|p| p.id);
+        if left_wb == right_wb {
+            return target;
+        }
+        // `side_inward` points from this wingback's touchline toward the centre: +x on the
+        // left flank (touchline at x=0), -x on the right (touchline at x=field_width).
+        let side_inward: f64 = if Some(player_id) == left_wb && me.home_position.x < center_x {
+            1.0
+        } else if Some(player_id) == right_wb && me.home_position.x > center_x {
+            -1.0
+        } else {
+            return target;
+        };
+        let defending = self.controlled_possession_team() != Some(me.team);
+        let desired_x = if defending {
+            // Pinch IN to the wider (closer-to-touchline) of {outermost opponent, box edge}.
+            let box_half_width = self.goal_width * 0.5 + SIX_YARD_BOX_DEPTH_YARDS;
+            let box_edge_x = center_x - side_inward * box_half_width;
+            let outermost_opp = self
+                .players
+                .iter()
+                .filter(|p| p.team != me.team && p.role != PlayerRole::Goalkeeper)
+                .map(|p| self.player_snapshot_position(p).x)
+                .fold(None, |acc: Option<f64>, x| {
+                    Some(match acc {
+                        // keep the most-toward-this-touchline opponent x (min on the left,
+                        // max on the right — i.e. the smaller inward projection).
+                        Some(a) if a * side_inward <= x * side_inward => a,
+                        _ => x,
+                    })
+                });
+            match outermost_opp {
+                Some(opp_x) if opp_x * side_inward < box_edge_x * side_inward => opp_x,
+                _ => box_edge_x,
+            }
+        } else {
+            // Open OUT toward the touchline; bomb wide when there is cover behind the ball.
+            let attack = me.team.attack_dir();
+            let ball_fwd = self.ball.position.y * attack;
+            let cover_behind_ball = self
+                .players
+                .iter()
+                .filter(|p| {
+                    p.team == me.team
+                        && p.id != player_id
+                        && self.player_snapshot_position(p).y * attack < ball_fwd
+                })
+                .count();
+            let buffer = if cover_behind_ball > WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN {
+                WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS
+            } else {
+                WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS
+            };
+            center_x - side_inward * (center_x - buffer)
+        };
+        // Directional, bounded pull: defending only pinches IN, possession only opens OUT.
+        let delta_inward = (desired_x - target.x) * side_inward;
+        let apply = if defending {
+            delta_inward > 0.0
+        } else {
+            delta_inward < 0.0
+        };
+        if !apply {
+            return target;
+        }
+        let gain = self.shape_consistency_gain_for_player_target(
+            me,
+            Vec2::new(desired_x, target.y),
+            WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS,
+        );
+        let adjusted_x = (target.x + (desired_x - target.x) * gain).clamp(0.0, self.field_width);
+        Vec2::new(adjusted_x, target.y)
+    }
+
+    /// Applies [`Self::wingback_width_adjusted_target`] to a wingback's off-ball move.
+    fn wingback_width_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+        let current = match &intent.action {
+            SoccerAction::MoveTo(target) => Some(*target),
+            SoccerAction::HoldShape => self
+                .players
+                .iter()
+                .find(|p| p.id == intent.player_id)
+                .map(|p| self.player_snapshot_position(p)),
+            _ => None,
+        };
+        if let Some(target) = current {
+            let adjusted = self.wingback_width_adjusted_target(intent.player_id, target);
+            if adjusted.distance(target) > 0.25 {
+                // Shape upkeep is a calm JOG — only sprint when genuinely far out of
+                // position. Sprint-snapping every sub-yard correction is what made the team
+                // frantic and burned energy needlessly.
+                if let Some(pos) = self
+                    .players
+                    .iter()
+                    .find(|p| p.id == intent.player_id)
+                    .map(|p| self.player_snapshot_position(p))
+                {
+                    if pos.distance(adjusted) > LINE_SHAPE_SPRINT_TRAVEL_YARDS {
+                        intent.sprint = true;
+                    }
+                }
+                intent.action = SoccerAction::MoveTo(adjusted);
+            }
+        }
+        intent
     }
 
     /// Keep the midfield line's AVERAGE 3-20yd IN FRONT of the back four, settling on an
@@ -23455,7 +23646,19 @@ impl WorldSnapshot {
         if let Some(target) = current {
             let adjusted = self.midfield_line_band_adjusted_target(intent.player_id, target);
             if adjusted.distance(target) > 0.25 {
-                intent.sprint = true;
+                // Shape upkeep is a calm JOG — only sprint when genuinely far out of
+                // position. Sprint-snapping every sub-yard correction is what made the team
+                // frantic and burned energy needlessly.
+                if let Some(pos) = self
+                    .players
+                    .iter()
+                    .find(|p| p.id == intent.player_id)
+                    .map(|p| self.player_snapshot_position(p))
+                {
+                    if pos.distance(adjusted) > LINE_SHAPE_SPRINT_TRAVEL_YARDS {
+                        intent.sprint = true;
+                    }
+                }
                 intent.action = SoccerAction::MoveTo(adjusted);
             }
         }
@@ -23512,8 +23715,15 @@ impl WorldSnapshot {
         // band so the attack can stretch. Either way the y target is recomputed every
         // snapshot and reached under the shape-consistency grace (eventual consistency).
         let defending = self.controlled_possession_team() != Some(me.team);
-        let hard_desired_gap =
-            gap.clamp(STRIKER_AHEAD_OF_MID_MIN_YARDS, STRIKER_AHEAD_OF_MID_MAX_YARDS);
+        // The striker line is held compact ahead of midfield while defending, but on the
+        // ball it pushes high to pin the opponent's back four and stretch the attack — so
+        // the upper edge of the band is much further forward in possession.
+        let max_ahead = if defending {
+            STRIKER_AHEAD_OF_MID_MAX_YARDS
+        } else {
+            STRIKER_AHEAD_OF_MID_MAX_IN_POSSESSION_YARDS
+        };
+        let hard_desired_gap = gap.clamp(STRIKER_AHEAD_OF_MID_MIN_YARDS, max_ahead);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
         let consistency_gain = self.shape_consistency_gain_for_player_target(
@@ -23558,10 +23768,8 @@ impl WorldSnapshot {
             let forward_count = forwards.len() as f64;
             let projected_avg_fwd = (peer_sum_fwd + target_fwd) / forward_count;
             let projected_gap = projected_avg_fwd - mid_avg;
-            let desired_projected_gap = projected_gap.clamp(
-                STRIKER_AHEAD_OF_MID_MIN_YARDS,
-                STRIKER_AHEAD_OF_MID_MAX_YARDS,
-            );
+            let desired_projected_gap =
+                projected_gap.clamp(STRIKER_AHEAD_OF_MID_MIN_YARDS, max_ahead);
             let projected_delta = desired_projected_gap - projected_gap;
             if projected_delta.abs() < 1e-6 {
                 return target;
@@ -23589,7 +23797,19 @@ impl WorldSnapshot {
         if let Some(target) = current {
             let adjusted = self.forward_line_band_adjusted_target(intent.player_id, target);
             if adjusted.distance(target) > 0.25 {
-                intent.sprint = true;
+                // Shape upkeep is a calm JOG — only sprint when genuinely far out of
+                // position. Sprint-snapping every sub-yard correction is what made the team
+                // frantic and burned energy needlessly.
+                if let Some(pos) = self
+                    .players
+                    .iter()
+                    .find(|p| p.id == intent.player_id)
+                    .map(|p| self.player_snapshot_position(p))
+                {
+                    if pos.distance(adjusted) > LINE_SHAPE_SPRINT_TRAVEL_YARDS {
+                        intent.sprint = true;
+                    }
+                }
                 intent.action = SoccerAction::MoveTo(adjusted);
             }
         }
