@@ -12075,6 +12075,9 @@ impl SoccerRetrievalConfig {
             behind_ball_discount_enabled: self.behind_ball_discount_enabled,
             behind_ball_yards: self.behind_ball_yards,
             opponent_end_fraction: self.opponent_end_fraction,
+            // The stored corpus weights by the ball point; an action-specific lane is supplied only
+            // by the live capture/query that knows the planned trajectory.
+            ball_path: None,
         }
     }
 }

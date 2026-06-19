@@ -98,6 +98,13 @@ pub struct ConfigWeightOptions {
     /// Fraction of the pitch length past which the ball counts as being in "the
     /// opponent's end" (`0.5` = past the half-way line).
     pub opponent_end_fraction: f64,
+    /// Optional planned ball path (world coords: `from`→`to`) for an action under consideration
+    /// (a pass/shot lane). When set, the proximity weight + the nearest-first ordering use each
+    /// player's distance to this PATH SEGMENT instead of to the ball's current point — so a
+    /// defender up the lane (far from the ball now, but decisive for the action) is weighted in,
+    /// and a player near the ball but off the lane is weighted down. `None` ⇒ distance to the
+    /// ball point (the legacy behaviour; the stored retrieval corpus is built this way).
+    pub ball_path: Option<(Vec2, Vec2)>,
 }
 
 impl Default for ConfigWeightOptions {
@@ -108,6 +115,7 @@ impl Default for ConfigWeightOptions {
             behind_ball_discount_enabled: true,
             behind_ball_yards: 6.0,
             opponent_end_fraction: 0.5,
+            ball_path: None,
         }
     }
 }
@@ -267,6 +275,11 @@ impl SoccerConfigVector {
         let perspective_has_ball =
             matches!(snapshot.possession_team(), Some(t) if t == perspective);
         let ball_in_opp_end = ball_oriented.y > field_length * weights.opponent_end_fraction;
+        // Oriented planned-action path (a pass/shot lane), when supplied: proximity is then measured
+        // to this segment, so players up the lane are weighted in and off-lane players down.
+        let path_oriented = weights
+            .ball_path
+            .map(|(a, b)| (canon.apply(a, false), canon.apply(b, false)));
 
         // (sort key, player) so the two comparison modes share one build pass and
         // differ only in the ordering key applied just below.
@@ -278,8 +291,13 @@ impl SoccerConfigVector {
         for player in &snapshot.players {
             let oriented = canon.apply(player.position, false);
             let dist_to_ball = oriented.distance(ball_oriented);
+            // Proximity is to the planned path segment when one is given, else to the ball point.
+            let proximity_dist = match path_oriented {
+                Some((a, b)) => segment_distance_to_point(a, b, oriented),
+                None => dist_to_ball,
+            };
             let weight = config_player_weight(
-                dist_to_ball,
+                proximity_dist,
                 oriented.y,
                 ball_oriented.y,
                 perspective_has_ball,
@@ -297,9 +315,10 @@ impl SoccerConfigVector {
             // All keys are built from canonical (orientation/mirror-normalised)
             // quantities, so the resulting slot ordering is itself invariant.
             let key = match comparison {
-                // Nearest the ball first; canonical pos breaks ties.
+                // Nearest the ball (or the planned path, when given) first; canonical pos
+                // breaks ties.
                 SoccerConfigComparison::PositionAgnostic => {
-                    [dist_to_ball, kin.pos.y, kin.pos.x]
+                    [proximity_dist, kin.pos.y, kin.pos.x]
                 }
                 // Assigned formation slot (deepest home first ⇒ GK leads), so
                 // like-for-like positions align across configs.
@@ -957,6 +976,45 @@ mod tests {
              (near {near_ratio}, far {far_ratio})"
         );
         assert!(far_ratio < 1.0, "far player energy must shrink (got {far_ratio})");
+    }
+
+    /// A planned ball path re-centres the proximity weighting on the LANE: an opponent far up the
+    /// lane (far from the ball point, so near-zero weight without a path) is weighted back in, so
+    /// the representation changes. `None` (the legacy ball-point weighting) is unaffected.
+    #[test]
+    fn planned_path_weighting_includes_lane_players() {
+        let mut snap = sample_snapshot();
+        let ball = Vec2::new(40.0, 20.0);
+        snap.ball.position = ball;
+        snap.ball.holder = None;
+        // An opponent 30 yd up the lane: far from the ball point, but on the line to the target.
+        if let Some(opp) = snap
+            .players
+            .iter_mut()
+            .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        {
+            opp.position = Vec2::new(40.0, 50.0);
+            opp.velocity = Vec2::new(0.0, 0.0);
+        }
+        let build = |path: Option<(Vec2, Vec2)>| {
+            SoccerConfigVector::from_snapshot_with(
+                &snap,
+                Team::Home,
+                SoccerConfigComparison::PositionAgnostic,
+                ConfigWeightOptions {
+                    ball_path: path,
+                    ..ConfigWeightOptions::default()
+                },
+            )
+            .to_features()
+        };
+        let no_path = build(None);
+        let with_path = build(Some((ball, Vec2::new(40.0, 80.0))));
+        assert!(
+            cosine(&no_path, &with_path) < 0.999,
+            "planned-path weighting must re-weight toward the lane (cos {})",
+            cosine(&no_path, &with_path)
+        );
     }
 
     /// The behind-ball discount zeroes a player **only** under the full gate
