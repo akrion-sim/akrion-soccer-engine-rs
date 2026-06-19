@@ -25,6 +25,18 @@ const EXPLOIT_SPACE_BEHIND_OFFSETS_YARDS: [f64; 3] = [5.0, 10.0, 15.0];
 const EXPLOIT_SPACE_LANE_RADIUS_YARDS: f64 = 1.8;
 const OFF_BALL_POSSESSION_MIN_FORWARD_YARDS: f64 = 0.75;
 const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
+/// Off-ball "arrival settle" (hold shape). An off-ball player with nothing urgent to
+/// chase eases its speed to a stop as it reaches its shape target, then holds, instead
+/// of perpetually creeping after a target that slides a yard or two with the ball.
+/// Speed is throttled from full at/beyond `OFFBALL_SETTLE_REFERENCE_YARDS` from the
+/// target down to zero at it; within `OFFBALL_SETTLE_STAND_YARDS` the player simply
+/// stands. This is what makes a team look like a settled block holding its structure
+/// rather than 22 players milling about — without it the only "arrived" check is the
+/// sub-yard gait deadband, which a continuously-moving shape target never satisfies, so
+/// every off-ball player runs at the proximity-urgency floor speed forever. Bypassed
+/// entirely for any genuine movement cue (see the exemptions at the call site).
+const OFFBALL_SETTLE_REFERENCE_YARDS: f64 = 6.5;
+const OFFBALL_SETTLE_STAND_YARDS: f64 = 2.0;
 const INTENDED_PASS_TARGET_AWARENESS_PROBABILITY: f64 = 0.80;
 const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
 const MPC_LATENT_PASS_CHAIN_SINGLE_TARGET: f64 = 0.18;
@@ -9164,6 +9176,46 @@ impl SoccerMatch {
         } else {
             gait
         };
+        // Off-ball cruise discipline (hold shape). With nothing urgent to chase, a
+        // player that is roughly in its shape position JOGS to hold/adjust it and
+        // STANDS once essentially arrived, instead of perpetually running at ~60% of top
+        // speed after a target that slides a yard or two with the ball — the difference
+        // between a settled block jockeying for shape and 22 players sprinting about
+        // ("headless chickens"). It self-regulates: a player that has fallen more than
+        // OFFBALL_SETTLE_REFERENCE_YARDS behind its target is genuinely out of position
+        // and breaks back into a run to recover (the cap only touches Run/Sprint).
+        // Bypassed for every real movement cue — being chased, a counter-break, joining
+        // the attack, a loose-ball scramble, an incoming pass to receive, a flat-out
+        // defensive recovery, a transition push-up, an active one-two run, the ball
+        // carrier itself, and a human-controlled player — so it only ever quiets a
+        // player with no reason to keep running. See OFFBALL_SETTLE_*.
+        let settle_engaged = !(dd_soccer_disable_offball_settle()
+            || chased
+            || on_break
+            || attack_support
+            || loose_ball_attack
+            || incoming_pass
+            || self.ball.holder == Some(player_id)
+            // The keeper continuously tracks the ball-goal line (its own positioning
+            // model); it never "holds shape", so it is exempt from the cruise settle.
+            || self.players[player_id].role == PlayerRole::Goalkeeper
+            || self.players[player_id].controller_slot.is_some()
+            || self.players[player_id].one_two.is_some()
+            || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD
+            || push_up_urgency > 0.0);
+        let to_target_len = to_target.len();
+        let gait = if settle_engaged && to_target_len <= OFFBALL_SETTLE_STAND_YARDS {
+            // Essentially arrived: hold position rather than creep the last yard.
+            MovementGait::Stand
+        } else if settle_engaged
+            && to_target_len <= OFFBALL_SETTLE_REFERENCE_YARDS
+            && matches!(gait, MovementGait::Run | MovementGait::Sprint)
+        {
+            // Roughly in position: jockey at a calm jog rather than a run/sprint.
+            MovementGait::Jog
+        } else {
+            gait
+        };
         // Locomotion momentum: a decision is instant, but the body carries the effort
         // it has committed to — it can't oscillate sprint↔run tick-to-tick. Once an
         // effort tier is entered it is held for the dwell before changing, EXCEPT a
@@ -14820,6 +14872,11 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
+}
+fn dd_soccer_disable_offball_settle() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OFFBALL_SETTLE").is_ok())
 }
 
 fn pending_pass_snapshot_from(
@@ -26390,8 +26447,8 @@ impl WorldSnapshot {
                             // flattens onto the ball's line and the only options are square).
                             PlayerRole::Midfielder if own_half_possession => -10.0 - tendency * 16.0,
                             PlayerRole::Midfielder => -6.0 - tendency * 22.0,
-                            PlayerRole::Forward if own_half_possession => -20.0,
-                            PlayerRole::Forward => -16.0,
+                            PlayerRole::Forward if own_half_possession => -26.0,
+                            PlayerRole::Forward => -22.0,
                             PlayerRole::Defender => 18.0,
                         }
             };
