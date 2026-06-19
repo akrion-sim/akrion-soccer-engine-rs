@@ -1777,11 +1777,11 @@ const TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS: f64 = 2.5;
 // only: a compact, press-ready block that rides up off the line behind it. In our own
 // possession we hold just the hard band so the attack can stretch (otherwise an 8+8
 // stack would pull the forwards back onto the ball during our build-up).
-const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 3.0;
+const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 5.0;
 const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
-const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
+const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 10.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
+const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 5.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 // In possession the strikers are let off the leash to push forward and hold a high line —
 // pinning the opponent's back four and offering an advanced outlet — instead of being
@@ -1791,7 +1791,7 @@ const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 const STRIKER_AHEAD_OF_MID_MAX_IN_POSSESSION_YARDS: f64 = 32.0;
 // The resting stagger ahead of midfield while defending — nudged up so the striker line
 // presses from a higher starting point ("push forward more").
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 11.0;
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 13.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 // Wingback lateral (width) discipline by phase (off the ball, 3s eventual consistency):
 // - DEFENDING: pinch IN toward centre, but only as far as the wider (closer-to-touchline) of
