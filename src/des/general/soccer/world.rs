@@ -8383,6 +8383,8 @@ impl SoccerMatch {
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
+                    let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
+                    self.stat_pass_attempt_half(attempt_own_half);
                 }
                 self.move_player_towards(player_id, self.players[player_id].home_position, false);
                 if release_facing != FacingBucket::Unknown {
@@ -10606,11 +10608,19 @@ impl SoccerMatch {
                                 .unwrap_or(self.ball.position.y);
                             let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
                             self.stat_pass_completed_direction(team, forward_yards);
+                            let own_half = self.pass_from_own_half(pass.team, pass.origin);
+                            self.stat_pass_completed_half(own_half);
                         }
                         self.pending_pass = None;
                         self.stat_pass_completed(team);
                     }
                     BallPossessionResult::Interception(team) => {
+                        if let Some(pass) = pending_pass_for_reward.as_ref() {
+                            // Key on the PASSING team's origin half (where it was played from),
+                            // not the intercepting team, so the by-half rate matches attempts.
+                            let own_half = self.pass_from_own_half(pass.team, pass.origin);
+                            self.stat_pass_intercepted_half(own_half);
+                        }
                         self.record_interception_reward(holder, pending_pass_for_reward.as_ref());
                         self.pending_pass = None;
                         self.stat_interception(team);
@@ -12949,6 +12959,35 @@ impl SoccerMatch {
                 Team::Home => self.stats.passes_completed_backward_home += 1,
                 Team::Away => self.stats.passes_completed_backward_away += 1,
             }
+        }
+    }
+
+    /// Whether a pass played from `origin` by `team` started in that team's OWN half.
+    fn pass_from_own_half(&self, team: Team, origin: Vec2) -> bool {
+        pass_origin_in_own_half(team, origin, self.config.field_length_yards)
+    }
+
+    fn stat_pass_attempt_half(&mut self, own_half: bool) {
+        if own_half {
+            self.stats.passes_attempted_own_half += 1;
+        } else {
+            self.stats.passes_attempted_opp_half += 1;
+        }
+    }
+
+    fn stat_pass_completed_half(&mut self, own_half: bool) {
+        if own_half {
+            self.stats.passes_completed_own_half += 1;
+        } else {
+            self.stats.passes_completed_opp_half += 1;
+        }
+    }
+
+    fn stat_pass_intercepted_half(&mut self, own_half: bool) {
+        if own_half {
+            self.stats.pass_interceptions_own_half += 1;
+        } else {
+            self.stats.pass_interceptions_opp_half += 1;
         }
     }
 

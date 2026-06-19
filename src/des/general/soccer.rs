@@ -12457,6 +12457,23 @@ pub struct MatchStats {
     pub passes_completed_backward_home: u32,
     #[serde(default)]
     pub passes_completed_backward_away: u32,
+    // Pass attempts/completions/interceptions split by the HALF the pass was played FROM
+    // (relative to the passing team), aggregated over both teams. Real football completion is
+    // a function of defender density + pressure, which rises in the opponent's half — so this
+    // surfaces the emergent split (high completion / low interception when building in our own
+    // half; lower completion / more interceptions playing into the crowded attacking half).
+    #[serde(default)]
+    pub passes_attempted_own_half: u32,
+    #[serde(default)]
+    pub passes_attempted_opp_half: u32,
+    #[serde(default)]
+    pub passes_completed_own_half: u32,
+    #[serde(default)]
+    pub passes_completed_opp_half: u32,
+    #[serde(default)]
+    pub pass_interceptions_own_half: u32,
+    #[serde(default)]
+    pub pass_interceptions_opp_half: u32,
     #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
@@ -43579,6 +43596,15 @@ fn noisy_pass_target(
     )
 }
 
+/// Whether the pass-accuracy calibration (zippier + better-threaded passes under pressure, so
+/// completion in the crowded opponent's half is realistic rather than punishing) is active. On by
+/// default; `DD_SOCCER_DISABLE_PASS_ACCURACY_CALIBRATION` restores the prior model for A/B.
+fn pass_accuracy_calibration_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PASS_ACCURACY_CALIBRATION").is_err())
+}
+
 fn noisy_pass_target_with_receiver_openness(
     from: Vec2,
     target: Vec2,
@@ -43600,13 +43626,25 @@ fn noisy_pass_target_with_receiver_openness(
     // runners land on target (marked receivers stay contested via receiver_pressure).
     // The more open the receiver, the more reliably the ball finds them.
     let openness_relief = 1.0 - openness * 0.82;
+    // Skilled players thread the ball under pressure and to a marked receiver far better than the
+    // prior model allowed (which made the crowded opponent's half punishing — ~57% completion vs a
+    // realistic ~70%). Cut the pressure / receiver-marking error contributions; the skill-error and
+    // distance terms (the bulk of an OPEN own-half pass's tiny error) are untouched, so own-half
+    // accuracy is unchanged and the gain lands where the defenders are.
+    let (press_scale, recv_press_scale, press_drive, recv_press_drive) =
+        if pass_accuracy_calibration_enabled() {
+            (0.50, 0.18, 0.24, 0.16)
+        } else {
+            (0.75, 0.28, 0.36, 0.24)
+        };
     let error_scale = (0.35 + distance * 0.020)
-        * (0.35 + skill_error * 1.45 + pressure * 0.75)
+        * (0.35 + skill_error * 1.45 + pressure * press_scale)
         * openness_relief
-        * (1.0 + receiver_pressure * 0.28);
+        * (1.0 + receiver_pressure * recv_press_scale);
     let lateral_sign = if target.x >= from.x { 1.0 } else { -1.0 };
     let error_drive =
-        (skill_error * 0.58 + pressure * 0.36 + receiver_pressure * 0.24 - openness * 0.42)
+        (skill_error * 0.58 + pressure * press_drive + receiver_pressure * recv_press_drive
+            - openness * 0.42)
             .clamp(0.0, 0.72);
     let lateral_error = lateral_sign * error_scale * error_drive * 0.55;
     let weight_error = -error_scale
@@ -44053,7 +44091,15 @@ fn modulated_pass_speed_yps(
     } else {
         (0.58 + distance / 31.0).clamp(0.72, 2.55)
     };
-    let timed_time = base_time * (1.0 + openness * 0.08 - pressure * 0.10);
+    // A pass into pressure is struck FIRMER so it beats the press (less time in the lane for a
+    // defender to cut it out) — the main reason completion in the crowded opponent's half is too
+    // low. An open receiver still gets a more weighted, easier-to-control ball.
+    let pressure_zip = if pass_accuracy_calibration_enabled() {
+        0.22
+    } else {
+        0.10
+    };
+    let timed_time = base_time * (1.0 + openness * 0.08 - pressure * pressure_zip);
     let desired_speed = (distance / timed_time.max(0.35)).clamp(
         if flight.is_aerial() {
             mph_to_yps(16.0)
