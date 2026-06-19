@@ -47129,6 +47129,47 @@ fn hold_up_defender_can_dispossess_dribbler_without_committing() {
 }
 
 #[test]
+fn hold_up_defender_behind_led_ball_cannot_passively_steal() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 0;
+    let attacker = 11;
+    sim.players[attacker].position = Vec2::new(40.0, 60.0);
+    sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
+    sim.players[attacker].skills.dribbling = 0.2;
+    sim.players[attacker].skills.first_touch = 0.2;
+    sim.players[defender].position = Vec2::new(40.0, 59.8);
+    sim.players[defender].skills.defending = 10.0;
+    sim.players[defender].skills.aggression = 10.0;
+    // Ball is led in front of the carrier, but close enough that the body-shield
+    // gap alone does not block the contest. The rear-challenge rule must.
+    sim.ball.position = Vec2::new(40.0, 60.6);
+    sim.ball.holder = Some(attacker);
+    let before = WorldSnapshot::from_match(&sim);
+    sim.players[attacker].last_decision = Some(test_decision_trace(&before, attacker, "left-cut"));
+    sim.players[defender].last_decision = Some(test_decision_trace(&before, defender, "defend"));
+    assert!(
+        !sim.carrier_shields_ball_from_defender(attacker, defender),
+        "setup should exercise the behind-carrier guard, not the body-shield gap"
+    );
+    assert!(
+        sim.tackle_blocked_from_behind(attacker, sim.players[defender].position),
+        "a defender behind the led ball cannot passively poke through the carrier"
+    );
+
+    sim.resolve_dribble_hold_up_contests();
+
+    assert_eq!(
+        sim.ball.holder,
+        Some(attacker),
+        "hold-up pressure from behind the carrier must not steal the ball"
+    );
+    assert!(!sim
+        .events
+        .iter()
+        .any(|event| event.kind == "hold-up-dispossession"));
+}
+
+#[test]
 fn failed_tackle_without_beating_dribbler_penalizes_defender_two_points() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 0;
@@ -66786,63 +66827,112 @@ fn slide_tackle_wins_the_ball_more_often_than_a_standing_tackle() {
 }
 
 #[test]
-fn no_tackle_wins_the_ball_from_behind_the_carrier() {
-    // The ball is led in front of the carrier; a defender trailing behind cannot win it
-    // with ANY tackle — standing or sliding. Both attempts leave possession with the
-    // carrier (the user's hard rule).
-    for action_is_slide in [false, true] {
+fn standing_tackle_from_behind_is_blocked_but_ball_reachable_slide_can_win() {
+    // The ball is led in front of the carrier; a trailing defender cannot poke it
+    // cleanly with a standing tackle.
+    {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let defender = 0;
         let attacker = 11;
         sim.players[attacker].position = Vec2::new(40.0, 60.0);
         sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
-        sim.players[attacker].skills.dribbling = 9.5;
-        // Ball led ~2yd in front (the +y direction the carrier is driving).
-        sim.ball.position = Vec2::new(40.0, 62.0);
+        sim.players[attacker].skills.dribbling = 0.2;
+        sim.players[attacker].skills.first_touch = 0.2;
+        sim.players[defender].position = Vec2::new(40.0, 59.8);
+        sim.players[defender].skills.defending = 10.0;
+        sim.players[defender].skills.aggression = 10.0;
+        sim.ball.position = Vec2::new(40.0, 60.8);
         sim.ball.holder = Some(attacker);
-        // Defender trailing 1.8yd behind the carrier — within slide/standing reach.
-        sim.players[defender].position = Vec2::new(40.0, 58.2);
 
         assert!(
             sim.tackle_blocked_from_behind(attacker, sim.players[defender].position),
             "defender behind the led ball should be blocked"
         );
+        assert!(
+            !sim.carrier_shields_ball_from_defender(attacker, defender),
+            "standing block should not rely only on the body-shield gap"
+        );
 
-        let action = if action_is_slide {
-            SoccerAction::SlideTackle {
-                target_player: attacker,
-            }
-        } else {
-            SoccerAction::Tackle {
-                target_player: attacker,
-            }
-        };
         sim.apply_player_intent(PlayerIntent {
             player_id: defender,
-            action,
+            action: SoccerAction::Tackle {
+                target_player: attacker,
+            },
             sprint: true,
         });
         assert_eq!(
             sim.ball.holder,
             Some(attacker),
-            "a tackle from behind (slide={action_is_slide}) must not win the ball"
+            "a standing tackle from behind must not win the ball"
+        );
+    }
+
+    // A slide tackle is the exception, but only when the lunge can actually reach
+    // the ball in front of the carrier.
+    {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let defender = 0;
+        let attacker = 11;
+        sim.players[attacker].position = Vec2::new(40.0, 60.0);
+        sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
+        sim.players[attacker].skills.dribbling = 0.2;
+        sim.players[attacker].skills.first_touch = 0.2;
+        sim.players[attacker].skills.strength = 0.2;
+        sim.players[defender].position = Vec2::new(40.0, 59.8);
+        sim.players[defender].velocity = Vec2::new(0.0, 6.0);
+        sim.players[defender].skills.defending = 10.0;
+        sim.players[defender].skills.aggression = 9.0;
+        sim.players[defender].skills.strength = 9.0;
+        sim.ball.position = Vec2::new(40.0, 61.2);
+        sim.ball.holder = Some(attacker);
+
+        assert!(
+            sim.tackle_blocked_from_behind(attacker, sim.players[defender].position),
+            "the same behind-carrier geometry applies"
+        );
+        assert!(
+            sim.carrier_shields_ball_from_defender(attacker, defender),
+            "the carrier body is between defender and ball, so only a slide may reach it"
+        );
+        assert!(
+            sim.players[defender].position.distance(sim.ball.position)
+                <= SLIDE_TACKLE_MAX_REACH_YARDS,
+            "slide setup must be within actual ball reach"
+        );
+
+        sim.apply_player_intent(PlayerIntent {
+            player_id: defender,
+            action: SoccerAction::SlideTackle {
+                target_player: attacker,
+            },
+            sprint: true,
+        });
+        assert_eq!(
+            sim.ball.holder,
+            Some(defender),
+            "a ball-reachable slide from behind is the one allowed exception"
+        );
+        assert_eq!(
+            sim.players[defender].slide_recovery_seconds, 0.0,
+            "winning the slide tackle means no recovery grounding"
         );
     }
 }
 
 #[test]
 fn missed_slide_tackle_grounds_defender_for_uniform_recovery_window() {
-    // A slide that fails to win the ball (here forced by tackling from behind) puts the
-    // defender flat on the grass for a uniform 1.75-2.25s and costs the team the
-    // committed-challenge penalty.
+    // A slide that fails to win the ball (here forced by being outside ball reach)
+    // puts the defender flat on the grass for a uniform 1.75-2.25s and costs the
+    // team the committed-challenge penalty.
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 0;
     let attacker = 11;
     sim.players[attacker].position = Vec2::new(40.0, 60.0);
     sim.players[attacker].velocity = Vec2::new(0.0, 6.0);
-    sim.ball.position = Vec2::new(40.0, 62.0);
+    sim.ball.position = Vec2::new(40.0, 61.2);
     sim.ball.holder = Some(attacker);
-    sim.players[defender].position = Vec2::new(40.0, 58.2);
+    // Close enough to launch at the carrier, too far to reach the led ball.
+    sim.players[defender].position = Vec2::new(40.0, 57.6);
 
     sim.apply_player_intent(PlayerIntent {
         player_id: defender,
@@ -66854,7 +66944,8 @@ fn missed_slide_tackle_grounds_defender_for_uniform_recovery_window() {
 
     let recovery = sim.players[defender].slide_recovery_seconds;
     assert!(
-        recovery >= SLIDE_TACKLE_RECOVERY_MIN_SECONDS && recovery <= SLIDE_TACKLE_RECOVERY_MAX_SECONDS,
+        recovery >= SLIDE_TACKLE_RECOVERY_MIN_SECONDS
+            && recovery <= SLIDE_TACKLE_RECOVERY_MAX_SECONDS,
         "grounded for {recovery:.3}s, expected [{:.2}, {:.2}]",
         SLIDE_TACKLE_RECOVERY_MIN_SECONDS,
         SLIDE_TACKLE_RECOVERY_MAX_SECONDS

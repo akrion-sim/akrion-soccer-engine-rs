@@ -1141,11 +1141,12 @@ const SLIDE_TACKLE_MIN_HOLDER_SPEED_YPS: f64 = 4.5;
 // a lone last defender being told to contain (urgency < 1.0) must NOT gamble a slide.
 const SLIDE_TACKLE_MIN_COMMIT_URGENCY: f64 = 1.0;
 const SLIDE_TACKLE_MAX_DECISION_PROBABILITY: f64 = 0.85;
-// A tackle can only take the BALL, and the ball is carried in front of the holder. A
-// defender trailing the holder (holder's body between the defender and the led ball)
-// cannot win it with ANY tackle. This is the dot(toDefender, toBall) cutoff below which
-// the defender counts as "behind" the carrier: only the rear hemisphere is blocked, so
-// a level/side challenge is still allowed.
+// A standing/passive tackle can only take the BALL, and the ball is carried in front
+// of the holder. A defender trailing the holder (holder's body between the defender
+// and the led ball) cannot win it without committing to a slide that actually reaches
+// the ball. This is the dot(toDefender, toBall) cutoff below which the defender counts
+// as "behind" the carrier: only the rear hemisphere is blocked, so a level/side
+// challenge is still allowed.
 const TACKLE_BEHIND_CARRIER_DOT: f64 = -0.15;
 const UNTARGETED_LONG_BALL_RECOVERY_REWARD_POINTS: f64 = 5.2;
 const UNTARGETED_LONG_BALL_LOSS_PENALTY_POINTS: f64 = 2.6;
@@ -41231,9 +41232,10 @@ fn slide_tackle_foul_probability(
 /// Whether a defender at `defender_pos` is BEHIND the ball-carrier — in the rear
 /// hemisphere relative to where the ball is being carried (the holder→ball lead, or the
 /// holder's motion when the ball is at the feet). The ball is led in front of the body,
-/// so a trailing defender cannot reach it: NO tackle (standing or sliding) wins the ball
-/// from here. Returns `false` when front cannot be determined (a stationary holder with
-/// the ball at its feet) — that case is governed by the body-shield test instead.
+/// so a trailing defender cannot poke it cleanly from there: standing/passive steals are
+/// blocked, while a committed slide must pass a separate ball-reach gate. Returns
+/// `false` when front cannot be determined (a stationary holder with the ball at its
+/// feet) — that case is governed by the body-shield test instead.
 fn carried_ball_behind_defender(
     holder_pos: Vec2,
     holder_velocity: Vec2,
