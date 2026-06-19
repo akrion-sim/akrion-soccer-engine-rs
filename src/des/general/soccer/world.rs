@@ -22381,9 +22381,15 @@ impl WorldSnapshot {
             }
         }
         let high_pressure = nearest_dist <= LOOSE_BALL_SHIELD_PRESSURE_RADIUS_YARDS;
-        let increasing_pressure = nearest_dist <= LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS
-            && nearest_closing >= LOOSE_BALL_SHIELD_CLOSING_YPS;
-        if high_pressure || increasing_pressure {
+        // A genuine 50/50: an opponent within the contest radius that is NOT clearly
+        // abandoning the ball (it isn't sprinting away from the drop faster than a
+        // shield-step). We commit a SECOND man to fight for these rather than conceding a
+        // winnable ball by peeling everyone goalside — the live "ran away from a loose
+        // ball instead of attacking it" bug. Only a ball dropping into space whose nearest
+        // opponent is genuinely fleeing it is left to a single calm claimer (rest hold shape).
+        let contested_fifty_fifty = nearest_dist <= LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS
+            && nearest_closing >= -LOOSE_BALL_SHIELD_CLOSING_YPS;
+        if high_pressure || contested_fifty_fifty {
             2
         } else {
             1
@@ -23546,11 +23552,11 @@ impl WorldSnapshot {
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return target;
         }
-        // THE RULE (simple, no regimes): the back four's AVERAGE sits 5-25yd behind
+        // THE RULE (simple, no regimes): the back four's AVERAGE sits 5-30yd behind
         // (goal-side of) the ball — always, in or out of possession. Exceptions:
         // (1) inside our own 5yd emergency zone, and
         // (2) the back four may not press more than 5yd into the opponent half, so
-        // a high ball may leave the line more than 25yd behind by design.
+        // a high ball may leave the line more than 30yd behind by design.
         let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         let min_behind = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind);
         // 5yd-into-the-opponents'-half ceiling (in attack-forward coords). The halfway
@@ -27607,8 +27613,28 @@ impl WorldSnapshot {
         point
     }
 
+    /// True when THIS defender has been deliberately sent to step ONTO the ball — the
+    /// single nearest presser/engager via a fast-carrier engage, a holder press, or an
+    /// advancing-carrier step-up. Such a defender has left the line to contest, so it must
+    /// be exempt from the back-four band's 5yd cushion (which would otherwise yank it back
+    /// off the ball — the "presser never reaches the carrier" bug). Only the one nearest
+    /// presser qualifies (each producer elects a single closest outfielder), so the rest of
+    /// the back four still hold the band.
+    fn defender_is_designated_ball_presser(&self, me: &PlayerSnapshot) -> bool {
+        if me.role != PlayerRole::Defender {
+            return false;
+        }
+        // The step/no-step decision in each producer is independent of the contain target,
+        // so a self-position placeholder is fine for the advancing-carrier probe.
+        self.fast_carrier_engage_target_for(me).is_some()
+            || self.holder_press_target_for(me).is_some()
+            || self
+                .advancing_carrier_stepup_target_for(me, self.player_snapshot_position(me))
+                .is_some()
+    }
+
     /// Clamp a defender's target forward-position to the hard back-four line band:
-    /// 5-25 yards behind the ball, except inside the team's own 5-yard emergency zone.
+    /// 5-30 yards behind the ball, except inside the team's own 5-yard emergency zone.
     fn defender_line_band_clamped_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         let attack = me.team.attack_dir();
         let ball_fwd = self.ball.position.y * attack;
@@ -27617,11 +27643,15 @@ impl WorldSnapshot {
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return compact_y;
         }
+        // The designated presser steps onto the ball out of the line — don't pull it back.
+        if self.defender_is_designated_ball_presser(me) {
+            return compact_y;
+        }
         let min_gap = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS;
         let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         let min_gap = min_gap.min(max_gap);
         // Lower bound of the gap: stay goal-side of the ball by the hard 5yd
-        // floor. Upper bound: no more than 25yd behind where the ball is headed.
+        // floor. Upper bound: no more than 30yd behind where the ball is headed.
         let predicted_fwd = self
             .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
             .y
@@ -27895,7 +27925,7 @@ impl WorldSnapshot {
         let target = self.defensive_assignment_for_unclamped(player_id, home, roam);
         // Final back-four band clamp: the blend toward a marked opponent / the
         // candidate search can re-deepen the line past the zone target, so enforce
-        // the ≤25yd-behind-ball rule on the FINAL assignment for defenders too.
+        // the ≤30yd-behind-ball rule on the FINAL assignment for defenders too.
         match self.players.iter().find(|p| p.id == player_id) {
             Some(me) if me.role == PlayerRole::Defender => {
                 let mut final_target =

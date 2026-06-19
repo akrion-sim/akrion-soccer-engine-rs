@@ -12500,12 +12500,22 @@ fn lone_loose_ball_is_claimed_by_one_retriever_two_only_under_pressure() {
         "increasing pressure (closing) → two"
     );
 
-    // Same distance but standing off / drifting away: just one.
+    // Same distance, drifting slightly off the drop but still inside the 50/50 radius:
+    // we FIGHT for it — a second man contests rather than conceding a winnable ball.
     sim.players[opp].velocity = Vec2::new(0.0, 2.0);
     assert_eq!(
         count_for(&sim, r1),
+        2,
+        "contested 50/50 inside the radius (opponent not fleeing) → two contest"
+    );
+
+    // The opponent is sprinting AWAY from the drop faster than a shield-step: the ball is
+    // genuinely ours, so a single calm claimer collects it and the rest hold their shape.
+    sim.players[opp].velocity = Vec2::new(0.0, 8.0);
+    assert_eq!(
+        count_for(&sim, r1),
         1,
-        "medium gap, not closing → one claimer"
+        "opponent clearly abandoning the ball → one calm claimer"
     );
 
     // The peeled-off second man drops GOALSIDE (Home own goal at y=0) and opens wide.
@@ -13512,7 +13522,7 @@ fn defensive_line_cushion_uses_full_back_four_average_y() {
 #[test]
 fn defensive_line_cushion_caps_press_at_five_yards_into_opponent_half() {
     // Ball deep in the opponents' half (y=100, field 120 -> halfway 60). The plain
-    // 5-25yd band would let the back four follow up to y=75; the opponent-half ceiling
+    // 5-30yd band would let the back four follow up to y=70; the opponent-half ceiling
     // (halfway + 5 = 65) overrides it, so an over-committed line (avg y=80) is pulled
     // BACK rather than allowed to sit at 80 (which the 30yd band alone would permit).
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -13742,7 +13752,7 @@ fn defensive_line_cushion_still_clamps_lane_and_row_when_average_is_legal() {
 fn defensive_line_cushion_releases_row_cohesion_in_possession() {
     // Same high back four, with one wide defender asked to drop deep to cover. Defending,
     // the ±row_band cohesion pins it up near the line average. When WE control the ball it
-    // is freed to stagger deeper (cover), but the hard 5-25yd-behind-ball band still wins:
+    // is freed to stagger deeper (cover), but the hard 5-30yd-behind-ball band still wins:
     // possession can release row cohesion, not let the back four drift to parity.
     let build = |home_has_ball: bool| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -13798,8 +13808,8 @@ fn defensive_line_cushion_releases_row_cohesion_in_possession() {
         "defending, row-cohesion should pin the dropping back up near the line: {defending_y:.2}"
     );
     assert!(
-        (55.0 - 1e-9..=75.0 + 1e-9).contains(&possession_y),
-        "in possession the back should stay inside the hard 5-25yd band: possession {possession_y:.2}"
+        (50.0 - 1e-9..=75.0 + 1e-9).contains(&possession_y),
+        "in possession the back should stay inside the hard 5-30yd band: possession {possession_y:.2}"
     );
     assert!(
         possession_y < defending_y + 1.0,
@@ -31220,13 +31230,15 @@ fn defensive_recovery_effort_includes_in_possession_back_line_consistency() {
         .map(|p| p.id)
         .unwrap();
     for &id in &home_def {
-        sim.players[id].position = Vec2::new(40.0, 65.0);
+        sim.players[id].position = Vec2::new(40.0, 60.0);
     }
     sim.players[home_holder].position = Vec2::new(40.0, 100.0);
     sim.ball.holder = Some(home_holder);
     sim.ball.position = Vec2::new(40.0, 100.0);
     sim.ball.last_touch_team = Some(Team::Home);
 
+    // 40yd behind the ball — stranded well beyond the 5-30yd in-possession cushion (10yd
+    // over), so the consistency urgency must reach sprint level rather than a calm adjust.
     let effort = sim.defensive_recovery_effort(home_def[1]);
     assert!(
         effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD,
@@ -43553,7 +43565,7 @@ fn defensive_assignment_keeps_retreat_connected_to_ball() {
 
 #[test]
 fn defensive_assignment_uses_hard_line_band_not_genome_permutation() {
-    // The hard 5-25yd defender band is tactical structure, not evolved genome shape.
+    // The hard 5-30yd defender band is tactical structure, not evolved genome shape.
     // Genome permutations may tune other behaviors, but must not weaken this guard.
     let target_y_for_band = |permutation_index: usize| {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -43580,11 +43592,11 @@ fn defensive_assignment_uses_hard_line_band_not_genome_permutation() {
     let hard_deepest_y = 68.0 - DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS;
     assert!(
         (high_line_y - hard_deepest_y).abs() < 1e-9,
-        "hard 25yd band should cap the high-line permutation: high={high_line_y}"
+        "hard 30yd band should cap the high-line permutation: high={high_line_y}"
     );
     assert!(
         (deeper_line_y - hard_deepest_y).abs() < 1e-9,
-        "hard 25yd band should cap the deep-line permutation too: deep={deeper_line_y}"
+        "hard 30yd band should cap the deep-line permutation too: deep={deeper_line_y}"
     );
 }
 

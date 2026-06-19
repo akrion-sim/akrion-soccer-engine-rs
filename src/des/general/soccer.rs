@@ -96,10 +96,14 @@ const CONTROL_FIRST_TOUCH_SETTLE_MAX_STEP_YARDS: f64 = 1.4;
 // them strike in that window launched the ball from out there / teleported it onto
 // the feet first — a "ghost kick" with no player visibly at the ball. A strike is
 // only legal once the ball has settled to within this reach; until then the holder
-// takes a settling touch. Set above the dribble carry lead (0.92yd) and orbit max
-// (1.10yd) so ordinary carrying/dribbling release is never blocked, but below the
-// settle-window distances so a not-yet-controlled ball can't be booted.
-const CONTROLLED_STRIKE_REACH_YARDS: f64 = 1.6;
+// takes a settling touch. Pinned JUST above the dribble carry lead (0.92yd) and orbit
+// max (1.10yd) so ordinary carrying/dribbling release is never blocked, but as low as
+// that allows so a just-won ball still 1.2–2.3yd off the feet (control snaps it onto its
+// own travel segment, not the feet — see `nearest_ball_controller_for_segment`) cannot be
+// struck. At 1.6 the slack above the orbit max was itself the phantom band: a strike fired
+// with the ball up to ~1.6yd (≈5ft) from any player. The settle draws the ball in at
+// 1.4yd/tick, so this only ever costs ~one extra tick before the strike fires cleanly.
+const CONTROLLED_STRIKE_REACH_YARDS: f64 = 1.25;
 // Physical reach caps for contesting a moving ball. A fast ball that only nicks
 // the skill-based control radius is unreachable: a player can close at most a
 // lunge (`INTERCEPT_LUNGE_REACH_YARDS`) plus the ground they cover while the ball
@@ -1263,17 +1267,19 @@ const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
 // along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line 5-25yd goal-side of the ball. The LP/formation nudge shifts the whole line to
+// keep the line 5-30yd goal-side of the ball. The LP/formation nudge shifts the whole line to
 // restore the band, except inside the team's own emergency 5-yard goal-line zone where parity with
 // the ball is allowed.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// THE rule: the back four's average sits 5-25yd behind (goal-side of) the ball, always,
-// outside the team's own 5-yard emergency zone.
+// THE rule: the back four's average sits 5-30yd behind (goal-side of) the ball, always,
+// outside the team's own 5-yard emergency zone. The deep edge (30) matches the emergency
+// break-cover cap `DEFENSIVE_MAX_BEHIND_BALL_YARDS`, so a line-break retreat is never
+// clamped shallower than the cover it is trying to provide.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
