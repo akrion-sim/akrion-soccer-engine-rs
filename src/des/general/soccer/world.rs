@@ -22460,6 +22460,83 @@ impl WorldSnapshot {
         }
     }
 
+    /// The point a player steps to in order to CONTROL a LOOSE ball that is about to roll/skip
+    /// past them — the player's own (subjective, POMDP) read of the ball's kinematics. This is
+    /// the same-side, loose-ball counterpart to the opponent-only [`Self::pending_pass_lane_cut_target_for`]:
+    /// it lets ANY outfielder (either team) the ball is travelling toward step onto its path and
+    /// take it, rather than holding shape and letting it run THROUGH them when a team-mate is the
+    /// marginally-closer "designated retriever".
+    ///
+    /// It fires only when, from the player's perspective, the ball's predicted path passes within
+    /// [`BALL_PATH_CONTROL_LATERAL_YARDS`] of them AND they can reach a point on it before it
+    /// arrives — reaction time + sprint reach, gated exactly like the pass-lane cut so the
+    /// decision predicts the trap the physics resolver ([`nearest_ball_controller_for_segment`])
+    /// actually makes. While a pass is pending the ball is "spoken for" (its intended receiver
+    /// meets it; opponents use the lane cut), so this returns `None` then — a team-mate never
+    /// robs its own pass (the decoy/let-it-run default); the trap is for genuinely loose balls.
+    pub(crate) fn loose_ball_path_cut_target_for(&self, player_id: usize) -> Option<Vec2> {
+        if self.ball.holder.is_some()
+            || self.active_set_play.is_some()
+            || self.pending_pass.is_some()
+        {
+            return None;
+        }
+        let ball_speed = self.ball.velocity.len();
+        // Only a LOW ball moving fast enough to skip past a player is worth a committed step-onto.
+        // A high ball flies overhead (aerial duel, not this), and a slow/settling ball is already
+        // handled by the ordinary loose-ball retriever election.
+        if self.ball.altitude_yards > LOW_BALL_INTERCEPT_REACH_FLOOR_YARDS
+            || ball_speed < LOOSE_BALL_BODY_BLOCK_MIN_SPEED_YPS
+        {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if me.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let from = self.ball.position;
+        let dir = self.ball.velocity * (1.0 / ball_speed.max(1e-6));
+        let me_pos = self.player_snapshot_position(me);
+        // Distance along the ball's travel to the player's nearest point on the path. Negative /
+        // ~zero means the ball is heading AWAY from (or already level with) the player — no cut.
+        let along = (me_pos - from).dot(dir);
+        if along <= 1e-3 || along > BALL_PATH_CUT_MAX_LOOKAHEAD_YARDS {
+            return None;
+        }
+        let lane_point = from + dir * along;
+        let perp_gap = me_pos.distance(lane_point);
+        // "within 2 yards of the trajectory" (user spec) — a lateral cap so only a player the
+        // ball will genuinely pass next to commits, never the whole team converging on a roll.
+        if perp_gap > BALL_PATH_CONTROL_LATERAL_YARDS {
+            return None;
+        }
+        let t_ball = along / ball_speed.max(1.0);
+        let sprint_speed = player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+            * MovementGait::Sprint.speed_multiplier();
+        // Time to react, then sprint across — the player can only commit if they can close the
+        // perpendicular gap before the ball reaches their point on the path.
+        let intercept_window = (t_ball - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        let reach = INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * intercept_window;
+        if perp_gap <= reach {
+            Some(lane_point.clamp_to_pitch(self.field_width, self.field_length))
+        } else {
+            None
+        }
+    }
+
+    /// Combined "step onto the ball's path" target a player commits to this tick, from their
+    /// subjective read of the ball: an opponent's pending-pass lane cut
+    /// ([`Self::pending_pass_lane_cut_target_for`]) OR a loose-ball on-path control
+    /// ([`Self::loose_ball_path_cut_target_for`]). The two are mutually exclusive (the loose cut
+    /// bails while a pass is pending), so this just prefers whichever applies. Used everywhere the
+    /// engine asks "is this player a committed on-path interceptor?".
+    pub(crate) fn on_path_ball_intercept_target_for(&self, player_id: usize) -> Option<Vec2> {
+        self.pending_pass_lane_cut_target_for(player_id)
+            .or_else(|| self.loose_ball_path_cut_target_for(player_id))
+    }
+
     /// The point a designated retriever ATTACKS to win a loose ball — an early
     /// interception point along the roll (cut harder when an opponent is bearing
     /// down), or the projected landing of a deliberate long ball. This is the raw
@@ -22472,8 +22549,10 @@ impl WorldSnapshot {
         // of trailing the ball's stale current spot. `projected_loose_ball_target` bails while
         // a pass is pending, so without this a defender a yard or two off the trajectory is
         // told to chase where the ball already WAS and "lets it roll" past — the live bug
-        // where nearby players never make the effort to intercept a ground pass.
-        if let Some(lane_point) = self.pending_pass_lane_cut_target_for(player_id) {
+        // where nearby players never make the effort to intercept a ground pass. The same
+        // step-onto applies to a genuinely LOOSE ball passing within reach of any player
+        // (`loose_ball_path_cut_target_for`), via the combined accessor.
+        if let Some(lane_point) = self.on_path_ball_intercept_target_for(player_id) {
             return lane_point;
         }
         let projected = self
@@ -22524,7 +22603,7 @@ impl WorldSnapshot {
         // alone (and it is exempt from the anti-swarm peel-off below). It does not have to win
         // the retriever election to count: several defenders may legitimately converge on
         // different points of the same lane.
-        if self.pending_pass_lane_cut_target_for(player_id).is_some() {
+        if self.on_path_ball_intercept_target_for(player_id).is_some() {
             return true;
         }
         let target = self.loose_ball_contest_target_for(player_id);
@@ -22544,8 +22623,9 @@ impl WorldSnapshot {
         // team-mate scored marginally closer to that same lane point — that was the live gap
         // where a ground pass rolled right past a defender 1–3yd off the lane and nobody
         // contested it. The cut is opponent-only and physically reach-gated, so it does not
-        // drag players out of shape.
-        if let Some(lane_point) = self.pending_pass_lane_cut_target_for(player_id) {
+        // drag players out of shape. A loose ball passing within reach of any player adds the
+        // same step-onto (`loose_ball_path_cut_target_for`) through the combined accessor.
+        if let Some(lane_point) = self.on_path_ball_intercept_target_for(player_id) {
             return lane_point;
         }
         let target = self.loose_ball_contest_target_for(player_id);

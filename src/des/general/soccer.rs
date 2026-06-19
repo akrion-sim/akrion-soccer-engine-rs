@@ -2101,6 +2101,21 @@ const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
 // touch that player before continuing to a later receiver. This is deliberately a
 // segment-level contact radius, not a scored reception preference.
 const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
+// No-ghost floor for a LOOSE ball (no pending pass): a low ball travelling at least this
+// fast that crosses within body reach of a player's feet must be contested — it cannot sail
+// THROUGH them as if they were not there, whichever way they are facing. Below this speed a
+// loose ball keeps the normal (skill/closing-speed scored) contest path so genuine slow 50/50s
+// are not auto-decided by raw proximity.
+const LOOSE_BALL_BODY_BLOCK_MIN_SPEED_YPS: f64 = 6.0;
+// A loose ball whose predicted path passes within this lateral distance of a player is "going
+// near enough to control": the player reads it and steps onto its line (reaction/reach permitting)
+// rather than letting it run through, instead of holding shape because a team-mate is the
+// marginally-closer designated retriever. The user's "ball trajectory within 2 yards" floor.
+const BALL_PATH_CONTROL_LATERAL_YARDS: f64 = 2.0;
+// How far AHEAD along its current travel a loose ball's path is read for a step-onto. A player
+// only commits to a ball passing near them SOON — not one projected the length of the pitch (a
+// fast ball decelerates and others will reach a far point first). Keeps the step-onto local.
+const BALL_PATH_CUT_MAX_LOOKAHEAD_YARDS: f64 = 12.0;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
 // looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
@@ -46094,7 +46109,11 @@ fn nearest_ball_controller_for_segment_with_guard(
             let progress = pass_progress_along_path(pass, control_point);
             let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
             let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
-            let contact_altitude = pass_altitude_at_point(pass, control_point);
+            // Ground truth wins over the pass MODEL altitude (see the gating contact_altitude
+            // below): a landed / overshot-and-rolling pass is a floor ball whatever its launch
+            // flight, so its body contact must register instead of being gated out as "airborne".
+            let contact_altitude =
+                pass_altitude_at_point(pass, control_point).min(ball_altitude_yards.max(0.0));
             let same_team_launch_bystander =
                 same_tick_launch && p.team == pass.team && !is_target;
             let body_contact_distance = p.position.distance(control_point);
@@ -46103,6 +46122,34 @@ fn nearest_ball_controller_for_segment_with_guard(
                 && !same_team_launch_bystander
                 && body_contact_distance <= LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS
             {
+                let replace = low_pass_body_contact.as_ref().is_none_or(
+                    |(best_projection, best_distance, _, _, _)| {
+                        control_projection < *best_projection - 1e-9
+                            || ((control_projection - *best_projection).abs() <= 1e-9
+                                && body_contact_distance < *best_distance)
+                    },
+                );
+                if replace {
+                    low_pass_body_contact = Some((
+                        control_projection,
+                        body_contact_distance,
+                        p.id,
+                        p.team,
+                        control_point,
+                    ));
+                }
+            }
+        } else if ball_altitude_yards <= LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS
+            && ball_speed >= LOOSE_BALL_BODY_BLOCK_MIN_SPEED_YPS
+        {
+            // No-ghost floor for a LOOSE ball (no pending pass). A low ball moving fast
+            // enough to skip past a player must at least be CONTESTED when it crosses within
+            // body reach of their feet — it cannot pass straight through them as if they were
+            // not there, regardless of facing. Mirrors the pending-pass body-contact capture
+            // above; the earliest projection / closest body wins. (`same_tick_long_ball_launcher`
+            // and the restart `double_touch_guard` are already excluded at the top of the loop.)
+            let body_contact_distance = p.position.distance(control_point);
+            if body_contact_distance <= LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS {
                 let replace = low_pass_body_contact.as_ref().is_none_or(
                     |(best_projection, best_distance, _, _, _)| {
                         control_projection < *best_projection - 1e-9
@@ -46238,7 +46285,16 @@ fn nearest_ball_controller_for_segment_with_guard(
                 ball_altitude_yards
             } else {
                 0.0
-            });
+            })
+            // Ground truth wins. The pass MODEL altitude is only valid while the ball is
+            // genuinely following its launch parabola; a pass that has already landed and is now
+            // rolling/skidding (or one that wildly overshot its target and is rolling away — a
+            // STALE pending pass) is physically a floor ball, however it was launched. Without
+            // this clamp such a ball is gated as "airborne", so the floor body-contact / trap
+            // logic never fires and it rolls untouched right past players (the reported ghost).
+            // For a genuine aerial in flight `ball_altitude_yards` ≈ the model, so this is a
+            // no-op; the intended receiver bypasses these gates anyway (`is_pass_target`).
+            .min(ball_altitude_yards.max(0.0));
         // Guaranteed trap: a non-aerial (floor) ball within the player's own control radius of
         // their ACTUAL feet is always controlled. A ball passing right under a player's feet is
         // not an "impossible-distance intercept", so it must bypass the kinematic-reach gate —

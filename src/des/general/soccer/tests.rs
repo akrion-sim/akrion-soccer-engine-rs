@@ -26194,8 +26194,9 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
     );
 
     pass.flight = PassFlight::Aerial;
+    let high_altitude = pass_altitude_at_point(&pass, defender.position);
     assert!(
-        pass_altitude_at_point(&pass, defender.position) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
+        high_altitude > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
         "test setup should put the loft above the 6ft body-contact gate"
     );
     let high = nearest_ball_controller_for_segment(
@@ -26207,7 +26208,10 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
         Some(&pass),
         None,
         None,
-        0.0,
+        // The ball's ACTUAL altitude as it crosses the defender — in flight it tracks the loft,
+        // so it is genuinely high here (not 0.0). The resolver clamps the pass-model altitude to
+        // this ground truth, so a real airborne ball must report its real height to clear the body.
+        high_altitude,
         &mut mulberry32(17_741),
     );
     assert_eq!(

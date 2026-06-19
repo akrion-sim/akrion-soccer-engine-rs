@@ -4277,7 +4277,7 @@ impl PlayerAgent {
     ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let distance = self.position.distance(target);
-            let lane_interceptor = snapshot.pending_pass_lane_cut_target_for(self.id).is_some();
+            let lane_interceptor = snapshot.on_path_ball_intercept_target_for(self.id).is_some();
             let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
             let moving_ball_to_attack =
                 snapshot.ball.velocity.len() >= COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS;
@@ -6909,7 +6909,7 @@ impl PlayerAgent {
             // 1–3yd off the lane while it deferred to a team-mate and held shape. `loose_ball_target`
             // already resolves to the lane cut-point for such a player.
             let lane_interceptor = self.role != PlayerRole::Goalkeeper
-                && snapshot.pending_pass_lane_cut_target_for(self.id).is_some();
+                && snapshot.on_path_ball_intercept_target_for(self.id).is_some();
             let should_recover = lane_interceptor
                 || fifty_fifty_duel
                 || action_option_score(&loose_options, "recover") > 0.0;
