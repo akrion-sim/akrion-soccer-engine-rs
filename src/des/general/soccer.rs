@@ -755,7 +755,7 @@ const COMPLETED_KILLER_PASS_MAX_BONUS_POINTS: f64 = 6.0;
 // near-certain turnover; penalize it at decision time (scaled by how blocked the
 // lane is) so the policy either skips the pass or lifts it aerially over the
 // defender. Aerial passes are exempt — they clear the lane.
-const BLOCKED_LANE_FLOOR_PASS_PENALTY_POINTS: f64 = 6.0;
+// (blocked-lane floor-pass penalty folded into tunables().reward — env/PG-overridable)
 const BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD: f64 = 0.5;
 // Under real pressure, a quick lateral ball or a SHORT backward pass that keeps
 // possession is a smart escape from the press. Reward it (scaled by how far over
@@ -785,7 +785,7 @@ const OFFSIDE_RECOVERY_REWARD: f64 = 1.0;
 // Center-backs must remain the last line: penalize a central defender for every
 // yard they advance ahead of their wing-backs, amplified when the ball is in the
 // attacking part of the field (so they stay the deepest two ~95% of the time).
-const CENTER_BACK_AHEAD_OF_WINGBACK_PENALTY_PER_YARD: f64 = 0.11;
+// (center-back-ahead-of-wingback penalty/yard folded into tunables().reward — env/PG-overridable)
 const NEAR_GOAL_NO_SHOT_PENALTY_POINTS: f64 = 3.0;
 const EXCESSIVE_HOLD_PENALTY_POINTS: f64 = 2.10;
 const NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF: f64 = 0.90;
@@ -1065,7 +1065,7 @@ const SCOOP_PASS_PASSER_MIN_CROWD: usize = 2;
 const SCOOP_PASS_FACING_HALF_CONE_DEGREES: f64 = 75.0;
 const GOALMOUTH_CARRY_REWARD_POINTS: f64 = 1.35;
 const ENDLINE_DRIBBLE_TRAP_PENALTY_POINTS: f64 = 1.85;
-const LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS: f64 = 1.75;
+// (low-pressure forced-pass penalty folded into tunables().reward — env/PG-overridable)
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_SECONDS: f64 = 5.0;
 const DEFENSIVE_CLEAR_AND_HOLD_SECOND_SECONDS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_REWARD_POINTS: f64 = 10.0;
@@ -1827,8 +1827,8 @@ const MIDLINE_LATERAL_IDEAL_YARDS: f64 = 5.0;
 // (goals, possession) dominate and the policy can learn that a tight overlap is
 // worth it (a wall, a double team) when results say so. One term rewards easing
 // out of a sustained overlap, the other lightly penalises camping in one.
-const TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD: f64 = 0.06;
-const TEAMMATE_SPACING_OVERLAP_CAMP_PENALTY: f64 = 0.03;
+// (overlap-relief shaping reward folded into tunables().reward — env/PG-overridable)
+// (overlap-camp shaping penalty folded into tunables().reward — env/PG-overridable)
 const BALL_PROXIMITY_MIN_PADDING_YARDS: f64 = 1.0;
 const BALL_PROXIMITY_PULL_MAX_YARDS: f64 = 2.8;
 const BALL_PROXIMITY_CONTESTED_LOOSE_PULL_MAX_YARDS: f64 = 7.5;
@@ -16059,9 +16059,9 @@ fn dense_soccer_transition_reward(
     if player.role != PlayerRole::Goalkeeper {
         let overlap_relief =
             before_obs.teammate_overlap_pressure - after_obs.teammate_overlap_pressure;
-        reward += overlap_relief.clamp(-1.0, 1.0) * TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD;
+        reward += overlap_relief.clamp(-1.0, 1.0) * tunables().reward.teammate_overlap_relief_reward;
         reward -= after_obs.teammate_overlap_pressure.clamp(0.0, 1.0)
-            * TEAMMATE_SPACING_OVERLAP_CAMP_PENALTY;
+            * tunables().reward.teammate_overlap_camp_penalty;
     }
     // Keepers should rarely stray far from goal. Penalty ramps in past 20 yds,
     // gets steep past 25, and very steep past 30 — so the learned policy keeps the
@@ -16114,7 +16114,7 @@ fn dense_soccer_transition_reward(
                 // stepping up in our own-half build-up is fine; the penalty bites
                 // once the ball is in the attacking part of the field.
                 reward -= ahead
-                    * CENTER_BACK_AHEAD_OF_WINGBACK_PENALTY_PER_YARD
+                    * tunables().reward.center_back_ahead_of_wingback_penalty_per_yard
                     * (0.15 + 0.85 * ball_advance);
             }
         }

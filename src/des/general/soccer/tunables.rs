@@ -144,6 +144,21 @@ pub struct RewardTunables {
     pub concede_keeper_defender_penalty: f64,
     /// Penalty when conceding, for an outfield non-defender. Was `2.0`.
     pub concede_outfield_penalty: f64,
+    /// Shaping reward for easing out of a sustained teammate overlap. Was the
+    /// `TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD` const.
+    pub teammate_overlap_relief_reward: f64,
+    /// Shaping penalty for camping in a teammate overlap. Was
+    /// `TEAMMATE_SPACING_OVERLAP_CAMP_PENALTY`.
+    pub teammate_overlap_camp_penalty: f64,
+    /// Penalty per yard a central defender advances ahead of the wing-backs. Was
+    /// `CENTER_BACK_AHEAD_OF_WINGBACK_PENALTY_PER_YARD`.
+    pub center_back_ahead_of_wingback_penalty_per_yard: f64,
+    /// Penalty for a floor pass played into a blocked lane. Was
+    /// `BLOCKED_LANE_FLOOR_PASS_PENALTY_POINTS`.
+    pub blocked_lane_floor_pass_penalty_points: f64,
+    /// Penalty for a forced pass played under low pressure (no need to rush). Was
+    /// `LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS`.
+    pub low_pressure_forced_pass_penalty_points: f64,
 }
 
 impl Default for RewardTunables {
@@ -152,6 +167,11 @@ impl Default for RewardTunables {
             goal_scored_points: 100.0,
             concede_keeper_defender_penalty: 8.0,
             concede_outfield_penalty: 2.0,
+            teammate_overlap_relief_reward: 0.06,
+            teammate_overlap_camp_penalty: 0.03,
+            center_back_ahead_of_wingback_penalty_per_yard: 0.11,
+            blocked_lane_floor_pass_penalty_points: 6.0,
+            low_pressure_forced_pass_penalty_points: 1.75,
         }
     }
 }
