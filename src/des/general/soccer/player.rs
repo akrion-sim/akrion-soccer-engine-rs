@@ -4683,6 +4683,75 @@ impl PlayerAgent {
             }
         }
 
+        // Loose-ball awareness reflex (every tick, cheap): a player must recognize a LIVE
+        // loose ball that is close OR rolling toward it and pounce on it directly — drive at
+        // the kinematic trajectory intercept and sprint — instead of waiting for the broad
+        // decision match below (where shape/support branches can divert it, so it reacts a
+        // beat late). Only the committed contester(s) pounce, so the anti-swarm election
+        // still holds; everyone else falls through to normal shape. This is what makes a
+        // 1-2yd 50-50 get attacked at once rather than strolled to.
+        if !has_ball
+            && snapshot.ball.holder.is_none()
+            && self.role != PlayerRole::Goalkeeper
+            && snapshot.active_set_play.is_none()
+        {
+            let ball_gap = self.position.distance(snapshot.ball.position);
+            let approaching = {
+                let to_me = self.position - snapshot.ball.position;
+                let d = to_me.len();
+                d > 1e-6
+                    && snapshot.ball.velocity.dot(to_me * (1.0 / d)) >= LOOSE_BALL_POUNCE_CLOSING_YPS
+            };
+            let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
+            if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS || approaching || fifty_fifty_duel)
+                && snapshot.is_committed_loose_ball_chaser(self.id)
+            {
+                let (intercept, _trap_now, _ball_speed) =
+                    snapshot.loose_ball_control_plan_for(self.id);
+                let my_distance = self.position.distance(intercept);
+                let my_distance_sq = (self.position - intercept).dot(self.position - intercept);
+                let closer_teammates = snapshot
+                    .players
+                    .iter()
+                    .filter(|player| player.team == self.team && player.id != self.id)
+                    .filter(|player| {
+                        let delta = player.position - intercept;
+                        delta.dot(delta) < my_distance_sq
+                    })
+                    .count();
+                let options =
+                    self.loose_ball_action_options(my_distance, closer_teammates, true, fifty_fifty_duel);
+                // The decision LABEL stays "recover" (the loose-ball recovery move), but the
+                // leading operation reflects the contest type — an explicit "fifty-fifty-duel"
+                // when both teams are right on it, else the ordinary "recover" pursuit.
+                let first_op = if fifty_fifty_duel {
+                    "fifty-fifty-duel"
+                } else {
+                    "recover"
+                };
+                let action = SoccerAction::MoveTo(intercept);
+                let intent = self.committed_chaser_sprint_guarantee(
+                    snapshot,
+                    PlayerIntent {
+                        player_id: self.id,
+                        action: action.clone(),
+                        sprint: false,
+                    },
+                );
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state,
+                    observation,
+                    belief,
+                    vec![first_op.to_string()],
+                    options,
+                    &action,
+                    "recover",
+                ));
+                return intent;
+            }
+        }
+
         // Keeper-collection build-up: when a loose ball is safely running to our own
         // keeper (deep, fast, no opponent within 15 yds), the back four trust the
         // keeper 100% — they stop tracking the ball and fan into an open position in

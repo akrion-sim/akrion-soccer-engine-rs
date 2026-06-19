@@ -58,8 +58,9 @@
     font-variant-numeric: tabular-nums;
     font-weight: 700;
   }
-  .score span {
+  .score > span {
     display: inline-flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
     min-width: 34px;
@@ -67,6 +68,13 @@
     border: 1px solid var(--line);
     border-radius: 6px;
     background: #fff;
+    line-height: 1.15;
+  }
+  .score .ontgt {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0;
   }
   .main {
     min-height: 0;
@@ -350,9 +358,15 @@
   <header>
     <h1>Live Soccer Simulation</h1>
     <div class="score">
-      <span id="homeScore">0</span>
+      <span id="homeScore">
+        <b id="homeGoals">0</b>
+        <small class="ontgt"><span id="homeOnTarget">0</span> on target</small>
+      </span>
       <strong id="clock">0:00.0</strong>
-      <span id="awayScore">0</span>
+      <span id="awayScore">
+        <b id="awayGoals">0</b>
+        <small class="ontgt"><span id="awayOnTarget">0</span> on target</small>
+      </span>
     </div>
   </header>
   <div class="main">
@@ -431,7 +445,6 @@
       <div class="metric"><span>Intent</span><b id="actionIntent">Idle</b></div>
       <div class="metric"><span>Surface</span><b id="surfaceReadout">D0.028 A0.009 G0.88 S0.55</b></div>
       <div class="metric"><span>Shots</span><b id="shots">0 - 0</b></div>
-      <div class="metric"><span>On Target</span><b id="onTarget">0 - 0</b></div>
       <div class="metric"><span>Saves</span><b id="saves">0 - 0</b></div>
       <div class="metric"><span>GK Physics</span><b id="gkPhysics">save/parry</b></div>
       <div class="metric"><span>Passes</span><b id="passes">0 / 0</b></div>
@@ -661,8 +674,10 @@ function fieldRenderAspect() {
   const fieldLength = Number(state?.config?.fieldLengthYards || 120);
   return fieldLength > 0 && fieldWidth > 0 ? fieldLength / fieldWidth : 1.5;
 }
-const homeScore = document.getElementById("homeScore");
-const awayScore = document.getElementById("awayScore");
+const homeGoals = document.getElementById("homeGoals");
+const awayGoals = document.getElementById("awayGoals");
+const homeOnTarget = document.getElementById("homeOnTarget");
+const awayOnTarget = document.getElementById("awayOnTarget");
 const clock = document.getElementById("clock");
 const phase = document.getElementById("phase");
 const centralBrain = document.getElementById("centralBrain");
@@ -677,7 +692,6 @@ const ballAction = document.getElementById("ballAction");
 const actionIntent = document.getElementById("actionIntent");
 const surfaceReadout = document.getElementById("surfaceReadout");
 const shots = document.getElementById("shots");
-const onTarget = document.getElementById("onTarget");
 const saves = document.getElementById("saves");
 const gkPhysics = document.getElementById("gkPhysics");
 const passes = document.getElementById("passes");
@@ -3411,8 +3425,8 @@ function render() {
   // motion between ~10Hz server frames); just hand it the new target frame.
   void r;
   registerFrameForInterpolation(f);
-  homeScore.textContent = f.scoreHome;
-  awayScore.textContent = f.scoreAway;
+  homeGoals.textContent = f.scoreHome;
+  awayGoals.textContent = f.scoreAway;
   clock.textContent = fmtClock(f.clockSeconds);
   phase.textContent = phaseLabel(f.phase);
   centralBrain.textContent = centralBrainLabel(f.centralBrain);
@@ -3432,7 +3446,8 @@ function render() {
   surfaceReadout.title = ballResistanceTitle(f.ball);
   const s = state.summary.stats;
   shots.textContent = `${s.shotsHome} - ${s.shotsAway}`;
-  onTarget.textContent = `${s.shotsOnTargetHome ?? 0} - ${s.shotsOnTargetAway ?? 0}`;
+  homeOnTarget.textContent = s.shotsOnTargetHome ?? 0;
+  awayOnTarget.textContent = s.shotsOnTargetAway ?? 0;
   saves.textContent = `${s.savesHome ?? 0} - ${s.savesAway ?? 0}`;
   gkPhysics.textContent = goalkeeperPhysicsLabel();
   gkPhysics.title = goalkeeperPhysicsTitle();

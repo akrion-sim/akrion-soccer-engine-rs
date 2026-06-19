@@ -9659,8 +9659,27 @@ impl SoccerMatch {
                 .is_some_and(|pass| pass.team == team)
     }
 
-    fn mpc_latent_execution_objective(&self, team: Team) -> SoccerMpcLatentObjective {
-        if self.config.mpc.latent_objective_enabled && self.team_is_attacking_for_mpc_latent(team) {
+    fn mpc_latent_execution_objective(
+        &self,
+        player_id: usize,
+        team: Team,
+    ) -> SoccerMpcLatentObjective {
+        if !self.config.mpc.latent_objective_enabled {
+            return SoccerMpcLatentObjective::default();
+        }
+        // The learned latent normally fine-tunes the MPC weights only for the team in
+        // possession (pass/shot/goal pressure). It is ALSO activated for a player contesting
+        // a LOOSE ball within the MPC active radius, so the neural-learned objective tunes
+        // the QP arrival when fighting for a 50-50 — the ball is nobody's yet, but winning it
+        // is exactly the team's live objective, so the chaser should arrive as decisively.
+        // (Tier-2 MPC only runs for players inside this radius, so the proxy is exact for the
+        // population that actually executes through the controller.)
+        let loose_ball_duel = self.ball.holder.is_none()
+            && self.players.get(player_id).is_some_and(|p| {
+                p.position.distance(self.ball.position)
+                    <= self.config.mpc.active_radius_yards.max(0.0)
+            });
+        if self.team_is_attacking_for_mpc_latent(team) || loose_ball_duel {
             self.mpc_latent_objective(team)
         } else {
             SoccerMpcLatentObjective::default()
@@ -9756,7 +9775,7 @@ impl SoccerMatch {
         let accel_cap = acceleration_yps2_from_score(player.skills.acceleration).max(0.5);
         let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
         let horizon = self.config.mpc.player_horizon.max(1);
-        let latent = self.mpc_latent_execution_objective(my_team);
+        let latent = self.mpc_latent_execution_objective(player_id, my_team);
         let desired_cfg = self.mpc_planar_config(horizon, dt, accel_cap, latent);
         let reference_target = self.mpc_latent_shaped_target(my_team, target, latent);
 
@@ -9782,12 +9801,31 @@ impl SoccerMatch {
             self.mpc_player_controllers.insert(player_id, controller);
         }
 
+        // Cushioned trap: when this player is closing IN on a MOVING loose ball (heading at it,
+        // within the active radius), the MPC arrives matching a fraction of the ball's velocity
+        // — a give-with-the-ball first touch — instead of braking to a dead stop into it (which
+        // bounces it away / miscontrols). Gated to players actually heading at the ball (target
+        // nearer the ball than they are), so a peeling support runner is unaffected.
+        let trap_match_velocity = (self.ball.holder.is_none()
+            && self.ball.velocity.len() >= LOOSE_BALL_PROJECTION_MIN_SPEED_YPS
+            && self.players.get(player_id).is_some_and(|p| {
+                let to_ball = p.position.distance(self.ball.position);
+                to_ball <= self.config.mpc.active_radius_yards.max(0.0)
+                    && reference_target.distance(self.ball.position) < to_ball
+            }))
+        .then(|| self.ball.velocity * LOOSE_BALL_TRAP_CUSHION);
+
         let controller = self.mpc_player_controllers.get_mut(&player_id)?;
         let state = PlanarState {
             pos: [pos.x, pos.y],
             vel: [vel.x, vel.y],
         };
-        let reference = PlanarReference::arrive([reference_target.x, reference_target.y]);
+        let reference = match trap_match_velocity {
+            Some(v) => {
+                PlanarReference::through([reference_target.x, reference_target.y], [v.x, v.y])
+            }
+            None => PlanarReference::arrive([reference_target.x, reference_target.y]),
+        };
         let accel = controller.control_with_obstacles(state, &[reference], &obstacles);
         let next = Vec2::new(vel.x + accel[0] * dt, vel.y + accel[1] * dt);
         // Cap to the heuristic speed envelope (MPC may only equal or undercut it).
@@ -15689,14 +15727,35 @@ impl WorldSnapshot {
         } else {
             0.65
         };
+        // A restart must be played TO a team-mate, never hoofed at nobody/out of bounds. When the
+        // set-play call carries no explicit receiver, resolve a concrete team-mate (best ranked
+        // pass target, else an adopted open forward outlet) so the throw-in / free-kick is always
+        // delivered to someone — the no-receiver "into space" exemption (which the restart taker
+        // would otherwise inherit) is reserved for a deliberate forward-long clearance only.
+        let resolve_floor_receiver = || {
+            release_player
+                .or_else(|| self.best_pass_target(taker_id))
+                .or_else(|| {
+                    self.no_target_forward_outlet_target(taker_id, taker.position, taker.team)
+                        .1
+                })
+        };
+        let resolve_aerial_receiver = || {
+            release_player
+                .or_else(|| self.best_aerial_pass_target(taker_id))
+                .or_else(|| {
+                    self.no_target_forward_outlet_target(taker_id, taker.position, taker.team)
+                        .1
+                })
+        };
         let action = match call.release_kind {
             SoccerSetPlayReleaseKind::Pass => SoccerAction::Pass {
-                target_player: release_player,
+                target_player: resolve_floor_receiver(),
                 power: release_power,
                 flight: PassFlight::Floor,
             },
             SoccerSetPlayReleaseKind::AerialPass => SoccerAction::Pass {
-                target_player: release_player,
+                target_player: resolve_aerial_receiver(),
                 power: release_power,
                 flight: PassFlight::Aerial,
             },
@@ -22525,6 +22584,180 @@ impl WorldSnapshot {
         projected
     }
 
+    /// Max yards a point mass already moving at `s0` toward a point (its speed component on
+    /// the approach axis) covers in time `t`, accelerating at `a` up to top speed `vmax`.
+    /// The reachability model behind the kinematic loose-ball intercept: accelerate to top
+    /// speed, then cruise.
+    fn point_mass_reach_yards(s0: f64, a: f64, vmax: f64, t: f64) -> f64 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        let s0 = s0.clamp(0.0, vmax);
+        let t_to_top = if a > 1e-9 { (vmax - s0) / a } else { 0.0 }.max(0.0);
+        if t <= t_to_top {
+            s0 * t + 0.5 * a * t * t
+        } else {
+            let d_accel = s0 * t_to_top + 0.5 * a * t_to_top * t_to_top;
+            d_accel + vmax * (t - t_to_top)
+        }
+    }
+
+    /// Predicted ball SPEED (yps) `t` seconds out, from its current velocity and the rolling
+    /// deceleration carried in `ball.acceleration` (which opposes the roll). Never negative —
+    /// once the decel would reverse the roll, the ball has stopped.
+    pub(crate) fn predicted_ball_speed(&self, t: f64) -> f64 {
+        let v = self.ball.velocity + self.ball.acceleration * t.max(0.0);
+        // The decel only slows the ball; if the projected vector flipped past the current
+        // heading it really means "stopped", so clamp by projection onto the current heading.
+        let v0 = self.ball.velocity;
+        if v0.len() <= 1e-6 {
+            return v.len();
+        }
+        v.dot(v0 * (1.0 / v0.len())).max(0.0)
+    }
+
+    /// Kinematic pursuit solution for `player_id` against the loose ball: the earliest point on
+    /// the ball's predicted trajectory it can physically reach (point-mass reach from current
+    /// velocity under accel + fatigue-limited top speed, plus a last-ditch lunge that stretches
+    /// further when an opponent contests the drop). Returns `(point, contact_seconds,
+    /// ball_speed_at_contact, reachable)`. When the ball outruns the chaser inside the search
+    /// horizon, `reachable` is false and `point` is the fraction-based contest cut (a leading
+    /// chase aim, cut earlier when contested).
+    fn loose_ball_intercept_solution_for(&self, player_id: usize) -> (Vec2, f64, f64, bool) {
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return (self.ball.position, 0.0, self.ball.velocity.len(), false);
+        };
+        let my_pos = self.player_snapshot_position(me);
+        let top_speed = (player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue))
+        .max(0.5);
+        let accel = acceleration_yps2_from_score(me.skills.acceleration).max(0.5);
+        let v0 = self.player_velocity(me.id).unwrap_or(me.velocity);
+        // Contested: an opponent is bearing down on where the ball will settle, so the chaser
+        // commits to an EARLIER intercept — it lunges further (a larger effective reach trips
+        // the catch sooner on the roll) to beat them to it rather than meeting it late.
+        let projected = self
+            .projected_loose_ball_target()
+            .unwrap_or(self.ball.position);
+        let lunge = INTERCEPT_LUNGE_REACH_YARDS
+            + if self.nearest_opponent_distance_at(me.team, projected) <= INTERCEPT_CONTEST_RADIUS_YARDS
+            {
+                LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS
+            } else {
+                0.0
+            };
+        let mut t = 0.0;
+        while t <= LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS {
+            let ball_t = self.predicted_ball_position(t);
+            let to_ball = ball_t - my_pos;
+            let gap = to_ball.len();
+            // Speed already carried toward this intercept (projected onto the approach axis);
+            // a player moving away from the point starts effectively from rest toward it.
+            let s0 = if gap > 1e-6 {
+                v0.dot(to_ball * (1.0 / gap)).max(0.0)
+            } else {
+                top_speed
+            };
+            let reach = Self::point_mass_reach_yards(s0, accel, top_speed, t) + lunge;
+            if reach >= gap {
+                return (
+                    ball_t.clamp_to_pitch(self.field_width, self.field_length),
+                    t,
+                    self.predicted_ball_speed(t),
+                    true,
+                );
+            }
+            t += LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS;
+        }
+        // Not reachable within the search horizon (the ball is outrunning the chaser): defer to
+        // the fraction-based contest cut, which still LEADS the roll and cuts EARLIER when an
+        // opponent is bearing down — a better aim than trailing to the resting point.
+        (
+            self.loose_ball_contest_target_for(player_id)
+                .clamp_to_pitch(self.field_width, self.field_length),
+            LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS,
+            self.predicted_ball_speed(LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS),
+            false,
+        )
+    }
+
+    /// The point the committed chaser drives at — the earliest kinematic intercept (see
+    /// [`Self::loose_ball_intercept_solution_for`]). Thin wrapper used where only the target
+    /// is needed (the election, the support split).
+    pub(crate) fn loose_ball_trajectory_intercept_for(&self, player_id: usize) -> Vec2 {
+        self.loose_ball_intercept_solution_for(player_id).0
+    }
+
+    /// First-touch TIMING decision (MDP/POMDP) for a committed loose-ball chaser: trap the ball
+    /// NOW at the earliest reachable point — fast, but a quick/awkward ball risks a miscontrol —
+    /// versus letting it RUN and meeting it a touch later where it has slowed to a clean-control
+    /// speed (safer first touch, but it cedes a little ground/time and an opponent may pounce).
+    /// The chaser commits to the early trap when an opponent is bearing down on it (deny), or
+    /// when the early ball is already slow/clean enough that there is no risk worth waiting out;
+    /// otherwise it backs off to the slower, cleaner reception. Returns `(target, trap_now,
+    /// ball_speed_at_target)`. The chosen target feeds the MoveTo → Tier-2 MPC drive; `trap_now`
+    /// + the ball speed drive the cushioned (velocity-matched) MPC reception.
+    pub(crate) fn loose_ball_control_plan_for(&self, player_id: usize) -> (Vec2, bool, f64) {
+        let (early, early_t, early_speed, reachable) =
+            self.loose_ball_intercept_solution_for(player_id);
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return (early, true, early_speed);
+        };
+        // Miscontrol risk of taking the EARLY ball: rises with ball speed past a clean-control
+        // pace, falls with the player's first touch. A clean (slow) early ball ⇒ ~0 risk.
+        let first_touch = ability01(me.skills.first_touch);
+        let miscontrol_risk = ((early_speed - LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS)
+            / LOOSE_BALL_CONTROL_RISK_SPEED_SCALE)
+            .clamp(0.0, 1.0)
+            * (1.0 - first_touch);
+        // An opponent bearing down on the early intercept point: we cannot afford to let the
+        // ball run — trap it now to deny them, miscontrol risk be damned.
+        let opponent_denial =
+            self.nearest_opponent_distance_at(me.team, early) <= LOOSE_BALL_LETRUN_DENIAL_YARDS;
+        if !reachable
+            || opponent_denial
+            || miscontrol_risk <= LOOSE_BALL_TRAP_NOW_RISK_THRESHOLD
+        {
+            return (early, true, early_speed);
+        }
+        // Let it run: search on past the early intercept for the first still-reachable point
+        // where the ball has slowed to a clean-control pace AND no opponent is denying it there.
+        let my_pos = self.player_snapshot_position(me);
+        let top_speed = (player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue))
+        .max(0.5);
+        let accel = acceleration_yps2_from_score(me.skills.acceleration).max(0.5);
+        let v0 = self.player_velocity(me.id).unwrap_or(me.velocity);
+        let mut t = early_t + LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS;
+        while t <= LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS {
+            let ball_t = self.predicted_ball_position(t);
+            let to_ball = ball_t - my_pos;
+            let gap = to_ball.len();
+            let s0 = if gap > 1e-6 {
+                v0.dot(to_ball * (1.0 / gap)).max(0.0)
+            } else {
+                top_speed
+            };
+            let reach = Self::point_mass_reach_yards(s0, accel, top_speed, t)
+                + INTERCEPT_LUNGE_REACH_YARDS;
+            let speed = self.predicted_ball_speed(t);
+            if reach >= gap
+                && speed <= LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS
+                && self.nearest_opponent_distance_at(me.team, ball_t)
+                    > LOOSE_BALL_LETRUN_DENIAL_YARDS
+            {
+                return (
+                    ball_t.clamp_to_pitch(self.field_width, self.field_length),
+                    false,
+                    speed,
+                );
+            }
+            t += LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS;
+        }
+        // No cleaner reception is safely available — take the early ball after all.
+        (early, true, early_speed)
+    }
+
     /// True when `player_id` is one of the teammates COMMITTED to winning a live
     /// loose ball this tick — the designated retriever, plus a second challenger on
     /// a genuine 50/50 (see [`Self::loose_ball_contester_count`]). These players are
@@ -22570,6 +22803,31 @@ impl WorldSnapshot {
         if let Some(lane_point) = self.pending_pass_lane_cut_target_for(player_id) {
             return lane_point;
         }
+        // Closest-body collect override: a slow, grounded loose ball within close range of the
+        // SINGLE nearest team-mate is his to gather — turn back onto it — regardless of the
+        // predicted-point retriever election, which can peel an over-running nearest player away
+        // from a ball sitting at his heels (the "ran over it then sprinted off" gap). Self-limiting:
+        // tight radius, slow + grounded ball only, and only the strict-closest outfielder.
+        if self.ball.holder.is_none()
+            && self.ball.velocity.len() <= LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS
+            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
+        {
+            if let Some(me) = self.players.iter().find(|p| p.id == player_id) {
+                if me.role != PlayerRole::Goalkeeper {
+                    let ball_pos = self.ball.position;
+                    let my_dist = self.player_snapshot_position(me).distance(ball_pos);
+                    let strict_closest = !self.players.iter().any(|p| {
+                        p.id != player_id
+                            && p.team == me.team
+                            && p.role != PlayerRole::Goalkeeper
+                            && self.player_snapshot_position(p).distance(ball_pos) < my_dist - 1e-6
+                    });
+                    if my_dist <= LOOSE_BALL_CLOSE_COLLECT_RADIUS_YARDS && strict_closest {
+                        return ball_pos.clamp_to_pitch(self.field_width, self.field_length);
+                    }
+                }
+            }
+        }
         let target = self.loose_ball_contest_target_for(player_id);
         let Some(player) = self.players.iter().find(|player| player.id == player_id) else {
             return target;
@@ -22584,7 +22842,11 @@ impl WorldSnapshot {
             if !self.is_among_closest_loose_ball_retrievers(player_id, target, contesters) {
                 return self.loose_ball_support_outlet_for(player_id, target);
             }
-            return target;
+            // The committed retriever drives at its first-touch-timing plan target (trap the
+            // ball now at the early intercept, or let it run to a cleaner slower reception),
+            // executed by the Tier-2 MPC. The election above still uses the fraction-based
+            // contest target, so retriever selection is unchanged.
+            return self.loose_ball_control_plan_for(player_id).0;
         }
         let current = self.player_snapshot_position(player);
         let ball_distance = current.distance(target);

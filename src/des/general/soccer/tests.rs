@@ -12585,6 +12585,52 @@ fn contested_loose_ball_is_cut_off_earlier_on_its_path() {
 }
 
 #[test]
+fn loose_ball_control_plan_traps_now_when_slow_or_pressured() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for player in sim.players.iter_mut() {
+        player.position = Vec2::new(2.0, 2.0);
+    }
+    let home = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    sim.players[home].position = Vec2::new(40.0, 48.0);
+    sim.ball.holder = None;
+
+    // A slow loose ball is a clean first touch — trap it now, no reason to let it run.
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.ball.velocity = Vec2::new(0.0, 1.0);
+    sim.ball.acceleration = Vec2::zero();
+    let snap = WorldSnapshot::from_match(&sim);
+    let (_target, trap_now, speed) = snap.loose_ball_control_plan_for(home);
+    assert!(trap_now, "a slow loose ball should be trapped now: speed={speed}");
+
+    // A fast ball with an opponent bearing down on the intercept must be trapped NOW to deny
+    // it — the miscontrol risk is accepted rather than letting the ball run to a cleaner touch.
+    sim.ball.velocity = Vec2::new(0.0, 9.0);
+    sim.ball.acceleration = Vec2::new(0.0, -6.0);
+    let early = WorldSnapshot::from_match(&sim).loose_ball_trajectory_intercept_for(home);
+    let away = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .map(|p| p.id)
+        .unwrap();
+    sim.players[away].position = early;
+    let snap2 = WorldSnapshot::from_match(&sim);
+    let (_t2, trap_now2, _s2) = snap2.loose_ball_control_plan_for(home);
+    assert!(
+        trap_now2,
+        "an opponent bearing down on the intercept forces a trap-now decision"
+    );
+
+    // Predicted ball speed falls under rolling deceleration (the basis of the timing choice).
+    assert!(snap2.predicted_ball_speed(0.0) > snap2.predicted_ball_speed(0.8));
+}
+
+#[test]
 fn rolling_ground_ball_is_led_so_chasers_intercept_earlier() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

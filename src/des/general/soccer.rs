@@ -2124,9 +2124,11 @@ const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 
 const REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS: f64 = 2.0;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
-// looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
-// you still needs a turn first. (Below this, the facing/control-cone gate is waived.)
-const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 0.5;
+// looking elsewhere. At 1yd a player can reach a foot/leg out and trap a ball at his
+// heels without first completing a turn, so a slow ball under a (even mis-facing)
+// player is collected instead of ghosting through. (Below this, the facing/control-cone
+// gate is waived.)
+const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 1.0;
 // Counterattack: with fewer than this many opponents ahead while in possession,
 // the break is on — off-ball players push forward into space (and sprint there).
 // Attack support: a teammate this far behind an advanced ball sprints forward to
@@ -2203,10 +2205,47 @@ const INTERCEPT_EARLY_CUTOFF_FRACTION: f64 = 0.55;
 // (this fraction of the way to where it would come to rest) rather than strolling
 // to the resting point and letting it die first. Lower = more aggressive attack.
 const LOOSE_BALL_ATTACK_CUTOFF_FRACTION: f64 = 0.72;
+// Kinematic loose-ball intercept search (gated by `mpc.loose_ball_intercept_enabled`):
+// march the predicted ball trajectory in these time steps out to this horizon and drive at
+// the FIRST point the chaser can physically reach (point-mass reach from its current velocity
+// under its acceleration + top-speed limits). Sized fine + short for a close 50-50 duel.
+const LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS: f64 = 0.05;
+const LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS: f64 = 1.6;
+// Per-tick loose-ball awareness reflex (player.rs): a committed contester pounces on a live
+// loose ball the moment it is within this range OF the player, or is rolling toward the
+// player at/above this closing speed (so it anticipates a ball "coming close" rather than
+// waiting for it to arrive). Drives straight at the kinematic intercept; the rest of the
+// decision match is short-circuited so a 1-2yd 50-50 is attacked at once.
+const LOOSE_BALL_POUNCE_RADIUS_YARDS: f64 = 4.0;
+const LOOSE_BALL_POUNCE_CLOSING_YPS: f64 = 2.0;
+// When an opponent is bearing down on a loose ball's projected drop, the chaser COMMITS to
+// an earlier intercept — it stretches/lunges this much further to reach the ball sooner and
+// beat them to it, rather than meeting it at the latest comfortable point on the roll.
+const LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS: f64 = 1.0;
+// First-touch TIMING decision (trap now vs let it run). A ball at/below this speed is a clean
+// first touch; faster than this it risks a miscontrol when trapped on the move.
+const LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS: f64 = 6.0;
+// How quickly miscontrol risk ramps with ball speed past the clean pace (yps per unit risk).
+const LOOSE_BALL_CONTROL_RISK_SPEED_SCALE: f64 = 12.0;
+// Below this miscontrol risk the chaser just traps the early ball — not worth ceding ground to
+// wait for it to slow. Above it (and unpressured) it lets the ball run to a cleaner reception.
+const LOOSE_BALL_TRAP_NOW_RISK_THRESHOLD: f64 = 0.30;
+// An opponent within this of the intercept point is "bearing down" — the chaser must trap NOW
+// to deny them rather than letting the ball run, miscontrol risk notwithstanding.
+const LOOSE_BALL_LETRUN_DENIAL_YARDS: f64 = 4.0;
+// Cushioned trap: the Tier-2 MPC arrives at a moving loose ball matching this fraction of the
+// ball's velocity (a give-with-the-ball first touch) instead of braking to a dead stop into
+// it (which bounces it away / miscontrols). 0 = dead stop, 1 = run alongside without slowing.
+const LOOSE_BALL_TRAP_CUSHION: f64 = 0.35;
 // A true 50/50: the ball is within this of a player AND an opponent is also this
 // close to it. The nearest TWO teammates then genuinely contest it (rather than
 // only one), so the team fights to win loose balls instead of conceding them.
 const LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS: f64 = 8.0;
+// A slow, grounded loose ball THIS close to the single nearest team-mate is his to
+// collect: he turns back onto it instead of being peeled to a support outlet by the
+// (predicted-point) retriever election. This closed the gap where the closest body
+// sprinted away from a ball sitting at his heels and nobody gathered it.
+const LOOSE_BALL_CLOSE_COLLECT_RADIUS_YARDS: f64 = 2.5;
 // A SECOND retriever only commits to a loose ball under genuine pressure from the team that
 // played it (in real soccer two players collect together to SHIELD it from a bearing-down
 // attacker). High pressure = an opponent right on the drop (within this radius). Increasing
