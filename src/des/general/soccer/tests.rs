@@ -718,8 +718,8 @@ fn holder_cannot_strike_ball_during_first_touch_settle() {
 }
 
 #[test]
-fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
-    // Rule B: a forward that lingers offside past the 3s grace is pulled back onside,
+fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
+    // Rule B: a mid/forward that lingers offside past the 3s grace is pulled back onside,
     // unless it is through on goal with the ball / being played in, the opponent last
     // touched the ball, or it is in its own half.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -728,9 +728,12 @@ fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
         ..Default::default()
     });
     let striker = 9; // Home forward, attacks +y
-    park_players_except(&mut sim, &[striker]);
+    let midfielder = 6;
+    park_players_except(&mut sim, &[striker, midfielder]);
     sim.players[striker].role = PlayerRole::Forward;
     sim.players[striker].team = Team::Home;
+    sim.players[midfielder].role = PlayerRole::Midfielder;
+    sim.players[midfielder].team = Team::Home;
     // Away offside line: keeper deepest (y=118), one defender at y=82 (the 2nd-last =
     // the offside line), the rest pushed up the pitch so they don't form the line.
     for away in 11..22 {
@@ -747,23 +750,49 @@ fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
 
     let target = sim
-        .striker_offside_recovery_target(striker)
+        .attacker_offside_recovery_target(striker)
         .expect("offside striker beyond grace should be recovered onside");
     assert!(target.y < 82.0, "recovery must be onside of the 2nd-last line: {target:?}");
     assert!(target.y < 90.0, "recovery must pull the striker back (lower y): {target:?}");
 
-    // Within grace: not yet recovered (free to make the run).
+    sim.players[midfielder].position = Vec2::new(44.0, 91.0);
+    sim.offside_clocks
+        .insert(midfielder, OFFSIDE_GRACE_SECONDS + 1.0);
+    let midfielder_target = sim
+        .attacker_offside_recovery_target(midfielder)
+        .expect("offside midfielder beyond grace should be recovered onside too");
+    assert!(
+        midfielder_target.y < 82.0,
+        "midfielder recovery must be onside of the 2nd-last line: {midfielder_target:?}"
+    );
+    assert!(
+        midfielder_target.y < 91.0,
+        "midfielder recovery must pull the runner back: {midfielder_target:?}"
+    );
+
+    // Marginally beyond the line keeps the normal 3s grace: not yet recovered, still timing the run.
+    sim.players[striker].position = Vec2::new(40.0, 84.0);
     sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS - 0.5);
     assert!(
-        sim.striker_offside_recovery_target(striker).is_none(),
+        sim.attacker_offside_recovery_target(striker).is_none(),
         "within the grace window the striker keeps its run"
+    );
+
+    // Deep offside is the bug class from live play: recover sooner instead of waiting
+    // around goal-side of the line for the full generic grace window.
+    sim.players[striker].position = Vec2::new(40.0, 90.0);
+    sim.offside_clocks
+        .insert(striker, DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS + 0.1);
+    assert!(
+        sim.attacker_offside_recovery_target(striker).is_some(),
+        "deep offside runners should be recovered before the full generic grace expires"
     );
 
     // Opponent last touched the ball: cannot be offside.
     sim.offside_clocks.insert(striker, OFFSIDE_GRACE_SECONDS + 1.0);
     sim.ball.last_touch_team = Some(Team::Away);
     assert!(
-        sim.striker_offside_recovery_target(striker).is_none(),
+        sim.attacker_offside_recovery_target(striker).is_none(),
         "cannot be offside off the opponents' touch"
     );
     sim.ball.last_touch_team = Some(Team::Home);
@@ -771,7 +800,7 @@ fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     // Through on goal WITH the ball: exempt.
     sim.ball.holder = Some(striker);
     assert!(
-        sim.striker_offside_recovery_target(striker).is_none(),
+        sim.attacker_offside_recovery_target(striker).is_none(),
         "a striker through with the ball is exempt"
     );
     sim.ball.holder = None;
@@ -779,8 +808,55 @@ fn striker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     // In its own half: cannot be offside.
     sim.players[striker].position = Vec2::new(40.0, 50.0);
     assert!(
-        sim.striker_offside_recovery_target(striker).is_none(),
+        sim.attacker_offside_recovery_target(striker).is_none(),
         "cannot be offside in its own half"
+    );
+}
+
+#[test]
+fn offside_clocks_tick_in_live_mode_when_learning_is_disabled() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.2,
+        seed: 78,
+        learning_enabled: false,
+        learning_logging_enabled: false,
+        full_game_learning_enabled: false,
+        disable_tick_order_shuffle: true,
+        ..Default::default()
+    });
+    let holder = 5;
+    let runner = 6;
+    park_players_except(&mut sim, &[holder, runner]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(35.0, 70.0);
+    sim.players[runner].team = Team::Home;
+    sim.players[runner].role = PlayerRole::Midfielder;
+    sim.players[runner].position = Vec2::new(40.0, 90.0);
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let event_start = sim.reward_events.len();
+
+    sim.run_time_step();
+
+    let clock = sim.offside_clocks.get(&runner).copied().unwrap_or(0.0);
+    assert!(
+        clock > 0.0,
+        "live-mode offside discipline must keep ticking clocks with learning disabled"
+    );
+    assert_eq!(
+        sim.reward_events.len(),
+        event_start,
+        "clock bookkeeping should not emit reward events while learning/logging are disabled"
     );
 }
 
@@ -13056,9 +13132,9 @@ fn defensive_line_cushion_uses_full_back_four_average_y() {
         sim.players[d].position = Vec2::new(30.0, 58.0);
         sim.players[d].home_position = sim.players[d].position;
     }
-    // One defender steps to the ball as the engagement exemption. The other three
-    // are individually 2yd behind the ball, but the full four-defender average is
-    // too high, so their targets must drop enough that the eventual average is legal.
+    // One defender has stepped toward the ball, but defending no longer grants a
+    // y-line exemption. The full back four must recover enough that the eventual
+    // average is legal.
     sim.players[home_def[0]].position = Vec2::new(40.0, 59.5);
     sim.players[away_holder].position = Vec2::new(40.0, 60.0);
     sim.ball.holder = Some(away_holder);
@@ -13066,16 +13142,19 @@ fn defensive_line_cushion_uses_full_back_four_average_y() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    let adjusted_line: Vec<Vec2> = home_def[1..]
+    let adjusted_line: Vec<Vec2> = home_def
         .iter()
         .map(|&id| snap.defensive_line_cushion_adjusted_target(id, sim.players[id].position))
         .collect();
     let eventual_average_y =
-        (sim.players[home_def[0]].position.y + adjusted_line.iter().map(|p| p.y).sum::<f64>())
-            / home_def.len() as f64;
+        adjusted_line.iter().map(|p| p.y).sum::<f64>() / home_def.len() as f64;
 
     assert!(
-        adjusted_line.iter().all(|target| target.y < 58.0),
+        adjusted_line[0].y < sim.players[home_def[0]].position.y,
+        "the defender who stepped to the ball should also recover the line while defending: {adjusted_line:?}"
+    );
+    assert!(
+        adjusted_line[1..].iter().all(|target| target.y < 58.0),
         "line-bound defenders should compensate for the full back-four average: {adjusted_line:?}"
     );
     assert!(
@@ -13147,7 +13226,7 @@ fn defensive_line_cushion_caps_press_at_five_yards_into_opponent_half() {
 }
 
 #[test]
-fn defensive_line_cushion_allows_one_ball_defender_but_holds_other_three() {
+fn defensive_line_cushion_pulls_all_four_into_line_when_defending() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 23,
@@ -13179,30 +13258,29 @@ fn defensive_line_cushion_allows_one_ball_defender_but_holds_other_three() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    let exempt = snap.defensive_line_cushion_adjusted_target(home_def[0], Vec2::new(40.0, 59.5));
+    let stepped = snap.defensive_line_cushion_adjusted_target(home_def[0], Vec2::new(40.0, 59.5));
     assert!(
-        exempt.y > sim.ball.position.y - 1.0,
-        "the closest defender may be the one ball-engagement exemption: {exempt:?}"
+        stepped.y <= sim.ball.position.y - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS + 1e-9,
+        "defending should pull the stepped defender back into the line: {stepped:?}"
     );
 
-    let other_targets: Vec<Vec2> = home_def[1..]
+    let targets: Vec<Vec2> = home_def
         .iter()
-        .map(|&id| snap.defensive_line_cushion_adjusted_target(id, Vec2::new(30.0, 20.0)))
+        .map(|&id| snap.defensive_line_cushion_adjusted_target(id, sim.players[id].position))
         .collect();
-    let other_mean_y =
-        other_targets.iter().map(|target| target.y).sum::<f64>() / other_targets.len() as f64;
+    let mean_y = targets.iter().map(|target| target.y).sum::<f64>() / targets.len() as f64;
     assert!(
-        other_mean_y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS,
-        "the other three defenders must pull the line back inside 30yd: {other_targets:?}"
+        mean_y >= sim.ball.position.y - DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS,
+        "all four defenders must pull the line back inside 30yd: {targets:?}"
     );
     assert!(
-        other_mean_y <= sim.ball.position.y - 1.0,
-        "the other three defenders should still stay goal-side of the ball: {other_targets:?}"
+        mean_y <= sim.ball.position.y - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS + 1e-9,
+        "all four defenders should stay goal-side of the ball: {targets:?}"
     );
 }
 
 #[test]
-fn defensive_line_cushion_clamps_two_second_target_when_line_already_legal() {
+fn defensive_line_cushion_clamps_three_second_target_when_line_already_legal() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 24,
@@ -13241,7 +13319,7 @@ fn defensive_line_cushion_clamps_two_second_target_when_line_already_legal() {
     let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_input);
     assert!(
         adjusted.y >= deep_input.y - 1e-9,
-        "a legal line must not aim its two-second target even deeper: {adjusted:?}"
+        "a legal line must not aim its three-second target even deeper: {adjusted:?}"
     );
     assert!(
         adjusted.y <= sim.ball.position.y - 1.0 + 1e-9,
@@ -13272,7 +13350,10 @@ fn defensive_line_cushion_still_clamps_lane_and_row_when_average_is_legal() {
     for &d in &home_def {
         sim.players[d].role = PlayerRole::Defender;
     }
-    // One closest defender can engage; the remaining three still need lane/row cohesion.
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(40.0, 72.0);
+    }
+    // The stepped defender and the remaining three all need lane/row cohesion.
     sim.players[home_def[0]].position = Vec2::new(40.0, 59.5);
     sim.players[home_def[1]].position = Vec2::new(31.0, 10.0);
     sim.players[home_def[2]].position = Vec2::new(49.0, 44.0);
@@ -13366,6 +13447,261 @@ fn back_four_horizontal_gap_targets_preserve_home_slot_order() {
                 ..=BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS + 1e-9)
                 .contains(&gap),
             "back four should recover home-slot order with 1.5-8yd x gaps: {adjusted:?}"
+        );
+    }
+}
+
+#[test]
+fn defending_wingbacks_pinch_to_six_yard_box_edge_without_wide_threat() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 228,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let left_wingback = *home_def
+        .iter()
+        .min_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let right_wingback = *home_def
+        .iter()
+        .max_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(40.0, 34.0);
+    }
+    sim.players[left_wingback].position = Vec2::new(4.0, 34.0);
+    sim.players[right_wingback].position = Vec2::new(76.0, 34.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = Vec2::new(40.0, 34.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let half_six_box_width =
+        snap.goal_width * 0.5 + SIX_YARD_BOX_POST_EXTENSION_YARDS;
+    let left_edge_x = snap.field_width * 0.5 - half_six_box_width;
+    let right_edge_x = snap.field_width * 0.5 + half_six_box_width;
+    let left_target =
+        snap.back_four_shape_adjusted_target(left_wingback, sim.players[left_wingback].position);
+    let right_target =
+        snap.back_four_shape_adjusted_target(right_wingback, sim.players[right_wingback].position);
+
+    assert!(
+        (left_target.x - left_edge_x).abs() < 1e-9,
+        "left wingback should pinch to the left six-yard-box edge without a wider threat: target={left_target:?} edge={left_edge_x}"
+    );
+    assert!(
+        (right_target.x - right_edge_x).abs() < 1e-9,
+        "right wingback should pinch to the right six-yard-box edge without a wider threat: target={right_target:?} edge={right_edge_x}"
+    );
+}
+
+#[test]
+fn defending_wingback_pinch_is_bounded_by_three_second_consistency_when_far_from_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 230,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let left_wingback = *home_def
+        .iter()
+        .min_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let away_holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(40.0, 110.0);
+    }
+    let current = Vec2::new(4.0, 34.0);
+    sim.players[left_wingback].position = current;
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = Vec2::new(40.0, 110.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let left_edge_x =
+        snap.field_width * 0.5 - (snap.goal_width * 0.5 + SIX_YARD_BOX_POST_EXTENSION_YARDS);
+    let target = snap.back_four_shape_adjusted_target(left_wingback, current);
+
+    assert!(
+        target.x > current.x + 6.0,
+        "far-side wingback should still start pinching inward: target={target:?} current={current:?}"
+    );
+    assert!(
+        target.x < left_edge_x - 0.5,
+        "far-side wingback should recover toward the six-yard edge over the grace window, not snap there instantly: target={target:?} edge={left_edge_x}"
+    );
+}
+
+#[test]
+fn defending_wingbacks_stop_at_outer_attacking_opponent_when_wider_than_six_yard_edge() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 229,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let left_wingback = *home_def
+        .iter()
+        .min_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let right_wingback = *home_def
+        .iter()
+        .max_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let away_outfield: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let left_threat = away_outfield[0];
+    let right_threat = away_outfield[1];
+    let away_holder = away_outfield[2];
+    for &away in &away_outfield {
+        sim.players[away].position = Vec2::new(40.0, 34.0);
+    }
+    sim.players[left_threat].position = Vec2::new(12.0, 34.0);
+    sim.players[right_threat].position = Vec2::new(68.0, 34.0);
+    sim.players[left_wingback].position = Vec2::new(4.0, 34.0);
+    sim.players[right_wingback].position = Vec2::new(76.0, 34.0);
+    sim.ball.holder = Some(away_holder);
+    sim.ball.position = Vec2::new(40.0, 34.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let left_target =
+        snap.back_four_shape_adjusted_target(left_wingback, sim.players[left_wingback].position);
+    let right_target =
+        snap.back_four_shape_adjusted_target(right_wingback, sim.players[right_wingback].position);
+
+    assert!(
+        (left_target.x - sim.players[left_threat].position.x).abs() < 1e-9,
+        "left wingback should stop at the outer left attacking opponent when wider than the six-yard edge: target={left_target:?}"
+    );
+    assert!(
+        (right_target.x - sim.players[right_threat].position.x).abs() < 1e-9,
+        "right wingback should stop at the outer right attacking opponent when wider than the six-yard edge: target={right_target:?}"
+    );
+}
+
+#[test]
+fn back_four_y_parity_applies_without_a_possessor_even_after_own_last_touch() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 226,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(home_def.len(), 4, "test needs the back four");
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for (id, y) in home_def.iter().copied().zip([24.0, 31.0, 39.0, 46.0]) {
+        sim.players[id].position = Vec2::new(sim.players[id].home_position.x, y);
+    }
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let adjusted: Vec<Vec2> = home_def
+        .iter()
+        .map(|&id| snap.back_four_shape_adjusted_target(id, sim.players[id].position))
+        .collect();
+    let raw_min_y = home_def
+        .iter()
+        .map(|&id| sim.players[id].position.y)
+        .fold(f64::INFINITY, f64::min);
+    let raw_max_y = home_def
+        .iter()
+        .map(|&id| sim.players[id].position.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let adjusted_min_y = adjusted.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    let adjusted_max_y = adjusted
+        .iter()
+        .map(|p| p.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    assert!(
+        adjusted_max_y - adjusted_min_y < (raw_max_y - raw_min_y) * 0.62,
+        "50:50 loose balls should recover y parity instead of treating last touch as possession: raw={raw_min_y:.2}..{raw_max_y:.2} adjusted={adjusted:?}"
+    );
+}
+
+#[test]
+fn controlled_possession_does_not_force_back_four_y_parity() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 227,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    assert_eq!(home_def.len(), 4, "test needs the back four");
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(42.0, 42.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    for (id, y) in home_def.iter().copied().zip([20.0, 27.0, 36.0, 44.0]) {
+        sim.players[id].position = Vec2::new(sim.players[id].home_position.x, y);
+    }
+
+    let snap = WorldSnapshot::from_match(&sim);
+    for &id in &home_def {
+        let target = sim.players[id].position;
+        let adjusted = snap.back_four_shape_adjusted_target(id, target);
+        assert!(
+            (adjusted.y - target.y).abs() < 1e-9,
+            "controlled possession should leave defender y parity to attacking support/overlap strategy: id={id} target={target:?} adjusted={adjusted:?}"
         );
     }
 }
@@ -35366,7 +35702,7 @@ fn uncontested_carrier_pulls_off_ball_attackers_forward_not_back() {
     let current = sim.players[striker].position;
     let support_forward_yards = (support.point.y - current.y) * attack;
     assert!(
-        support_forward_yards >= 6.0,
+        support_forward_yards >= UNCONTESTED_SUPPORT_PUSH_YARDS + 1.0,
         "off-ball striker should be pushed FORWARD to support the free carrier, \
          not held or dropped back: target {:?} vs current {:?}",
         support.point,
@@ -36134,6 +36470,80 @@ fn defenders_and_midfielders_preserve_vertical_lanes_by_phase() {
 }
 
 #[test]
+fn possession_support_expands_width_while_respecting_all_outfield_lanes() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for id in 1..11 {
+        sim.players[id].position = Vec2::new(37.0 + (id % 4) as f64 * 2.0, 50.0 + id as f64);
+        sim.players[id].velocity = Vec2::zero();
+    }
+    sim.players[holder].position = sim.ball.position;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(70.0, 96.0 + (away - 11) as f64 * 0.5);
+    }
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let compact_width = sim.players[1..11]
+        .iter()
+        .filter(|player| player.id != holder)
+        .map(|player| player.position.x)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min_x, max_x), x| {
+            (min_x.min(x), max_x.max(x))
+        });
+    let compact_width = compact_width.1 - compact_width.0;
+    let mut min_target_x = f64::INFINITY;
+    let mut max_target_x = f64::NEG_INFINITY;
+    let center = snapshot.field_width * 0.5;
+
+    for player_id in 1usize..11 {
+        if player_id == holder {
+            continue;
+        }
+        let player = &sim.players[player_id];
+        let target = snapshot
+            .attacking_support_movement_for(player_id, player.home_position, false)
+            .point;
+        let target_lane = vertical_lane_index(target.x, snapshot.field_width);
+        let (min_lane, max_lane) = role_vertical_lane_range(
+            player.role,
+            player.home_position.x,
+            snapshot.field_width,
+            true,
+        );
+        let possession_max_lane = (max_lane + 1).min(VERTICAL_LANE_COUNT - 1);
+        assert!(
+            (min_lane..=possession_max_lane).contains(&target_lane),
+            "{} should keep its home 12-grid lane band or immediate support lane in possession: home={:?} target={:?} lane={target_lane} allowed={min_lane}..={possession_max_lane}",
+            player.name,
+            player.home_position,
+            target
+        );
+        if (player.home_position.x - center).abs() > snapshot.field_width * 0.18 {
+            assert!(
+                (target.x - center).abs() > (player.position.x - center).abs() + 3.0,
+                "{} should widen from the compact start toward its lane: start={:?} home={:?} target={:?}",
+                player.name,
+                player.position,
+                player.home_position,
+                target
+            );
+        }
+        min_target_x = min_target_x.min(target.x);
+        max_target_x = max_target_x.max(target.x);
+    }
+
+    let target_width = max_target_x - min_target_x;
+    assert!(
+        target_width > compact_width + snapshot.field_width * 0.52,
+        "support targets should expand a compact possession shape across the field: compact={compact_width:.2} target={target_width:.2}"
+    );
+}
+
+#[test]
 fn defender_and_midfielder_markov_lane_affinities_sum_to_one() {
     for (name, table) in [
         ("defender", &DEFENDER_MARKOV_LANE_PMF_BY_SLOT),
@@ -36287,7 +36697,7 @@ fn markov_lane_pmf_interpolates_for_non_four_player_role_lines() {
 }
 
 #[test]
-fn forwards_have_no_dynamic_lane_affinity_prior() {
+fn forwards_have_light_dynamic_lane_affinity_prior() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let forward = 9;
     sim.ball.holder = None;
@@ -36299,16 +36709,25 @@ fn forwards_have_no_dynamic_lane_affinity_prior() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let player = snapshot.players.iter().find(|p| p.id == forward).unwrap();
+    let home_lane_target = Vec2::new(22.0, 90.0);
+    let cross_pitch_target = Vec2::new(64.0, 90.0);
+    let home_lane_affinity =
+        snapshot.dynamic_lane_affinity_for_player_target(player, home_lane_target);
+    let cross_pitch_affinity =
+        snapshot.dynamic_lane_affinity_for_player_target(player, cross_pitch_target);
 
-    assert_eq!(
-        snapshot.dynamic_lane_affinity_for_player_target(player, Vec2::new(64.0, 90.0)),
-        0.0,
-        "forwards should use runs/space cues, not a defender-style lane prior"
+    assert!(
+        home_lane_affinity > cross_pitch_affinity + 0.10,
+        "forwards should keep a lighter lane prior so learned/MPC support does not send them cross-pitch: home={home_lane_affinity:.3} cross={cross_pitch_affinity:.3}"
+    );
+    assert!(
+        cross_pitch_affinity > 0.0,
+        "forward lane affinity should stay soft rather than a hard zero: cross={cross_pitch_affinity:.3}"
     );
 }
 
 #[test]
-fn dynamic_lane_affinity_halves_for_team_in_possession_until_turnover() {
+fn dynamic_lane_affinity_dampens_for_team_in_possession_until_turnover() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 1;
     let home_holder = 9;
@@ -36361,11 +36780,15 @@ fn dynamic_lane_affinity_halves_for_team_in_possession_until_turnover() {
         turnover_snapshot.dynamic_lane_affinity_for_player_target(turnover_player, target);
 
     assert!(
-        possession_affinity < free_affinity * 0.60,
-        "own possession should damp lane affinity by about half: free={free_affinity:.3} possession={possession_affinity:.3}"
+        possession_affinity < free_affinity * 0.86,
+        "own possession should still damp lane affinity: free={free_affinity:.3} possession={possession_affinity:.3}"
     );
     assert!(
-        turnover_affinity > possession_affinity * 1.70,
+        possession_affinity > free_affinity * 0.62,
+        "own possession should preserve a live lane signal for width: free={free_affinity:.3} possession={possession_affinity:.3}"
+    );
+    assert!(
+        turnover_affinity > possession_affinity * 1.16,
         "after giving it away, defensive lane affinity should return: turnover={turnover_affinity:.3} possession={possession_affinity:.3}"
     );
 }
@@ -38543,6 +38966,137 @@ fn wingback_push_is_smoothly_boosted_by_space_and_midfield_cover() {
                 && covered_rb_target.y > covered_center_back_line + 2.0,
             "outside backs should remain ahead of the center-back line: lb={covered_target:?} rb={covered_rb_target:?} cb_line={covered_center_back_line}"
         );
+}
+
+#[test]
+fn covered_possession_opens_both_wingbacks_to_flanks() {
+    fn configure_covered_wingback_shape(sim: &mut SoccerMatch, covered: bool) {
+        let holder = 7usize;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = Vec2::new(40.0, 62.0);
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.acceleration = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[holder].position = sim.ball.position;
+
+        for id in 1..11 {
+            sim.players[id].velocity = Vec2::zero();
+            sim.players[id].position = Vec2::new(40.0, 74.0 + id as f64 * 0.3);
+        }
+        for (id, x) in [(1usize, 16.0), (2, 32.0), (3, 48.0), (4, 64.0), (6, 40.0)] {
+            sim.players[id].position = Vec2::new(x, 44.0);
+        }
+        sim.players[5].position = if covered {
+            Vec2::new(39.0, 45.0)
+        } else {
+            Vec2::new(39.0, 72.0)
+        };
+        sim.players[holder].position = sim.ball.position;
+
+        for away in 11..22 {
+            sim.players[away].position = Vec2::new(40.0, 96.0 + (away - 11) as f64 * 0.5);
+        }
+    }
+
+    let lb = 1usize;
+    let rb = 4usize;
+    let mut uncovered = SoccerMatch::default_11v11(MatchConfig::default());
+    let mut covered = SoccerMatch::default_11v11(MatchConfig::default());
+    configure_covered_wingback_shape(&mut uncovered, false);
+    configure_covered_wingback_shape(&mut covered, true);
+
+    let uncovered_snapshot = WorldSnapshot::from_match(&uncovered);
+    let covered_snapshot = WorldSnapshot::from_match(&covered);
+    let uncovered_lb = uncovered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == lb)
+        .expect("uncovered left wingback");
+    let covered_lb = covered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == lb)
+        .expect("covered left wingback");
+    let uncovered_rb = uncovered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == rb)
+        .expect("uncovered right wingback");
+    let covered_rb = covered_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == rb)
+        .expect("covered right wingback");
+    let behind_ball_count = |snapshot: &WorldSnapshot, wingback_id: usize| -> usize {
+        snapshot
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == Team::Home
+                    && player.id != wingback_id
+                    && player.role != PlayerRole::Goalkeeper
+                    && (snapshot.ball.position.y - snapshot.player_snapshot_position(player).y)
+                        * Team::Home.attack_dir()
+                        > 0.75
+            })
+            .count()
+    };
+
+    assert_eq!(
+        behind_ball_count(&uncovered_snapshot, uncovered_lb.id),
+        WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL
+    );
+    assert!(
+        behind_ball_count(&covered_snapshot, covered_lb.id)
+            > WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL
+    );
+    assert!(
+        uncovered_snapshot
+            .wide_possession_outlet_target_for(lb, uncovered.players[lb].home_position)
+            .is_none(),
+        "four other players behind the ball should not trigger the wingback flank outlet"
+    );
+    let covered_left_outlet = covered_snapshot
+        .wide_possession_outlet_target_for(lb, covered.players[lb].home_position)
+        .expect("five-plus cover players should release the left wingback wide");
+    let covered_right_outlet = covered_snapshot
+        .wide_possession_outlet_target_for(rb, covered.players[rb].home_position)
+        .expect("five-plus cover players should release the right wingback wide");
+    let uncovered_left =
+        uncovered_snapshot.positional_open_space_for(lb, uncovered.players[lb].home_position, false);
+    let covered_left =
+        covered_snapshot.positional_open_space_for(lb, covered.players[lb].home_position, false);
+    let uncovered_right =
+        uncovered_snapshot.positional_open_space_for(rb, uncovered.players[rb].home_position, false);
+    let covered_right =
+        covered_snapshot.positional_open_space_for(rb, covered.players[rb].home_position, false);
+
+    assert!(
+        covered_left.x < uncovered_left.x - 4.0,
+        "covered left wingback should open wider toward the left flank: uncovered={uncovered_left:?} covered={covered_left:?}"
+    );
+    assert!(
+        covered_right.x > uncovered_right.x + 4.0,
+        "covered right wingback should open wider toward the right flank: uncovered={uncovered_right:?} covered={covered_right:?}"
+    );
+    assert!(
+        covered_left_outlet.x < covered.players[lb].home_position.x - 8.0,
+        "left covered outlet should be a true flank outlet: {covered_left_outlet:?}"
+    );
+    assert!(
+        covered_right_outlet.x > covered.players[rb].home_position.x + 8.0,
+        "right covered outlet should be a true flank outlet: {covered_right_outlet:?}"
+    );
+    assert!(
+        covered_snapshot.wingback_extra_push_yards(covered_lb)
+            > uncovered_snapshot.wingback_extra_push_yards(uncovered_lb) + 1.0,
+        "coverage behind the ball should also permit more wingback push"
+    );
+    assert!(
+        covered_snapshot.wingback_extra_push_yards(covered_rb)
+            > uncovered_snapshot.wingback_extra_push_yards(uncovered_rb) + 0.75,
+        "far-side wingback should still get some covered-possession push"
+    );
 }
 
 #[test]
@@ -41701,8 +42255,7 @@ fn back_line_cushion_lets_one_wingback_overlap_while_holding_the_other_three() {
     // Reconciled rule: in possession the back-line cushion grants exactly ONE exemption —
     // an OVERLAPPING WINGBACK (an outside back clearly ahead of the line). That player is
     // left alone to bomb forward while the other three are still pulled up toward a high
-    // ball. (Defending, the one exemption is instead the closest engager — covered
-    // separately by `defensive_line_cushion_allows_one_ball_defender_but_holds_other_three`.)
+    // ball. Defending and 50:50 phases grant no ordinary line exemption.
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defenders: Vec<usize> = sim
         .players
@@ -41761,6 +42314,59 @@ fn back_line_cushion_lets_one_wingback_overlap_while_holding_the_other_three() {
     assert!(
         cb_adjusted.y > cb_target.y + 1.0,
         "a holding defender steps up toward the high ball: {cb_adjusted:?}"
+    );
+}
+
+#[test]
+fn flank_overlap_directive_can_release_wingback_before_it_is_already_ahead() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defenders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let right_back = *defenders
+        .iter()
+        .max_by(|&&a, &&b| {
+            sim.players[a]
+                .home_position
+                .x
+                .total_cmp(&sim.players[b].home_position.x)
+        })
+        .unwrap();
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    assert_eq!(defenders.len(), 4, "need a back four");
+    for &d in &defenders {
+        sim.players[d].position = Vec2::new(sim.players[d].home_position.x, 30.0);
+    }
+    sim.players[holder].position = Vec2::new(sim.players[right_back].home_position.x, 64.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let mut directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        sim.config.field_width_yards,
+        sim.config.field_length_yards,
+    );
+    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    directive.flank_overlap_run_probability = 0.48;
+    directive.risk_tolerance = 0.72;
+    sim.central_brain.home_directive = directive;
+
+    let target = Vec2::new(sim.players[right_back].home_position.x, 46.0);
+    let snap = WorldSnapshot::from_match(&sim);
+    let adjusted = snap.defensive_line_cushion_adjusted_target(right_back, target);
+
+    assert!(
+        (adjusted.y - target.y).abs() < 1e-9,
+        "an active flank-overlap strategy should release the wingback target before it is already ahead: target={target:?} adjusted={adjusted:?}"
     );
 }
 
@@ -43583,6 +44189,11 @@ fn tactical_learning_scores_prefer_flanks_and_defensive_contraction() {
     assert!(
         attack_width_score(field_width * 0.78, field_width)
             > attack_width_score(field_width * 0.30, field_width)
+    );
+    assert!(
+        attack_width_score(field_width * 0.92, field_width)
+            > attack_width_score(field_width * 0.78, field_width),
+        "attacking width should now prefer using nearly the full pitch over a merely broad shape"
     );
     assert!(
         flank_lane_score(Vec2::new(field_width * 0.12, 40.0), field_width)

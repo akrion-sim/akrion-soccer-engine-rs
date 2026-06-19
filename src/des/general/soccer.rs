@@ -773,6 +773,8 @@ const OUT_OF_BOUNDS_PRESSURE_EXEMPT_THRESHOLD: f64 = 0.8;
 // seconds. After the grace window the penalty grows with how long they linger,
 // and stepping back onside after lingering earns a small recovery reward.
 const OFFSIDE_GRACE_SECONDS: f64 = 3.0;
+const DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS: f64 = 1.0;
+const DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS: f64 = 8.0;
 // Time-offside and distance-offside are independent dimensions with their own
 // scalars; the per-tick lingering penalty is the sum of a time term and a
 // distance term (further AND longer => more penalty, each weighted separately).
@@ -1259,7 +1261,7 @@ const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
-const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 2.0;
+const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
 // permute the min over {1,2,3}yd and max over values capped at 30yd.
 const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
@@ -1311,6 +1313,9 @@ const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
 const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
 const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
 const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const WINGBACK_DEFENSIVE_PINCH_TARGET_SECONDS: f64 = 3.0;
+const WINGBACK_DEFENSIVE_PINCH_OPPONENT_HALF_MARGIN_YARDS: f64 = 8.0;
+const SIX_YARD_BOX_POST_EXTENSION_YARDS: f64 = 6.0;
 const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
 const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
 const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
@@ -1872,7 +1877,7 @@ const DEFENSIVE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // In possession, a single wingback (one of the two outside backs) is granted the one
 // back-line-band exemption — but only once it is genuinely overlapping, i.e. this far
 // forward of the rest of the back line. Otherwise all four carry the band. The band
-// itself (centroid distance, genome scaling, goal-shrink, 2s consistency horizon) lives
+// itself (centroid distance, genome scaling, goal-shrink, 3s consistency horizon) lives
 // in `defensive_line_cushion_adjusted_target`; this only selects the one player allowed
 // to break it. See `WorldSnapshot::overlapping_wingback_exempt_defender`.
 const BACK_LINE_WINGBACK_RUN_MARGIN_YARDS: f64 = 4.0;
@@ -2235,7 +2240,7 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// up to this many yards ahead of his current position (capped onside) so he actively
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
-const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 8.0;
+const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 10.0;
 /// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
 /// stays level/behind the line (timing the run) until the ball is actually played beyond it,
 /// rather than standing in an offside position.
@@ -2825,6 +2830,10 @@ const GOAL_URGENCY_KEEPER_CROWD_YARDS: f64 = 6.0;
 const SUPPORT_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.10;
 const WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS: f64 = 4.5;
 const WIDE_OUTLET_MIN_FORWARD_YARDS: f64 = 2.0;
+const WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL: usize = 4;
+const WINGBACK_ATTACK_COVER_FULL_OTHER_PLAYERS_BEHIND_BALL: usize = 6;
+const WINGBACK_COVERED_ATTACK_FLANK_SCORE_BONUS: f64 = 3.2;
+const WINGBACK_COVERED_ATTACK_PUSH_BONUS_YARDS: f64 = 4.0;
 const SOCCER_PLAYBACK_INTENT_LIMIT: usize = 3;
 
 fn default_ball_drag_per_tick() -> f64 {
@@ -3339,9 +3348,10 @@ fn role_vertical_lane_range(
         // Forwards keep their freedom to drift and make runs, but not across the
         // WHOLE pitch: a generous home-centred band (±3 of 12 lanes ≈ ±20yd) lets a
         // striker work the centre and both half-spaces while still stopping it from
-        // wandering onto the opposite touchline and emptying the team's width. This is
-        // a containment guardrail only — forwards still carry no positive lane prior
-        // pulling them to a home channel (see `dynamic_lane_affinity_for_player_target`).
+        // wandering onto the opposite touchline and emptying the team's width. Forwards
+        // still carry a lighter lane prior than the back/midfield lines, but the learned
+        // and MPC shape scorers now see that prior instead of treating forwards as
+        // lane-less.
         PlayerRole::Forward => centered_band(3),
         PlayerRole::Defender if in_possession => centered_band(2),
         PlayerRole::Defender => centered_band(1),
@@ -3364,15 +3374,15 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
         // tracking a mark, no outlet, covering a teammate, team urgency) — i.e. players
         // only leave their primary lane for those already-specified reasons. Drift
         // INSIDE the band is still free; this only bounds the band edge.
-        PlayerRole::Defender if in_possession => 0.66,
+        PlayerRole::Defender if in_possession => 0.74,
         PlayerRole::Defender => 0.92,
-        PlayerRole::Midfielder if in_possession => 0.66,
+        PlayerRole::Midfielder if in_possession => 0.74,
         PlayerRole::Midfielder => 0.90,
         // A light containment pull for forwards: enough to keep the lane clamp/penalty
         // alive against a cross-pitch drift (commitment must be > 0 to engage at all),
         // but well below the 0.65 hard-lock threshold and eroded by genuine attacking
         // runs (`offensive_high_speed_run_relief`), so striker movement stays free.
-        PlayerRole::Forward if in_possession => 0.24,
+        PlayerRole::Forward if in_possession => 0.34,
         PlayerRole::Forward => 0.40,
     }
 }
@@ -11291,8 +11301,8 @@ impl Default for SoccerTacticalLearningWeights {
             attack_spacing_delta_weight: 0.22,
             attack_spacing_score_weight: 0.06,
             attack_width_delta_weight: 0.52,
-            attack_width_score_weight: 0.14,
-            attack_flank_lane_weight: 0.28,
+            attack_width_score_weight: 0.24,
+            attack_flank_lane_weight: 0.36,
             defense_spacing_delta_weight: 0.08,
             defense_spacing_score_weight: 0.04,
             defense_contract_delta_weight: 0.42,
@@ -13598,11 +13608,11 @@ fn tactical_directive_for_team(
     .clamp(6.5, 24.0);
     let width_factor = if has_ball {
         if attacking_phase {
-            0.76 + risk_tolerance * 0.18 + overload_score * 0.06
+            0.82 + risk_tolerance * 0.17 + overload_score * 0.07
         } else if build_up_phase || own_half_possession {
-            0.71 + risk_tolerance * 0.16 + overload_score * 0.05
+            0.78 + risk_tolerance * 0.15 + overload_score * 0.06
         } else {
-            0.69 + risk_tolerance * 0.14 + overload_score * 0.04
+            0.75 + risk_tolerance * 0.13 + overload_score * 0.05
         }
     } else if defending {
         0.36 + press_intensity * 0.10
@@ -13610,7 +13620,7 @@ fn tactical_directive_for_team(
         0.52 + press_intensity * 0.08
     };
     let width_factor = if flank_attack_policy.is_flank() {
-        width_factor + 0.04
+        width_factor + 0.06
     } else {
         width_factor
     };
@@ -13618,11 +13628,11 @@ fn tactical_directive_for_team(
     // wing-backs open up on the flanks as outlets for the keeper, instead of
     // pinching in centrally. If a caller supplies an inconsistent build-up/no-ball
     // phase, keep the clamp total rather than panicking on min > max.
-    let max_width_factor: f64 = if has_ball { 0.94 } else { 0.72 };
+    let max_width_factor: f64 = if has_ball { 0.98 } else { 0.72 };
     let raw_min_width_factor: f64 = if build_up_phase && has_ball {
-        0.74
+        0.82
     } else if has_ball {
-        0.56
+        0.68
     } else {
         0.34
     };
@@ -16378,7 +16388,7 @@ fn dense_soccer_transition_reward(
             if is_floor_pass {
                 let lane_open = before_obs.floor_pass_lane_score.clamp(0.0, 1.0);
                 if lane_open < BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD {
-                    reward -= BLOCKED_LANE_FLOOR_PASS_PENALTY_POINTS
+                    reward -= tunables().reward.blocked_lane_floor_pass_penalty_points
                         * (BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD - lane_open)
                         / BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD;
                 }
@@ -17172,7 +17182,14 @@ fn positional_shape_learning_signal(
     let lane_reward = if lane_commitment > 1e-9 {
         let delta = (after_lane.affinity_score - before_lane.affinity_score).clamp(-1.0, 1.0);
         let steady_state = (after_lane.affinity_score - 0.62).clamp(-0.62, 0.38);
-        (delta * 0.38 + steady_state * 0.10) * lane_commitment
+        let phase_weight = if in_possession {
+            1.20
+        } else if defending {
+            1.05
+        } else {
+            0.90
+        };
+        (delta * 0.52 + steady_state * 0.16) * lane_commitment * phase_weight
     } else {
         0.0
     };
@@ -17659,9 +17676,9 @@ fn attack_width_score(width_yards: f64, field_width_yards: f64) -> f64 {
     width_band_score(
         width_yards,
         field_width_yards,
-        field_width_yards * 0.52,
-        field_width_yards * 0.78,
-        field_width_yards * 0.96,
+        field_width_yards * 0.68,
+        field_width_yards * 0.92,
+        field_width_yards * 0.995,
     )
 }
 
@@ -42254,7 +42271,7 @@ fn low_pressure_forced_pass_penalty_points(
     };
     let outcome_cost = if retained_possession { 0.36 } else { 1.0 };
 
-    (LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS
+    (tunables().reward.low_pressure_forced_pass_penalty_points
         * patience
         * poor_pass
         * (0.55 + carry_space * 0.45)
