@@ -37,7 +37,7 @@ use soccer_engine::des::general::soccer::{
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, GenomeRng, SoccerTeamGenome, TeamBrain, Tournament,
     TournamentFormat, TournamentLearningMode, TournamentReport, TournamentTeam,
-    DEF_LINE_BAND_PERMUTATION_COUNT, TOURNAMENT_DEFAULT_MATCH_SECONDS,
+    TOURNAMENT_DEFAULT_MATCH_SECONDS,
 };
 use soccer_engine::des::soccer_learning::SOCCER_POLICY_STATUS_ACTIVE;
 use soccer_engine::des::soccer_learning_pg::{SoccerLearningPgStore, TournamentElite};
@@ -915,6 +915,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use soccer_engine::des::general::soccer::SoccerNeuralLayerSnapshot;
+    use soccer_engine::des::general::tournament::DEF_LINE_BAND_PERMUTATION_COUNT;
 
     #[test]
     fn default_format_is_128_team_world_cup_shape() {

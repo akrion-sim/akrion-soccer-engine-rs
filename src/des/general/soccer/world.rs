@@ -22760,16 +22760,16 @@ impl WorldSnapshot {
                 >= BALL_PROXIMITY_LOOSE_UNCONTESTED_OPPONENT_RADIUS_YARDS
     }
 
-    fn ball_proximity_candidate_respects_padding(
+    fn ball_proximity_candidate_after_shape_guards(
         &self,
         player: &PlayerSnapshot,
         base: Vec2,
         candidate: Vec2,
         focus: Vec2,
         ball_padding: f64,
-    ) -> bool {
+    ) -> Option<Vec2> {
         if candidate.distance(focus) < ball_padding - 1e-6 {
-            return false;
+            return None;
         }
         let teammate_padding = if self.point_in_either_penalty_area(candidate) {
             TEAMMATE_MIN_SPACING_BOX_YARDS
@@ -22779,24 +22779,24 @@ impl WorldSnapshot {
         if self.nearest_teammate_distance_at(player.team, candidate, Some(player.id))
             < teammate_padding
         {
-            return false;
+            return None;
         }
         if self.teammate_axis_clump_pressure_at(player.team, candidate, Some(player.id))
             > TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
         {
-            return false;
+            return None;
         }
         if self.possession_team() == Some(player.team)
             && self.position_would_be_offside(player.team, candidate)
         {
-            return false;
+            return None;
         }
         let base_layer_error = self.role_layer_gap_error_yards_for_target(player, base);
         let candidate_layer_error = self.role_layer_gap_error_yards_for_target(player, candidate);
         if candidate_layer_error
-            > base_layer_error + BALL_PROXIMITY_MAX_LINE_BAND_ERROR_INCREASE_YARDS
+            <= base_layer_error + BALL_PROXIMITY_MAX_LINE_BAND_ERROR_INCREASE_YARDS
         {
-            return false;
+            return Some(candidate);
         }
         let line_clamped = match player.role {
             PlayerRole::Defender => self.defensive_line_cushion_adjusted_target(player.id, candidate),
@@ -22804,7 +22804,37 @@ impl WorldSnapshot {
             PlayerRole::Forward => self.forward_line_band_adjusted_target(player.id, candidate),
             PlayerRole::Goalkeeper => candidate,
         };
-        line_clamped.distance(candidate) <= 0.75
+        if !line_clamped.x.is_finite() || !line_clamped.y.is_finite() {
+            return None;
+        }
+        let clamped_layer_error = self.role_layer_gap_error_yards_for_target(player, line_clamped);
+        if clamped_layer_error
+            > base_layer_error + BALL_PROXIMITY_MAX_LINE_BAND_ERROR_INCREASE_YARDS
+        {
+            return None;
+        }
+        if line_clamped.distance(focus) >= base.distance(focus) - 0.05 {
+            return None;
+        }
+        if line_clamped.distance(focus) < ball_padding - 1e-6 {
+            return None;
+        }
+        if self.nearest_teammate_distance_at(player.team, line_clamped, Some(player.id))
+            < teammate_padding
+        {
+            return None;
+        }
+        if self.teammate_axis_clump_pressure_at(player.team, line_clamped, Some(player.id))
+            > TEAMMATE_AXIS_CLUMP_PRESSURE_EPSILON
+        {
+            return None;
+        }
+        if self.possession_team() == Some(player.team)
+            && self.position_would_be_offside(player.team, line_clamped)
+        {
+            return None;
+        }
+        Some(line_clamped)
     }
 
     pub(crate) fn ball_proximity_adjusted_target(
@@ -22880,7 +22910,7 @@ impl WorldSnapshot {
             if candidate.distance(focus) >= target_distance - 0.05 {
                 continue;
             }
-            if self.ball_proximity_candidate_respects_padding(
+            if let Some(candidate) = self.ball_proximity_candidate_after_shape_guards(
                 me,
                 target,
                 candidate,

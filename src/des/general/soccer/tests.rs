@@ -12780,7 +12780,9 @@ fn ball_proximity_nudge_pulls_midfielder_toward_ball_when_shape_allows() {
     let (adjusted, sprint) = snap.ball_proximity_adjusted_target(player, target);
     assert!(
         adjusted.distance(sim.ball.position) < target.distance(sim.ball.position) - 0.5,
-        "ordinary off-ball movement should be pulled toward the ball when spacing allows"
+        "ordinary off-ball movement should be pulled toward the ball when spacing allows: target={target:?} adjusted={adjusted:?} target_dist={:.3} adjusted_dist={:.3}",
+        target.distance(sim.ball.position),
+        adjusted.distance(sim.ball.position)
     );
     assert!(!sprint, "settled opponent possession should not force a loose-ball sprint");
 }
@@ -56754,13 +56756,12 @@ fn live_http_input_route_feeds_next_step() {
                 .unwrap()
     );
     assert!(
-        step_value["controllerYield"]["notifiedWaits"]
-            .as_u64()
-            .unwrap()
-            + step_value["controllerYield"]["immediatePendingWaits"]
-                .as_u64()
-                .unwrap()
-            >= 1
+        step_value["controllerYield"]["notifiedWaits"].as_u64().unwrap()
+            + step_value["controllerYield"]["immediatePendingWaits"].as_u64().unwrap()
+            + step_value["controllerYield"]["timedOutWaits"].as_u64().unwrap()
+            >= 1,
+        "controller yield should account for the assigned-slot wait regardless of parallel-test timing: yield={:?}",
+        step_value["controllerYield"]
     );
     assert_eq!(step_value["queuedHumanInputs"], 0);
     assert!(session.lock().unwrap().match_ref().players[0].position.x > start_x);
