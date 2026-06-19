@@ -7169,11 +7169,11 @@ impl SoccerMatch {
 
     /// True when the carrier's body is physically between the ball and this
     /// defender (the carrier is shielding) AND the defender is more than a yard
-    /// off the ball. From there a clean dispossession is impossible — the only way
-    /// past the body is a foul — so the steal must be denied. With the orbital
-    /// carry model the ball can sit anywhere around the body, so this keys purely
-    /// on the betweenness geometry (ball and defender on opposite sides of the
-    /// carrier), not on the body facing.
+    /// off the ball. From there a standing/passive dispossession is impossible;
+    /// a committed slide has its own ball-reach gate. With the orbital carry model
+    /// the ball can sit anywhere around the body, so this keys purely on the
+    /// betweenness geometry (ball and defender on opposite sides of the carrier),
+    /// not on the body facing.
     pub(crate) fn carrier_shields_ball_from_defender(
         &self,
         attacker_id: usize,
@@ -7208,8 +7208,9 @@ impl SoccerMatch {
     }
 
     /// Whether a defender at `defender_pos` is behind the ball-carrier (the held ball is
-    /// led in front of the holder's body, away from the defender). No tackle — standing
-    /// or sliding — can win the ball from there. See [`carried_ball_behind_defender`].
+    /// led in front of the holder's body, away from the defender). Standing/passive
+    /// steals are blocked from there; slide tackles must prove actual ball reach.
+    /// See [`carried_ball_behind_defender`].
     pub(crate) fn tackle_blocked_from_behind(&self, holder_id: usize, defender_pos: Vec2) -> bool {
         let Some(holder) = self.players.get(holder_id) else {
             return false;
@@ -7622,10 +7623,13 @@ impl SoccerMatch {
             dispossession_probability =
                 dispossession_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
         }
-        // Physical body-shield: if the carrier has the ball pushed out in front and
-        // this defender is behind the body and off the ball, there is no clean steal
-        // from there (a defender could only get through by fouling).
-        if self.carrier_shields_ball_from_defender(attacker_id, defender_id) {
+        // Physical body-shield / rear challenge: if the carrier has the ball pushed
+        // out in front and this defender is behind the body or the led ball, there is
+        // no passive clean steal from there. The explicit slide action is the only
+        // legal exception, and it is gated by actual ball reach.
+        if self.carrier_shields_ball_from_defender(attacker_id, defender_id)
+            || self.tackle_blocked_from_behind(attacker_id, self.players[defender_id].position)
+        {
             dispossession_probability = 0.0;
         }
         let beat_probability = if kind != DribbleMoveKind::ProtectBall {
@@ -8726,6 +8730,7 @@ impl SoccerMatch {
                 {
                     let contact_distance =
                         self.players[target_player].position.distance(player_pos);
+                    let ball_contact_distance = self.ball.position.distance(player_pos);
                     let target_action = self.players[target_player]
                         .last_decision
                         .as_ref()
@@ -8739,8 +8744,13 @@ impl SoccerMatch {
                             && recent.winner == target_player
                             && recent.loser == player_id
                     });
-                    // A slide lunges further than a standing poke can reach.
-                    if !regain_blocked && contact_distance < SLIDE_TACKLE_MAX_REACH_YARDS {
+                    // A slide lunges further than a standing poke, but it must reach
+                    // the actual ball. From behind, the carrier's body may sit between
+                    // player and ball; only a real ball-reaching lunge can win it.
+                    if !regain_blocked
+                        && contact_distance < SLIDE_TACKLE_MAX_REACH_YARDS
+                        && ball_contact_distance <= SLIDE_TACKLE_MAX_REACH_YARDS
+                    {
                         let contact_speed = (self.players[player_id].velocity
                             - self.players[target_player].velocity)
                             .len();
@@ -8778,13 +8788,6 @@ impl SoccerMatch {
                         if holder_is_shielding {
                             success_probability =
                                 success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
-                        }
-                        // The hard rule: no tackle wins the ball from behind the carrier
-                        // (body-shield, or the led ball trailing out of reach).
-                        if self.carrier_shields_ball_from_defender(target_player, player_id)
-                            || self.tackle_blocked_from_behind(target_player, player_pos)
-                        {
-                            success_probability = 0.0;
                         }
                         if success_probability >= SLIDE_TACKLE_SUCCESS_THRESHOLD {
                             won_ball = true;
