@@ -1258,10 +1258,12 @@ const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 // Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min over {1,2,3}yd and max over values capped at 30yd.
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 2.0;
-// THE rule: the back four's average sits 2-30yd behind (goal-side of) the ball, always.
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+// permute the min/max within this 5-25yd standoff.
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
+// THE rule: the back four's average sits 5-25yd behind (goal-side of) the ball, always —
+// except inside our own DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS (parity with the ball is
+// fine that deep), where the band is suspended.
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -1274,10 +1276,10 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
-// The back-four band is suspended when the ball is within this of either goal line
-// (a ball on the end-line can't have the line sit just "behind" it without going
-// out of bounds).
-const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 8.0;
+// The back-four band is suspended when the ball is within this of either goal line: deep in
+// our own end (ball on our 0-5yd zone) the line can sit at parity with the ball rather than a
+// forced 5yd behind it (which would shove it off our own end-line).
+const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 5.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
