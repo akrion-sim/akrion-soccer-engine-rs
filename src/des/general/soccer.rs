@@ -1272,6 +1272,11 @@ const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
 // instead of a frantic sprint-snap. Sized so a comfortable jog closes it within grace.
 const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
+// Same idea for EVERY off-ball line-shape adjuster (back four block, wingback width,
+// midfield + striker line bands): a player only SPRINTS to take up its shape slot when it
+// is genuinely far out of position. Smaller upkeep corrections are jogged inside the grace
+// window so the team isn't frantically sprint-snapping every tick (it conserves energy).
+const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield: never more than this
 // far into the opponents' half, regardless of how deep the ball is. This is the
 // exception to the 25yd rule — with the ball deep in the opponents' half the 2-25yd
@@ -1310,6 +1315,11 @@ const BACK_FOUR_BLOCK_WIDTH_YARDS: f64 = 22.0;
 const BACK_FOUR_BALL_SIDE_SHIFT: f64 = 0.6;
 const BACK_FOUR_LATERAL_GAIN: f64 = 0.78;
 const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
+// Defending in our OWN half we tighten to a true offside-trap line: strive for the SAME
+// fore-aft depth (near-full flatten), not merely a reduced stagger. Still a bounded pull
+// converging over the 3s consistency horizon (eventual consistency), never a snap. On
+// offense the flat line is dropped entirely (a wingback may overlap, the four may stagger).
+const BACK_FOUR_OFFSIDE_TRAP_FLATTEN_GAIN: f64 = 0.9;
 const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
 const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
 const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
@@ -1376,13 +1386,21 @@ const SETTLED_POSSESSION_SECONDS: f64 = 5.0;
 // the ball. So ATTACK keeps the 5yd floor but stretches (ideal 10, isolate-past 17);
 // DEFENDING stays compact (5/7/10). The back four's own LATERAL band (1.5-8yd along x,
 // adjacent pairs) is a separate, tighter rule for the defensive line.
-const ATTACK_SPACING_MIN_YARDS: f64 = 5.0;
-const ATTACK_SPACING_IDEAL_YARDS: f64 = 10.0;
-const ATTACK_SPACING_MAX_YARDS: f64 = 17.0;
+// On offense the team STRETCHES the pitch: a wider "happy" separation band so players hold
+// real distance between them (instead of bunching), rewarded up to the ideal and only pulled
+// back in past the max. Defending stays compact (below).
+const ATTACK_SPACING_MIN_YARDS: f64 = 7.0;
+const ATTACK_SPACING_IDEAL_YARDS: f64 = 15.0;
+const ATTACK_SPACING_MAX_YARDS: f64 = 24.0;
 const DEFENSE_SPACING_MIN_YARDS: f64 = 5.0;
 const DEFENSE_SPACING_IDEAL_YARDS: f64 = 7.0;
 const DEFENSE_SPACING_MAX_YARDS: f64 = 10.0;
-const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.50;
+// How much of the opponent's lateral stretch the defending block tracks. At 0.50 the
+// block sat at roughly HALF the attack's width, abandoning the far flank and collapsing
+// 22 players into a central "bunchball" vacuum. A defending team narrows ball-side but
+// must still honour the width of the pitch (track a stretched opponent and stay near home
+// lanes), so it tracks most of the opponent's spread, not half of it.
+const DEFENSE_SPREAD_FOLLOW_RATIO: f64 = 0.80;
 // Territory discipline ("cover ground"). Two teammates packed into the same few yards
 // add no attacking or defensive value, so beyond a brief grace window — long enough
 // for a legitimate handoff, screen/block, or double-team — one of the pair is told to
@@ -1765,8 +1783,29 @@ const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 8.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 3.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
-const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 8.0;
+// In possession the strikers are let off the leash to push forward and hold a high line —
+// pinning the opponent's back four and offering an advanced outlet — instead of being
+// dragged back onto the midfield band. They are still bounded (onside-capped elsewhere, and
+// this keeps the line from drifting so far it disconnects), just far higher than the
+// compact defending block. See `forward_line_band_adjusted_target`.
+const STRIKER_AHEAD_OF_MID_MAX_IN_POSSESSION_YARDS: f64 = 32.0;
+// The resting stagger ahead of midfield while defending — nudged up so the striker line
+// presses from a higher starting point ("push forward more").
+const STRIKER_AHEAD_OF_MID_IDEAL_YARDS: f64 = 11.0;
 const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+// Wingback lateral (width) discipline by phase (off the ball, 3s eventual consistency):
+// - DEFENDING: pinch IN toward centre, but only as far as the wider (closer-to-touchline) of
+//   {the outermost opponent on that flank, the near edge of the 6-yard box} — never further,
+//   so the wide channel / box corner stays protected.
+// - IN POSSESSION: open OUT toward the touchline for attacking width, bombing wide when there
+//   is cover behind the ball (more than `WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN` team-mates
+//   goal-side of it), opening only moderately when cover is thin.
+// The 6-yard box (goal area) extends this far either side of each post.
+const SIX_YARD_BOX_DEPTH_YARDS: f64 = 6.0;
+const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
+const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 12.0;
+const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 4;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
@@ -2024,6 +2063,12 @@ const ATTACKING_DEFENDER_PUSH_UP_YARDS: f64 = 8.0;
 // holds and covers when the opponent attacks the box. Downstream caps (halfway+5,
 // the goal-line buffer, line-break retreat) further bound it.
 const DEFENDER_LINE_FORWARD_BIAS_YARDS: f64 = 2.5;
+// Weak-side width holder. In possession, the wide player on the flank AWAY from the
+// ball should hold its home channel (stay wide/high) to stretch the opponent's back
+// line and pin the far full-back — NOT drift ball-side into the bunch. The ball must
+// be at least this lopsided (fraction of the half-width off-centre) before the far
+// flank is meaningfully a "weak side" worth pinning; below it both flanks are live.
+const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.18;
 // Defenders slide toward the ball laterally a touch more than before, and
 // wing-backs (wide defenders) slide much more — they are the ones who shuttle out
 // to the ball on their flank. Centre-backs get only a small amount: they hold
@@ -3375,9 +3420,9 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
         // tracking a mark, no outlet, covering a teammate, team urgency) — i.e. players
         // only leave their primary lane for those already-specified reasons. Drift
         // INSIDE the band is still free; this only bounds the band edge.
-        PlayerRole::Defender if in_possession => 0.74,
+        PlayerRole::Defender if in_possession => 0.76,
         PlayerRole::Defender => 0.92,
-        PlayerRole::Midfielder if in_possession => 0.74,
+        PlayerRole::Midfielder if in_possession => 0.76,
         PlayerRole::Midfielder => 0.90,
         // A light containment pull for forwards: enough to keep the lane clamp/penalty
         // alive against a cross-pitch drift (commitment must be > 0 to engage at all),
