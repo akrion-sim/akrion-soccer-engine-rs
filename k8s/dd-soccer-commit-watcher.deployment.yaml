@@ -60,6 +60,43 @@ spec:
       containers:
         - name: watcher
           image: docker.io/library/rust:1.90-bookworm
+          env:
+            - name: WATCH_BRANCH
+              value: "learning"
+            - name: WATCH_POLL_SECONDS
+              value: "120"
+            # Lightweight per-push tournaments so the OLD one keeps running in parallel
+            # with the NEW one within cluster capacity (the nightly cronjob stays the full
+            # 128-team run). Tune here.
+            - name: PUSH_TOURNAMENT_TEAMS
+              value: "24"
+            - name: PUSH_TOURNAMENT_GROUP_SIZE
+              value: "3"
+            - name: PUSH_TOURNAMENT_ADVANCERS
+              value: "1"
+            - name: PUSH_TOURNAMENT_THREADS
+              value: "2"
+            - name: PUSH_TOURNAMENT_MATCH_SECONDS
+              value: "600"
+            # CPU request tiny (compressible) so several co-schedule on the CPU-saturated
+            # AWS node; memory request RESERVES headroom so the scheduler never overcommits
+            # a node into OOM (a tournament that won't fit waits Pending — graceful).
+            - name: PUSH_TOURNAMENT_CPU_REQUEST
+              value: "50m"
+            - name: PUSH_TOURNAMENT_CPU_LIMIT
+              value: "2"
+            - name: PUSH_TOURNAMENT_MEM_REQUEST
+              value: "6Gi"
+            - name: PUSH_TOURNAMENT_MEM_LIMIT
+              value: "12Gi"
+            - name: PUSH_TOURNAMENT_TTL_SECONDS
+              value: "10800"
+            # Safety valve: don't pile up more than this many active push-tournaments per
+            # cluster (protects pod/etcd count + resources). Extra commits still rebuild the
+            # learner + record state; they just skip launching another tournament until the
+            # backlog drains.
+            - name: MAX_PARALLEL_PUSH_TOURNAMENTS
+              value: "5"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -70,26 +107,68 @@ spec:
               CM=dd-soccer-commit-watcher-state
               LEARNER=deployment/dd-soccer-learning-rds-continuous
               CRON=cronjob/dd-soccer-tournament-nightly
+              BRANCH="${WATCH_BRANCH:-learning}"
               POLL="${WATCH_POLL_SECONDS:-120}"
-              # install kubectl once (no per-poll download)
+              MAXT="${MAX_PARALLEL_PUSH_TOURNAMENTS:-5}"
+              # one-time tooling install (kubectl + jq); rust:bookworm has git+curl+apt
               if [ ! -x "$KCTL" ]; then
                 V="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
                 curl -fsSL -o "$KCTL" "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
                 chmod +x "$KCTL"
               fi
-              echo "commit-watcher up: repo=$REPO poll=${POLL}s kubectl=$($KCTL version --client -o yaml 2>/dev/null | grep gitVersion | head -1)"
+              command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq >/dev/null; }
+              echo "commit-watcher up: repo=$REPO branch=$BRANCH poll=${POLL}s maxParallelTournaments=$MAXT"
               LAST="$($KCTL -n $NS get cm $CM -o jsonpath='{.data.lastSha}' 2>/dev/null || echo '')"
               echo "seed lastSha=${LAST:-<none>}"
+              launch_tournament() {
+                sha="$1"
+                active="$($KCTL -n $NS get jobs -l dd-soccer/push-tournament=true --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+                if [ "${active:-0}" -ge "$MAXT" ]; then
+                  echo "  tournament backlog at cap ($active >= $MAXT) -> skip launch for $sha (learner still rebuilt)"
+                  return 0
+                fi
+                job="dd-soccer-tournament-push-$(echo "$sha" | cut -c1-7)-$(date +%s)"
+                $KCTL -n $NS create job "$job" --from="$CRON" --dry-run=client -o json \
+                  | jq \
+                    --arg lock "$job" \
+                    --arg teams "$PUSH_TOURNAMENT_TEAMS" \
+                    --arg grp "$PUSH_TOURNAMENT_GROUP_SIZE" \
+                    --arg adv "$PUSH_TOURNAMENT_ADVANCERS" \
+                    --arg thr "$PUSH_TOURNAMENT_THREADS" \
+                    --arg msec "$PUSH_TOURNAMENT_MATCH_SECONDS" \
+                    --arg cpureq "$PUSH_TOURNAMENT_CPU_REQUEST" \
+                    --arg cpulim "$PUSH_TOURNAMENT_CPU_LIMIT" \
+                    --arg memreq "$PUSH_TOURNAMENT_MEM_REQUEST" \
+                    --arg memlim "$PUSH_TOURNAMENT_MEM_LIMIT" \
+                    --argjson ttl "$PUSH_TOURNAMENT_TTL_SECONDS" \
+                    '
+                    .metadata.labels["dd-soccer/push-tournament"]="true"
+                    | .spec.ttlSecondsAfterFinished=$ttl
+                    | .spec.template.metadata.labels["dd-soccer/push-tournament"]="true"
+                    | .spec.template.spec.containers[0].resources={requests:{cpu:$cpureq,memory:$memreq},limits:{cpu:$cpulim,memory:$memlim}}
+                    | .spec.template.spec.containers[0].env|=(
+                        map(select(.name|test("^(SOCCER_TOURNAMENT_LOCK_KEY|SOCCER_SOURCE_REF|SOCCER_TOURNAMENT_TEAMS|SOCCER_TOURNAMENT_GROUP_SIZE|SOCCER_TOURNAMENT_ADVANCERS|SOCCER_TOURNAMENT_THREADS|SOCCER_TOURNAMENT_MATCH_SECONDS)$")|not))
+                        + [
+                            {name:"SOCCER_TOURNAMENT_LOCK_KEY",value:$lock},
+                            {name:"SOCCER_SOURCE_REF",value:"learning"},
+                            {name:"SOCCER_TOURNAMENT_TEAMS",value:$teams},
+                            {name:"SOCCER_TOURNAMENT_GROUP_SIZE",value:$grp},
+                            {name:"SOCCER_TOURNAMENT_ADVANCERS",value:$adv},
+                            {name:"SOCCER_TOURNAMENT_THREADS",value:$thr},
+                            {name:"SOCCER_TOURNAMENT_MATCH_SECONDS",value:$msec}
+                          ]
+                      )
+                    ' \
+                  | $KCTL -n $NS create -f - && echo "  launched $job (teams=$PUSH_TOURNAMENT_TEAMS ref=learning lock=$job, parallel)" || echo "  WARN tournament create failed"
+              }
               while true; do
-                SHA="$(git ls-remote "$REPO" refs/heads/main 2>/dev/null | awk '{print $1}')"
+                SHA="$(git ls-remote "$REPO" "refs/heads/${BRANCH}" 2>/dev/null | awk '{print $1}')"
                 if [ -n "$SHA" ] && [ "$SHA" != "$LAST" ]; then
-                  echo "$(date -u +%FT%TZ) NEW COMMIT $SHA (was ${LAST:-<none>}) -> redeploy learner + launch tournament"
-                  $KCTL -n $NS rollout restart "$LEARNER" || echo "WARN rollout restart failed"
-                  JOB="dd-soccer-tournament-push-$(echo "$SHA" | cut -c1-7)-$(date +%s)"
-                  $KCTL -n $NS create job "$JOB" --from="$CRON" || echo "WARN tournament job create failed"
-                  $KCTL -n $NS create cm $CM --from-literal=lastSha="$SHA" --dry-run=client -o yaml | $KCTL -n $NS apply -f - || echo "WARN state update failed"
+                  echo "$(date -u +%FT%TZ) NEW COMMIT on $BRANCH: $SHA (was ${LAST:-<none>})"
+                  $KCTL -n $NS rollout restart "$LEARNER" && echo "  learner restarted (rebuilds $BRANCH)" || echo "  WARN rollout restart failed"
+                  launch_tournament "$SHA"
+                  $KCTL -n $NS create cm $CM --from-literal=lastSha="$SHA" --from-literal=branch="$BRANCH" --dry-run=client -o yaml | $KCTL -n $NS apply -f - >/dev/null && echo "  state updated -> $SHA" || echo "  WARN state update failed"
                   LAST="$SHA"
-                  echo "$(date -u +%FT%TZ) done; now tracking $SHA"
                 fi
                 sleep "$POLL"
               done
