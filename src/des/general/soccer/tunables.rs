@@ -45,6 +45,12 @@ pub struct Tunables {
     pub flank_cross: FlankCrossTunables,
     /// Discrete-event learning reward magnitudes (goal scored / conceded).
     pub reward: RewardTunables,
+    /// MDP/POMDP ↔ MPC execution-reselect thresholds.
+    pub decision_mpc: DecisionMpcTunables,
+    /// Shot/carry tactical decision thresholds.
+    pub shooting: ShootingTunables,
+    /// Defensive line and back-four shape thresholds.
+    pub defensive_shape: DefensiveShapeTunables,
 }
 
 impl Default for Tunables {
@@ -53,6 +59,9 @@ impl Default for Tunables {
             tracking: TrackingInferenceTunables::default(),
             flank_cross: FlankCrossTunables::default(),
             reward: RewardTunables::default(),
+            decision_mpc: DecisionMpcTunables::default(),
+            shooting: ShootingTunables::default(),
+            defensive_shape: DefensiveShapeTunables::default(),
         }
     }
 }
@@ -176,6 +185,84 @@ impl Default for RewardTunables {
     }
 }
 
+/// MDP/POMDP action selection proposes an action; MPC prices whether the body
+/// and ball can execute it. These thresholds decide when execution is "bad
+/// enough" to send the candidate back for reselection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionMpcTunables {
+    pub deviation_trace_threshold_yards: f64,
+    pub blend_max_target_delta_yards: f64,
+    pub reselect_max_target_delta_yards: f64,
+    pub reselect_min_execution_confidence: f64,
+    pub reselect_min_ball_execution_probability: f64,
+}
+
+impl Default for DecisionMpcTunables {
+    fn default() -> Self {
+        DecisionMpcTunables {
+            deviation_trace_threshold_yards: 0.75,
+            blend_max_target_delta_yards: 6.0,
+            reselect_max_target_delta_yards: 16.0,
+            reselect_min_execution_confidence: 0.18,
+            reselect_min_ball_execution_probability: 0.34,
+        }
+    }
+}
+
+/// Global shot and goal-approach decision thresholds. Defaults preserve the
+/// historical literals in `soccer.rs`, `player.rs`, and `world.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShootingTunables {
+    pub shot_on_frame_min_probability: f64,
+    pub striker_shot_window_yards: f64,
+    pub shot_block_bailout_max_probability: f64,
+    pub goal_approach_carry_yards: f64,
+    pub striker_hold_up_min_goal_distance_yards: f64,
+}
+
+impl Default for ShootingTunables {
+    fn default() -> Self {
+        ShootingTunables {
+            shot_on_frame_min_probability: 0.60,
+            striker_shot_window_yards: 30.0,
+            shot_block_bailout_max_probability: 0.86,
+            goal_approach_carry_yards: 45.0,
+            striker_hold_up_min_goal_distance_yards: 45.0,
+        }
+    }
+}
+
+/// Defensive line and back-four spacing knobs. These are intentionally narrow:
+/// they cover the line/wingback shape rules that must stay configurable without
+/// allowing an overlay to make the back four collapse into nonsense.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DefensiveShapeTunables {
+    pub defensive_line_max_into_opp_half_yards: f64,
+    pub back_four_block_width_yards: f64,
+    pub back_four_horizontal_min_gap_yards: f64,
+    pub back_four_horizontal_max_gap_yards: f64,
+    pub wingback_defensive_pinch_target_seconds: f64,
+    pub wingback_defensive_pinch_opponent_half_margin_yards: f64,
+    pub defensive_goal_side_min_yards: f64,
+}
+
+impl Default for DefensiveShapeTunables {
+    fn default() -> Self {
+        DefensiveShapeTunables {
+            defensive_line_max_into_opp_half_yards: 5.0,
+            back_four_block_width_yards: 22.0,
+            back_four_horizontal_min_gap_yards: 1.5,
+            back_four_horizontal_max_gap_yards: 8.0,
+            wingback_defensive_pinch_target_seconds: 3.0,
+            wingback_defensive_pinch_opponent_half_margin_yards: 8.0,
+            defensive_goal_side_min_yards: 1.5,
+        }
+    }
+}
+
 impl Tunables {
     /// Build the tunables from compile-time defaults plus the environment
     /// layers (`SOCCER_TUNABLES_JSON` then per-field `DD_SOCCER_TUNABLE__*`).
@@ -193,7 +280,235 @@ impl Tunables {
         for overlay in overlays {
             merge_json(&mut merged, overlay);
         }
-        serde_json::from_value(merged).unwrap_or_default()
+        match serde_json::from_value::<Tunables>(merged) {
+            Ok(tunables) => tunables.sanitized(),
+            Err(err) => {
+                eprintln!(
+                    "soccer tunables: overlay type mismatch ({err}); using sanitized defaults"
+                );
+                Tunables::default().sanitized()
+            }
+        }
+    }
+
+    /// Return a copy with every numeric field finite and inside its hard safety
+    /// bounds. Hard outliers are clamped with a warning; softer "that looks
+    /// weird" ranges also warn but keep the value.
+    pub fn sanitized(mut self) -> Tunables {
+        self.tracking.sanitize();
+        self.flank_cross.sanitize();
+        self.reward.sanitize();
+        self.decision_mpc.sanitize();
+        self.shooting.sanitize();
+        self.defensive_shape.sanitize();
+        self
+    }
+
+    /// Strict validation for callers/tests that want an error instead of runtime
+    /// warning+clamp behavior.
+    pub fn validate_strict(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        self.tracking.validate_strict("tracking", &mut errors);
+        self.flank_cross.validate_strict("flank_cross", &mut errors);
+        self.reward.validate_strict("reward", &mut errors);
+        self.decision_mpc
+            .validate_strict("decision_mpc", &mut errors);
+        self.shooting.validate_strict("shooting", &mut errors);
+        self.defensive_shape
+            .validate_strict("defensive_shape", &mut errors);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+impl TrackingInferenceTunables {
+    fn sanitize(&mut self) {
+        let default = TrackingInferenceTunables::default();
+        sanitize_f64("tracking.moved_dt_multiplier", &mut self.moved_dt_multiplier, default.moved_dt_multiplier, 0.05, 12.0, 0.30, 3.0);
+        sanitize_f64("tracking.shot_lane_max_yards_to_goal", &mut self.shot_lane_max_yards_to_goal, default.shot_lane_max_yards_to_goal, 1.0, 120.0, 8.0, 45.0);
+        sanitize_f64("tracking.tackle_recover_max_distance_yards", &mut self.tackle_recover_max_distance_yards, default.tackle_recover_max_distance_yards, 0.2, 20.0, 1.0, 8.0);
+        sanitize_f64("tracking.defend_closing_margin_yards", &mut self.defend_closing_margin_yards, default.defend_closing_margin_yards, 0.0, 8.0, 0.05, 2.0);
+        sanitize_f64("tracking.space_improvement_threshold", &mut self.space_improvement_threshold, default.space_improvement_threshold, 0.0, 20.0, 0.0, 3.0);
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "moved_dt_multiplier", self.moved_dt_multiplier, 0.05, 12.0, errors);
+        validate_f64(prefix, "shot_lane_max_yards_to_goal", self.shot_lane_max_yards_to_goal, 1.0, 120.0, errors);
+        validate_f64(prefix, "tackle_recover_max_distance_yards", self.tackle_recover_max_distance_yards, 0.2, 20.0, errors);
+        validate_f64(prefix, "defend_closing_margin_yards", self.defend_closing_margin_yards, 0.0, 8.0, errors);
+        validate_f64(prefix, "space_improvement_threshold", self.space_improvement_threshold, 0.0, 20.0, errors);
+    }
+}
+
+impl FlankCrossTunables {
+    fn sanitize(&mut self) {
+        let default = FlankCrossTunables::default();
+        sanitize_f64("flank_cross.min_flank_score", &mut self.min_flank_score, default.min_flank_score, 0.0, 1.0, 0.10, 0.90);
+        sanitize_f64("flank_cross.max_yards_to_goal", &mut self.max_yards_to_goal, default.max_yards_to_goal, 1.0, 120.0, 20.0, 80.0);
+        sanitize_f64("flank_cross.perceived_pressure_weight", &mut self.perceived_pressure_weight, default.perceived_pressure_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("flank_cross.pressure_urgency_weight", &mut self.pressure_urgency_weight, default.pressure_urgency_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("flank_cross.pressure_release_cap", &mut self.pressure_release_cap, default.pressure_release_cap, 0.0, 1.0, 0.0, 0.85);
+        sanitize_f64("flank_cross.flank_weight", &mut self.flank_weight, default.flank_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("flank_cross.attacking_depth_weight", &mut self.attacking_depth_weight, default.attacking_depth_weight, 0.0, 5.0, 0.0, 1.5);
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "min_flank_score", self.min_flank_score, 0.0, 1.0, errors);
+        validate_f64(prefix, "max_yards_to_goal", self.max_yards_to_goal, 1.0, 120.0, errors);
+        validate_f64(prefix, "perceived_pressure_weight", self.perceived_pressure_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "pressure_urgency_weight", self.pressure_urgency_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "pressure_release_cap", self.pressure_release_cap, 0.0, 1.0, errors);
+        validate_f64(prefix, "flank_weight", self.flank_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "attacking_depth_weight", self.attacking_depth_weight, 0.0, 5.0, errors);
+    }
+}
+
+impl RewardTunables {
+    fn sanitize(&mut self) {
+        let default = RewardTunables::default();
+        sanitize_f64("reward.goal_scored_points", &mut self.goal_scored_points, default.goal_scored_points, -1000.0, 1000.0, 0.0, 250.0);
+        sanitize_f64("reward.concede_keeper_defender_penalty", &mut self.concede_keeper_defender_penalty, default.concede_keeper_defender_penalty, 0.0, 200.0, 0.0, 40.0);
+        sanitize_f64("reward.concede_outfield_penalty", &mut self.concede_outfield_penalty, default.concede_outfield_penalty, 0.0, 200.0, 0.0, 25.0);
+        sanitize_f64("reward.teammate_overlap_relief_reward", &mut self.teammate_overlap_relief_reward, default.teammate_overlap_relief_reward, -10.0, 10.0, 0.0, 2.0);
+        sanitize_f64("reward.teammate_overlap_camp_penalty", &mut self.teammate_overlap_camp_penalty, default.teammate_overlap_camp_penalty, 0.0, 10.0, 0.0, 2.0);
+        sanitize_f64("reward.center_back_ahead_of_wingback_penalty_per_yard", &mut self.center_back_ahead_of_wingback_penalty_per_yard, default.center_back_ahead_of_wingback_penalty_per_yard, 0.0, 10.0, 0.0, 2.0);
+        sanitize_f64("reward.blocked_lane_floor_pass_penalty_points", &mut self.blocked_lane_floor_pass_penalty_points, default.blocked_lane_floor_pass_penalty_points, 0.0, 200.0, 0.0, 40.0);
+        sanitize_f64("reward.low_pressure_forced_pass_penalty_points", &mut self.low_pressure_forced_pass_penalty_points, default.low_pressure_forced_pass_penalty_points, 0.0, 200.0, 0.0, 25.0);
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "goal_scored_points", self.goal_scored_points, -1000.0, 1000.0, errors);
+        validate_f64(prefix, "concede_keeper_defender_penalty", self.concede_keeper_defender_penalty, 0.0, 200.0, errors);
+        validate_f64(prefix, "concede_outfield_penalty", self.concede_outfield_penalty, 0.0, 200.0, errors);
+        validate_f64(prefix, "teammate_overlap_relief_reward", self.teammate_overlap_relief_reward, -10.0, 10.0, errors);
+        validate_f64(prefix, "teammate_overlap_camp_penalty", self.teammate_overlap_camp_penalty, 0.0, 10.0, errors);
+        validate_f64(prefix, "center_back_ahead_of_wingback_penalty_per_yard", self.center_back_ahead_of_wingback_penalty_per_yard, 0.0, 10.0, errors);
+        validate_f64(prefix, "blocked_lane_floor_pass_penalty_points", self.blocked_lane_floor_pass_penalty_points, 0.0, 200.0, errors);
+        validate_f64(prefix, "low_pressure_forced_pass_penalty_points", self.low_pressure_forced_pass_penalty_points, 0.0, 200.0, errors);
+    }
+}
+
+impl DecisionMpcTunables {
+    fn sanitize(&mut self) {
+        let default = DecisionMpcTunables::default();
+        sanitize_f64("decision_mpc.deviation_trace_threshold_yards", &mut self.deviation_trace_threshold_yards, default.deviation_trace_threshold_yards, 0.0, 60.0, 0.1, 8.0);
+        sanitize_f64("decision_mpc.blend_max_target_delta_yards", &mut self.blend_max_target_delta_yards, default.blend_max_target_delta_yards, 0.0, 120.0, 1.0, 25.0);
+        sanitize_f64("decision_mpc.reselect_max_target_delta_yards", &mut self.reselect_max_target_delta_yards, default.reselect_max_target_delta_yards, 0.1, 120.0, 3.0, 45.0);
+        sanitize_f64("decision_mpc.reselect_min_execution_confidence", &mut self.reselect_min_execution_confidence, default.reselect_min_execution_confidence, 0.0, 1.0, 0.0, 0.8);
+        sanitize_f64("decision_mpc.reselect_min_ball_execution_probability", &mut self.reselect_min_ball_execution_probability, default.reselect_min_ball_execution_probability, 0.0, 1.0, 0.0, 0.8);
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "deviation_trace_threshold_yards", self.deviation_trace_threshold_yards, 0.0, 60.0, errors);
+        validate_f64(prefix, "blend_max_target_delta_yards", self.blend_max_target_delta_yards, 0.0, 120.0, errors);
+        validate_f64(prefix, "reselect_max_target_delta_yards", self.reselect_max_target_delta_yards, 0.1, 120.0, errors);
+        validate_f64(prefix, "reselect_min_execution_confidence", self.reselect_min_execution_confidence, 0.0, 1.0, errors);
+        validate_f64(prefix, "reselect_min_ball_execution_probability", self.reselect_min_ball_execution_probability, 0.0, 1.0, errors);
+    }
+}
+
+impl ShootingTunables {
+    fn sanitize(&mut self) {
+        let default = ShootingTunables::default();
+        sanitize_f64("shooting.shot_on_frame_min_probability", &mut self.shot_on_frame_min_probability, default.shot_on_frame_min_probability, 0.0, 1.0, 0.05, 0.95);
+        sanitize_f64("shooting.striker_shot_window_yards", &mut self.striker_shot_window_yards, default.striker_shot_window_yards, 1.0, 120.0, 8.0, 55.0);
+        sanitize_f64("shooting.shot_block_bailout_max_probability", &mut self.shot_block_bailout_max_probability, default.shot_block_bailout_max_probability, 0.0, 1.0, 0.10, 0.98);
+        sanitize_f64("shooting.goal_approach_carry_yards", &mut self.goal_approach_carry_yards, default.goal_approach_carry_yards, 1.0, 120.0, 15.0, 80.0);
+        sanitize_f64("shooting.striker_hold_up_min_goal_distance_yards", &mut self.striker_hold_up_min_goal_distance_yards, default.striker_hold_up_min_goal_distance_yards, 1.0, 120.0, 15.0, 80.0);
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "shot_on_frame_min_probability", self.shot_on_frame_min_probability, 0.0, 1.0, errors);
+        validate_f64(prefix, "striker_shot_window_yards", self.striker_shot_window_yards, 1.0, 120.0, errors);
+        validate_f64(prefix, "shot_block_bailout_max_probability", self.shot_block_bailout_max_probability, 0.0, 1.0, errors);
+        validate_f64(prefix, "goal_approach_carry_yards", self.goal_approach_carry_yards, 1.0, 120.0, errors);
+        validate_f64(prefix, "striker_hold_up_min_goal_distance_yards", self.striker_hold_up_min_goal_distance_yards, 1.0, 120.0, errors);
+    }
+}
+
+impl DefensiveShapeTunables {
+    fn sanitize(&mut self) {
+        let default = DefensiveShapeTunables::default();
+        sanitize_f64("defensive_shape.defensive_line_max_into_opp_half_yards", &mut self.defensive_line_max_into_opp_half_yards, default.defensive_line_max_into_opp_half_yards, 0.0, 30.0, 0.0, 12.0);
+        sanitize_f64("defensive_shape.back_four_block_width_yards", &mut self.back_four_block_width_yards, default.back_four_block_width_yards, 4.0, 80.0, 12.0, 45.0);
+        sanitize_f64("defensive_shape.back_four_horizontal_min_gap_yards", &mut self.back_four_horizontal_min_gap_yards, default.back_four_horizontal_min_gap_yards, 0.5, 20.0, 1.0, 6.0);
+        sanitize_f64("defensive_shape.back_four_horizontal_max_gap_yards", &mut self.back_four_horizontal_max_gap_yards, default.back_four_horizontal_max_gap_yards, 0.5, 30.0, 3.0, 16.0);
+        sanitize_f64("defensive_shape.wingback_defensive_pinch_target_seconds", &mut self.wingback_defensive_pinch_target_seconds, default.wingback_defensive_pinch_target_seconds, 0.0, 20.0, 0.5, 8.0);
+        sanitize_f64("defensive_shape.wingback_defensive_pinch_opponent_half_margin_yards", &mut self.wingback_defensive_pinch_opponent_half_margin_yards, default.wingback_defensive_pinch_opponent_half_margin_yards, 0.0, 40.0, 2.0, 20.0);
+        sanitize_f64("defensive_shape.defensive_goal_side_min_yards", &mut self.defensive_goal_side_min_yards, default.defensive_goal_side_min_yards, 0.0, 10.0, 0.5, 4.0);
+        if self.back_four_horizontal_min_gap_yards > self.back_four_horizontal_max_gap_yards {
+            eprintln!(
+                "soccer tunables: defensive_shape back-four min gap exceeded max gap; swapping"
+            );
+            std::mem::swap(
+                &mut self.back_four_horizontal_min_gap_yards,
+                &mut self.back_four_horizontal_max_gap_yards,
+            );
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "defensive_line_max_into_opp_half_yards", self.defensive_line_max_into_opp_half_yards, 0.0, 30.0, errors);
+        validate_f64(prefix, "back_four_block_width_yards", self.back_four_block_width_yards, 4.0, 80.0, errors);
+        validate_f64(prefix, "back_four_horizontal_min_gap_yards", self.back_four_horizontal_min_gap_yards, 0.5, 20.0, errors);
+        validate_f64(prefix, "back_four_horizontal_max_gap_yards", self.back_four_horizontal_max_gap_yards, 0.5, 30.0, errors);
+        validate_f64(prefix, "wingback_defensive_pinch_target_seconds", self.wingback_defensive_pinch_target_seconds, 0.0, 20.0, errors);
+        validate_f64(prefix, "wingback_defensive_pinch_opponent_half_margin_yards", self.wingback_defensive_pinch_opponent_half_margin_yards, 0.0, 40.0, errors);
+        validate_f64(prefix, "defensive_goal_side_min_yards", self.defensive_goal_side_min_yards, 0.0, 10.0, errors);
+        if self.back_four_horizontal_min_gap_yards > self.back_four_horizontal_max_gap_yards {
+            errors.push(format!("{prefix}.back_four_horizontal_min_gap_yards > {prefix}.back_four_horizontal_max_gap_yards"));
+        }
+    }
+}
+
+fn sanitize_f64(
+    path: &str,
+    value: &mut f64,
+    default: f64,
+    hard_min: f64,
+    hard_max: f64,
+    sane_min: f64,
+    sane_max: f64,
+) {
+    if !value.is_finite() {
+        eprintln!("soccer tunables: {path} is non-finite; using default {default}");
+        *value = default;
+        return;
+    }
+    if *value < hard_min || *value > hard_max {
+        let before = *value;
+        *value = (*value).clamp(hard_min, hard_max);
+        eprintln!(
+            "soccer tunables: {path}={before} outside hard range [{hard_min}, {hard_max}]; clamped to {}",
+            *value
+        );
+        return;
+    }
+    if *value < sane_min || *value > sane_max {
+        eprintln!(
+            "soccer tunables: {path}={} outside sane range [{sane_min}, {sane_max}]",
+            *value
+        );
+    }
+}
+
+fn validate_f64(
+    prefix: &str,
+    field: &str,
+    value: f64,
+    hard_min: f64,
+    hard_max: f64,
+    errors: &mut Vec<String>,
+) {
+    if !value.is_finite() {
+        errors.push(format!("{prefix}.{field} is non-finite"));
+    } else if value < hard_min || value > hard_max {
+        errors.push(format!(
+            "{prefix}.{field}={value} outside [{hard_min}, {hard_max}]"
+        ));
     }
 }
 
@@ -294,16 +609,68 @@ mod tests {
         assert_eq!(t.tracking.tackle_recover_max_distance_yards, 3.8);
         assert_eq!(t.tracking.defend_closing_margin_yards, 0.35);
         assert_eq!(t.tracking.space_improvement_threshold, 0.25);
+        assert_eq!(t.decision_mpc.deviation_trace_threshold_yards, 0.75);
+        assert_eq!(t.decision_mpc.blend_max_target_delta_yards, 6.0);
+        assert_eq!(t.decision_mpc.reselect_max_target_delta_yards, 16.0);
+        assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.18);
+        assert_eq!(
+            t.decision_mpc
+                .reselect_min_ball_execution_probability,
+            0.34
+        );
+        assert_eq!(t.shooting.shot_on_frame_min_probability, 0.60);
+        assert_eq!(t.shooting.striker_shot_window_yards, 30.0);
+        assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
+        assert_eq!(t.shooting.goal_approach_carry_yards, 45.0);
+        assert_eq!(
+            t.shooting.striker_hold_up_min_goal_distance_yards,
+            45.0
+        );
+        assert_eq!(
+            t.defensive_shape.defensive_line_max_into_opp_half_yards,
+            5.0
+        );
+        assert_eq!(t.defensive_shape.back_four_block_width_yards, 22.0);
+        assert_eq!(
+            t.defensive_shape.back_four_horizontal_min_gap_yards,
+            1.5
+        );
+        assert_eq!(
+            t.defensive_shape.back_four_horizontal_max_gap_yards,
+            8.0
+        );
+        assert_eq!(
+            t.defensive_shape.wingback_defensive_pinch_target_seconds,
+            3.0
+        );
+        assert_eq!(
+            t.defensive_shape
+                .wingback_defensive_pinch_opponent_half_margin_yards,
+            8.0
+        );
+        assert_eq!(t.defensive_shape.defensive_goal_side_min_yards, 1.5);
     }
 
     #[test]
     fn partial_overlay_only_touches_named_fields() {
         let t = Tunables::from_overlays([json!({
-            "tracking": { "moved_dt_multiplier": 1.5 }
+            "tracking": { "moved_dt_multiplier": 1.5 },
+            "decision_mpc": { "reselect_min_ball_execution_probability": 0.42 },
+            "defensive_shape": { "defensive_line_max_into_opp_half_yards": 4.0 }
         })]);
         assert_eq!(t.tracking.moved_dt_multiplier, 1.5);
+        assert_eq!(
+            t.decision_mpc
+                .reselect_min_ball_execution_probability,
+            0.42
+        );
+        assert_eq!(
+            t.defensive_shape.defensive_line_max_into_opp_half_yards,
+            4.0
+        );
         // Untouched fields keep their defaults.
         assert_eq!(t.tracking.tackle_recover_max_distance_yards, 3.8);
+        assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
     }
 
     #[test]
@@ -326,5 +693,33 @@ mod tests {
         let mut base = json!({ "a": { "x": 1, "y": 2 }, "b": 3 });
         merge_json(&mut base, json!({ "a": { "y": 9 }, "c": 4 }));
         assert_eq!(base, json!({ "a": { "x": 1, "y": 9 }, "b": 3, "c": 4 }));
+    }
+
+    #[test]
+    fn overlays_are_sanitized_to_hard_bounds() {
+        let t = Tunables::from_overlays([json!({
+            "decision_mpc": { "reselect_min_execution_confidence": -1.0 },
+            "shooting": { "shot_block_bailout_max_probability": 4.0 },
+            "defensive_shape": {
+                "back_four_horizontal_min_gap_yards": 12.0,
+                "back_four_horizontal_max_gap_yards": 4.0
+            }
+        })]);
+        assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
+        assert_eq!(t.shooting.shot_block_bailout_max_probability, 1.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 4.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 12.0);
+    }
+
+    #[test]
+    fn strict_validation_reports_bad_direct_configs() {
+        let mut t = Tunables::default();
+        t.shooting.shot_on_frame_min_probability = 1.2;
+        t.defensive_shape.back_four_horizontal_min_gap_yards = 9.0;
+        t.defensive_shape.back_four_horizontal_max_gap_yards = 6.0;
+
+        let err = t.validate_strict().expect_err("config should be invalid");
+        assert!(err.contains("shooting.shot_on_frame_min_probability"));
+        assert!(err.contains("defensive_shape.back_four_horizontal_min_gap_yards >"));
     }
 }

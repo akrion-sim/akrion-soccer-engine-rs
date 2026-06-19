@@ -648,6 +648,122 @@ fn mpc_pass_execution_prices_lane_and_ball_recipe() {
 }
 
 #[test]
+fn mpc_reselects_normal_shot_when_execution_is_poor() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_197,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let shooter = 9usize;
+    let blocker = 15usize;
+    let keeper = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("away keeper");
+    park_players_except(&mut sim, &[shooter, blocker, keeper]);
+    sim.players[shooter].team = Team::Home;
+    sim.players[shooter].role = PlayerRole::Forward;
+    sim.players[shooter].position = Vec2::new(40.0, 92.0);
+    sim.players[shooter].home_position = sim.players[shooter].position;
+    sim.players[shooter].velocity = Vec2::new(0.0, -2.0);
+    sim.players[shooter].skills.shooting = 1.0;
+    sim.players[shooter].skills.first_touch = 1.0;
+    sim.players[shooter].skills.acceleration = 1.0;
+    sim.players[shooter].skills.right_foot_shot_power = 1.0;
+    sim.players[shooter].skills.left_foot_shot_power = 1.0;
+    sim.players[shooter].fatigue = 0.92;
+    sim.players[blocker].team = Team::Away;
+    sim.players[blocker].position = Vec2::new(40.0, 96.0);
+    sim.players[keeper].position = Vec2::new(40.0, 119.0);
+    sim.ball.holder = Some(shooter);
+    sim.ball.position = sim.players[shooter].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, shooter, sim.players[shooter].position);
+    let player = sim.players[shooter].clone();
+    let action = SoccerAction::Shoot {
+        power: shot_power_for_skill(ability01(player.skills.shooting)),
+    };
+    let target = player.action_target_trace(&action, &snapshot);
+    let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "shoot")
+        .expect("MPC should trace a normal shot command");
+
+    assert_eq!(trace.decision, "reselect-mdp-after-mpc-low-confidence");
+    assert!(
+        trace.mpc_reselect_reason.starts_with("mpc-shot")
+            || trace.mpc_reselect_reason == "mpc-target-beyond-reachable-horizon",
+        "normal shot should be sent back through MDP/POMDP when MPC cannot execute it: {trace:?}"
+    );
+    assert!(
+        trace.mpc_execution_probability < 0.34,
+        "poor shot execution should be below the reselect floor: {trace:?}"
+    );
+}
+
+#[test]
+fn mpc_reselects_dribble_when_touch_cannot_be_controlled() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_198,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    let dribbler = 6usize;
+    let defender = 16usize;
+    park_players_except(&mut sim, &[dribbler, defender]);
+    sim.players[dribbler].team = Team::Home;
+    sim.players[dribbler].role = PlayerRole::Midfielder;
+    sim.players[dribbler].position = Vec2::new(40.0, 50.0);
+    sim.players[dribbler].home_position = sim.players[dribbler].position;
+    sim.players[dribbler].velocity = Vec2::zero();
+    sim.players[dribbler].skills.dribbling = 1.0;
+    sim.players[dribbler].skills.first_touch = 1.0;
+    sim.players[dribbler].skills.acceleration = 1.0;
+    sim.players[dribbler].skills.top_speed = 1.0;
+    sim.players[dribbler].fatigue = 0.92;
+    sim.players[defender].team = Team::Away;
+    sim.players[defender].position = Vec2::new(40.0, 61.0);
+    sim.ball.holder = Some(dribbler);
+    sim.ball.position = sim.players[dribbler].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, dribbler, sim.players[dribbler].position);
+    let player = sim.players[dribbler].clone();
+    let action = SoccerAction::DribbleMove {
+        target: Vec2::new(40.0, 64.0),
+        kind: DribbleMoveKind::CarryForward,
+        touch: DribbleTouchDecision::new(0, 12.0),
+    };
+    let target = player.action_target_trace(&action, &snapshot);
+    let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "carry-forward")
+        .expect("MPC should trace a dribble command");
+
+    assert_eq!(trace.decision, "reselect-mdp-after-mpc-low-confidence");
+    assert!(
+        trace.mpc_reselect_reason.starts_with("mpc-dribble")
+            || trace.mpc_reselect_reason == "mpc-target-beyond-reachable-horizon",
+        "uncontrolled dribble should be sent back through MDP/POMDP: {trace:?}"
+    );
+    assert!(
+        trace.mpc_dribble_success_probability < 0.34,
+        "uncontrolled touch should be below the reselect floor: {trace:?}"
+    );
+}
+
+#[test]
 fn holder_cannot_strike_ball_during_first_touch_settle() {
     // Regression ("a ghost kicked the ball"): a player who has just won a loose ball
     // is its `holder` immediately, but a ball won from a stretched trap is still
@@ -2627,9 +2743,10 @@ fn pass_anticipation_scene(
 }
 
 #[test]
-fn pass_anticipation_flag_off_is_a_no_op() {
-    // A defender sitting right on the pass lane: with the flag OFF it gets no contest
-    // intent at all (baseline behaviour); flipping ONLY the flag makes it step in.
+fn pass_contest_lane_cut_is_live_without_pass_anticipation_flag() {
+    // A defender sitting right on the pass lane: even with broader pass anticipation OFF, the
+    // core pass-contest lane cut is live so reachable ground passes are attacked instead of
+    // watched. Flipping the flag keeps the same committed contest path available.
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
 
@@ -2639,8 +2756,8 @@ fn pass_anticipation_flag_off_is_a_no_op() {
     assert!(
         WorldSnapshot::from_match(&off)
             .pass_contest_intent_for(14)
-            .is_none(),
-        "with pass anticipation disabled the contest intent is inert"
+            .is_some(),
+        "core lane contests stay live even with broader pass anticipation disabled"
     );
 
     let mut on = pass_anticipation_scene(&[14], from, to, true);
@@ -2650,7 +2767,7 @@ fn pass_anticipation_flag_off_is_a_no_op() {
         WorldSnapshot::from_match(&on)
             .pass_contest_intent_for(14)
             .is_some(),
-        "flipping only the flag makes the same defender anticipate the pass"
+        "with broader anticipation enabled the same defender still attacks the pass"
     );
 }
 
@@ -2669,6 +2786,15 @@ fn pass_anticipation_defender_steps_onto_the_lane_to_intercept() {
         .pass_contest_intent_for(14)
         .expect("an in-position defender should jump the lane to intercept");
     assert!(sprint, "interception is a committed sprint");
+    assert!(
+        snap.is_live_ball_attacker_for_movement_guards(14),
+        "the lane interceptor should be treated as a live-ball attacker by late movement guards"
+    );
+    assert_eq!(
+        snap.defensive_line_cushion_adjusted_target(14, target),
+        target,
+        "late defensive-line shape must not pull the elected interceptor off the pass lane"
+    );
     assert!(
         (target.x - 40.0).abs() < 3.0,
         "the intercept point sits on the pass lane: {target:?}"
@@ -2745,6 +2871,53 @@ fn pass_anticipation_support_attacker_only_crashes_a_contested_reception() {
             .pass_contest_intent_for(8)
             .is_none(),
         "an uncontested reception draws no extra attacker"
+    );
+}
+
+#[test]
+fn contested_pass_support_prefers_lp_in_position_runner() {
+    let from = Vec2::new(40.0, 45.0);
+    let to = Vec2::new(40.0, 75.0);
+    let mut sim = pass_anticipation_scene(&[8, 10, 14], from, to, false);
+    sim.players[8].role = PlayerRole::Midfielder;
+    sim.players[10].role = PlayerRole::Midfielder;
+    sim.players[8].position = Vec2::new(36.6, 73.0);
+    sim.players[8].home_position = Vec2::new(14.0, 73.0);
+    sim.players[10].position = Vec2::new(43.4, 73.0);
+    sim.players[10].home_position = to;
+    sim.players[14].position = Vec2::new(43.0, 73.0);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    push_stationary_mpc_guidance(&mut snapshot, 8, Vec2::new(14.0, 73.0));
+    push_stationary_mpc_guidance(&mut snapshot, 10, to);
+    let off_shape_player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == 8)
+        .expect("off-shape support player");
+    let shaped_player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == 10)
+        .expect("in-position support player");
+    let off_shape_fit = snapshot.ball_receipt_shape_fit_for_player_target(off_shape_player, to);
+    let shaped_fit = snapshot.ball_receipt_shape_fit_for_player_target(shaped_player, to);
+
+    assert!(
+        shaped_fit > off_shape_fit + 0.12,
+        "fixture should make LP/MPC guidance prefer the in-position support runner: shaped={shaped_fit:.3} off_shape={off_shape_fit:.3}"
+    );
+    assert!(
+        snapshot.pass_contest_intent_for(8).is_none(),
+        "the slightly closer but off-shape support runner should not crash the reception"
+    );
+    let (target, sprint) = snapshot
+        .pass_contest_intent_for(10)
+        .expect("the in-position support runner should attack the contested reception");
+    assert!(sprint);
+    assert!(
+        target.distance(to) < 1e-6,
+        "support runner should attack the reception point: target={target:?}"
     );
 }
 
@@ -13375,7 +13548,7 @@ fn defensive_line_cushion_caps_press_at_five_yards_into_opponent_half() {
     sim.ball.last_touch_team = Some(Team::Home);
 
     let halfway = sim.config.field_length_yards * 0.5;
-    let ceiling = halfway + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS; // 65 for a 120yd pitch
+    let ceiling = halfway + tunables().defensive_shape.defensive_line_max_into_opp_half_yards; // 65 for a 120yd pitch
     let snap = WorldSnapshot::from_match(&sim);
     let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], Vec2::new(30.0, 80.0));
     assert!(
@@ -13553,8 +13726,8 @@ fn defensive_line_cushion_still_clamps_lane_and_row_when_average_is_legal() {
     for pair in adjusted_line.windows(2) {
         let gap = pair[1].1.x - pair[0].1.x;
         assert!(
-            (BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS - 1e-9
-                ..=BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS + 1e-9)
+            (tunables().defensive_shape.back_four_horizontal_min_gap_yards - 1e-9
+                ..=tunables().defensive_shape.back_four_horizontal_max_gap_yards + 1e-9)
                 .contains(&gap),
             "line-bound defenders should preserve 1.5-8yd x gaps: line={adjusted_line:?}"
         );
@@ -13682,8 +13855,8 @@ fn back_four_horizontal_gap_targets_preserve_home_slot_order() {
     for pair in adjusted.windows(2) {
         let gap = pair[1].1.x - pair[0].1.x;
         assert!(
-            (BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS - 1e-9
-                ..=BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS + 1e-9)
+            (tunables().defensive_shape.back_four_horizontal_min_gap_yards - 1e-9
+                ..=tunables().defensive_shape.back_four_horizontal_max_gap_yards + 1e-9)
                 .contains(&gap),
             "back four should recover home-slot order with 1.5-8yd x gaps: {adjusted:?}"
         );
@@ -14075,7 +14248,8 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     home.ball.last_touch_team = Some(Team::Home);
     let home_snapshot = WorldSnapshot::from_match(&home);
     let home_ceiling =
-        home.config.field_length_yards * 0.5 + DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS;
+        home.config.field_length_yards * 0.5
+            + tunables().defensive_shape.defensive_line_max_into_opp_half_yards;
     for &id in &home_def {
         let raw = Vec2::new(home.players[id].position.x, 96.0);
         let adjusted = home_snapshot.defensive_line_cushion_adjusted_target(id, raw);
@@ -14109,7 +14283,8 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     away.ball.last_touch_team = Some(Team::Away);
     let away_snapshot = WorldSnapshot::from_match(&away);
     let away_ceiling =
-        away.config.field_length_yards * 0.5 - DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS;
+        away.config.field_length_yards * 0.5
+            - tunables().defensive_shape.defensive_line_max_into_opp_half_yards;
     for &id in &away_def {
         let raw = Vec2::new(away.players[id].position.x, 24.0);
         let adjusted = away_snapshot.defensive_line_cushion_adjusted_target(id, raw);
@@ -24656,11 +24831,13 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     observation.yards_to_goal = 9.0;
     observation.offensive_urgency = 0.0;
     observation.immediate_dispossession_risk = 0.20;
-    observation.shot_on_frame_probability = SHOT_ON_FRAME_MIN_PROBABILITY - 0.01;
+    observation.shot_on_frame_probability =
+        tunables().shooting.shot_on_frame_min_probability - 0.01;
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.20;
     assert!(!shot_decision_is_qualified(&observation));
 
-    observation.shot_on_frame_probability = SHOT_ON_FRAME_MIN_PROBABILITY + 0.01;
+    observation.shot_on_frame_probability =
+        tunables().shooting.shot_on_frame_min_probability + 0.01;
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY - 0.01;
     assert!(!shot_decision_is_qualified(&observation));
 
@@ -24671,7 +24848,8 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     assert!(shot_decision_is_qualified(&observation));
     observation.offensive_urgency = 0.0;
 
-    observation.shot_on_frame_probability = SHOT_ON_FRAME_MIN_PROBABILITY + 0.01;
+    observation.shot_on_frame_probability =
+        tunables().shooting.shot_on_frame_min_probability + 0.01;
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.01;
     assert!(shot_decision_is_qualified(&observation));
 
@@ -24686,7 +24864,8 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     observation.shot_lane_open = false;
     observation.yards_to_goal = 9.0;
     observation.shot_block_probability = 0.05;
-    observation.shot_on_frame_probability = SHOT_ON_FRAME_MIN_PROBABILITY + 0.20;
+    observation.shot_on_frame_probability =
+        tunables().shooting.shot_on_frame_min_probability + 0.20;
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.20;
     observation.immediate_dispossession_risk = SHOT_BAILOUT_DISPOSSESSION_RISK + 0.20;
     assert!(!shot_decision_is_qualified(&observation));
@@ -24710,7 +24889,7 @@ fn striker_shot_window_extends_to_thirty_yards() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let mut observation = snapshot.observation_for(attacker);
     observation.shot_lane_open = true;
-    observation.yards_to_goal = STRIKER_SHOT_WINDOW_YARDS - 0.5;
+    observation.yards_to_goal = tunables().shooting.striker_shot_window_yards - 0.5;
     observation.shot_block_probability = 0.20;
     observation.shot_on_frame_probability = STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY + 0.02;
     observation.shot_beat_goalkeeper_probability = STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY + 0.02;
@@ -25140,7 +25319,7 @@ fn pomdp_observation_exposes_calibrated_shot_probabilities() {
     let good = good_snapshot.observation_for(attacker);
     assert!(good.shot_lane_open);
     assert!(
-        good.shot_on_frame_probability >= SHOT_ON_FRAME_MIN_PROBABILITY,
+        good.shot_on_frame_probability >= tunables().shooting.shot_on_frame_min_probability,
         "good shot on-frame probability: {}",
         good.shot_on_frame_probability
     );
@@ -38006,7 +38185,7 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named feature indices all live in the base block; the
     // whole-field "moment of all 22 + ball" block is appended after it.
-    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 182);
+    assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM
@@ -38035,12 +38214,26 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR, 179);
     assert_eq!(SOCCER_NEURAL_FEATURE_BALL_FINE_LANE, 180);
     assert_eq!(SOCCER_NEURAL_FEATURE_BALL_FINE_ROW, 181);
+    assert_eq!(SOCCER_NEURAL_FEATURE_PASS_TARGET_EXPECTED_COMPLETION, 182);
+    assert_eq!(SOCCER_NEURAL_FEATURE_PASS_MPC_RECEIPT_PROBABILITY, 183);
+    assert_eq!(SOCCER_NEURAL_FEATURE_PASS_RECEIPT_RACE_ADVANTAGE, 184);
+    assert_eq!(SOCCER_NEURAL_FEATURE_PASS_RECEIPT_QP_ACCEL_FIT, 185);
+    assert_eq!(SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_CONTROL_PROBABILITY, 186);
+    assert_eq!(SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_QP_ACCEL_FIT, 187);
+    assert_eq!(SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_SPACE_MARGIN, 188);
+    assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY, 189);
+    assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT, 190);
+    assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY, 191);
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&258));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&265));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&268));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&318));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&320));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&182));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&324));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&186));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&163));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&248));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&251));
@@ -38217,6 +38410,391 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(
         first_time_shot_features[SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_ACTION],
         1.0
+    );
+}
+
+#[test]
+fn pass_receipt_qp_fit_rewards_reachable_arrivals() {
+    let receiver = Vec2::new(40.0, 50.0);
+    let target = Vec2::new(40.0, 58.0);
+    let reachable = pass_receipt_qp_accel_fit(receiver, Vec2::new(0.0, 4.5), target, 1.35, 8.5);
+    let impossible = pass_receipt_qp_accel_fit(receiver, Vec2::zero(), target, 0.42, 1.0);
+
+    assert!(
+        reachable > impossible + 0.35,
+        "QP receipt fit should separate a controllable arrival from a late low-accel one: reachable={reachable} impossible={impossible}"
+    );
+}
+
+#[test]
+fn pass_neural_features_include_mpc_receipt_context() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_619,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 45.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].skills.passing_completion_rate = 8.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(42.0, 64.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::new(0.0, 3.8);
+    sim.players[receiver].skills.acceleration = 8.0;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(passer);
+    let target_point = snapshot
+        .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, 16.0)
+        .unwrap_or(sim.players[receiver].position);
+    let action_target = AgentActionTargetTrace {
+        point: Some(target_point),
+        player_id: Some(receiver),
+        grid: Some(pitch_grid_address(
+            target_point,
+            snapshot.field_width,
+            snapshot.field_length,
+        )),
+        facing: facing_bucket_from_vector(target_point - sim.players[passer].position),
+        dribble_touch: None,
+    };
+    let context = soccer_decision_context_for(
+        passer,
+        Team::Home,
+        "pass",
+        Some(&action_target),
+        &snapshot,
+        &snapshot,
+    );
+    assert!(context.pass_target_expected_completion > 0.0);
+    assert!(context.pass_mpc_receipt_probability > 0.0);
+    assert!(context.pass_receipt_qp_accel_fit > 0.0);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: passer,
+        team: Team::Home,
+        role: sim.players[passer].role,
+        state: snapshot.mdp_state_for_player(passer),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: Some(action_target),
+        decision_context: context,
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(passer),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_TARGET_EXPECTED_COMPLETION] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_MPC_RECEIPT_PROBABILITY] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_RECEIPT_QP_ACCEL_FIT] > 0.0);
+}
+
+#[test]
+fn dribble_mpc_qp_fit_rewards_reachable_control_touch() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_621,
+        ..Default::default()
+    });
+    let dribbler = 6usize;
+    let defender = 16usize;
+    park_players_except(&mut sim, &[dribbler, defender]);
+    sim.players[dribbler].team = Team::Home;
+    sim.players[dribbler].role = PlayerRole::Midfielder;
+    sim.players[dribbler].position = Vec2::new(40.0, 50.0);
+    sim.players[dribbler].velocity = Vec2::new(0.0, 4.4);
+    sim.players[dribbler].skills.dribbling = 8.8;
+    sim.players[dribbler].skills.first_touch = 8.2;
+    sim.players[dribbler].skills.acceleration = 8.4;
+    sim.players[defender].team = Team::Away;
+    sim.players[defender].position = Vec2::new(40.8, 68.0);
+    sim.ball.holder = Some(dribbler);
+    sim.ball.position = sim.players[dribbler].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let current = sim.players[dribbler].position;
+    let reachable = dribble_mpc_control_estimate_for_snapshot(
+        &snapshot,
+        dribbler,
+        Team::Home,
+        sim.players[dribbler].role,
+        &sim.players[dribbler].skills,
+        sim.players[dribbler].fatigue,
+        current,
+        sim.players[dribbler].velocity,
+        Vec2::new(40.0, 54.0),
+        3.0,
+    );
+    let smothered = dribble_mpc_control_estimate_for_snapshot(
+        &snapshot,
+        dribbler,
+        Team::Home,
+        sim.players[dribbler].role,
+        &sim.players[dribbler].skills,
+        sim.players[dribbler].fatigue,
+        current,
+        Vec2::zero(),
+        Vec2::new(40.0, 68.0),
+        12.0,
+    );
+
+    assert!(
+        reachable.qp_accel_fit > smothered.qp_accel_fit + 0.20,
+        "dribble QP fit should reward the touch the carrier can actually control: reachable={reachable:?} smothered={smothered:?}"
+    );
+    assert!(
+        reachable.control_probability > smothered.control_probability + 0.18,
+        "MPC dribble control should prefer reachable open grass over a smothered heavy touch: reachable={reachable:?} smothered={smothered:?}"
+    );
+}
+
+#[test]
+fn shot_mpc_qp_target_fit_rewards_clean_execution() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_622,
+        ..Default::default()
+    });
+    let shooter = 9usize;
+    let keeper = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("away keeper");
+    park_players_except(&mut sim, &[shooter, keeper]);
+    sim.players[shooter].team = Team::Home;
+    sim.players[shooter].role = PlayerRole::Forward;
+    sim.players[shooter].position = Vec2::new(35.0, 92.0);
+    sim.players[shooter].velocity = Vec2::new(0.2, 1.4);
+    sim.players[shooter].skills.shooting = 9.1;
+    sim.players[shooter].skills.first_touch = 8.4;
+    sim.players[shooter].skills.strength = 8.0;
+    sim.players[shooter].skills.acceleration = 8.0;
+    sim.players[shooter].skills.right_foot_shot_power = 8.8;
+    sim.players[keeper].position = Vec2::new(40.0, 119.0);
+    sim.players[keeper].velocity = Vec2::zero();
+    sim.ball.holder = Some(shooter);
+    sim.ball.position = sim.players[shooter].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let clean_speed = shot_speed_yps_from_power(
+        shot_power_for_skill(ability01(sim.players[shooter].skills.shooting)),
+        &sim.players[shooter].skills,
+    );
+    let mut poor_skills = sim.players[shooter].skills.clone();
+    poor_skills.shooting = 2.1;
+    poor_skills.first_touch = 2.4;
+    poor_skills.strength = 2.6;
+    poor_skills.acceleration = 2.2;
+    poor_skills.right_foot_shot_power = 2.5;
+    poor_skills.left_foot_shot_power = 2.5;
+    let rushed_speed = shot_speed_yps_from_power(shot_power_for_skill(ability01(2.1)), &poor_skills);
+    let clean = shot_mpc_accuracy_estimate_for_snapshot(
+        &snapshot,
+        shooter,
+        Team::Home,
+        &sim.players[shooter].skills,
+        0.0,
+        sim.players[shooter].position,
+        sim.players[shooter].velocity,
+        clean_speed,
+        false,
+        0.05,
+    );
+    let rushed = shot_mpc_accuracy_estimate_for_snapshot(
+        &snapshot,
+        shooter,
+        Team::Home,
+        &poor_skills,
+        0.88,
+        sim.players[shooter].position,
+        Vec2::new(4.0, -2.0),
+        rushed_speed,
+        false,
+        0.96,
+    );
+
+    assert!(
+        clean.qp_target_fit > rushed.qp_target_fit + 0.10,
+        "shot QP target fit should separate clean mechanics from rushed low-skill contact: clean={clean:?} rushed={rushed:?}"
+    );
+    assert!(
+        clean.accuracy_probability > rushed.accuracy_probability + 0.12,
+        "MPC shot accuracy should be higher for the clean solve: clean={clean:?} rushed={rushed:?}"
+    );
+}
+
+#[test]
+fn dribble_and_shot_neural_features_include_mpc_accuracy_context() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_623,
+        ..Default::default()
+    });
+    let holder = 6usize;
+    let defender = 16usize;
+    let keeper = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .expect("away keeper");
+    park_players_except(&mut sim, &[holder, defender, keeper]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].role = PlayerRole::Forward;
+    sim.players[holder].position = Vec2::new(38.0, 88.0);
+    sim.players[holder].velocity = Vec2::new(0.0, 3.2);
+    sim.players[holder].skills.dribbling = 8.2;
+    sim.players[holder].skills.first_touch = 8.0;
+    sim.players[holder].skills.acceleration = 8.0;
+    sim.players[holder].skills.shooting = 8.4;
+    sim.players[holder].skills.right_foot_shot_power = 8.3;
+    sim.players[defender].team = Team::Away;
+    sim.players[defender].position = Vec2::new(45.0, 96.0);
+    sim.players[keeper].position = Vec2::new(40.0, 119.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(holder);
+    let dribble_target = Vec2::new(39.0, 92.0);
+    let dribble_action_target = AgentActionTargetTrace {
+        point: Some(dribble_target),
+        player_id: None,
+        grid: Some(pitch_grid_address(
+            dribble_target,
+            snapshot.field_width,
+            snapshot.field_length,
+        )),
+        facing: facing_bucket_from_vector(dribble_target - sim.players[holder].position),
+        dribble_touch: Some(DribbleTouchDecision::new(4, 3.2)),
+    };
+    let dribble_context = soccer_decision_context_for(
+        holder,
+        Team::Home,
+        "carry-forward",
+        Some(&dribble_action_target),
+        &snapshot,
+        &snapshot,
+    );
+    assert!(dribble_context.dribble_mpc_control_probability > 0.0);
+    assert!(dribble_context.dribble_mpc_qp_accel_fit > 0.0);
+
+    let dribble_transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: holder,
+        team: Team::Home,
+        role: sim.players[holder].role,
+        state: snapshot.mdp_state_for_player(holder),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "carry-forward".to_string(),
+        action_target: Some(dribble_action_target),
+        decision_context: dribble_context,
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(holder),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let dribble_features = soccer_neural_transition_features(&dribble_transition);
+    assert!(
+        dribble_features[SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_CONTROL_PROBABILITY] > 0.0
+    );
+    assert!(dribble_features[SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_QP_ACCEL_FIT] > 0.0);
+
+    let shot_context =
+        soccer_decision_context_for(holder, Team::Home, "shoot", None, &snapshot, &snapshot);
+    assert!(shot_context.shot_mpc_accuracy_probability > 0.0);
+    assert!(shot_context.shot_mpc_qp_target_fit > 0.0);
+    assert!(shot_context.shot_mpc_goal_probability >= 0.0);
+    let shot_transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: holder,
+        team: Team::Home,
+        role: sim.players[holder].role,
+        state: snapshot.mdp_state_for_player(holder),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "shoot".to_string(),
+        action_target: None,
+        decision_context: shot_context,
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(holder),
+        next_observation: observation,
+        done: false,
+    };
+    let shot_features = soccer_neural_transition_features(&shot_transition);
+    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY] > 0.0);
+    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT] > 0.0);
+    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY] >= 0.0);
+}
+
+#[test]
+fn learned_pass_target_value_reranks_mpc_receipt_candidates() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_620,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let analytic_target = 8usize;
+    let learned_target = 9usize;
+    park_players_except(&mut sim, &[passer, analytic_target, learned_target]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 45.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[analytic_target].team = Team::Home;
+    sim.players[analytic_target].position = Vec2::new(38.0, 55.0);
+    sim.players[analytic_target].home_position = sim.players[analytic_target].position;
+    sim.players[learned_target].team = Team::Home;
+    sim.players[learned_target].position = Vec2::new(48.0, 58.0);
+    sim.players[learned_target].home_position = sim.players[learned_target].position;
+    sim.players[learned_target].skills.acceleration = 8.0;
+    sim.players[learned_target].skills.first_touch = 8.0;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut policy = SoccerQPolicy::new(SoccerQPolicyOptions::default());
+    assert!(policy.set_target_value_for_snapshot(
+        &snapshot,
+        passer,
+        "pass",
+        sim.players[learned_target].position,
+        6.0,
+    ));
+    let chosen = policy.best_pass_target_player_for_snapshot(
+        &snapshot,
+        passer,
+        "pass",
+        PassFlight::Floor,
+        &[analytic_target, learned_target],
+    );
+
+    assert_eq!(
+        chosen,
+        Some(learned_target),
+        "learned target values should steer pass target selection after the MPC receipt candidates are scored"
     );
 }
 
@@ -38578,6 +39156,60 @@ fn territorial_spacing_is_stable_and_bounded_over_real_matches() {
 }
 
 #[test]
+fn roaming_support_target_respects_lane_and_role_layers() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let mids = &home[4..8];
+    let forwards = &home[8..10];
+    let holder = mids[0];
+    let runner = forwards[0];
+    let other_forward = forwards[1];
+
+    for &mid in mids {
+        sim.players[mid].role = PlayerRole::Midfielder;
+        sim.players[mid].position = Vec2::new(40.0, 50.0);
+    }
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].home_position = Vec2::new(60.0, 56.0);
+    sim.players[runner].position = Vec2::new(60.0, 54.0);
+    sim.players[other_forward].role = PlayerRole::Forward;
+    sim.players[other_forward].position = Vec2::new(54.0, 54.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let proposed = Vec2::new(5.0, 50.0);
+    let fallback = Vec2::new(60.0, 54.0);
+    let guarded =
+        snapshot.shape_guarded_support_point(runner, proposed, &[fallback], fallback, true);
+    let runner_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+
+    assert!(
+        guarded.x > proposed.x + 20.0,
+        "roaming support must not jump across the pitch and abandon its lane: proposed={proposed:?} guarded={guarded:?}"
+    );
+    assert!(
+        guarded.y > proposed.y + 1.0,
+        "roaming support must stay separated from the midfield line: proposed={proposed:?} guarded={guarded:?}"
+    );
+    assert!(
+        snapshot.movement_target_shape_score(runner_snapshot, guarded)
+            > snapshot.movement_target_shape_score(runner_snapshot, proposed) + 0.25,
+        "the guarded target should score materially better for lane/layer shape: proposed={proposed:?} guarded={guarded:?}"
+    );
+}
+
+#[test]
 fn support_target_guard_blocks_running_past_a_moving_teammate() {
     // A moving teammate sitting directly in the straight line to the run target is
     // a "running past each other / switching positions" swap: the run must be
@@ -38834,7 +39466,7 @@ fn defending_pulls_off_ball_player_goal_side_of_ball_but_exempts_presser() {
     let striker_guarded =
         snapshot.shape_guarded_movement_point(striker, striker_proposed, &[], striker_home, true);
     assert!(
-        striker_guarded.y <= ball.y - DEFENSIVE_GOAL_SIDE_MIN_YARDS + 1e-6,
+        striker_guarded.y <= ball.y - tunables().defensive_shape.defensive_goal_side_min_yards + 1e-6,
         "out-of-possession striker must be pulled to the own-goal side of the ball: \
          guarded={striker_guarded:?} ball={ball:?}"
     );
@@ -42299,6 +42931,97 @@ fn intended_pending_pass_target_backs_off_for_clearly_closer_teammate() {
     assert!(closer_observation.receiving_pending_pass);
     assert!(snapshot.pending_pass_reception_target_for(intended).is_none());
     assert!(snapshot.pending_pass_reception_target_for(closer).is_some());
+}
+
+#[test]
+fn pending_pass_receipt_tie_break_prefers_lp_in_position_teammate() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let intended = 9;
+    let shaped = 10;
+    let origin = Vec2::new(40.0, 60.0);
+    let arrival = Vec2::new(40.0, 75.0);
+    park_players_except(&mut sim, &[passer, intended, shaped]);
+    sim.ball.holder = None;
+    sim.ball.position = origin;
+    sim.ball.velocity = (arrival - origin).normalized() * 14.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[passer].position = origin;
+    sim.players[intended].position = Vec2::new(36.5, 75.0);
+    sim.players[intended].home_position = Vec2::new(16.0, 75.0);
+    sim.players[intended].velocity = Vec2::zero();
+    sim.players[shaped].position = Vec2::new(43.7, 75.0);
+    sim.players[shaped].home_position = arrival;
+    sim.players[shaped].velocity = Vec2::zero();
+    sim.pending_pass = Some(test_pending_pass(
+        Team::Home,
+        passer,
+        intended,
+        origin,
+        arrival,
+    ));
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    snapshot.pending_pass.as_mut().expect("pending pass").nearest_receiver = Some(intended);
+    push_stationary_mpc_guidance(&mut snapshot, intended, Vec2::new(16.0, 75.0));
+    push_stationary_mpc_guidance(&mut snapshot, shaped, arrival);
+    let intended_player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == intended)
+        .expect("intended player");
+    let shaped_player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == shaped)
+        .expect("shaped player");
+    let intended_fit = snapshot.ball_receipt_shape_fit_for_player_target(intended_player, arrival);
+    let shaped_fit = snapshot.ball_receipt_shape_fit_for_player_target(shaped_player, arrival);
+
+    assert!(
+        shaped_fit > intended_fit + 0.12,
+        "fixture should make LP/MPC guidance clearly prefer the shaped receiver: shaped={shaped_fit:.3} intended={intended_fit:.3}"
+    );
+    assert!(
+        snapshot
+            .pending_pass_reception_target_for(intended)
+            .is_none(),
+        "the slightly closer but badly positioned intended target should yield"
+    );
+    assert!(
+        !snapshot.is_live_ball_attacker_for_movement_guards(intended),
+        "the yielding named receiver should not keep live-ball exemption"
+    );
+    let (target, sprint) = snapshot
+        .pending_pass_reception_target_for(shaped)
+        .expect("the in-position teammate should take the pass over");
+    assert!(sprint, "the elected receiver should attack the moving pass");
+    assert!(
+        snapshot.is_live_ball_attacker_for_movement_guards(shaped),
+        "the elected de-facto receiver should be protected from late shape/spacing guards"
+    );
+    let shaped_observation = snapshot.observation_for(shaped);
+    assert!(
+        shaped_observation.receiving_pending_pass,
+        "observation should expose the elected de-facto receiver, not only the original nearest receiver"
+    );
+    assert!(
+        shaped_observation.pending_pass_receiver_urgency > 0.0,
+        "the elected de-facto receiver should carry pending-pass urgency into learning/MDP state"
+    );
+    assert_eq!(
+        snapshot.forward_line_band_adjusted_target(shaped, target),
+        target,
+        "late striker-line shape must not pull the elected de-facto receiver away from the pass"
+    );
+    assert!(
+        target.distance(snapshot.ball.position)
+            < snapshot
+                .player_position(shaped)
+                .expect("shaped position")
+                .distance(snapshot.ball.position),
+        "the elected receiver should meet the ball earlier instead of waiting around it: target={target:?}"
+    );
 }
 
 #[test]
@@ -48714,7 +49437,7 @@ fn carry_forward_in_goal_approach_bends_toward_goal() {
         DribbleMoveKind::CarryForward,
     );
 
-    assert!(observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards);
     assert!(goal_approach_carry_preferred(
         &observation,
         sim.players[holder].role
@@ -49126,7 +49849,7 @@ fn wide_striker_in_approach_band_drives_at_goal_not_endline() {
     let origin = sim.players[holder].position;
     let goal_center_x = snapshot.field_width * 0.5;
     assert!(observation.yards_to_goal > ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS);
-    assert!(observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards);
     assert!(goal_approach_forces_goalmouth_carry(
         &observation,
         sim.players[holder].role
@@ -49207,7 +49930,7 @@ fn human_dribble_command_in_goal_approach_rewrites_to_goalmouth_drive() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(holder);
     assert!(observation.yards_to_goal > ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS);
-    assert!(observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards);
     assert!(goal_approach_forces_goalmouth_carry(
         &observation,
         sim.players[holder].role
@@ -49281,8 +50004,8 @@ fn pressured_wide_striker_still_drives_goalward_in_approach_band() {
     let origin = sim.players[holder].position;
     let goal_center_x = snapshot.field_width * 0.5;
     let goal = Vec2::new(goal_center_x, Team::Home.goal_y(snapshot.field_length));
-    assert!(observation.yards_to_goal > STRIKER_SHOT_WINDOW_YARDS);
-    assert!(observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(observation.yards_to_goal > tunables().shooting.striker_shot_window_yards);
+    assert!(observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards);
     assert!(
         observation.forward_dribble_space_yards < 1.2,
         "blocker should shrink straight-ahead dribble space: {:?}",
@@ -49383,7 +50106,7 @@ fn wide_midfielder_in_approach_band_drives_at_goal_not_endline() {
     let origin = sim.players[holder].position;
     let goal_center_x = snapshot.field_width * 0.5;
     assert!(observation.yards_to_goal > ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS);
-    assert!(observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards);
     assert!(observation.forward_dribble_space_yards >= 1.2);
     assert!(goal_approach_forces_goalmouth_carry(
         &observation,
@@ -49460,7 +50183,9 @@ fn goalmouth_carry_learning_reward_prefers_pocket_over_endline_trap() {
 
     let before = WorldSnapshot::from_match(&sim);
     let before_observation = before.observation_for(holder);
-    assert!(before_observation.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS);
+    assert!(
+        before_observation.yards_to_goal <= tunables().shooting.goal_approach_carry_yards
+    );
 
     let pocket_target = Vec2::new(48.0, 104.0);
     let mut pocket_after = before.clone();
@@ -59311,7 +60036,7 @@ fn near_box_carry_bends_toward_goal_instead_of_endline() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(attacker);
-    assert!(observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards);
     assert!(!shot_decision_is_qualified_for_role(
         &observation,
         sim.players[attacker].role
@@ -59379,7 +60104,7 @@ fn wide_attacker_switches_from_goalmouth_drive_to_shot() {
     let blocked_snapshot = WorldSnapshot::from_match(&sim);
     let blocked_observation = blocked_snapshot.observation_for(attacker);
     assert!(blocked_observation.yards_to_goal > STRIKER_MUST_SHOOT_YARDS);
-    assert!(blocked_observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS);
+    assert!(blocked_observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards);
     assert!(!shot_decision_is_qualified_for_role(
         &blocked_observation,
         sim.players[attacker].role
@@ -59706,7 +60431,7 @@ fn clear_goal_approach_striker_shoots_instead_of_extra_dribble() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(attacker);
     assert!(observation.yards_to_goal > STRIKER_MUST_SHOOT_YARDS);
-    assert!(observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards);
     assert!(goal_attack_shot_is_required(
         &observation,
         sim.players[attacker].role
@@ -59803,7 +60528,7 @@ fn clear_striker_takes_attempts_from_thirty_yard_window() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(attacker);
     assert!(observation.yards_to_goal > STRIKER_MUST_SHOOT_YARDS);
-    assert!(observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS);
+    assert!(observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards);
     assert!(shot_decision_is_qualified_for_role(
         &observation,
         sim.players[attacker].role
@@ -64029,7 +64754,6 @@ fn default_full_match_streaming_writer_emits_sparse_jsonl() {
         learning_enabled: false,
         learning_logging_enabled: false,
         full_game_learning_enabled: false,
-        formation_lp_enabled: false,
         neural_learning: SoccerNeuralLearningConfig {
             enabled: false,
             ..SoccerNeuralLearningConfig::default()
@@ -65624,9 +66348,9 @@ fn wall_partner_returns_first_time_to_committed_runner() {
 #[test]
 fn pass_anticipation_intended_target_backs_off_when_teammate_is_closer() {
     // Intended-target belief & hand-off: the named receiver is dragged well off where the ball
-    // will arrive, while a team-mate sits right on it. With anticipation ON the named man realises
-    // he is beaten and backs off; the genuinely closer team-mate takes the reception over. With it
-    // OFF, baseline holds: the named receiver always meets the ball and the team-mate holds shape.
+    // will arrive, while a team-mate sits right on it. Receiver election always lets the named man
+    // realise he is beaten and back off; broader pass anticipation only gates extra support and
+    // first-touch behaviours.
     let from = Vec2::new(40.0, 45.0);
     let to = Vec2::new(40.0, 75.0);
     let build = |enabled: bool| {
@@ -65650,12 +66374,12 @@ fn pass_anticipation_intended_target_backs_off_when_teammate_is_closer() {
 
     let off = WorldSnapshot::from_match(&build(false));
     assert!(
-        off.pending_pass_reception_target_for(9).is_some(),
-        "with anticipation off the named receiver always meets the ball (baseline)"
+        off.pending_pass_reception_target_for(9).is_none(),
+        "even with anticipation off the named receiver backs off when a team-mate is clearly closer"
     );
     assert!(
-        off.pending_pass_reception_target_for(10).is_none(),
-        "with anticipation off a non-named team-mate is never the receiver (baseline)"
+        off.pending_pass_reception_target_for(10).is_some(),
+        "even with anticipation off the closer team-mate becomes the de-facto receiver"
     );
 }
 

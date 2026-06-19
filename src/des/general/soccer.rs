@@ -542,12 +542,10 @@ const CARRY_ORBIT_RADIUS_EASE_YPS: f64 = 6.0;
 // the carrier in one possession. On reaching it, a rare roll either unlocks
 // further winding or clamps it.
 const CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD: f64 = 4.712_388_980_384_69; // 270 deg
-const SHOT_ON_FRAME_MIN_PROBABILITY: f64 = 0.60;
 const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
 const SHOT_BAILOUT_DISPOSSESSION_RISK: f64 = 0.80;
 const SHOT_BAILOUT_ON_FRAME_PROBABILITY: f64 = 0.20;
-const STRIKER_SHOT_WINDOW_YARDS: f64 = 30.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
@@ -594,9 +592,7 @@ const STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.06;
 const SHOT_BLOCK_DIRECT_PROBABILITY: f64 = 0.80;
 const SHOT_BLOCK_LANE_RADIUS_YARDS: f64 = 3.25;
 const SHOT_BLOCK_DECISION_MAX_PROBABILITY: f64 = 0.58;
-const SHOT_BLOCK_BAILOUT_MAX_PROBABILITY: f64 = 0.86;
 const SHOT_GOALMOUTH_TARGET_FRACTIONS: [f64; 5] = [-0.92, -0.46, 0.0, 0.46, 0.92];
-const GOAL_APPROACH_CARRY_YARDS: f64 = 45.0;
 const SHOT_BLOCK_QUICK_RELEASE_MULTIPLIER: f64 = 0.68;
 const SHOT_SCREEN_IDEAL_MIN_YARDS: f64 = 1.0;
 const SHOT_SCREEN_IDEAL_MAX_YARDS: f64 = 3.0;
@@ -1201,7 +1197,6 @@ const FACING_GATE_AT_FEET_RADIUS_YARDS: f64 = 0.45;
 const STABLE_CURRENT_FACING_BALL_DOT: f64 = 0.18;
 const FAST_AWAY_FACING_MIN_SPEED_YPS: f64 = 0.35;
 const FAST_AWAY_FACING_BALL_DOT: f64 = -0.55;
-const STRIKER_HOLD_UP_MIN_GOAL_DISTANCE_YARDS: f64 = GOAL_APPROACH_CARRY_YARDS;
 const STRIKER_HOLD_UP_SIDEWAYS_YARDS: f64 = 7.5;
 const STRIKER_HOLD_UP_FORWARD_YARDS: f64 = 2.8;
 const GOAL_CHAIN_REWARD_PATTERN: [f64; 5] = [30.0, 30.0, 20.0, 15.0, 5.0];
@@ -1277,12 +1272,8 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 // is genuinely far out of position. Smaller upkeep corrections are jogged inside the grace
 // window so the team isn't frantically sprint-snapping every tick (it conserves energy).
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
-// Hard cap on how far the back four's AVERAGE may press upfield: never more than this
-// far into the opponents' half, regardless of how deep the ball is. This is the
-// exception to the 25yd rule — with the ball deep in the opponents' half the 2-25yd
-// band would otherwise drag the line well upfield; this pins the line's average to at
-// most 5yd past the halfway line so the back four never over-commits.
-const DEFENSIVE_LINE_MAX_INTO_OPP_HALF_YARDS: f64 = 5.0;
+// Hard cap on how far the back four's AVERAGE may press upfield now lives in
+// `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
 // The back-four band is suspended when the ball is within this of either goal line
 // (a ball on the end-line can't have the line sit just "behind" it without going
 // out of bounds).
@@ -1311,7 +1302,7 @@ const DEFENSIVE_LINE_GAP_FLOOR_YARDS: f64 = 3.0;
 // (a ~26yd block ≈ 3.9 lanes), the block's centre tracking the ball's x (shift-and-cover,
 // retaining some centrality). Fore-aft they FLATTEN to the line's average depth (no
 // 20-35yd stagger among the four). Both are bounded pulls toward the slot, not hard snaps.
-const BACK_FOUR_BLOCK_WIDTH_YARDS: f64 = 22.0;
+// Back-four width and horizontal gap thresholds live in `tunables().defensive_shape`.
 const BACK_FOUR_BALL_SIDE_SHIFT: f64 = 0.6;
 const BACK_FOUR_LATERAL_GAIN: f64 = 0.78;
 const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
@@ -1320,11 +1311,8 @@ const BACK_FOUR_FLATTEN_GAIN: f64 = 0.5;
 // converging over the 3s consistency horizon (eventual consistency), never a snap. On
 // offense the flat line is dropped entirely (a wingback may overlap, the four may stagger).
 const BACK_FOUR_OFFSIDE_TRAP_FLATTEN_GAIN: f64 = 0.9;
-const BACK_FOUR_HORIZONTAL_MIN_GAP_YARDS: f64 = 1.5;
-const BACK_FOUR_HORIZONTAL_MAX_GAP_YARDS: f64 = 8.0;
 const BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-const WINGBACK_DEFENSIVE_PINCH_TARGET_SECONDS: f64 = 3.0;
-const WINGBACK_DEFENSIVE_PINCH_OPPONENT_HALF_MARGIN_YARDS: f64 = 8.0;
+// Wingback defensive pinch horizon/margin live in `tunables().defensive_shape`.
 const SIX_YARD_BOX_POST_EXTENSION_YARDS: f64 = 6.0;
 const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
 const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
@@ -1685,14 +1673,11 @@ const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
 // their pass is in flight (no holder; `possession_team` falls back to last-touch) —
 // every non-pressing outfielder must be on the own-goal side of the ball, i.e. on
 // the segment between the ball and our own goal. An off-ball target that sits
-// upfield of the ball (between ball and the opponent goal) is pulled back along the
-// ball->own-goal axis until it is at least `MIN` yds goal-side, capped at `MAX_PULL`
-// yds of correction per evaluation so a high striker recovers progressively rather
-// than teleporting. Only the player's depth along that axis is corrected; lateral
-// offset is preserved so the back line keeps its width. The nearest outfielder to
-// the ball (the primary presser) is exempt — someone still closes the ball down.
-const DEFENSIVE_GOAL_SIDE_MIN_YARDS: f64 = 1.5;
-const DEFENSIVE_GOAL_SIDE_MAX_PULL_YARDS: f64 = 10.0;
+// upfield of the ball (between ball and the opponent goal) is pulled back in y
+// until it is at least `MIN` yds goal-side. Lateral offset is preserved so the
+// back line keeps its width. The nearest outfielder to the ball (the primary
+// presser) is exempt — someone still closes the ball down. The goal-side margin
+// lives in `tunables().defensive_shape.defensive_goal_side_min_yards`.
 // Position-swap / cross-through guard. Players "switching positions" and "running
 // past each other" is an artefact: off the ball a player should never steer a
 // straight line that carries it PAST a teammate (ending up on the far side of
@@ -2218,14 +2203,10 @@ const PASS_CONTEST_ENGAGE_RADIUS_YARDS: f64 = 30.0;
 // margin (seconds) by which a team-mate must beat his own arrival before he defers; it is
 // generous precisely because his belief that the ball is his is strong.
 const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
-// Receiver "in-position" election: among team-mates racing an in-flight pass, the raw arrival time
-// is discounted by how in-position (for BOTH phases) the player would be controlling the ball at the
-// reception point. LP_REFERENCE is the distance from a player's formation-LP/IPM ideal slot at which
-// the in-position bonus has fully decayed to zero; MAX_BONUS_SECONDS caps the discount so arrival time
-// stays primary and being in-position only decides genuinely close calls (the tie-breaker the user asked
-// for). See `pass_receiver_in_position_bonus` / `pass_receiver_effective_arrival`.
-const RECEIVER_IN_POSITION_LP_REFERENCE_YARDS: f64 = 16.0;
-const RECEIVER_IN_POSITION_MAX_BONUS_SECONDS: f64 = 0.40;
+// NB: the receiver "in-position" election (my `pass_receiver_in_position_bonus` /
+// `pass_receiver_effective_arrival`) was superseded in the merge with `6a61a50` by the richer
+// two-way `ball_receipt_shape_fit_for_player_target` + `pass_receipt_claim_score_for_player_target`,
+// so those constants were removed.
 // ---- MPC pass execution ----
 // A receding-horizon optimiser for the LAUNCH of a ground pass: it predicts the receiver's
 // dynamically-feasible run (point-mass MPC, bending around opponents), forward-models the ball's
@@ -2620,7 +2601,7 @@ const SOCCER_MOMENT_REPLAY_SHOT_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_PASS_REWARD: f64 = 30.0;
 const SOCCER_MOMENT_REPLAY_DRIBBLE_REWARD: f64 = 15.0;
 /// Base per-decision feature count: everything except the whole-field block below.
-const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 182;
+const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 192;
 /// Whole-field "moment of all 22 + ball" block appended to every decision's feature
 /// vector: for the actor's team then the opponents (each ordered by player id),
 /// followed by the ball, the actor-relative canonical (forward, lateral) position,
@@ -2745,6 +2726,16 @@ const SOCCER_NEURAL_FEATURE_FIRST_TIME_SHOT_FIELD_FEASIBILITY: usize = 178;
 const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR: usize = 179;
 const SOCCER_NEURAL_FEATURE_BALL_FINE_LANE: usize = 180;
 const SOCCER_NEURAL_FEATURE_BALL_FINE_ROW: usize = 181;
+const SOCCER_NEURAL_FEATURE_PASS_TARGET_EXPECTED_COMPLETION: usize = 182;
+const SOCCER_NEURAL_FEATURE_PASS_MPC_RECEIPT_PROBABILITY: usize = 183;
+const SOCCER_NEURAL_FEATURE_PASS_RECEIPT_RACE_ADVANTAGE: usize = 184;
+const SOCCER_NEURAL_FEATURE_PASS_RECEIPT_QP_ACCEL_FIT: usize = 185;
+const SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_CONTROL_PROBABILITY: usize = 186;
+const SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_QP_ACCEL_FIT: usize = 187;
+const SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_SPACE_MARGIN: usize = 188;
+const SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY: usize = 189;
+const SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT: usize = 190;
+const SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY: usize = 191;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -2792,6 +2783,10 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     268,
     180,
     318,
+    320,
+    182,
+    324,
+    186,
     SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
@@ -4587,6 +4582,34 @@ pub struct SoccerDecisionContext {
     pub target_angle_degrees: f64,
     #[serde(default)]
     pub action_ball_speed_yps: f64,
+    /// Chosen pass target's decision-time completion estimate. Zero for non-pass
+    /// actions or passes without a resolved receiver.
+    #[serde(default)]
+    pub pass_target_expected_completion: f64,
+    /// MPC/QP receipt prior for the chosen pass: can the receiver meet the ball
+    /// under bounded acceleration before/against the nearest opponent?
+    #[serde(default)]
+    pub pass_mpc_receipt_probability: f64,
+    #[serde(default)]
+    pub pass_receipt_race_advantage_seconds: f64,
+    #[serde(default)]
+    pub pass_receipt_qp_accel_fit: f64,
+    /// MPC/QP dribble-control prior for the chosen touch target. Zero for
+    /// non-dribble actions.
+    #[serde(default)]
+    pub dribble_mpc_control_probability: f64,
+    #[serde(default)]
+    pub dribble_mpc_qp_accel_fit: f64,
+    #[serde(default)]
+    pub dribble_mpc_space_margin_yards: f64,
+    /// MPC/QP shot target prior for the chosen shooting action. Zero for
+    /// non-shot actions.
+    #[serde(default)]
+    pub shot_mpc_accuracy_probability: f64,
+    #[serde(default)]
+    pub shot_mpc_qp_target_fit: f64,
+    #[serde(default)]
+    pub shot_mpc_goal_probability: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dribble_touch_angle_bucket: Option<u8>,
     #[serde(default)]
@@ -7906,6 +7929,55 @@ impl SoccerQPolicy {
                 Some((*candidate_id, preference))
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(candidate_id, _)| candidate_id)
+    }
+
+    pub fn best_pass_target_player_for_snapshot(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> Option<usize> {
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let player_position = snapshot.player_position(player_id).unwrap_or(player.position);
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(player_id),
+            &snapshot.observation_for(player_id),
+            player.team,
+            player.role,
+        );
+        let action = normalize_soccer_action_label(action);
+        candidates
+            .iter()
+            .filter_map(|candidate_id| {
+                let target = snapshot.players.iter().find(|p| p.id == *candidate_id)?;
+                let position = snapshot.player_position(*candidate_id)?;
+                let grid =
+                    pitch_grid_address(position, snapshot.field_width, snapshot.field_length);
+                let learned_preference = self.target_preference_for_grid(&state, action, &grid);
+                let quality = pass_target_quality_for_snapshot(
+                    snapshot,
+                    player,
+                    player_position,
+                    target,
+                    position,
+                    flight,
+                );
+                let learned_score = learned_preference.unwrap_or(0.0);
+                let learned_weight = if learned_preference.is_some() { 1.0 } else { 0.0 };
+                let score = learned_score * learned_weight
+                    + quality.expected_completion * 0.82
+                    + quality.mpc_receipt_probability * 0.52
+                    + quality.stride_fit * 0.22
+                    + quality.receiver_openness * 0.20;
+                Some((*candidate_id, score))
+            })
+            .max_by(|a, b| {
+                a.1.total_cmp(&b.1)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
             .map(|(candidate_id, _)| candidate_id)
     }
 
@@ -14204,8 +14276,9 @@ fn movement_decisiveness(confidence: f64) -> f64 {
 
 fn belief_from_observation(obs: &SoccerPomdpObservation) -> BeliefState {
     let pressure = obs.perceived_pressure;
-    let shot_quality =
-        if obs.visible_ball && obs.shot_block_probability <= SHOT_BLOCK_BAILOUT_MAX_PROBABILITY {
+    let shot_quality = if obs.visible_ball
+        && obs.shot_block_probability <= tunables().shooting.shot_block_bailout_max_probability
+    {
             let block_factor = (1.0 - obs.shot_block_probability * 0.55).clamp(0.25, 1.0);
             ((obs.shot_on_frame_probability * 0.64
                 + obs.shot_beat_goalkeeper_probability * 0.30
@@ -14213,9 +14286,9 @@ fn belief_from_observation(obs: &SoccerPomdpObservation) -> BeliefState {
                 + (1.0 - obs.immediate_dispossession_risk) * 0.06)
                 * block_factor)
                 .clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+    } else {
+        0.0
+    };
     let visible_option_confidence = (obs.visible_pass_options as f64 / 3.0).clamp(0.0, 1.0);
     BeliefState {
         possession_confidence: if obs.has_ball {
@@ -15282,6 +15355,11 @@ fn soccer_decision_context_for(
         .player_acceleration(player_id)
         .or_else(|| after.player_acceleration(player_id))
         .unwrap_or_else(Vec2::zero);
+    let actor_snapshot = before
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .or_else(|| after.players.iter().find(|player| player.id == player_id));
     let (target_point, target_player) =
         soccer_decision_target_point(team, action, action_target, before, after);
     let target_player_position = target_player.and_then(|target_id| {
@@ -15305,6 +15383,35 @@ fn soccer_decision_context_for(
         .map(|delta| angle_between_vectors_degrees(Vec2::new(0.0, attack_dir), delta))
         .unwrap_or(0.0);
     let action_ball_speed_yps = after.ball.velocity.len();
+    let pass_quality_for_action = pass_like_action_flight(action).and_then(|flight| {
+        let passer = before.players.iter().find(|player| player.id == player_id)?;
+        let target_id = target_player?;
+        let target = before.players.iter().find(|player| player.id == target_id)?;
+        let target_position = before
+            .player_position(target_id)
+            .or_else(|| after.player_position(target_id))
+            .unwrap_or(target.position);
+        Some(pass_target_quality_for_snapshot(
+            before,
+            passer,
+            actor_position,
+            target,
+            target_position,
+            flight,
+        ))
+    });
+    let pass_target_expected_completion = pass_quality_for_action
+        .map(|quality| quality.expected_completion)
+        .unwrap_or(0.0);
+    let pass_mpc_receipt_probability = pass_quality_for_action
+        .map(|quality| quality.mpc_receipt_probability)
+        .unwrap_or(0.0);
+    let pass_receipt_race_advantage_seconds = pass_quality_for_action
+        .map(|quality| quality.mpc_receipt_race_advantage_seconds)
+        .unwrap_or(0.0);
+    let pass_receipt_qp_accel_fit = pass_quality_for_action
+        .map(|quality| quality.mpc_receipt_qp_accel_fit)
+        .unwrap_or(0.0);
     let dribble_touch = action_target.and_then(|target| {
         if is_dribble_action_label(action) {
             target.dribble_touch
@@ -15327,6 +15434,98 @@ fn soccer_decision_context_for(
     } else {
         (None, 0.0, 0, 0)
     };
+    let dribble_mpc_for_action = if is_dribble_action_label(action) {
+        actor_snapshot.and_then(|actor| {
+            target_point.map(|target| {
+                dribble_mpc_control_estimate_for_snapshot(
+                    before,
+                    actor.id,
+                    actor.team,
+                    actor.role,
+                    &actor.skills,
+                    actor.fatigue,
+                    actor_position,
+                    actor_velocity,
+                    target,
+                    dribble_touch
+                        .map(|touch| touch.distance_yards)
+                        .unwrap_or(target_distance_yards),
+                )
+            })
+        })
+    } else {
+        None
+    };
+    let dribble_mpc_control_probability = dribble_mpc_for_action
+        .map(|estimate| estimate.control_probability)
+        .unwrap_or(0.0);
+    let dribble_mpc_qp_accel_fit = dribble_mpc_for_action
+        .map(|estimate| estimate.qp_accel_fit)
+        .unwrap_or(0.0);
+    let dribble_mpc_space_margin_yards = dribble_mpc_for_action
+        .map(|estimate| estimate.space_margin_yards)
+        .unwrap_or(0.0);
+    let shot_mpc_for_action = {
+        let label = normalize_soccer_action_label(action);
+        if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            actor_snapshot.map(|actor| {
+                let first_time = matches!(label, "first-time-shot" | "first-time-header");
+                let finish_skill = if label == "first-time-header" {
+                    aerial_duel_skill_from_snapshot(actor)
+                } else {
+                    (ability01(
+                        actor
+                            .skills
+                            .right_foot_shot_power
+                            .max(actor.skills.left_foot_shot_power),
+                    ) * 0.62
+                        + ability01(actor.skills.shooting) * 0.26
+                        + ability01(actor.skills.first_touch) * 0.12)
+                        .clamp(0.0, 1.0)
+                };
+                let shot_power = if first_time {
+                    shot_power_for_finish_skill(finish_skill)
+                } else {
+                    shot_power_for_skill(ability01(actor.skills.shooting))
+                };
+                let shot_speed = shot_speed_yps_from_power(shot_power, &actor.skills);
+                let nearest_opponent_distance = before
+                    .players
+                    .iter()
+                    .filter(|player| player.team == actor.team.other())
+                    .map(|opponent| {
+                        before
+                            .player_position(opponent.id)
+                            .unwrap_or(opponent.position)
+                            .distance(actor_position)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                shot_mpc_accuracy_estimate_for_snapshot(
+                    before,
+                    actor.id,
+                    actor.team,
+                    &actor.skills,
+                    actor.fatigue,
+                    actor_position,
+                    actor_velocity,
+                    shot_speed,
+                    first_time,
+                    pressure_from_nearest_distance(nearest_opponent_distance),
+                )
+            })
+        } else {
+            None
+        }
+    };
+    let shot_mpc_accuracy_probability = shot_mpc_for_action
+        .map(|estimate| estimate.accuracy_probability)
+        .unwrap_or(0.0);
+    let shot_mpc_qp_target_fit = shot_mpc_for_action
+        .map(|estimate| estimate.qp_target_fit)
+        .unwrap_or(0.0);
+    let shot_mpc_goal_probability = shot_mpc_for_action
+        .map(|estimate| estimate.goal_probability)
+        .unwrap_or(0.0);
     let (attacking_team_speed_yps, attacking_team_acceleration_yps2) =
         team_kinematic_average(before, team);
     let (defending_team_speed_yps, defending_team_acceleration_yps2) =
@@ -15421,6 +15620,16 @@ fn soccer_decision_context_for(
         target_lateral_yards,
         target_angle_degrees,
         action_ball_speed_yps,
+        pass_target_expected_completion,
+        pass_mpc_receipt_probability,
+        pass_receipt_race_advantage_seconds,
+        pass_receipt_qp_accel_fit,
+        dribble_mpc_control_probability,
+        dribble_mpc_qp_accel_fit,
+        dribble_mpc_space_margin_yards,
+        shot_mpc_accuracy_probability,
+        shot_mpc_qp_target_fit,
+        shot_mpc_goal_probability,
         dribble_touch_angle_bucket,
         dribble_touch_distance_yards,
         dribble_touch_distance_bin,
@@ -15901,10 +16110,11 @@ fn soccer_goal_credit_transition_score(
             Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | HoldUpFlank
             | SideStep | LeftCut | RightCut | Nutmeg | FakeLeftCutRight | FakeRightCutLeft,
         ) => {
-            let goal_approach_fit = ((GOAL_APPROACH_CARRY_YARDS - obs.yards_to_goal)
-                / GOAL_APPROACH_CARRY_YARDS)
+            let goal_approach_carry_yards = tunables().shooting.goal_approach_carry_yards;
+            let goal_approach_fit = ((goal_approach_carry_yards - obs.yards_to_goal)
+                / goal_approach_carry_yards)
                 .clamp(0.0, 1.0);
-            let endline_trap_risk = if obs.yards_to_goal <= GOAL_APPROACH_CARRY_YARDS
+            let endline_trap_risk = if obs.yards_to_goal <= goal_approach_carry_yards
                 && next_obs.yards_to_goal <= 6.0
                 && next_obs.goal_attack_window_score <= obs.goal_attack_window_score + 0.02
             {
@@ -16875,7 +17085,7 @@ fn goalmouth_dribble_learning_reward(
 ) -> f64 {
     if player.role == PlayerRole::Goalkeeper
         || !is_dribble_action_label(action)
-        || before_obs.yards_to_goal > GOAL_APPROACH_CARRY_YARDS
+        || before_obs.yards_to_goal > tunables().shooting.goal_approach_carry_yards
         || before.ball.holder != Some(player.id)
     {
         return 0.0;
@@ -16887,8 +17097,9 @@ fn goalmouth_dribble_learning_reward(
         - goalmouth_centrality(before_pos, before.field_width);
     let window_gain = after_obs.goal_attack_window_score.clamp(0.0, 1.0)
         - before_obs.goal_attack_window_score.clamp(0.0, 1.0);
-    let approach_fit = ((GOAL_APPROACH_CARRY_YARDS - before_obs.yards_to_goal)
-        / (GOAL_APPROACH_CARRY_YARDS - TEAMMATE_MUST_SHOOT_YARDS).max(1.0))
+    let goal_approach_carry_yards = tunables().shooting.goal_approach_carry_yards;
+    let approach_fit = ((goal_approach_carry_yards - before_obs.yards_to_goal)
+        / (goal_approach_carry_yards - TEAMMATE_MUST_SHOOT_YARDS).max(1.0))
     .clamp(0.0, 1.0);
     let role_fit = match player.role {
         PlayerRole::Forward => 1.18,
@@ -29951,6 +30162,29 @@ fn soccer_neural_transition_features_with_action(
             PITCH_FINE_GRID_COLUMNS as f64 - 1.0,
         ),
         soccer_neural_scaled(ball_grid.fine.y as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
+        // Pass receipt learning (indices 182-185): chosen-target completion plus
+        // the MPC/QP reach prior from the 22-player + ball configuration. These
+        // let the critic learn which pass target actually gets controlled rather
+        // than treating endpoint noise as a free-standing analytic scalar.
+        soccer_neural_unit(transition.decision_context.pass_target_expected_completion),
+        soccer_neural_unit(transition.decision_context.pass_mpc_receipt_probability),
+        soccer_neural_signed_unit(
+            transition
+                .decision_context
+                .pass_receipt_race_advantage_seconds
+                / 2.0,
+        ),
+        soccer_neural_unit(transition.decision_context.pass_receipt_qp_accel_fit),
+        // Dribble and shot MPC learning (indices 186-191): bounded-control and
+        // QP target-fit estimates, derived from the full 22-player + ball field
+        // shape, so dribble and shooting accuracy are learned instead of
+        // remaining detached endpoint heuristics.
+        soccer_neural_unit(context.dribble_mpc_control_probability),
+        soccer_neural_unit(context.dribble_mpc_qp_accel_fit),
+        soccer_neural_signed_unit(context.dribble_mpc_space_margin_yards / 6.0),
+        soccer_neural_unit(context.shot_mpc_accuracy_probability),
+        soccer_neural_unit(context.shot_mpc_qp_target_fit),
+        soccer_neural_unit(context.shot_mpc_goal_probability),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
     // grid + motion vector of all 22. Older nets (input_dim == base) migrate by
@@ -41460,7 +41694,7 @@ fn goal_attack_window_score_for_role(
     }
 
     let mut distance_fit = ((window_yards - yards_to_goal) / window_yards).clamp(0.0, 1.0);
-    if role == PlayerRole::Forward && yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS {
+    if role == PlayerRole::Forward && yards_to_goal <= tunables().shooting.striker_shot_window_yards {
         distance_fit = distance_fit.max(0.30);
     }
     if yards_to_goal <= TEAMMATE_MUST_SHOOT_YARDS {
@@ -41498,9 +41732,9 @@ fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
     }
     let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
     let quality_shot = block_risk <= SHOT_BLOCK_DECISION_MAX_PROBABILITY
-        && observation.shot_on_frame_probability >= SHOT_ON_FRAME_MIN_PROBABILITY
+        && observation.shot_on_frame_probability >= tunables().shooting.shot_on_frame_min_probability
         && observation.shot_beat_goalkeeper_probability >= SHOT_KEEPER_BEAT_MIN_PROBABILITY;
-    let pressure_bailout = block_risk <= SHOT_BLOCK_BAILOUT_MAX_PROBABILITY
+    let pressure_bailout = block_risk <= tunables().shooting.shot_block_bailout_max_probability
         && observation.yards_to_goal <= SHOT_BAILOUT_NEAR_GOAL_YARDS
         && observation.immediate_dispossession_risk >= SHOT_BAILOUT_DISPOSSESSION_RISK
         && observation.shot_on_frame_probability >= SHOT_BAILOUT_ON_FRAME_PROBABILITY;
@@ -41835,7 +42069,7 @@ fn striker_shot_window_is_qualified(
         return false;
     }
     let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
-    observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS
+    observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards
         && observation.shot_lane_open
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
@@ -41933,7 +42167,7 @@ fn striker_legal_shot_attempt_bonus(observation: &SoccerPomdpObservation, role: 
         return 0.0;
     }
     let window_yards = if role == PlayerRole::Forward {
-        STRIKER_SHOT_WINDOW_YARDS
+        tunables().shooting.striker_shot_window_yards
     } else {
         TEAMMATE_MUST_SHOOT_YARDS
     };
@@ -41943,7 +42177,10 @@ fn striker_legal_shot_attempt_bonus(observation: &SoccerPomdpObservation, role: 
             / STRIKER_SHOT_MAX_BLOCK_PROBABILITY.max(1e-6))
     .clamp(0.0, 1.0);
     let on_frame_fit = (observation.shot_on_frame_probability
-        / SHOT_ON_FRAME_MIN_PROBABILITY.max(1e-6))
+        / tunables()
+            .shooting
+            .shot_on_frame_min_probability
+            .max(1e-6))
     .clamp(0.0, 1.4);
     let keeper_fit = (observation.shot_beat_goalkeeper_probability
         / SHOT_KEEPER_BEAT_MIN_PROBABILITY.max(1e-6))
@@ -41973,7 +42210,7 @@ fn near_goal_shot_pressure_floor(
         return 0.0;
     }
     let window_yards = match role {
-        PlayerRole::Forward => STRIKER_SHOT_WINDOW_YARDS,
+        PlayerRole::Forward => tunables().shooting.striker_shot_window_yards,
         PlayerRole::Midfielder | PlayerRole::Defender => TEAMMATE_MUST_SHOOT_YARDS,
         PlayerRole::Goalkeeper => return 0.0,
     };
@@ -42486,7 +42723,9 @@ fn goal_approach_carry_window_yards(role: PlayerRole) -> f64 {
     match role {
         PlayerRole::Goalkeeper => 0.0,
         PlayerRole::Defender => ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS,
-        PlayerRole::Midfielder | PlayerRole::Forward => GOAL_APPROACH_CARRY_YARDS,
+        PlayerRole::Midfielder | PlayerRole::Forward => {
+            tunables().shooting.goal_approach_carry_yards
+        }
     }
 }
 
@@ -42548,11 +42787,13 @@ fn close_clear_shot_attempt_probability(
         return 0.0;
     }
     let (window_yards, ramp_yards) = match role {
-        PlayerRole::Forward => (STRIKER_SHOT_WINDOW_YARDS, 18.0),
+        PlayerRole::Forward => (tunables().shooting.striker_shot_window_yards, 18.0),
         _ => (TEAMMATE_MUST_SHOOT_YARDS, 16.0),
     };
     let mut close_fit = ((window_yards - observation.yards_to_goal) / ramp_yards).clamp(0.0, 1.0);
-    if role == PlayerRole::Forward && observation.yards_to_goal <= STRIKER_SHOT_WINDOW_YARDS {
+    if role == PlayerRole::Forward
+        && observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards
+    {
         close_fit = close_fit.max(0.24);
     }
     if striker_must_shoot(observation, role) {
@@ -42566,7 +42807,9 @@ fn close_clear_shot_attempt_probability(
             / SHOT_BLOCK_DECISION_MAX_PROBABILITY.max(1e-6))
     .clamp(0.0, 1.0);
     let on_frame_fit =
-        (observation.shot_on_frame_probability / SHOT_ON_FRAME_MIN_PROBABILITY).clamp(0.0, 1.35);
+        (observation.shot_on_frame_probability
+            / tunables().shooting.shot_on_frame_min_probability)
+            .clamp(0.0, 1.35);
     let keeper_fit = (observation.shot_beat_goalkeeper_probability
         / SHOT_KEEPER_BEAT_MIN_PROBABILITY)
         .clamp(0.0, 1.35);
@@ -42581,8 +42824,9 @@ fn close_clear_shot_attempt_probability(
         PlayerRole::Goalkeeper => 0.0,
     };
     let striker_window_bonus = if role == PlayerRole::Forward {
-        let window_fit = ((STRIKER_SHOT_WINDOW_YARDS - observation.yards_to_goal)
-            / (STRIKER_SHOT_WINDOW_YARDS - STRIKER_MUST_SHOOT_YARDS).max(1e-6))
+        let striker_shot_window_yards = tunables().shooting.striker_shot_window_yards;
+        let window_fit = ((striker_shot_window_yards - observation.yards_to_goal)
+            / (striker_shot_window_yards - STRIKER_MUST_SHOOT_YARDS).max(1e-6))
         .clamp(0.0, 1.0);
         0.18 + window_fit * 0.22
     } else {
@@ -42646,7 +42890,7 @@ fn first_time_shot_score_for_player(
     goal_angle_degrees: f64,
     pressure: f64,
 ) -> f64 {
-    if shot_block_probability > SHOT_BLOCK_BAILOUT_MAX_PROBABILITY {
+    if shot_block_probability > tunables().shooting.shot_block_bailout_max_probability {
         return 0.0;
     }
     let foot_power = (ability01(
@@ -43147,6 +43391,287 @@ struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
     stride_fit: f64,
+    mpc_receipt_probability: f64,
+    mpc_receipt_race_advantage_seconds: f64,
+    mpc_receipt_qp_accel_fit: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PassMpcReceiptEstimate {
+    probability: f64,
+    race_advantage_seconds: f64,
+    qp_accel_fit: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DribbleMpcControlEstimate {
+    control_probability: f64,
+    qp_accel_fit: f64,
+    space_margin_yards: f64,
+}
+
+fn bounded_accel_qp_control_fit(
+    position: Vec2,
+    velocity: Vec2,
+    target_point: Vec2,
+    horizon_seconds: f64,
+    acceleration_cap_yps2: f64,
+    control_radius_yards: f64,
+    effort_weight: f64,
+) -> f64 {
+    let horizon = horizon_seconds.clamp(0.10, 3.5);
+    let accel_cap = acceleration_cap_yps2.clamp(0.5, 16.0);
+    let control_radius = control_radius_yards.clamp(0.35, 3.2);
+    let effort_weight = effort_weight.clamp(0.0, 0.35);
+    let drift = position + velocity * horizon;
+    let error = drift - target_point;
+    if error.len() <= control_radius * 0.65 {
+        return 1.0;
+    }
+    let coeff = 0.5 * horizon * horizon;
+    let quad = 2.0 * (coeff * coeff + effort_weight);
+    let program = QuadraticProgram {
+        q: vec![vec![quad, 0.0], vec![0.0, quad]],
+        c: vec![2.0 * coeff * error.x, 2.0 * coeff * error.y],
+        lb: Some(vec![Some(-accel_cap), Some(-accel_cap)]),
+        ub: Some(vec![Some(accel_cap), Some(accel_cap)]),
+        var_names: Some(vec!["ax".to_string(), "ay".to_string()]),
+        ..QuadraticProgram::default()
+    };
+    let solution = solve_qp_active_set(
+        &program,
+        QPOptions {
+            tol: 1e-7,
+            max_active_sets: 64,
+        },
+    );
+    let accel = if solution.status == QPStatus::Optimal && solution.x.len() >= 2 {
+        Vec2::new(solution.x[0], solution.x[1])
+    } else {
+        let needed = (target_point - drift) * (1.0 / coeff.max(1e-6));
+        limit_vec2_len(needed, accel_cap)
+    };
+    let solved_position = drift + accel * coeff;
+    let miss_yards = solved_position.distance(target_point);
+    let position_fit =
+        (1.0 - miss_yards / (control_radius * 2.2).max(1.0)).clamp(0.0, 1.0);
+    let accel_economy = (1.0 - accel.len() / (accel_cap * 1.414).max(1.0)).clamp(0.0, 1.0);
+    (position_fit * 0.74 + accel_economy * 0.26).clamp(0.0, 1.0)
+}
+
+fn dribble_mpc_control_estimate_for_snapshot(
+    snapshot: &WorldSnapshot,
+    _player_id: usize,
+    team: Team,
+    role: PlayerRole,
+    skills: &SkillProfile,
+    fatigue: f64,
+    current: Vec2,
+    velocity: Vec2,
+    target: Vec2,
+    touch_distance_yards: f64,
+) -> DribbleMpcControlEstimate {
+    let target = target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+    let distance = current.distance(target);
+    let fatigue_factor = fatigue_speed_factor(skills.stamina, fatigue);
+    let top_speed = (player_top_speed_yps(role, skills) * fatigue_factor).max(0.85);
+    let accel_cap = acceleration_yps2_from_score(skills.acceleration) * fatigue_factor;
+    let horizon = (distance / (top_speed * 0.92).max(0.85)).clamp(0.16, 0.92);
+    let control_radius = (PLAYER_CONTROL_RADIUS_YARDS
+        * (1.0 + ability01(skills.first_touch) * 0.42 + ability01(skills.dribbling) * 0.18))
+    .clamp(0.85, 2.35);
+    let qp_accel_fit = bounded_accel_qp_control_fit(
+        current,
+        velocity,
+        target,
+        horizon,
+        accel_cap,
+        control_radius,
+        0.045,
+    );
+    let mut nearest_target_gap = f64::INFINITY;
+    let mut nearest_path_gap = f64::INFINITY;
+    let mut opponent_time = f64::INFINITY;
+    for opponent in snapshot.players.iter().filter(|player| player.team == team.other()) {
+        let opponent_position = snapshot
+            .player_position(opponent.id)
+            .unwrap_or(opponent.position);
+        nearest_target_gap = nearest_target_gap.min(opponent_position.distance(target));
+        nearest_path_gap =
+            nearest_path_gap.min(segment_distance_to_point(current, target, opponent_position));
+        let opponent_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        opponent_time = opponent_time.min(opponent_position.distance(target) / opponent_speed);
+    }
+    let nearest_current_gap = snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == team.other())
+        .map(|opponent| {
+            snapshot
+                .player_position(opponent.id)
+                .unwrap_or(opponent.position)
+                .distance(current)
+        })
+        .fold(f64::INFINITY, f64::min);
+    let pressure = pressure_from_nearest_distance(nearest_current_gap);
+    let clearance = nearest_target_gap.min(nearest_path_gap + 0.75);
+    let space_margin_yards = if clearance.is_finite() {
+        clearance - PLAYER_CONTROL_RADIUS_YARDS
+    } else {
+        8.0
+    };
+    let space_fit = ((space_margin_yards + 0.65) / 5.25).clamp(0.0, 1.0);
+    let player_time = distance / (top_speed * MovementGait::Sprint.speed_multiplier()).max(0.85);
+    let race_advantage = if opponent_time.is_finite() {
+        opponent_time - player_time
+    } else {
+        1.8
+    };
+    let race_fit = ((race_advantage + 0.22) / 1.55).clamp(0.0, 1.0);
+    let touch_fit =
+        (1.0 - (touch_distance_yards.max(distance) - distance).abs() / 3.8).clamp(0.25, 1.0);
+    let control_skill = (ability01(skills.dribbling) * 0.46
+        + ability01(skills.first_touch) * 0.22
+        + ability01(skills.acceleration) * 0.22
+        + ability01(skills.strength) * 0.10)
+        .clamp(0.0, 1.0);
+    let control_probability = (0.05
+        + qp_accel_fit * 0.34
+        + space_fit * 0.25
+        + race_fit * 0.16
+        + control_skill * 0.17
+        + touch_fit * 0.08
+        - pressure * 0.18)
+        .clamp(0.0, 0.99);
+    DribbleMpcControlEstimate {
+        control_probability,
+        qp_accel_fit,
+        space_margin_yards: finite_metric(space_margin_yards),
+    }
+}
+
+fn pass_receipt_qp_accel_fit(
+    receiver_position: Vec2,
+    receiver_velocity: Vec2,
+    target_point: Vec2,
+    ball_time_seconds: f64,
+    acceleration_cap_yps2: f64,
+) -> f64 {
+    let horizon = ball_time_seconds.clamp(0.12, 3.5);
+    let accel_cap = acceleration_cap_yps2.clamp(0.5, 16.0);
+    let drift = receiver_position + receiver_velocity * horizon;
+    let error = drift - target_point;
+    if error.len() <= PLAYER_CONTROL_RADIUS_YARDS * 0.65 {
+        return 1.0;
+    }
+    let coeff = 0.5 * horizon * horizon;
+    let position_weight = 1.0;
+    let effort_weight = 0.035;
+    let quad = 2.0 * (position_weight * coeff * coeff + effort_weight);
+    let program = QuadraticProgram {
+        q: vec![vec![quad, 0.0], vec![0.0, quad]],
+        c: vec![
+            2.0 * position_weight * coeff * error.x,
+            2.0 * position_weight * coeff * error.y,
+        ],
+        lb: Some(vec![Some(-accel_cap), Some(-accel_cap)]),
+        ub: Some(vec![Some(accel_cap), Some(accel_cap)]),
+        var_names: Some(vec!["ax".to_string(), "ay".to_string()]),
+        ..QuadraticProgram::default()
+    };
+    let solution = solve_qp_active_set(
+        &program,
+        QPOptions {
+            tol: 1e-7,
+            max_active_sets: 64,
+        },
+    );
+    let accel = if solution.status == QPStatus::Optimal && solution.x.len() >= 2 {
+        Vec2::new(solution.x[0], solution.x[1])
+    } else {
+        let needed = (target_point - drift) * (1.0 / coeff.max(1e-6));
+        limit_vec2_len(needed, accel_cap)
+    };
+    let solved_position = drift + accel * coeff;
+    let miss_yards = solved_position.distance(target_point);
+    let position_fit = (1.0 - miss_yards / (PLAYER_CONTROL_RADIUS_YARDS * 2.2).max(1.0))
+        .clamp(0.0, 1.0);
+    let accel_economy = (1.0 - accel.len() / (accel_cap * 1.414).max(1.0)).clamp(0.0, 1.0);
+    (position_fit * 0.76 + accel_economy * 0.24).clamp(0.0, 1.0)
+}
+
+fn pass_mpc_receipt_estimate_for_snapshot(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    flight: PassFlight,
+    pass_speed_yps: f64,
+    target_point: Vec2,
+) -> PassMpcReceiptEstimate {
+    let distance = passer_position.distance(target_point);
+    let ball_time_seconds = distance / pass_speed_yps.max(1.0);
+    let receiver_velocity = snapshot
+        .player_velocity(target.id)
+        .unwrap_or(target.velocity);
+    let receiver_accel_cap = acceleration_yps2_from_score(target.skills.acceleration)
+        * fatigue_speed_factor(target.skills.stamina, target.fatigue);
+    let qp_accel_fit = pass_receipt_qp_accel_fit(
+        target_position,
+        receiver_velocity,
+        target_point,
+        ball_time_seconds,
+        receiver_accel_cap,
+    );
+    let receiver_sprint_speed = (player_top_speed_yps(target.role, &target.skills)
+        * fatigue_speed_factor(target.skills.stamina, target.fatigue)
+        * MovementGait::Sprint.speed_multiplier())
+    .max(1.0);
+    let receiver_time = target_position.distance(target_point) / receiver_sprint_speed;
+    let opponent_time = snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == passer.team.other())
+        .map(|opponent| {
+            let position = snapshot
+                .player_position(opponent.id)
+                .unwrap_or(opponent.position);
+            let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+                * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+                * MovementGait::Sprint.speed_multiplier())
+            .max(1.0);
+            position.distance(target_point) / sprint_speed
+        })
+        .fold(f64::INFINITY, f64::min);
+    let race_advantage_seconds = if opponent_time.is_finite() {
+        opponent_time - receiver_time
+    } else {
+        2.0
+    };
+    let race_fit = ((race_advantage_seconds + 0.30) / 1.80).clamp(0.0, 1.0);
+    let receiver_late_seconds = receiver_time - ball_time_seconds;
+    let meet_fit = if receiver_late_seconds <= 0.20 {
+        (1.0 - (-receiver_late_seconds - 2.0).max(0.0) / 4.0).clamp(0.55, 1.0)
+    } else {
+        (1.0 - (receiver_late_seconds - 0.20) / 1.35).clamp(0.0, 1.0)
+    };
+    let aerial_control = if flight.is_aerial() {
+        aerial_duel_skill_from_snapshot(target) * 0.36 + ability01(target.skills.first_touch) * 0.20
+    } else {
+        ability01(target.skills.first_touch) * 0.22
+    };
+    let probability =
+        (0.06 + qp_accel_fit * 0.38 + meet_fit * 0.22 + race_fit * 0.24 + aerial_control)
+            .clamp(0.0, 0.99);
+    PassMpcReceiptEstimate {
+        probability,
+        race_advantage_seconds: finite_metric(race_advantage_seconds),
+        qp_accel_fit,
+    }
 }
 
 fn pass_target_quality_for_snapshot(
@@ -43220,6 +43745,16 @@ fn pass_target_quality_for_snapshot(
         anticipated_target,
         nominal_speed,
         passer.team,
+    );
+    let mpc_receipt = pass_mpc_receipt_estimate_for_snapshot(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        flight,
+        nominal_speed,
+        anticipated_target,
     );
     let position_confidence = snapshot
         .player_position_confidence_for_point(passer.id, target_position)
@@ -43310,12 +43845,16 @@ fn pass_target_quality_for_snapshot(
         + stride_fit * 0.08
         + position_confidence * 0.10;
     let pass_precision = 0.80 + pass_skill * 0.20;
+    let mpc_receipt_gate = 0.68 + mpc_receipt.probability * 0.32;
     let expected_completion =
-        target_quality * lane_clearance * pass_precision * pressure_adjustment;
+        target_quality * lane_clearance * pass_precision * pressure_adjustment * mpc_receipt_gate;
     PassTargetQuality {
         receiver_openness,
         stride_fit,
         expected_completion: expected_completion.clamp(0.02, 0.98),
+        mpc_receipt_probability: mpc_receipt.probability,
+        mpc_receipt_race_advantage_seconds: mpc_receipt.race_advantage_seconds,
+        mpc_receipt_qp_accel_fit: mpc_receipt.qp_accel_fit,
     }
 }
 
@@ -44843,6 +45382,199 @@ fn shot_on_frame_probability(
     (geometry_probability * angle_factor * distance_factor * block_factor).clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ShotMpcAccuracyEstimate {
+    target_point: Vec2,
+    accuracy_probability: f64,
+    qp_target_fit: f64,
+    goal_probability: f64,
+    goalkeeper_reach_pressure: f64,
+    block_probability: f64,
+}
+
+fn shot_mpc_accuracy_estimate_for_snapshot(
+    snapshot: &WorldSnapshot,
+    _player_id: usize,
+    attacking_team: Team,
+    skills: &SkillProfile,
+    fatigue: f64,
+    player_position: Vec2,
+    player_velocity: Vec2,
+    shot_speed_yps: f64,
+    quick_release: bool,
+    pressure: f64,
+) -> ShotMpcAccuracyEstimate {
+    let goal_y = attacking_team.goal_y(snapshot.field_length);
+    let goal_center_x = snapshot.field_width * 0.5;
+    let half_width = (snapshot.goal_width * 0.5).max(0.5);
+    let left_post_x = goal_center_x - half_width;
+    let right_post_x = goal_center_x + half_width;
+    let shot_speed_yps = shot_speed_yps.max(1.0);
+    let pressure = pressure.clamp(0.0, 1.0);
+    let targets = shot_goalmouth_target_points(
+        snapshot.field_width,
+        snapshot.field_length,
+        snapshot.goal_width,
+        attacking_team,
+    );
+    let mut least_blocked_target = Vec2::new(goal_center_x, goal_y);
+    let mut least_block_probability = f64::INFINITY;
+    for target in targets {
+        let block_probability = shot_block_assessment_for_snapshot_target(
+            snapshot,
+            player_position,
+            target,
+            attacking_team,
+            shot_speed_yps,
+            quick_release,
+        )
+        .map(|assessment| assessment.probability)
+        .unwrap_or(0.0);
+        if block_probability < least_block_probability {
+            least_block_probability = block_probability;
+            least_blocked_target = target;
+        }
+    }
+    if !least_block_probability.is_finite() {
+        least_block_probability = 0.0;
+    }
+    let keeper_position = snapshot
+        .goalkeeper_for(attacking_team.other())
+        .and_then(|keeper_id| snapshot.player_position(keeper_id))
+        .unwrap_or(Vec2::new(goal_center_x, goal_y));
+    let keeper_open_x = if keeper_position.x <= goal_center_x {
+        goal_center_x + half_width * 0.82
+    } else {
+        goal_center_x - half_width * 0.82
+    };
+    let shooter_angle_x = if player_position.x <= goal_center_x {
+        goal_center_x + half_width * 0.42
+    } else {
+        goal_center_x - half_width * 0.42
+    };
+    let shooting_skill = ability01(skills.shooting);
+    let foot_power = ability01(skills.right_foot_shot_power.max(skills.left_foot_shot_power));
+    let body_control = (ability01(skills.first_touch) * 0.34
+        + ability01(skills.strength) * 0.24
+        + ability01(skills.acceleration) * 0.18
+        + shooting_skill * 0.24)
+        .clamp(0.0, 1.0);
+    let shot_skill = (shooting_skill * 0.58 + foot_power * 0.22 + body_control * 0.20)
+        .clamp(0.0, 1.0);
+    let target_weight = 0.82 + shot_skill * 0.72;
+    let keeper_weight = 0.56 + (1.0 - pressure) * 0.24;
+    let blocker_weight = 0.58 + least_block_probability.clamp(0.0, 1.0) * 0.42;
+    let velocity_weight = (player_velocity.len() / 10.0).clamp(0.0, 0.24);
+    let fatigue_penalty = fatigue.clamp(0.0, 1.0) * 0.18;
+    let unbounded_preference = (target_weight * shooter_angle_x
+        + keeper_weight * keeper_open_x
+        + blocker_weight * least_blocked_target.x
+        + velocity_weight * (goal_center_x + player_velocity.x.clamp(-8.0, 8.0) * 0.18))
+        / (target_weight + keeper_weight + blocker_weight + velocity_weight).max(1e-6);
+    let program = QuadraticProgram {
+        q: vec![vec![2.0 * (target_weight + keeper_weight + blocker_weight + 0.08)]],
+        c: vec![-2.0
+            * (target_weight * shooter_angle_x
+                + keeper_weight * keeper_open_x
+                + blocker_weight * least_blocked_target.x)],
+        lb: Some(vec![Some(left_post_x)]),
+        ub: Some(vec![Some(right_post_x)]),
+        var_names: Some(vec!["goal_x".to_string()]),
+        ..QuadraticProgram::default()
+    };
+    let solution = solve_qp_active_set(
+        &program,
+        QPOptions {
+            tol: 1e-7,
+            max_active_sets: 32,
+        },
+    );
+    let target_x = if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
+        solution.x[0]
+    } else {
+        unbounded_preference
+    }
+    .clamp(left_post_x, right_post_x);
+    let target_point = Vec2::new(target_x, goal_y);
+    let bounded_preference = unbounded_preference.clamp(left_post_x, right_post_x);
+    let bound_residual = (target_x - bounded_preference).abs();
+    let distance = player_position.distance(target_point);
+    let left_post = Vec2::new(left_post_x, goal_y);
+    let right_post = Vec2::new(right_post_x, goal_y);
+    let goal_angle_degrees =
+        angle_between_vectors_degrees(left_post - player_position, right_post - player_position);
+    let chosen_block_probability = shot_block_assessment_for_snapshot_target(
+        snapshot,
+        player_position,
+        target_point,
+        attacking_team,
+        shot_speed_yps,
+        quick_release,
+    )
+    .map(|assessment| assessment.probability)
+    .unwrap_or(0.0)
+    .clamp(0.0, 1.0);
+    let base_on_frame = shot_on_frame_probability(
+        snapshot.goal_width,
+        shooting_skill,
+        pressure,
+        distance,
+        goal_angle_degrees,
+        chosen_block_probability,
+    );
+    let shot_time = distance / shot_speed_yps.max(1.0);
+    let body_fit = (0.48 + shot_skill * 0.30 + body_control * 0.22 - fatigue_penalty)
+        .clamp(0.22, 1.0);
+    let target_fit = (1.0 - bound_residual / (half_width * 1.35).max(0.25)).clamp(0.0, 1.0);
+    let time_fit = (1.0 - (shot_time - 1.05).max(0.0) / 2.6).clamp(0.35, 1.0);
+    let qp_target_fit = (target_fit * 0.46
+        + body_fit * 0.30
+        + time_fit * 0.14
+        + (1.0 - pressure) * 0.10)
+        .clamp(0.0, 1.0);
+    let save_probability = snapshot
+        .goalkeeper_for(attacking_team.other())
+        .and_then(|keeper_id| {
+            snapshot.players.iter().find(|keeper| keeper.id == keeper_id).map(|keeper| {
+                let keeper_position = snapshot
+                    .player_position(keeper_id)
+                    .unwrap_or(keeper.position);
+                let keeper_velocity = snapshot
+                    .player_velocity(keeper_id)
+                    .unwrap_or(keeper.velocity);
+                goalkeeper_save_probability_from_traits(
+                    &keeper.skills,
+                    keeper_position,
+                    keeper_velocity,
+                    keeper.fatigue,
+                    player_position,
+                    target_point,
+                    shot_speed_yps,
+                    snapshot.goal_width,
+                    chosen_block_probability,
+                )
+            })
+        })
+        .unwrap_or(0.65)
+        .clamp(0.0, 0.995);
+    let accuracy_probability = (base_on_frame
+        * (0.70 + qp_target_fit * 0.30)
+        * (0.88 + body_fit * 0.12))
+        .clamp(0.0, 1.0);
+    let goal_probability = (accuracy_probability
+        * (1.0 - save_probability)
+        * (1.0 - chosen_block_probability * 0.42).clamp(0.12, 1.0))
+        .clamp(0.0, 1.0);
+    ShotMpcAccuracyEstimate {
+        target_point,
+        accuracy_probability,
+        qp_target_fit,
+        goal_probability,
+        goalkeeper_reach_pressure: save_probability,
+        block_probability: chosen_block_probability,
+    }
+}
+
 fn noisy_shot_target_x(
     goal_center_x: f64,
     goal_width: f64,
@@ -46049,7 +46781,10 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         "hold-up-flank" => {
             observation.has_ball
                 && player.role == PlayerRole::Forward
-                && observation.yards_to_goal > STRIKER_HOLD_UP_MIN_GOAL_DISTANCE_YARDS
+                && observation.yards_to_goal
+                    > tunables()
+                        .shooting
+                        .striker_hold_up_min_goal_distance_yards
                 && snapshot
                     .striker_hold_up_flank_target_for(player_id)
                     .is_some()
@@ -46900,8 +47635,9 @@ fn shot_creation_carry_multiplier(observation: &SoccerPomdpObservation) -> f64 {
     }
     let attacking_range =
         (1.0 - ((observation.yards_to_goal - 14.0).max(0.0) / 54.0)).clamp(0.0, 1.0);
-    let almost_on_frame =
-        (observation.shot_on_frame_probability / SHOT_ON_FRAME_MIN_PROBABILITY).clamp(0.0, 1.0);
+    let almost_on_frame = (observation.shot_on_frame_probability
+        / tunables().shooting.shot_on_frame_min_probability)
+        .clamp(0.0, 1.0);
     let almost_beats_keeper = (observation.shot_beat_goalkeeper_probability
         / SHOT_KEEPER_BEAT_MIN_PROBABILITY)
         .clamp(0.0, 1.0);
