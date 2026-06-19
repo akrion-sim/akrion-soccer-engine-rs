@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
+    SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
     SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
@@ -1686,9 +1687,56 @@ impl SoccerLearningPgStore {
                 SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
             )?;
         }
+        if !game.pass_outcome_samples.is_empty() {
+            ensure_soccer_pass_outcome_tables(&mut tx)?;
+            insert_pass_outcome_samples_in_transaction(
+                &mut tx,
+                Some(run_id.as_str()),
+                Some(experiment_id),
+                &game.pass_outcome_samples,
+            )?;
+        }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run: {err}"))?;
         Ok(run_id)
+    }
+
+    /// Load the most recent pass-outcome training samples for an experiment (newest first), the
+    /// corpus the cluster learner trains [`SoccerPassCompletionHead`] on. `limit` caps the batch.
+    pub fn load_pass_outcome_samples(
+        &mut self,
+        experiment_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SoccerPassOutcomeSample>, String> {
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin pass-outcome load transaction: {err}"))?;
+        ensure_soccer_pass_outcome_tables(&mut tx)?;
+        let rows = tx
+            .query(
+                "select features, completed, own_half \
+                 from des_soccer_pass_outcome_samples \
+                 where experiment_id = $1::text::uuid and deleted_at is null \
+                 order by created_at desc limit $2",
+                &[&experiment_id, &limit],
+            )
+            .map_err(|err| format!("load soccer pass-outcome samples: {err}"))?;
+        let samples = rows
+            .into_iter()
+            .map(|row| {
+                let features: Vec<f32> = row.get(0);
+                SoccerPassOutcomeSample {
+                    features,
+                    completed: row.get(1),
+                    own_half: row.get(2),
+                }
+            })
+            .collect();
+        tx.commit()
+            .map_err(|err| format!("commit pass-outcome load: {err}"))?;
+        Ok(samples)
     }
 
     /// Persist moment embeddings (one fixed-width vector per transition) for
@@ -3842,6 +3890,86 @@ fn config_moment_values_clause(rows: usize) -> String {
         );
     }
     clause
+}
+
+/// Multi-row VALUES clause for pass-outcome samples: `$1,$2` are the shared run/experiment ids,
+/// then 3 params per row (features real[], completed bool, own_half bool).
+fn pass_outcome_values_clause(rows: usize) -> String {
+    let mut clause = String::new();
+    for i in 0..rows {
+        if i > 0 {
+            clause.push(',');
+        }
+        let base = 3 + i * 3;
+        let _ = write!(
+            clause,
+            "($1::text::uuid,$2::text::uuid,${},${},${})",
+            base,
+            base + 1,
+            base + 2
+        );
+    }
+    clause
+}
+
+/// 3 params/row + 2 shared ⇒ stay well under Postgres's 65535-parameter ceiling.
+const PASS_OUTCOME_INSERT_CHUNK_ROWS: usize = 5000;
+
+fn ensure_soccer_pass_outcome_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
+    tx.batch_execute(&format!(
+        r#"
+        create extension if not exists pgcrypto;
+        create table if not exists des_soccer_pass_outcome_samples (
+          id uuid primary key default gen_random_uuid(),
+          run_id uuid,
+          experiment_id uuid,
+          features real[] not null,
+          completed boolean not null,
+          own_half boolean not null,
+          created_at timestamptz not null default now(),
+          deleted_at timestamptz,
+          constraint des_soccer_pass_outcome_features_len_chk
+            check (array_length(features, 1) = {dim})
+        );
+        create index if not exists des_soccer_pass_outcome_run_idx
+          on des_soccer_pass_outcome_samples (run_id);
+        create index if not exists des_soccer_pass_outcome_live_created_idx
+          on des_soccer_pass_outcome_samples (experiment_id, created_at)
+          where deleted_at is null;
+        "#,
+        dim = SOCCER_PASS_COMPLETION_FEATURE_DIM
+    ))
+    .map_err(|err| format!("ensure soccer pass-outcome tables: {err}"))
+}
+
+fn insert_pass_outcome_samples_in_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: Option<&str>,
+    experiment_id: Option<&str>,
+    samples: &[SoccerPassOutcomeSample],
+) -> Result<(), String> {
+    for chunk in samples.chunks(PASS_OUTCOME_INSERT_CHUNK_ROWS) {
+        let features: Vec<Vec<f32>> = chunk
+            .iter()
+            .map(|s| sanitize_features(&s.features))
+            .collect();
+        let completed: Vec<bool> = chunk.iter().map(|s| s.completed).collect();
+        let own_half: Vec<bool> = chunk.iter().map(|s| s.own_half).collect();
+        let sql = format!(
+            "insert into des_soccer_pass_outcome_samples \
+             (run_id, experiment_id, features, completed, own_half) values {}",
+            pass_outcome_values_clause(chunk.len())
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&run_id, &experiment_id];
+        for i in 0..chunk.len() {
+            params.push(&features[i]);
+            params.push(&completed[i]);
+            params.push(&own_half[i]);
+        }
+        tx.execute(sql.as_str(), &params)
+            .map_err(|err| format!("insert soccer pass-outcome samples: {err}"))?;
+    }
+    Ok(())
 }
 
 fn soccer_moment_vector_retention_limit_days(days: i64) -> Option<i64> {

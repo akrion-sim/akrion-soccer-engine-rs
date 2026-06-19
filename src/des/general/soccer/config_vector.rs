@@ -105,6 +105,12 @@ pub struct ConfigWeightOptions {
     /// and a player near the ball but off the lane is weighted down. `None` ⇒ distance to the
     /// ball point (the legacy behaviour; the stored retrieval corpus is built this way).
     pub ball_path: Option<(Vec2, Vec2)>,
+    /// Along-path taper applied ONLY when `ball_path` is set: a player's weight is additionally
+    /// scaled by `exp(-t * taper)`, where `t in [0, 1]` is how far along the lane (0 = the release
+    /// point, 1 = the target) its nearest point on the path sits. So danger concentrated early in
+    /// the lane (where the ball is most cuttable) dominates and the target end is discounted.
+    /// `0.0` => uniform along the path (no taper).
+    pub ball_path_along_taper: f64,
 }
 
 impl Default for ConfigWeightOptions {
@@ -116,6 +122,7 @@ impl Default for ConfigWeightOptions {
             behind_ball_yards: 6.0,
             opponent_end_fraction: 0.5,
             ball_path: None,
+            ball_path_along_taper: 0.0,
         }
     }
 }
@@ -296,6 +303,21 @@ impl SoccerConfigVector {
                 Some((a, b)) => segment_distance_to_point(a, b, oriented),
                 None => dist_to_ball,
             };
+            // Along-path taper: discount players whose nearest lane point sits further toward the
+            // target (the early lane is where the ball is most cuttable). Only with a path + taper.
+            let along_factor = match path_oriented {
+                Some((a, b)) if weights.ball_path_along_taper > 0.0 => {
+                    let ab = b - a;
+                    let len2 = ab.dot(ab);
+                    let t = if len2 > 1e-9 {
+                        ((oriented - a).dot(ab) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    (-t * weights.ball_path_along_taper).exp()
+                }
+                _ => 1.0,
+            };
             let weight = config_player_weight(
                 proximity_dist,
                 oriented.y,
@@ -303,7 +325,7 @@ impl SoccerConfigVector {
                 perspective_has_ball,
                 ball_in_opp_end,
                 &weights,
-            );
+            ) * along_factor;
             let kin = SoccerPlayerKin {
                 role: player.role,
                 pos: canon.norm_pos(player.position),

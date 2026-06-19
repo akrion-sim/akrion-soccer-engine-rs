@@ -16,7 +16,8 @@ use serde_json::Value;
 use crate::des::general::prng::SeededRandom;
 use crate::des::general::soccer::{
     MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
+    SoccerQPolicyOptions,
     SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
     SoccerTeamQPolicies, Team,
@@ -129,6 +130,10 @@ pub struct SoccerLearningCompletedGame {
     pub score: SoccerLearningRunScore,
     pub delta: SoccerLearningPolicyDelta,
     pub config_moments: Vec<SoccerConfigMomentInsert>,
+    /// Learned pass-completion training samples captured this game (config embedding + pass
+    /// features, labelled completed/intercepted). Persisted to Postgres alongside the config
+    /// moments so the cluster learner can train [`SoccerPassCompletionHead`] on the pooled corpus.
+    pub pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     pub neural_network: Option<SoccerNeuralNetworkSnapshot>,
     pub elapsed_seconds: f64,
 }
@@ -3186,6 +3191,7 @@ fn run_soccer_learning_game_from_snapshot(
     let score = soccer_learning_run_score(&summary);
     let delta = soccer_policy_delta_entries(starting_policies.as_ref(), &policies, &score);
     let config_moments = sim.config_moments();
+    let pass_outcome_samples = sim.drain_pass_outcome_samples();
     let episode_summary = SoccerSelfPlayEpisodeSummary {
         episode,
         seed,
@@ -3208,6 +3214,7 @@ fn run_soccer_learning_game_from_snapshot(
         score,
         delta,
         config_moments,
+        pass_outcome_samples,
         neural_network,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })
