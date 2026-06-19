@@ -52,7 +52,7 @@ spec:
               work_base="/tmp/${run_prefix}-src"
               work="${work_base}"
               target="/tmp/${run_prefix}-target"
-              ready_file="/tmp/${run_prefix}-ready"
+              ready_file="/tmp/${run_prefix}-ready-${HOSTNAME:-pod}"
               export CARGO_TARGET_DIR="${target}"
 
               require_value() {
@@ -294,7 +294,7 @@ spec:
               command:
                 - /bin/bash
                 - -lc
-                - test -f /tmp/codex-soccer-learning-overnight-ready
+                - 'test -f "/tmp/codex-soccer-learning-overnight-ready-${HOSTNAME:-pod}"'
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 90
