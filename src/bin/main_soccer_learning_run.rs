@@ -3908,6 +3908,8 @@ mod tests {
             value: Some(-0.5),
             embedding: vec![0.0; SOCCER_MOMENT_EMBEDDING_DIM],
             features: vec![0.0; CONFIG_FEATURE_DIM],
+            embedding_assigned: vec![0.0; SOCCER_MOMENT_EMBEDDING_DIM],
+            features_assigned: vec![0.0; CONFIG_FEATURE_DIM],
         });
 
         let completed = soccer_learning_completed_game_from_completed(&game);

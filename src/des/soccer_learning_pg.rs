@@ -12,9 +12,9 @@ use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::des::general::soccer::{
-    MatchConfig, PlayerRole, SoccerConfigMomentInsert, SoccerMomentEmbeddingInsert,
-    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
-    SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
+    MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
+    SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
+    SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
     CONFIG_FEATURE_DIM_V1, SOCCER_MOMENT_EMBEDDING_DIM,
 };
@@ -129,6 +129,19 @@ from des_soccer_config_moments \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
 order by embedding <=> $1::vector \
+limit $3";
+/// As [`SOCCER_CONFIG_MOMENT_SEARCH_SQL`] but over the **assigned-position**
+/// corpus (slot-aligned ordering). Back-compat rows without the second corpus
+/// (null `embedding_assigned`) are skipped so the cosine geometry stays defined.
+const SOCCER_CONFIG_MOMENT_SEARCH_ASSIGNED_SQL: &str = "\
+select team, role, action, reward_micros, nstep_return_micros, value_micros, \
+tick, features_assigned, (embedding_assigned <=> $1::vector) as distance \
+from des_soccer_config_moments \
+where ($2::text is null or team = $2) \
+  and deleted_at is null \
+  and embedding_assigned is not null \
+  and features_assigned is not null \
+order by embedding_assigned <=> $1::vector \
 limit $3";
 const SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL: &str = "\
 update des_soccer_moment_embeddings \
@@ -739,6 +752,42 @@ impl SoccerLearningPgStore {
             )
             .map_err(|err| format!("insert soccer learning experiment: {err}"))?;
         Ok(row.get(0))
+    }
+
+    /// Synchronously load the process-wide tunables overlay from Postgres: the
+    /// most recent row of `des_soccer_tunables`, whose `overlay` is a partial JSON
+    /// patch applied on top of the compile-time defaults and the environment layer
+    /// (see [`crate::des::general::soccer::Tunables`]). The table is created on
+    /// demand, so a fresh database simply yields `None` (env + defaults stand).
+    /// Blocking; intended to be called once at startup before the engine reads any
+    /// tunable.
+    pub fn fetch_tunables_overlay(&mut self) -> Result<Option<Value>, String> {
+        self.ensure_connected()?;
+        self.client
+            .batch_execute(
+                r#"
+                create table if not exists des_soccer_tunables (
+                    id bigserial primary key,
+                    created_at timestamptz not null default now(),
+                    note text,
+                    overlay jsonb not null
+                )
+                "#,
+            )
+            .map_err(|err| format!("ensure des_soccer_tunables: {err}"))?;
+        let row = self
+            .client
+            .query_opt(
+                r#"
+                select overlay
+                from des_soccer_tunables
+                order by id desc
+                limit 1
+                "#,
+                &[],
+            )
+            .map_err(|err| format!("select soccer tunables overlay: {err}"))?;
+        Ok(row.map(|row| row.get::<_, Value>(0)))
     }
 
     /// Durably store a finished learning tournament: one header row, every match,
@@ -1817,6 +1866,7 @@ impl SoccerLearningPgStore {
         query: &[f64],
         limit: usize,
         team: Option<Team>,
+        comparison: SoccerConfigComparison,
     ) -> Result<Vec<SoccerConfigMomentNeighbor>, String> {
         if query.len() != SOCCER_MOMENT_EMBEDDING_DIM {
             return Err(format!(
@@ -1839,12 +1889,13 @@ impl SoccerLearningPgStore {
         let limit = limit.clamp(1, 1000) as i64;
         let query_text = pg_vector_text(query);
         let team_filter = team.map(soccer_team_label);
+        let search_sql = match comparison {
+            SoccerConfigComparison::PositionAgnostic => SOCCER_CONFIG_MOMENT_SEARCH_SQL,
+            SoccerConfigComparison::AssignedPosition => SOCCER_CONFIG_MOMENT_SEARCH_ASSIGNED_SQL,
+        };
         let rows = self
             .client
-            .query(
-                SOCCER_CONFIG_MOMENT_SEARCH_SQL,
-                &[&query_text, &team_filter, &limit],
-            )
+            .query(search_sql, &[&query_text, &team_filter, &limit])
             .map_err(|err| format!("search soccer config moments: {err}"))?;
         Ok(rows
             .iter()
@@ -3670,10 +3721,22 @@ fn validate_config_moments(moments: &[SoccerConfigMomentInsert]) -> Result<(), S
                 moment.embedding.len()
             ));
         }
+        if moment.embedding_assigned.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            return Err(format!(
+                "config moment assigned embedding has {} dims, expected {SOCCER_MOMENT_EMBEDDING_DIM}",
+                moment.embedding_assigned.len()
+            ));
+        }
         if moment.features.len() != CONFIG_FEATURE_DIM {
             return Err(format!(
                 "config moment features have {} dims, expected {CONFIG_FEATURE_DIM}",
                 moment.features.len()
+            ));
+        }
+        if moment.features_assigned.len() != CONFIG_FEATURE_DIM {
+            return Err(format!(
+                "config moment assigned features have {} dims, expected {CONFIG_FEATURE_DIM}",
+                moment.features_assigned.len()
             ));
         }
     }
@@ -3710,10 +3773,19 @@ fn insert_config_moments_in_transaction(
             .iter()
             .map(|m| sanitize_features(&m.features))
             .collect();
+        let embeddings_assigned: Vec<String> = chunk
+            .iter()
+            .map(|m| pg_vector_text(&m.embedding_assigned))
+            .collect();
+        let features_assigned: Vec<Vec<f32>> = chunk
+            .iter()
+            .map(|m| sanitize_features(&m.features_assigned))
+            .collect();
         let sql = format!(
             "insert into des_soccer_config_moments \
              (run_id, experiment_id, team, tick, role, action, reward_micros, \
-              nstep_return_micros, value_micros, embedding, features) \
+              nstep_return_micros, value_micros, embedding, features, \
+              embedding_assigned, features_assigned) \
              values {}",
             config_moment_values_clause(chunk.len())
         );
@@ -3728,6 +3800,8 @@ fn insert_config_moments_in_transaction(
             params.push(&values[i]);
             params.push(&embeddings[i]);
             params.push(&features[i]);
+            params.push(&embeddings_assigned[i]);
+            params.push(&features_assigned[i]);
         }
         tx.execute(&sql, &params)
             .map_err(|err| format!("insert soccer config moments: {err}"))?;
@@ -3735,24 +3809,25 @@ fn insert_config_moments_in_transaction(
     Ok(())
 }
 
-/// Max config moments per multi-row insert. Each row binds 9 params plus the 2
-/// shared run/experiment ids, so 256 rows = 2306 params — well under the ceiling.
+/// Max config moments per multi-row insert. Each row binds 11 params plus the 2
+/// shared run/experiment ids, so 256 rows = 2818 params — well under the ceiling.
 const CONFIG_MOMENT_INSERT_CHUNK_ROWS: usize = 256;
 
 /// Build the `values (...),(...)` clause for a chunked config-moment insert.
 /// `$1`/`$2` are the shared run_id/experiment_id reused by every row; each row's
-/// 9 columns start at `$3 + 9*i`. Kept separate so the placeholder/offset
-/// arithmetic is unit-tested without a live database.
+/// 11 columns (…, embedding, features, embedding_assigned, features_assigned)
+/// start at `$3 + 11*i`. Kept separate so the placeholder/offset arithmetic is
+/// unit-tested without a live database.
 fn config_moment_values_clause(rows: usize) -> String {
     let mut clause = String::new();
     for i in 0..rows {
         if i > 0 {
             clause.push(',');
         }
-        let base = 3 + i * 9;
+        let base = 3 + i * 11;
         let _ = write!(
             clause,
-            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${},${},${}::vector,${})",
+            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${},${},${}::vector,${},${}::vector,${})",
             base,
             base + 1,
             base + 2,
@@ -3761,7 +3836,9 @@ fn config_moment_values_clause(rows: usize) -> String {
             base + 5,
             base + 6,
             base + 7,
-            base + 8
+            base + 8,
+            base + 9,
+            base + 10
         );
     }
     clause
@@ -3829,13 +3906,28 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
         );
         alter table des_soccer_config_moments
           add column if not exists deleted_at timestamptz;
+        -- Second (assigned-position / slot-aligned) corpus. Nullable so rows
+        -- captured before this column existed remain valid; new inserts always
+        -- populate both corpora.
+        alter table des_soccer_config_moments
+          add column if not exists embedding_assigned vector({dim});
+        alter table des_soccer_config_moments
+          add column if not exists features_assigned real[];
         alter table des_soccer_config_moments
           drop constraint if exists des_soccer_config_moments_features_len_chk;
         alter table des_soccer_config_moments
           add constraint des_soccer_config_moments_features_len_chk
             check (array_length(features, 1) in ({legacy_features}, {features}));
+        alter table des_soccer_config_moments
+          drop constraint if exists des_soccer_config_moments_features_assigned_len_chk;
+        alter table des_soccer_config_moments
+          add constraint des_soccer_config_moments_features_assigned_len_chk
+            check (features_assigned is null
+              or array_length(features_assigned, 1) in ({legacy_features}, {features}));
         create index if not exists des_soccer_config_moments_hnsw
           on des_soccer_config_moments using hnsw (embedding vector_cosine_ops);
+        create index if not exists des_soccer_config_moments_hnsw_assigned
+          on des_soccer_config_moments using hnsw (embedding_assigned vector_cosine_ops);
         create index if not exists des_soccer_config_moments_run_idx
           on des_soccer_config_moments (run_id);
         create index if not exists des_soccer_config_moments_live_created_idx
@@ -4506,15 +4598,15 @@ mod tests {
         assert_eq!(config_moment_values_clause(0), "");
         assert_eq!(
             config_moment_values_clause(1),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13)"
         );
         assert_eq!(
             config_moment_values_clause(2),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11),\
-             ($1::text::uuid,$2::text::uuid,$12,$13,$14,$15,$16,$17,$18,$19::vector,$20)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13),\
+             ($1::text::uuid,$2::text::uuid,$14,$15,$16,$17,$18,$19,$20,$21::vector,$22,$23::vector,$24)"
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
-        let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 9;
+        let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 11;
         assert!(params < 65535, "chunk uses {params} params");
     }
 

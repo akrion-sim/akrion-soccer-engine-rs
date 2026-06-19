@@ -3131,13 +3131,24 @@ impl SoccerMatch {
         }
     }
 
-    /// The canonical config **query embedding** for `team`'s current state — the
-    /// vector to feed `search_nearest_config_moments` ("find the N closest
-    /// configurations"). Built from a fresh snapshot, so the retrieval consumer
-    /// can call it at whatever cadence it chooses.
-    pub fn retrieval_query_embedding(&self, team: Team) -> Vec<f64> {
+    /// The canonical config **query embedding** for `team`'s current state in the
+    /// requested `comparison` mode — the vector to feed
+    /// `search_nearest_config_moments` ("find the N closest configurations") for
+    /// that mode's corpus. Built from a fresh snapshot with the configured
+    /// ball-proximity weighting, so the query matches how the corpus was captured.
+    pub fn retrieval_query_embedding(
+        &self,
+        team: Team,
+        comparison: SoccerConfigComparison,
+    ) -> Vec<f64> {
         let snapshot = WorldSnapshot::from_match(self);
-        SoccerConfigVector::from_snapshot(&snapshot, team).embedding()
+        SoccerConfigVector::from_snapshot_with(
+            &snapshot,
+            team,
+            comparison,
+            self.config.retrieval.weight_options(),
+        )
+        .embedding()
     }
 
     pub fn config_moments(&self) -> Vec<SoccerConfigMomentInsert> {
@@ -3188,6 +3199,8 @@ impl SoccerMatch {
                     })
                     .unwrap_or(immediate);
                 let features_f64: Vec<f64> = capture.features.iter().map(|&f| f as f64).collect();
+                let features_assigned_f64: Vec<f64> =
+                    capture.features_assigned.iter().map(|&f| f as f64).collect();
                 SoccerConfigMomentInsert {
                     team: capture.team,
                     tick: capture.tick,
@@ -3198,6 +3211,8 @@ impl SoccerMatch {
                     value: None,
                     embedding: soccer_moment_embedding(&features_f64),
                     features: capture.features.clone(),
+                    embedding_assigned: soccer_moment_embedding(&features_assigned_f64),
+                    features_assigned: capture.features_assigned.clone(),
                 }
             })
             .collect()
@@ -4800,21 +4815,33 @@ impl SoccerMatch {
                         if let Some(carrier) =
                             tick_transitions.iter().find(|t| t.player_id == holder)
                         {
-                            let features = SoccerConfigVector::from_snapshot(
-                                &tick_start_snapshot,
-                                carrier.team,
-                            )
-                            .to_features()
-                            .iter()
-                            .map(|&f| f as f32)
-                            .collect();
+                            // Capture both comparison orderings (position-agnostic
+                            // + assigned-position) from the one snapshot, sharing
+                            // the configured ball-proximity weighting, so each is
+                            // independently searchable downstream.
+                            let weights = self.config.retrieval.weight_options();
+                            let features_for = |comparison| {
+                                SoccerConfigVector::from_snapshot_with(
+                                    &tick_start_snapshot,
+                                    carrier.team,
+                                    comparison,
+                                    weights,
+                                )
+                                .to_features()
+                                .iter()
+                                .map(|&f| f as f32)
+                                .collect::<Vec<f32>>()
+                            };
                             self.episode_config_captures.push(SoccerConfigCapture {
                                 tick: tick_start_snapshot.tick,
                                 player_id: holder,
                                 team: carrier.team,
                                 role: carrier.role,
                                 action: normalize_soccer_action_label(&carrier.action).to_string(),
-                                features,
+                                features: features_for(SoccerConfigComparison::PositionAgnostic),
+                                features_assigned: features_for(
+                                    SoccerConfigComparison::AssignedPosition,
+                                ),
                             });
                         }
                     }

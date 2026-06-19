@@ -58,6 +58,60 @@ const BALL_SPEED_SCALE_YPS: f64 = 45.0;
 const BALL_ACCEL_SCALE_YPS2: f64 = 60.0;
 const BALL_ALTITUDE_SCALE_YARDS: f64 = 12.0;
 
+/// Which of the two whole-field comparisons to build. The modes differ **only**
+/// in how each team's players are ordered into the fixed slots (i.e. who is
+/// compared to whom under the slot-aligned cosine); the ball-proximity weighting
+/// is identical for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SoccerConfigComparison {
+    /// "No regard to assigned field position": order each team by **live
+    /// geometry** (nearest the ball first), so the comparison is a pure
+    /// on-the-ball *shape* match regardless of who is nominally assigned where.
+    #[default]
+    PositionAgnostic,
+    /// "Apples to apples with regard to assigned field position": order each team
+    /// by **assigned formation slot** (`home_position`), so a left-back only ever
+    /// lines up against a left-back, a centre-back against a centre-back, etc.
+    AssignedPosition,
+}
+
+/// Ball-proximity weighting + behind-ball discount controls for the configuration
+/// vector. Every weight is **intrinsic** to a single config (derived from its own
+/// ball + player positions), so weighting preserves the orientation / mirror /
+/// permutation invariances. Defaults mirror [`SoccerRetrievalConfig`]; see
+/// [`SoccerRetrievalConfig::weight_options`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConfigWeightOptions {
+    /// Down-weight players by distance from the ball (`false` ⇒ every player
+    /// keeps weight `1`, i.e. the legacy equal-weight comparison).
+    pub proximity_enabled: bool,
+    /// Characteristic decay length in yards: `weight = exp(-distance / tau)`.
+    /// Smaller ⇒ similarity concentrates harder around the ball.
+    pub proximity_tau_yards: f64,
+    /// Fully discount (weight `0`) players far behind the ball **when the
+    /// perspective team is attacking in the opponent's end** — they are out of
+    /// the immediate play, so dropping them simplifies the comparison.
+    pub behind_ball_discount_enabled: bool,
+    /// How far behind the ball (yards, toward the perspective team's own goal) a
+    /// player must be to be discounted.
+    pub behind_ball_yards: f64,
+    /// Fraction of the pitch length past which the ball counts as being in "the
+    /// opponent's end" (`0.5` = past the half-way line).
+    pub opponent_end_fraction: f64,
+}
+
+impl Default for ConfigWeightOptions {
+    fn default() -> Self {
+        ConfigWeightOptions {
+            proximity_enabled: true,
+            proximity_tau_yards: 14.0,
+            behind_ball_discount_enabled: true,
+            behind_ball_yards: 6.0,
+            opponent_end_fraction: 0.5,
+        }
+    }
+}
+
 /// One player's canonical kinematic state inside a [`SoccerConfigVector`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SoccerPlayerKin {
@@ -70,6 +124,10 @@ pub struct SoccerPlayerKin {
     pub acc: Vec2,
     /// `1` if this exact player holds the ball in the source snapshot, else `0`.
     pub has_possession: f64,
+    /// Ball-proximity weight in `[0, 1]` applied to this player's `pos/vel/acc`
+    /// channels when flattening to features (the `has_possession` flag stays
+    /// unscaled). `0` ⇒ fully discounted (far behind the ball during an attack).
+    pub weight: f64,
 }
 
 /// The whole-field configuration as seen from one team's perspective, after
@@ -145,9 +203,28 @@ impl Canonicalizer {
 
 impl SoccerConfigVector {
     /// Build the canonical configuration vector for `perspective` from a live
-    /// world snapshot. Pure function of the snapshot, so it is identical at
-    /// training (corpus build) and at inference (live retrieval) time.
+    /// world snapshot, using the default comparison ([`SoccerConfigComparison`])
+    /// and weighting ([`ConfigWeightOptions`]). Pure function of the snapshot, so
+    /// it is identical at training (corpus build) and inference (live retrieval).
     pub fn from_snapshot(snapshot: &WorldSnapshot, perspective: Team) -> Self {
+        Self::from_snapshot_with(
+            snapshot,
+            perspective,
+            SoccerConfigComparison::default(),
+            ConfigWeightOptions::default(),
+        )
+    }
+
+    /// As [`Self::from_snapshot`], but with an explicit comparison mode and
+    /// weighting. Both modes apply identical ball-proximity weighting; they
+    /// differ only in how each team's players are ordered into the fixed slots
+    /// (which determines who is compared to whom under the slot-aligned cosine).
+    pub fn from_snapshot_with(
+        snapshot: &WorldSnapshot,
+        perspective: Team,
+        comparison: SoccerConfigComparison,
+        weights: ConfigWeightOptions,
+    ) -> Self {
         let field_width = snapshot.field_width;
         let field_length = snapshot.field_length;
 
@@ -182,25 +259,63 @@ impl SoccerConfigVector {
             mirror_x,
         };
 
-        let mut own = Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
-        let mut opponents = Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
+        // Oriented (yards) ball position drives the proximity weight and the
+        // behind-ball discount gate. Orientation/mirror are isometries, so the
+        // ball-distance (and the +y "behind" test, since the perspective always
+        // attacks +y after canonicalisation) are invariant.
+        let ball_oriented = canon.apply(snapshot.ball.position, false);
+        let perspective_has_ball =
+            matches!(snapshot.possession_team(), Some(t) if t == perspective);
+        let ball_in_opp_end = ball_oriented.y > field_length * weights.opponent_end_fraction;
+
+        // (sort key, player) so the two comparison modes share one build pass and
+        // differ only in the ordering key applied just below.
+        let mut own: Vec<([f64; 3], SoccerPlayerKin)> =
+            Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
+        let mut opponents: Vec<([f64; 3], SoccerPlayerKin)> =
+            Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
         let holder = snapshot.ball.holder;
         for player in &snapshot.players {
+            let oriented = canon.apply(player.position, false);
+            let dist_to_ball = oriented.distance(ball_oriented);
+            let weight = config_player_weight(
+                dist_to_ball,
+                oriented.y,
+                ball_oriented.y,
+                perspective_has_ball,
+                ball_in_opp_end,
+                &weights,
+            );
             let kin = SoccerPlayerKin {
                 role: player.role,
                 pos: canon.norm_pos(player.position),
                 vel: canon.norm_vel(player.velocity, PLAYER_SPEED_SCALE_YPS),
                 acc: canon.norm_vel(player.acceleration, PLAYER_ACCEL_SCALE_YPS2),
                 has_possession: if holder == Some(player.id) { 1.0 } else { 0.0 },
+                weight,
+            };
+            // All keys are built from canonical (orientation/mirror-normalised)
+            // quantities, so the resulting slot ordering is itself invariant.
+            let key = match comparison {
+                // Nearest the ball first; canonical pos breaks ties.
+                SoccerConfigComparison::PositionAgnostic => {
+                    [dist_to_ball, kin.pos.y, kin.pos.x]
+                }
+                // Assigned formation slot (deepest home first ⇒ GK leads), so
+                // like-for-like positions align across configs.
+                SoccerConfigComparison::AssignedPosition => {
+                    let home = canon.apply(player.home_position, false);
+                    [home.y, home.x, kin.pos.y]
+                }
             };
             if player.team == perspective {
-                own.push(kin);
+                own.push((key, kin));
             } else {
-                opponents.push(kin);
+                opponents.push((key, kin));
             }
         }
-        sort_canonical(&mut own);
-        sort_canonical(&mut opponents);
+        let own = sort_by_key_into_kin(own);
+        let opponents = sort_by_key_into_kin(opponents);
 
         let ball = &snapshot.ball;
         let bpos = canon.norm_pos(ball.position);
@@ -259,16 +374,21 @@ impl SoccerConfigVector {
     }
 }
 
+/// Flatten one team's players into the feature stream. Each player's `pos/vel/acc`
+/// channels are scaled by its ball-proximity `weight` (so near-ball players
+/// dominate the cosine and fully-discounted players contribute nothing); the
+/// `has_possession` flag is left **unscaled** as a categorical holder marker.
 fn push_team(out: &mut Vec<f64>, team: &[SoccerPlayerKin]) {
     for slot in 0..CONFIG_PLAYERS_PER_TEAM {
         if let Some(k) = team.get(slot) {
+            let w = k.weight;
             out.extend_from_slice(&[
-                k.pos.x,
-                k.pos.y,
-                k.vel.x,
-                k.vel.y,
-                k.acc.x,
-                k.acc.y,
+                k.pos.x * w,
+                k.pos.y * w,
+                k.vel.x * w,
+                k.vel.y * w,
+                k.acc.x * w,
+                k.acc.y * w,
                 k.has_possession,
             ]);
         } else {
@@ -277,25 +397,42 @@ fn push_team(out: &mut Vec<f64>, team: &[SoccerPlayerKin]) {
     }
 }
 
-/// Canonical, identity-free ordering of one team: GK first, then by role family,
-/// then by attack-axis depth (deepest first), then laterally. Uses `total_cmp`
-/// so it is a deterministic total order even with NaNs scrubbed upstream.
-fn sort_canonical(players: &mut [SoccerPlayerKin]) {
-    players.sort_by(|a, b| {
-        role_rank(a.role)
-            .cmp(&role_rank(b.role))
-            .then(a.pos.y.total_cmp(&b.pos.y))
-            .then(a.pos.x.total_cmp(&b.pos.x))
+/// Deterministic total order of one team by an `[f64; 3]` key (built from
+/// canonical, orientation/mirror-normalised quantities, so the ordering is itself
+/// invariant), then strip the keys leaving the ordered players. `total_cmp` keeps
+/// it a total order even with NaNs scrubbed upstream.
+fn sort_by_key_into_kin(mut keyed: Vec<([f64; 3], SoccerPlayerKin)>) -> Vec<SoccerPlayerKin> {
+    keyed.sort_by(|(a, _), (b, _)| {
+        a[0].total_cmp(&b[0])
+            .then(a[1].total_cmp(&b[1]))
+            .then(a[2].total_cmp(&b[2]))
     });
+    keyed.into_iter().map(|(_, kin)| kin).collect()
 }
 
-fn role_rank(role: PlayerRole) -> u8 {
-    match role {
-        PlayerRole::Goalkeeper => 0,
-        PlayerRole::Defender => 1,
-        PlayerRole::Midfielder => 2,
-        PlayerRole::Forward => 3,
+/// Ball-proximity weight in `[0, 1]` for one player. Players far behind the ball
+/// while the perspective team attacks in the opponent's end are fully discounted
+/// (weight `0`); otherwise weight decays smoothly with distance from the ball.
+fn config_player_weight(
+    dist_to_ball: f64,
+    oriented_y: f64,
+    ball_oriented_y: f64,
+    perspective_has_ball: bool,
+    ball_in_opp_end: bool,
+    opts: &ConfigWeightOptions,
+) -> f64 {
+    if opts.behind_ball_discount_enabled
+        && perspective_has_ball
+        && ball_in_opp_end
+        && oriented_y < ball_oriented_y - opts.behind_ball_yards
+    {
+        return 0.0;
     }
+    if !opts.proximity_enabled {
+        return 1.0;
+    }
+    let tau = opts.proximity_tau_yards.max(1e-3);
+    (-dist_to_ball.max(0.0) / tau).exp()
 }
 
 /// Perspective-relative phase: `+1` the team is attacking, `-1` it is defending
@@ -325,13 +462,23 @@ pub struct SoccerConfigCapture {
     pub team: Team,
     pub role: PlayerRole,
     pub action: String,
-    /// Canonical raw config features ([`CONFIG_FEATURE_DIM`]) for this team.
+    /// Canonical raw config features ([`CONFIG_FEATURE_DIM`]) in the
+    /// **position-agnostic** ordering (the primary ANN corpus).
     pub features: Vec<f32>,
+    /// The same config in the **assigned-position** (slot-aligned) ordering — the
+    /// second corpus, so a like-for-like positional comparison is independently
+    /// searchable. Same width as `features`.
+    pub features_assigned: Vec<f32>,
 }
 
 /// A persisted configuration moment for the retrieval corpus: the embedding (for
 /// ANN search), the raw features (for exact permutation re-score), the decision
 /// taken, and how it turned out. This is the "config + decision + outcome" unit.
+///
+/// Two orderings are stored per moment so each comparison mode
+/// ([`SoccerConfigComparison`]) is independently HNSW-searchable: the
+/// position-agnostic pair (`embedding` / `features`) and the assigned-position
+/// pair (`embedding_assigned` / `features_assigned`).
 #[derive(Clone, Debug)]
 pub struct SoccerConfigMomentInsert {
     pub team: Team,
@@ -345,10 +492,15 @@ pub struct SoccerConfigMomentInsert {
     pub nstep_return: f64,
     /// Critic value of the moment (`None` when neural learning is off/untrained).
     pub value: Option<f64>,
-    /// Fixed-width similarity vector (projected from `features`).
+    /// Position-agnostic similarity vector (projected from `features`).
     pub embedding: Vec<f64>,
-    /// Raw canonical features, kept for an exact Hungarian re-score on retrieval.
+    /// Raw canonical features (position-agnostic ordering), kept for an exact
+    /// re-score on retrieval.
     pub features: Vec<f32>,
+    /// Assigned-position similarity vector (projected from `features_assigned`).
+    pub embedding_assigned: Vec<f64>,
+    /// Raw canonical features in the assigned-position (slot-aligned) ordering.
+    pub features_assigned: Vec<f32>,
 }
 
 /// A feature-independent view of one retrieved neighbour, so the prior aggregator
@@ -667,6 +819,219 @@ mod tests {
             "left/right reflection must be canonically identical (got {})",
             cosine(&base, &reflected)
         );
+    }
+
+    /// The assigned-position mode orders by `home_position`, so a left↔right board
+    /// reflection (current state **and** the formation anchors) must canonicalise
+    /// identically — handedness invariance for the slot-aligned corpus.
+    #[test]
+    fn assigned_position_mirror_invariant() {
+        let snap = sample_snapshot();
+        let opts = ConfigWeightOptions::default();
+        let base = SoccerConfigVector::from_snapshot_with(
+            &snap,
+            Team::Home,
+            SoccerConfigComparison::AssignedPosition,
+            opts,
+        )
+        .to_features();
+
+        let mut mirrored = snap.clone();
+        let w = mirrored.field_width;
+        for p in &mut mirrored.players {
+            p.position = Vec2::new(w - p.position.x, p.position.y);
+            p.velocity = Vec2::new(-p.velocity.x, p.velocity.y);
+            p.acceleration = Vec2::new(-p.acceleration.x, p.acceleration.y);
+            // The assigned mode sorts by home_position, so the formation anchors
+            // must reflect with the board.
+            p.home_position = Vec2::new(w - p.home_position.x, p.home_position.y);
+        }
+        mirrored.ball.position = Vec2::new(w - mirrored.ball.position.x, mirrored.ball.position.y);
+        mirrored.ball.velocity = Vec2::new(-mirrored.ball.velocity.x, mirrored.ball.velocity.y);
+        mirrored.ball.acceleration =
+            Vec2::new(-mirrored.ball.acceleration.x, mirrored.ball.acceleration.y);
+        let reflected = SoccerConfigVector::from_snapshot_with(
+            &mirrored,
+            Team::Home,
+            SoccerConfigComparison::AssignedPosition,
+            opts,
+        )
+        .to_features();
+
+        assert!(
+            cosine(&base, &reflected) > 0.999,
+            "assigned-position reflection must canonicalise identically (got {})",
+            cosine(&base, &reflected)
+        );
+    }
+
+    /// The two modes differ exactly in whether they care about assigned position:
+    /// permuting only the `home_position`s (reassigning slots, leaving every live
+    /// position/velocity untouched) must leave the **position-agnostic** vector
+    /// byte-identical yet **change** the **assigned-position** vector.
+    #[test]
+    fn modes_differ_on_assigned_position_only() {
+        let snap = sample_snapshot();
+        let opts = ConfigWeightOptions::default();
+        let features = |s: &WorldSnapshot, c| {
+            SoccerConfigVector::from_snapshot_with(s, Team::Home, c, opts).to_features()
+        };
+        let agnostic = features(&snap, SoccerConfigComparison::PositionAgnostic);
+        let assigned = features(&snap, SoccerConfigComparison::AssignedPosition);
+
+        // Rotate the Home players' home_positions by one (reassign their slots).
+        let mut permuted = snap.clone();
+        let homes: Vec<Vec2> = permuted
+            .players
+            .iter()
+            .filter(|p| p.team == Team::Home)
+            .map(|p| p.home_position)
+            .collect();
+        assert!(homes.len() >= 2, "need at least two assigned slots");
+        let mut k = 0;
+        for p in permuted.players.iter_mut().filter(|p| p.team == Team::Home) {
+            p.home_position = homes[(k + 1) % homes.len()];
+            k += 1;
+        }
+
+        let agnostic_permuted = features(&permuted, SoccerConfigComparison::PositionAgnostic);
+        let assigned_permuted = features(&permuted, SoccerConfigComparison::AssignedPosition);
+
+        assert_eq!(
+            agnostic, agnostic_permuted,
+            "position-agnostic comparison must ignore assigned field position"
+        );
+        assert_ne!(
+            assigned, assigned_permuted,
+            "assigned-position comparison must depend on assigned field position"
+        );
+    }
+
+    /// Ball-proximity weighting must make players near the ball dominate: turning
+    /// it on shrinks a far player's channel energy far more than a near player's
+    /// (slot order is unaffected by weighting, so slots align ON vs OFF).
+    #[test]
+    fn proximity_weighting_downweights_far_players() {
+        let snap = sample_snapshot();
+        let on = ConfigWeightOptions {
+            proximity_enabled: true,
+            behind_ball_discount_enabled: false,
+            ..ConfigWeightOptions::default()
+        };
+        let off = ConfigWeightOptions {
+            proximity_enabled: false,
+            behind_ball_discount_enabled: false,
+            ..ConfigWeightOptions::default()
+        };
+        let feats = |o| {
+            SoccerConfigVector::from_snapshot_with(
+                &snap,
+                Team::Home,
+                SoccerConfigComparison::PositionAgnostic,
+                o,
+            )
+            .to_features()
+        };
+        let f_on = feats(on);
+        let f_off = feats(off);
+
+        // Energy of one own slot's six weighted pos/vel/acc channels.
+        let slot_energy = |f: &[f64], slot: usize| -> f64 {
+            let base = slot * CONFIG_PER_PLAYER_FLOATS;
+            (0..6).map(|c| f[base + c] * f[base + c]).sum()
+        };
+        // Slot 0 is the nearest own player to the ball; the last own slot the
+        // farthest (position-agnostic sorts own players by ball distance).
+        let near = 0usize;
+        let far = CONFIG_PLAYERS_PER_TEAM - 1;
+        let (near_off, far_off) = (slot_energy(&f_off, near), slot_energy(&f_off, far));
+        assert!(
+            near_off > 1e-9 && far_off > 1e-9,
+            "need non-degenerate baseline energies"
+        );
+        let near_ratio = slot_energy(&f_on, near) / near_off;
+        let far_ratio = slot_energy(&f_on, far) / far_off;
+        assert!(
+            far_ratio < near_ratio,
+            "far player must be down-weighted more than the near player \
+             (near {near_ratio}, far {far_ratio})"
+        );
+        assert!(far_ratio < 1.0, "far player energy must shrink (got {far_ratio})");
+    }
+
+    /// The behind-ball discount zeroes a player **only** under the full gate
+    /// (perspective attacking, ball in opponent's end, player >6 yd behind).
+    #[test]
+    fn behind_ball_discount_gate() {
+        let opts = ConfigWeightOptions::default();
+        let ball_y = 90.0_f64; // opponent's end
+        let deep_y = ball_y - 10.0; // 10 yd behind the ball
+        // All conditions met ⇒ fully discounted.
+        assert_eq!(
+            config_player_weight(40.0, deep_y, ball_y, true, true, &opts),
+            0.0
+        );
+        // Not in possession ⇒ kept (proximity weight only).
+        assert!(config_player_weight(40.0, deep_y, ball_y, false, true, &opts) > 0.0);
+        // Ball not in opponent's end ⇒ kept.
+        assert!(config_player_weight(40.0, deep_y, ball_y, true, false, &opts) > 0.0);
+        // Ahead of (or level with) the ball ⇒ kept even under attack.
+        assert!(config_player_weight(40.0, ball_y + 5.0, ball_y, true, true, &opts) > 0.0);
+        // Discoverable off-switch.
+        let no_discount = ConfigWeightOptions {
+            behind_ball_discount_enabled: false,
+            ..opts
+        };
+        assert!(config_player_weight(40.0, deep_y, ball_y, true, true, &no_discount) > 0.0);
+    }
+
+    /// End-to-end: with the gate satisfied, the discount fully zeroes the channels
+    /// of own players caught behind the ball — and does so only when enabled.
+    #[test]
+    fn behind_ball_discount_zeroes_deep_players_in_snapshot() {
+        let mut snap = sample_snapshot();
+        // Home attacks +y (identity orientation); put the ball deep in the
+        // opponent's end and give Home possession so the gate is live.
+        let home_id = snap
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home)
+            .expect("home player")
+            .id;
+        snap.ball.holder = Some(home_id);
+        snap.ball.position = Vec2::new(snap.field_width * 0.5, snap.field_length * 0.75);
+
+        let proximity_off = ConfigWeightOptions {
+            proximity_enabled: false,
+            ..ConfigWeightOptions::default()
+        };
+        let with_discount = proximity_off;
+        let without_discount = ConfigWeightOptions {
+            behind_ball_discount_enabled: false,
+            ..proximity_off
+        };
+        let zeroed_own_slots = |o| {
+            let f = SoccerConfigVector::from_snapshot_with(
+                &snap,
+                Team::Home,
+                SoccerConfigComparison::PositionAgnostic,
+                o,
+            )
+            .to_features();
+            (0..CONFIG_PLAYERS_PER_TEAM)
+                .filter(|slot| {
+                    let base = slot * CONFIG_PER_PLAYER_FLOATS;
+                    (0..6).all(|c| f[base + c] == 0.0)
+                })
+                .count()
+        };
+        let on = zeroed_own_slots(with_discount);
+        let off = zeroed_own_slots(without_discount);
+        assert!(
+            on > off,
+            "discount must zero deep own players (on {on}, off {off})"
+        );
+        assert!(on >= 1, "at least one deep own player should be discounted");
     }
 
     #[test]
