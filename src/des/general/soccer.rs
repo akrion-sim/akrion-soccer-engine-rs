@@ -2218,6 +2218,14 @@ const PASS_CONTEST_ENGAGE_RADIUS_YARDS: f64 = 30.0;
 // margin (seconds) by which a team-mate must beat his own arrival before he defers; it is
 // generous precisely because his belief that the ball is his is strong.
 const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
+// Receiver "in-position" election: among team-mates racing an in-flight pass, the raw arrival time
+// is discounted by how in-position (for BOTH phases) the player would be controlling the ball at the
+// reception point. LP_REFERENCE is the distance from a player's formation-LP/IPM ideal slot at which
+// the in-position bonus has fully decayed to zero; MAX_BONUS_SECONDS caps the discount so arrival time
+// stays primary and being in-position only decides genuinely close calls (the tie-breaker the user asked
+// for). See `pass_receiver_in_position_bonus` / `pass_receiver_effective_arrival`.
+const RECEIVER_IN_POSITION_LP_REFERENCE_YARDS: f64 = 16.0;
+const RECEIVER_IN_POSITION_MAX_BONUS_SECONDS: f64 = 0.40;
 // ---- First touch: retain position / flick onto a runner ----
 // Length (yards) of a directional settling touch — short, so the ball stays under control.
 const FIRST_TOUCH_RETAIN_PUSH_YARDS: f64 = 2.2;
