@@ -8126,7 +8126,7 @@ impl SoccerMatch {
                         receiver_openness_at_player,
                         &mut self.rng,
                     );
-                    let led_target = target_id
+                    let mut led_target = target_id
                         .and_then(|id| {
                             snapshot.anticipated_pass_reception_point(
                                 player_id,
@@ -8140,6 +8140,24 @@ impl SoccerMatch {
                             self.config.field_width_yards,
                             self.config.field_length_yards,
                         );
+                    // MPC pass execution: for a ground pass to a real receiver, replace the analytic
+                    // lead with the receding-horizon rendezvous (lead point + launch speed) so the
+                    // ball is delivered onto the receiver's predicted run, into space, beating the
+                    // defenders' reach. Falls back to the analytic lead when the solver declines.
+                    let mut mpc_pass_speed: Option<f64> = None;
+                    if !flight.is_aerial() {
+                        if let Some(id) = target_id {
+                            if let Some((aim, v)) =
+                                snapshot.mpc_pass_execution(player_id, id, led_target, initial_speed)
+                            {
+                                led_target = aim.clamp_to_pitch(
+                                    self.config.field_width_yards,
+                                    self.config.field_length_yards,
+                                );
+                                mpc_pass_speed = Some(v);
+                            }
+                        }
+                    }
                     // A ball with no resolved receiver ("to nobody in particular") is only a
                     // legitimate delivery into space when it is genuinely FORWARD and LONG —
                     // within ~70° of the line to the opponent's goal and more than ~25yd. A
@@ -8212,7 +8230,7 @@ impl SoccerMatch {
                     );
                     let receiver_openness =
                         pass_receiver_openness_for_agents(&self.players, player_team, led_target);
-                    let speed = modulated_pass_speed_yps(
+                    let modulated_speed = modulated_pass_speed_yps(
                         raw_speed,
                         player_pos,
                         led_target,
@@ -8222,6 +8240,16 @@ impl SoccerMatch {
                         receiver_openness,
                         &mut self.rng,
                     );
+                    // The MPC chose a launch speed for the ball/receiver rendezvous; nudge the
+                    // analytic speed toward it (kept close so it stays a real ground pass and does
+                    // not outrun the receiver's control), else keep the analytic modulated speed.
+                    let speed = match mpc_pass_speed {
+                        Some(v) => {
+                            let blended = modulated_speed * 0.6 + v * 0.4;
+                            blended.clamp(modulated_speed * 0.85, modulated_speed * 1.25)
+                        }
+                        None => modulated_speed,
+                    };
                     let distance = player_pos.distance(led_target);
                     let mut aimed_target = noisy_pass_target_with_receiver_openness(
                         player_pos,
@@ -14932,6 +14960,15 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
+/// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
+/// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
+/// from the real receiver controller, so moving the aim/speed off the analytic misses). Enable for
+/// A/B / future tuning with `DD_SOCCER_ENABLE_MPC_PASS=1`. See `mpc_pass_execution`.
+fn soccer_mpc_pass_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MPC_PASS").is_ok())
 }
 
 fn pending_pass_snapshot_from(
@@ -26590,6 +26627,183 @@ impl WorldSnapshot {
             led.y.max(attacking_goal_y + RECEPTION_BYLINE_MARGIN_YARDS)
         };
         Some(Vec2::new(led.x, byline_capped_y))
+    }
+
+    /// Forward-model the time (seconds) for a GROUND ball launched at `launch_speed` (yps) to roll
+    /// `distance` yards under the live ball deceleration (drag + grass). `None` if it would stop
+    /// short of the distance. This is the ball half of the MPC pass rendezvous — "when, if ever,
+    /// does the ball get there?" — using the SAME `ball_resistance_after` the physics step uses, so
+    /// the plan predicts the real flight.
+    fn ball_ground_travel_time(&self, distance: f64, launch_speed: f64) -> Option<f64> {
+        if !distance.is_finite() || !launch_speed.is_finite() {
+            return None;
+        }
+        if distance <= 0.05 {
+            return Some(0.0);
+        }
+        let dt = self.dt_seconds.max(1e-3);
+        let mut speed = launch_speed.max(0.0);
+        let mut covered = 0.0;
+        let mut t = 0.0;
+        for _ in 0..300 {
+            let prev = speed;
+            speed = ball_resistance_after(
+                Vec2::new(speed, 0.0),
+                dt,
+                self.ball_drag_per_tick,
+                self.ball_air_resistance,
+                self.ball_grass_resistance_yps2,
+                0.0,
+                self.ball_stop_speed_yps,
+            )
+            .velocity
+            .x;
+            let adv = (prev + speed) * 0.5 * dt;
+            if covered + adv >= distance {
+                let frac = ((distance - covered) / adv.max(1e-6)).clamp(0.0, 1.0);
+                return Some(t + frac * dt);
+            }
+            covered += adv;
+            t += dt;
+            if speed <= self.ball_stop_speed_yps {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The receiver's dynamically-feasible predicted run over the horizon, via the point-mass MPC
+    /// (it bends around opponents as soft obstacles). Returns `horizon + 1` positions at `dt`
+    /// spacing starting at the receiver — the trajectory the pass is led onto.
+    fn mpc_predicted_receiver_path(
+        &self,
+        receiver: &PlayerSnapshot,
+        dest: Vec2,
+        horizon: usize,
+        dt: f64,
+    ) -> Option<Vec<Vec2>> {
+        use crate::des::general::mpc_point_mass::{
+            PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
+        };
+        let pos = self.player_snapshot_position(receiver);
+        let vel = self.player_velocity(receiver.id).unwrap_or(receiver.velocity);
+        let dest = dest.clamp_to_pitch(self.field_width, self.field_length);
+        let a_max = acceleration_yps2_from_score(receiver.skills.acceleration).clamp(3.0, 9.0);
+        let cfg = PlanarMpcConfig {
+            horizon,
+            dt,
+            a_max,
+            ..PlanarMpcConfig::default()
+        };
+        let mut ctrl = PlanarPointMassMpc::new(cfg).ok()?;
+        let state = PlanarState {
+            pos: [pos.x, pos.y],
+            vel: [vel.x, vel.y],
+        };
+        let obstacles: Vec<PlanarObstacle> = self
+            .players
+            .iter()
+            .filter(|o| o.team != receiver.team && o.role != PlayerRole::Goalkeeper)
+            .map(|o| {
+                let op = self.player_snapshot_position(o);
+                let ov = self.player_velocity(o.id).unwrap_or(o.velocity);
+                PlanarObstacle {
+                    center: [op.x, op.y],
+                    velocity: [ov.x, ov.y],
+                    radius: 2.0,
+                    weight: 1.0,
+                }
+            })
+            .collect();
+        ctrl.control_with_obstacles(
+            state,
+            &[PlanarReference::arrive([dest.x, dest.y])],
+            &obstacles,
+        );
+        let path = ctrl.predicted_path(state);
+        Some(
+            path.into_iter()
+                .map(|p| Vec2::new(p[0], p[1]).clamp_to_pitch(self.field_width, self.field_length))
+                .collect(),
+        )
+    }
+
+    /// MPC pass execution: a receding-horizon optimisation of the LAUNCH (lead point + speed) for a
+    /// ground pass to `receiver_id`. It predicts the receiver's feasible run
+    /// ([`Self::mpc_predicted_receiver_path`]), forward-models the decelerating ball
+    /// ([`Self::ball_ground_travel_time`]), and scores each rendezvous on the receiver's path by:
+    /// the ball and the receiver arriving together (within tolerance), the lane being clear of a
+    /// defender cut-out, the open space at the reception, and forward progress. Returns the optimal
+    /// `(aim_point, launch_speed)`, or `None` to fall back to the analytic lead (gate
+    /// `DD_SOCCER_DISABLE_MPC_PASS`, degenerate input, or no feasible rendezvous found).
+    pub(crate) fn mpc_pass_execution(
+        &self,
+        passer_id: usize,
+        receiver_id: usize,
+        analytic_lead: Vec2,
+        base_speed: f64,
+    ) -> Option<(Vec2, f64)> {
+        if !soccer_mpc_pass_enabled() {
+            return None;
+        }
+        let passer = self.players.iter().find(|p| p.id == passer_id)?;
+        let receiver = self.players.iter().find(|p| p.id == receiver_id)?;
+        if receiver.team != passer.team || receiver.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let from = self.player_snapshot_position(passer);
+        let dt = self.dt_seconds.max(1e-3);
+        // Predict the receiver running toward the ANALYTIC lead (a good estimate of where it will
+        // actually be) rather than a blind velocity extrapolation — so the rendezvous candidates lie
+        // along the run the receiver truly makes, and the MPC refines timing/lane/space along it
+        // instead of leading the ball into space the receiver never reaches.
+        let recv_path =
+            self.mpc_predicted_receiver_path(receiver, analytic_lead, MPC_PASS_HORIZON_STEPS, dt)?;
+        let opp = passer.team.other();
+        let attack_dir = passer.team.attack_dir();
+        let speeds = [base_speed * 0.9, base_speed, base_speed * 1.25];
+        let mut best: Option<(f64, Vec2, f64)> = None;
+        for (k, &rk) in recv_path.iter().enumerate().skip(MPC_PASS_MIN_STEP) {
+            let t_k = k as f64 * dt;
+            let dist = from.distance(rk);
+            if dist < 3.0 {
+                continue;
+            }
+            // Refinement only: stay near the proven analytic reception point.
+            let refine_off = rk.distance(analytic_lead);
+            if refine_off > MPC_PASS_MAX_REFINE_YARDS {
+                continue;
+            }
+            for &v in speeds.iter() {
+                if !v.is_finite() || v <= 1.0 {
+                    continue;
+                }
+                let Some(t_ball) = self.ball_ground_travel_time(dist, v) else {
+                    continue;
+                };
+                let rendezvous_err = (t_ball - t_k).abs();
+                if rendezvous_err > MPC_PASS_RENDEZVOUS_TOLERANCE_SECONDS {
+                    continue;
+                }
+                let (clear_now, clear_flight) =
+                    self.pass_lane_clearance(from, rk, opp, MPC_PASS_LANE_RADIUS_YARDS, v);
+                if !clear_now {
+                    continue;
+                }
+                let space = (self.space_score_at(rk, passer.team) / 18.0).clamp(0.0, 1.0);
+                let forward = ((rk.y - from.y) * attack_dir).clamp(-6.0, 14.0);
+                let intercept_pen = if clear_flight { 0.0 } else { 1.0 };
+                let score = space + forward * 0.04
+                    - rendezvous_err * 1.6
+                    - intercept_pen * 0.9
+                    - refine_off * 0.12
+                    - t_k * 0.05;
+                if best.is_none_or(|(s, _, _)| score > s) {
+                    best = Some((score, rk, v));
+                }
+            }
+        }
+        best.map(|(_, aim, v)| (aim, v))
     }
 
     fn shot_creation_score_for(

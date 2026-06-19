@@ -2226,6 +2226,22 @@ const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
 // for). See `pass_receiver_in_position_bonus` / `pass_receiver_effective_arrival`.
 const RECEIVER_IN_POSITION_LP_REFERENCE_YARDS: f64 = 16.0;
 const RECEIVER_IN_POSITION_MAX_BONUS_SECONDS: f64 = 0.40;
+// ---- MPC pass execution ----
+// A receding-horizon optimiser for the LAUNCH of a ground pass: it predicts the receiver's
+// dynamically-feasible run (point-mass MPC, bending around opponents), forward-models the ball's
+// decelerating flight, and picks the rendezvous (lead point + launch speed) the receiver meets in
+// time and defenders can't cut out. Horizon ~1.6s at dt=1/15; steps below MIN are too close to lead.
+const MPC_PASS_HORIZON_STEPS: usize = 24;
+const MPC_PASS_MIN_STEP: usize = 3;
+// A candidate rendezvous is only accepted when the ball's predicted arrival time and the receiver's
+// predicted arrival time agree within this tolerance (seconds) — i.e. the ball actually meets the run.
+const MPC_PASS_RENDEZVOUS_TOLERANCE_SECONDS: f64 = 0.22;
+// Half-width (yards) of the pass-lane corridor the MPC tests for a defender cutting the ball out.
+const MPC_PASS_LANE_RADIUS_YARDS: f64 = 1.4;
+// The MPC only REFINES the proven analytic lead — its chosen aim must stay within this far of it.
+// Keeps the optimiser anchored to where the receiver actually runs (no leading the ball into space
+// the receiver never reaches) while letting it pick a better-timed, lane-clear point along the run.
+const MPC_PASS_MAX_REFINE_YARDS: f64 = 3.0;
 // ---- First touch: retain position / flick onto a runner ----
 // Length (yards) of a directional settling touch — short, so the ball stays under control.
 const FIRST_TOUCH_RETAIN_PUSH_YARDS: f64 = 2.2;
