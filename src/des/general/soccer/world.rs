@@ -23525,21 +23525,23 @@ impl WorldSnapshot {
             .sum::<f64>()
             / defenders.len() as f64;
         let ball_fwd = fwd(self.ball.position);
-        // The band is suspended only with the ball on/near a goal line (forcing "2yd
-        // behind" there would shove the line off the end-line). Otherwise it applies
-        // even when the line has drifted AHEAD of the ball (gap <= 0) — that's exactly
-        // the build-up bug we must pull back, so do NOT bail here.
+        // The band is suspended only with the ball on/near a goal line (forcing "5yd
+        // behind" there would shove the line off the end-line — deep in our own end the
+        // line sits at parity with the ball instead). Otherwise it applies even when the
+        // line has drifted AHEAD of the ball (gap <= 0) — that's exactly the build-up bug
+        // we must pull back, so do NOT bail here.
         let ball_y = self.ball.position.y;
         if ball_y <= DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
             || ball_y >= self.field_length - DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS
         {
             return target;
         }
-        // THE RULE (simple, no regimes): the back four's AVERAGE sits 2-30yd behind
+        // THE RULE (simple, no regimes): the back four's AVERAGE sits 5-25yd behind
         // (goal-side of) the ball — always, in or out of possession. Exceptions:
-        // (1) near our own goal line, 30yd behind the ball may be off-pitch, and
+        // (1) near our own goal line, 25yd behind the ball may be off-pitch (and within
+        // our own 5yd zone the band is suspended above), and
         // (2) the back four may not press more than 5yd into the opponent half, so
-        // a high ball may leave the line more than 30yd behind by design.
+        // a high ball may leave the line more than 25yd behind by design.
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
         let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);

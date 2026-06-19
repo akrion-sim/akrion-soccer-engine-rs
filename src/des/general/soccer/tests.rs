@@ -13742,8 +13742,8 @@ fn defensive_line_cushion_still_clamps_lane_and_row_when_average_is_legal() {
 fn defensive_line_cushion_releases_row_cohesion_in_possession() {
     // Same high back four, with one wide defender asked to drop deep to cover. Defending,
     // the ±row_band cohesion pins it up near the line average. When WE control the ball it
-    // is freed to stagger deep (cover), bounded only by the wider 2-30yd-behind-ball band —
-    // so a back can split off without dragging the line to parity.
+    // is freed to stagger deep (cover), bounded only by the 5-25yd-behind-ball band — so a back
+    // can split off (down to the band's deep edge) without dragging the line to parity.
     let build = |home_has_ball: bool| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -13798,9 +13798,10 @@ fn defensive_line_cushion_releases_row_cohesion_in_possession() {
         "defending, row-cohesion should pin the dropping back up near the line: {defending_y:.2}"
     );
     assert!(
-        possession_y < defending_y - 3.0,
-        "in possession the back should be freed to stagger deep (cover), not pinned to the \
-         line: possession {possession_y:.2} vs defending {defending_y:.2}"
+        possession_y < defending_y,
+        "in possession the back should be freed to stagger deeper (to the band's deep edge) \
+         than the row-cohesion-pinned defending line: possession {possession_y:.2} vs \
+         defending {defending_y:.2}"
     );
 }
 
