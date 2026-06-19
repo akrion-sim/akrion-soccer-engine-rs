@@ -12567,6 +12567,13 @@ pub(crate) struct PendingPass {
     /// matching the Laws: any player in an offside position who becomes involved is
     /// penalised, regardless of who the pass was "meant" for.
     offside_candidates: Vec<PendingOffside>,
+    /// Captured AT LAUNCH for the learned pass-completion model: the canonical 22-player+ball
+    /// config embedding (perspective = the passing team) concatenated with this pass's own
+    /// features (distance / forward / lateral / pressure / receiver openness / aerial). When the
+    /// pass resolves it is emitted as a `SoccerPassOutcomeSample` with the completed/intercepted
+    /// label, so the model learns "from THIS whole-field configuration, does THIS pass complete?".
+    /// Empty ⇒ not captured (no learning sample emitted).
+    learn_features: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -27092,6 +27099,111 @@ pub struct SoccerNeuralNetworkSnapshot {
     pub parameter_count: usize,
     pub l2_norm: f64,
     pub layers: Vec<SoccerNeuralLayerSnapshot>,
+}
+
+/// Number of pass-specific scalar features appended to the 256-d config embedding for the learned
+/// pass-completion model: distance, forward progress, lateral, passer pressure, receiver openness,
+/// aerial flag.
+pub const SOCCER_PASS_COMPLETION_PASS_FEATURES: usize = 6;
+/// Total input width of the learned pass-completion model.
+pub const SOCCER_PASS_COMPLETION_FEATURE_DIM: usize =
+    SOCCER_MOMENT_EMBEDDING_DIM + SOCCER_PASS_COMPLETION_PASS_FEATURES;
+const SOCCER_PASS_COMPLETION_HIDDEN_UNITS: usize = 32;
+/// Cap on retained pass-outcome training samples (a rolling window; the cluster learner drains
+/// them to Postgres + the model each learning pass).
+const SOCCER_PASS_OUTCOME_SAMPLE_CAP: usize = 4096;
+
+/// One training example for the learned pass-completion model: the whole-field configuration +
+/// pass features captured AT LAUNCH, labelled with whether the pass was completed. This is the
+/// substrate that lets passing LEARN from the 22-player+ball config (persisted to Postgres by the
+/// cluster learner; see [`SoccerPassCompletionHead`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPassOutcomeSample {
+    /// `SOCCER_PASS_COMPLETION_FEATURE_DIM` features (config embedding ++ pass features).
+    pub features: Vec<f32>,
+    /// `true` = the pass was received by a team-mate; `false` = intercepted / lost.
+    pub completed: bool,
+    /// Whether the pass was played from the passing team's own half (stratified reporting).
+    pub own_half: bool,
+}
+
+/// Learned pass-completion model: an MLP over the whole-field config embedding + pass features that
+/// predicts P(complete). Mirrors [`SoccerPolicyHead`]'s use of the shared `FeedForwardNetwork`
+/// (live net not serde; round-tripped through [`SoccerNeuralNetworkSnapshot`] for Postgres). It is
+/// the learned replacement for the analytic completion estimate and the hand-scored MPC pass
+/// weights — trained on [`SoccerPassOutcomeSample`]s, conditioned on the 22+ball config.
+#[derive(Clone, Debug)]
+pub(crate) struct SoccerPassCompletionHead {
+    network: FeedForwardNetwork,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerPassCompletionHead {
+    pub(crate) fn new(seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ 0x5F37_2C1B);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_PASS_COMPLETION_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_PASS_COMPLETION_HIDDEN_UNITS],
+                output_dim: 1,
+                hidden_activation: ActivationName::Relu,
+                // Sigmoid output = a probability in (0, 1).
+                output_activation: ActivationName::Sigmoid,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerPassCompletionHead {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    /// P(complete) for a captured feature vector, or `None` on malformed input.
+    pub(crate) fn predict(&self, features: &[f32]) -> Option<f64> {
+        if features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM
+            || features.iter().any(|v| !v.is_finite())
+        {
+            return None;
+        }
+        let input: Vec<f64> = features.iter().map(|&v| v as f64).collect();
+        let out = self.network.predict(&input);
+        out.first().copied().filter(|p| p.is_finite())
+    }
+
+    /// One SGD epoch over `samples` (binary cross-entropy via the clipped MSE step on a sigmoid
+    /// output is adequate here). Returns the mean step loss.
+    pub(crate) fn train(&mut self, samples: &[SoccerPassOutcomeSample], learning_rate: f64) -> f64 {
+        let mut total = 0.0;
+        let mut applied = 0usize;
+        for sample in samples {
+            if sample.features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM {
+                continue;
+            }
+            let input: Vec<f64> = sample.features.iter().map(|&v| v as f64).collect();
+            let target = [if sample.completed { 1.0 } else { 0.0 }];
+            let result = self.network.train_sample_clipped(&input, &target, learning_rate, 4.0);
+            if result.applied && result.loss.is_finite() {
+                total += result.loss;
+                applied += 1;
+                self.training_steps += 1;
+            }
+        }
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
+        self.last_loss = Some(mean);
+        mean
+    }
+
+    pub(crate) fn training_steps(&self) -> usize {
+        self.training_steps
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

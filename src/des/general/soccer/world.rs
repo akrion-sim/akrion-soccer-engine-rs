@@ -183,6 +183,12 @@ pub struct SoccerMatch {
     pub(crate) goal_kick_must_clear_box: Option<(Team, Vec2)>,
     pub(crate) recent_learning_history: VecDeque<SoccerLearningTransition>,
     pub(crate) deferred_reward_transitions: Vec<SoccerLearningTransition>,
+    /// Rolling window of pass-outcome training samples (config embedding + pass features captured
+    /// at launch, labelled completed/intercepted at resolution). The substrate for learned pass
+    /// completion; drained by the cluster learner to Postgres + [`SoccerPassCompletionHead`].
+    pub(crate) pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
+    /// The learned pass-completion model, when present (trained from `pass_outcome_samples`).
+    pub(crate) pass_completion_head: Option<SoccerPassCompletionHead>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
     /// only while the turnover-window penalty is enabled, so a dispossession/interception
     /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
@@ -1014,6 +1020,8 @@ impl SoccerMatch {
             }),
             recent_learning_history: VecDeque::new(),
             deferred_reward_transitions: Vec::new(),
+            pass_outcome_samples: Vec::new(),
+            pass_completion_head: None,
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             defensive_delay_clocks: HashMap::new(),
@@ -8407,6 +8415,15 @@ impl SoccerMatch {
                         receiver_velocity_at_launch,
                         offside,
                         offside_candidates,
+                        learn_features: snapshot.pass_completion_learn_features(
+                            player_team,
+                            player_pos,
+                            led_target,
+                            distance,
+                            pressure,
+                            receiver_openness,
+                            flight,
+                        ),
                     });
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
@@ -10638,6 +10655,7 @@ impl SoccerMatch {
                             self.stat_pass_completed_direction(team, forward_yards);
                             let own_half = self.pass_from_own_half(pass.team, pass.origin);
                             self.stat_pass_completed_half(own_half);
+                            self.record_pass_outcome_sample(pass, true, own_half);
                         }
                         self.pending_pass = None;
                         self.stat_pass_completed(team);
@@ -10648,6 +10666,7 @@ impl SoccerMatch {
                             // not the intercepting team, so the by-half rate matches attempts.
                             let own_half = self.pass_from_own_half(pass.team, pass.origin);
                             self.stat_pass_intercepted_half(own_half);
+                            self.record_pass_outcome_sample(pass, false, own_half);
                         }
                         self.record_interception_reward(holder, pending_pass_for_reward.as_ref());
                         self.pending_pass = None;
@@ -13017,6 +13036,30 @@ impl SoccerMatch {
         } else {
             self.stats.pass_interceptions_opp_half += 1;
         }
+    }
+
+    /// Emit a learned-pass-completion training sample from a resolved pass (the launch-time config
+    /// embedding + pass features, labelled `completed`). Bounded rolling window; the cluster learner
+    /// drains it to Postgres + the model. No-op when the launch features were not captured.
+    fn record_pass_outcome_sample(&mut self, pass: &PendingPass, completed: bool, own_half: bool) {
+        if pass.learn_features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM {
+            return;
+        }
+        self.pass_outcome_samples.push(SoccerPassOutcomeSample {
+            features: pass.learn_features.clone(),
+            completed,
+            own_half,
+        });
+        if self.pass_outcome_samples.len() > SOCCER_PASS_OUTCOME_SAMPLE_CAP {
+            let overflow = self.pass_outcome_samples.len() - SOCCER_PASS_OUTCOME_SAMPLE_CAP;
+            self.pass_outcome_samples.drain(0..overflow);
+        }
+    }
+
+    /// Drain the accumulated pass-outcome samples (the cluster learner persists them to Postgres
+    /// and trains [`SoccerPassCompletionHead`] on the pooled corpus).
+    pub(crate) fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
+        std::mem::take(&mut self.pass_outcome_samples)
     }
 
     fn stat_clearance(&mut self, team: Team) {
@@ -26627,6 +26670,40 @@ impl WorldSnapshot {
             led.y.max(attacking_goal_y + RECEPTION_BYLINE_MARGIN_YARDS)
         };
         Some(Vec2::new(led.x, byline_capped_y))
+    }
+
+    /// Capture the learned-pass-completion feature vector AT LAUNCH: the canonical 22-player+ball
+    /// config embedding (perspective = the passing team — the same vector used for retrieval/PG)
+    /// concatenated with this pass's own normalised features. Paired with the completed/intercepted
+    /// label at resolution, this is the training substrate that lets passing LEARN from the
+    /// whole-field configuration. See [`SoccerPassOutcomeSample`] / [`SoccerPassCompletionHead`].
+    pub(crate) fn pass_completion_learn_features(
+        &self,
+        team: Team,
+        from: Vec2,
+        to: Vec2,
+        distance: f64,
+        pressure: f64,
+        receiver_openness: f64,
+        flight: PassFlight,
+    ) -> Vec<f32> {
+        let config = SoccerConfigVector::from_snapshot_with(
+            self,
+            team,
+            SoccerConfigComparison::PositionAgnostic,
+            ConfigWeightOptions::default(),
+        );
+        let embedding = config.embedding();
+        let mut features: Vec<f32> = Vec::with_capacity(SOCCER_PASS_COMPLETION_FEATURE_DIM);
+        features.extend(embedding.iter().map(|&v| v as f32));
+        let attack = team.attack_dir();
+        features.push((distance / 60.0).clamp(0.0, 1.5) as f32);
+        features.push((((to.y - from.y) * attack) / 40.0).clamp(-1.0, 1.5) as f32);
+        features.push(((to.x - from.x).abs() / 40.0).clamp(0.0, 1.0) as f32);
+        features.push(pressure.clamp(0.0, 1.0) as f32);
+        features.push(receiver_openness.clamp(0.0, 1.0) as f32);
+        features.push(if flight.is_aerial() { 1.0 } else { 0.0 });
+        features
     }
 
     /// Forward-model the time (seconds) for a GROUND ball launched at `launch_speed` (yps) to roll
