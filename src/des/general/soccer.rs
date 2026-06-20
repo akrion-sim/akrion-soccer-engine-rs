@@ -1847,8 +1847,8 @@ const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const SIX_YARD_BOX_DEPTH_YARDS: f64 = 6.0;
 const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
-const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 12.0;
-const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 4;
+const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 8.0;
+const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 2;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
@@ -2120,7 +2120,7 @@ const DEFENDER_LINE_FORWARD_BIAS_YARDS: f64 = 2.5;
 // line and pin the far full-back — NOT drift ball-side into the bunch. The ball must
 // be at least this lopsided (fraction of the half-width off-centre) before the far
 // flank is meaningfully a "weak side" worth pinning; below it both flanks are live.
-const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.18;
+const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.10;
 // Defenders slide toward the ball laterally a touch more than before, and
 // wing-backs (wide defenders) slide much more — they are the ones who shuttle out
 // to the ball on their flank. Centre-backs get only a small amount: they hold
@@ -3040,7 +3040,7 @@ static SOCCER_LAST_SITE_PLAYBACK_SEED: AtomicU32 = AtomicU32::new(0);
 const GOAL_URGENCY_MAX_YARDS: f64 = 30.0;
 const GOAL_URGENCY_KEEPER_CROWD_YARDS: f64 = 6.0;
 const SUPPORT_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.10;
-const WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS: f64 = 4.5;
+const WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS: f64 = 3.0;
 const WIDE_OUTLET_MIN_FORWARD_YARDS: f64 = 2.0;
 const WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL: usize = 4;
 const WINGBACK_ATTACK_COVER_FULL_OTHER_PLAYERS_BEHIND_BALL: usize = 6;
@@ -48476,7 +48476,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
             "Home LM".to_string(),
             PlayerRole::Midfielder,
             11,
-            Vec2::new(17.0, 57.0),
+            Vec2::new(13.0, 57.0),
         ),
         (
             "Home CM1".to_string(),
@@ -48494,7 +48494,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
             "Home RM".to_string(),
             PlayerRole::Midfielder,
             7,
-            Vec2::new(63.0, 57.0),
+            Vec2::new(67.0, 57.0),
         ),
         (
             "Home ST1".to_string(),
