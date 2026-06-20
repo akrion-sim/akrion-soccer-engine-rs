@@ -28107,8 +28107,18 @@ impl WorldSnapshot {
         let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
         let line_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
         let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
-        // Cap only the AHEAD (high-fwd) side; deeper (cover/retreat) is always allowed.
-        let leveled_fwd = clamped_fwd.min(line_centre_fwd + level_half_band);
+        // No defender may sit AHEAD of the line (toward the attackers) — that is what plays runners
+        // onside — so the front edge is always capped to the line centre + half-band.
+        let ahead_cap = line_centre_fwd + level_half_band;
+        // Pulling laggers UP to the line completes the flat ≤2yd block. But while a carrier is
+        // breaking through, the line must be free to DROP and cover (a deep recovering defender is
+        // never offside-relevant), so the pull-up (lower edge) is suspended during a break and the
+        // four re-level once it clears. This is the target only; the player jogs level over ~3s.
+        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
+            clamped_fwd.min(ahead_cap)
+        } else {
+            clamped_fwd.clamp(line_centre_fwd - level_half_band, ahead_cap)
+        };
         leveled_fwd * attack
     }
 

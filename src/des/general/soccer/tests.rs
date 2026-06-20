@@ -873,8 +873,7 @@ fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     assert!(target.y < 90.0, "recovery must pull the striker back (lower y): {target:?}");
 
     sim.players[midfielder].position = Vec2::new(44.0, 91.0);
-    sim.offside_clocks
-        .insert(midfielder, OFFSIDE_GRACE_SECONDS + 1.0);
+    sim.offside_clocks.insert(midfielder, OFFSIDE_GRACE_SECONDS + 1.0);
     let midfielder_target = sim
         .attacker_offside_recovery_target(midfielder)
         .expect("offside midfielder beyond grace should be recovered onside too");
@@ -898,8 +897,7 @@ fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     // Deep offside is the bug class from live play: recover sooner instead of waiting
     // around goal-side of the line for the full generic grace window.
     sim.players[striker].position = Vec2::new(40.0, 90.0);
-    sim.offside_clocks
-        .insert(striker, DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS + 0.1);
+    sim.offside_clocks.insert(striker, DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS + 0.1);
     assert!(
         sim.attacker_offside_recovery_target(striker).is_some(),
         "deep offside runners should be recovered before the full generic grace expires"
