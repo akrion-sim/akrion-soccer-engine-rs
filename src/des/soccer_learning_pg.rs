@@ -1251,11 +1251,28 @@ impl SoccerLearningPgStore {
         home_options: SoccerQPolicyOptions,
         away_options: SoccerQPolicyOptions,
     ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
+        // Full policy (every tabular entry) — what the LEARNER needs to resume exactly.
+        self.load_latest_active_policy_with_min_visits(experiment_id, home_options, away_options, 0)
+    }
+
+    /// Like [`Self::load_latest_active_policy`] but returns only tabular entries with
+    /// `visits >= min_visits` (the neural net is always loaded in full). The
+    /// inference-only live server uses this to load just the well-learned core of the
+    /// tip instead of hauling the full multi-million-row policy over the wire; pass `0`
+    /// for the complete policy (training resume).
+    pub fn load_latest_active_policy_with_min_visits(
+        &mut self,
+        experiment_id: &str,
+        home_options: SoccerQPolicyOptions,
+        away_options: SoccerQPolicyOptions,
+        min_visits: i32,
+    ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
         self.ensure_connected()?;
         let Some(metadata) = self.load_latest_active_policy_metadata(experiment_id)? else {
             return Ok(None);
         };
-        let policies = self.load_policy_entries(&metadata.id, home_options, away_options)?;
+        let policies =
+            self.load_policy_entries(&metadata.id, home_options, away_options, min_visits.max(0))?;
         let policy_fingerprint = metadata
             .policy_fingerprint
             .or_else(|| Some(soccer_team_q_policies_fingerprint(&policies)));
@@ -2498,6 +2515,12 @@ impl SoccerLearningPgStore {
         policy_version_id: &str,
         home_options: SoccerQPolicyOptions,
         away_options: SoccerQPolicyOptions,
+        // Server-side trim: only entries with `visits >= min_visits` are returned.
+        // `0` (the learner's resume) loads everything (the predicate is always true).
+        // The inference-only live server passes `> 0` to skip the noisy single-visit
+        // tail, so it transfers + holds the well-learned core (+ the net) instead of
+        // the full multi-million-row policy. See `load_latest_active_policy_with_min_visits`.
+        min_visits: i32,
     ) -> Result<SoccerTeamQPolicies, String> {
         let mut home_entries = Vec::new();
         let mut away_entries = Vec::new();
@@ -2542,6 +2565,7 @@ impl SoccerLearningPgStore {
                            target_macro_cell_id, target_root_cell_id)
                         > ($2::text, $3::text, $4::text, $5::text,
                            $6::int, $7::int, $8::int, $9::int)
+                      and visits >= $11::int
                     order by team, entry_kind, state_hash, action,
                              target_fine_cell_id, target_tactical_cell_id,
                              target_macro_cell_id, target_root_cell_id
@@ -2558,6 +2582,7 @@ impl SoccerLearningPgStore {
                         &cursor_macro,
                         &cursor_root,
                         &SOCCER_POLICY_ENTRY_PAGE_SIZE,
+                        &min_visits,
                     ],
                 )
                 .map_err(|err| format!("select soccer policy entries page: {err}"))?;

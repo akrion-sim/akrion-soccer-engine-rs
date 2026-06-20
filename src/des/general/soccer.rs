@@ -32868,6 +32868,20 @@ fn soccer_live_pg_experiment_slug() -> String {
     std::env::var("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|_| "soccer-self-play".to_string())
 }
 
+/// Minimum tabular-entry visit count the live server loads from Postgres. `0` (default)
+/// loads the entire active policy (every entry); a value `> 0` skips the noisy
+/// single-/low-visit tail so a *remote* `:5055` starts in seconds and stays light in
+/// memory (the neural net — the real learner — is always loaded in full regardless).
+/// Set `SOCCER_LIVE_POLICY_MIN_VISITS` to opt in.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_policy_min_visits() -> i32 {
+    std::env::var("SOCCER_LIVE_POLICY_MIN_VISITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(0)
+}
+
 // ── Postgres → live-server policy bridge ───────────────────────────────────────────────
 // Built only with the `postgres-persistence` feature. When `SOCCER_DATABASE_URL` is set the
 // live server loads the latest ACTIVE learned policy (tabular Q + neural net) for the
@@ -32911,7 +32925,16 @@ fn soccer_live_fetch_latest_pg_policy(
     experiment_id: &str,
 ) -> Result<Option<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion>, String> {
     let options = SoccerQPolicyOptions::default();
-    store.load_latest_active_policy(experiment_id, options.clone(), options)
+    // The live server does inference only, so it loads the neural net (always, in full)
+    // plus the well-learned tabular core — entries visited at least
+    // `SOCCER_LIVE_POLICY_MIN_VISITS` times — instead of hauling the full
+    // multi-million-row policy tip over the wire. `0` (default) loads everything.
+    store.load_latest_active_policy_with_min_visits(
+        experiment_id,
+        options.clone(),
+        options,
+        soccer_live_policy_min_visits(),
+    )
 }
 
 /// Install an already-fetched policy version into `sim` (the cheap, lock-held step): move the
