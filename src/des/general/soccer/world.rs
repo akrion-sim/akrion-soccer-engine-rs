@@ -8888,7 +8888,13 @@ impl SoccerMatch {
                     return 0.0;
                 }
                 let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
-                let min_gap = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap);
+                // Waive the 10yd minimum standoff close to our own goal (defend on the box, not
+                // a forced 10yd off the ball); the max still applies.
+                let min_gap = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
+                    0.0
+                } else {
+                    DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
+                };
                 let gap = ball_fwd - fwd(me.position);
                 urgency_for_error(role_layer_gap_band_error_yards(gap, min_gap, max_gap))
             }
@@ -15748,16 +15754,28 @@ impl WorldSnapshot {
                         .1
                 })
         };
+        // Out of time (we are past the hold delay) with no resolvable receiver: hoof it into the
+        // attacking corner channel rather than tapping it to nobody / out of play.
+        let corner_hoof = || {
+            let (aim, power) = self.restart_corner_hoof_for(taker_id);
+            SoccerAction::Clearance { target: aim, power }
+        };
         let action = match call.release_kind {
-            SoccerSetPlayReleaseKind::Pass => SoccerAction::Pass {
-                target_player: resolve_floor_receiver(),
-                power: release_power,
-                flight: PassFlight::Floor,
+            SoccerSetPlayReleaseKind::Pass => match resolve_floor_receiver() {
+                Some(id) => SoccerAction::Pass {
+                    target_player: Some(id),
+                    power: release_power,
+                    flight: PassFlight::Floor,
+                },
+                None => corner_hoof(),
             },
-            SoccerSetPlayReleaseKind::AerialPass => SoccerAction::Pass {
-                target_player: resolve_aerial_receiver(),
-                power: release_power,
-                flight: PassFlight::Aerial,
+            SoccerSetPlayReleaseKind::AerialPass => match resolve_aerial_receiver() {
+                Some(id) => SoccerAction::Pass {
+                    target_player: Some(id),
+                    power: release_power,
+                    flight: PassFlight::Aerial,
+                },
+                None => corner_hoof(),
             },
             SoccerSetPlayReleaseKind::Shoot => SoccerAction::Shoot {
                 power: release_power,
@@ -19022,6 +19040,36 @@ impl WorldSnapshot {
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(id, _)| id)
+    }
+
+    /// A forced restart with NO available team-mate: hoof the ball up-field toward the
+    /// attacking corner flag (wide of the central keeper), 20yd when already near the
+    /// opponent goal up to 50yd deep in our own half. Returns the aim point and a firm
+    /// clearance power — used only when a restart taker is out of time AND out of passing
+    /// options, where a long ball into the corner channel beats a tap to nobody.
+    pub(crate) fn restart_corner_hoof_for(&self, taker_id: usize) -> (Vec2, f64) {
+        let (pos, team) = match self.players.iter().find(|p| p.id == taker_id) {
+            Some(taker) => (self.player_snapshot_position(taker), taker.team),
+            None => (self.ball.position, Team::Home),
+        };
+        let attack_dir = team.attack_dir();
+        let opp_goal_y = if attack_dir > 0.0 { self.field_length } else { 0.0 };
+        // Far from the opponent goal (deep in our half) ⇒ longer hoof; near it ⇒ shorter.
+        let frac = ((opp_goal_y - pos.y).abs() / self.field_length.max(1.0)).clamp(0.0, 1.0);
+        let hoof =
+            RESTART_HOOF_MIN_YARDS + (RESTART_HOOF_MAX_YARDS - RESTART_HOOF_MIN_YARDS) * frac;
+        let target_y = (pos.y + hoof * attack_dir).clamp(
+            RESTART_HOOF_BYLINE_MARGIN_YARDS,
+            self.field_length - RESTART_HOOF_BYLINE_MARGIN_YARDS,
+        );
+        // Toward the nearer touchline / corner flag — wide, away from the central keeper.
+        let target_x = if pos.x <= self.field_width * 0.5 {
+            RESTART_HOOF_CORNER_INSET_YARDS
+        } else {
+            self.field_width - RESTART_HOOF_CORNER_INSET_YARDS
+        };
+        let aim = Vec2::new(target_x, target_y).clamp_to_pitch(self.field_width, self.field_length);
+        (aim, RESTART_HOOF_POWER)
     }
 
     /// Where to play a pass that has NO resolved short target — instead of a fixed blind
@@ -23028,9 +23076,20 @@ impl WorldSnapshot {
                 Vec2::new(0.0, -attack_dir)
             };
             let cover = recovery + dir * IN_BEHIND_COVER_DISTANCE_YARDS;
+            let adjusted = self.defensive_line_cushion_adjusted_target(player_id, cover);
+            // Stay GOALSIDE of the recovery point even where the line band relaxes its minimum
+            // standoff near our own goal: covering a ball played in behind is an emergency, so the
+            // second man tucks behind the recovering nearest defender to protect the goal rather
+            // than sitting level with the ball (which the relaxed band would otherwise permit).
+            let recovery_fwd = recovery.y * attack_dir;
+            let min_goalside_fwd = recovery_fwd - IN_BEHIND_COVER_MIN_GOALSIDE_YARDS;
+            let cover_target = if adjusted.y * attack_dir > min_goalside_fwd {
+                Vec2::new(adjusted.x, min_goalside_fwd * attack_dir)
+            } else {
+                adjusted
+            };
             return (
-                self.defensive_line_cushion_adjusted_target(player_id, cover)
-                    .clamp_to_pitch(self.field_width, self.field_length),
+                cover_target.clamp_to_pitch(self.field_width, self.field_length),
                 pressured_sprint,
             );
         }
@@ -23823,7 +23882,13 @@ impl WorldSnapshot {
         // (2) the back four may not press more than 5yd into the opponent half, so
         // a high ball may leave the line more than 30yd behind by design.
         let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
-        let min_behind = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind);
+        // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
+        // 10yd off the ball); the max still applies.
+        let min_behind = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
+            0.0
+        } else {
+            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind)
+        };
         // 5yd-into-the-opponents'-half ceiling (in attack-forward coords). The halfway
         // line sits exactly field_length/2 forward of our own goal.
         let opp_half_ceiling_fwd = own_goal_fwd
@@ -27899,7 +27964,8 @@ impl WorldSnapshot {
     }
 
     /// Clamp a defender's target forward-position to the hard back-four line band:
-    /// 5-30 yards behind the ball, except inside the team's own 5-yard emergency zone.
+    /// 10-30 yards behind the ball, except the 10yd minimum is waived within 20yd of our own
+    /// goal (and the band fully suspended inside the team's own 5-yard emergency zone).
     fn defender_line_band_clamped_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         let attack = me.team.attack_dir();
         let ball_fwd = self.ball.position.y * attack;
@@ -27912,10 +27978,15 @@ impl WorldSnapshot {
         if self.defender_is_designated_ball_presser(me) {
             return compact_y;
         }
-        let min_gap = DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS;
         let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
-        let min_gap = min_gap.min(max_gap);
-        // Lower bound of the gap: stay goal-side of the ball by the hard 5yd
+        // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
+        // 10yd off the ball); the max still applies.
+        let min_gap = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
+            0.0
+        } else {
+            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
+        };
+        // Lower bound of the gap: stay goal-side of the ball by the hard 10yd
         // floor. Upper bound: no more than 30yd behind where the ball is headed.
         let predicted_fwd = self
             .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)

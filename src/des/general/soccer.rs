@@ -1275,12 +1275,17 @@ const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// THE rule: the back four's average sits 5-30yd behind (goal-side of) the ball, always,
+// THE rule: the back four's average sits 10-30yd behind (goal-side of) the ball, always,
 // outside the team's own 5-yard emergency zone. The deep edge (30) matches the emergency
 // break-cover cap `DEFENSIVE_MAX_BEHIND_BALL_YARDS`, so a line-break retreat is never
 // clamped shallower than the cover it is trying to provide.
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 10.0;
 const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+// ...but the 10yd MINIMUM standoff is waived once the ball is this close to our own goal:
+// defending on top of our own box we hold level with / goal-side of the ball rather than
+// being forced a full 10yd off it (which would shove the line into the six-yard box / off
+// the end-line). The 30yd maximum (capped by room to our own goal) still applies.
+const DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS: f64 = 20.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -2246,6 +2251,16 @@ const LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS: f64 = 8.0;
 // (predicted-point) retriever election. This closed the gap where the closest body
 // sprinted away from a ball sitting at his heels and nobody gathered it.
 const LOOSE_BALL_CLOSE_COLLECT_RADIUS_YARDS: f64 = 2.5;
+// A forced restart (out of time) with NO available team-mate hoofs the ball up-field
+// toward the attacking CORNER flag — wide of the central keeper — rather than tapping
+// it to nobody. The hoof length scales with how deep we are: ~20yd already near the
+// opponent goal, up to ~50yd deep in our own half. Aimed inset from the touchline/byline
+// so it lands in the corner channel, not out of play.
+const RESTART_HOOF_MIN_YARDS: f64 = 20.0;
+const RESTART_HOOF_MAX_YARDS: f64 = 50.0;
+const RESTART_HOOF_CORNER_INSET_YARDS: f64 = 8.0;
+const RESTART_HOOF_BYLINE_MARGIN_YARDS: f64 = 6.0;
+const RESTART_HOOF_POWER: f64 = 0.85;
 // A SECOND retriever only commits to a loose ball under genuine pressure from the team that
 // played it (in real soccer two players collect together to SHIELD it from a bearing-down
 // attacker). High pressure = an opponent right on the drop (within this radius). Increasing
@@ -2316,6 +2331,9 @@ const LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS: f64 = 10.0;
 const BALL_IN_BEHIND_MARGIN_YARDS: f64 = 2.0;
 const BALL_IN_BEHIND_MAX_FROM_GOAL_YARDS: f64 = 55.0;
 const IN_BEHIND_COVER_DISTANCE_YARDS: f64 = 6.0;
+// The second man covering a ball played in behind stays at least this far goalside of the
+// recovery point — even where the line band relaxes its minimum standoff near our own goal.
+const IN_BEHIND_COVER_MIN_GOALSIDE_YARDS: f64 = 2.0;
 const IN_BEHIND_SPRINT_PRESSURE: f64 = 0.45;
 const IN_BEHIND_GK_MAX_ADVANCE_YARDS: f64 = 16.0;
 /// A midfielder/striker carrier counts as "driving at goal" — the cue for other attackers

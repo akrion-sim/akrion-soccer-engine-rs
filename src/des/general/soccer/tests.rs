@@ -15771,13 +15771,17 @@ fn close_ball_support_movement_keeps_existing_facing_to_avoid_spin() {
         ..Default::default()
     });
     let player = 2;
-    sim.ball.holder = None;
-    sim.ball.position = Vec2::new(40.0, 60.25);
-    sim.players[player].position = Vec2::new(40.0, 60.0);
+    // A team-mate holds the ball (a support, not a loose-ball recovery), and the scene sits deep
+    // in our own third (within the back-four band's near-own-goal relaxation), so neither the
+    // 10-30yd line band nor a back-line 50/50 forces a recovery sprint — isolating the facing/gait
+    // logic under test. Only the player→ball bearing matters, which the uniform depth preserves.
+    sim.ball.holder = Some(9);
+    sim.ball.position = Vec2::new(40.0, 8.25);
+    sim.players[player].position = Vec2::new(40.0, 8.0);
     sim.players[player].velocity = Vec2::zero();
     sim.players[player].action_facing = FacingBucket::East;
 
-    sim.move_player_towards(player, Vec2::new(44.0, 60.0), false);
+    sim.move_player_towards(player, Vec2::new(44.0, 8.0), false);
 
     assert_eq!(sim.players[player].movement_gait, MovementGait::SideStep);
     assert_eq!(
@@ -15796,13 +15800,17 @@ fn support_movement_keeps_broad_ball_facing_to_avoid_bucket_spin() {
         ..Default::default()
     });
     let player = 2;
-    sim.ball.holder = None;
-    sim.ball.position = Vec2::new(44.0, 70.0);
-    sim.players[player].position = Vec2::new(40.0, 60.0);
+    // A team-mate holds the ball (support, not loose-ball recovery) deep in our own third (within
+    // the band's near-own-goal relaxation) so neither the 10-30yd band nor a back-line 50/50 forces
+    // a recovery sprint — isolating the facing logic. Uniform depth preserves the player→ball
+    // bearings the facing buckets key on.
+    sim.ball.holder = Some(9);
+    sim.ball.position = Vec2::new(44.0, 18.0);
+    sim.players[player].position = Vec2::new(40.0, 8.0);
     sim.players[player].velocity = Vec2::zero();
     sim.players[player].action_facing = FacingBucket::South;
 
-    sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
+    sim.move_player_towards(player, Vec2::new(46.0, 8.0), false);
 
     assert_eq!(sim.players[player].movement_gait, MovementGait::SideStep);
     assert_eq!(
@@ -15811,12 +15819,12 @@ fn support_movement_keeps_broad_ball_facing_to_avoid_bucket_spin() {
             "slight diagonal ball movement should not make a defender spin across adjacent facing buckets"
         );
 
-    sim.ball.position = Vec2::new(62.0, 60.0);
-    sim.players[player].position = Vec2::new(40.0, 60.0);
+    sim.ball.position = Vec2::new(62.0, 8.0);
+    sim.players[player].position = Vec2::new(40.0, 8.0);
     sim.players[player].velocity = Vec2::zero();
     sim.players[player].action_facing = FacingBucket::South;
 
-    sim.move_player_towards(player, Vec2::new(48.0, 60.0), false);
+    sim.move_player_towards(player, Vec2::new(48.0, 8.0), false);
 
     assert_eq!(
             sim.players[player].action_facing,
@@ -15835,12 +15843,15 @@ fn broad_forward_view_keeps_defensive_facing_stable_until_ball_is_square() {
     });
     let player = 2;
     sim.ball.holder = Some(9);
-    sim.ball.position = Vec2::new(58.0, 65.0);
-    sim.players[player].position = Vec2::new(40.0, 60.0);
+    // Deep in our own third (within the band's near-own-goal relaxation) so the 10-30yd line band
+    // doesn't force a recovery sprint — isolating the facing logic. Uniform depth preserves the
+    // player→ball bearings the facing buckets key on.
+    sim.ball.position = Vec2::new(58.0, 13.0);
+    sim.players[player].position = Vec2::new(40.0, 8.0);
     sim.players[player].velocity = Vec2::zero();
     sim.players[player].action_facing = FacingBucket::South;
 
-    sim.move_player_towards(player, Vec2::new(46.0, 60.0), false);
+    sim.move_player_towards(player, Vec2::new(46.0, 8.0), false);
 
     assert_eq!(sim.players[player].movement_gait, MovementGait::SideStep);
     assert_eq!(
@@ -15849,12 +15860,12 @@ fn broad_forward_view_keeps_defensive_facing_stable_until_ball_is_square() {
             "defenders should not spin from south to east while the ball is still in a broad forward view"
         );
 
-    sim.ball.position = Vec2::new(62.0, 60.0);
-    sim.players[player].position = Vec2::new(40.0, 60.0);
+    sim.ball.position = Vec2::new(62.0, 8.0);
+    sim.players[player].position = Vec2::new(40.0, 8.0);
     sim.players[player].velocity = Vec2::zero();
     sim.players[player].action_facing = FacingBucket::South;
 
-    sim.move_player_towards(player, Vec2::new(48.0, 60.0), false);
+    sim.move_player_towards(player, Vec2::new(48.0, 8.0), false);
 
     assert_eq!(
             sim.players[player].action_facing,
@@ -22716,10 +22727,19 @@ fn set_play_release_sanitizes_bad_target_and_power() {
             power,
             flight: PassFlight::Aerial,
         } => {
-            assert_eq!(target_player, None);
+            // The bad target (opponent #11) is sanitized — but rather than being dropped to
+            // "nobody", a restart now resolves a real team-mate to deliver to. So the chosen
+            // target must be a valid Home outfielder (not the opponent, not the taker).
+            let chosen = target_player.expect("restart resolves a team-mate, not nobody");
+            assert_ne!(chosen, 11, "must not keep the opponent target");
+            assert_ne!(chosen, taker, "must not pass to self");
+            assert!(
+                sim.players[chosen].team == Team::Home,
+                "resolved target must be a team-mate"
+            );
             assert!((power - 0.65).abs() < 1e-9);
         }
-        other => panic!("expected sanitized aerial pass, got {other:?}"),
+        other => panic!("expected sanitized aerial pass to a team-mate, got {other:?}"),
     }
 }
 
@@ -52827,8 +52847,10 @@ fn cannot_control_a_low_ball_behind_you_but_can_backpedal_under_a_high_one() {
         ..Default::default()
     });
     let mut player = sim.players[12].clone();
-    // Player at x=41, ball just to the WEST (x=40) — but the player faces EAST (away).
-    player.position = Vec2::new(41.0, 55.0);
+    // Player at x=41.5, ball ~1.3yd to the WEST (x=40) — beyond the at-feet trap radius
+    // (CONTROL_AT_FEET_TRAP_RADIUS_YARDS = 1.0yd, below which a ball is controlled no matter
+    // the facing) — and the player faces EAST (away), so a turn is still required.
+    player.position = Vec2::new(41.5, 55.0);
     player.velocity = Vec2::zero();
     player.action_facing = FacingBucket::East;
     player.receive_facing = FacingBucket::East;

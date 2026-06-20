@@ -4052,14 +4052,29 @@ impl PlayerAgent {
             _ => 0.58 + 0.24 * passing_skill,
         }
         .clamp(0.32, 0.96);
-        Some((
-            SoccerAction::Pass {
-                target_player: target,
-                power,
-                flight,
-            },
-            restart_label.to_string(),
-        ))
+        match target {
+            Some(id) => Some((
+                SoccerAction::Pass {
+                    target_player: Some(id),
+                    power,
+                    flight,
+                },
+                restart_label.to_string(),
+            )),
+            // No team-mate to aim at and the taker must release now (any hold window above has
+            // already elapsed): hoof it into the attacking corner channel, wide of the keeper,
+            // rather than tapping it to nobody / straight out of play.
+            None => {
+                let (aim, hoof_power) = snapshot.restart_corner_hoof_for(self.id);
+                Some((
+                    SoccerAction::Clearance {
+                        target: aim,
+                        power: hoof_power,
+                    },
+                    restart_label.to_string(),
+                ))
+            }
+        }
     }
 
     fn control_touch_target_for_goal_context(
