@@ -528,6 +528,50 @@ pub struct OneTwoRun {
     pub return_target: Vec2,
 }
 
+/// What a carrier holding the ball is *signalling* its teammates to do while it waits for
+/// the play to set up (see [`HoldForSupport`]). Both are a delay-before-pass: the carrier
+/// keeps the ball calmly and summons support rather than forcing a poor outlet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupportSummonKind {
+    /// "Push forward into space" — summoned teammates make an advanced/in-behind run so a
+    /// forward outlet opens up.
+    MoveForward,
+    /// "Take up your position" — summoned teammates step into an open passing lane / their
+    /// structural slot so a clean pass becomes available.
+    AssumePosition,
+}
+
+/// Active "hold-and-summon support" commitment on the carrier: it has elected to delay the
+/// release, keep the ball (shield/slow), and signal `summoned` teammates to improve their
+/// position (`kind`) before passing. Cleared on a pass / turnover, by the bounded max-hold
+/// in the gate, or by the safety TTL — see
+/// [`SoccerMatch::maintain_hold_for_support_commitments`]. Mirrored onto the snapshot so the
+/// summoned teammates can read the signal from their own decision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldForSupport {
+    /// What the carrier is asking its teammates to do.
+    pub kind: SupportSummonKind,
+    /// Match clock when the wait began; drives the bounded max-hold and the safety TTL. NOT
+    /// reset while the carrier keeps re-electing the same wait, so the pause is genuinely
+    /// bounded rather than able to renew forever.
+    pub launch_clock_seconds: f64,
+    /// The teammates being signalled (the best-placed candidates, capped to a few).
+    pub summoned: Vec<usize>,
+}
+
+/// A viable "hold-and-summon support" the carrier can elect right now: keep the ball and
+/// signal `summoned` teammates to improve their position (`kind`) before releasing. `quality`
+/// in `[0, 1]` scores how worthwhile the wait is and drives the appetite to elect it. Produced
+/// by [`WorldSnapshot::hold_for_support_option_for`].
+#[derive(Clone, Debug)]
+pub struct HoldForSupportPlan {
+    pub kind: SupportSummonKind,
+    pub summoned: Vec<usize>,
+    pub quality: f64,
+}
+
 /// A viable wall-pass the carrier can elect right now: lay the ball off to
 /// `wall_partner` (the "give"), then burst into `return_target` (the "go").
 /// `quality` in [0, 1] scores how good the combination is (lane to the wall, space
@@ -617,6 +661,11 @@ pub struct PlayerAgent {
     /// [`OneTwoRun`]. `None` when not engaged in a give-and-go.
     #[serde(default)]
     pub one_two: Option<OneTwoRun>,
+    /// Active "hold-and-summon support" commitment: this player is on the ball and has
+    /// elected to delay the pass while signalling teammates to get into a better position —
+    /// see [`HoldForSupport`]. `None` when not waiting on support.
+    #[serde(default)]
+    pub hold_for_support: Option<HoldForSupport>,
     /// Seconds remaining flat on the ground after a MISSED slide tackle. While `> 0`
     /// the player is prone: it makes no decision, holds its position, and cannot
     /// challenge — so the attacker carries the ball past it unopposed. Drawn uniformly
@@ -3624,6 +3673,41 @@ impl PlayerAgent {
                     .clamp(FLANK_OVERLAP_MIN_OPTION_SHARE, 0.72),
             );
         }
+        // Hold-and-summon support (off-ball half): if this player's on-ball teammate is waiting
+        // and has summoned it, make the matching response the priority in its OWN decision — a
+        // POMDP option-score boost, not a world movement override. The summoned-forward urgency
+        // also feeds `in_behind_run_target_for`, so the run target itself exists to be boosted.
+        if let Some(summon) = snapshot.support_summon_for(self.id) {
+            match summon {
+                SupportSummonKind::MoveForward => {
+                    // "Make the run, I'll find you" — push forward into space.
+                    for label in ["run-in-behind", "exploit-space-run"] {
+                        if options.iter().any(|o| o.legal && o.label == label) {
+                            ensure_min_legal_option_probability(
+                                &mut options,
+                                label,
+                                HOLD_FOR_SUPPORT_SUMMON_RUN_FLOOR,
+                            );
+                        }
+                    }
+                }
+                SupportSummonKind::AssumePosition => {
+                    // "Take up your position" — find the open passing lane / settle into the slot.
+                    if options.iter().any(|o| o.legal && o.label == "check-to-ball") {
+                        ensure_min_legal_option_probability(
+                            &mut options,
+                            "check-to-ball",
+                            HOLD_FOR_SUPPORT_SUMMON_POSITION_FLOOR,
+                        );
+                    }
+                    scale_legal_option_score(
+                        &mut options,
+                        "support-shape",
+                        HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE,
+                    );
+                }
+            }
+        }
         let options = normalize_action_options(options);
         SupportActionContext {
             options,
@@ -5863,6 +5947,37 @@ impl PlayerAgent {
                     true,
                 ));
             }
+            // Hold-and-summon support: a calm carrier with no good forward outlet may DELAY the
+            // release and signal teammates to improve their position (see
+            // `WorldSnapshot::hold_for_support_option_for`). Added conditionally (like the
+            // wall-pass / scoop options) so the option set is byte-identical to baseline outside
+            // this window. Never offered when something decisive is already on — it is the patient
+            // "let the play set up" choice, not a substitute for a shot or a killer ball.
+            let hold_for_support_option = snapshot.hold_for_support_option_for(self.id);
+            let mut hold_for_support_offered = false;
+            if let Some(plan) = hold_for_support_option.as_ref() {
+                let decisive_on = observation.threaded_goal_pass_available
+                    || goal_attack_shot_blocks_alternatives(&observation, self.role)
+                    || must_shoot_near_goal(&observation, self.role);
+                if !decisive_on {
+                    let patience = low_pressure_patience_factor(&observation);
+                    let calm = ((1.0
+                        - observation.pressure_urgency.max(observation.perceived_pressure))
+                        * (1.0 - pressure_rising_signal(&observation)))
+                    .clamp(0.0, 1.0);
+                    let appetite = (HOLD_FOR_SUPPORT_BASE_APPETITE
+                        * (0.40 + plan.quality * 0.90)
+                        * (0.60 + patience * 0.60)
+                        * (0.50 + calm * 0.70))
+                        .clamp(0.0, HOLD_FOR_SUPPORT_MAX_APPETITE);
+                    action_options.push(AgentActionOptionTrace::new(
+                        "wait-for-support",
+                        appetite,
+                        true,
+                    ));
+                    hold_for_support_offered = true;
+                }
+            }
             action_options = normalize_action_options(action_options);
             annotate_tick_probabilities_from_scores(&mut action_options, snapshot.dt_seconds);
             let mut weighted_ops = vec![
@@ -5963,6 +6078,12 @@ impl PlayerAgent {
                 weighted_ops.push((
                     "wall-pass".to_string(),
                     action_option_score(&action_options, "wall-pass"),
+                ));
+            }
+            if hold_for_support_offered {
+                weighted_ops.push((
+                    "wait-for-support".to_string(),
+                    action_option_score(&action_options, "wait-for-support"),
                 ));
             }
             for rank in 0..pass_targets.len() {
@@ -6523,6 +6644,53 @@ impl PlayerAgent {
                                     launch_clock_seconds: snapshot.clock_seconds,
                                     return_target: plan.return_target,
                                 });
+                                break;
+                            }
+                        }
+                    }
+                    "wait-for-support" => {
+                        order_names.push("wait-for-support".to_string());
+                        if let Some(plan) = hold_for_support_option.as_ref() {
+                            let chance =
+                                action_option_score(&action_options, "wait-for-support");
+                            if agentic_action_commitment(
+                                chance,
+                                snapshot.dt_seconds,
+                                &observation,
+                                self.role,
+                            ) {
+                                // Keep the ball: a controlled body-shield (reusing the protect-ball
+                                // dribble execution) while the summoned teammates get into position
+                                // — the carrier does NOT release yet.
+                                let kind = DribbleMoveKind::ProtectBall;
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
+                                let target = snapshot.dribble_move_target_for_touch(
+                                    self.id,
+                                    self.home_position,
+                                    kind,
+                                    touch,
+                                );
+                                // Preserve the original wait start so the bounded max-hold counts
+                                // total elapsed time, not just since the latest re-election.
+                                let launch_clock_seconds = self
+                                    .hold_for_support
+                                    .as_ref()
+                                    .map(|h| h.launch_clock_seconds)
+                                    .unwrap_or(snapshot.clock_seconds);
+                                self.hold_for_support = Some(HoldForSupport {
+                                    kind: plan.kind,
+                                    launch_clock_seconds,
+                                    summoned: plan.summoned.clone(),
+                                });
+                                chosen = Some((
+                                    SoccerAction::DribbleMove {
+                                        target,
+                                        kind,
+                                        touch,
+                                    },
+                                    "wait-for-support".to_string(),
+                                ));
                                 break;
                             }
                         }

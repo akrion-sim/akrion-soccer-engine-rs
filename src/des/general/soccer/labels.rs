@@ -73,6 +73,10 @@ pub enum SoccerActionLabel {
     FakeRightCutLeft,
     VerticalAttack,
     TurnoverBurst,
+    /// On-ball: the carrier deliberately keeps the ball and *signals* teammates to
+    /// improve their position before releasing (delay-before-pass). See
+    /// `WorldSnapshot::hold_for_support_option_for`.
+    WaitForSupport,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -141,6 +145,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
+            SoccerActionLabel::WaitForSupport => "wait-for-support",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -204,6 +209,7 @@ impl SoccerActionLabel {
             "fake-right-cut-left" => SoccerActionLabel::FakeRightCutLeft,
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
+            "wait-for-support" => SoccerActionLabel::WaitForSupport,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -293,6 +299,17 @@ impl SoccerActionLabel {
             | "chip_pass"
             | "chippass" => "scoop-pass",
             "flick-on" | "flick_on" | "flickon" | "header-flick" | "header_flick" => "flick-on",
+            "wait-for-support"
+            | "wait_for_support"
+            | "waitforsupport"
+            | "hold-and-summon"
+            | "hold_and_summon"
+            | "holdandsummon"
+            | "summon-support"
+            | "summon_support"
+            | "delay-pass"
+            | "delay_pass"
+            | "delaypass" => "wait-for-support",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"

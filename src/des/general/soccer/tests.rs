@@ -68402,3 +68402,125 @@ fn pass_outcome_samples_are_captured_during_play() {
     assert!(!drained.is_empty());
     assert!(sim.pass_outcome_samples.is_empty());
 }
+
+// --- Hold-and-summon support (wait-for-support / delay-before-pass) -------------
+
+/// A calm Home carrier (id 6) on the ball with NO forward outlet on, one teammate (id 7)
+/// level with him in a clean central channel who could make an onside forward run, and the
+/// other outfielders neutralised (deep defenders) so the only viable summon is that runner.
+fn hold_for_support_scenario() -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.tick = 30;
+    sim.clock_seconds = 12.0;
+    let carrier = 6;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[carrier].home_position = sim.ball.position;
+    // Park the other Home outfielders deep as defenders: behind the carrier (not forward
+    // outlets) and role-excluded from the forward-run summon, so id 7 is the only candidate.
+    for (k, home) in [1usize, 2, 3, 4, 5, 8, 9, 10].into_iter().enumerate() {
+        sim.players[home].role = PlayerRole::Defender;
+        sim.players[home].position = Vec2::new(8.0 + k as f64 * 8.0, 45.0);
+        sim.players[home].home_position = sim.players[home].position;
+    }
+    // The designated runner: level with the carrier (forward gain < the min, so NOT an outlet
+    // yet) in a clean central channel, able to make an onside forward run.
+    let runner = 7;
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].position = Vec2::new(46.0, 61.0);
+    sim.players[runner].home_position = sim.players[runner].position;
+    // Away keeper deep; a flat back line at y = 95 with a clean central channel around x = 40-46
+    // (so the second-last-defender line sits at 95 and an onside run target is ~y 94).
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    let line_xs = [12.0, 20.0, 28.0, 56.0, 64.0, 72.0, 8.0, 76.0, 4.0, 80.0];
+    for (away, x) in (12..=21).zip(line_xs) {
+        sim.players[away].position = Vec2::new(x, 95.0);
+    }
+    sim
+}
+
+#[test]
+fn hold_for_support_summons_a_forward_run_when_no_outlet_is_on() {
+    let sim = hold_for_support_scenario();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .hold_for_support_option_for(6)
+        .expect("a calm carrier with no forward outlet should be able to wait-and-summon");
+    assert_eq!(
+        plan.kind,
+        SupportSummonKind::MoveForward,
+        "with space ahead the carrier should summon a forward run: {plan:?}"
+    );
+    assert_eq!(
+        plan.summoned,
+        vec![7],
+        "only the viable forward runner should be summoned: {plan:?}"
+    );
+    assert!(
+        plan.summoned.len() <= HOLD_FOR_SUPPORT_MAX_SUMMONED,
+        "summoned set is capped: {plan:?}"
+    );
+    assert!(plan.quality > 0.0, "plan should have positive quality: {plan:?}");
+}
+
+#[test]
+fn hold_for_support_declines_once_a_forward_outlet_already_exists() {
+    let mut sim = hold_for_support_scenario();
+    // Push one teammate into a clean, open, onside forward position: now a real outlet is on,
+    // so there is nothing to wait for — the gate must decline (the carrier should just pass).
+    sim.players[8].role = PlayerRole::Forward;
+    sim.players[8].position = Vec2::new(38.0, 80.0);
+    sim.players[8].home_position = sim.players[8].position;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.hold_for_support_option_for(6).is_none(),
+        "a clean forward outlet should self-terminate the wait"
+    );
+}
+
+#[test]
+fn hold_for_support_declines_when_not_calm_on_the_ball() {
+    let mut sim = hold_for_support_scenario();
+    // A defender steps onto the carrier: this is pressured retention (protect-ball), not the
+    // calm "let the play set up" wait — the gate must decline.
+    sim.players[12].position = Vec2::new(41.0, 62.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.hold_for_support_option_for(6).is_none(),
+        "a proximate defender should rule out the calm wait"
+    );
+}
+
+#[test]
+fn support_summon_is_read_only_by_the_signalled_teammate() {
+    let mut sim = hold_for_support_scenario();
+    sim.players[6].hold_for_support = Some(HoldForSupport {
+        kind: SupportSummonKind::MoveForward,
+        launch_clock_seconds: sim.clock_seconds,
+        summoned: vec![7],
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.support_summon_for(7),
+        Some(SupportSummonKind::MoveForward),
+        "the summoned teammate reads the carrier's signal"
+    );
+    assert_eq!(
+        snapshot.support_summon_for(8),
+        None,
+        "a non-summoned teammate reads nothing"
+    );
+    assert_eq!(
+        snapshot.support_summon_for(6),
+        None,
+        "the carrier does not summon itself"
+    );
+    assert_eq!(
+        snapshot.support_summon_for(13),
+        None,
+        "an opponent never reads our summon"
+    );
+}
