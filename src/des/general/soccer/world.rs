@@ -14382,6 +14382,14 @@ pub struct PlayerSnapshot {
     pub receive_facing: FacingBucket,
     #[serde(default)]
     pub action_facing: FacingBucket,
+    /// Continuous body yaw (radians, field frame: vector = `(cos, sin)`, +x = East,
+    /// +y = South) rate-limited by biomechanics in
+    /// [`PlayerAgent::update_body_orientation_dizziness_energy`]. This is the value
+    /// the renderer must use for body orientation — the discrete `action_facing` /
+    /// `receive_facing` buckets snap between 8 compass points and so jump up to 180°
+    /// in a single tick, which is what made players look like they were spinning.
+    #[serde(default)]
+    pub facing_yaw: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     #[serde(default)]
@@ -15298,6 +15306,7 @@ impl WorldSnapshot {
                 movement_gait: p.movement_gait,
                 receive_facing: p.receive_facing,
                 action_facing: p.action_facing,
+                facing_yaw: p.facing_yaw,
                 incoming_ball: p.incoming_ball.clone(),
                 skills: p.skills.clone(),
                 skill_bands: soccer_playback_skill_bands(&p.skills),

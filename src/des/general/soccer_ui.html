@@ -1770,6 +1770,15 @@ function facingVectorFromBucket(bucket) {
   }
 }
 function playerFacing(p) {
+  // Prefer the continuous, biomechanically rate-limited body yaw the engine
+  // tracks (radians, field frame: vector = (cos, sin)). The discrete
+  // actionFacing/receiveFacing buckets snap between 8 compass points and so can
+  // flip up to 180 degrees in a single tick, which made players look like they
+  // were spinning. facingYaw can only change within the engine's angular-velocity
+  // cap per tick, so the rendered orientation turns smoothly.
+  if (typeof p.facingYaw === "number" && Number.isFinite(p.facingYaw)) {
+    return {x: Math.cos(p.facingYaw), y: Math.sin(p.facingYaw)};
+  }
   const bucketFacing = facingVectorFromBucket(p.actionFacing || p.receiveFacing);
   if (bucketFacing) return bucketFacing;
   if (vecLen(p.velocity) > 0.35) return norm(p.velocity);

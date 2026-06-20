@@ -39967,6 +39967,9 @@ fn tracking_frame_to_world_snapshot(
                 movement_gait: MovementGait::Stand,
                 receive_facing: tracking_player_receive_facing(p),
                 action_facing: tracking_player_action_facing(p),
+                facing_yaw: facing_bucket_to_vector(tracking_player_action_facing(p))
+                    .map(|v| v.y.atan2(v.x))
+                    .unwrap_or(0.0),
                 incoming_ball: None,
                 vision_range_yards: vision_range_yards(skills.vision),
                 field_of_view_degrees: field_of_view_degrees(skills.vision),
