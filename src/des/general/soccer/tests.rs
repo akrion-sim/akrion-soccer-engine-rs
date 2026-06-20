@@ -7762,6 +7762,66 @@ fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
 }
 
 #[test]
+fn aerial_pass_lands_near_target_not_overshooting() {
+    // Regression for "lateral aerial passes way too long": the ball is aloft for a gravity-fixed
+    // hang time, so launch speed must be ~distance/hang_time to LAND at the target instead of
+    // sailing 2-3x past. carry (speed*hang, the no-drag upper bound) must be in the ballpark of
+    // the target distance for both short/lateral and long balls.
+    let mut rng = mulberry32(11);
+    let hang = |d: f64| {
+        let apex =
+            (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + d * 0.074).clamp(5.0, MAX_LOFT_APEX_YARDS);
+        2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt()
+    };
+    for d in [12.0_f64, 18.0, 30.0, 60.0] {
+        let from = Vec2::new(40.0, 30.0);
+        let target = Vec2::new(40.0, 30.0 + d);
+        let speed =
+            modulated_pass_speed_yps(40.0, from, target, PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+        let carry = speed * hang(d);
+        assert!(
+            carry >= d * 0.85 && carry <= d * 1.5,
+            "aerial carry must land near target: d={d} speed={speed:.1} carry={carry:.1}"
+        );
+    }
+    // A short lateral loft is struck much softer than a goal-to-goal ball.
+    let from = Vec2::new(40.0, 60.0);
+    let short_lateral =
+        modulated_pass_speed_yps(40.0, from, Vec2::new(58.0, 60.0), PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+    let goal_to_goal =
+        modulated_pass_speed_yps(40.0, from, Vec2::new(40.0, 112.0), PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+    assert!(
+        short_lateral < goal_to_goal * 0.6,
+        "lateral loft ({short_lateral:.1}) must be far softer than a long ball ({goal_to_goal:.1})"
+    );
+}
+
+#[test]
+fn long_pass_prefers_opponent_corner_channel() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 909,
+        ..Default::default()
+    });
+    let snap = WorldSnapshot::from_match(&sim);
+    let origin = Vec2::new(40.0, 55.0); // Home attacks +y
+    let wide_forward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 95.0), 45.0);
+    let central_forward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(40.0, 95.0), 45.0);
+    let wide_backward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 20.0), 45.0);
+    let short_wide =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 62.0), 9.0);
+    assert!(
+        wide_forward > central_forward,
+        "a long ball to the opponent corner channel must be preferred over a central one"
+    );
+    assert_eq!(wide_backward, 0.0, "must never bias a long ball toward your OWN corners");
+    assert_eq!(short_wide, 0.0, "short balls get no corner affinity");
+}
+
+#[test]
 fn landed_aerial_pass_ball_is_controllable_not_run_over() {
     // The live run-over cause (confirmed via the control resolver): an AERIAL pass that has
     // landed/overshot keeps `pending_pass` set while the ball physically rests on the grass. The
@@ -23558,7 +23618,9 @@ fn full_time_match_frames_pass_accounting_smoke_report() {
     let trace = run_simulation(
         MatchConfig {
             seed: 1307,
-            ..MatchConfig::playback_trace(1.0)
+            // A liveness smoke needs a few seconds of play to observe goalward progress: a
+            // 1s window from kickoff can legitimately net zero (kickoffs are played backward).
+            ..MatchConfig::playback_trace(4.0)
         },
         1,
     );

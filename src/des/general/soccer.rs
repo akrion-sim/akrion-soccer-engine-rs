@@ -627,6 +627,17 @@ const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
 // so capping the apex does not change x/y speed or time-to-destination — it is realism only.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
+/// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
+/// target it must be launched at ~`distance / hang_time`. In flight it loses a little pace to air
+/// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
+/// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
+const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.15;
+/// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
+/// attacking area), the classic territory-winning long ball. Only balls at least this long, and
+/// only when forward (toward the opponent's goal line), earn the affinity — a long SIDEWAYS or
+/// backward ball gets nothing.
+const LONG_PASS_CORNER_AFFINITY_MIN_YARDS: f64 = 26.0;
+const LONG_PASS_CORNER_AFFINITY_WEIGHT: f64 = 2.2;
 // Stuck-ball ("rat's nest") watchdog. The ball only "escapes" the stuck zone — resetting
 // the watchdog — when it genuinely LEAVES the area (travels past this escape radius from
 // the anchor). A ball that merely shuffles, orbits, or ping-pongs inside the radius keeps
@@ -45019,15 +45030,27 @@ fn modulated_pass_speed_yps(
     let distance = from.distance(target).max(0.1);
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
-    let base_time = if flight.is_aerial() {
-        // Aerials were floating: too much hang time made them loop slowly through the air and
-        // arrive late. A lofted/long ball is driven — it should cover the x-y distance with
-        // pace and get down to the receiver ~20-25% quicker. Hang time cut ~22% from the old
-        // calibration (0.55 + d/40, clamp 0.72..2.45) so the launch speed is correspondingly
-        // higher. (The arc still drops the ball at the target: altitude is a function of
-        // horizontal progress, not of time, so a faster ball lands at the same spot, sooner.)
-        (0.43 + distance / 51.0).clamp(0.56, 1.91)
-    } else if is_cross {
+    if flight.is_aerial() {
+        // Aerial flight calibration ("the MPC should help"): the ball is a projectile aloft for a
+        // gravity-fixed hang time T = 2·√(2·apex/g), where the apex scales with distance (see
+        // `pass_loft_apex_yards`). Crucially the ball's altitude is integrated by ELAPSED TIME, not
+        // by horizontal progress — so a ball struck harder does NOT land at the same spot, it stays
+        // up for the same T and simply carries farther. Calibrating launch to power (the old model)
+        // therefore launched a short LATERAL loft at ~3x the speed needed and it sailed clean over
+        // the receiver, landing 2-3x too far. The only launch speed that LANDS the ball at the
+        // target is distance / T (plus a touch for in-flight drag): short/lateral lofts are struck
+        // softly, only genuine goal-to-goal balls get real pace.
+        let apex_yards = (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + distance * 0.074)
+            .clamp(5.0, MAX_LOFT_APEX_YARDS);
+        let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
+        let land_at_target = (distance / hang_time.max(0.35)) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+        // A ball into pressure is struck a touch firmer so it beats the press; an open receiver gets
+        // a slightly more weighted ball. Small — the dominant term is landing on the target.
+        let pressure_firm = 1.0 + pressure * 0.06;
+        return (land_at_target * pressure_firm).clamp(mph_to_yps(7.0), mph_to_yps(66.0));
+    }
+    // Ground / cross passes only (aerials returned above with their own flight calibration).
+    let base_time = if is_cross {
         (0.68 + distance / 31.0).clamp(0.82, 2.65)
     } else {
         (0.58 + distance / 31.0).clamp(0.72, 2.55)
