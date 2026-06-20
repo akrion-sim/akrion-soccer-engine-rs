@@ -140,6 +140,10 @@ spec:
                   value: bilearning
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
                   value: "3600"
+                # Per-fixture wall-clock watchdog: abort only the stuck match and
+                # keep the bracket moving. Set 0 to disable.
+                - name: SOCCER_TOURNAMENT_MATCH_WATCHDOG_SECONDS
+                  value: "900"
                 # Soft cap is measured from binary start, after clone/build; with
                 # the current ~4-5m build this leaves roughly 5m before the hard
                 # job cap for failure marking, lock release, salvage promotion,

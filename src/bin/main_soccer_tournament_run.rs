@@ -26,6 +26,7 @@
 //!   SOCCER_TOURNAMENT_PROMOTE        (bool, default true)
 //!   SOCCER_TOURNAMENT_LOCK_KEY       (default SOCCER_EXPERIMENT_SLUG)
 //!   SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS (f64, default 0/off)
+//!   SOCCER_TOURNAMENT_MATCH_WATCHDOG_SECONDS (f64, default 900; 0/off)
 //!   SOCCER_EXPERIMENT_SLUG           (default "soccer-nightly-tournament")
 
 use std::error::Error;
@@ -47,6 +48,8 @@ const DEFAULT_EXPERIMENT_SLUG: &str = "soccer-nightly-tournament";
 /// Upper bound on parallel match workers — each holds a live SoccerMatch sim, so this caps
 /// peak memory/threads regardless of the env value or the host core count.
 const MAX_TOURNAMENT_THREADS: usize = 256;
+const DEFAULT_TOURNAMENT_MATCH_WATCHDOG_SECONDS: f64 = 15.0 * 60.0;
+const MAX_TOURNAMENT_MATCH_WATCHDOG_SECONDS: f64 = 86_400.0;
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var(key)
@@ -591,6 +594,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let promote = env_bool("SOCCER_TOURNAMENT_PROMOTE", true);
     let soft_deadline_seconds =
         env_f64("SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS", 0.0).clamp(0.0, 86_400.0);
+    let match_watchdog_seconds = env_f64(
+        "SOCCER_TOURNAMENT_MATCH_WATCHDOG_SECONDS",
+        DEFAULT_TOURNAMENT_MATCH_WATCHDOG_SECONDS,
+    )
+    .clamp(0.0, MAX_TOURNAMENT_MATCH_WATCHDOG_SECONDS);
     let slug =
         env_string("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| DEFAULT_EXPERIMENT_SLUG.to_string());
     // Parallelism: independent fixtures (groups, and matches within a knockout round)
@@ -610,12 +618,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = match_seconds;
+    runner_config.match_wall_time_limit =
+        (match_watchdog_seconds > 0.0).then(|| Duration::from_secs_f64(match_watchdog_seconds));
     let promote_config = runner_config.base.clone();
     let options = SoccerQPolicyOptions::default();
     let progress_granularity = tournament_progress_granularity(&format);
 
     println!(
-        "tournament_start teams={} groups={} knockout={} mode={:?} seed={} match_seconds={:.1} seed_fraction={:.2} threads={} promote={} soft_deadline_seconds={:.1}",
+        "tournament_start teams={} groups={} knockout={} mode={:?} seed={} match_seconds={:.1} seed_fraction={:.2} threads={} promote={} soft_deadline_seconds={:.1} match_watchdog_seconds={:.1}",
         format.team_count,
         format.group_count(),
         format.knockout_team_count(),
@@ -626,6 +636,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         threads,
         promote,
         soft_deadline_seconds,
+        match_watchdog_seconds,
     );
     println!(
         "tournament_progress_plan progress_unit=wave first_checkpoint_matches={} largest_wave_matches={} group_rounds={} progress_events={} matches_total={} threads={}",
