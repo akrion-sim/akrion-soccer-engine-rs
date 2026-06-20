@@ -19100,6 +19100,31 @@ impl WorldSnapshot {
     /// teammate's id — so the caller can ADOPT them as the receiver (a ball played TO someone is
     /// not a "pass to nobody"). The id is `None` only for the channel-point fallback, i.e. a
     /// true delivery into open space with no intended receiver.
+    /// Affinity for a LONG ball played into the opponent's corner channel — a forward diagonal into
+    /// the wide attacking area (toward the opponent's corner flag). Zero for short balls and for any
+    /// ball that is not forward (you never want to bias a long ball toward your OWN corners). Scales
+    /// with how wide the reception is (cornerward) and how long/forward the diagonal is.
+    pub(crate) fn long_pass_attacking_corner_affinity(
+        &self,
+        team: Team,
+        origin: Vec2,
+        pass_point: Vec2,
+        dist: f64,
+    ) -> f64 {
+        if dist < LONG_PASS_CORNER_AFFINITY_MIN_YARDS {
+            return 0.0;
+        }
+        let forward = (pass_point.y - origin.y) * team.attack_dir();
+        if forward <= 0.0 {
+            return 0.0;
+        }
+        let center_x = self.field_width * 0.5;
+        let wideness = ((pass_point.x - center_x).abs() / center_x.max(1.0)).clamp(0.0, 1.0);
+        let long_fraction =
+            ((dist - LONG_PASS_CORNER_AFFINITY_MIN_YARDS) / 30.0).clamp(0.0, 1.0);
+        LONG_PASS_CORNER_AFFINITY_WEIGHT * wideness * (0.45 + 0.55 * long_fraction)
+    }
+
     pub(crate) fn no_target_forward_outlet_target(
         &self,
         passer_id: usize,
@@ -19976,8 +20001,15 @@ impl WorldSnapshot {
                 let directional_progress_score =
                     directional_pass_progress_score(forward, forward_weight);
                 let backward_depth_adjustment = backward_pass_depth_adjustment(forward);
+                let corner_affinity = self.long_pass_attacking_corner_affinity(
+                    me.team,
+                    me_position,
+                    pass_point,
+                    dist,
+                );
                 let score = directional_progress_score + self.space_score_at(position, me.team)
                     - dist * 0.010
+                    + corner_affinity
                     - support_fit * 0.020
                     - recycle_pingpong_penalty
                     + confidence * 0.65
@@ -20356,6 +20388,12 @@ impl WorldSnapshot {
                     forward,
                     0.16 + directive.risk_tolerance * 0.24,
                 );
+                let corner_affinity = self.long_pass_attacking_corner_affinity(
+                    me.team,
+                    me_position,
+                    pass_point,
+                    dist,
+                );
                 let score = directional_progress_score
                     + self.space_score_at(pass_point, me.team) * 0.65
                     - dist * 0.018
@@ -20364,6 +20402,7 @@ impl WorldSnapshot {
                     + lane_bonus
                     + cross_bonus
                     + wide_outlet_bonus
+                    + corner_affinity
                     + finishing_window_bonus
                     + in_behind_bonus
                     + preferred_in_behind_bonus

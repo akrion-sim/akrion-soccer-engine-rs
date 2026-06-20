@@ -2934,6 +2934,44 @@ impl PlayerAgent {
                 .clamp(0.0, 0.54);
             ensure_min_legal_option_probability(&mut options, "carry-forward", progression_floor);
         }
+        // Won the ball with clear space ahead: DRIVE into it. MDP/POMDP elects the forward-drive
+        // family here (the MPC dribble then sprints into the open space — see the DribbleMove
+        // execution, which sets sprint when there's forward room). A freshly-won carrier (low time
+        // on the ball) with real grass ahead and little pressure should accelerate forward rather
+        // than take a settling touch and recycle it sideways/backward. Unlike the final-third
+        // progression floor above, this fires ANYWHERE on the pitch — the gap was a ball won in
+        // midfield or our own half with space to run into. Role-scaled (forwards drive most,
+        // centre-backs least, keepers never) and damped by pressure (shield/pass when crowded).
+        // `actual_time_on_ball_seconds` is the REAL elapsed possession time (≈0 the instant the ball
+        // is won), unlike `perceived_time_on_ball_seconds` which is a pressure proxy. Gate the
+        // transition drive on it so this fires on a genuine just-won ball, not merely under
+        // pressure. (turnover-burst itself is only legal under heavy pressure, so under the low
+        // pressure we want here the family floor lands on carry-forward / vertical-attack.)
+        let just_won_fit = (1.0
+            - observation.actual_time_on_ball_seconds / WON_BALL_DRIVE_FRESH_SECONDS)
+            .clamp(0.0, 1.0);
+        if self.role != PlayerRole::Goalkeeper
+            && carry_forward_legal
+            && just_won_fit > 0.0
+            && observation.forward_dribble_space_yards >= WON_BALL_DRIVE_MIN_SPACE_YARDS
+            && pressure < 0.55
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let role_floor = match self.role {
+                PlayerRole::Forward => 0.42,
+                PlayerRole::Midfielder => 0.34,
+                PlayerRole::Defender => 0.16,
+                PlayerRole::Goalkeeper => 0.0,
+            };
+            let won_ball_drive_fit =
+                (just_won_fit * forward_space_fit * (1.0 - pressure)).clamp(0.0, 1.0);
+            let drive_floor = (role_floor * won_ball_drive_fit).clamp(0.0, 0.52);
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &["turnover-burst", "carry-forward", "vertical-attack"],
+                drive_floor,
+            );
+        }
         if decisive_goal_pressure >= 0.12 && (shot_legal || killer_pass_legal) {
             let recycle_multiplier = (1.0
                 - decisive_goal_pressure * 0.82

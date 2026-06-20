@@ -4498,6 +4498,63 @@ fn possession_action_options_expose_dt_scaled_tick_probabilities() {
 }
 
 #[test]
+fn just_won_ball_with_space_drives_forward_into_it() {
+    // Winning the ball with clear grass ahead and little pressure must give a real probability to
+    // the forward-drive family (carry-forward / vertical-attack / turnover-burst) so the carrier
+    // accelerates into the space rather than taking a settling touch and recycling it. Keyed on
+    // REAL elapsed possession time (just won), not the pressure proxy.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        seed: 151,
+        ..Default::default()
+    });
+    let holder = 6;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 55.0); // midfield, Home attacks +y
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let directive = snapshot.tactical_directive(Team::Home);
+    let drive_family = ["carry-forward", "vertical-attack", "turnover-burst"];
+    let family_prob = |opts: &[AgentActionOptionTrace]| -> f64 {
+        let legal_total: f64 = opts.iter().filter(|o| o.legal).map(|o| o.score.max(0.0)).sum();
+        let fam: f64 = opts
+            .iter()
+            .filter(|o| o.legal && drive_family.contains(&o.label.as_str()))
+            .map(|o| o.score.max(0.0))
+            .sum();
+        if legal_total > 0.0 { fam / legal_total } else { 0.0 }
+    };
+    let opts_for = |secs: f64| {
+        let mut obs = snapshot.observation_for(holder);
+        obs.actual_time_on_ball_seconds = secs;
+        obs.forward_dribble_space_yards = 14.0;
+        obs.perceived_pressure = 0.05;
+        sim.players[holder].possession_action_options(
+            &obs,
+            &directive,
+            2,
+            1,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        )
+    };
+    let fresh_p = family_prob(&opts_for(0.1)); // just won
+    let held_p = family_prob(&opts_for(5.0)); // had it a while (floor does not apply)
+    assert!(
+        fresh_p > 0.20,
+        "a just-won ball with space ahead must give a real forward-drive probability: {fresh_p}"
+    );
+    assert!(
+        fresh_p >= held_p - 1e-9,
+        "winning the ball with space must not drive forward LESS than holding it a while: fresh={fresh_p} held={held_p}"
+    );
+}
+
+#[test]
 fn pinned_holder_favours_shield_and_escape_over_open_play() {
     // A holder with a defender goal-side and on top of them (the livelock
     // situation) should value body-shielding to keep the ball AND side-stepping
@@ -7759,6 +7816,66 @@ fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
         Some(collector),
         "a dead/rolling shot ball at a team-mate's feet must be collectable, not locked out"
     );
+}
+
+#[test]
+fn aerial_pass_lands_near_target_not_overshooting() {
+    // Regression for "lateral aerial passes way too long": the ball is aloft for a gravity-fixed
+    // hang time, so launch speed must be ~distance/hang_time to LAND at the target instead of
+    // sailing 2-3x past. carry (speed*hang, the no-drag upper bound) must be in the ballpark of
+    // the target distance for both short/lateral and long balls.
+    let mut rng = mulberry32(11);
+    let hang = |d: f64| {
+        let apex =
+            (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + d * 0.074).clamp(5.0, MAX_LOFT_APEX_YARDS);
+        2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt()
+    };
+    for d in [12.0_f64, 18.0, 30.0, 60.0] {
+        let from = Vec2::new(40.0, 30.0);
+        let target = Vec2::new(40.0, 30.0 + d);
+        let speed =
+            modulated_pass_speed_yps(40.0, from, target, PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+        let carry = speed * hang(d);
+        assert!(
+            carry >= d * 0.85 && carry <= d * 1.5,
+            "aerial carry must land near target: d={d} speed={speed:.1} carry={carry:.1}"
+        );
+    }
+    // A short lateral loft is struck much softer than a goal-to-goal ball.
+    let from = Vec2::new(40.0, 60.0);
+    let short_lateral =
+        modulated_pass_speed_yps(40.0, from, Vec2::new(58.0, 60.0), PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+    let goal_to_goal =
+        modulated_pass_speed_yps(40.0, from, Vec2::new(40.0, 112.0), PassFlight::Aerial, false, 0.8, 1.0, &mut rng);
+    assert!(
+        short_lateral < goal_to_goal * 0.6,
+        "lateral loft ({short_lateral:.1}) must be far softer than a long ball ({goal_to_goal:.1})"
+    );
+}
+
+#[test]
+fn long_pass_prefers_opponent_corner_channel() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 909,
+        ..Default::default()
+    });
+    let snap = WorldSnapshot::from_match(&sim);
+    let origin = Vec2::new(40.0, 55.0); // Home attacks +y
+    let wide_forward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 95.0), 45.0);
+    let central_forward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(40.0, 95.0), 45.0);
+    let wide_backward =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 20.0), 45.0);
+    let short_wide =
+        snap.long_pass_attacking_corner_affinity(Team::Home, origin, Vec2::new(72.0, 62.0), 9.0);
+    assert!(
+        wide_forward > central_forward,
+        "a long ball to the opponent corner channel must be preferred over a central one"
+    );
+    assert_eq!(wide_backward, 0.0, "must never bias a long ball toward your OWN corners");
+    assert_eq!(short_wide, 0.0, "short balls get no corner affinity");
 }
 
 #[test]
@@ -23558,7 +23675,9 @@ fn full_time_match_frames_pass_accounting_smoke_report() {
     let trace = run_simulation(
         MatchConfig {
             seed: 1307,
-            ..MatchConfig::playback_trace(1.0)
+            // A liveness smoke needs a few seconds of play to observe goalward progress: a
+            // 1s window from kickoff can legitimately net zero (kickoffs are played backward).
+            ..MatchConfig::playback_trace(4.0)
         },
         1,
     );
