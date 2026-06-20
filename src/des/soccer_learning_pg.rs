@@ -1702,6 +1702,31 @@ impl SoccerLearningPgStore {
         tip_policy_version_id: &str,
     ) -> Result<u64, String> {
         self.ensure_connected()?;
+        // Resolve the superseded version ids FIRST (a tiny scan of the small policy-versions
+        // table). Deleting by `policy_version_id` then drives that column's index directly,
+        // instead of a join-scan over millions of entry rows per batch — which blew the
+        // statement_timeout and was the cleanup's "db error". Ids are carried as text (the
+        // `postgres` dep has no `with-uuid` feature) and cast back to uuid in the predicates.
+        let superseded: Vec<String> = self
+            .client
+            .query(
+                r#"
+                select id::text
+                from des_soccer_learning_policy_versions
+                where experiment_id = $1::text::uuid
+                  and branch_key = $2::text::uuid
+                  and id <> $3::text::uuid
+                  and full_entries_retained = true
+                "#,
+                &[&experiment_id, &branch_key, &tip_policy_version_id],
+            )
+            .map_err(|err| format!("list superseded branch versions: {err}"))?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        if superseded.is_empty() {
+            return Ok(0);
+        }
         let mut total: u64 = 0;
         loop {
             let deleted = self
@@ -1710,22 +1735,13 @@ impl SoccerLearningPgStore {
                     r#"
                     delete from des_soccer_learning_policy_entries
                     where ctid in (
-                      select e.ctid
-                      from des_soccer_learning_policy_entries e
-                      join des_soccer_learning_policy_versions v on v.id = e.policy_version_id
-                      where v.experiment_id = $1::text::uuid
-                        and v.branch_key = $2::text::uuid
-                        and v.id <> $3::text::uuid
-                        and v.full_entries_retained = true
-                      limit $4
+                      select ctid
+                      from des_soccer_learning_policy_entries
+                      where policy_version_id = any($1::text[]::uuid[])
+                      limit $2
                     )
                     "#,
-                    &[
-                        &experiment_id,
-                        &branch_key,
-                        &tip_policy_version_id,
-                        &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE,
-                    ],
+                    &[&superseded, &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE],
                 )
                 .map_err(|err| format!("prune superseded branch entries (batch): {err}"))?;
             total += deleted;
@@ -1749,17 +1765,14 @@ impl SoccerLearningPgStore {
                     coalesce(metrics->'postgresRetention', '{}'::jsonb)
                       || jsonb_build_object(
                         'fullEntriesRetained', false,
-                        'prunedByPolicyVersionId', $3,
+                        'prunedByPolicyVersionId', $2,
                         'retentionKind', 'branch_tip'
                       ),
                     true
                   )
-                where experiment_id = $1::text::uuid
-                  and branch_key = $2::text::uuid
-                  and id <> $3::text::uuid
-                  and full_entries_retained = true
+                where id = any($1::text[]::uuid[])
                 "#,
-                &[&experiment_id, &branch_key, &tip_policy_version_id],
+                &[&superseded, &tip_policy_version_id],
             )
             .map_err(|err| format!("mark superseded branch versions pruned: {err}"))?;
         Ok(total)
