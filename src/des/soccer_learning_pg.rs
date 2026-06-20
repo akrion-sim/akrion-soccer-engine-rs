@@ -91,6 +91,12 @@ const SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
+/// Rows deleted per statement when cleaning up a superseded generation's entries
+/// ([`SoccerLearningPgStore::prune_superseded_branch_entries_batched`]). Each batch is its own
+/// statement well under the session `statement_timeout`, so a multi-million-row cleanup never
+/// trips the timeout — and because it runs AFTER the promotion commits, a slow cleanup can no
+/// longer roll back the promotion (the bug that stalled generation promotion for a week).
+const SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE: i64 = 50_000;
 pub const SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS: i64 = 10;
 
 const SOCCER_PG_CONNECT_DEFAULT_MAX_ATTEMPTS: u32 = 5;
@@ -1653,17 +1659,110 @@ impl SoccerLearningPgStore {
                 &policies.away,
                 None,
             )?;
-            let _ = prune_old_policy_entries_for_branch_tip(
-                &mut tx,
-                experiment_id,
-                &branch_key,
-                policy_version_id,
-            )?;
+            // NOTE: the superseded generation's entries are deliberately NOT pruned inside this
+            // transaction. Doing so meant a multi-million-row DELETE of the previous tip's
+            // entries had to complete within the session `statement_timeout`, or the ENTIRE
+            // promotion rolled back — which stalled generation promotion for a week. Cleanup now
+            // runs best-effort AFTER the commit below.
         }
 
         tx.commit()
             .map_err(|err| format!("commit soccer policy version: {err}"))?;
+
+        // The promotion is now durable. Clean up the superseded generation's entries OUTSIDE the
+        // promotion transaction, in timeout-bounded batches, best-effort: a slow or failed
+        // cleanup can never roll back the promotion, and an interrupted cleanup is simply retried
+        // by the next promotion (drained versions keep `full_entries_retained = true` until their
+        // entries are actually gone).
+        if full_entries_retained {
+            if let Err(err) = self.prune_superseded_branch_entries_batched(
+                experiment_id,
+                &branch_key,
+                policy_version_id,
+            ) {
+                eprintln!(
+                    "soccer policy retention: superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Best-effort, timeout-bounded cleanup of every NON-tip version's entries on a branch, run
+    /// AFTER a promotion has committed (see [`Self::insert_policy_version_with_id_inner`]).
+    /// Deletes in [`SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE`] chunks — each its own statement,
+    /// comfortably under the session `statement_timeout`, so a multi-million-row cleanup never
+    /// trips it — then flips the drained versions to `full_entries_retained = false`. Safe to
+    /// interrupt or rerun: a version stays retained until its entries are gone, so an aborted run
+    /// is picked up by the next promotion. Returns the number of entries deleted.
+    fn prune_superseded_branch_entries_batched(
+        &mut self,
+        experiment_id: &str,
+        branch_key: &str,
+        tip_policy_version_id: &str,
+    ) -> Result<u64, String> {
+        self.ensure_connected()?;
+        let mut total: u64 = 0;
+        loop {
+            let deleted = self
+                .client
+                .execute(
+                    r#"
+                    delete from des_soccer_learning_policy_entries
+                    where ctid in (
+                      select e.ctid
+                      from des_soccer_learning_policy_entries e
+                      join des_soccer_learning_policy_versions v on v.id = e.policy_version_id
+                      where v.experiment_id = $1::text::uuid
+                        and v.branch_key = $2::text::uuid
+                        and v.id <> $3::text::uuid
+                        and v.full_entries_retained = true
+                      limit $4
+                    )
+                    "#,
+                    &[
+                        &experiment_id,
+                        &branch_key,
+                        &tip_policy_version_id,
+                        &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE,
+                    ],
+                )
+                .map_err(|err| format!("prune superseded branch entries (batch): {err}"))?;
+            total += deleted;
+            if deleted == 0 {
+                break;
+            }
+        }
+        // Entries are gone — flip the drained versions to not-retained (cheap; the policy-versions
+        // table is tiny). Mirrors the retention bookkeeping the old in-transaction prune did.
+        self.client
+            .execute(
+                r#"
+                update des_soccer_learning_policy_versions
+                set
+                  full_entries_retained = false,
+                  full_entries_pruned_at = now(),
+                  updated_at = now(),
+                  metrics = jsonb_set(
+                    metrics,
+                    '{postgresRetention}',
+                    coalesce(metrics->'postgresRetention', '{}'::jsonb)
+                      || jsonb_build_object(
+                        'fullEntriesRetained', false,
+                        'prunedByPolicyVersionId', $3,
+                        'retentionKind', 'branch_tip'
+                      ),
+                    true
+                  )
+                where experiment_id = $1::text::uuid
+                  and branch_key = $2::text::uuid
+                  and id <> $3::text::uuid
+                  and full_entries_retained = true
+                "#,
+                &[&experiment_id, &branch_key, &tip_policy_version_id],
+            )
+            .map_err(|err| format!("mark superseded branch versions pruned: {err}"))?;
+        Ok(total)
     }
 
     pub fn insert_completed_run(
