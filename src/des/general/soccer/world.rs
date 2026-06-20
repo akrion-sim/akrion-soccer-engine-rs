@@ -26306,14 +26306,14 @@ impl WorldSnapshot {
                     } else {
                         0.0
                     };
-                    let spread_need = (0.80 + width_shortage * 1.25).clamp(0.80, 1.85);
+                    let spread_need = (0.82 + width_shortage * 1.35).clamp(0.82, 1.95);
                     // Lane affinity: holding the player's OWN home channel (and, for wide
                     // players, the touchline) has to compete with the open-space term
                     // (~0..18), while the global width fit rewards spreading the whole team.
-                    (lane_width * 1.35
+                    (lane_width * 1.5
                         + home_lane_fit * 2.85
                         + width_gain.max(0.0) * 2.10
-                        + width_fit * 0.85)
+                        + width_fit * 0.9)
                         * if correct_side { 1.0 } else { 0.28 }
                         // Don't hold width when the ball is well ahead — get forward.
                         * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.38))
