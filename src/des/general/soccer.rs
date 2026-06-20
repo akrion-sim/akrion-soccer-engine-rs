@@ -1264,17 +1264,20 @@ const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
 // along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line 5-25yd goal-side of the ball. The LP/formation nudge shifts the whole line to
-// restore the band, except inside the team's own emergency 5-yard goal-line zone where parity with
-// the ball is allowed.
+// keep the line 10-30yd goal-side of the ball. The LP/formation nudge shifts the whole line to
+// restore the band, except inside the team's own emergency 20-yard goal-line zone where parity
+// with the ball is allowed.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// THE rule: the back four's average sits 5-25yd behind (goal-side of) the ball, always,
-// outside the team's own 5-yard emergency zone.
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+// Neutral genome defaults for the evolved back-four standoff band. Tournaments
+// permute the min/max within this 10-30yd standoff.
+// THE rule: the back four's average sits 10-30yd behind (goal-side of) the ball, always,
+// except inside the defending team's own 20-yard emergency zone, where parity with the ball
+// is fine and the band is suspended.
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 10.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -1288,9 +1291,9 @@ const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
 // The back-four band is suspended only when the ball is inside the defending team's
-// own 5-yard emergency zone: a ball on the goal-line may be played level/parity
+// own 20-yard emergency zone: a ball near the goal-line may be played level/parity
 // rather than forcing the line behind the end-line.
-const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 5.0;
+const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 20.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
