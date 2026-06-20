@@ -566,6 +566,11 @@ const SHOT_BAILOUT_ON_FRAME_PROBABILITY: f64 = 0.20;
 /// on goal — it is a loose ball again and must be contestable/collectable. Above it the ball is
 /// still treated as a live shot (control suppressed so a fast shot is not "trapped" mid-flight).
 const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
+// Actual shots on/toward goal should leave the foot in this band. Slower contacts are
+// passes, pokes, or control touches; once an action is classified as Shoot, rendering and
+// physics should both see a real strike.
+const SHOT_MIN_SPEED_MPH: f64 = 40.0;
+const SHOT_MAX_SPEED_MPH: f64 = 60.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
@@ -2037,6 +2042,15 @@ const RESTART_OPPONENT_KEEPOUT_YARDS: f64 = 10.0;
 // Throw-ins use a much shorter keep-out: Law 15 holds opponents 2yd (≈2m) off the
 // thrower until the ball is in play.
 const THROW_IN_OPPONENT_KEEPOUT_YARDS: f64 = 2.0;
+// On throw-ins there is no offside offence from the restart, so the defending back
+// line should not hold an offside trap. Drop defenders at least this far goal-side
+// of the ball while the throw-in setup is live.
+const THROW_IN_NO_OFFSIDE_DEFENDER_DEPTH_YARDS: f64 = 25.0;
+// Defenders track legal no-offside throw-in runners only through this depth channel
+// from the taker/ball y spot, rather than chasing the whole pitch.
+const THROW_IN_RUNNER_TRACK_DEPTH_YARDS: f64 = 30.0;
+const THROW_IN_RUNNER_TRACK_GOAL_SIDE_YARDS: f64 = 1.5;
+const THROW_IN_RUNNER_TRACK_LATERAL_WEIGHT: f64 = 0.72;
 // Fouls disabled: foul probability is multiplied by this so it is ~0.
 const FOUL_PROBABILITY_SCALE: f64 = 0.000_001;
 // Goal geometry: a real goal is 8 ft (= 8/3 yd) tall under the crossbar and 24 ft
@@ -3013,6 +3027,7 @@ const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
 // this has been sprinting flat-out continuously, which is physically impossible.
 const SOCCER_PHYSICS_PLAYER_SUSTAINED_MAX_SPEED_YPS: f64 = 8.8;
 const SOCCER_PHYSICS_PLAYER_SUSTAINED_WINDOW_SECONDS: f64 = 15.0;
+const SOCCER_PHYSICS_NON_GK_EXACT_STATIONARY_LIMIT_SECONDS: f64 = 3.0;
 const SOCCER_PHYSICS_BALL_MAX_SPEED_YPS: f64 = 85.0;
 const SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2: f64 = 28.0;
 const SOCCER_PHYSICS_BALL_MAX_ACCEL_YPS2: f64 = 260.0;
@@ -3508,6 +3523,41 @@ impl Team {
             Team::Away => "Away",
         }
     }
+}
+
+fn throw_in_no_offside_defender_line_y(defending_team: Team, ball_y: f64, field_length: f64) -> f64 {
+    let length = field_length.max(1.0);
+    let own_goal_y = defending_team.other().goal_y(length);
+    let raw = ball_y - defending_team.attack_dir() * THROW_IN_NO_OFFSIDE_DEFENDER_DEPTH_YARDS;
+    match defending_team {
+        Team::Home => raw.clamp(own_goal_y, length),
+        Team::Away => raw.clamp(0.0, own_goal_y),
+    }
+}
+
+fn throw_in_no_offside_defender_tracking_target(
+    defending_team: Team,
+    ball_y: f64,
+    runner_target: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> Option<Vec2> {
+    if !runner_target.x.is_finite() || !runner_target.y.is_finite() {
+        return None;
+    }
+    let (width, length) = sane_pitch_dimensions(field_width, field_length);
+    let attacking_dir = defending_team.other().attack_dir();
+    let runner_depth = (runner_target.y - ball_y) * attacking_dir;
+    if !runner_depth.is_finite() || runner_depth < 0.0 {
+        return None;
+    }
+    let tracking_depth = (runner_depth + THROW_IN_RUNNER_TRACK_GOAL_SIDE_YARDS)
+        .clamp(
+            THROW_IN_NO_OFFSIDE_DEFENDER_DEPTH_YARDS,
+            THROW_IN_RUNNER_TRACK_DEPTH_YARDS,
+        );
+    let y = (ball_y + attacking_dir * tracking_depth).clamp(0.0, length);
+    Some(Vec2::new(runner_target.x.clamp(0.0, width), y))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -20613,6 +20663,8 @@ pub struct SoccerPhysicsSmokeLimits {
     pub player_sustained_max_speed_yps: f64,
     #[serde(default = "default_player_sustained_window_seconds")]
     pub player_sustained_window_seconds: f64,
+    #[serde(default = "default_non_goalkeeper_exact_stationary_limit_seconds")]
+    pub non_goalkeeper_exact_stationary_limit_seconds: f64,
 }
 
 fn default_player_sustained_max_speed_yps() -> f64 {
@@ -20620,6 +20672,9 @@ fn default_player_sustained_max_speed_yps() -> f64 {
 }
 fn default_player_sustained_window_seconds() -> f64 {
     SOCCER_PHYSICS_PLAYER_SUSTAINED_WINDOW_SECONDS
+}
+fn default_non_goalkeeper_exact_stationary_limit_seconds() -> f64 {
+    SOCCER_PHYSICS_NON_GK_EXACT_STATIONARY_LIMIT_SECONDS
 }
 
 impl Default for SoccerPhysicsSmokeLimits {
@@ -20633,8 +20688,18 @@ impl Default for SoccerPhysicsSmokeLimits {
             frame_epsilon_yards: SOCCER_PHYSICS_FRAME_EPSILON_YARDS,
             player_sustained_max_speed_yps: SOCCER_PHYSICS_PLAYER_SUSTAINED_MAX_SPEED_YPS,
             player_sustained_window_seconds: SOCCER_PHYSICS_PLAYER_SUSTAINED_WINDOW_SECONDS,
+            non_goalkeeper_exact_stationary_limit_seconds:
+                SOCCER_PHYSICS_NON_GK_EXACT_STATIONARY_LIMIT_SECONDS,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExactStationaryPlayerRun {
+    position: Vec2,
+    start_tick: u64,
+    start_clock_seconds: f64,
+    reported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20739,6 +20804,7 @@ pub fn soccer_match_frame_physics_smoke_report_with_limits(
     // Rolling (clock, position) trail per player for the SUSTAINED-speed check: a footballer
     // can't average a flat-out sprint over a long window.
     let mut player_speed_windows = HashMap::<usize, std::collections::VecDeque<(f64, Vec2)>>::new();
+    let mut player_exact_stationary_runs = HashMap::<usize, ExactStationaryPlayerRun>::new();
     for frame in frames {
         check_clock_monotonicity(
             &mut report,
@@ -20819,6 +20885,14 @@ pub fn soccer_match_frame_physics_smoke_report_with_limits(
                 player.position,
                 config,
                 limits.pitch_margin_yards,
+            );
+            check_non_goalkeeper_exact_stationary_run(
+                &mut report,
+                player,
+                frame.tick,
+                frame.clock_seconds,
+                &mut player_exact_stationary_runs,
+                limits.non_goalkeeper_exact_stationary_limit_seconds,
             );
             if let Some(value) = check_motion_vector(
                 &mut report,
@@ -20932,6 +21006,58 @@ pub fn soccer_match_frame_physics_smoke_report_with_limits(
     }
     report.violation_count = report.violations.len();
     report
+}
+
+fn check_non_goalkeeper_exact_stationary_run(
+    report: &mut SoccerPhysicsSmokeReport,
+    player: &PlayerSnapshot,
+    tick: u64,
+    clock_seconds: f64,
+    runs: &mut HashMap<usize, ExactStationaryPlayerRun>,
+    limit_seconds: f64,
+) {
+    if player.role == PlayerRole::Goalkeeper {
+        runs.remove(&player.id);
+        return;
+    }
+    if !vec2_is_finite(player.position) || !clock_seconds.is_finite() {
+        runs.remove(&player.id);
+        return;
+    }
+    let limit_seconds = if limit_seconds.is_finite() && limit_seconds >= 0.0 {
+        limit_seconds
+    } else {
+        SOCCER_PHYSICS_NON_GK_EXACT_STATIONARY_LIMIT_SECONDS
+    };
+    if let Some(run) = runs.get_mut(&player.id) {
+        if run.position == player.position {
+            let elapsed = (clock_seconds - run.start_clock_seconds).max(0.0);
+            if elapsed > limit_seconds && !run.reported {
+                report.push_violation(
+                    tick,
+                    format!("player:{}", player.id),
+                    "exactStationarySeconds",
+                    elapsed,
+                    limit_seconds,
+                    format!(
+                        "non-goalkeeper player stayed at exact position ({:.6}, {:.6}) for {:.3}s from tick {} to {}",
+                        run.position.x, run.position.y, elapsed, run.start_tick, tick
+                    ),
+                );
+                run.reported = true;
+            }
+            return;
+        }
+    }
+    runs.insert(
+        player.id,
+        ExactStationaryPlayerRun {
+            position: player.position,
+            start_tick: tick,
+            start_clock_seconds: clock_seconds,
+            reported: false,
+        },
+    );
 }
 
 pub fn soccer_tracking_physics_smoke_report(
@@ -37773,6 +37899,7 @@ pub fn soccer_live_page_html() -> String {
 
 pub fn soccer_simulation_trace_jsonl(trace: &SimulationTrace) -> String {
     let tactical_liveness = soccer_playback_tactical_liveness_json_for_trace(trace);
+    let physics_smoke = soccer_simulation_physics_smoke_report(trace);
     let mut lines = Vec::with_capacity(trace.frames.len() + trace.events.len() + 2);
     lines.push(
         serde_json::to_string(&serde_json::json!({
@@ -37808,7 +37935,8 @@ pub fn soccer_simulation_trace_jsonl(trace: &SimulationTrace) -> String {
         serde_json::to_string(&serde_json::json!({
             "kind": "soccer-sim-summary",
             "summary": &trace.summary,
-            "tacticalLiveness": tactical_liveness
+            "tacticalLiveness": tactical_liveness,
+            "physicsSmoke": physics_smoke
         }))
         .unwrap_or_else(|_| "{}".to_string()),
     );
@@ -44661,8 +44789,8 @@ fn shot_speed_yps_from_power(power: f64, skills: &SkillProfile) -> f64 {
     // A real shot on goal travels 40-60mph: even a placed/low-power shot leaves the boot at ~40,
     // and a full-power strike from a powerful technique reaches 60. (Below this is a pass/poke,
     // handled elsewhere — this is the SHOT speed.)
-    let mph = 40.0 + power.clamp(0.0, 1.0) * (8.0 + technique_power * 12.0);
-    mph_to_yps(mph.clamp(40.0, 60.0))
+    let mph = SHOT_MIN_SPEED_MPH + power.clamp(0.0, 1.0) * (8.0 + technique_power * 12.0);
+    mph_to_yps(mph.clamp(SHOT_MIN_SPEED_MPH, SHOT_MAX_SPEED_MPH))
 }
 
 fn pass_speed_yps_from_power(

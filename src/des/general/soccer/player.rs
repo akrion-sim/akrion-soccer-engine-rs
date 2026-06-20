@@ -10,6 +10,42 @@ const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
+const WIDE_OUTLET_WIDTH_TARGET_FRACTION: f64 = 0.92;
+const WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT: f64 = 0.42;
+const WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT: f64 = 0.20;
+const WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING: f64 = 0.18;
+
+fn snapshot_team_lateral_width_yards(snapshot: &WorldSnapshot, team: Team) -> f64 {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut count = 0usize;
+    for player in snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == team && player.role != PlayerRole::Goalkeeper)
+    {
+        min_x = min_x.min(player.position.x);
+        max_x = max_x.max(player.position.x);
+        count += 1;
+    }
+    if count < 2 {
+        0.0
+    } else {
+        (max_x - min_x).clamp(0.0, snapshot.field_width.max(0.0))
+    }
+}
+
+fn possession_width_shortage(snapshot: &WorldSnapshot, directive: &TeamTacticalDirective) -> f64 {
+    let target_width = directive
+        .width_yards
+        .max(snapshot.field_width * WIDE_OUTLET_WIDTH_TARGET_FRACTION)
+        .min(snapshot.field_width * 0.99);
+    if target_width <= 1e-6 {
+        return 0.0;
+    }
+    ((target_width - snapshot_team_lateral_width_yards(snapshot, directive.team)) / target_width)
+        .clamp(0.0, 1.0)
+}
 
 fn dd_soccer_disable_power_duration_ceiling() -> bool {
     use std::sync::OnceLock;
@@ -3219,6 +3255,11 @@ impl PlayerAgent {
         let exploit_space_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::ExploitSpace);
         let possession_team = snapshot.controlled_possession_team();
+        let width_shortage = if possession_team == Some(self.team) {
+            possession_width_shortage(snapshot, directive)
+        } else {
+            0.0
+        };
         let flank_policy_active =
             possession_team == Some(self.team) && directive.flank_attack_policy.is_flank();
         // A striker holding up in the opponent half, OR a midfielder/striker carrying the
@@ -3364,6 +3405,7 @@ impl PlayerAgent {
                     // on the wing more readily than drifting inside.
                     target,
                     0.72 + touchline_fit * 0.34
+                        + width_shortage * WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT
                         + shape_support_urgency * 0.20
                         + holder_pressure_urgency * 0.34
                         + if flank_policy_active {
@@ -3521,11 +3563,22 @@ impl PlayerAgent {
             .any(|option| option.legal && option.label == "wide-outlet")
         {
             let wide_floor = (0.12
+                + width_shortage * WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT
                 + shape_support_urgency * 0.08
                 + holder_pressure_urgency * 0.10
                 + if flank_policy_active { 0.10 } else { 0.0 })
-            .clamp(0.16, 0.34);
+            .clamp(0.18, 0.50);
             ensure_min_legal_option_probability(&mut options, "wide-outlet", wide_floor);
+            if width_shortage > 0.0 {
+                let support_shape_multiplier =
+                    (1.0 - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING)
+                        .clamp(0.76, 1.0);
+                let support_roam_multiplier =
+                    (1.0 - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING * 0.55)
+                        .clamp(0.84, 1.0);
+                scale_legal_option_score(&mut options, "support-shape", support_shape_multiplier);
+                scale_legal_option_score(&mut options, "support-roam", support_roam_multiplier);
+            }
         }
         if holder_pressure_urgency >= PRESSURED_SUPPORT_SPRINT_URGENCY {
             if options
@@ -3541,9 +3594,10 @@ impl PlayerAgent {
                 .any(|option| option.legal && option.label == "wide-outlet")
             {
                 let wide_floor = (0.20
+                    + width_shortage * WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT
                     + holder_pressure_urgency * 0.20
                     + if flank_policy_active { 0.08 } else { 0.0 })
-                .clamp(0.26, 0.48);
+                .clamp(0.28, 0.58);
                 ensure_min_legal_option_probability(&mut options, "wide-outlet", wide_floor);
             }
         }

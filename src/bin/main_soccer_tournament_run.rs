@@ -110,6 +110,49 @@ fn parse_learning_mode(raw: Option<String>) -> TournamentLearningMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TournamentProgressGranularity {
+    group_round_count: usize,
+    first_checkpoint_matches: usize,
+    largest_wave_matches: usize,
+    progress_event_count: usize,
+    matches_total: usize,
+}
+
+fn tournament_progress_granularity(format: &TournamentFormat) -> TournamentProgressGranularity {
+    let group_count = format.group_count();
+    let legs = if format.double_round_robin { 2 } else { 1 };
+    let padded_group_size = if format.group_size % 2 == 0 {
+        format.group_size
+    } else {
+        format.group_size + 1
+    };
+    let group_round_count = padded_group_size.saturating_sub(1) * legs;
+    let group_wave_matches = group_count * (format.group_size / 2).max(1);
+    let group_match_total =
+        group_count * format.group_size * format.group_size.saturating_sub(1) / 2 * legs;
+    let knockout_team_count = format.knockout_team_count();
+    let mut knockout_wave_count = 0usize;
+    let mut remaining = knockout_team_count;
+    while remaining > 1 {
+        knockout_wave_count += 1;
+        remaining /= 2;
+    }
+    let knockout_match_total =
+        knockout_team_count.saturating_sub(1) + usize::from(format.third_place_match);
+    let largest_wave_matches = group_wave_matches.max(knockout_team_count / 2);
+
+    TournamentProgressGranularity {
+        group_round_count,
+        first_checkpoint_matches: group_wave_matches,
+        largest_wave_matches,
+        progress_event_count: group_round_count
+            + knockout_wave_count
+            + usize::from(format.third_place_match),
+        matches_total: group_match_total + knockout_match_total,
+    }
+}
+
 /// Deterministic per-team RNG (splitmix64) so a given tournament seed reproduces
 /// the exact same diversified field — diversity must not break reproducibility.
 struct DiversityRng {
@@ -569,6 +612,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     runner_config.base.duration_seconds = match_seconds;
     let promote_config = runner_config.base.clone();
     let options = SoccerQPolicyOptions::default();
+    let progress_granularity = tournament_progress_granularity(&format);
 
     println!(
         "tournament_start teams={} groups={} knockout={} mode={:?} seed={} match_seconds={:.1} seed_fraction={:.2} threads={} promote={} soft_deadline_seconds={:.1}",
@@ -583,11 +627,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         promote,
         soft_deadline_seconds,
     );
+    println!(
+        "tournament_progress_plan progress_unit=wave first_checkpoint_matches={} largest_wave_matches={} group_rounds={} progress_events={} matches_total={} threads={}",
+        progress_granularity.first_checkpoint_matches,
+        progress_granularity.largest_wave_matches,
+        progress_granularity.group_round_count,
+        progress_granularity.progress_event_count,
+        progress_granularity.matches_total,
+        threads,
+    );
 
     // Optional Postgres: seed from the latest active policy and promote the champion.
     let mut store = SoccerLearningPgStore::connect_from_env()?;
     let tournament_lock_key =
         tournament_run_lock_key(env_string("SOCCER_TOURNAMENT_LOCK_KEY"), &slug);
+    if tournament_lock_key != slug && !env_bool("SOCCER_TOURNAMENT_ALLOW_NONCANONICAL_LOCK", false)
+    {
+        println!(
+            "tournament_lock_noncanonical key={tournament_lock_key} slug={slug} skipped=true reason=noncanonical_lock_key"
+        );
+        return Ok(());
+    }
     let mut tournament_lock_held = false;
     if let Some(store) = store.as_mut() {
         if store.try_acquire_tournament_run_lock(&tournament_lock_key)? {
@@ -626,10 +686,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("tournament_reconciled_orphans experiment={eid} count={n} status=partial")
             }
             Ok(_) => {}
-            Err(err) => eprintln!("tournament_reconcile_orphans_failed experiment={eid} error={err} (continuing)"),
+            Err(err) => eprintln!(
+                "tournament_reconcile_orphans_failed experiment={eid} error={err} (continuing)"
+            ),
         }
-        match store.load_latest_active_policy_metadata(&eid)? {
-            Some(metadata) => {
+        match store.load_latest_active_policy_metadata(&eid) {
+            Ok(Some(metadata)) => {
                 parent_policy_version_id = Some(metadata.id.clone());
                 parent_generation = metadata.generation;
                 seed_snapshot = metadata.neural_network.clone();
@@ -641,8 +703,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     seed_snapshot.is_some(),
                 );
             }
-            None => {
+            Ok(None) => {
                 println!("tournament_seed experiment={eid} no_active_policy=true (cold start)");
+            }
+            Err(err) => {
+                eprintln!(
+                    "tournament_seed_active_policy_load_failed experiment={eid} error={err} (continuing with elite pool or cold field)"
+                );
             }
         }
         // Prefer the previous tournament's elite finishers as the breeding pool so
@@ -672,12 +739,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Total fixtures (group round-robins + knockout + third place) — matches the engine's
     // own count, so the header records progress as `matches_played / match_count`.
-    let group_count = format.team_count / format.group_size.max(1);
-    let per_group_matches = format.group_size * format.group_size.saturating_sub(1) / 2
-        * if format.double_round_robin { 2 } else { 1 };
-    let knockout_matches =
-        format.knockout_team_count().saturating_sub(1) + usize::from(format.third_place_match);
-    let matches_total = group_count * per_group_matches + knockout_matches;
+    let matches_total = progress_granularity.matches_total;
     let tournament_date = env_string("SOCCER_RUN_ID").unwrap_or_else(|| format!("seed-{seed}"));
     let learning_mode_label = format!("{mode:?}");
 
@@ -739,9 +801,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tournament = Tournament::new(teams, format, mode, seed)?;
     let runner = EngineMatchRunner::new(runner_config);
     // Engine API (HEAD line): run_parallel borrows the runner and takes an
-    // optional wall-clock deadline + a per-wave progress callback. The CronJob
-    // still enforces the hard 2am-7am stop via activeDeadlineSeconds, but an
-    // app-level soft deadline lets the normal failure/salvage path finish first.
+    // optional wall-clock deadline + a per-wave progress callback. A zero soft
+    // deadline lets continuous tournament lanes run each generation to completion.
     // Persist each wave AS IT COMMITS (matches + per-team brain checkpoints) and track the
     // strongest brain in memory, so a failure mid-bracket salvages the night's learning.
     let mut persisted_matches: usize = 0;
@@ -924,6 +985,35 @@ mod tests {
         assert_eq!(format.team_count, 128);
         assert_eq!(format.group_count(), 32);
         assert_eq!(format.knockout_team_count(), 64);
+    }
+
+    #[test]
+    fn default_progress_granularity_explains_first_persisted_checkpoint() {
+        let format = TournamentFormat::default();
+        let granularity = tournament_progress_granularity(&format);
+        assert_eq!(granularity.matches_total, 256);
+        assert_eq!(granularity.first_checkpoint_matches, 64);
+        assert_eq!(granularity.largest_wave_matches, 64);
+        assert_eq!(granularity.group_round_count, 3);
+        assert_eq!(granularity.progress_event_count, 10);
+    }
+
+    #[test]
+    fn progress_granularity_handles_odd_group_sizes() {
+        let format = TournamentFormat {
+            team_count: 24,
+            group_size: 3,
+            advancers_per_group: 1,
+            double_round_robin: false,
+            third_place_match: false,
+        };
+        assert!(format.validate().is_ok());
+        let granularity = tournament_progress_granularity(&format);
+        assert_eq!(granularity.matches_total, 31);
+        assert_eq!(granularity.first_checkpoint_matches, 8);
+        assert_eq!(granularity.largest_wave_matches, 8);
+        assert_eq!(granularity.group_round_count, 3);
+        assert_eq!(granularity.progress_event_count, 6);
     }
 
     #[test]

@@ -2138,6 +2138,13 @@ impl SoccerFormationLpBrain {
                     length,
                     current,
                 );
+                let target = soccer_throw_in_no_offside_defender_target(
+                    snapshot,
+                    self.team,
+                    input.player_id,
+                    input.role,
+                    target,
+                );
                 let recommended_move = target - current;
                 let target_velocity = limit_vec2_len(
                     finite_vec2(
@@ -2260,6 +2267,13 @@ impl SoccerFormationLpBrain {
                     desired
                 };
                 let target = (current + recommended_move).clamp_to_pitch(width, length);
+                let target = soccer_throw_in_no_offside_defender_target(
+                    snapshot,
+                    self.team,
+                    input.player_id,
+                    input.role,
+                    target,
+                );
                 let raw_target_velocity = (target - current) / dt;
                 let speed_cap = soccer_lp_clamped(input.top_speed, 0.0, 20.0, 0.0)
                     .max(velocity.len())
@@ -3675,6 +3689,136 @@ pub(crate) fn relational_shape_learning_reward(
     (err_before - err_after) * params.relational_reward_per_yard
 }
 
+fn soccer_throw_in_no_offside_defender_line_for(
+    snapshot: &WorldSnapshot,
+    team: Team,
+    role: PlayerRole,
+) -> Option<f64> {
+    if role != PlayerRole::Defender {
+        return None;
+    }
+    let call = snapshot.active_set_play.as_ref()?;
+    if call.team == team || !set_play_restart_labels_match(&call.restart, "throw-in") {
+        return None;
+    }
+    if snapshot.tick > call.expires_tick || snapshot.clock_seconds > call.expires_clock_seconds {
+        return None;
+    }
+    let (_, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    Some(throw_in_no_offside_defender_line_y(
+        team,
+        snapshot.ball.position.y,
+        length,
+    ))
+}
+
+fn soccer_throw_in_defender_lane_rank(
+    snapshot: &WorldSnapshot,
+    team: Team,
+    player_id: usize,
+) -> Option<usize> {
+    let mut defenders = snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == team && player.role == PlayerRole::Defender)
+        .collect::<Vec<_>>();
+    defenders.sort_by(|a, b| {
+        a.home_position
+            .x
+            .partial_cmp(&b.home_position.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    defenders
+        .iter()
+        .position(|player| player.id == player_id)
+}
+
+fn soccer_throw_in_no_offside_runner_targets_for(
+    snapshot: &WorldSnapshot,
+    defending_team: Team,
+) -> Vec<Vec2> {
+    let Some(call) = snapshot.active_set_play.as_ref() else {
+        return Vec::new();
+    };
+    if call.team == defending_team || !set_play_restart_labels_match(&call.restart, "throw-in") {
+        return Vec::new();
+    }
+    if snapshot.tick > call.expires_tick || snapshot.clock_seconds > call.expires_clock_seconds {
+        return Vec::new();
+    }
+    let (width, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let mut targets = call
+        .assignments
+        .iter()
+        .filter_map(|assignment| {
+            if assignment.role == SoccerSetPlayAssignmentRole::Taker {
+                return None;
+            }
+            let player = snapshot
+                .players
+                .iter()
+                .find(|player| player.id == assignment.player_id)?;
+            if player.team != call.team {
+                return None;
+            }
+            throw_in_no_offside_defender_tracking_target(
+                defending_team,
+                snapshot.ball.position.y,
+                assignment.target,
+                width,
+                length,
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|a, b| {
+        a.x.partial_cmp(&b.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.y.partial_cmp(&b.y)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    targets
+}
+
+fn soccer_throw_in_no_offside_runner_target_for_defender(
+    snapshot: &WorldSnapshot,
+    team: Team,
+    player_id: usize,
+) -> Option<Vec2> {
+    let targets = soccer_throw_in_no_offside_runner_targets_for(snapshot, team);
+    if targets.is_empty() {
+        return None;
+    }
+    let rank = soccer_throw_in_defender_lane_rank(snapshot, team, player_id).unwrap_or(0);
+    targets.get(rank.min(targets.len() - 1)).copied()
+}
+
+fn soccer_throw_in_no_offside_defender_target(
+    snapshot: &WorldSnapshot,
+    team: Team,
+    player_id: usize,
+    role: PlayerRole,
+    mut target: Vec2,
+) -> Vec2 {
+    let Some(line_y) = soccer_throw_in_no_offside_defender_line_for(snapshot, team, role) else {
+        return target;
+    };
+    if let Some(runner_target) =
+        soccer_throw_in_no_offside_runner_target_for_defender(snapshot, team, player_id)
+    {
+        target.x = target.x * (1.0 - THROW_IN_RUNNER_TRACK_LATERAL_WEIGHT)
+            + runner_target.x * THROW_IN_RUNNER_TRACK_LATERAL_WEIGHT;
+        target.y = runner_target.y;
+    }
+    match team {
+        Team::Home => target.y = target.y.min(line_y),
+        Team::Away => target.y = target.y.max(line_y),
+    }
+    target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+}
+
 fn soccer_formation_lp_anchor(
     snapshot: &WorldSnapshot,
     team: Team,
@@ -3793,10 +3937,10 @@ fn soccer_formation_lp_anchor(
     }
     if possession == Some(team.other()) && player.role != PlayerRole::Goalkeeper {
         if let Some(mark_target) = soccer_defensive_mark_target(snapshot, team, player.role, zone) {
-            return (mark_target * 0.5 + zone * 0.5).clamp_to_pitch(width, length);
+            zone = (mark_target * 0.5 + zone * 0.5).clamp_to_pitch(width, length);
         }
     }
-    zone
+    soccer_throw_in_no_offside_defender_target(snapshot, team, player.id, player.role, zone)
 }
 
 pub(crate) fn soccer_formation_lp_slot_inputs(
