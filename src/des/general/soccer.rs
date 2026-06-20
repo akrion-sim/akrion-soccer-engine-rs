@@ -79,6 +79,9 @@ pub const DEFAULT_BALL_GRASS_RESISTANCE_YPS2: f64 = 0.96;
 pub const DEFAULT_BALL_STOP_SPEED_YPS: f64 = 0.55;
 pub const DEFAULT_PLAYER_VISION_SKILL: f64 = 7.6;
 pub const DEFAULT_CONTROLLER_DEBOUNCE_MS: u64 = 4;
+const ACTION_LABEL_RECOVER: &str = "recover";
+const TRACE_REACTIVE_GROUND_PASS: &str = "reactive-ground-pass";
+const TRACE_TRAP_CONTROLLABLE_TRAJECTORY: &str = "trap-controllable-trajectory";
 const PLAYER_CONTROL_RADIUS_YARDS: f64 = 1.55;
 // First-touch settle cap: when a player gains control of a ball from a distance
 // (within the control radius but not at their feet), the held ball is drawn in to
@@ -93,10 +96,14 @@ const CONTROL_FIRST_TOUCH_SETTLE_MAX_STEP_YARDS: f64 = 1.4;
 // them strike in that window launched the ball from out there / teleported it onto
 // the feet first — a "ghost kick" with no player visibly at the ball. A strike is
 // only legal once the ball has settled to within this reach; until then the holder
-// takes a settling touch. Set above the dribble carry lead (0.92yd) and orbit max
-// (1.10yd) so ordinary carrying/dribbling release is never blocked, but below the
-// settle-window distances so a not-yet-controlled ball can't be booted.
-const CONTROLLED_STRIKE_REACH_YARDS: f64 = 1.6;
+// takes a settling touch. Pinned JUST above the dribble carry lead (0.92yd) and orbit
+// max (1.10yd) so ordinary carrying/dribbling release is never blocked, but as low as
+// that allows so a just-won ball still 1.2–2.3yd off the feet (control snaps it onto its
+// own travel segment, not the feet — see `nearest_ball_controller_for_segment`) cannot be
+// struck. At 1.6 the slack above the orbit max was itself the phantom band: a strike fired
+// with the ball up to ~1.6yd (≈5ft) from any player. The settle draws the ball in at
+// 1.4yd/tick, so this only ever costs ~one extra tick before the strike fires cleanly.
+const CONTROLLED_STRIKE_REACH_YARDS: f64 = 1.25;
 // Physical reach caps for contesting a moving ball. A fast ball that only nicks
 // the skill-based control radius is unreachable: a player can close at most a
 // lunge (`INTERCEPT_LUNGE_REACH_YARDS`) plus the ground they cover while the ball
@@ -115,6 +122,15 @@ const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
 // point (large ball-time-to-arrival) hands a distant defender a huge reach (sprint × seconds),
 // flagging defenders 25+ yd off the lane. Bounds the reach to a believable step-in radius.
 const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
+// During the launch tick, same-team bystanders ignore the first sliver of an outgoing pass so
+// the passer cannot ping it into a teammate standing on top of the kick animation. After this
+// progress, normal controllable-trajectory logic may take over.
+const PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS: f64 = 0.12;
+const REACTIVE_GROUND_PASS_MIN_SPEED_YPS: f64 = 1.0;
+const REACTIVE_GROUND_PASS_LOOKAHEAD_SECONDS: f64 = 1.40;
+const REACTIVE_GROUND_PASS_CLAIM_GAP_PENALTY_SECONDS_PER_YARD: f64 = 0.04;
+const REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS: f64 = 1e-3;
+const REACTIVE_GROUND_PASS_NUMERIC_EPSILON: f64 = 1e-6;
 // A ball flying overhead can only be contacted by players who can get up to it:
 // a standing reach plus a jump scaled by aerial ability. Higher balls fly over
 // grounded players (the correct "aerial pass passed through" behavior).
@@ -546,6 +562,10 @@ const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
 const SHOT_BAILOUT_DISPOSSESSION_RISK: f64 = 0.80;
 const SHOT_BAILOUT_ON_FRAME_PROBABILITY: f64 = 0.20;
+/// A shot that has decelerated to at or below this ground speed is no longer a credible attempt
+/// on goal — it is a loose ball again and must be contestable/collectable. Above it the ball is
+/// still treated as a live shot (control suppressed so a fast shot is not "trapped" mid-flight).
+const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
@@ -1125,11 +1145,12 @@ const SLIDE_TACKLE_MIN_HOLDER_SPEED_YPS: f64 = 4.5;
 // a lone last defender being told to contain (urgency < 1.0) must NOT gamble a slide.
 const SLIDE_TACKLE_MIN_COMMIT_URGENCY: f64 = 1.0;
 const SLIDE_TACKLE_MAX_DECISION_PROBABILITY: f64 = 0.85;
-// A tackle can only take the BALL, and the ball is carried in front of the holder. A
-// defender trailing the holder (holder's body between the defender and the led ball)
-// cannot win it with ANY tackle. This is the dot(toDefender, toBall) cutoff below which
-// the defender counts as "behind" the carrier: only the rear hemisphere is blocked, so
-// a level/side challenge is still allowed.
+// A standing/passive tackle can only take the BALL, and the ball is carried in front
+// of the holder. A defender trailing the holder (holder's body between the defender
+// and the led ball) cannot win it without committing to a slide that actually reaches
+// the ball. This is the dot(toDefender, toBall) cutoff below which the defender counts
+// as "behind" the carrier: only the rear hemisphere is blocked, so a level/side
+// challenge is still allowed.
 const TACKLE_BEHIND_CARRIER_DOT: f64 = -0.15;
 const UNTARGETED_LONG_BALL_RECOVERY_REWARD_POINTS: f64 = 5.2;
 const UNTARGETED_LONG_BALL_LOSS_PENALTY_POINTS: f64 = 2.6;
@@ -1251,19 +1272,25 @@ const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
 // along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line at least 2yd goal-side of the ball and no more than 30yd behind it. The
-// LP/formation nudge shifts the whole line to restore the band.
+// keep the line 10-30yd goal-side of the ball. The LP/formation nudge shifts the whole line to
+// restore the band. Near our own goal the band is relaxed (the minimum standoff is waived within
+// 20yd so the line may sit level with the ball on top of the box) and fully suspended inside the
+// team's own emergency 5-yard goal-line zone where parity with the ball is allowed.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// Neutral genome defaults for the evolved back-four standoff band. Tournaments
-// permute the min/max within this 5-25yd standoff.
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 5.0;
-// THE rule: the back four's average sits 5-25yd behind (goal-side of) the ball, always —
-// except inside our own DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS (parity with the ball is
-// fine that deep), where the band is suspended.
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 25.0;
+// THE rule: the back four's average sits 10-30yd behind (goal-side of) the ball, always,
+// outside the near-goal relaxation below. The deep edge (30) matches the emergency break-cover
+// cap `DEFENSIVE_MAX_BEHIND_BALL_YARDS`, so a line-break retreat is never clamped shallower than
+// the cover it is trying to provide. (Tournament genomes permute the min/max within this band.)
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 10.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
+// ...but the 10yd MINIMUM standoff is waived once the ball is this close to our own goal:
+// defending on top of our own box we hold level with / goal-side of the ball rather than
+// being forced a full 10yd off it (which would shove the line into the six-yard box / off
+// the end-line). The 30yd maximum (capped by room to our own goal) still applies.
+const DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS: f64 = 20.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -1276,20 +1303,26 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
-// The back-four band is suspended when the ball is within this of either goal line: deep in
-// our own end (ball on our 0-5yd zone) the line can sit at parity with the ball rather than a
-// forced 5yd behind it (which would shove it off our own end-line).
-const DEFENSIVE_LINE_BAND_GOAL_LINE_EXEMPT_YARDS: f64 = 5.0;
+// The back-four band is FULLY suspended only inside the defending team's own 5-yard emergency
+// zone (a ball on the goal-line may be played at parity rather than forcing the line off the
+// end-line). Between there and DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS the band still holds,
+// but with its minimum standoff relaxed (the line may sit level with the ball, just not ahead).
+const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 5.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
 // the tighter in-possession cap.
 const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
-// Back-four row cohesion in the 24-row tactical grid. A row is 1/24 of pitch
-// length; line-bound defenders should stay within this many rows of the line
-// center so one fullback/centerback does not drift several rows away while the
-// average still looks legal.
-const BACK_FOUR_ROW_COHESION_ROWS: f64 = 1.5;
+// Offside line flatness: when defending, the back four holds a FLAT line so it presents a clean
+// offside trap — the total fore-aft (along-attacking-axis) spread between the four is kept within
+// this many yards (each defender within ±half of it of the line average). Eased toward level over
+// the ~3s consistency window (not snapped) so a defender caught out of line jogs back into it; in
+// possession the clamp lifts entirely (centre-backs split, full-backs overlap).
+const BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS: f64 = 2.0;
+// A defender whose current position is more than this far AHEAD of the back-four band (up at the
+// ball pressing or cutting a lane) has stepped out of the line, so it is excluded from the line
+// centre used for the offside-flatness clamp (a cheap position test, no decision re-entry).
+const LINE_STEPPED_OUT_AHEAD_YARDS: f64 = 6.0;
 // Below this speed (and on the ground) the ball counts as "settled" for the shared 2yd floor.
 const DEFENSIVE_LINE_SETTLED_BALL_SPEED_YPS: f64 = 6.0;
 // The cushion behind the ball MUST shrink as the ball nears the defenders' OWN goal -- you
@@ -1673,8 +1706,9 @@ const CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS: f64 = 2.5;
 const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
 // Defensive goal-side recovery. When the opponent has possession — INCLUDING while
 // their pass is in flight (no holder; `possession_team` falls back to last-touch) —
-// every non-pressing outfielder must be on the own-goal side of the ball, i.e. on
-// the segment between the ball and our own goal. An off-ball target that sits
+// every non-pressing defender/midfielder must be on the own-goal side of the ball,
+// i.e. on the segment between the ball and our own goal. Strikers/forwards are
+// exempt so the outlet line can stay high. An off-ball target that sits
 // upfield of the ball (between ball and the opponent goal) is pulled back in y
 // until it is at least `MIN` yds goal-side. Lateral offset is preserved so the
 // back line keeps its width. The nearest outfielder to the ball (the primary
@@ -2101,11 +2135,37 @@ const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
 // touch that player before continuing to a later receiver. This is deliberately a
 // segment-level contact radius, not a scored reception preference.
 const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
+// Ground passes within this two-yard lane are controllable when reaction-delayed
+// reach says the player can trap them. Wider than body contact: it covers the step
+// or lunge onto a rolling pass that would otherwise ghost through a nearby player.
+const REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS: f64 = 2.0;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
-// looking elsewhere. Kept tight (truly at the feet) so a ball at your heels behind
-// you still needs a turn first. (Below this, the facing/control-cone gate is waived.)
-const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 0.5;
+// looking elsewhere. At 1yd a player can reach a foot/leg out and trap a ball at his
+// heels without first completing a turn, so a slow ball under a (even mis-facing)
+// player is collected instead of ghosting through. (Below this, the facing/control-cone
+// gate is waived.)
+const CONTROL_AT_FEET_TRAP_RADIUS_YARDS: f64 = 1.0;
+// MPC/QP execution gates for ball control. The analytic control radius decides whether a touch
+// is geometrically nearby; this layer only rejects touches whose bounded-acceleration solve is
+// effectively impossible. Risky-but-possible control stays an MDP/POMDP player choice.
+const MPC_BALL_CONTROL_MIN_QP_ACCEL_FIT: f64 = 0.10;
+const MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT: f64 = 0.08;
+const MPC_BALL_CONTROL_SCORE_WEIGHT: f64 = 0.46;
+// POMDP local choice: on a loose roller, a player may let the ball run across their body and
+// collect it later only when the intended recovery target is genuinely ahead on the ball's path
+// and opponents are not close enough to punish the delay.
+const POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS: f64 = 1.15;
+const POMDP_BALL_CONTROL_LET_RUN_AHEAD_FULL_YARDS: f64 = 5.0;
+const POMDP_BALL_CONTROL_LET_RUN_PRESSURE_MARGIN_YARDS: f64 = 1.35;
+const POMDP_BALL_CONTROL_TRAP_URGENCY_OPPONENT_YARDS: f64 = 4.0;
+const POMDP_BALL_CONTROL_TRAP_SCORE_MARGIN: f64 = 0.06;
+// Defensive steals use the same MPC/QP idea: deciding to tackle is MDP/POMDP, but the steal only
+// resolves if the defender can physically reach and control the ball under bounded acceleration.
+const MPC_STEAL_STANDING_MIN_QP_ACCEL_FIT: f64 = 0.10;
+const MPC_STEAL_SLIDE_MIN_QP_ACCEL_FIT: f64 = 0.06;
+const MPC_STEAL_SUCCESS_MULTIPLIER_FLOOR: f64 = 0.42;
+const MPC_STEAL_SUCCESS_MULTIPLIER_SPAN: f64 = 0.68;
 // Counterattack: with fewer than this many opponents ahead while in possession,
 // the break is on — off-ball players push forward into space (and sprint there).
 // Attack support: a teammate this far behind an advanced ball sprints forward to
@@ -2182,10 +2242,57 @@ const INTERCEPT_EARLY_CUTOFF_FRACTION: f64 = 0.55;
 // (this fraction of the way to where it would come to rest) rather than strolling
 // to the resting point and letting it die first. Lower = more aggressive attack.
 const LOOSE_BALL_ATTACK_CUTOFF_FRACTION: f64 = 0.72;
+// Kinematic loose-ball intercept search (gated by `mpc.loose_ball_intercept_enabled`):
+// march the predicted ball trajectory in these time steps out to this horizon and drive at
+// the FIRST point the chaser can physically reach (point-mass reach from its current velocity
+// under its acceleration + top-speed limits). Sized fine + short for a close 50-50 duel.
+const LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS: f64 = 0.05;
+const LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS: f64 = 1.6;
+// Per-tick loose-ball awareness reflex (player.rs): a committed contester pounces on a live
+// loose ball the moment it is within this range OF the player, or is rolling toward the
+// player at/above this closing speed (so it anticipates a ball "coming close" rather than
+// waiting for it to arrive). Drives straight at the kinematic intercept; the rest of the
+// decision match is short-circuited so a 1-2yd 50-50 is attacked at once.
+const LOOSE_BALL_POUNCE_RADIUS_YARDS: f64 = 4.0;
+const LOOSE_BALL_POUNCE_CLOSING_YPS: f64 = 2.0;
+// When an opponent is bearing down on a loose ball's projected drop, the chaser COMMITS to
+// an earlier intercept — it stretches/lunges this much further to reach the ball sooner and
+// beat them to it, rather than meeting it at the latest comfortable point on the roll.
+const LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS: f64 = 1.0;
+// First-touch TIMING decision (trap now vs let it run). A ball at/below this speed is a clean
+// first touch; faster than this it risks a miscontrol when trapped on the move.
+const LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS: f64 = 6.0;
+// How quickly miscontrol risk ramps with ball speed past the clean pace (yps per unit risk).
+const LOOSE_BALL_CONTROL_RISK_SPEED_SCALE: f64 = 12.0;
+// Below this miscontrol risk the chaser just traps the early ball — not worth ceding ground to
+// wait for it to slow. Above it (and unpressured) it lets the ball run to a cleaner reception.
+const LOOSE_BALL_TRAP_NOW_RISK_THRESHOLD: f64 = 0.30;
+// An opponent within this of the intercept point is "bearing down" — the chaser must trap NOW
+// to deny them rather than letting the ball run, miscontrol risk notwithstanding.
+const LOOSE_BALL_LETRUN_DENIAL_YARDS: f64 = 4.0;
+// Cushioned trap: the Tier-2 MPC arrives at a moving loose ball matching this fraction of the
+// ball's velocity (a give-with-the-ball first touch) instead of braking to a dead stop into
+// it (which bounces it away / miscontrols). 0 = dead stop, 1 = run alongside without slowing.
+const LOOSE_BALL_TRAP_CUSHION: f64 = 0.35;
 // A true 50/50: the ball is within this of a player AND an opponent is also this
 // close to it. The nearest TWO teammates then genuinely contest it (rather than
 // only one), so the team fights to win loose balls instead of conceding them.
 const LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS: f64 = 8.0;
+// A slow, grounded loose ball THIS close to the single nearest team-mate is his to
+// collect: he turns back onto it instead of being peeled to a support outlet by the
+// (predicted-point) retriever election. This closed the gap where the closest body
+// sprinted away from a ball sitting at his heels and nobody gathered it.
+const LOOSE_BALL_CLOSE_COLLECT_RADIUS_YARDS: f64 = 2.5;
+// A forced restart (out of time) with NO available team-mate hoofs the ball up-field
+// toward the attacking CORNER flag — wide of the central keeper — rather than tapping
+// it to nobody. The hoof length scales with how deep we are: ~20yd already near the
+// opponent goal, up to ~50yd deep in our own half. Aimed inset from the touchline/byline
+// so it lands in the corner channel, not out of play.
+const RESTART_HOOF_MIN_YARDS: f64 = 20.0;
+const RESTART_HOOF_MAX_YARDS: f64 = 50.0;
+const RESTART_HOOF_CORNER_INSET_YARDS: f64 = 8.0;
+const RESTART_HOOF_BYLINE_MARGIN_YARDS: f64 = 6.0;
+const RESTART_HOOF_POWER: f64 = 0.85;
 // A SECOND retriever only commits to a loose ball under genuine pressure from the team that
 // played it (in real soccer two players collect together to SHIELD it from a bearing-down
 // attacker). High pressure = an opponent right on the drop (within this radius). Increasing
@@ -2256,6 +2363,9 @@ const LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS: f64 = 10.0;
 const BALL_IN_BEHIND_MARGIN_YARDS: f64 = 2.0;
 const BALL_IN_BEHIND_MAX_FROM_GOAL_YARDS: f64 = 55.0;
 const IN_BEHIND_COVER_DISTANCE_YARDS: f64 = 6.0;
+// The second man covering a ball played in behind stays at least this far goalside of the
+// recovery point — even where the line band relaxes its minimum standoff near our own goal.
+const IN_BEHIND_COVER_MIN_GOALSIDE_YARDS: f64 = 2.0;
 const IN_BEHIND_SPRINT_PRESSURE: f64 = 0.45;
 const IN_BEHIND_GK_MAX_ADVANCE_YARDS: f64 = 16.0;
 /// A midfielder/striker carrier counts as "driving at goal" — the cue for other attackers
@@ -2293,10 +2403,13 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 10.0;
-/// A staging run in behind is held this far ONSIDE of the second-last defender so the runner
-/// stays level/behind the line (timing the run) until the ball is actually played beyond it,
-/// rather than standing in an offside position.
+/// A staging run in behind is held this far ONSIDE of the second-last defender when
+/// strict legality is required.
 const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
+/// In open-space support movement, midfielders/forwards may stretch 0-3yd beyond
+/// the line. Offside enforcement still happens when the pass is played; this only
+/// lets the off-ball run use the full width/depth instead of camping a yard onside.
+const OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS: f64 = 3.0;
 // Wall-pass / one-two (give-and-go) geometry. A wall pass lays the ball off to a side-on
 // teammate and bursts past the man-to-beat into the onside space behind them; the wall
 // returns it first-time, led into the run. These seed the combination; the appetite to
@@ -16919,7 +17032,7 @@ fn dense_soccer_transition_reward(
         let tracking_skill = ability01(player.skills.defensive_tracking);
         reward +=
             (before_distance - after_distance).clamp(-6.0, 6.0) * (0.055 + tracking_skill * 0.045);
-        reward += defensive_goal_side_reward(player.team, before_pos, before);
+        reward += defensive_goal_side_reward_for_role(player.team, player.role, before_pos, before);
         if player.role == PlayerRole::Goalkeeper {
             let before_line_score =
                 goalkeeper_ball_goal_line_alignment_score(player.team, before_pos, before);
@@ -18180,7 +18293,15 @@ fn defensive_role_press_signal(
     }
 }
 
-fn defensive_goal_side_reward(team: Team, player_position: Vec2, snapshot: &WorldSnapshot) -> f64 {
+fn defensive_goal_side_reward_for_role(
+    team: Team,
+    role: PlayerRole,
+    player_position: Vec2,
+    snapshot: &WorldSnapshot,
+) -> f64 {
+    if role == PlayerRole::Forward {
+        return 0.0;
+    }
     // Engage whenever the opponent has possession — including while their pass is in
     // flight (no holder), which is exactly the transition window where recovering
     // goal-side matters most. `possession_team` falls back to `last_touch_team`.
@@ -41208,9 +41329,10 @@ fn slide_tackle_foul_probability(
 /// Whether a defender at `defender_pos` is BEHIND the ball-carrier — in the rear
 /// hemisphere relative to where the ball is being carried (the holder→ball lead, or the
 /// holder's motion when the ball is at the feet). The ball is led in front of the body,
-/// so a trailing defender cannot reach it: NO tackle (standing or sliding) wins the ball
-/// from here. Returns `false` when front cannot be determined (a stationary holder with
-/// the ball at its feet) — that case is governed by the body-shield test instead.
+/// so a trailing defender cannot poke it cleanly from there: standing/passive steals are
+/// blocked, while a committed slide must pass a separate ball-reach gate. Returns
+/// `false` when front cannot be determined (a stationary holder with the ball at its
+/// feet) — that case is governed by the body-shield test instead.
 fn carried_ball_behind_defender(
     holder_pos: Vec2,
     holder_velocity: Vec2,
@@ -43412,6 +43534,25 @@ struct DribbleMpcControlEstimate {
     space_margin_yards: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MpcBallControlExecutionFit {
+    pub(crate) probability: f64,
+    pub(crate) qp_accel_fit: f64,
+    pub(crate) velocity_match: f64,
+    pub(crate) facing_fit: f64,
+    pub(crate) miscontrol_risk: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LooseBallControlDecision {
+    pub(crate) trap_now: bool,
+    pub(crate) target: Vec2,
+    pub(crate) trap_now_score: f64,
+    pub(crate) let_run_score: f64,
+    pub(crate) mpc_control_probability: f64,
+    pub(crate) miscontrol_risk: f64,
+}
+
 fn bounded_accel_qp_control_fit(
     position: Vec2,
     velocity: Vec2,
@@ -43459,6 +43600,133 @@ fn bounded_accel_qp_control_fit(
         (1.0 - miss_yards / (control_radius * 2.2).max(1.0)).clamp(0.0, 1.0);
     let accel_economy = (1.0 - accel.len() / (accel_cap * 1.414).max(1.0)).clamp(0.0, 1.0);
     (position_fit * 0.74 + accel_economy * 0.26).clamp(0.0, 1.0)
+}
+
+pub(crate) fn mpc_ball_control_execution_fit(
+    role: PlayerRole,
+    skills: &SkillProfile,
+    fatigue: f64,
+    position: Vec2,
+    velocity: Vec2,
+    facing_fit: f64,
+    control_point: Vec2,
+    ball_velocity: Vec2,
+    ball_time_seconds: f64,
+    control_radius_yards: f64,
+) -> MpcBallControlExecutionFit {
+    let fatigue_factor = fatigue_speed_factor(skills.stamina, fatigue);
+    let top_speed = (player_top_speed_yps(role, skills) * fatigue_factor).max(0.85);
+    let distance = position.distance(control_point);
+    let horizon = ball_time_seconds
+        .max(distance / (top_speed * MovementGait::Sprint.speed_multiplier()).max(0.85))
+        .clamp(DEFAULT_DT_SECONDS, 0.90);
+    let accel_cap = acceleration_yps2_from_score(skills.acceleration) * fatigue_factor;
+    let control_radius = control_radius_yards.clamp(0.45, REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS);
+    let qp_accel_fit = bounded_accel_qp_control_fit(
+        position,
+        velocity,
+        control_point,
+        horizon,
+        accel_cap,
+        control_radius,
+        0.055,
+    );
+    let to_control = control_point - position;
+    let closing_fit = if to_control.len() > 1e-6 {
+        ((velocity.dot(to_control.normalized()) + 4.0) / 14.0).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let velocity_match =
+        (1.0 - ((velocity - ball_velocity).len() / 30.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let skill_fit = (ability01(skills.first_touch) * 0.42
+        + ability01(skills.dribbling) * 0.18
+        + ability01(skills.acceleration) * 0.26
+        + ability01(skills.strength) * 0.14)
+        .clamp(0.0, 1.0);
+    let probability = (0.04
+        + qp_accel_fit * 0.46
+        + skill_fit * 0.16
+        + facing_fit.clamp(0.0, 1.0) * 0.14
+        + velocity_match * 0.13
+        + closing_fit * 0.07)
+        .clamp(0.0, 0.99);
+    MpcBallControlExecutionFit {
+        probability,
+        qp_accel_fit,
+        velocity_match,
+        facing_fit: facing_fit.clamp(0.0, 1.0),
+        miscontrol_risk: (1.0 - probability).clamp(0.0, 1.0),
+    }
+}
+
+pub(crate) fn pomdp_loose_ball_control_decision(
+    skills: &SkillProfile,
+    decision_confidence: f64,
+    position: Vec2,
+    control_point: Vec2,
+    run_on_target: Vec2,
+    ball_velocity: Vec2,
+    nearest_opponent_distance: f64,
+    mpc_fit: MpcBallControlExecutionFit,
+    force_trap_urgent: bool,
+) -> LooseBallControlDecision {
+    let ball_speed = ball_velocity.len();
+    if force_trap_urgent || ball_speed <= REACTIVE_GROUND_PASS_MIN_SPEED_YPS {
+        return LooseBallControlDecision {
+            trap_now: true,
+            target: control_point,
+            trap_now_score: 1.0,
+            let_run_score: 0.0,
+            mpc_control_probability: mpc_fit.probability,
+            miscontrol_risk: mpc_fit.miscontrol_risk,
+        };
+    }
+
+    let ball_dir = ball_velocity.normalized();
+    let ahead = (run_on_target - control_point).dot(ball_dir);
+    let lateral = ((run_on_target - control_point) - ball_dir * ahead).len();
+    let run_ahead_fit = ((ahead - POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS)
+        / (POMDP_BALL_CONTROL_LET_RUN_AHEAD_FULL_YARDS
+            - POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    let run_line_fit = (1.0 - lateral / REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS)
+        .clamp(0.0, 1.0);
+    let run_intent = run_ahead_fit * run_line_fit;
+    let my_distance = position.distance(control_point);
+    let opponent_urgency = if nearest_opponent_distance.is_finite() {
+        (1.0
+            - ((nearest_opponent_distance - my_distance + POMDP_BALL_CONTROL_LET_RUN_PRESSURE_MARGIN_YARDS)
+                / POMDP_BALL_CONTROL_TRAP_URGENCY_OPPONENT_YARDS)
+                .clamp(0.0, 1.0))
+        .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let first_touch_risk = 1.0 - ability01(skills.first_touch);
+    let confidence = decision_confidence.clamp(0.2, 1.0);
+    let let_run_score = (run_intent
+        * (mpc_fit.miscontrol_risk * 0.54
+            + first_touch_risk * 0.24
+            + (ball_speed / 24.0).clamp(0.0, 1.0) * 0.22)
+        * (1.0 - opponent_urgency * 0.82)
+        * (0.70 + confidence * 0.30))
+        .clamp(0.0, 1.0);
+    let trap_now_score = (mpc_fit.probability * 0.66
+        + opponent_urgency * 0.42
+        + ability01(skills.first_touch) * 0.12
+        + confidence * 0.10)
+        .clamp(0.0, 1.0);
+    let trap_now = trap_now_score + POMDP_BALL_CONTROL_TRAP_SCORE_MARGIN >= let_run_score;
+    LooseBallControlDecision {
+        trap_now,
+        target: if trap_now { control_point } else { run_on_target },
+        trap_now_score,
+        let_run_score,
+        mpc_control_probability: mpc_fit.probability,
+        miscontrol_risk: mpc_fit.miscontrol_risk,
+    }
 }
 
 fn dribble_mpc_control_estimate_for_snapshot(
@@ -45990,6 +46258,30 @@ fn goalkeeper_for_players(players: &[PlayerAgent], team: Team) -> Option<usize> 
         .map(|player| player.id)
 }
 
+fn last_recover_target_for_player(player: &PlayerAgent) -> Option<Vec2> {
+    let decision = player.last_decision.as_ref()?;
+    let label = normalize_soccer_action_label(&decision.action);
+    if !matches!(label, ACTION_LABEL_RECOVER | "fifty-fifty-duel") {
+        return None;
+    }
+    decision
+        .action_target
+        .as_ref()
+        .and_then(|target| target.point)
+}
+
+fn nearest_opponent_distance_to_point(
+    players: &[PlayerAgent],
+    team: Team,
+    point: Vec2,
+) -> f64 {
+    players
+        .iter()
+        .filter(|player| player.team != team && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.position.distance(point))
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn nearest_ball_controller_for(
     current_tick: u64,
     ball_pos: Vec2,
@@ -46063,6 +46355,8 @@ fn nearest_ball_controller_for_segment_with_guard(
     let ball_segment_len = ball_segment.len();
     let mut candidates = Vec::new();
     let mut low_pass_body_contact: Option<(f64, f64, usize, Team, Vec2)> = None;
+    let mut reactive_ground_pass_trap: Option<(f64, f64, usize, Team, Vec2)> = None;
+    let mut rolling_loose_ball_trap: Option<(f64, f64, usize, Team, Vec2)> = None;
     for p in players {
         if same_tick_long_ball_launcher == Some(p.id) {
             continue;
@@ -46092,9 +46386,14 @@ fn nearest_ball_controller_for_segment_with_guard(
         if let Some(pass) = pending_pass {
             let is_target = pass.target == Some(p.id);
             let progress = pass_progress_along_path(pass, control_point);
-            let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
+            let same_tick_launch = current_tick <= pass.launch_tick
+                && progress < PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS;
             let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
-            let contact_altitude = pass_altitude_at_point(pass, control_point);
+            // Clamp the pass-model arc height to the ACTUAL ball altitude so a landed/overshot
+            // aerial pass (ball physically on the grass, model still high) is correctly treated as
+            // a grounded, contestable ball rather than one flying overhead.
+            let contact_altitude =
+                pass_altitude_at_point(pass, control_point).min(ball_altitude_yards);
             let same_team_launch_bystander =
                 same_tick_launch && p.team == pass.team && !is_target;
             let body_contact_distance = p.position.distance(control_point);
@@ -46118,6 +46417,115 @@ fn nearest_ball_controller_for_segment_with_guard(
                         p.team,
                         control_point,
                     ));
+                }
+            }
+            if !is_target
+                && matches!(pass.flight, PassFlight::Floor)
+                && contact_altitude <= BALL_ROLLING_ALTITUDE_YARDS
+                && !is_own_outgoing_pass
+                && !same_team_launch_bystander
+                && body_contact_distance <= REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS
+            {
+                let pass_arrival = (pass.distance_yards
+                    / pass.launch_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS)
+                    * progress.clamp(0.0, 1.0))
+                .max(
+                    (control_point - previous_ball_pos).len()
+                        / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS),
+                );
+                let reaction_window = (pass_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+                    .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+                let player_speed = player_top_speed_yps(p.role, &p.skills)
+                    * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                    * MovementGait::Sprint.speed_multiplier();
+                let reach = INTERCEPT_LUNGE_REACH_YARDS + player_speed * reaction_window;
+                let cone_quality =
+                    player_facing_ball_control_multiplier(p, control_point, ball_speed);
+                let mpc_fit = mpc_ball_control_execution_fit(
+                    p.role,
+                    &p.skills,
+                    p.fatigue,
+                    p.position,
+                    p.velocity,
+                    cone_quality,
+                    control_point,
+                    ball_velocity,
+                    pass_arrival,
+                    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS,
+                );
+                if body_contact_distance <= reach
+                    && (cone_quality >= CONTROL_MIN_VIABLE_QUALITY
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                    && (mpc_fit.qp_accel_fit >= MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                {
+                    let replace = reactive_ground_pass_trap.as_ref().is_none_or(
+                        |(best_projection, best_distance, _, _, _)| {
+                            control_projection < *best_projection - 1e-9
+                                || ((control_projection - *best_projection).abs() <= 1e-9
+                                    && body_contact_distance < *best_distance)
+                        },
+                    );
+                    if replace {
+                        reactive_ground_pass_trap = Some((
+                            control_projection,
+                            body_contact_distance,
+                            p.id,
+                            p.team,
+                            control_point,
+                        ));
+                    }
+                }
+            }
+        } else if ball_altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
+            && ball_speed >= REACTIVE_GROUND_PASS_MIN_SPEED_YPS
+            && ball_segment_len > REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS
+        {
+            let body_contact_distance = p.position.distance(control_point);
+            if body_contact_distance <= REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS {
+                let ball_arrival = (control_point - previous_ball_pos).len()
+                    / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+                let player_speed = player_top_speed_yps(p.role, &p.skills)
+                    * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                    * MovementGait::Sprint.speed_multiplier();
+                let reach = INTERCEPT_LUNGE_REACH_YARDS
+                    + player_speed * ball_arrival.clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+                let cone_quality =
+                    player_facing_ball_control_multiplier(p, control_point, ball_speed);
+                let mpc_fit = mpc_ball_control_execution_fit(
+                    p.role,
+                    &p.skills,
+                    p.fatigue,
+                    p.position,
+                    p.velocity,
+                    cone_quality,
+                    control_point,
+                    ball_velocity,
+                    ball_arrival,
+                    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS,
+                );
+                if body_contact_distance <= reach
+                    && (cone_quality >= CONTROL_MIN_VIABLE_QUALITY
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                    && (mpc_fit.qp_accel_fit >= MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT
+                        || body_contact_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+                {
+                    let replace = rolling_loose_ball_trap.as_ref().is_none_or(
+                        |(best_projection, best_distance, _, _, _)| {
+                            control_projection < *best_projection - 1e-9
+                                || ((control_projection - *best_projection).abs() <= 1e-9
+                                    && body_contact_distance < *best_distance)
+                        },
+                    );
+                    if replace {
+                        rolling_loose_ball_trap = Some((
+                            control_projection,
+                            body_contact_distance,
+                            p.id,
+                            p.team,
+                            control_point,
+                        ));
+                    }
                 }
             }
         }
@@ -46152,7 +46560,8 @@ fn nearest_ball_controller_for_segment_with_guard(
                     }
                 }
             }
-            let same_tick_launch = current_tick <= pass.launch_tick && progress < 0.12;
+            let same_tick_launch = current_tick <= pass.launch_tick
+                && progress < PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS;
             if same_tick_launch && p.team == pass.team && !is_target {
                 control_radius *= 0.35;
             }
@@ -46231,9 +46640,16 @@ fn nearest_ball_controller_for_segment_with_guard(
         // below must not apply — otherwise they "let it run" past their own pass.
         let is_pass_target = pending_pass.is_some_and(|pass| pass.target == Some(p.id));
         let dist = player_control_position.distance(control_point);
+        // Contact altitude gates whether a player can reach the ball (a high ball flies over a
+        // grounded player). For an aerial pass this is normally read from the pass MODEL's arc —
+        // but an aerial pass that has LANDED or overshot stays pending while the ball physically
+        // sits on the grass, and the model still reports it high in its arc. Reading the model
+        // alone then treats a ball at a player's feet as flying overhead, so nobody is eligible to
+        // control it and players run straight over it. Clamp to the ACTUAL ball altitude: the
+        // physical ball is the authority, so a landed ball is grounded regardless of the stale arc.
         let contact_altitude = pending_pass
             .filter(|pass| pass.flight.is_aerial())
-            .map(|pass| pass_altitude_at_point(pass, control_point))
+            .map(|pass| pass_altitude_at_point(pass, control_point).min(ball_altitude_yards))
             .unwrap_or(if loose_long_ball_team.is_some() {
                 ball_altitude_yards
             } else {
@@ -46326,6 +46742,33 @@ fn nearest_ball_controller_for_segment_with_guard(
                 continue;
             }
         }
+        let mut mpc_control_score_bonus = 0.0;
+        if low_ball
+            && ball_speed >= REACTIVE_GROUND_PASS_MIN_SPEED_YPS
+            && ball_segment_len > REACTIVE_GROUND_PASS_GEOMETRY_EPSILON_YARDS
+            && !guaranteed_trap
+        {
+            let along = (control_point - previous_ball_pos).len();
+            let ball_contact_time = along / ball_speed.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+            let mpc_fit = mpc_ball_control_execution_fit(
+                p.role,
+                &p.skills,
+                p.fatigue,
+                p.position,
+                p.velocity,
+                cone_quality,
+                control_point,
+                ball_velocity,
+                ball_contact_time,
+                effective_radius.max(CONTROL_AT_FEET_TRAP_RADIUS_YARDS),
+            );
+            if mpc_fit.qp_accel_fit < MPC_BALL_CONTROL_MIN_QP_ACCEL_FIT {
+                continue;
+            }
+            mpc_control_score_bonus = mpc_fit.probability * MPC_BALL_CONTROL_SCORE_WEIGHT
+                + mpc_fit.qp_accel_fit * 0.18
+                + mpc_fit.velocity_match * 0.08;
+        }
         let to_ball = (control_point - player_control_position).normalized();
         let closing_speed = dot(p.velocity - ball_velocity, to_ball).clamp(-8.0, 8.0);
         // A guaranteed trap is scored by the ball's true closeness to the player's
@@ -46336,11 +46779,40 @@ fn nearest_ball_controller_for_segment_with_guard(
             + ability01(p.skills.first_touch) * 0.72
             + ability01(p.skills.aggression) * 0.18
             + closing_speed * 0.055
+            + mpc_control_score_bonus
             + pass_reception_score_bonus
             + aerial_score_bonus;
         candidates.push((p.id, p.team, score, control_point));
     }
-    if let Some((_, _, id, team, point)) = low_pass_body_contact {
+    let mut forced_ground_control = match (low_pass_body_contact, reactive_ground_pass_trap) {
+        (Some(low), Some(reactive)) => {
+            if reactive.0 < low.0 - 1e-9
+                || ((reactive.0 - low.0).abs() <= 1e-9 && reactive.1 < low.1)
+            {
+                Some(reactive)
+            } else {
+                Some(low)
+            }
+        }
+        (Some(low), None) => Some(low),
+        (None, Some(reactive)) => Some(reactive),
+        (None, None) => None,
+    };
+    if let Some(rolling) = rolling_loose_ball_trap {
+        forced_ground_control = match forced_ground_control {
+            Some(existing) => {
+                if rolling.0 < existing.0 - 1e-9
+                    || ((rolling.0 - existing.0).abs() <= 1e-9 && rolling.1 < existing.1)
+                {
+                    Some(rolling)
+                } else {
+                    Some(existing)
+                }
+            }
+            None => Some(rolling),
+        };
+    }
+    if let Some((_, _, id, team, point)) = forced_ground_control {
         return Some((id, team, point));
     }
     sample_control_candidate_with_point(&candidates, rng)
@@ -47455,13 +47927,13 @@ fn default_agent_preferences(
         }
         PlayerRole::Midfielder if shirt == 8 => {
             preferences.pass_bias = 0.80;
-            preferences.open_space_bias = 0.86;
+            preferences.open_space_bias = 0.92;
             preferences.offensive_mindedness = 0.76;
             preferences.defensive_mindedness = 0.50;
         }
         PlayerRole::Midfielder => {
             preferences.pass_bias = 0.76;
-            preferences.open_space_bias = 0.82;
+            preferences.open_space_bias = 0.88;
             preferences.offensive_mindedness = 0.70;
             preferences.defensive_mindedness = 0.52;
         }
@@ -47469,6 +47941,7 @@ fn default_agent_preferences(
             preferences.shoot_bias = 0.78;
             preferences.pass_bias = 0.48;
             preferences.dribble_bias = 0.82;
+            preferences.open_space_bias = 0.94;
             preferences.offensive_mindedness = 0.88;
             preferences.defensive_mindedness = 0.30;
         }
