@@ -3212,6 +3212,96 @@ fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
     );
 }
 
+/// Regression for "the defender played the shortest pass to nobody and ran away": a one-two
+/// "give" must be laid off to the wall partner's FEET, not led forward toward goal like a
+/// through-ball. The generic reception lead biases the aim ahead of even a stationary partner
+/// (role forward-bias), so the give sailed into space the partner never ran into while the
+/// passer had already burst into the return run — the ball was left to nobody. With the carrier
+/// committing a live one-two naming this target as the wall, the give is aimed straight at the
+/// partner (and the partner is bound to collect it); the identical pass WITHOUT the commitment
+/// leads clearly ahead.
+#[test]
+fn one_two_give_is_aimed_at_the_wall_partners_feet_and_binds_the_partner() {
+    let passer = 6usize;
+    let partner = 7usize;
+    let partner_pos = Vec2::new(40.0, 78.0);
+    let launch_give = |with_one_two: bool| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 73_117,
+            ..Default::default()
+        });
+        park_players_except(&mut sim, &[passer, partner]);
+        // Carrier in the opponent half, facing the attacking goal (+y, North).
+        sim.players[passer].position = Vec2::new(40.0, 70.0);
+        sim.players[passer].velocity = Vec2::new(0.0, 2.0);
+        sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+        sim.players[passer].action_facing = FacingBucket::North;
+        sim.players[passer].receive_facing = FacingBucket::North;
+        sim.players[passer].skills.passing = 9.6;
+        sim.players[passer].skills.passing_completion_rate = 9.6;
+        sim.players[passer].skills.vision = 9.6;
+        // The wall: a forward partner just ahead, making a forward run (so the generic lead
+        // would otherwise throw the give ahead of his feet).
+        sim.players[partner].role = PlayerRole::Forward;
+        sim.players[partner].position = partner_pos;
+        sim.players[partner].velocity = Vec2::new(0.0, 7.0);
+        if with_one_two {
+            sim.players[passer].one_two = Some(OneTwoRun {
+                wall_partner: partner,
+                launch_clock_seconds: 0.0,
+                return_target: Vec2::new(40.0, 92.0),
+            });
+        }
+        sim.ball.holder = Some(passer);
+        sim.ball.position = sim.players[passer].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.apply_player_intent(PlayerIntent {
+            player_id: passer,
+            action: SoccerAction::Pass {
+                target_player: Some(partner),
+                power: 0.58,
+                flight: PassFlight::Floor,
+            },
+            sprint: false,
+        });
+        sim
+    };
+
+    // Fix A: the give is laid off to the partner's feet, not led ahead toward goal.
+    let give = launch_give(true);
+    let give_pass = give.pending_pass.as_ref().expect("give launched");
+    assert_eq!(give_pass.target, Some(partner));
+    let give_to_feet = give_pass.intended_target.distance(partner_pos);
+
+    let normal = launch_give(false);
+    let normal_pass = normal.pending_pass.as_ref().expect("pass launched");
+    let led_ahead = normal_pass.intended_target.distance(partner_pos);
+
+    assert!(
+        give_to_feet < 1.5,
+        "one-two give should be aimed at the partner's feet, was {give_to_feet:.2}yd away"
+    );
+    assert!(
+        led_ahead > give_to_feet + 1.0,
+        "an ordinary pass to the same moving partner should lead clearly ahead of his feet \
+         (led={led_ahead:.2}yd vs give={give_to_feet:.2}yd)"
+    );
+
+    // Fix B: the named wall partner is bound to collect the give — it serves the reception and
+    // attacks (sprints) the ball rather than backing off, so the give is not abandoned to nobody.
+    let snapshot = WorldSnapshot::from_match(&give);
+    assert!(
+        snapshot.is_bound_one_two_give_receiver(partner),
+        "the named wall partner of a live one-two give should be bound to collect it"
+    );
+    let (_, sprint) = snapshot
+        .pending_pass_reception_target_for(partner)
+        .expect("bound wall partner should move to meet the give");
+    assert!(sprint, "bound wall partner should attack the give at a sprint");
+}
+
 #[test]
 fn targeted_floor_pass_noise_does_not_pull_aim_into_opponent() {
     for seed in 41_300..41_360 {
@@ -14539,6 +14629,85 @@ fn assert_offside_trap_gating_for(team: Team) {
 }
 
 #[test]
+fn throw_in_drops_the_back_four_off_with_no_offside_to_trap() {
+    // On a throw-in the offside law is suspended (the ball is played directly from the throw),
+    // so the back four cannot hold a high trap line — a runner may legally lurk goal-side of it.
+    // The line must instead DROP OFF to a deep block, 25yd+ behind (goal-side of) the ball.
+    // Run both teams: the fore-aft sense is mirrored by `attack_dir`.
+    for team in [Team::Home, Team::Away] {
+        assert_throw_in_back_four_drop_off_for(team);
+    }
+}
+
+fn assert_throw_in_back_four_drop_off_for(team: Team) {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 71,
+        ..Default::default()
+    });
+    let attack = team.attack_dir();
+    // The throw-in window is the ball IN FLIGHT off the touchline (no holder), so the line is
+    // governed by the offside trap/band, not by the carrier-driving break-cover retreat (which
+    // needs a holder). The opposing (throwing) team last touched it, so `team` is defending.
+    // Ball at midfield so the trap is otherwise a live mid/high block.
+    let ball_pos = Vec2::new(6.0, 60.0);
+    sim.ball.holder = None;
+    sim.ball.position = ball_pos;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(team.other());
+
+    // Place `team`'s back four on a HIGH line, only ~10yd goal-side of the ball.
+    let defenders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == team && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(defenders.len(), 4, "test needs the back four for {team:?}");
+    let high_line_y = ball_pos.y - attack * 10.0;
+    let lateral_x = [12.0, 30.0, 50.0, 68.0];
+    for (&id, x) in defenders.iter().zip(lateral_x) {
+        sim.players[id].position = Vec2::new(x, high_line_y);
+    }
+
+    // Average yards the shaped back four sits BEHIND (goal-side of) the ball along attack axis.
+    let line_gap_behind_ball = |sim: &SoccerMatch| -> f64 {
+        let snap = WorldSnapshot::from_match(sim);
+        let avg_fwd: f64 = defenders
+            .iter()
+            .map(|&id| snap.defensive_shape_for(id, sim.players[id].home_position).y * attack)
+            .sum::<f64>()
+            / defenders.len() as f64;
+        ball_pos.y * attack - avg_fwd
+    };
+
+    // Offside in force (ball last played from open play): the line holds its high trap gap.
+    sim.ball.record_decision(0, "pass", None);
+    let trap_gap = line_gap_behind_ball(&sim);
+    assert!(
+        trap_gap < NO_OFFSIDE_RESTART_DROP_OFF_YARDS,
+        "{team:?} with offside in force should hold a high trap line, not drop off: \
+         gap {trap_gap:.1}yd should be under {NO_OFFSIDE_RESTART_DROP_OFF_YARDS:.0}yd"
+    );
+
+    // Same frame, but the ball is in flight directly from a throw-in -> offside suspended ->
+    // the line cannot trap and drops off to 25yd+ behind the ball.
+    sim.ball.record_decision(0, "throw-in", None);
+    let drop_off_gap = line_gap_behind_ball(&sim);
+    assert!(
+        drop_off_gap >= NO_OFFSIDE_RESTART_DROP_OFF_YARDS - 1.0,
+        "{team:?} on a throw-in (no offside) should drop the line off to ~25yd+ behind the ball: \
+         gap {drop_off_gap:.1}yd"
+    );
+    assert!(
+        drop_off_gap > trap_gap + 8.0,
+        "{team:?} should sit markedly deeper on a throw-in than when trapping: \
+         {drop_off_gap:.1}yd vs {trap_gap:.1}yd"
+    );
+}
+
+#[test]
 fn controlled_possession_does_not_force_back_four_y_parity() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -25705,6 +25874,128 @@ fn elite_shot_speed_can_reach_sixty_mph_cap() {
 
     assert!(speed <= mph_to_yps(60.0) + 1e-9);
     assert!(speed >= mph_to_yps(59.0));
+}
+
+#[test]
+fn shot_launch_speed_stays_within_forty_to_sixty_mph_band() {
+    // A shot on goal must leave the boot at 40-60 mph: even a zero-power placed
+    // effort clears the 40 mph floor, and a full-power elite strike is capped at
+    // 60. Sweep the whole power x technique space; every launch stays in band.
+    let floor = mph_to_yps(40.0);
+    let cap = mph_to_yps(60.0);
+    let weak = SkillProfile {
+        shooting: 0.0,
+        right_foot_shot_power: 0.0,
+        left_foot_shot_power: 0.0,
+        strength: 0.0,
+        ..SkillProfile::default()
+    };
+    let mid = SkillProfile {
+        shooting: 5.0,
+        right_foot_shot_power: 5.0,
+        left_foot_shot_power: 5.0,
+        strength: 5.0,
+        ..SkillProfile::default()
+    };
+    let elite = SkillProfile {
+        shooting: 10.0,
+        right_foot_shot_power: 10.0,
+        left_foot_shot_power: 10.0,
+        strength: 10.0,
+        ..SkillProfile::default()
+    };
+
+    for skills in [&weak, &mid, &elite] {
+        for power in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let speed = shot_speed_yps_from_power(power, skills);
+            assert!(
+                speed >= floor - 1e-9 && speed <= cap + 1e-9,
+                "shot launch must stay in the 40-60 mph band (power={power}, speed_yps={speed})"
+            );
+        }
+    }
+
+    // The floor is genuinely reached: a zero-power poke still leaves at exactly 40 mph.
+    assert!((shot_speed_yps_from_power(0.0, &weak) - floor).abs() < 1e-9);
+    // The cap is genuinely reached: an elite full-power strike tops out at 60 mph.
+    assert!((shot_speed_yps_from_power(1.0, &elite) - cap).abs() < mph_to_yps(0.5));
+}
+
+#[test]
+fn struck_shot_releases_the_ball_in_the_forty_to_sixty_band() {
+    // End-to-end guard on the launch path (`apply_player_intent` -> Shoot): a
+    // planted shooter (no body momentum, so the kick-power factor is a full 1.0)
+    // must send the ball away at the 40-60 mph shot pace, not a slow roll.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 7_788,
+        ..Default::default()
+    });
+    let shooter = 9usize;
+    park_players_except(&mut sim, &[shooter]);
+    sim.players[shooter].team = Team::Home;
+    sim.players[shooter].role = PlayerRole::Forward;
+    sim.players[shooter].position = Vec2::new(40.0, 100.0);
+    sim.players[shooter].home_position = sim.players[shooter].position;
+    sim.players[shooter].velocity = Vec2::zero();
+    sim.players[shooter].skills.shooting = 9.0;
+    sim.players[shooter].skills.right_foot_shot_power = 9.0;
+    sim.players[shooter].skills.left_foot_shot_power = 8.0;
+    sim.ball.holder = Some(shooter);
+    sim.ball.position = sim.players[shooter].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let power = shot_power_for_skill(ability01(sim.players[shooter].skills.shooting));
+    sim.apply_player_intent(PlayerIntent {
+        player_id: shooter,
+        action: SoccerAction::Shoot { power },
+        sprint: false,
+    });
+
+    assert!(sim.ball.holder.is_none(), "the strike must release the ball");
+    let launch = sim.ball.velocity.len();
+    assert!(
+        launch >= mph_to_yps(40.0) - 1e-6 && launch <= mph_to_yps(60.0) + 1e-6,
+        "a planted strike must leave the boot at 40-60 mph (got {launch} yps)"
+    );
+}
+
+#[test]
+fn struck_low_shot_keeps_credible_pace_over_shooting_range() {
+    // A grounded shot must still arrive with pace. It is launched at 40-60 mph and,
+    // crossing the ~18yd from the penalty spot to the goal line, must not be dragged
+    // down to a roll. This pins the ball-resistance model against over-damping a
+    // struck shot (the launch speed is correct; the risk is the in-flight decay).
+    // It is a lower bound: reducing drag keeps it green, only over-damping breaks it.
+    let dt = DEFAULT_DT_SECONDS;
+    let launch = mph_to_yps(50.0);
+    let mut velocity = Vec2::new(launch, 0.0);
+    let mut traveled = 0.0;
+    let mut speed_at_goal = velocity.len();
+    // 18 yards: the penalty spot to the goal line.
+    while traveled < 18.0 {
+        traveled += velocity.len() * dt;
+        velocity = ball_velocity_after_resistance(
+            velocity,
+            dt,
+            DEFAULT_BALL_DRAG_PER_TICK,
+            DEFAULT_BALL_AIR_RESISTANCE,
+            DEFAULT_BALL_GRASS_RESISTANCE_YPS2,
+            0.0, // grounded shot: full grass + linear + air drag, no aerial relief
+        );
+        speed_at_goal = velocity.len();
+    }
+
+    // Sanity: drag is doing something — the ball bleeds pace over the run.
+    assert!(
+        speed_at_goal < launch,
+        "a grounded shot should bleed some pace to drag (launch {launch}, at goal {speed_at_goal})"
+    );
+    // But a 50 mph strike must still reach goal well clear of a slow roll.
+    assert!(
+        speed_at_goal >= mph_to_yps(20.0),
+        "a 50 mph shot must keep credible pace to goal, got {speed_at_goal} yps over {traveled} yd"
+    );
 }
 
 #[test]
@@ -55055,6 +55346,54 @@ fn live_game_registry_isolates_games_and_keeps_default() {
 }
 
 #[test]
+fn live_game_registry_keeps_actively_polled_games_over_capacity() {
+    // Regression: with more open tabs than `max_games`, the capacity evictor must
+    // NOT reclaim a game that is still being actively polled. Reclaiming it drops
+    // the session, so the tab's next ~10Hz poll re-creates the match from its seed
+    // and it snaps back to kickoff — the "every game keeps freezing/restarting"
+    // bug. Only genuinely idle (abandoned) games may be evicted.
+    let config = SoccerLiveServerConfig {
+        autoload_team_policy: false,
+        autosave_team_policy: false,
+        ..Default::default()
+    };
+    let session = SoccerRealtimeSession::new_without_controller_threads(MatchConfig::default());
+    let input_queue = session.input_queue();
+    let controller_input_router = session.controller_input_router();
+    let mut registry = LiveGameRegistry::with_default(
+        config,
+        Arc::new(Mutex::new(session)),
+        input_queue,
+        controller_input_router,
+    );
+    // Tiny soft cap so "default" + one ephemeral game already sits at capacity.
+    registry.max_games = 2;
+
+    let alpha = registry.resolve("alpha");
+    // Resolving a second game puts the map over the soft cap. The stalest
+    // non-default game is `alpha`, but it was just accessed, so it must survive.
+    let _beta = registry.resolve("beta");
+    let alpha_again = registry.resolve("alpha");
+    assert!(
+        Arc::ptr_eq(&alpha, &alpha_again),
+        "an actively-polled game must not be evicted when over capacity"
+    );
+
+    // Once a game goes idle past the eviction window (its tab closed), it IS
+    // reclaimable. Backdate alpha's last access to simulate that.
+    let stale = soccer_unix_millis().saturating_sub(LIVE_GAME_EVICT_IDLE_MS + 1_000);
+    alpha
+        .last_access_ms
+        .store(stale, std::sync::atomic::Ordering::Relaxed);
+    let _gamma = registry.resolve("gamma");
+    let alpha_fresh = registry.resolve("alpha");
+    assert!(
+        !Arc::ptr_eq(&alpha, &alpha_fresh),
+        "an idle/abandoned game is reclaimed once it crosses the eviction window"
+    );
+}
+
+#[test]
 fn live_state_response_uses_compact_http_frame() {
     let mut session = SoccerRealtimeSession::new(MatchConfig {
         duration_seconds: 0.2,
@@ -60184,7 +60523,6 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
         velocity: Vec2::new(0.0, -8.0),
         deflection_kind: ShotDeflectionKind::Rebound,
         keep_shot_active: false,
-        restart: None,
     });
 
     let shot_block_events = &sim.reward_events[event_start..];
@@ -60210,6 +60548,63 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
         shooter_transition.reward < 0.0,
         "blocked shot should be net negative for the shooter, got {}",
         shooter_transition.reward
+    );
+}
+
+#[test]
+fn wide_block_deflection_does_not_award_an_instant_corner() {
+    // A glancing (lateral) block must NOT teleport the ball to the flag and award a
+    // corner by fiat. The ball stays LIVE, deflected wide off the defender; a corner is
+    // only awarded later by the byline-crossing logic IF the ball actually runs over the
+    // goal line off that defender's touch. This guards the regression where corners
+    // appeared "out of nowhere" from the block-deflection heuristic.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.3,
+        seed: 23_180,
+        ..Default::default()
+    });
+    let shooter = 9;
+    let blocker = 13;
+    park_players_except(&mut sim, &[shooter, blocker]);
+    sim.players[shooter].position = Vec2::new(40.0, 104.0);
+    sim.players[blocker].position = Vec2::new(40.0, 109.0);
+    sim.ball.holder = None;
+    sim.ball.position = sim.players[blocker].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let corners_before = sim.stats.corner_kicks_home + sim.stats.corner_kicks_away;
+    let deflected = Vec2::new(6.0, 9.0);
+    sim.apply_ball_outcome(BallStepOutcome::ShotBlocked {
+        shot: PendingShot {
+            team: Team::Home,
+            shooter,
+            origin: sim.players[shooter].position,
+        },
+        blocker_id: blocker,
+        defending_team: Team::Away,
+        position: sim.players[blocker].position,
+        velocity: deflected,
+        deflection_kind: ShotDeflectionKind::Wide,
+        keep_shot_active: false,
+    });
+
+    assert_eq!(
+        sim.stats.corner_kicks_home + sim.stats.corner_kicks_away,
+        corners_before,
+        "a glancing (wide) block must not award a corner by fiat"
+    );
+    assert!(
+        sim.ball.holder.is_none(),
+        "the deflected ball stays loose/live, not handed to a corner taker"
+    );
+    assert!(
+        sim.ball.velocity.len() > 1e-6,
+        "the deflected ball keeps its momentum (no teleport-and-stop at the flag)"
+    );
+    assert_eq!(
+        sim.ball.last_touch_team,
+        Some(Team::Away),
+        "the defender is the last toucher, so an actual byline crossing later yields a corner"
     );
 }
 

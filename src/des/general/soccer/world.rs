@@ -8129,26 +8129,45 @@ impl SoccerMatch {
                         receiver_openness_at_player,
                         &mut self.rng,
                     );
-                    let mut led_target = target_id
-                        .and_then(|id| {
-                            snapshot.anticipated_pass_reception_point(
-                                player_id,
-                                id,
-                                flight,
-                                initial_speed,
-                            )
-                        })
-                        .unwrap_or(target)
-                        .clamp_to_pitch(
+                    // A one-two "give" is a firm lay-off to the wall partner's FEET so they can
+                    // play it back first-time — NOT a led through-ball. The generic lead
+                    // (`anticipated_pass_reception_point`) biases the aim forward toward goal by
+                    // the receiver's role bias even for a stationary partner, throwing the give
+                    // ahead into space the partner never occupies; meanwhile the passer has
+                    // already burst into the return run, so the ball is left to nobody. When the
+                    // carrier is committing the give of a live one-two naming THIS target as the
+                    // wall, aim straight at the partner and skip the lead/MPC.
+                    let is_one_two_give = !dd_soccer_disable_one_two_give_to_feet()
+                        && target_id.is_some()
+                        && self.players[player_id].one_two.map(|o| o.wall_partner) == target_id;
+                    let mut led_target = if is_one_two_give {
+                        target.clamp_to_pitch(
                             self.config.field_width_yards,
                             self.config.field_length_yards,
-                        );
+                        )
+                    } else {
+                        target_id
+                            .and_then(|id| {
+                                snapshot.anticipated_pass_reception_point(
+                                    player_id,
+                                    id,
+                                    flight,
+                                    initial_speed,
+                                )
+                            })
+                            .unwrap_or(target)
+                            .clamp_to_pitch(
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            )
+                    };
                     // MPC pass execution: for a ground pass to a real receiver, replace the analytic
                     // lead with the receding-horizon rendezvous (lead point + launch speed) so the
                     // ball is delivered onto the receiver's predicted run, into space, beating the
                     // defenders' reach. Falls back to the analytic lead when the solver declines.
+                    // (Skipped for a one-two give — that is aimed to the partner's feet above.)
                     let mut mpc_pass_speed: Option<f64> = None;
-                    if !flight.is_aerial() {
+                    if !flight.is_aerial() && !is_one_two_give {
                         if let Some(id) = target_id {
                             if let Some((aim, v)) =
                                 snapshot.mpc_pass_execution(player_id, id, led_target, initial_speed)
@@ -10896,7 +10915,6 @@ impl SoccerMatch {
                 velocity,
                 deflection_kind,
                 keep_shot_active,
-                restart,
             } => {
                 self.pending_pass = None;
                 self.pending_rebound = None;
@@ -10929,7 +10947,7 @@ impl SoccerMatch {
                     .map(|player| player.name.as_str())
                     .unwrap_or("Defender");
                 let detail = match deflection_kind {
-                    ShotDeflectionKind::CornerKick => "behind for a corner",
+                    ShotDeflectionKind::Wide => "and deflected wide",
                     ShotDeflectionKind::GoalBound => "off the goal-bound line",
                     ShotDeflectionKind::Rebound => "back into play",
                 };
@@ -10941,10 +10959,6 @@ impl SoccerMatch {
                     player_id: Some(blocker_id),
                     description: format!("{blocker_name} blocked {shooter_name}'s shot {detail}"),
                 });
-                if let Some(restart) = restart {
-                    self.pending_shot = None;
-                    self.apply_restart(restart);
-                }
             }
             BallStepOutcome::OutOfPlay {
                 restart,
@@ -13771,7 +13785,7 @@ impl BallAgent {
                     let deflection_kind = if assessment.lateral_distance
                         >= PLAYER_BODY_RADIUS_YARDS * 0.85
                     {
-                        ShotDeflectionKind::CornerKick
+                        ShotDeflectionKind::Wide
                     } else if assessment.screen_score >= 0.72 || shot_speed >= 22.0 {
                         ShotDeflectionKind::Rebound
                     } else {
@@ -13779,13 +13793,35 @@ impl BallAgent {
                     };
                     let deflection_speed = (shot_speed
                         * match deflection_kind {
-                            ShotDeflectionKind::CornerKick => 0.0,
+                            // A glancing block barely sheds the ball's pace — it skids
+                            // on wide rather than stopping dead. (No teleport-to-corner.)
+                            ShotDeflectionKind::Wide => 0.66,
                             ShotDeflectionKind::GoalBound => 0.52,
                             ShotDeflectionKind::Rebound => 0.40,
                         })
                     .max(0.0);
                     let velocity = match deflection_kind {
-                        ShotDeflectionKind::CornerKick => Vec2::zero(),
+                        ShotDeflectionKind::Wide => {
+                            // Ball clips the edge of the defender and skids on toward
+                            // the byline, pushed wide of the near post. It stays LIVE:
+                            // if it crosses the goal line off this defender's touch the
+                            // byline logic awards a corner, otherwise it runs on and can
+                            // be retrieved. No corner is awarded from this heuristic.
+                            let lateral_side = if assessment.block_position.x >= goal.x {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            let toward_byline =
+                                (goal.y - assessment.block_position.y).signum();
+                            let dir = Vec2::new(lateral_side * 0.62, toward_byline * 0.78);
+                            let dir = if dir.len() > 1e-6 {
+                                dir.normalized()
+                            } else {
+                                Vec2::new(lateral_side, 0.0)
+                            };
+                            dir * deflection_speed
+                        }
                         ShotDeflectionKind::GoalBound => {
                             let target_x = (goal.x
                                 + (assessment.block_position.x - goal.x)
@@ -13813,20 +13849,6 @@ impl BallAgent {
                             (away_from_goal * 0.64 + lateral * 0.36).normalized() * deflection_speed
                         }
                     };
-                    let restart = if deflection_kind == ShotDeflectionKind::CornerKick {
-                        let corner_x = if assessment.block_position.x <= context.field_width * 0.5 {
-                            0.0
-                        } else {
-                            context.field_width
-                        };
-                        Some(BallRestart {
-                            kind: BallRestartKind::CornerKick,
-                            awarded_team: shot.team,
-                            position: Vec2::new(corner_x, goal.y),
-                        })
-                    } else {
-                        None
-                    };
                     self.position = assessment
                         .block_position
                         .clamp_to_pitch(context.field_width, context.field_length);
@@ -13846,7 +13868,6 @@ impl BallAgent {
                         velocity,
                         deflection_kind,
                         keep_shot_active: deflection_kind == ShotDeflectionKind::GoalBound,
-                        restart,
                     };
                 }
             }
@@ -14841,6 +14862,17 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
+/// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
+/// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
+/// partner is bound to collect it, so the give can't be thrown into space the partner never
+/// occupies while the passer has already burst into the return run (the "defender plays the
+/// shortest pass to nobody and runs away" bug). Set `DD_SOCCER_DISABLE_ONE_TWO_GIVE_TO_FEET=1` to
+/// restore the old led-give behaviour (A/B / parity).
+fn dd_soccer_disable_one_two_give_to_feet() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONE_TWO_GIVE_TO_FEET").is_ok())
 }
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
@@ -20532,17 +20564,24 @@ impl WorldSnapshot {
             .unwrap_or(FacingBucket::Unknown)
     }
 
+    /// True while the offside law is NOT in force: the ball is being played DIRECTLY from a
+    /// restart that grants offside exemption — a throw-in (the common case), goal kick, or corner
+    /// kick (Law 11). The window ends as soon as the ball is next played by any player (a fresh
+    /// `last_decision` overwrites the restart action). While it holds, the defending back four
+    /// cannot hold a high trap line: an attacker may legally receive the ball goal-side of it.
+    pub(crate) fn offside_currently_suspended(&self) -> bool {
+        self.ball
+            .last_decision
+            .as_ref()
+            .is_some_and(|decision| offside_exempt_restart_action(&decision.action))
+    }
+
     pub(crate) fn pending_offside_for_pass(
         &self,
         passer_id: usize,
         target_id: usize,
     ) -> Option<PendingOffside> {
-        if self
-            .ball
-            .last_decision
-            .as_ref()
-            .is_some_and(|decision| offside_exempt_restart_action(&decision.action))
-        {
+        if self.offside_currently_suspended() {
             return None;
         }
         let passer = self.players.iter().find(|p| p.id == passer_id)?;
@@ -21341,6 +21380,26 @@ impl WorldSnapshot {
         Some(self.clamp_to_role_position(player_id, candidate, home, false))
     }
 
+    /// True when `player_id` is the named wall partner of a live one-two give now in flight to
+    /// them — a team-mate holds an active `one_two` commitment naming this player as the wall and
+    /// the pending pass is that give. Such a receiver is bound to collect the lay-off (the
+    /// combination's burst is already committed), so they never back off it for a "better placed"
+    /// team-mate. ON with the give-to-feet fix; the same env disable reverts both.
+    pub(crate) fn is_bound_one_two_give_receiver(&self, player_id: usize) -> bool {
+        if dd_soccer_disable_one_two_give_to_feet() {
+            return false;
+        }
+        let Some(pass) = self.pending_pass.as_ref() else {
+            return false;
+        };
+        if pass.target != Some(player_id) {
+            return false;
+        }
+        self.players.iter().any(|carrier| {
+            carrier.id == pass.from && carrier.one_two.map(|o| o.wall_partner) == Some(player_id)
+        })
+    }
+
     pub(crate) fn pending_pass_reception_target_for(
         &self,
         player_id: usize,
@@ -21355,8 +21414,15 @@ impl WorldSnapshot {
         // arrival-time + two-way shape window, he backs off and that de-facto receiver attacks the
         // ball instead. Broader pass anticipation still gates extra interception/support runners;
         // the receiver election itself must always avoid the "wrong player dances around it" bug.
-        let is_named = pass.nearest_receiver == Some(player_id);
-        let serve = if is_named {
+        // The named wall partner of a live one-two give is committed to the one-touch return, so
+        // they must collect the give themselves and never defer to a "better placed" team-mate
+        // outside the combination — otherwise the give is abandoned to nobody while the passer
+        // has already burst into the return run.
+        let bound_one_two_wall = self.is_bound_one_two_give_receiver(player_id);
+        let is_named = pass.nearest_receiver == Some(player_id) || bound_one_two_wall;
+        let serve = if bound_one_two_wall {
+            true
+        } else if is_named {
             !self.teammate_clearly_better_placed_receiver(player_id)
         } else {
             self.is_defacto_closest_receiver(player_id)
@@ -21463,7 +21529,8 @@ impl WorldSnapshot {
             || distance_to_ball > 4.5
             || pressured_reception
             || defender_can_contest
-            || moving_pass_needs_attack;
+            || moving_pass_needs_attack
+            || bound_one_two_wall;
         Some((target, sprint))
     }
 
@@ -28091,9 +28158,17 @@ impl WorldSnapshot {
             return compact_y;
         }
         let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
+        // No offside in force (the ball is being played directly from a throw-in &c.): the line
+        // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
+        // into a deep block, sitting at least NO_OFFSIDE_RESTART_DROP_OFF_YARDS behind the ball
+        // (capped by the max gap and by room to our own goal). The flat-line trap clamp below is
+        // likewise meaningless and is lifted for the window.
+        let offside_suspended = self.offside_currently_suspended();
         // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
         // 10yd off the ball); the max still applies.
-        let min_gap = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
+        let min_gap = if offside_suspended {
+            NO_OFFSIDE_RESTART_DROP_OFF_YARDS.min(max_gap)
+        } else if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
             0.0
         } else {
             DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
@@ -28135,7 +28210,7 @@ impl WorldSnapshot {
         // While a pass is in flight defenders are reacting — stepping to cut the lane or tracking
         // a runner — and offside has already been judged at the moment the pass was played, so the
         // flat-line clamp is lifted for the flight (it would otherwise pin a lane-cutter back).
-        if controls_ball || !line_trap_active || self.pending_pass.is_some() {
+        if controls_ball || !line_trap_active || self.pending_pass.is_some() || offside_suspended {
             return clamped_fwd * attack;
         }
         // The line CENTRE is the average of the defenders still HOLDING the line. A defender that

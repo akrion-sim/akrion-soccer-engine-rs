@@ -1308,6 +1308,13 @@ const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
 // being forced a full 10yd off it (which would shove the line into the six-yard box / off
 // the end-line). The 30yd maximum (capped by room to our own goal) still applies.
 const DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS: f64 = 20.0;
+// When the offside law is NOT in force — the ball is being played DIRECTLY from a throw-in (the
+// common case), goal kick, or corner kick (Law 11) — the back four cannot hold a high offside
+// trap: an attacker may legally lurk goal-side of the line, so trapping leaves a runner free in
+// behind. The line therefore DROPS OFF into a deep block, at least this many yards behind the
+// ball (capped by the max gap and by room to our own goal), and the flat-line trap clamp is
+// lifted. The normal trap re-forms once the ball is next played and the exemption ends.
+const NO_OFFSIDE_RESTART_DROP_OFF_YARDS: f64 = 25.0;
 // Grace for the line's "eventual consistency": a defender only SPRINTS to recover the
 // band when it must travel more than this to reach its band-corrected slot. A smaller
 // correction (a couple of yards) is closed at a walk/jog inside the ~3s grace window
@@ -12897,7 +12904,11 @@ struct ShotBlockAssessment {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShotDeflectionKind {
-    CornerKick,
+    /// A glancing block off the edge of the defender's body. The ball skids on,
+    /// pushed wide toward the byline, and stays LIVE — it is NOT auto-awarded as a
+    /// corner here. Whether it actually runs out (and for a corner, off this
+    /// defender's touch) is decided by the byline-crossing logic in the ball step.
+    Wide,
     GoalBound,
     Rebound,
 }
@@ -13014,7 +13025,6 @@ pub(crate) enum BallStepOutcome {
         velocity: Vec2,
         deflection_kind: ShotDeflectionKind,
         keep_shot_active: bool,
-        restart: Option<BallRestart>,
     },
     OutOfPlay {
         restart: BallRestart,
@@ -33033,8 +33043,13 @@ impl SoccerLiveServer {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_LIVE_GAME_ID: &str = "default";
-const DEFAULT_LIVE_MAX_GAMES: usize = 6;
+const DEFAULT_LIVE_MAX_GAMES: usize = 16;
 const MAX_LIVE_GAME_ID_LEN: usize = 64;
+/// A game is only eligible for capacity eviction once it has gone this long with
+/// no request. A live tab polls ~10Hz, so anything touched within this window is
+/// an open match and must never be reclaimed (reclaiming it resets the match to
+/// kickoff under the viewer); only abandoned/closed tabs cross this threshold.
+const LIVE_GAME_EVICT_IDLE_MS: u64 = 20_000;
 
 /// Restrict a caller-supplied game id to uuid-ish characters and a sane length.
 /// It is only ever used as a map key, but bounding it avoids unbounded keys and
@@ -33165,13 +33180,25 @@ impl LiveGameRegistry {
             instance.last_access_ms.store(now, Ordering::Relaxed);
             return Arc::clone(instance);
         }
-        // Evict the stalest game when at capacity; never reclaim the shared default.
+        // Reclaim space past the soft cap, but ONLY by evicting a genuinely IDLE
+        // game (no request for LIVE_GAME_EVICT_IDLE_MS) — never the shared default.
+        // Evicting a game that an open tab is still actively polling would drop its
+        // session; the tab's very next ~10Hz poll would re-create it from its
+        // id-derived seed, snapping the live match back to the kickoff at tick 0.
+        // With more than `max_games` tabs open at once that produced a permanent
+        // "every game keeps restarting / freezing" thrash. So when the stalest game
+        // is still active, we keep it and let the map hold the extra live tabs; the
+        // count falls back below the cap on its own once those tabs go idle/close.
         // Hold the removed instance so its controller threads join AFTER we release
         // the lock, not while every other request is blocked on it.
         let evicted = if games.len() >= self.max_games {
             games
                 .iter()
-                .filter(|(key, _)| key.as_str() != DEFAULT_LIVE_GAME_ID)
+                .filter(|(key, instance)| {
+                    key.as_str() != DEFAULT_LIVE_GAME_ID
+                        && now.saturating_sub(instance.last_access_ms.load(Ordering::Relaxed))
+                            >= LIVE_GAME_EVICT_IDLE_MS
+                })
                 .min_by_key(|(_, instance)| instance.last_access_ms.load(Ordering::Relaxed))
                 .map(|(key, _)| key.clone())
                 .and_then(|victim| games.remove(&victim))
