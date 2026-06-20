@@ -588,6 +588,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut store = SoccerLearningPgStore::connect_from_env()?;
     let tournament_lock_key =
         tournament_run_lock_key(env_string("SOCCER_TOURNAMENT_LOCK_KEY"), &slug);
+    if tournament_lock_key != slug && !env_bool("SOCCER_TOURNAMENT_ALLOW_NONCANONICAL_LOCK", false)
+    {
+        println!(
+            "tournament_lock_noncanonical key={tournament_lock_key} slug={slug} skipped=true reason=noncanonical_lock_key"
+        );
+        return Ok(());
+    }
     let mut tournament_lock_held = false;
     if let Some(store) = store.as_mut() {
         if store.try_acquire_tournament_run_lock(&tournament_lock_key)? {
