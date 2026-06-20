@@ -25352,9 +25352,11 @@ impl WorldSnapshot {
         let touchline_x = if wingback_outlet {
             self.wingback_attacking_flank_x(me, wingback_coverage_fit)
         } else if home.x <= center_x {
-            WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS
+            (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72).clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
         } else {
-            self.field_width - WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS
+            self.field_width
+                - (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                    .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
         };
         // When the ball holder has time (low pressure) and this supporting player is
         // within ~20 yds, the holder "directs" them into wide open space — pull harder
@@ -25378,7 +25380,7 @@ impl WorldSnapshot {
                 == (self.ball.position.x - center).signum()
                 && (home.x - center).abs() > 1.0;
             if on_ball_side {
-                1.8
+                2.4
             } else {
                 0.0
             }
@@ -25429,7 +25431,7 @@ impl WorldSnapshot {
                 let score = self.space_score_at(candidate, me.team)
                     + openness * 3.0
                     + width
-                        * (2.8
+                        * (3.8
                             + holder_calm_wide_boost
                             + ball_side_wide_boost
                             + wingback_coverage_fit * WINGBACK_COVERED_ATTACK_FLANK_SCORE_BONUS)
@@ -26029,11 +26031,11 @@ impl WorldSnapshot {
             / (self.field_width * 0.5).max(1.0))
         .clamp(-1.0, 1.0);
         let tendency = me.preferences.offensive_mindedness - me.preferences.defensive_mindedness;
-        let support_spread_bias = (home_lane * 0.98 - ball_lane * 0.06 + tendency * 0.20)
+        let support_spread_bias = (home_lane * 1.08 - ball_lane * 0.035 + tendency * 0.24)
             .clamp(-1.0, 1.0);
         let width_scale = (directive.width_yards / (self.field_width * 0.54)
-            * (1.0 + support_spread_bias * 0.16))
-            .clamp(0.90, 1.75);
+            * (1.0 + support_spread_bias * 0.24))
+            .clamp(1.05, 2.05);
         let depth_scale = (directive.support_depth_yards / 11.0).clamp(0.65, 1.65);
         let possession = self.possession_team() == Some(me.team);
         let own_half_possession =
@@ -26070,8 +26072,8 @@ impl WorldSnapshot {
             // the ball's lane, collapsing the team's width onto the ball. Holding the home
             // channel keeps the pitch stretched and honours each player's lane affinity.
             let home_anchor =
-                (0.66 + (possession_width_fit - 0.62) * 0.82 + support_spread_bias * 0.070)
-                    .clamp(0.62, 0.90);
+                (0.74 + (possession_width_fit - 0.62) * 0.95 + support_spread_bias * 0.095)
+                    .clamp(0.70, 0.95);
             let ball_anchor = 1.0 - home_anchor;
             let base_x = home.x * home_anchor + self.ball.position.x * ball_anchor;
             let base_x = if let Some(flank_x) = wingback_flank_x {
@@ -26104,7 +26106,7 @@ impl WorldSnapshot {
         let target_attack_width = if possession && me.role != PlayerRole::Goalkeeper {
             directive
                 .width_yards
-                .max(self.field_width * 0.86)
+                .max(self.field_width * 0.92)
                 .min(self.field_width * 0.99)
         } else {
             0.0
@@ -26179,24 +26181,24 @@ impl WorldSnapshot {
                     let width_after =
                         self.team_lateral_width_yards_with_candidate(me.team, me.id, p);
                     let width_gain = ((width_after - current_attack_width)
-                        / (self.field_width * 0.18).max(1.0))
+                        / (self.field_width * 0.12).max(1.0))
                     .clamp(-1.0, 1.0);
                     let width_fit = if target_attack_width > 1e-6 {
                         (width_after / target_attack_width).clamp(0.0, 1.0)
                     } else {
                         0.0
                     };
-                    let spread_need = (0.65 + width_shortage * 1.05).clamp(0.65, 1.55);
+                    let spread_need = (0.80 + width_shortage * 1.25).clamp(0.80, 1.85);
                     // Lane affinity: holding the player's OWN home channel (and, for wide
                     // players, the touchline) has to compete with the open-space term
                     // (~0..18), while the global width fit rewards spreading the whole team.
-                    (lane_width * 1.15
-                        + home_lane_fit * 2.2
-                        + width_gain.max(0.0) * 1.25
-                        + width_fit * 0.54)
-                        * if correct_side { 1.0 } else { 0.40 }
+                    (lane_width * 1.35
+                        + home_lane_fit * 2.85
+                        + width_gain.max(0.0) * 2.10
+                        + width_fit * 0.85)
+                        * if correct_side { 1.0 } else { 0.28 }
                         // Don't hold width when the ball is well ahead — get forward.
-                        * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.45))
+                        * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.38))
                         * spread_need
                 } else {
                     0.0
@@ -27310,13 +27312,21 @@ impl WorldSnapshot {
             0.0
         };
         let center_x = self.field_width * 0.5;
-        let wide_bias = if team_has_possession && self.is_wide_midfielder(target) {
+        let wide_receiver = self.is_wide_attacker(target)
+            || (team_has_possession
+                && target.role == PlayerRole::Defender
+                && self.is_wide_defender(target)
+                && self.wingback_covered_attack_fit(target) > 0.0);
+        let wide_bias = if team_has_possession && wide_receiver {
             let touchline_x = if target.home_position.x <= center_x {
-                WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS
+                (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                    .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
             } else {
-                self.field_width - WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS
+                self.field_width
+                    - (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                        .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
             };
-            (touchline_x - target_position.x).clamp(-8.0, 8.0)
+            (touchline_x - target_position.x).clamp(-12.0, 12.0)
         } else {
             0.0
         };
@@ -27341,7 +27351,7 @@ impl WorldSnapshot {
             led_support,
             Some(target.id),
         );
-        let base_support_weight = if self.is_wide_midfielder(target) && openness > 0.58 {
+        let base_support_weight = if wide_receiver && openness > 0.58 {
             0.70
         } else if openness > 0.45 {
             0.58
@@ -27886,7 +27896,7 @@ impl WorldSnapshot {
                     support_y = support_y * (1.0 - screen_weight) + screen_y * screen_weight;
                 }
             }
-            let base_x = home.x * 0.90 + self.ball.position.x * 0.10;
+            let base_x = home.x * 0.94 + self.ball.position.x * 0.06;
             let shape_x = if me.role == PlayerRole::Defender && self.is_wide_defender(me) {
                 let coverage_fit = self.wingback_covered_attack_fit(me);
                 if coverage_fit > 0.0 {
@@ -28767,7 +28777,7 @@ impl WorldSnapshot {
             let directive = self.tactical_directive(player.team);
             let target_width = directive
                 .width_yards
-                .max(self.field_width * 0.86)
+                .max(self.field_width * 0.92)
                 .min(self.field_width * 0.99);
             let width_after =
                 self.team_lateral_width_yards_with_candidate(player.team, player.id, target);
@@ -28782,7 +28792,7 @@ impl WorldSnapshot {
             let home_lane_fit = (1.0
                 - (target.x - player.home_position.x).abs() / (self.field_width * 0.42).max(1.0))
             .clamp(0.0, 1.0);
-            (width_fit * 0.58 + lateral_fit * 0.42 + home_lane_fit * 0.18).clamp(0.0, 1.0)
+            (width_fit * 0.68 + lateral_fit * 0.52 + home_lane_fit * 0.28).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -28804,7 +28814,7 @@ impl WorldSnapshot {
             + spacing * 0.30
             + relief * 0.12
             + dynamic_lane_fit * 0.22
-            + possession_width_score * 0.36
+            + possession_width_score * 0.58
             - teammate_penalty * 0.72
             - lane_penalty * lane_penalty_weight
             - line_penalty * line_penalty_weight

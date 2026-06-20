@@ -12177,6 +12177,10 @@ fn winger_wide_forward_gets_a_flank_run_when_team_has_possession() {
         target.x < sim.players[winger].position.x,
         "winger run should pull WIDE toward the touchline, not stay tucked in: {target:?}"
     );
+    assert!(
+        target.x < home.x - 2.0,
+        "winger outlet should be a true flank outlet beyond its lane home, not a token lateral step: home={home:?} target={target:?}"
+    );
 }
 
 #[test]
@@ -37413,7 +37417,13 @@ fn wide_midfielder_support_opens_touchline_with_upfield_slope() {
     sim.ball.velocity = Vec2::zero();
     sim.ball.last_touch_team = Some(Team::Home);
     sim.players[passer].position = sim.ball.position;
-    sim.players[winger].position = Vec2::new(63.0, 57.0);
+    for home in 0..11 {
+        if home != passer && home != winger {
+            sim.players[home].position =
+                Vec2::new(37.0 + (home % 4) as f64 * 2.0, 49.0 + home as f64 * 0.5);
+        }
+    }
+    sim.players[winger].position = Vec2::new(43.0, 57.0);
     for away in 11..22 {
         sim.players[away].position = Vec2::new(35.0, 88.0 + (away - 11) as f64 * 0.5);
     }
@@ -37866,7 +37876,7 @@ fn possession_support_expands_width_while_respecting_all_outfield_lanes() {
         );
         if (player.home_position.x - center).abs() > snapshot.field_width * 0.18 {
             assert!(
-                (target.x - center).abs() > (player.position.x - center).abs() + 3.0,
+                (target.x - center).abs() > (player.position.x - center).abs() + 5.0,
                 "{} should widen from the compact start toward its lane: start={:?} home={:?} target={:?}",
                 player.name,
                 player.position,
@@ -37880,8 +37890,13 @@ fn possession_support_expands_width_while_respecting_all_outfield_lanes() {
 
     let target_width = max_target_x - min_target_x;
     assert!(
-        target_width > compact_width + snapshot.field_width * 0.52,
+        target_width > compact_width + snapshot.field_width * 0.62,
         "support targets should expand a compact possession shape across the field: compact={compact_width:.2} target={target_width:.2}"
+    );
+    assert!(
+        target_width > snapshot.field_width * 0.70,
+        "support targets should use most of the field width in possession: field={:.2} target={target_width:.2}",
+        snapshot.field_width
     );
 }
 
@@ -40573,7 +40588,7 @@ fn aerial_passes_are_harder_and_lead_open_wide_outlets() {
     let lateral = (anticipated.x - current.x).abs();
     let forward = (anticipated.y - current.y) * Team::Home.attack_dir();
     assert!(
-        anticipated.x > current.x,
+        anticipated.x > current.x + 2.0,
         "pass should lead winger wider: {anticipated:?}"
     );
     assert!(
@@ -43372,7 +43387,13 @@ fn learned_support_policy_can_choose_wide_outlet() {
     sim.ball.position = Vec2::new(40.0, 56.0);
     sim.ball.last_touch_team = Some(Team::Home);
     sim.players[passer].position = sim.ball.position;
-    sim.players[winger].position = Vec2::new(63.0, 57.0);
+    for home in 0..11 {
+        if home != passer && home != winger {
+            sim.players[home].position =
+                Vec2::new(37.0 + (home % 4) as f64 * 2.0, 49.0 + home as f64 * 0.5);
+        }
+    }
+    sim.players[winger].position = Vec2::new(43.0, 57.0);
     for away in 11..22 {
         sim.players[away].position = Vec2::new(35.0, 88.0 + (away - 11) as f64 * 0.5);
     }
@@ -43394,8 +43415,8 @@ fn learned_support_policy_can_choose_wide_outlet() {
         "wide-outlet should be a real autonomous/MDP option: {wide_option:?}"
     );
     assert!(
-        wide_option.probability >= 0.16,
-        "wide-outlet should keep a meaningful support share: {wide_option:?}; options={options:?}"
+        wide_option.probability >= 0.30,
+        "compact possession shape should make wide-outlet a meaningful player-level support choice: {wide_option:?}; options={options:?}"
     );
     assert!(learned_action_label_is_legal(
         "wide_outlet",
