@@ -26075,7 +26075,7 @@ impl WorldSnapshot {
         let target_attack_width = if possession && me.role != PlayerRole::Goalkeeper {
             directive
                 .width_yards
-                .max(self.field_width * 0.90)
+                .max(self.field_width * 0.86)
                 .min(self.field_width * 0.99)
         } else {
             0.0
@@ -26157,14 +26157,14 @@ impl WorldSnapshot {
                     } else {
                         0.0
                     };
-                    let spread_need = (0.82 + width_shortage * 1.35).clamp(0.82, 1.95);
+                    let spread_need = (0.65 + width_shortage * 1.05).clamp(0.65, 1.55);
                     // Lane affinity: holding the player's OWN home channel (and, for wide
                     // players, the touchline) has to compete with the open-space term
                     // (~0..18), while the global width fit rewards spreading the whole team.
-                    (lane_width * 1.5
+                    (lane_width * 1.15
                         + home_lane_fit * 2.2
-                        + width_gain.max(0.0) * 1.7
-                        + width_fit * 0.9)
+                        + width_gain.max(0.0) * 1.25
+                        + width_fit * 0.54)
                         * if correct_side { 1.0 } else { 0.40 }
                         // Don't hold width when the ball is well ahead — get forward.
                         * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.45))

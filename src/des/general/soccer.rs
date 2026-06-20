@@ -48348,7 +48348,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
             "Home LM".to_string(),
             PlayerRole::Midfielder,
             11,
-            Vec2::new(13.0, 57.0),
+            Vec2::new(17.0, 57.0),
         ),
         (
             "Home CM1".to_string(),
@@ -48366,7 +48366,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
             "Home RM".to_string(),
             PlayerRole::Midfielder,
             7,
-            Vec2::new(67.0, 57.0),
+            Vec2::new(63.0, 57.0),
         ),
         (
             "Home ST1".to_string(),
