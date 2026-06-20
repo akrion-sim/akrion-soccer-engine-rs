@@ -626,10 +626,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("tournament_reconciled_orphans experiment={eid} count={n} status=partial")
             }
             Ok(_) => {}
-            Err(err) => eprintln!("tournament_reconcile_orphans_failed experiment={eid} error={err} (continuing)"),
+            Err(err) => eprintln!(
+                "tournament_reconcile_orphans_failed experiment={eid} error={err} (continuing)"
+            ),
         }
-        match store.load_latest_active_policy_metadata(&eid)? {
-            Some(metadata) => {
+        match store.load_latest_active_policy_metadata(&eid) {
+            Ok(Some(metadata)) => {
                 parent_policy_version_id = Some(metadata.id.clone());
                 parent_generation = metadata.generation;
                 seed_snapshot = metadata.neural_network.clone();
@@ -641,8 +643,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     seed_snapshot.is_some(),
                 );
             }
-            None => {
+            Ok(None) => {
                 println!("tournament_seed experiment={eid} no_active_policy=true (cold start)");
+            }
+            Err(err) => {
+                eprintln!(
+                    "tournament_seed_active_policy_load_failed experiment={eid} error={err} (continuing with elite pool or cold field)"
+                );
             }
         }
         // Prefer the previous tournament's elite finishers as the breeding pool so
@@ -739,9 +746,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tournament = Tournament::new(teams, format, mode, seed)?;
     let runner = EngineMatchRunner::new(runner_config);
     // Engine API (HEAD line): run_parallel borrows the runner and takes an
-    // optional wall-clock deadline + a per-wave progress callback. The CronJob
-    // still enforces the hard 2am-7am stop via activeDeadlineSeconds, but an
-    // app-level soft deadline lets the normal failure/salvage path finish first.
+    // optional wall-clock deadline + a per-wave progress callback. A zero soft
+    // deadline lets continuous tournament lanes run each generation to completion.
     // Persist each wave AS IT COMMITS (matches + per-team brain checkpoints) and track the
     // strongest brain in memory, so a failure mid-bracket salvages the night's learning.
     let mut persisted_matches: usize = 0;
