@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::des::general::mpc_point_mass::PlanarMpcConfig;
-use crate::des::general::soccer_genome::{SoccerTeamGenome, PITCH_GENOME_ROWS};
+use crate::des::general::soccer_genome::SoccerTeamGenome;
 
 const SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
@@ -4336,17 +4336,6 @@ impl SoccerMatch {
         self.stage_opening_kickoff_if_pending();
         self.maintain_one_two_commitments();
         self.maintain_slide_recoveries();
-        // Tokens for the per-tick soft nudge passes below. Their order is semantic
-        // (explicit, not randomized): spacing/shape protections first, tactical
-        // lane/ball proximity last.
-        enum SoftNudge {
-            AntiBunch,
-            SnapshotSpacing,
-            SelfSpacing,
-            RelationalShape,
-            LaneGuard,
-            BallProximity,
-        }
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
         let mut pre_field_snapshot_elapsed = Duration::from_secs(0);
@@ -4532,134 +4521,11 @@ impl SoccerMatch {
                         learned_plan.as_ref(),
                         &mut self.rng,
                     );
-                    // A committed loose-ball chaser sprints to the intercept point (attack
-                    // the ball) — applied before the shape pipeline so it isn't damped away.
-                    let intent = self.players[actor].committed_chaser_sprint_guarantee(&snapshot, intent);
-                    // Live-ball attacker exemption (used by the spacing/shape nudges below):
-                    // the elected pass receiver, pass interceptor/support contester, or
-                    // loose-ball chaser must keep attacking the ball. Reads only `player_id`,
-                    // which no adjustment changes, so it is stable for the whole chain.
-                    let live_ball_attacker =
-                        snapshot.is_live_ball_attacker_for_movement_guards(intent.player_id);
-                    // --- Soft nudge cluster A (before the team-line structure shape) ---
-                    // Anti-bunchball: keep at most two field players engaging the ball;
-                    // bias any excess off-ball mover back to its formation slot.
-                    // Territorial spacing: nudge a player the brain flagged as camped on a
-                    // teammate back toward open space / its own slot.
-                    // These are live-causal, so the order is explicit instead of randomized:
-                    // first protect the ball cluster, then repair teammate territory.
-                    let mut cluster_a: Vec<SoftNudge> = Vec::new();
-                    if !dd_soccer_disable_anti_bunch() {
-                        cluster_a.push(SoftNudge::AntiBunch);
-                    }
-                    if !(dd_soccer_disable_spacing_nudge() || live_ball_attacker) {
-                        cluster_a.push(SoftNudge::SnapshotSpacing);
-                    }
-                    let mut intent = intent;
-                    for nudge in cluster_a {
-                        intent = match nudge {
-                            SoftNudge::AntiBunch => {
-                                snapshot.discipline_intent_against_bunchball(intent)
-                            }
-                            SoftNudge::SnapshotSpacing => {
-                                snapshot.nudge_intent_for_teammate_spacing(intent)
-                            }
-                            _ => intent,
-                        };
-                    }
-                    // --- Team-line structure shape (PINNED order — deliberate hierarchy) ---
-                    // Hold the back four's average 2-30yd behind the ball.
-                    let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
-                    // Then hold the back four as a compact, FLAT, ball-side block (~4 lanes),
-                    // each defender keeping its left-to-right slot.
-                    let intent = snapshot.back_four_shape_adjusted_intent(intent);
-                    // Hold the midfield line 3-20yd in front of the back four (ideal 8
-                    // when defending).
-                    let intent = snapshot.midfield_line_band_adjusted_intent(intent);
-                    // Hold the striker line 3-20yd in front of the midfield line (ideal 8
-                    // when defending).
-                    let intent = snapshot.forward_line_band_adjusted_intent(intent);
-                    // A forward/mid that chose to STAND while offside in our possession is a
-                    // stranded goal-hanger; pull it straight back onside when the line-band
-                    // stage did not already convert the hold into a shape-restoring run.
-                    let intent = snapshot.offside_standing_recovery_adjusted_intent(intent);
-                    // While the ball is in transit, a player who can't get it drops goalside of
-                    // where the ball is GOING (anticipated possession), not where it is now.
-                    let intent = snapshot.goalside_anticipation_adjusted_intent(intent);
-                    // Offside-trap cover: the nearest defender drops to track an attacker
-                    // sprinting to break the line unless it is highly confident the trap
-                    // (belief in the line + keeper sweep) would catch them.
-                    let intent = snapshot.offside_trap_cover_adjusted_intent(intent);
-                    // --- Soft nudge cluster B (after structure, before the hard overrides) ---
-                    // Territory-spacing self-nudge: if this player was told to vacate a
-                    // teammate's space last tick, nudge it out of the minimum-spacing radius
-                    // and back toward its formation slot (same loose-ball-chaser exemption).
-                    // Relational shape: nudge an off-ball mover toward its ideal offsets to its
-                    // formation neighbours so the team covers ground as a unit.
-                    // Late route discipline: ordinary off-ball movers should not run through or
-                    // past a teammate's lane, and in possession their support movement must
-                    // still climb toward the opponent goal (tactical exceptions left alone).
-                    // Predictive spacing then checks the two-second path against teammates'
-                    // current position, velocity, and acceleration so the final target is
-                    // already aimed toward the 5-10yd/3-6yd-box spacing band.
-                    // These are ordered by dependency: own spacing, relational shape,
-                    // teammate lane guard, then ball proximity as the final tactical trim.
-                    let mut cluster_b: Vec<SoftNudge> = Vec::new();
-                    if !live_ball_attacker {
-                        cluster_b.push(SoftNudge::SelfSpacing);
-                        cluster_b.push(SoftNudge::RelationalShape);
-                        cluster_b.push(SoftNudge::LaneGuard);
-                        cluster_b.push(SoftNudge::BallProximity);
-                    }
-                    let mut intent = intent;
-                    for nudge in cluster_b {
-                        intent = match nudge {
-                            SoftNudge::SelfSpacing => {
-                                self.teammate_spacing_disciplined_intent(intent)
-                            }
-                            SoftNudge::RelationalShape => {
-                                self.relational_shape_disciplined_intent(intent)
-                            }
-                            SoftNudge::LaneGuard => {
-                                snapshot.teammate_lane_guard_adjusted_intent(intent)
-                            }
-                            SoftNudge::BallProximity => {
-                                snapshot.ball_proximity_adjusted_intent(intent)
-                            }
-                            _ => intent,
-                        };
-                    }
-                    // The back-four block gets the final say on defender shape over the soft
-                    // cluster (relational cohesion would otherwise pull the four back out to
-                    // their WIDE formation slots). Per-defender slot assignment is stable to
-                    // re-apply (unlike the average-based line bands).
-                    let intent = snapshot.back_four_shape_adjusted_intent(intent);
-                    // --- Hard safety / shape overrides (PINNED LAST — these MUST win) ---
-                    // Ball played IN BEHIND our back line: this has FINAL say over shape — the
-                    // keeper sweeps and the two nearest defenders sprint/run goalside to recover
-                    // (paced by the chasing attacker's granular pressure). Everyone else keeps
-                    // the shape the chain just gave them.
-                    let intent = snapshot.ball_in_behind_recovery_adjusted_intent(intent);
-                    // No-swap discipline has the final word on the settled move: whatever
-                    // the chain above produced, an off-ball player still must not steer a
-                    // straight line that carries it PAST a moving teammate (the "running
-                    // past each other / switching positions" artefact). Same-direction
-                    // recovery sprints and tracking/handoff runs are exempt by design.
-                    let intent = snapshot.cross_through_disciplined_intent(intent);
-                    let intent = snapshot.teammate_spacing_path_adjusted_intent(intent);
-                    // Stretch the pitch: the wide player on the flank away from the ball
-                    // holds its home channel rather than collapsing ball-side.
-                    let intent = snapshot.weak_side_width_hold_adjusted_intent(intent);
-                    // Final no-exception role-layer assertion for movement targets: later
-                    // route/spacing/safety stages may have rewritten targets, but the team
-                    // lines must still aim back to the back-four / midfield / striker bands.
-                    let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
-                    let intent = snapshot.midfield_line_band_adjusted_intent(intent);
-                    let intent = snapshot.forward_line_band_adjusted_intent(intent);
-                    // Wingback width: pinch IN toward centre when defending, open OUT to the
-                    // flank in possession (more so with cover behind the ball). Final say on
-                    // wide-back x, after the back-four lateral re-apply above.
-                    let intent = snapshot.wingback_width_adjusted_intent(intent);
+                    let intent = self.players[actor].apply_post_decision_movement_discipline(
+                        &snapshot,
+                        self,
+                        intent,
+                    );
                     let player_decision_elapsed = phase_started.elapsed();
                     field_player_decision_elapsed += player_decision_elapsed;
                     match decision_context {
@@ -7223,6 +7089,96 @@ impl SoccerMatch {
         )
     }
 
+    fn mpc_steal_execution_fit(
+        &self,
+        defender_id: usize,
+        carrier_id: usize,
+        committed: bool,
+    ) -> MpcBallControlExecutionFit {
+        let Some(defender) = self.players.get(defender_id) else {
+            return MpcBallControlExecutionFit::default();
+        };
+        let Some(carrier) = self.players.get(carrier_id) else {
+            return MpcBallControlExecutionFit::default();
+        };
+        let ball_target = self.ball.position;
+        let distance = defender.position.distance(ball_target);
+        let fatigue_factor = fatigue_speed_factor(defender.skills.stamina, defender.fatigue);
+        let top_speed = (player_top_speed_yps(defender.role, &defender.skills)
+            * fatigue_factor
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let horizon = (distance / top_speed).clamp(
+            DEFAULT_DT_SECONDS,
+            if committed { 0.48 } else { 0.34 },
+        );
+        let accel_cap = acceleration_yps2_from_score(defender.skills.acceleration) * fatigue_factor;
+        let control_radius = if committed {
+            SLIDE_TACKLE_MAX_REACH_YARDS
+        } else {
+            DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS.max(CONTESTABLE_STEAL_RADIUS_YARDS)
+        };
+        let qp_accel_fit = bounded_accel_qp_control_fit(
+            defender.position,
+            defender.velocity,
+            ball_target,
+            horizon,
+            accel_cap,
+            control_radius,
+            if committed { 0.035 } else { 0.075 },
+        );
+        let facing_fit = player_facing_ball_control_multiplier(
+            defender,
+            ball_target,
+            self.ball.velocity.len().max(carrier.velocity.len()),
+        )
+        .clamp(0.0, 1.0);
+        let to_ball = ball_target - defender.position;
+        let closing_fit = if to_ball.len() > 1e-6 {
+            ((defender.velocity.dot(to_ball.normalized()) + 4.0) / 14.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let velocity_match =
+            (1.0 - ((defender.velocity - self.ball.velocity).len() / 32.0).clamp(0.0, 1.0))
+                .clamp(0.0, 1.0);
+        let skill_fit = (ability01(defender.skills.defending) * 0.46
+            + ability01(defender.skills.aggression) * 0.22
+            + ability01(defender.skills.acceleration) * 0.20
+            + ability01(defender.skills.strength) * 0.12)
+            .clamp(0.0, 1.0);
+        let close_fit = (1.0 - distance / control_radius.max(1.0)).clamp(0.0, 1.0);
+        let probability = (0.03
+            + qp_accel_fit * 0.48
+            + skill_fit * 0.17
+            + facing_fit * if committed { 0.08 } else { 0.13 }
+            + closing_fit * 0.08
+            + velocity_match * 0.08
+            + close_fit * 0.08)
+            .clamp(0.0, 0.99);
+        MpcBallControlExecutionFit {
+            probability,
+            qp_accel_fit,
+            velocity_match,
+            facing_fit,
+            miscontrol_risk: (1.0 - probability).clamp(0.0, 1.0),
+        }
+    }
+
+    fn mpc_steal_success_multiplier(
+        &self,
+        fit: MpcBallControlExecutionFit,
+        min_qp_accel_fit: f64,
+    ) -> f64 {
+        if fit.qp_accel_fit < min_qp_accel_fit {
+            0.0
+        } else {
+            (MPC_STEAL_SUCCESS_MULTIPLIER_FLOOR
+                + MPC_STEAL_SUCCESS_MULTIPLIER_SPAN * fit.probability.clamp(0.0, 1.0))
+                .clamp(0.0, 1.08)
+        }
+    }
+
     /// The defending goalkeeper currently holding the ball IN HIS HANDS — the
     /// holder is his team's keeper and he is inside his own penalty area. While
     /// this holds the ball cannot be tackled/stolen; he must release within
@@ -7632,6 +7588,13 @@ impl SoccerMatch {
         {
             dispossession_probability = 0.0;
         }
+        let mpc_steal_fit = self.mpc_steal_execution_fit(defender_id, attacker_id, false);
+        dispossession_probability = (dispossession_probability
+            * self.mpc_steal_success_multiplier(
+                mpc_steal_fit,
+                MPC_STEAL_STANDING_MIN_QP_ACCEL_FIT,
+            ))
+        .clamp(0.0, 0.95);
         let beat_probability = if kind != DribbleMoveKind::ProtectBall {
             dribble_beat_probability(
                 kind,
@@ -7843,9 +7806,31 @@ impl SoccerMatch {
         if self.pending_pass.as_ref().and_then(|pass| pass.target) == Some(player_id) {
             return None;
         }
-        // Can't be offside off the opponents' touch — only when our team last played it.
-        if self.ball.last_touch_team != Some(me.team) {
-            return None;
+        // A LOOSE ball the opponent (or anyone) last played does not leave you offside — Law 11
+        // is only ever assessed off a team-mate's deliberate touch — and a ball this player is
+        // genuinely placed to win must not be abandoned. So keep the run while the ball is loose
+        // and this player is a committed chaser of it. In every OTHER case (the opponent is in
+        // clear possession, or the ball is loose but out of this player's reach) a mid/forward
+        // stranded beyond the line is doing nothing useful and should drift back into shape,
+        // regardless of who touched it last.
+        //
+        // The old code bailed on ANY opponent touch. In scrappy midfield play the last-touch
+        // flag flickers team-to-team every few seconds, so that gate kept cancelling the recovery
+        // jog mid-stride and re-stranding the attacker — live measurement (GET /api/inspect)
+        // showed strikers sitting offside for 6-8s instead of recovering shortly after the ~3s
+        // grace.
+        if self.ball.holder.is_none() {
+            let ball_pos = self.ball.position;
+            let my_dist = me.position.distance(ball_pos);
+            let i_am_closest = !self.players.iter().any(|p| {
+                p.id != player_id
+                    && p.team == me.team
+                    && p.role != PlayerRole::Goalkeeper
+                    && p.position.distance(ball_pos) < my_dist
+            });
+            if my_dist <= LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS && i_am_closest {
+                return None;
+            }
         }
         // Confirm STILL offside now (guards a stale clock from a prior possession): in the
         // opponents' half, beyond the 2nd-last opponent (keeper included), beyond the ball.
@@ -8672,6 +8657,14 @@ impl SoccerMatch {
                         if self.tackle_blocked_from_behind(target_player, player_pos) {
                             success_probability = 0.0;
                         }
+                        let mpc_steal_fit =
+                            self.mpc_steal_execution_fit(player_id, target_player, false);
+                        success_probability = (success_probability
+                            * self.mpc_steal_success_multiplier(
+                                mpc_steal_fit,
+                                MPC_STEAL_STANDING_MIN_QP_ACCEL_FIT,
+                            ))
+                        .clamp(0.0, 0.95);
                         if success_probability >= 0.54 {
                             self.complete_defensive_dispossession(
                                 player_id,
@@ -8789,6 +8782,14 @@ impl SoccerMatch {
                             success_probability =
                                 success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
                         }
+                        let mpc_steal_fit =
+                            self.mpc_steal_execution_fit(player_id, target_player, true);
+                        success_probability = (success_probability
+                            * self.mpc_steal_success_multiplier(
+                                mpc_steal_fit,
+                                MPC_STEAL_SLIDE_MIN_QP_ACCEL_FIT,
+                            ))
+                        .clamp(0.0, 0.97);
                         if success_probability >= SLIDE_TACKLE_SUCCESS_THRESHOLD {
                             won_ball = true;
                             self.complete_defensive_dispossession(
@@ -14786,12 +14787,12 @@ fn open_space_score_from_distances_with_axis_pressure(
 // path (anti-bunch + spacing-nudge fire 2×/player/tick, the energy + defensive-pushup ones
 // once/player/tick). Caching them once removes ~tens of thousands of syscalls per match and
 // the lock contention that spikes the live server's tail latency. No test toggles these.
-fn dd_soccer_disable_anti_bunch() -> bool {
+pub(crate) fn dd_soccer_disable_anti_bunch() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ANTI_BUNCH").is_ok())
 }
-fn dd_soccer_disable_spacing_nudge() -> bool {
+pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
@@ -17226,7 +17227,10 @@ impl WorldSnapshot {
             .clamp_to_pitch(self.field_width, self.field_length)
     }
 
-    fn offside_trap_cover_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn offside_trap_cover_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.offside_trap_cover_adjusted_target(intent.player_id, target);
             intent.action = SoccerAction::MoveTo(adjusted);
@@ -17599,7 +17603,7 @@ impl WorldSnapshot {
                 target.y = target.y.max(retreat_y - 1.0);
             }
         }
-        let max_behind_ball = DEFENSIVE_MAX_BEHIND_BALL_YARDS;
+        let max_behind_ball = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS;
         self.clamp_defensive_goal_line_and_ball_gap_with_max(team, target, max_behind_ball)
     }
 
@@ -17650,7 +17654,7 @@ impl WorldSnapshot {
         self.clamp_defensive_goal_line_and_ball_gap_with_max(
             team,
             target,
-            DEFENSIVE_MAX_BEHIND_BALL_YARDS,
+            DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS,
         )
     }
 
@@ -22626,7 +22630,8 @@ impl WorldSnapshot {
                 } else {
                     LOOSE_BALL_ATTACK_CUTOFF_FRACTION
                 };
-                return self.ball.position + (projected - self.ball.position) * cutoff;
+                let early_control = self.ball.position + (projected - self.ball.position) * cutoff;
+                return early_control.clamp_to_pitch(self.field_width, self.field_length);
             }
         }
         projected
@@ -23098,7 +23103,10 @@ impl WorldSnapshot {
 
     /// Applies [`Self::ball_in_behind_recovery_adjusted_target`] to a decided off-ball move,
     /// setting the sprint pace it returns.
-    fn ball_in_behind_recovery_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn ball_in_behind_recovery_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let (adjusted, sprint) =
                 self.ball_in_behind_recovery_adjusted_target(intent.player_id, target);
@@ -23413,7 +23421,10 @@ impl WorldSnapshot {
     /// Applies [`Self::anti_bunchball_adjusted_target`] to a decided intent. Only
     /// plain off-ball `MoveTo` movement is adjusted; ball-carrier and set actions
     /// pass through untouched.
-    fn discipline_intent_against_bunchball(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn discipline_intent_against_bunchball(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.anti_bunchball_adjusted_target(intent.player_id, target);
             let adjusted =
@@ -23747,7 +23758,10 @@ impl WorldSnapshot {
         (target, false)
     }
 
-    fn ball_proximity_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn ball_proximity_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let (adjusted, sprint) = self.ball_proximity_adjusted_target(intent.player_id, target);
             if adjusted.distance(target) > 1e-6 {
@@ -23809,10 +23823,8 @@ impl WorldSnapshot {
     /// steps up (in possession) or drops off (opponent has the ball upfield) together while
     /// keeping its left-right shape. In defense and 50:50 phases, no ordinary defender is
     /// exempt from the line; in controlled possession, an authorized overlapping wingback may
-    /// break it. Every tick aims those line-bound defenders at the needed
-    /// correction for ball-distance-aware consistency:
-    /// close ball means roughly 1 second, far ball roughly 5 seconds, while accepting that
-    /// physics/traffic may make the actual arrival slower.
+    /// break it. Every tick aims those line-bound defenders at eventual consistency over the
+    /// 2-3 second grace window; physics/traffic may make the actual arrival slower.
     pub(crate) fn defensive_line_cushion_adjusted_target(
         &self,
         player_id: usize,
@@ -23870,15 +23882,16 @@ impl WorldSnapshot {
         let ball_fwd = fwd(self.ball.position);
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
-        // The band is suspended only inside THIS team's own 5-yard emergency zone
-        // (parity with the ball is fine there). Otherwise it applies even when the
-        // line has drifted ahead of the ball: that is exactly what this pull fixes.
+        // The band is suspended only inside THIS team's own 20-yard emergency zone
+        // (parity with the ball is fine there; forcing 10yd behind can shove the
+        // line off the end-line). Otherwise it applies even when the line has
+        // drifted ahead of the ball: that is exactly what this pull fixes.
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return target;
         }
-        // THE RULE (simple, no regimes): the back four's AVERAGE sits 5-30yd behind
+        // THE RULE (simple, no regimes): the back four's AVERAGE sits 10-30yd behind
         // (goal-side of) the ball — always, in or out of possession. Exceptions:
-        // (1) inside our own 5yd emergency zone, and
+        // (1) inside our own 20yd emergency zone, and
         // (2) the back four may not press more than 5yd into the opponent half, so
         // a high ball may leave the line more than 30yd behind by design.
         let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
@@ -23896,7 +23909,7 @@ impl WorldSnapshot {
             + tunables()
                 .defensive_shape
                 .defensive_line_max_into_opp_half_yards;
-        // Upper bound = nearer of "5yd behind the ball" and the opp-half ceiling; pin the
+        // Upper bound = nearer of "10yd behind the ball" and the opp-half ceiling; pin the
         // lower bound at/under it so a ball deep upfield can't invert the band (the
         // ceiling wins — bulletproof, never panics on lower > upper).
         let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
@@ -23913,8 +23926,9 @@ impl WorldSnapshot {
             DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
         );
         let current_delta = desired_avg_fwd - avg_fwd;
+        let distributed_delta =
+            current_delta * (defender_count / line_count).clamp(1.0, 2.0);
         let adjusted_fwd = if current_delta.abs() > 1e-6 {
-            let distributed_delta = current_delta * (defender_count / line_count).clamp(1.0, 2.0);
             current_fwd + distributed_delta * consistency_gain
         } else {
             let peer_sum_fwd = defenders
@@ -23931,25 +23945,42 @@ impl WorldSnapshot {
                 target_fwd + projected_delta * defender_count * consistency_gain
             }
         };
-        let tactical_row_height = self.field_length.max(1.0) / f64::from(PITCH_GENOME_ROWS);
-        let row_band = tactical_row_height * BACK_FOUR_ROW_COHESION_ROWS;
-        // Row-cohesion pins each defender within `row_band` of the line average — a
-        // DEFENDING guard against one back drifting off the shape. When WE genuinely
-        // control the ball the back four is free to stagger fore-aft (a centre-back may
-        // step into midfield, a wingback overlap and bomb on), so we lift the individual
-        // clamp on offense. We key on CONTROLLED possession (an actual holder), not
-        // last-touch, so a 50/50 we last brushed still forms up. The band AVERAGE pull
-        // above still applies — the whole line keeps pushing up / dropping off with the
-        // ball — only the per-defender stagger clamp is released. Mirrors the fore-aft
-        // gate in `back_four_shape_adjusted_target`.
+        // Offside line flatness: when DEFENDING, the back four holds a FLAT line so it presents a
+        // clean offside line — each defender's target is clamped to within ±half of
+        // BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS of the line average (≤2yd total fore-aft spread). This
+        // sets the TARGET only; the player then JOGS onto the line over ~3s (the movement grace,
+        // `DEFENSIVE_LINE_GRACE_JOG_YARDS`), so a defender caught out of line eases level (eventual
+        // consistency) rather than teleporting. The band AVERAGE correction below still slides the
+        // whole flat line to the legal 10-30yd gap. When WE genuinely control the ball the clamp
+        // lifts entirely (a centre-back may step into midfield, a full-back overlap and bomb on) —
+        // offside doesn't apply to us, and we key on CONTROLLED possession (an actual holder), not
+        // last-touch, so a 50/50 we last brushed still forms up flat.
         let controls_ball = self.controlled_possession_team() == Some(me.team);
-        let cohesive_fwd = if controls_ball {
-            adjusted_fwd
-        } else {
-            adjusted_fwd.clamp(desired_avg_fwd - row_band, desired_avg_fwd + row_band)
+        let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+        let level_to_line = |fwd_now: f64| -> f64 {
+            if controls_ball {
+                fwd_now
+            } else {
+                fwd_now.clamp(desired_avg_fwd - level_half_band, desired_avg_fwd + level_half_band)
+            }
         };
-        let banded_fwd = line_band_avg_fwd(cohesive_fwd);
-        let adjusted_y = (banded_fwd * attack_dir).clamp(0.0, self.field_length);
+        let cohesive_fwd = level_to_line(adjusted_fwd);
+        let peer_cohesive_sum_fwd = defenders
+            .iter()
+            .filter(|p| p.id != player_id)
+            .map(|p| {
+                let peer_current_fwd = fwd(self.player_snapshot_position(p));
+                let peer_adjusted_fwd = if current_delta.abs() > 1e-6 {
+                    peer_current_fwd + distributed_delta * consistency_gain
+                } else {
+                    peer_current_fwd
+                };
+                level_to_line(peer_adjusted_fwd)
+            })
+            .sum::<f64>();
+        let projected_line_avg_fwd = (peer_cohesive_sum_fwd + cohesive_fwd) / defender_count;
+        let average_delta = line_band_avg_fwd(projected_line_avg_fwd) - projected_line_avg_fwd;
+        let adjusted_y = ((cohesive_fwd + average_delta) * attack_dir).clamp(0.0, self.field_length);
         let in_possession = self
             .controlled_possession_team()
             .or_else(|| self.possession_team())
@@ -23972,7 +24003,10 @@ impl WorldSnapshot {
 
     /// Applies [`Self::defensive_line_cushion_adjusted_target`] to movement-like decisions
     /// and converts `HoldShape` into a move when the back four is out of band.
-    fn defensive_line_cushion_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn defensive_line_cushion_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         let target = match &intent.action {
             SoccerAction::HoldShape => self
                 .players
@@ -24270,7 +24304,10 @@ impl WorldSnapshot {
 
     /// Applies [`Self::back_four_shape_adjusted_target`] to a defender's off-ball move; a
     /// defender HOLDING a position that breaks the block is converted to a corrective move.
-    fn back_four_shape_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn back_four_shape_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         let current = match &intent.action {
             SoccerAction::MoveTo(target) => Some(*target),
             SoccerAction::HoldShape => self
@@ -24432,7 +24469,10 @@ impl WorldSnapshot {
     }
 
     /// Applies [`Self::wingback_width_adjusted_target`] to a wingback's off-ball move.
-    fn wingback_width_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn wingback_width_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         let current = match &intent.action {
             SoccerAction::MoveTo(target) => Some(*target),
             SoccerAction::HoldShape => self
@@ -24574,7 +24614,10 @@ impl WorldSnapshot {
 
     /// Applies [`Self::midfield_line_band_adjusted_target`] to movement-like decisions
     /// and converts `HoldShape` into a move when the line average is out of band.
-    fn midfield_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn midfield_line_band_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         // Only reshape genuine off-ball positioning: a MoveTo, or a HoldShape that is out
         // of band. NOT Dribble/ControlTouch/etc. — those are going to the BALL.
         let current = match &intent.action {
@@ -24727,7 +24770,10 @@ impl WorldSnapshot {
 
     /// Applies [`Self::forward_line_band_adjusted_target`] to movement-like decisions
     /// and converts `HoldShape` into a move when the line average is out of band.
-    fn forward_line_band_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn forward_line_band_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         // Only reshape genuine off-ball positioning: a MoveTo, or a HoldShape that is out
         // of band. NOT Dribble/ControlTouch/etc. — those are going to the BALL.
         let current = match &intent.action {
@@ -24767,7 +24813,10 @@ impl WorldSnapshot {
     /// forever (the goal-hanger artefact). When such a player is genuinely offside —
     /// not the carrier, not on a sanctioned in-behind run — convert its hold into a
     /// `MoveTo` straight back to its onside support position.
-    fn offside_standing_recovery_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn offside_standing_recovery_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if self.active_set_play.is_some() {
             return intent;
         }
@@ -24857,7 +24906,10 @@ impl WorldSnapshot {
     }
 
     /// Applies [`Self::goalside_anticipation_adjusted_target`] to a decided off-ball move.
-    fn goalside_anticipation_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn goalside_anticipation_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.goalside_anticipation_adjusted_target(intent.player_id, target);
             intent.action = SoccerAction::MoveTo(adjusted);
@@ -24926,7 +24978,10 @@ impl WorldSnapshot {
         adjusted.clamp_to_pitch(self.field_width, self.field_length)
     }
 
-    fn teammate_lane_guard_adjusted_intent(&self, mut intent: PlayerIntent) -> PlayerIntent {
+    pub(crate) fn teammate_lane_guard_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let adjusted = self.teammate_lane_guard_adjusted_target(intent.player_id, target);
             intent.action = SoccerAction::MoveTo(adjusted);
@@ -27946,10 +28001,10 @@ impl WorldSnapshot {
     /// True when THIS defender has been deliberately sent to step ONTO the ball — the
     /// single nearest presser/engager via a fast-carrier engage, a holder press, or an
     /// advancing-carrier step-up. Such a defender has left the line to contest, so it must
-    /// be exempt from the back-four band's 5yd cushion (which would otherwise yank it back
-    /// off the ball — the "presser never reaches the carrier" bug). Only the one nearest
-    /// presser qualifies (each producer elects a single closest outfielder), so the rest of
-    /// the back four still hold the band.
+    /// be exempt from the back-four band (which would otherwise yank it back off the ball —
+    /// the "presser never reaches the carrier" bug). Only the one nearest presser qualifies
+    /// (each producer elects a single closest outfielder), so the rest of the back four still
+    /// hold the band.
     fn defender_is_designated_ball_presser(&self, me: &PlayerSnapshot) -> bool {
         if me.role != PlayerRole::Defender {
             return false;
@@ -27963,10 +28018,13 @@ impl WorldSnapshot {
                 .is_some()
     }
 
-    /// Clamp a defender's target forward-position to the hard back-four line band:
-    /// 10-30 yards behind the ball, except the 10yd minimum is waived within 20yd of our own
-    /// goal (and the band fully suspended inside the team's own 5-yard emergency zone).
-    fn defender_line_band_clamped_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
+    /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
+    /// connected: 10-30 yards behind the ball (measured to where the ball is HEADED, so the line
+    /// retreats early on a fast break). Exceptions: the designated ball-presser is left alone (it
+    /// has stepped out of the line to contest); the band is fully suspended inside the team's own
+    /// 5-yard emergency zone; and within 20yd of our own goal the 10yd minimum standoff is waived
+    /// (the line may sit level with the ball on top of the box, just not ahead of it).
+    fn defender_line_band_average_adjusted_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         let attack = me.team.attack_dir();
         let ball_fwd = self.ball.position.y * attack;
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
@@ -27986,8 +28044,9 @@ impl WorldSnapshot {
         } else {
             DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
         };
-        // Lower bound of the gap: stay goal-side of the ball by the hard 10yd
-        // floor. Upper bound: no more than 30yd behind where the ball is headed.
+        // Lower bound of the gap: stay goal-side of the ball by the hard 10yd floor — measured to
+        // where the ball is HEADED (lookahead), so a fast carrier driving at the line pulls the
+        // back four back BEFORE he arrives. Upper bound: no more than 30yd behind the headed ball.
         let predicted_fwd = self
             .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
             .y
@@ -28002,7 +28061,55 @@ impl WorldSnapshot {
         // "don't sit level" ceiling wins so the line never overruns the ball.
         let deepest_fwd = deepest_fwd.min(shallowest_fwd);
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
-        clamped_fwd * attack
+        // Offside line flatness: when DEFENDING, no defender may stand AHEAD of the back-four line
+        // (toward the attackers) by more than half of BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS — that is
+        // what plays attackers onside, so the front of the line is kept flat (≤2yd). The clamp is
+        // ASYMMETRIC: a defender may always drop DEEPER (goal-side) to cover or to retreat onto a
+        // break — extra depth never breaks the offside line (the second-rearmost defender still
+        // sets it). The reference is the band-corrected line CENTRE (`avg.clamp(band)`), not the
+        // raw average, so the whole flat line still slides to the legal 10-30yd gap as a unit. A
+        // defender that has stepped OUT of the line to do a job — the designated presser or a
+        // live-ball / pass-lane attacker — is excluded from both the centre and the clamp. This
+        // sets the TARGET only; the player jogs onto the line over ~3s (the movement grace), so a
+        // defender caught upfield eases level (eventual consistency). Lifted when WE control.
+        let controls_ball = self.controlled_possession_team() == Some(me.team);
+        // The offside trap is a MID/HIGH-block tool. Deep in our own third (ball within a third of
+        // our own goal) there is no space behind to play anyone offside, so the back four marks /
+        // pushes up / retreats individually instead of holding a flat trap (mirrors the press gate
+        // in `holder_press_target_for`). The flat line only applies once the ball is further out.
+        let line_trap_active = ball_from_own_goal > self.field_length / 3.0;
+        // While a pass is in flight defenders are reacting — stepping to cut the lane or tracking
+        // a runner — and offside has already been judged at the moment the pass was played, so the
+        // flat-line clamp is lifted for the flight (it would otherwise pin a lane-cutter back).
+        if controls_ball || !line_trap_active || self.pending_pass.is_some() {
+            return clamped_fwd * attack;
+        }
+        // The line CENTRE is the average of the defenders still HOLDING the line. A defender that
+        // has clearly stepped out IN FRONT of the band (a presser / lane-cutter up at the ball) is
+        // excluded by position — cheaply, without re-entering the press/pass-contest decision
+        // (which would recurse back into this shape code). `me` is already known not to be the
+        // designated presser (early-returned above).
+        let stepped_out_ahead = |p: &PlayerSnapshot| {
+            self.player_snapshot_position(p).y * attack
+                > shallowest_fwd + LINE_STEPPED_OUT_AHEAD_YARDS
+        };
+        let line_fwds: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == me.team && p.role == PlayerRole::Defender && !stepped_out_ahead(p)
+            })
+            .map(|p| self.player_snapshot_position(p).y * attack)
+            .collect();
+        if line_fwds.len() < 2 {
+            return clamped_fwd * attack;
+        }
+        let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
+        let line_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
+        let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+        // Cap only the AHEAD (high-fwd) side; deeper (cover/retreat) is always allowed.
+        let leveled_fwd = clamped_fwd.min(line_centre_fwd + level_half_band);
+        leveled_fwd * attack
     }
 
     pub fn defensive_shape_for(&self, player_id: usize, home: Vec2) -> Vec2 {
@@ -28123,7 +28230,7 @@ impl WorldSnapshot {
             }
         }
         if me.role == PlayerRole::Defender {
-            compact_y = self.defender_line_band_clamped_y(me, compact_y);
+            compact_y = self.defender_line_band_average_adjusted_y(me, compact_y);
         }
         let mut shape =
             Vec2::new(compact_x, compact_y).clamp_to_pitch(self.field_width, self.field_length);
@@ -28259,13 +28366,16 @@ impl WorldSnapshot {
 
     pub fn defensive_assignment_for(&self, player_id: usize, home: Vec2, roam: bool) -> Vec2 {
         let target = self.defensive_assignment_for_unclamped(player_id, home, roam);
-        // Final back-four band clamp: the blend toward a marked opponent / the
-        // candidate search can re-deepen the line past the zone target, so enforce
-        // the ≤30yd-behind-ball rule on the FINAL assignment for defenders too.
+        // Final back-four band clamp: the blend toward a marked opponent / the candidate search
+        // can re-deepen the line past the zone target, so enforce the connected 10-30yd-behind-ball
+        // rule on the FINAL assignment for defenders too.
         match self.players.iter().find(|p| p.id == player_id) {
             Some(me) if me.role == PlayerRole::Defender => {
                 let mut final_target =
-                    Vec2::new(target.x, self.defender_line_band_clamped_y(me, target.y))
+                    Vec2::new(
+                        target.x,
+                        self.defender_line_band_average_adjusted_y(me, target.y),
+                    )
                         .clamp_to_pitch(self.field_width, self.field_length);
                 if !roam {
                     let relief = self
