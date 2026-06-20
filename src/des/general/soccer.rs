@@ -861,6 +861,12 @@ const EXCESSIVE_HOLD_RAMP_SPAN_SECONDS: f64 = 3.0;
 // third, where taking a man on is worth the risk.
 const DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL: f64 = 36.0;
+/// On winning the ball, a carrier needs at least this much clear space directly ahead before the
+/// "drive into space" floor fires (below it there is nothing to run into, so settle/pass/shield).
+const WON_BALL_DRIVE_MIN_SPACE_YARDS: f64 = 4.0;
+/// How long after gaining possession a carry still counts as a "just won the ball" transition for
+/// the drive-into-space floor (real elapsed possession time, `actual_time_on_ball_seconds`).
+const WON_BALL_DRIVE_FRESH_SECONDS: f64 = 0.8;
 // "There's an open man — play it." When the learned policy proposes a dribble
 // but a teammate is this open with at least this expected completion, release
 // the ball to them rather than carrying on into traffic. Closes the hole where
