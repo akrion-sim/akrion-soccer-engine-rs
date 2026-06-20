@@ -2177,6 +2177,21 @@ const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 
 // reach says the player can trap them. Wider than body contact: it covers the step
 // or lunge onto a rolling pass that would otherwise ghost through a nearby player.
 const REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS: f64 = 2.0;
+// No-ghost floor for a LOOSE ball (no pending pass): a low ball travelling at least this
+// fast that crosses within body reach of a player's feet must be contested — it cannot sail
+// THROUGH them as if they were not there, whichever way they are facing. Below this speed a
+// loose ball keeps the normal (skill/closing-speed scored) contest path so genuine slow 50/50s
+// are not auto-decided by raw proximity.
+const LOOSE_BALL_BODY_BLOCK_MIN_SPEED_YPS: f64 = 6.0;
+// A loose ball whose predicted path passes within this lateral distance of a player is "going
+// near enough to control": the player reads it and steps onto its line (reaction/reach permitting)
+// rather than letting it run through, instead of holding shape because a team-mate is the
+// marginally-closer designated retriever. The user's "ball trajectory within 2 yards" floor.
+const BALL_PATH_CONTROL_LATERAL_YARDS: f64 = 2.0;
+// How far AHEAD along its current travel a loose ball's path is read for a step-onto. A player
+// only commits to a ball passing near them SOON — not one projected the length of the pitch (a
+// fast ball decelerates and others will reach a far point first). Keeps the step-onto local.
+const BALL_PATH_CUT_MAX_LOOKAHEAD_YARDS: f64 = 12.0;
 // A floor ball rolling THIS close to a player's feet is controlled no matter which
 // way they are facing — a ball right under you does not roll past because you were
 // looking elsewhere. At 1yd a player can reach a foot/leg out and trap a ball at his
@@ -46841,7 +46856,16 @@ fn nearest_ball_controller_for_segment_with_guard(
                 ball_altitude_yards
             } else {
                 0.0
-            });
+            })
+            // Ground truth wins. The pass MODEL altitude is only valid while the ball is
+            // genuinely following its launch parabola; a pass that has already landed and is now
+            // rolling/skidding (or one that wildly overshot its target and is rolling away — a
+            // STALE pending pass) is physically a floor ball, however it was launched. Without
+            // this clamp such a ball is gated as "airborne", so the floor body-contact / trap
+            // logic never fires and it rolls untouched right past players (the reported ghost).
+            // For a genuine aerial in flight `ball_altitude_yards` ≈ the model, so this is a
+            // no-op; the intended receiver bypasses these gates anyway (`is_pass_target`).
+            .min(ball_altitude_yards.max(0.0));
         // Guaranteed trap: a non-aerial (floor) ball within the player's own control radius of
         // their ACTUAL feet is always controlled. A ball passing right under a player's feet is
         // not an "impossible-distance intercept", so it must bypass the kinematic-reach gate —
