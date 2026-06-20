@@ -14842,6 +14842,33 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
 }
+fn soccer_observation_telemetry_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OBSERVATION_TELEMETRY")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+fn soccer_observation_telemetry_min_duration() -> Duration {
+    use std::sync::OnceLock;
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        let ms = std::env::var("DD_SOCCER_OBSERVATION_TELEMETRY_MIN_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(25.0)
+            .clamp(1.0, 10_000.0);
+        Duration::from_secs_f64(ms / 1000.0)
+    })
+}
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
 /// from the real receiver controller, so moving the aim/speed off the analytic misses). Enable for
@@ -18954,7 +18981,9 @@ impl WorldSnapshot {
         observation.decisive_goal_action_pressure =
             near_goal_decisive_action_pressure_score(&observation, me.role);
         let total_elapsed = observation_started.elapsed();
-        if total_elapsed > Duration::from_millis(25) {
+        if soccer_observation_telemetry_enabled()
+            && total_elapsed > soccer_observation_telemetry_min_duration()
+        {
             eprintln!(
                 concat!(
                     "# soccer-observation telemetry tick={} player={} totalMs={:.2} ",
