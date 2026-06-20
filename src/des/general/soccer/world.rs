@@ -26337,7 +26337,7 @@ impl WorldSnapshot {
         } else {
             target.x.max(hold_x)
         };
-        let blend = (0.40 + ball_offset * 0.50).clamp(0.0, 0.90);
+        let blend = (0.58 + ball_offset * 0.50).clamp(0.0, 0.95);
         let new_x = target.x + (pinned_x - target.x) * blend;
         Vec2::new(new_x, target.y).clamp_to_pitch(self.field_width, self.field_length)
     }

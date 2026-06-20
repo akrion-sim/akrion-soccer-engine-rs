@@ -672,7 +672,7 @@ impl TeamTacticalDirective {
             attacking_numbers_advantage: 0,
             attacking_overload_score: 0.0,
             support_depth_yards: 11.0,
-            width_yards: field_width * 0.62,
+            width_yards: field_width * 0.74,
             press_intensity: 0.48,
             pass_priority: 1.0,
             carry_priority: 1.0,
