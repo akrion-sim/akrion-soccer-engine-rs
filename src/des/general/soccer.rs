@@ -2516,6 +2516,45 @@ const WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY: f64 = 0.25;
 const WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS: f64 = 40.0;
 /// Firm-but-controlled power for the lay-off give (skill adds a little).
 const WALL_PASS_GIVE_POWER: f64 = 0.58;
+// Hold-and-summon support ("wait-for-support" / delay-before-pass). A calm, unpressured
+// carrier with NO good forward outlet yet may deliberately keep the ball (shield/slow) and
+// *signal* teammates to improve their position — either push forward into space
+// (`MoveForward`) or step into an open passing lane / their slot (`AssumePosition`) — then
+// release once a teammate has genuinely arrived. These seed the trigger window; the appetite
+// and the eventual pass are emergent (the gate self-terminates once a real outlet exists).
+/// The carrier only *waits* when calm: the nearest opponent must be at least this far away
+/// (it is patience, not a pressured shield — pressured retention is the protect-ball option).
+const HOLD_FOR_SUPPORT_MIN_SPACE_YARDS: f64 = 4.5;
+/// A teammate already ahead with a clean lane and at least this much space is a forward
+/// outlet NOW — so there is nothing to wait for and the gate declines (the carrier passes).
+const HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS: f64 = 3.0;
+/// A summoned forward run must net at least this much ground toward goal to be worth waiting
+/// for (otherwise it is not a meaningful improvement on the current picture).
+const HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS: f64 = 5.0;
+/// Corridor half-width used to test that the lane to a summoned teammate's target is clean.
+const HOLD_FOR_SUPPORT_LANE_RADIUS_YARDS: f64 = 1.6;
+/// The bounded pause: the carrier will hold-and-summon for at most this long before the gate
+/// forces a normal decision (so the delay is a beat to let the play set up, never a stall).
+const HOLD_FOR_SUPPORT_MAX_HOLD_SECONDS: f64 = 1.8;
+/// Safety TTL on the commitment state itself (cleared earlier on a pass / turnover); a touch
+/// longer than the max-hold so the state never outlives the carrier's actual hold.
+const HOLD_FOR_SUPPORT_TTL_SECONDS: f64 = 2.6;
+/// Base appetite to elect the wait (scaled by plan quality, patience, and calmness). It
+/// competes with the recycle/carry/shield options that are all that remain when no forward
+/// outlet is on, so it is a genuine choice rather than a rare one.
+const HOLD_FOR_SUPPORT_BASE_APPETITE: f64 = 0.34;
+/// ...but capped so a calm carrier still mixes in the safe alternatives rather than freezing
+/// on the ball every tick.
+const HOLD_FOR_SUPPORT_MAX_APPETITE: f64 = 0.60;
+/// At most this many teammates are signalled at once (the best-placed candidates).
+const HOLD_FOR_SUPPORT_MAX_SUMMONED: usize = 3;
+/// When summoned to push forward, the advanced-run option is floored to this probability in
+/// the teammate's own off-ball decision (a POMDP boost — they choose to run, not a world push).
+const HOLD_FOR_SUPPORT_SUMMON_RUN_FLOOR: f64 = 0.55;
+/// When summoned to take up position, the check-into-the-lane option is floored to this.
+const HOLD_FOR_SUPPORT_SUMMON_POSITION_FLOOR: f64 = 0.50;
+/// ...and the hold-your-shape option is lifted so the player settles into its slot/open lane.
+const HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE: f64 = 1.25;
 /// Over-the-top run trigger: minimum cos-angle between the holder's facing and the
 /// direction to the runner for "eye contact" (≈ within 60°) — the holder is looking up
 /// at the runner before they commit to breaking the line.
@@ -40004,6 +40043,7 @@ fn tracking_frame_to_world_snapshot(
                 learned_policy: None,
                 recent_reward: None,
                 one_two: None,
+                hold_for_support: None,
                 slide_recovery_seconds: 0.0,
             }
         })
@@ -41339,6 +41379,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         last_decision: None,
         decision_confidence: 1.0,
         one_two: player.one_two,
+        hold_for_support: player.hold_for_support.clone(),
         slide_recovery_seconds: player.slide_recovery_seconds,
     }
 }
@@ -48618,6 +48659,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 last_decision: None,
                 decision_confidence: 1.0,
                 one_two: None,
+                hold_for_support: None,
                 slide_recovery_seconds: 0.0,
             });
         }

@@ -4299,6 +4299,25 @@ impl SoccerMatch {
         }
     }
 
+    /// Bleed off the carrier's hold-and-summon commitment (see [`HoldForSupport`]). It is only
+    /// meaningful while THIS player is on the ball, so it clears the instant the ball leaves its
+    /// feet (a pass / turnover / loose ball) and on the safety TTL — the bounded pause itself is
+    /// enforced in [`WorldSnapshot::hold_for_support_option_for`], which stops re-arming the wait
+    /// once `HOLD_FOR_SUPPORT_MAX_HOLD_SECONDS` has elapsed.
+    fn maintain_hold_for_support_commitments(&mut self) {
+        let holder = self.ball.holder;
+        let clock = self.clock_seconds;
+        for player in self.players.iter_mut() {
+            if let Some(hold) = player.hold_for_support.as_ref() {
+                let still_on_the_ball = holder == Some(player.id);
+                let timed_out = clock - hold.launch_clock_seconds > HOLD_FOR_SUPPORT_TTL_SECONDS;
+                if !still_on_the_ball || timed_out {
+                    player.hold_for_support = None;
+                }
+            }
+        }
+    }
+
     /// Bleed down the grounded-recovery clock of any player flat on the grass after a
     /// missed slide tackle, by one live step of `dt`, and freeze it in place while it is
     /// down (no residual coast). A prone player's decision/intent is skipped entirely in
@@ -4335,6 +4354,7 @@ impl SoccerMatch {
         }
         self.stage_opening_kickoff_if_pending();
         self.maintain_one_two_commitments();
+        self.maintain_hold_for_support_commitments();
         self.maintain_slide_recoveries();
         let step_started = Instant::now();
         let mut pre_field_elapsed = Duration::from_secs(0);
@@ -14421,6 +14441,10 @@ pub struct PlayerSnapshot {
     /// wall partner and the runner can read it from the shared snapshot.
     #[serde(default)]
     pub one_two: Option<OneTwoRun>,
+    /// Live hold-and-summon commitment (mirrors [`PlayerAgent::hold_for_support`]) so the
+    /// summoned teammates can read the carrier's signal from the shared snapshot.
+    #[serde(default)]
+    pub hold_for_support: Option<HoldForSupport>,
     /// Seconds the player is still grounded after a missed slide tackle (mirrors
     /// [`PlayerAgent::slide_recovery_seconds`]); `> 0` means it is prone and out of the
     /// play. Surfaced so teammates/opponents and the UI can read it from the snapshot.
@@ -14951,6 +14975,15 @@ fn soccer_observation_telemetry_min_duration() -> Duration {
         Duration::from_secs_f64(ms / 1000.0)
     })
 }
+/// "Hold-and-summon support" (the carrier's wait-for-support / delay-before-pass strategy and
+/// the matching off-ball summon boost) is ON by default. Set `DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT=1`
+/// to turn the whole mechanic off — the decision path is otherwise byte-identical to baseline,
+/// since the option is only ever *added* in the calm/no-outlet/improvable window.
+fn dd_soccer_disable_hold_for_support() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT").is_ok())
+}
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
 /// from the real receiver controller, so moving the aim/speed off the analytic misses). Enable for
@@ -15333,6 +15366,7 @@ impl WorldSnapshot {
                 learned_policy: None,
                 recent_reward: None,
                 one_two: p.one_two,
+                hold_for_support: p.hold_for_support.clone(),
                 slide_recovery_seconds: p.slide_recovery_seconds,
             })
             .collect::<Vec<_>>();
@@ -20862,9 +20896,14 @@ impl WorldSnapshot {
         let carrier_driving = self.attacking_carrier_driving_at_goal(me.team).is_some();
         // A ball being driven forward at the carrier's feet, or a long/aerial ball in
         // flight, is also an urgent invitation to break in behind — commit the run rather
-        // than holding the staging cadence.
-        let urgent_run_invite =
-            through_ball_invite || carrier_driving || self.forward_attacking_momentum(me.team);
+        // than holding the staging cadence. So is being explicitly summoned forward by a
+        // carrier waiting on support (the "make a run, I'll find you" signal).
+        let summoned_forward =
+            self.support_summon_for(player_id) == Some(SupportSummonKind::MoveForward);
+        let urgent_run_invite = through_ball_invite
+            || carrier_driving
+            || summoned_forward
+            || self.forward_attacking_momentum(me.team);
         // Widen the neutral-build-up staging cadence so more attackers are timing a run at
         // any moment (was ~14/41 ticks → ~19/41), giving the holder more forward options.
         let cadence = (self.tick + player_id as u64 * 17) % 41;
@@ -21339,6 +21378,182 @@ impl WorldSnapshot {
                     .partial_cmp(&b.quality)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+    }
+
+    /// Decide whether a calm carrier with no good forward outlet should DELAY the release and
+    /// summon support — keep the ball (shield/slow) and signal teammates to either push forward
+    /// into space ([`SupportSummonKind::MoveForward`]) or step into an open lane / their slot
+    /// ([`SupportSummonKind::AssumePosition`]). Returns `Some` only inside that narrow window,
+    /// so the carrier's option set is byte-identical to baseline everywhere else (the option is
+    /// only ever *added*, like the wall-pass / scoop options).
+    ///
+    /// Self-terminating on three fronts: it declines the instant a real forward outlet exists
+    /// (a summoned teammate has arrived → the normal pass options release the ball); it stops
+    /// re-arming once the carrier has already waited `HOLD_FOR_SUPPORT_MAX_HOLD_SECONDS` (the
+    /// bounded pause); and the off-ball boost is itself opt-in per the teammate's own POMDP.
+    pub(crate) fn hold_for_support_option_for(
+        &self,
+        carrier_id: usize,
+    ) -> Option<HoldForSupportPlan> {
+        if dd_soccer_disable_hold_for_support() {
+            return None;
+        }
+        let carrier = self.players.iter().find(|p| p.id == carrier_id)?;
+        if self.ball.holder != Some(carrier_id)
+            || self.possession_team() != Some(carrier.team)
+            || carrier.role == PlayerRole::Goalkeeper
+        {
+            return None;
+        }
+        // The bounded pause: stop re-arming the wait once the carrier has already held-and-
+        // summoned long enough. Declining here lets the normal options make a decision now.
+        if let Some(hold) = carrier.hold_for_support.as_ref() {
+            if self.clock_seconds - hold.launch_clock_seconds > HOLD_FOR_SUPPORT_MAX_HOLD_SECONDS {
+                return None;
+            }
+        }
+        let attack_dir = carrier.team.attack_dir();
+        let carrier_pos = self.player_snapshot_position(carrier);
+        // Patience, not panic: only WAIT when calm on the ball. A proximate defender means the
+        // answer is a real on-ball action (shield / release / beat the man), not a pause.
+        let nearest_opp_dist = self
+            .nearest_opponent_at(carrier.team, carrier_pos)
+            .map(|(_, _, dist)| dist)
+            .unwrap_or(f64::INFINITY);
+        if nearest_opp_dist < HOLD_FOR_SUPPORT_MIN_SPACE_YARDS {
+            return None;
+        }
+        let opp = carrier.team.other();
+        // Is a clean, open, onside FORWARD outlet already on? Then there is nothing to wait for —
+        // the carrier should simply pass, so decline (this is what makes the wait self-terminate
+        // the moment a summoned runner actually arrives).
+        let forward_outlet_now = self.players.iter().any(|t| {
+            if t.id == carrier_id || t.team != carrier.team || t.role == PlayerRole::Goalkeeper {
+                return false;
+            }
+            let t_pos = self.player_snapshot_position(t);
+            let forward = (t_pos.y - carrier_pos.y) * attack_dir;
+            forward >= HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
+                && self.nearest_opponent_distance_at(t.team, t_pos)
+                    >= HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS
+                && self.clear_line(carrier_pos, t_pos, opp, HOLD_FOR_SUPPORT_LANE_RADIUS_YARDS)
+                && self.pending_offside_for_pass(carrier_id, t.id).is_none()
+        });
+        if forward_outlet_now {
+            return None;
+        }
+        // No forward outlet now: which teammates could BECOME one with a short run / reposition?
+        let onside_cap_y = self
+            .second_last_defender_line_for(carrier.team)
+            .map(|y| y - attack_dir * ONSIDE_RUN_HOLD_BUFFER_YARDS);
+        // There is forward space to attack only if the carrier is not already pinned at the line.
+        let forward_room = onside_cap_y
+            .map(|cap| (cap - carrier_pos.y) * attack_dir)
+            .unwrap_or(0.0);
+        let mut move_forward: Vec<(usize, f64)> = Vec::new();
+        let mut assume_position: Vec<(usize, f64)> = Vec::new();
+        for t in self.players.iter() {
+            if t.id == carrier_id || t.team != carrier.team || t.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let t_pos = self.player_snapshot_position(t);
+            // MoveForward candidate: an onside advanced run in this teammate's channel that would
+            // open a clean forward outlet from the carrier (mids/forwards make these runs).
+            if matches!(t.role, PlayerRole::Forward | PlayerRole::Midfielder) {
+                if let Some(cap_y) = onside_cap_y {
+                    let run_target = Vec2::new(t_pos.x, cap_y)
+                        .clamp_to_pitch(self.field_width, self.field_length);
+                    let run_gain = (run_target.y - t_pos.y) * attack_dir;
+                    let outlet_gain = (run_target.y - carrier_pos.y) * attack_dir;
+                    if run_gain >= HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
+                        && outlet_gain >= HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
+                        && self.clear_line(
+                            carrier_pos,
+                            run_target,
+                            opp,
+                            HOLD_FOR_SUPPORT_LANE_RADIUS_YARDS,
+                        )
+                    {
+                        let space =
+                            (self.space_score_at(run_target, carrier.team) / 12.0).clamp(0.0, 1.0);
+                        move_forward.push((t.id, space));
+                        continue;
+                    }
+                }
+            }
+            // AssumePosition candidate: this teammate's lane is blocked NOW, but a short step into
+            // its open space would open a clean lane (find the passing angle / take up position).
+            let blocked_now =
+                !self.clear_line(carrier_pos, t_pos, opp, HOLD_FOR_SUPPORT_LANE_RADIUS_YARDS);
+            if blocked_now {
+                let open_target = self.open_space_for(t.id, t.home_position);
+                // Not a backward bail-out: the repositioned outlet must not drop well behind the ball.
+                let open_forward = (open_target.y - carrier_pos.y) * attack_dir;
+                if open_forward >= -HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
+                    && self.clear_line(
+                        carrier_pos,
+                        open_target,
+                        opp,
+                        HOLD_FOR_SUPPORT_LANE_RADIUS_YARDS,
+                    )
+                    && self.nearest_opponent_distance_at(t.team, open_target)
+                        >= HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS
+                {
+                    let space =
+                        (self.space_score_at(open_target, carrier.team) / 12.0).clamp(0.0, 1.0);
+                    assume_position.push((t.id, space));
+                }
+            }
+        }
+        // Prefer pushing teammates forward when there is space ahead to attack; otherwise ask
+        // them to find the open lane / take up position. (A `move_forward` candidate only exists
+        // when `forward_room >= HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS` — its run target IS the
+        // onside cap — so the first branch already covers every viable forward summon.)
+        let (kind, mut candidates) = if forward_room >= HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
+            && !move_forward.is_empty()
+        {
+            (SupportSummonKind::MoveForward, move_forward)
+        } else if !assume_position.is_empty() {
+            (SupportSummonKind::AssumePosition, assume_position)
+        } else {
+            return None;
+        };
+        // Best-placed candidates first, capped to a few.
+        candidates
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(HOLD_FOR_SUPPORT_MAX_SUMMONED);
+        let best_space = candidates.first().map(|(_, s)| *s).unwrap_or(0.0);
+        let depth =
+            (candidates.len() as f64 / HOLD_FOR_SUPPORT_MAX_SUMMONED as f64).clamp(0.0, 1.0);
+        let calm = ((nearest_opp_dist - HOLD_FOR_SUPPORT_MIN_SPACE_YARDS) / 6.0).clamp(0.0, 1.0);
+        let quality = (best_space * 0.50 + depth * 0.28 + calm * 0.22).clamp(0.0, 1.0);
+        let summoned: Vec<usize> = candidates.into_iter().map(|(id, _)| id).collect();
+        Some(HoldForSupportPlan {
+            kind,
+            summoned,
+            quality,
+        })
+    }
+
+    /// What (if anything) this player's on-ball teammate is signalling it to do — the off-ball
+    /// read of a carrier's [`HoldForSupport`]. `None` unless the player is one of the carrier's
+    /// summoned teammates. Drives the matching support run / positioning in the player's OWN
+    /// off-ball decision (a POMDP boost, not a world override).
+    pub(crate) fn support_summon_for(&self, player_id: usize) -> Option<SupportSummonKind> {
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        let holder = self.ball.holder?;
+        if holder == player_id {
+            return None;
+        }
+        let carrier = self.players.iter().find(|p| p.id == holder)?;
+        if carrier.team != me.team {
+            return None;
+        }
+        let hold = carrier.hold_for_support.as_ref()?;
+        hold.summoned
+            .iter()
+            .any(|&id| id == player_id)
+            .then_some(hold.kind)
     }
 
     /// The onside burst target for a player who has just played the give in a one-two —
