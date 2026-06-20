@@ -8545,7 +8545,9 @@ impl SoccerMatch {
                         let f = self
                             .kick_power_factor_for(player_id, kd)
                             .max(SHOT_MIN_KICK_POWER_FACTOR);
-                        self.ball.velocity = kd * (speed * f);
+                        let launch_speed = (speed * f)
+                            .clamp(mph_to_yps(SHOT_MIN_SPEED_MPH), mph_to_yps(SHOT_MAX_SPEED_MPH));
+                        self.ball.velocity = kd * launch_speed;
                     }
                     self.ball.curl_acceleration = release.curl_acceleration;
                     self.ball.altitude_yards = release.altitude_yards;
@@ -11903,6 +11905,46 @@ impl SoccerMatch {
         {
             self.set_dead_ball_player_position(player_id, slot);
         }
+
+        let defending_team = team.other();
+        let back_line_y = throw_in_no_offside_defender_line_y(defending_team, spot.y, length);
+        let defending_ids = self.set_play_role_ids(defending_team, PlayerRole::Defender, None);
+        let tracking_slots = receiver_slots
+            .iter()
+            .filter_map(|slot| {
+                throw_in_no_offside_defender_tracking_target(
+                    defending_team,
+                    spot.y,
+                    *slot,
+                    width,
+                    length,
+                )
+            })
+            .collect::<Vec<_>>();
+        let defending_slots = defending_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, player_id)| {
+                self.players
+                    .iter()
+                    .find(|player| player.id == *player_id)
+                    .map(|player| {
+                        let home_slot =
+                            Vec2::new(player.home_position.x.clamp(6.0, width - 6.0), back_line_y);
+                        let tracked_slot = tracking_slots
+                            .get(idx.min(tracking_slots.len().saturating_sub(1)))
+                            .copied()
+                            .unwrap_or(home_slot);
+                        Vec2::new(
+                            home_slot.x * (1.0 - THROW_IN_RUNNER_TRACK_LATERAL_WEIGHT)
+                                + tracked_slot.x * THROW_IN_RUNNER_TRACK_LATERAL_WEIGHT,
+                            tracked_slot.y,
+                        )
+                        .clamp_to_pitch(width, length)
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.assign_dead_ball_slots_lane_stable(&defending_ids, &defending_slots);
     }
 
     /// Clamp a dead-ball slot so an attacker is not placed beyond the defending
@@ -29595,7 +29637,7 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn shot_lane_clear(&self, from: Vec2, attacking_team: Team, radius: f64) -> bool {
-        let speed = mph_to_yps(60.0);
+        let speed = mph_to_yps(SHOT_MAX_SPEED_MPH);
         let threshold = if radius <= 2.0 { 0.18 } else { 0.34 };
         shot_block_assessment_for_snapshot(self, from, attacking_team, speed, false)
             .map(|assessment| assessment.probability <= threshold)

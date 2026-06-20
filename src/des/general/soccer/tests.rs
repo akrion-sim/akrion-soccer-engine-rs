@@ -17551,6 +17551,19 @@ fn soccer_simulation_trace_exports_json_and_jsonl_records() {
         records.last().unwrap()["summary"]["ticks"],
         trace.summary.ticks
     );
+    let physics_smoke = soccer_simulation_physics_smoke_report(&trace);
+    assert_eq!(
+        records.last().unwrap()["physicsSmoke"]["framesAnalyzed"],
+        trace.frames.len() as u64
+    );
+    assert_eq!(
+        records.last().unwrap()["physicsSmoke"]["fullTimeReached"],
+        physics_smoke.full_time_reached
+    );
+    assert_eq!(
+        records.last().unwrap()["physicsSmoke"]["violationCount"],
+        physics_smoke.violation_count as u64
+    );
     assert_eq!(
         records.last().unwrap()["tacticalLiveness"]["passAttempts"],
         trace
@@ -23650,6 +23663,65 @@ fn physics_smoke_report_flags_impossible_frame_jump() {
 }
 
 #[test]
+fn physics_smoke_report_flags_non_gk_exact_stationary_run_over_three_seconds() {
+    let mut trace = run_simulation(
+        MatchConfig {
+            seed: 13_608,
+            ..MatchConfig::playback_trace(4.0)
+        },
+        1,
+    );
+    let stuck_player_id = trace.frames[0]
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+        .expect("away non-goalkeeper")
+        .id;
+    let away_keeper_id = trace.frames[0]
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
+        .expect("away goalkeeper")
+        .id;
+    let stuck_spot = Vec2::new(31.25, 58.75);
+    let keeper_spot = Vec2::new(40.0, 8.0);
+    for frame in &mut trace.frames {
+        for player in &mut frame.players {
+            if player.id == stuck_player_id {
+                player.position = stuck_spot;
+                player.velocity = Vec2::zero();
+                player.acceleration = Vec2::zero();
+            } else if player.id == away_keeper_id {
+                player.position = keeper_spot;
+                player.velocity = Vec2::zero();
+                player.acceleration = Vec2::zero();
+            }
+        }
+    }
+
+    let report = soccer_simulation_physics_smoke_report(&trace);
+
+    assert!(!report.ok());
+    assert!(
+        report.violations.iter().any(|violation| {
+            violation.subject == format!("player:{stuck_player_id}")
+                && violation.metric == "exactStationarySeconds"
+                && violation.value > 3.0
+        }),
+        "non-GK exact-position stall should be reported: {:?}",
+        report.violations
+    );
+    assert!(
+        !report.violations.iter().any(|violation| {
+            violation.subject == format!("player:{away_keeper_id}")
+                && violation.metric == "exactStationarySeconds"
+        }),
+        "goalkeeper exact-position holds are allowed: {:?}",
+        report.violations
+    );
+}
+
+#[test]
 fn live_physics_report_flags_impossible_history_jump() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         seed: 13_061,
@@ -25709,6 +25781,49 @@ fn elite_shot_speed_can_reach_sixty_mph_cap() {
 
     assert!(speed <= mph_to_yps(60.0) + 1e-9);
     assert!(speed >= mph_to_yps(59.0));
+}
+
+#[test]
+fn shoot_action_launches_at_least_forty_mph_even_off_balance() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 25_716,
+        ..Default::default()
+    });
+    let shooter = 9usize;
+    park_players_except(&mut sim, &[shooter]);
+    sim.players[shooter].team = Team::Home;
+    sim.players[shooter].role = PlayerRole::Forward;
+    sim.players[shooter].position = Vec2::new(40.0, 92.0);
+    sim.players[shooter].velocity = Vec2::new(
+        0.0,
+        -player_top_speed_yps(sim.players[shooter].role, &sim.players[shooter].skills),
+    );
+    sim.players[shooter].skills.shooting = 1.0;
+    sim.players[shooter].skills.right_foot_shot_power = 1.0;
+    sim.players[shooter].skills.left_foot_shot_power = 1.0;
+    sim.players[shooter].skills.strength = 1.0;
+    sim.ball.holder = Some(shooter);
+    sim.ball.position = sim.players[shooter].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: shooter,
+        action: SoccerAction::Shoot { power: 0.0 },
+        sprint: false,
+    });
+
+    let speed = sim.ball.velocity.len();
+    assert!(
+        speed >= mph_to_yps(SHOT_MIN_SPEED_MPH) - 1e-9,
+        "a Shoot action should launch at least 40mph even off balance, got {:.2}mph",
+        speed / mph_to_yps(1.0)
+    );
+    assert!(
+        speed <= mph_to_yps(SHOT_MAX_SPEED_MPH) + 1e-9,
+        "a Shoot action should remain inside the 60mph cap, got {:.2}mph",
+        speed / mph_to_yps(1.0)
+    );
 }
 
 #[test]
@@ -47235,6 +47350,146 @@ fn throw_in_holds_opponents_two_yards_off_the_ball() {
         sim.players[opponent].position, near,
         "throw-in keep-out is only 2yd — a defender 4yd away is not pushed back"
     );
+}
+
+#[test]
+fn throw_in_defenders_drop_behind_ball_because_offside_is_off() {
+    for (throwing_team, defending_team, spot) in [
+        (Team::Home, Team::Away, Vec2::new(0.0, 60.0)),
+        (Team::Away, Team::Home, Vec2::new(80.0, 60.0)),
+    ] {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: false,
+            learning_logging_enabled: false,
+            formation_lp_enabled: true,
+            max_human_players: 0,
+            ..Default::default()
+        });
+        sim.apply_restart(BallRestart {
+            kind: BallRestartKind::ThrowIn,
+            awarded_team: throwing_team,
+            position: spot,
+        });
+        let line_y = throw_in_no_offside_defender_line_y(
+            defending_team,
+            spot.y,
+            sim.config.field_length_yards,
+        );
+        let defenders = sim
+            .players
+            .iter()
+            .filter(|player| player.team == defending_team && player.role == PlayerRole::Defender)
+            .collect::<Vec<_>>();
+        assert!(!defenders.is_empty());
+        for defender in defenders {
+            let depth = (spot.y - defender.position.y) * defending_team.attack_dir();
+            assert!(
+                depth >= THROW_IN_NO_OFFSIDE_DEFENDER_DEPTH_YARDS - 1e-6,
+                "{defending_team:?} defender {} should stage at least 25yd goal-side of throw-in ball, got {depth}",
+                defender.id
+            );
+            assert!((defender.position.y - line_y).abs() < 1e-6);
+        }
+
+        let before = WorldSnapshot::from_match(&sim);
+        let mut rng = mulberry32(25_015);
+        sim.central_brain.run_time_step(&before, &mut rng);
+        let solved = WorldSnapshot::from_match(&sim);
+        let lp_targets = solved
+            .formation_lp_guidance
+            .iter()
+            .filter(|guidance| guidance.team == defending_team)
+            .filter(|guidance| {
+                sim.players
+                    .iter()
+                    .find(|player| player.id == guidance.player_id)
+                    .is_some_and(|player| player.role == PlayerRole::Defender)
+            })
+            .collect::<Vec<_>>();
+        assert!(!lp_targets.is_empty());
+        for guidance in lp_targets {
+            let depth = (spot.y - guidance.target.y) * defending_team.attack_dir();
+            assert!(
+                depth >= THROW_IN_NO_OFFSIDE_DEFENDER_DEPTH_YARDS - 1e-6,
+                "{defending_team:?} defender {} LP target should stay at least 25yd goal-side of throw-in ball, got {depth}",
+                guidance.player_id
+            );
+        }
+    }
+}
+
+#[test]
+fn throw_in_defenders_track_no_offside_runners_up_to_thirty_yards() {
+    for (throwing_team, defending_team, spot, runner_x) in [
+        (Team::Home, Team::Away, Vec2::new(0.0, 60.0), 20.0),
+        (Team::Away, Team::Home, Vec2::new(80.0, 60.0), 60.0),
+    ] {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: false,
+            learning_logging_enabled: false,
+            formation_lp_enabled: true,
+            max_human_players: 0,
+            ..Default::default()
+        });
+        sim.apply_restart(BallRestart {
+            kind: BallRestartKind::ThrowIn,
+            awarded_team: throwing_team,
+            position: spot,
+        });
+        let runner_target = Vec2::new(
+            runner_x,
+            spot.y + throwing_team.attack_dir() * THROW_IN_RUNNER_TRACK_DEPTH_YARDS,
+        );
+        let call = sim.active_set_play.as_mut().expect("throw-in set play");
+        let runner = call
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.role == SoccerSetPlayAssignmentRole::PrimaryRunner)
+            .expect("primary throw-in runner");
+        runner.target = runner_target;
+
+        let before = WorldSnapshot::from_match(&sim);
+        let mut rng = mulberry32(30_030);
+        sim.central_brain.run_time_step(&before, &mut rng);
+        let solved = WorldSnapshot::from_match(&sim);
+        let defender_targets = solved
+            .formation_lp_guidance
+            .iter()
+            .filter(|guidance| guidance.team == defending_team)
+            .filter(|guidance| {
+                solved
+                    .players
+                    .iter()
+                    .find(|player| player.id == guidance.player_id)
+                    .is_some_and(|player| player.role == PlayerRole::Defender)
+            })
+            .collect::<Vec<_>>();
+        assert!(!defender_targets.is_empty());
+
+        let deepest = defender_targets
+            .iter()
+            .max_by(|a, b| {
+                let a_depth = (spot.y - a.target.y) * defending_team.attack_dir();
+                let b_depth = (spot.y - b.target.y) * defending_team.attack_dir();
+                a_depth
+                    .partial_cmp(&b_depth)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("deepest defender target");
+        let depth = (spot.y - deepest.target.y) * defending_team.attack_dir();
+        assert!(
+            (depth - THROW_IN_RUNNER_TRACK_DEPTH_YARDS).abs() < 1e-6,
+            "{defending_team:?} defender {} should track the throw-in runner up to 30yd from the throw-in spot, got {depth}",
+            deepest.player_id
+        );
+        assert!(
+            (deepest.target.x - runner_target.x).abs() <= 18.0,
+            "{defending_team:?} defender {} should lane-track the deep throw-in runner, target x {} runner x {}",
+            deepest.player_id,
+            deepest.target.x,
+            runner_target.x
+        );
+    }
 }
 
 #[test]
