@@ -10055,6 +10055,21 @@ impl SoccerMatch {
     }
 
     pub(crate) fn run_ball_time_step(&mut self) {
+        // A shot that has slowed to a roll on the ground is no longer a credible attempt on goal —
+        // it is a loose ball again. While `pending_shot` is set, control is never attempted (the
+        // ball step only resolves control when `pending_shot.is_none()`), so EVERY player is locked
+        // out and runs straight over the dead/dying shot ball without any attempt to collect it,
+        // until the stuck-ball watchdog eventually hoofs it away. Demote it here so it becomes a
+        // normal contestable loose ball. (Goal detection does not depend on `pending_shot` — a ball
+        // crossing the line is still a goal — so a slow shot trickling in is unaffected; and a fast
+        // shot still in flight stays a live shot and is left untouched.)
+        if self.pending_shot.is_some()
+            && self.ball.holder.is_none()
+            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS
+            && self.ball.velocity.len() <= DEAD_SHOT_LOOSE_BALL_SPEED_YPS
+        {
+            self.pending_shot = None;
+        }
         let previous_position = self.ball.position;
         let previous_velocity = self.ball.velocity;
         let previous_acceleration = self.ball.acceleration;

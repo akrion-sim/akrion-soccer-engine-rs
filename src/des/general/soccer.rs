@@ -562,6 +562,10 @@ const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
 const SHOT_BAILOUT_DISPOSSESSION_RISK: f64 = 0.80;
 const SHOT_BAILOUT_ON_FRAME_PROBABILITY: f64 = 0.20;
+/// A shot that has decelerated to at or below this ground speed is no longer a credible attempt
+/// on goal — it is a loose ball again and must be contestable/collectable. Above it the ball is
+/// still treated as a live shot (control suppressed so a fast shot is not "trapped" mid-flight).
+const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
@@ -46385,7 +46389,11 @@ fn nearest_ball_controller_for_segment_with_guard(
             let same_tick_launch = current_tick <= pass.launch_tick
                 && progress < PASS_SAME_TICK_BYSTANDER_IGNORE_PROGRESS;
             let is_own_outgoing_pass = pass.from == p.id && pass.target != Some(p.id);
-            let contact_altitude = pass_altitude_at_point(pass, control_point);
+            // Clamp the pass-model arc height to the ACTUAL ball altitude so a landed/overshot
+            // aerial pass (ball physically on the grass, model still high) is correctly treated as
+            // a grounded, contestable ball rather than one flying overhead.
+            let contact_altitude =
+                pass_altitude_at_point(pass, control_point).min(ball_altitude_yards);
             let same_team_launch_bystander =
                 same_tick_launch && p.team == pass.team && !is_target;
             let body_contact_distance = p.position.distance(control_point);
@@ -46632,9 +46640,16 @@ fn nearest_ball_controller_for_segment_with_guard(
         // below must not apply — otherwise they "let it run" past their own pass.
         let is_pass_target = pending_pass.is_some_and(|pass| pass.target == Some(p.id));
         let dist = player_control_position.distance(control_point);
+        // Contact altitude gates whether a player can reach the ball (a high ball flies over a
+        // grounded player). For an aerial pass this is normally read from the pass MODEL's arc —
+        // but an aerial pass that has LANDED or overshot stays pending while the ball physically
+        // sits on the grass, and the model still reports it high in its arc. Reading the model
+        // alone then treats a ball at a player's feet as flying overhead, so nobody is eligible to
+        // control it and players run straight over it. Clamp to the ACTUAL ball altitude: the
+        // physical ball is the authority, so a landed ball is grounded regardless of the stale arc.
         let contact_altitude = pending_pass
             .filter(|pass| pass.flight.is_aerial())
-            .map(|pass| pass_altitude_at_point(pass, control_point))
+            .map(|pass| pass_altitude_at_point(pass, control_point).min(ball_altitude_yards))
             .unwrap_or(if loose_long_ball_team.is_some() {
                 ball_altitude_yards
             } else {

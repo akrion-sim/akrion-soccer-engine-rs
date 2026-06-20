@@ -7684,6 +7684,139 @@ fn ball_decision_trace_records_agentic_schedule_slot() {
 }
 
 #[test]
+fn stationary_loose_ball_at_feet_is_trapped() {
+    // Live capture: a player ends a tick 0.1-0.7yd from a DEAD-STILL loose ball (vel 0, on the
+    // floor) yet runs straight over it without controlling. A floor ball that close to the feet
+    // must be trapped (GUARANTEED_FLOOR_TRAP_RADIUS = 1.5yd; the at-feet clause is 1.0yd).
+    for facing_away in [false, true] {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.2,
+            seed: 404,
+            ..Default::default()
+        });
+        let p = 9;
+        park_players_except(&mut sim, &[p]);
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(40.0, 60.0);
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.acceleration = Vec2::zero();
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        // Player 0.6yd from the ball, running at 8yps either toward or away from it.
+        sim.players[p].position = Vec2::new(40.0, 59.4);
+        let dir = if facing_away { 1.0 } else { -1.0 };
+        sim.players[p].velocity = Vec2::new(0.0, 8.0 * dir);
+        sim.players[p].facing_yaw = if facing_away {
+            std::f64::consts::FRAC_PI_2
+        } else {
+            -std::f64::consts::FRAC_PI_2
+        };
+
+        sim.integrate_ball();
+        assert_eq!(
+            sim.ball.holder,
+            Some(p),
+            "a dead loose ball 0.6yd from the feet must be controlled (facing_away={facing_away})"
+        );
+    }
+}
+
+#[test]
+fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
+    // The real run-over cause: a shot that does not score, is not saved, and slows to rest in the
+    // field of play leaves `pending_shot` set. Control is gated on `pending_shot.is_none()`, so
+    // every player is locked out and runs over the dead ball until the stuck-ball watchdog hoofs
+    // it. A shot ball that has slowed to a near-stop in open play is just a loose ball again.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.2,
+        seed: 405,
+        ..Default::default()
+    });
+    let shooter = 9;
+    let collector = 6;
+    park_players_except(&mut sim, &[shooter, collector]);
+    // Shot was taken a moment ago; the ball has rolled to a near-stop well short of goal.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 70.0);
+    sim.ball.velocity = Vec2::new(0.0, 0.3); // below ball_stop_speed: effectively dead
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.pending_pass = None;
+    sim.pending_shot = Some(PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 40.0),
+    });
+    // A team-mate is right on the dead ball.
+    sim.players[collector].position = Vec2::new(40.0, 70.3);
+    sim.players[collector].velocity = Vec2::zero();
+
+    sim.integrate_ball();
+    assert_eq!(
+        sim.ball.holder,
+        Some(collector),
+        "a dead/rolling shot ball at a team-mate's feet must be collectable, not locked out"
+    );
+}
+
+#[test]
+fn landed_aerial_pass_ball_is_controllable_not_run_over() {
+    // The live run-over cause (confirmed via the control resolver): an AERIAL pass that has
+    // landed/overshot keeps `pending_pass` set while the ball physically rests on the grass. The
+    // control gate read the pass MODEL's arc height (still high) instead of the actual ball
+    // altitude, so a ball at a player's feet was treated as flying overhead — nobody was eligible
+    // and players ran straight over it. Control must use the ACTUAL ball altitude.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.2,
+        seed: 406,
+        ..Default::default()
+    });
+    let passer = 2;
+    let intended = 9; // intended receiver, NOT present at the ball (pass overshot)
+    let collector = 6; // a different player standing on the landed ball
+    park_players_except(&mut sim, &[passer, intended, collector]);
+    // Aerial pass whose model arc peaks around the midpoint.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0); // midpoint of the path => model says high
+    sim.ball.velocity = Vec2::new(0.0, 1.0); // physically settling on the grass
+    sim.ball.altitude_yards = 0.0; // ACTUALLY on the ground
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.pending_pass = Some(PendingPass {
+        team: Team::Home,
+        from: passer,
+        target: Some(intended),
+        flight: PassFlight::Aerial,
+        is_cross: false,
+        launch_tick: 0,
+        origin: Vec2::new(40.0, 40.0),
+        intended_target: Vec2::new(40.0, 80.0),
+        distance_yards: 40.0,
+        receiver_openness: 1.0,
+        passer_skill: 0.9,
+        launch_speed_yps: 22.0,
+        receiver_position_at_launch: Some(Vec2::new(40.0, 80.0)),
+        receiver_velocity_at_launch: Some(Vec2::zero()),
+        offside: None,
+        offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
+    });
+    sim.pending_shot = None;
+    // Sanity: the pass MODEL really does report this point as high in the air (so the test
+    // exercises the stale-altitude gate, not a trivially-grounded ball).
+    sim.players[collector].position = Vec2::new(40.0, 60.3);
+    sim.players[collector].velocity = Vec2::zero();
+
+    sim.integrate_ball();
+    assert_eq!(
+        sim.ball.holder,
+        Some(collector),
+        "a landed aerial-pass ball at a player's feet must be controllable, not run over"
+    );
+}
+
+#[test]
 fn integrate_ball_delegates_to_ball_agent_run_time_step() {
     let mut via_agent = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.2,
@@ -26354,10 +26487,15 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
     );
 
     pass.flight = PassFlight::Aerial;
+    let loft = pass_altitude_at_point(&pass, defender.position);
     assert!(
-        pass_altitude_at_point(&pass, defender.position) > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
+        loft > LOW_BALL_FACING_REQUIRED_ALTITUDE_YARDS,
         "test setup should put the loft above the 6ft body-contact gate"
     );
+    // The ball is genuinely airborne over the defender this step, so its ACTUAL altitude is the
+    // loft (the live engine maintains `ball.altitude_yards` from the pass arc each tick). Control
+    // now clamps the model arc to the actual ball altitude, so feed a realistic airborne value
+    // rather than 0 (a grounded ball) — otherwise this would describe an impossible state.
     let high = nearest_ball_controller_for_segment(
         1,
         previous_ball_pos,
@@ -26367,7 +26505,7 @@ fn low_pass_body_contact_ignores_target_and_facing_but_high_pass_clears() {
         Some(&pass),
         None,
         None,
-        0.0,
+        loft,
         &mut mulberry32(17_741),
     );
     assert_eq!(

@@ -3405,14 +3405,27 @@ function drawCoachHintDrag(r) {
 }
 
 function animateField() {
-  if (state && interpTargetFrame) {
-    const r = pitchRect();
-    const t = interpDuration > 0
-      ? clamp((performance.now() - interpStart) / interpDuration, 0, 1)
-      : 1;
-    drawField(interpolatedFrame(interpPrevFrame, interpTargetFrame, t), r);
+  // A single bad frame (e.g. an unexpected null in one drawField path) must NEVER kill the
+  // render loop: this function re-arms itself via the trailing requestAnimationFrame, so an
+  // uncaught throw would stop that re-arm and freeze the pitch on screen permanently — even
+  // though the sim keeps stepping server-side. Guard the draw and ALWAYS re-arm (finally), and
+  // surface the error once instead of dying silently.
+  try {
+    if (state && interpTargetFrame) {
+      const r = pitchRect();
+      const t = interpDuration > 0
+        ? clamp((performance.now() - interpStart) / interpDuration, 0, 1)
+        : 1;
+      drawField(interpolatedFrame(interpPrevFrame, interpTargetFrame, t), r);
+    }
+  } catch (e) {
+    if (typeof console !== "undefined") console.error("animateField draw error", e);
+    if (typeof statusEl !== "undefined" && statusEl) {
+      statusEl.textContent = "render error (recovered): " + (e && e.message ? e.message : e);
+    }
+  } finally {
+    requestAnimationFrame(animateField);
   }
-  requestAnimationFrame(animateField);
 }
 requestAnimationFrame(animateField);
 
