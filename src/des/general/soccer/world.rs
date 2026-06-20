@@ -16927,7 +16927,7 @@ impl WorldSnapshot {
     }
 
     fn goal_side_defensive_target_for_player(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
-        if player.role == PlayerRole::Goalkeeper
+        if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Forward)
             || self
                 .controlled_possession_team()
                 .or_else(|| self.possession_team())
@@ -16949,7 +16949,7 @@ impl WorldSnapshot {
             PlayerRole::Defender if ball_depth <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS => ball_depth,
             PlayerRole::Defender => DEFENSIVE_GOAL_SIDE_CUSHION_YARDS + 1.25,
             PlayerRole::Midfielder => DEFENSIVE_GOAL_SIDE_CUSHION_YARDS,
-            PlayerRole::Forward => DEFENSIVE_GOAL_SIDE_CUSHION_YARDS * 0.70,
+            PlayerRole::Forward => 0.0,
             PlayerRole::Goalkeeper => 0.0,
         };
         let goal_side_depth = (ball_depth - cushion).max(0.0);
@@ -28887,12 +28887,13 @@ impl WorldSnapshot {
     }
 
     /// Defensive goal-side recovery override: when our team is out of possession, pull
-    /// an off-ball target that has been caught upfield of the ball back onto the own-goal
-    /// side of it (the segment between the ball and our own goal). See the
+    /// an off-ball defender/midfielder target that has been caught upfield of the ball
+    /// back onto the own-goal side of it (the segment between the ball and our own goal).
+    /// Forwards/strikers are exempt so the outlet line can stay high. See the
     /// `DEFENSIVE_GOAL_SIDE_*` constants for the geometry. This is the directive the
     /// learned policy's `defensive_goal_side_reward` only ever nudged toward.
     fn defensive_goal_side_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
-        if player.role == PlayerRole::Goalkeeper {
+        if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Forward) {
             return target;
         }
         // Defending iff the opponent is the possession team. `possession_team` falls back

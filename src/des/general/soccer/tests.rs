@@ -30668,6 +30668,25 @@ fn defensive_reward_prefers_goal_side_of_ball_and_attacker() {
         goal_side_reward > wrong_side_reward + 0.45,
         "goal-side {goal_side_reward}, wrong-side {wrong_side_reward}"
     );
+    assert_eq!(
+        defensive_goal_side_reward_for_role(
+            Team::Home,
+            PlayerRole::Forward,
+            Vec2::new(40.0, 54.0),
+            &wrong_side,
+        ),
+        0.0,
+        "forwards/strikers are exempt from the generic defensive goal-side reward"
+    );
+    assert!(
+        defensive_goal_side_reward_for_role(
+            Team::Home,
+            PlayerRole::Midfielder,
+            Vec2::new(40.0, 54.0),
+            &wrong_side,
+        ) < 0.0,
+        "midfielders still get penalized when caught wrong-side"
+    );
 }
 
 #[test]
@@ -39980,16 +39999,17 @@ fn defensive_target_guard_rejects_static_teammate_occupied_final_space() {
 }
 
 #[test]
-fn defending_pulls_off_ball_player_goal_side_of_ball_but_exempts_presser() {
+fn defending_pulls_off_ball_players_goal_side_but_exempts_presser_and_strikers() {
     // Away has the ball in Home's half; a Home outfielder caught UPFIELD of the ball
     // (between the ball and the goal Home attacks) must be pulled back onto the own-goal
     // side of it. The nearest Home midfielder to the ball — the presser — is exempt,
-    // but defenders must still stay goal-side.
+    // but defenders must still stay goal-side. Strikers are also exempt so they can
+    // remain as the outlet line instead of being dragged behind the ball.
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let away_holder = 17;
     let presser = 6; // Home CM placed right on the ball -> closes it down, stays put.
     let defender = 2; // Home defender near the ball -> still must stay goal-side.
-    let striker = 9; // Home ST caught high -> must recover goal-side.
+    let striker = 9; // Home ST caught high -> exempt from generic goal-side recovery.
     park_players_except(&mut sim, &[away_holder, presser, defender, striker]);
     let ball = Vec2::new(40.0, 40.0);
     sim.ball.holder = Some(away_holder);
@@ -40008,9 +40028,9 @@ fn defending_pulls_off_ball_player_goal_side_of_ball_but_exempts_presser() {
     let striker_guarded =
         snapshot.shape_guarded_movement_point(striker, striker_proposed, &[], striker_home, true);
     assert!(
-        striker_guarded.y <= ball.y - tunables().defensive_shape.defensive_goal_side_min_yards + 1e-6,
-        "out-of-possession striker must be pulled to the own-goal side of the ball: \
-         guarded={striker_guarded:?} ball={ball:?}"
+        striker_guarded.y > ball.y,
+        "out-of-possession striker should be exempt from being pulled goal-side of the ball: \
+         guarded={striker_guarded:?} proposed={striker_proposed:?} ball={ball:?}"
     );
 
     // The presser, given the same upfield proposal, is left free to engage the ball.
@@ -44140,7 +44160,7 @@ fn goal_side_projection_preserves_defender_lateral_lane() {
 }
 
 #[test]
-fn defensive_forward_stops_retreat_at_halfway_line() {
+fn defensive_forward_is_exempt_from_goal_side_projection() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let forward = sim
         .players
@@ -44158,12 +44178,12 @@ fn defensive_forward_stops_retreat_at_halfway_line() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let target =
-        snapshot.defensive_assignment_for(forward, sim.players[forward].home_position, false);
+    let requested = Vec2::new(48.0, 86.0);
+    let target = snapshot.goal_side_defensive_target_for(forward, requested);
 
     assert!(
-        target.y >= snapshot.field_length * 0.5 - 1e-9,
-        "forward should not retreat past halfway even when goal-side is deeper: target={target:?}"
+        (target.y - requested.y).abs() < 1e-9 && (target.x - requested.x).abs() < 1e-9,
+        "forward should be exempt from generic goal-side projection: target={target:?} requested={requested:?}"
     );
 }
 

@@ -1702,8 +1702,9 @@ const CARRIER_LANE_KEEPOUT_HALF_WIDTH_YARDS: f64 = 2.5;
 const CARRIER_LANE_KEEPOUT_PRESSURE_RELIEF_DISTANCE_YARDS: f64 = 4.5;
 // Defensive goal-side recovery. When the opponent has possession — INCLUDING while
 // their pass is in flight (no holder; `possession_team` falls back to last-touch) —
-// every non-pressing outfielder must be on the own-goal side of the ball, i.e. on
-// the segment between the ball and our own goal. An off-ball target that sits
+// every non-pressing defender/midfielder must be on the own-goal side of the ball,
+// i.e. on the segment between the ball and our own goal. Strikers/forwards are
+// exempt so the outlet line can stay high. An off-ball target that sits
 // upfield of the ball (between ball and the opponent goal) is pulled back in y
 // until it is at least `MIN` yds goal-side. Lateral offset is preserved so the
 // back line keeps its width. The nearest outfielder to the ball (the primary
@@ -17027,7 +17028,7 @@ fn dense_soccer_transition_reward(
         let tracking_skill = ability01(player.skills.defensive_tracking);
         reward +=
             (before_distance - after_distance).clamp(-6.0, 6.0) * (0.055 + tracking_skill * 0.045);
-        reward += defensive_goal_side_reward(player.team, before_pos, before);
+        reward += defensive_goal_side_reward_for_role(player.team, player.role, before_pos, before);
         if player.role == PlayerRole::Goalkeeper {
             let before_line_score =
                 goalkeeper_ball_goal_line_alignment_score(player.team, before_pos, before);
@@ -18288,7 +18289,15 @@ fn defensive_role_press_signal(
     }
 }
 
-fn defensive_goal_side_reward(team: Team, player_position: Vec2, snapshot: &WorldSnapshot) -> f64 {
+fn defensive_goal_side_reward_for_role(
+    team: Team,
+    role: PlayerRole,
+    player_position: Vec2,
+    snapshot: &WorldSnapshot,
+) -> f64 {
+    if role == PlayerRole::Forward {
+        return 0.0;
+    }
     // Engage whenever the opponent has possession — including while their pass is in
     // flight (no holder), which is exactly the transition window where recovering
     // goal-side matters most. `possession_team` falls back to `last_touch_team`.
