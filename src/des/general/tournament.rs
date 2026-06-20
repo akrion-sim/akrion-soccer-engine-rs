@@ -27,7 +27,7 @@ use crate::des::general::soccer::{
     SoccerQPolicy, SoccerQPolicyOptions, SoccerTeamQPolicies, Team,
 };
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Tiny deterministic RNG (mulberry32) so the module owns its reproducibility
 /// without threading the engine's `RandomSource` trait through scheduling and
@@ -1401,6 +1401,10 @@ pub struct EngineMatchRunnerConfig {
     /// Base match config (duration, dt, field, neural knobs). The runner forces
     /// `max_human_players = 0` and enables learning/neural so brains can train.
     pub base: MatchConfig,
+    /// Optional wall-clock cap for one fixture. When it trips, only that match is
+    /// aborted: the current score is recorded, pre-match brains are carried
+    /// forward, and the tournament keeps moving.
+    pub match_wall_time_limit: Option<Duration>,
 }
 
 impl Default for EngineMatchRunnerConfig {
@@ -1420,7 +1424,10 @@ impl Default for EngineMatchRunnerConfig {
         // on would let one shared net influence both brains and blur "who is best";
         // disable it so the tournament compares genuinely independent brains.
         base.neural_blend.actor_critic = false;
-        EngineMatchRunnerConfig { base }
+        EngineMatchRunnerConfig {
+            base,
+            match_wall_time_limit: None,
+        }
     }
 }
 
@@ -1473,7 +1480,21 @@ impl TournamentMatchRunner for EngineMatchRunner {
         // Play to the final whistle. The guard is purely an anti-infinite-loop
         // net — sized generously (2× regulation + slack) so period breaks / stoppage
         // never truncate a legitimate match; `is_done()` is the real terminator.
+        let wall_started = Instant::now();
+        eprintln!(
+            "tournament_match_start stage={:?} round={} match={} home={} away={} wall_limit_secs={:.1}",
+            ctx.stage,
+            ctx.round_index,
+            ctx.match_index,
+            ctx.home_id,
+            ctx.away_id,
+            self.config
+                .match_wall_time_limit
+                .map(|limit| limit.as_secs_f64())
+                .unwrap_or(0.0)
+        );
         let mut guard = 0u64;
+        let mut stopped_early: Option<&'static str> = None;
         let max_ticks = sim
             .config
             .total_ticks()
@@ -1482,16 +1503,58 @@ impl TournamentMatchRunner for EngineMatchRunner {
         while !sim.is_done() {
             sim.run_time_step();
             guard += 1;
+            if self
+                .config
+                .match_wall_time_limit
+                .is_some_and(|limit| wall_started.elapsed() >= limit)
+            {
+                stopped_early = Some("wall-timeout");
+                eprintln!(
+                    "tournament_match_wall_timeout home={} away={} wall_secs={:.1} limit_secs={:.1} ticks={} max_ticks={} score={}-{} (aborting fixture only)",
+                    ctx.home_id,
+                    ctx.away_id,
+                    wall_started.elapsed().as_secs_f64(),
+                    self.config
+                        .match_wall_time_limit
+                        .map(|limit| limit.as_secs_f64())
+                        .unwrap_or(0.0),
+                    guard,
+                    max_ticks,
+                    sim.score_home,
+                    sim.score_away
+                );
+                break;
+            }
             if guard > max_ticks {
                 // The guard should never trip for a well-formed match (`is_done()` ends it
                 // first). Surface it instead of silently recording a truncated score, which
                 // would otherwise corrupt standings with no signal.
+                stopped_early = Some("tick-guard");
                 eprintln!(
                     "tournament_match_guard_tripped home={} away={} max_ticks={max_ticks} score={}-{} (did not reach is_done; recording truncated score)",
                     ctx.home_id, ctx.away_id, sim.score_home, sim.score_away
                 );
                 break;
             }
+        }
+        if let Some(reason) = stopped_early {
+            eprintln!(
+                "tournament_match_aborted reason={reason} home={} away={} score={}-{} wall_secs={:.1} ticks={} carry_forward=pre_match",
+                ctx.home_id,
+                ctx.away_id,
+                sim.score_home,
+                sim.score_away,
+                wall_started.elapsed().as_secs_f64(),
+                guard
+            );
+            return Ok(MatchOutcome {
+                home_goals: sim.score_home,
+                away_goals: sim.score_away,
+                home_brain: home.clone(),
+                away_brain: away.clone(),
+                home_training_steps: 0,
+                away_training_steps: 0,
+            });
         }
         // Flush any in-flight neural training so extracted brains are current.
         sim.drain_neural_learning(Duration::from_millis(500));
@@ -1500,6 +1563,17 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let away_goals = sim.score_away;
         let home_training_steps = sim.neural_training_steps_for(Team::Home);
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
+        eprintln!(
+            "tournament_match_finish home={} away={} score={}-{} wall_secs={:.1} ticks={} home_training_steps={} away_training_steps={}",
+            ctx.home_id,
+            ctx.away_id,
+            home_goals,
+            away_goals,
+            wall_started.elapsed().as_secs_f64(),
+            guard,
+            home_training_steps,
+            away_training_steps
+        );
 
         // Carry forward each side's (possibly updated) brain.
         let home_brain = carry_brain(
@@ -2102,7 +2176,10 @@ mod tests {
         base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
         base.neural_learning.train_every_ticks = 1;
         base.neural_learning.hidden_units = 8;
-        let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig { base });
+        let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
+            base,
+            match_wall_time_limit: None,
+        });
 
         let report = tournament.run(&mut runner).expect("engine tournament runs");
 
@@ -2121,6 +2198,45 @@ mod tests {
             .sum();
         assert!(total_steps > 0, "engine bi-learning should train brains");
         assert!(report.champion().brain.neural.is_some());
+    }
+
+    #[test]
+    fn engine_match_wall_time_limit_aborts_fixture_without_training() {
+        let teams = fresh_teams(4, 4343);
+        let tournament = Tournament::new(
+            teams,
+            small_format(),
+            TournamentLearningMode::BiLearning,
+            4343,
+        )
+        .unwrap();
+        let ctx = tournament.match_context(TournamentStage::Group, 0, 0, 0, 1);
+        let home = tournament.teams[tournament.team_index(0)].brain.clone();
+        let away = tournament.teams[tournament.team_index(1)].brain.clone();
+
+        let mut base = MatchConfig::live_gameplay();
+        base.max_human_players = 0;
+        base.duration_seconds = 60.0;
+        base.learning_enabled = true;
+        base.learning_logging_enabled = false;
+        base.full_game_learning_enabled = false;
+        base.neural_learning.enabled = true;
+        base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+        base.neural_learning.train_every_ticks = 1;
+        base.neural_learning.hidden_units = 8;
+        let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
+            base,
+            match_wall_time_limit: Some(Duration::ZERO),
+        });
+
+        let outcome = runner
+            .play(&ctx, &home, &away)
+            .expect("timeout is contained to one fixture");
+
+        assert_eq!(outcome.home_training_steps, 0);
+        assert_eq!(outcome.away_training_steps, 0);
+        assert_eq!(outcome.home_brain.matches_learned, home.matches_learned);
+        assert_eq!(outcome.away_brain.matches_learned, away.matches_learned);
     }
 
     #[test]
