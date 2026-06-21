@@ -20456,8 +20456,15 @@ impl WorldSnapshot {
                 } else {
                     pass_quality.receiver_openness
                 };
+                // For SAFE passes, a high dynamic lane-interception risk strips the half-open
+                // forward completion floor (we'd rather not score up an interceptable ball).
+                // For THREADED/killer candidates (`require_reception_won == false`) we deliberately
+                // KEEP the floor even under high risk: a killer ball through a congested defence is
+                // risky by nature, and per `ranked_threaded_pass_candidates` that risk is priced
+                // into the score, NOT used to hide (truncate) the option out of the candidate pool.
                 let expected_completion_for_score = if half_open_forward_score
-                    && pass_quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH
+                    && (!require_reception_won
+                        || pass_quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH)
                 {
                     pass_quality
                         .expected_completion
