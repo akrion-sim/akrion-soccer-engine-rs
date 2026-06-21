@@ -22253,6 +22253,7 @@ fn realtime_session_captures_goal_moment_windows() {
         team: Some(Team::Home),
         player_id: Some(9),
         description: "Home goal".to_string(),
+        ..MatchEvent::default()
     }]);
 
     let summaries = session.recent_moment_summaries();
@@ -24562,6 +24563,7 @@ fn accounting_smoke_report_flags_exclusive_events_same_tick() {
         team: Some(Team::Home),
         player_id: Some(last.players[0].id),
         description: "test home goal".to_string(),
+        ..MatchEvent::default()
     });
     trace.events.push(MatchEvent {
         tick: last.tick,
@@ -24570,6 +24572,7 @@ fn accounting_smoke_report_flags_exclusive_events_same_tick() {
         team: Some(Team::Home),
         player_id: Some(last.players[0].id),
         description: "test impossible miss".to_string(),
+        ..MatchEvent::default()
     });
 
     let report = soccer_simulation_accounting_smoke_report(&trace);
@@ -24816,6 +24819,7 @@ fn accounting_smoke_report_flags_dribble_beat_stat_mismatch() {
         team: Some(Team::Home),
         player_id: Some(last.players[0].id),
         description: "test dribble beat".to_string(),
+        ..MatchEvent::default()
     });
 
     let report = soccer_simulation_accounting_smoke_report(&trace);
@@ -36480,6 +36484,23 @@ fn offside_geometry_uses_ball_second_last_defender_and_halfway_line() {
     sim.players[9].position = Vec2::new(40.0, 48.0);
     let snapshot = WorldSnapshot::from_match(&sim);
     assert!(snapshot.pending_offside_for_pass(5, 9).is_none());
+
+    sim.call_offside(offside);
+    let event = sim
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "offside")
+        .expect("offside event");
+    assert_eq!(event.offside_line_y, Some(96.0));
+    assert_eq!(event.offside_ball_y, Some(70.0));
+    assert_eq!(event.offside_player_x, Some(40.0));
+    assert_eq!(event.offside_player_y, Some(108.0));
+    let json = serde_json::to_value(event).expect("event json");
+    assert_eq!(json["offsideLineY"], 96.0);
+    assert_eq!(json["offsideBallY"], 70.0);
+    assert_eq!(json["offsidePlayerX"], 40.0);
+    assert_eq!(json["offsidePlayerY"], 108.0);
 }
 
 #[test]
@@ -37471,6 +37492,63 @@ fn uncontested_carrier_pulls_off_ball_attackers_forward_not_back() {
         !snapshot.position_would_be_offside(Team::Home, support.point),
         "forward support push must stay onside: {:?}",
         support.point
+    );
+}
+
+#[test]
+fn front_line_carrier_pulls_support_runners_even_when_marked() {
+    // The holder is the second-furthest-forward outfielder: only one teammate is
+    // ahead. Even with a marker close enough to disable the "uncontested carrier"
+    // cue, off-ball attackers should sprint and run forward to give the carrier
+    // options instead of leaving him isolated at the front of the attack.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 6;
+    let runner = 9;
+    let ahead_teammate = 10;
+    let marker = 12;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(40.0, 80.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for home in 1..11 {
+        if home != carrier && home != runner && home != ahead_teammate {
+            sim.players[home].position = Vec2::new(20.0 + home as f64, 54.0);
+        }
+    }
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[runner].position = Vec2::new(43.0, 70.0);
+    sim.players[runner].home_position = Vec2::new(43.0, 58.0);
+    sim.players[ahead_teammate].position = Vec2::new(48.0, 84.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(30.0 + (away - 11) as f64 * 2.0, 118.0);
+    }
+    sim.players[marker].position = Vec2::new(41.0, 81.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.uncontested_carrier_advancing(Team::Home).is_none(),
+        "close marker should disable the old unpressured-carrier cue"
+    );
+    assert!(
+        snapshot.front_line_carrier_support_cue(Team::Home).is_some(),
+        "carrier with only one teammate ahead should be a front-line support cue"
+    );
+    assert!(
+        snapshot.attacking_support_sprint_active(Team::Home),
+        "front-line carrier should trigger off-ball sprint support"
+    );
+
+    let support = snapshot.attacking_support_movement_for(
+        runner,
+        sim.players[runner].home_position,
+        false,
+    );
+    let forward_yards = (support.point.y - sim.players[runner].position.y) * Team::Home.attack_dir();
+    assert!(
+        forward_yards >= UNCONTESTED_SUPPORT_PUSH_YARDS + 1.0,
+        "runner should push forward for a front-line carrier: target={:?} current={:?}",
+        support.point,
+        sim.players[runner].position
     );
 }
 
@@ -50816,21 +50894,36 @@ fn pass_through_a_defender_in_the_lane_is_down_weighted() {
         pass_target_quality_for_snapshot(&snap, p, p_pos, t, t_pos, PassFlight::Floor)
             .expected_completion
     };
+    let lane_risk = |sim: &SoccerMatch| -> f64 {
+        WorldSnapshot::from_match(sim)
+            .pass_lane_interception_risk(
+                passer_pos,
+                receiver_pos,
+                Team::Away,
+                2.5,
+                17.0,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk
+    };
 
     // Defender parked dead in the passing lane = a ball straight through them.
     sim.players[blocker].position = Vec2::new(40.0, 49.0);
     sim.players[blocker].velocity = Vec2::zero();
     let blocked = completion(&sim);
+    let blocked_risk = lane_risk(&sim);
 
     // Same defender, off to the side (not in the corridor) = clear lane.
     sim.players[blocker].position = Vec2::new(62.0, 49.0);
     sim.players[blocker].velocity = Vec2::zero();
     let clear = completion(&sim);
+    let clear_risk = lane_risk(&sim);
 
     // Currently 3yd off the lane but SPRINTING into it: priced between clear and blocked.
     sim.players[blocker].position = Vec2::new(43.0, 49.0);
     sim.players[blocker].velocity = Vec2::new(-8.0, 0.0);
     let drifting = completion(&sim);
+    let drifting_risk = lane_risk(&sim);
 
     assert!(
         blocked < clear * 0.5,
@@ -50841,6 +50934,11 @@ fn pass_through_a_defender_in_the_lane_is_down_weighted() {
         drifting > blocked && drifting < clear,
         "a defender drifting into the lane is worse than a clear lane but not as bad as one \
              already sitting in it: clear={clear} drifting={drifting} blocked={blocked}"
+    );
+    assert!(
+        blocked_risk > 0.95 && drifting_risk >= PASS_LANE_DYNAMIC_RISK_HIGH && clear_risk < 0.20,
+        "POMDP/MPC lane risk should ask whether the lane is clear now or in the next two seconds: \
+         blocked={blocked_risk} drifting={drifting_risk} clear={clear_risk}"
     );
 }
 
@@ -64774,6 +64872,21 @@ fn static_soccer_page_loads_trace_from_split_stream_assets() {
     assert!(
         !html.contains("\"frames\":[") && !html.contains("\"frames\": ["),
         "static HTML shell should not inline a large JSON frames array"
+    );
+}
+
+#[test]
+fn live_offside_flash_uses_pass_time_snapshot_values() {
+    let html = include_str!("../soccer_live_ui.html");
+    assert!(html.contains("function offsideSnapshotFromEvent"));
+    assert!(html.contains("offsidePlayerX"));
+    assert!(html.contains("beyond line"));
+    assert!(html.contains("line.secondLastDefenderY ?? line.effectiveLineY"));
+    assert!(html.contains("ctx.arc(offender.x, offender.y"));
+    assert!(html.contains("BALL PLAYED"));
+    assert!(
+        !html.contains("const p = (state.frame?.players || []).find(pl => pl.id === offsideEvent.playerId)"),
+        "live offside flash should not fall back to the post-restart player position"
     );
 }
 
