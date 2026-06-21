@@ -130,6 +130,55 @@ const PASS_LANE_DECISION_LOOKAHEAD_SECONDS: f64 = 2.0;
 const PASS_LANE_DYNAMIC_RISK_HIGH: f64 = 0.62;
 const PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH: f64 = 0.74;
 const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
+// ---------------------------------------------------------------------------
+// Bayesian opponent-press belief (lightweight Beta-Bernoulli filter).
+// ---------------------------------------------------------------------------
+// A POMDP only yields Bayesian effects if a belief is actually maintained. The
+// analytic pass-lane interception risk (`pass_lane_interception_risk`) prices a
+// lane from the CURRENT geometry alone — it has no memory of whether THIS
+// opponent has actually been stepping into lanes. This layer carries a per-player
+// posterior over each player's propensity to press / step toward the ball (their
+// "will they really cut this lane?" tendency), updated online from observed
+// closing behaviour with a conjugate Beta-Bernoulli update and an exponential
+// forget toward the prior. The posterior mean shades the geometric lane risk into
+// a Bayesian POSTERIOR risk that feeds pass selection: a proven aggressor
+// amplifies the priced risk, a passive sitter discounts it. Pure arithmetic, no
+// RNG => deterministic / parity-safe; OFF by default, and a disabled match leaves
+// the belief map empty so risk is byte-identical to the analytic-only path.
+//
+// Future hook: the prior (α0, β0) can be seeded per opponent/team from retrieved
+// similar moments in Postgres ("this defender closes this lane 70% of the time")
+// instead of the neutral prior, without changing any consumer.
+//
+// Neutral prior Beta(α0, β0): mean 0.5, deliberately weak so a few seconds of
+// observation can move it.
+const OPPONENT_PRESS_PRIOR_ALPHA: f64 = 2.0;
+const OPPONENT_PRESS_PRIOR_BETA: f64 = 2.0;
+// Only players within this radius of the ball are "in a position to contest", so
+// only they generate a press/hold observation this tick; everyone else just
+// forgets toward the prior.
+const OPPONENT_PRESS_OBSERVE_RADIUS_YARDS: f64 = 14.0;
+// Closing speed toward the ball that counts as a full "stepping in" observation (e=1).
+const OPPONENT_PRESS_REFERENCE_CLOSING_YPS: f64 = 4.0;
+// Pseudo-count added per observed tick (fractional via soft evidence e in [0,1]).
+const OPPONENT_PRESS_OBSERVATION_WEIGHT: f64 = 1.0;
+// Memory time-constant of the exponential forget toward the prior (seconds): the
+// belief reflects roughly the last ~2s of behaviour, so a defender switching from
+// sitting to pressing is re-learned quickly.
+const OPPONENT_PRESS_FORGET_TAU_SECONDS: f64 = 2.0;
+// Posterior mean that maps to "no change" to the geometric risk (the prior mean).
+const OPPONENT_PRESS_NEUTRAL_TENDENCY: f64 = 0.5;
+// Clamp on the risk modulation factor: a passive defender discounts the priced lane
+// risk to ~0.5x, a proven aggressor amplifies it to ~1.4x.
+const OPPONENT_PRESS_RISK_MODULATION_FLOOR: f64 = 0.5;
+const OPPONENT_PRESS_RISK_MODULATION_CEIL: f64 = 1.4;
+// Hard cap on the total pseudo-count alpha+beta. The exponential forget already bounds the
+// concentration at any positive dt, but a degenerate dt of 0 (some playback/trace configs)
+// makes the forget factor 1.0 (no decay) and lets the counts grow every tick toward f64
+// overflow -> NaN. Capping the concentration (scaling alpha,beta proportionally so the mean is
+// preserved) keeps the belief finite and bounds how certain it can ever get. At normal dt the
+// fixed point is ~40, far below this, so it never bites in live play.
+const OPPONENT_PRESS_MAX_CONCENTRATION: f64 = 400.0;
 // During the launch tick, same-team bystanders ignore the first sliver of an outgoing pass so
 // the passer cannot ping it into a teammate standing on top of the kick animation. After this
 // progress, normal controllable-trajectory logic may take over.
@@ -2856,9 +2905,20 @@ const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 6;
 const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
     + SOCCER_NEURAL_FIELD_MOTION_BALLS)
     * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
-/// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` migrate by zero-padding the block.
-const SOCCER_NEURAL_FEATURE_DIM: usize =
-    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+/// Bayesian opponent-press belief block appended after the whole-field motion block: a compact
+/// summary (nearest / mean / max centered press tendency of nearby opponents + belief coverage)
+/// of the per-opponent posterior the analytic pass-lane risk is shaded by. Lets the learned
+/// value/critic and policy condition on the belief and learn to exploit a passive marker or
+/// respect a proven aggressor, instead of relying only on the hand-coded risk modulation. All
+/// channels are centered at 0 (neutral), so when the belief is disabled the block is all-zeros
+/// and an older net migrates by zero-padding it.
+const SOCCER_NEURAL_OPP_BELIEF_DIM: usize = 4;
+const SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS: f64 = 18.0;
+/// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total) migrate by
+/// zero-padding the appended blocks.
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_FEATURE_DIM
+    + SOCCER_NEURAL_FIELD_MOTION_DIM
+    + SOCCER_NEURAL_OPP_BELIEF_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3030,6 +3090,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     324,
     186,
     SOCCER_NEURAL_BASE_FEATURE_DIM,
+    // Previous total dim (base + whole-field motion), before the opponent-press belief block.
+    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -4818,6 +4880,13 @@ pub struct SoccerDecisionContext {
     /// each decision on every player's grid spot + smooth motion vector.
     #[serde(default)]
     pub field_player_motion: Vec<f32>,
+    /// Bayesian opponent-press belief summary (length `SOCCER_NEURAL_OPP_BELIEF_DIM`): nearest /
+    /// mean / max centered press tendency of nearby opponents + belief coverage. Lets the neural
+    /// value/critic and policy learn to exploit a passive marker or respect a proven aggressor,
+    /// rather than relying only on the hand-coded lane-risk modulation. Empty/zeros when the
+    /// belief is disabled. See [`soccer_opponent_belief_block`].
+    #[serde(default)]
+    pub opponent_belief: Vec<f32>,
     #[serde(default)]
     pub ball_position: Vec2,
     #[serde(default)]
@@ -12537,6 +12606,15 @@ pub struct MatchConfig {
     /// disabled match is byte-identical to one where no such window arises.
     #[serde(default)]
     pub disable_slide_tackle: bool,
+    /// Enable the lightweight Bayesian opponent-press belief: a per-player
+    /// Beta-Bernoulli posterior over how readily each opponent steps into pass
+    /// lanes, which shades the analytic pass-lane interception risk into a Bayesian
+    /// posterior risk for pass selection. OFF by default; also forced on
+    /// process-wide by `DD_SOCCER_OPPONENT_BELIEF`. Disabled => the belief map stays
+    /// empty and lane risk is byte-identical to the analytic-only path. See
+    /// [`opponent_belief_enabled`].
+    #[serde(default)]
+    pub opponent_belief_enabled: bool,
     pub max_human_players: usize,
     pub seed: u32,
 }
@@ -12577,6 +12655,7 @@ impl Default for MatchConfig {
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
             disable_tick_order_shuffle: false,
             disable_slide_tackle: false,
+            opponent_belief_enabled: false,
             max_human_players: 4,
             seed: 2026,
         }
@@ -15574,6 +15653,77 @@ fn soccer_decision_target_point(
 /// retrieval moment vector uses). Players are ordered own-team then opponents,
 /// each by ascending player id, and the ball occupies the final fixed slot.
 /// Pure arithmetic over the snapshot — cheap enough to run for every decision.
+/// Whole-field Bayesian opponent-press belief block for the actor's decision (length
+/// `SOCCER_NEURAL_OPP_BELIEF_DIM`). Summarises how aggressively the nearby OPPONENTS press —
+/// the learned posterior that the analytic pass-lane risk is shaded by — so the value/critic
+/// and policy can condition on it. Channels (all centered at the neutral prior, so 0 = "no
+/// signal / off"): nearest opponent's tendency, mean and max tendency within
+/// `SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS`, and belief coverage (fraction of nearby
+/// opponents we actually hold a belief on). When the belief is disabled the snapshot's tendency
+/// map is empty, every opponent reads as neutral, and the block is all-zeros — byte-identical
+/// to a legacy net's zero-pad.
+fn soccer_opponent_belief_block(
+    snapshot: &WorldSnapshot,
+    actor_id: usize,
+    actor_team: Team,
+) -> Vec<f32> {
+    let actor_pos = snapshot
+        .player_position(actor_id)
+        .unwrap_or(snapshot.ball.position);
+    let mut nearest_tendency = OPPONENT_PRESS_NEUTRAL_TENDENCY;
+    let mut nearest_distance = f64::INFINITY;
+    let mut sum_centered = 0.0;
+    let mut max_centered = f64::NEG_INFINITY;
+    let mut near_count = 0usize;
+    let mut observed_count = 0usize;
+    for opponent in snapshot.players.iter().filter(|p| p.team != actor_team) {
+        let pos = snapshot.player_position(opponent.id).unwrap_or(actor_pos);
+        let distance = (pos - actor_pos).len();
+        let entry = snapshot.opponent_press_tendency.get(&opponent.id).copied();
+        // Absent belief reads as the neutral prior, so it contributes no shift.
+        let tendency = entry.unwrap_or(OPPONENT_PRESS_NEUTRAL_TENDENCY);
+        let centered = tendency - OPPONENT_PRESS_NEUTRAL_TENDENCY;
+        if distance < nearest_distance {
+            nearest_distance = distance;
+            nearest_tendency = tendency;
+        }
+        if distance <= SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS {
+            sum_centered += centered;
+            max_centered = max_centered.max(centered);
+            near_count += 1;
+            if entry.is_some() {
+                observed_count += 1;
+            }
+        }
+    }
+    let nearest_centered = if nearest_distance.is_finite() {
+        nearest_tendency - OPPONENT_PRESS_NEUTRAL_TENDENCY
+    } else {
+        0.0
+    };
+    let mean_centered = if near_count > 0 {
+        sum_centered / near_count as f64
+    } else {
+        0.0
+    };
+    let max_centered = if near_count > 0 && max_centered.is_finite() {
+        max_centered
+    } else {
+        0.0
+    };
+    let coverage = if near_count > 0 {
+        observed_count as f64 / near_count as f64
+    } else {
+        0.0
+    };
+    vec![
+        nearest_centered as f32,
+        mean_centered as f32,
+        max_centered as f32,
+        coverage as f32,
+    ]
+}
+
 fn soccer_field_player_motion_block(
     snapshot: &WorldSnapshot,
     actor_id: usize,
@@ -15900,6 +16050,7 @@ fn soccer_decision_context_for(
         actor_velocity,
         actor_acceleration,
         field_player_motion: soccer_field_player_motion_block(before, player_id, team),
+        opponent_belief: soccer_opponent_belief_block(before, player_id, team),
         ball_position: before.ball.position,
         ball_velocity: before.ball.velocity,
         ball_acceleration: before.ball.acceleration,
@@ -30585,9 +30736,26 @@ fn soccer_neural_transition_features_with_action(
     // unfilled — a short/absent block — must stay 0.
     let mut features = [0.0_f64; SOCCER_NEURAL_FEATURE_DIM];
     features[..SOCCER_NEURAL_BASE_FEATURE_DIM].copy_from_slice(&base_features);
+    // The whole-field motion block fills exactly SOCCER_NEURAL_FIELD_MOTION_DIM slots after the
+    // base; the zip stops there even though the tail is now longer (it also holds the belief
+    // block), leaving the belief slots at 0 until filled below.
     for (slot, value) in features[SOCCER_NEURAL_BASE_FEATURE_DIM..]
         .iter_mut()
         .zip(transition.decision_context.field_player_motion.iter())
+    {
+        *slot = if value.is_finite() {
+            f64::from(*value)
+        } else {
+            0.0
+        };
+    }
+    // Append the Bayesian opponent-press belief block after the motion block. Empty/neutral
+    // (all-zeros) when the belief is disabled, so this tail stays 0 and a legacy net
+    // (input_dim == the previous total) migrates by zero-padding it.
+    let belief_start = SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+    for (slot, value) in features[belief_start..]
+        .iter_mut()
+        .zip(transition.decision_context.opponent_belief.iter())
     {
         *slot = if value.is_finite() {
             f64::from(*value)
@@ -40335,6 +40503,9 @@ fn tracking_frame_to_world_snapshot(
         away_recycle_urgency: 0.0,
         home_recycle_participants: Vec::new(),
         away_recycle_participants: Vec::new(),
+        // A tracking-frame reconstruction has no per-tick belief history; an empty map
+        // means the analytic pass-lane risk is used unchanged.
+        opponent_press_tendency: HashMap::new(),
     }
 }
 
@@ -41746,6 +41917,34 @@ fn dd_soccer_disable_slide_tackle() -> bool {
 /// parent module so both the decision (`player`) and execution (`world`) layers see it.
 fn slide_tackle_enabled(config: &MatchConfig) -> bool {
     !dd_soccer_disable_slide_tackle() && !config.disable_slide_tackle
+}
+
+fn dd_soccer_opponent_belief_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_OPPONENT_BELIEF").is_ok())
+}
+
+/// Whether the Bayesian opponent-press belief is live for this match: off unless the
+/// per-match config opts in or the process-wide `DD_SOCCER_OPPONENT_BELIEF` env flag is
+/// set. Defined on the parent module so both the per-tick update and the consuming
+/// pass-lane risk (`world`) read one source of truth.
+fn opponent_belief_enabled(config: &MatchConfig) -> bool {
+    dd_soccer_opponent_belief_enabled() || config.opponent_belief_enabled
+}
+
+/// Convert a posterior press tendency theta-hat in [0,1] into a multiplicative factor on the
+/// analytic pass-lane interception risk: the prior-mean tendency (0.5) maps to 1.0 (no
+/// change), a passive defender discounts the priced risk, a proven aggressor amplifies it.
+/// Bounded so the belief shades the geometric estimate without ever dominating it.
+fn opponent_press_risk_modulation(tendency: f64) -> f64 {
+    if !tendency.is_finite() {
+        return 1.0;
+    }
+    (tendency / OPPONENT_PRESS_NEUTRAL_TENDENCY).clamp(
+        OPPONENT_PRESS_RISK_MODULATION_FLOOR,
+        OPPONENT_PRESS_RISK_MODULATION_CEIL,
+    )
 }
 
 fn tackle_foul_probability(

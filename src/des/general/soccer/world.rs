@@ -71,6 +71,70 @@ pub(crate) struct CachedAdversarialEmbeddingSignals {
     signals: Option<SoccerAdversarialEmbeddingSignals>,
 }
 
+/// Per-player Beta-Bernoulli posterior over how readily a player presses / steps
+/// toward the ball (a proxy for their pass-lane interception propensity).
+/// `mean()` = alpha / (alpha + beta). Updated online with soft Bernoulli evidence and
+/// an exponential forget toward the neutral prior, so it tracks the last ~tau seconds
+/// of behaviour; pure arithmetic (no RNG) => deterministic / parity-safe. See the
+/// `OPPONENT_PRESS_*` constants and [`SoccerMatch::update_opponent_press_beliefs`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpponentPressBelief {
+    alpha: f64,
+    beta: f64,
+}
+
+impl Default for OpponentPressBelief {
+    fn default() -> Self {
+        OpponentPressBelief {
+            alpha: OPPONENT_PRESS_PRIOR_ALPHA,
+            beta: OPPONENT_PRESS_PRIOR_BETA,
+        }
+    }
+}
+
+impl OpponentPressBelief {
+    /// Posterior mean tendency theta-hat in (0,1). Falls back to the neutral prior mean if the
+    /// concentration is ever non-finite or non-positive (it cannot be in normal operation, but
+    /// the guard keeps a single bad sample from propagating NaN into pass selection).
+    pub(crate) fn mean(&self) -> f64 {
+        let total = self.alpha + self.beta;
+        let mean = self.alpha / total;
+        if total > 0.0 && mean.is_finite() {
+            mean
+        } else {
+            OPPONENT_PRESS_NEUTRAL_TENDENCY
+        }
+    }
+
+    /// One filter step: exponential forget toward the prior (so the belief tracks the
+    /// last ~tau seconds), then, when an observation is available this tick, fold soft
+    /// Bernoulli evidence `e` in [0,1] ("how strongly is this player stepping toward the
+    /// ball right now?") as a conjugate Beta update. Non-finite evidence is dropped (treated as
+    /// "no observation") and the concentration is capped so the counts stay finite even when the
+    /// forget factor is 1.0 (dt == 0).
+    pub(crate) fn step(&mut self, forget: f64, observation: Option<f64>) {
+        let forget = forget.clamp(0.0, 1.0);
+        self.alpha =
+            OPPONENT_PRESS_PRIOR_ALPHA + forget * (self.alpha - OPPONENT_PRESS_PRIOR_ALPHA);
+        self.beta = OPPONENT_PRESS_PRIOR_BETA + forget * (self.beta - OPPONENT_PRESS_PRIOR_BETA);
+        if let Some(e) = observation {
+            if e.is_finite() {
+                let e = e.clamp(0.0, 1.0);
+                self.alpha += OPPONENT_PRESS_OBSERVATION_WEIGHT * e;
+                self.beta += OPPONENT_PRESS_OBSERVATION_WEIGHT * (1.0 - e);
+            }
+        }
+        // Cap the concentration (mean-preserving) so alpha+beta cannot grow without bound when
+        // there is no effective decay (forget == 1.0 at dt == 0).
+        let total = self.alpha + self.beta;
+        if total > OPPONENT_PRESS_MAX_CONCENTRATION && total.is_finite() {
+            let scale = OPPONENT_PRESS_MAX_CONCENTRATION / total;
+            self.alpha *= scale;
+            self.beta *= scale;
+        }
+    }
+}
+
 pub struct SoccerMatch {
     pub config: MatchConfig,
     pub tick: u64,
@@ -277,6 +341,12 @@ pub struct SoccerMatch {
     /// resolved it. Only updated while `config.mpc.reconcile_enabled`; otherwise
     /// stays at its zero default. Runtime telemetry — never serialized.
     pub(crate) mpc_reconcile_stats: SoccerMpcReconcileStats,
+    /// Per-player Bayesian press belief (Beta-Bernoulli posterior over how readily each
+    /// player steps into pass lanes), advanced each tick by
+    /// [`Self::update_opponent_press_beliefs`] while `opponent_belief_enabled`. Empty (and
+    /// never updated) when the feature is off, so pass-lane risk is byte-identical to the
+    /// analytic-only path. Pure runtime state — never serialized.
+    pub(crate) opponent_press_belief: HashMap<usize, OpponentPressBelief>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -1057,6 +1127,7 @@ impl SoccerMatch {
             decision_trace_by_player: BTreeMap::new(),
             mpc_player_controllers: HashMap::new(),
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
+            opponent_press_belief: HashMap::new(),
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -4378,6 +4449,57 @@ impl SoccerMatch {
         }
     }
 
+    /// Advance the per-player Bayesian press belief one tick (a lightweight Beta-Bernoulli
+    /// filter). For each player within contesting range of the ball we fold a soft Bernoulli
+    /// observation of how strongly they are stepping toward it (closing speed toward the ball,
+    /// normalized); every player also forgets toward the neutral prior, so the belief reflects
+    /// the last ~tau seconds. The resulting posterior tendency shades the analytic pass-lane
+    /// interception risk in [`WorldSnapshot::pass_lane_interception_risk`]. No-op (and the
+    /// belief map is left empty) unless `opponent_belief_enabled`, so a disabled match is
+    /// byte-identical. Deterministic (no RNG) => parity-safe.
+    pub(crate) fn update_opponent_press_beliefs(&mut self, snapshot: &WorldSnapshot) {
+        if !opponent_belief_enabled(&self.config) {
+            return;
+        }
+        let dt = self.config.dt_seconds.max(0.0);
+        let forget = (-dt / OPPONENT_PRESS_FORGET_TAU_SECONDS.max(1e-3)).exp();
+        let ball = snapshot.ball.position;
+        for p in &snapshot.players {
+            let position = snapshot.player_snapshot_position(p);
+            let to_ball = ball - position;
+            let distance = to_ball.len();
+            let observation = if distance <= OPPONENT_PRESS_OBSERVE_RADIUS_YARDS && distance > 1e-6 {
+                // Soft Bernoulli evidence: how strongly is this player closing on the ball
+                // right now (proactive press) vs holding/dropping off? Compute the raw closing
+                // speed first and only fold it if finite — `.max(0.0)` would otherwise silently
+                // coerce a non-finite velocity into a spurious "holding" (e = 0) observation.
+                let velocity = snapshot.player_velocity(p.id).unwrap_or(p.velocity);
+                let closing = velocity.dot(to_ball.normalized());
+                if closing.is_finite() {
+                    Some((closing.max(0.0) / OPPONENT_PRESS_REFERENCE_CLOSING_YPS).clamp(0.0, 1.0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.opponent_press_belief
+                .entry(p.id)
+                .or_default()
+                .step(forget, observation);
+        }
+    }
+
+    /// Snapshot view of the current per-player posterior press tendency theta-hat in [0,1],
+    /// copied by value into each [`WorldSnapshot`]. Empty when the belief is disabled, so
+    /// consumers fall back to the analytic lane risk unchanged.
+    pub(crate) fn opponent_press_tendency_map(&self) -> HashMap<usize, f64> {
+        self.opponent_press_belief
+            .iter()
+            .map(|(id, belief)| (*id, belief.mean()))
+            .collect()
+    }
+
     pub fn run_time_step(&mut self) {
         if self.is_done() {
             return;
@@ -4432,6 +4554,11 @@ impl SoccerMatch {
         let phase_started = Instant::now();
         let brain_input_snapshot = WorldSnapshot::from_match_for_agent_decision(self);
         pre_field_snapshot_elapsed += phase_started.elapsed();
+        // Advance the Bayesian opponent-press belief from this tick's geometry BEFORE the
+        // per-player decision snapshots are built in the field loop, so pass selection reads
+        // the fresh posterior. No-op when the feature is disabled. (Reuses the snapshot above
+        // for geometry only — its embedded tendency map is last tick's and unused here.)
+        self.update_opponent_press_beliefs(&brain_input_snapshot);
         let score_home_before = self.score_home;
         let score_away_before = self.score_away;
         // `reward_events` is a per-tick scratch buffer: every consumer reads only
@@ -14813,6 +14940,13 @@ pub struct WorldSnapshot {
     pub(crate) home_recycle_participants: Vec<usize>,
     #[serde(default)]
     pub(crate) away_recycle_participants: Vec<usize>,
+    /// Per-player Bayesian press tendency theta-hat in [0,1] (posterior mean of the match's
+    /// opponent-press belief), copied in by value at snapshot build. Read by
+    /// [`Self::pass_lane_interception_risk`] to turn the analytic geometric risk into a
+    /// Bayesian posterior risk. Empty => feature off => analytic risk unchanged. Rebuilt each
+    /// tick, never serialized.
+    #[serde(skip)]
+    pub(crate) opponent_press_tendency: HashMap<usize, f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15780,6 +15914,7 @@ impl WorldSnapshot {
             away_recycle_urgency,
             home_recycle_participants,
             away_recycle_participants,
+            opponent_press_tendency: m.opponent_press_tendency_map(),
         }
     }
 
@@ -30548,6 +30683,18 @@ impl WorldSnapshot {
             let gap_risk = (1.0 - gap_to_corridor / 8.0).clamp(0.0, 1.0);
             let local_risk =
                 projected_risk.max((timing_risk * 0.72 + gap_risk * 0.28).clamp(0.0, 1.0));
+            // Bayesian posterior: shade the geometric "could step into the lane" risk by THIS
+            // opponent's learned propensity to actually press. An empty tendency map (feature
+            // off, or a defender never observed near the ball) leaves the analytic risk
+            // unchanged — byte-identical to the analytic-only path. A defender already IN the
+            // corridor is handled by the hard short-circuit above, so this only modulates the
+            // PREDICTIVE step-in risk, which is exactly what the belief is uncertain about.
+            let local_risk = match self.opponent_press_tendency.get(&p.id) {
+                Some(&tendency) => {
+                    (local_risk * opponent_press_risk_modulation(tendency)).clamp(0.0, 1.0)
+                }
+                None => local_risk,
+            };
             risk = risk.max(local_risk);
         }
 
