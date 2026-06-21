@@ -2830,15 +2830,39 @@ function drawPitchGridOverlay(r) {
 }
 function drawAssistantOffsideLines(r) {
   for (const line of assistantOffsideLines()) {
-    const x = mapPoint({x: 0, y: Number(line.effectiveLineY || 0)}, r).x;
-    ctx.beginPath();
-    ctx.moveTo(x, r.y);
-    ctx.lineTo(x, r.y + r.h);
-    ctx.strokeStyle = line.attackingTeam === "Home" ? "rgba(31,111,235,.72)" : "rgba(214,69,69,.72)";
-    ctx.lineWidth = 2;
-    ctx.setLineDash([9, 7]);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    const color = line.attackingTeam === "Home" ? "rgba(31,111,235,.78)" : "rgba(214,69,69,.78)";
+    const faint = line.attackingTeam === "Home" ? "rgba(31,111,235,.30)" : "rgba(214,69,69,.30)";
+    // PRIMARY: the second-last-defender line — the classic offside line, where offside is judged
+    // (NOT the ball position). This determines whether an attacker is in an offside position.
+    const defY = Number(line.secondLastDefenderY);
+    if (Number.isFinite(defY)) {
+      const x = mapPoint({x: 0, y: defY}, r).x;
+      ctx.beginPath();
+      ctx.moveTo(x, r.y);
+      ctx.lineTo(x, r.y + r.h);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([9, 7]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color;
+      ctx.font = "10px sans-serif";
+      ctx.fillText("offside (2nd-last def)", x + 4, r.y + 12);
+    }
+    // SECONDARY (faint): the EFFECTIVE limit = max(2nd-last defender, ball, halfway). It jumps to
+    // the ball when the ball is ahead of the defenders — drawn faintly so both are visible.
+    const effY = Number(line.effectiveLineY);
+    if (Number.isFinite(effY) && (!Number.isFinite(defY) || Math.abs(effY - defY) > 0.3)) {
+      const x = mapPoint({x: 0, y: effY}, r).x;
+      ctx.beginPath();
+      ctx.moveTo(x, r.y);
+      ctx.lineTo(x, r.y + r.h);
+      ctx.strokeStyle = faint;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 6]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
 }
 // On an offside call, draw a solid red line across the pitch at the spot offside
@@ -5251,7 +5275,12 @@ async function stepOnce(options = {}) {
     if (offsideEvent) {
       const lines = assistantOffsideLines();
       const line = lines.find(l => l.attackingTeam === offsideEvent.team) || lines[0];
-      let lineY = line ? Number(line.effectiveLineY) : null;
+      // Freeze at the second-last-defender line (where offside is judged when the ball is played),
+      // not the ball-following effective limit; fall back to the effective line, then the player.
+      let lineY = line ? Number(line.secondLastDefenderY) : null;
+      if (lineY == null || !Number.isFinite(lineY)) {
+        lineY = line ? Number(line.effectiveLineY) : null;
+      }
       if (lineY == null || !Number.isFinite(lineY)) {
         const p = (state.frame?.players || []).find(pl => pl.id === offsideEvent.playerId);
         lineY = p?.position ? Number(p.position.y) : null;

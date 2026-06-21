@@ -15171,6 +15171,14 @@ fn dd_soccer_disable_runaround_dribble() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RUNAROUND_DRIBBLE").is_ok())
 }
+fn dd_soccer_disable_foremost_carrier_support() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FOREMOST_CARRIER_SUPPORT").is_ok())
+}
+// A teammate this far ahead (toward the opponent goal) of the carrier counts as "in front",
+// so the carrier is only "furthest forward" when nobody is meaningfully ahead of it.
+const FOREMOST_CARRIER_AHEAD_MARGIN_YARDS: f64 = 2.0;
 /// Demo lever: relax the tight run-around gate (speed-advantage + lane/2nd-defender clearances)
 /// so the move triggers whenever it is remotely viable, to watch it locally. The geometry +
 /// in-play checks still apply. Unset = the realistic tight gate.
@@ -15964,6 +15972,32 @@ impl WorldSnapshot {
         Some((holder_id, holder_pos))
     }
 
+    /// The team's ball-carrier is the FURTHEST-FORWARD outfield teammate — the strong cue for
+    /// everyone else to sprint forward in support, so the carrier is not left as the lone advanced
+    /// man with no forward outlet (a common cause of stalls and turnovers). Pressure-independent
+    /// (unlike `uncontested_carrier_advancing`). Gated (default on) by
+    /// `DD_SOCCER_DISABLE_FOREMOST_CARRIER_SUPPORT`.
+    pub(crate) fn carrier_is_foremost_teammate(&self, team: Team) -> Option<usize> {
+        if dd_soccer_disable_foremost_carrier_support() {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team || holder.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let attack = team.attack_dir();
+        let holder_fwd = self.player_snapshot_position(holder).y * attack;
+        let someone_ahead = self.players.iter().any(|player| {
+            player.team == team
+                && player.id != holder_id
+                && player.role != PlayerRole::Goalkeeper
+                && self.player_snapshot_position(player).y * attack
+                    > holder_fwd + FOREMOST_CARRIER_AHEAD_MARGIN_YARDS
+        });
+        (!someone_ahead).then_some(holder_id)
+    }
+
     pub(crate) fn attacking_support_sprint_active(&self, team: Team) -> bool {
         matches!(
             self.tactical_directive(team).attack_strategy,
@@ -15973,6 +16007,7 @@ impl WorldSnapshot {
             || self.team_speed_surge_active(team)
             || self.forward_attacking_momentum(team)
             || self.uncontested_carrier_advancing(team).is_some()
+            || self.carrier_is_foremost_teammate(team).is_some()
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
@@ -20306,7 +20341,10 @@ impl WorldSnapshot {
                 // Defender drifting into the lane (clear now, not for the whole flight):
                 // a penalty, not a veto — an open forward option can still win, but a safer
                 // ball is preferred when the scores are close.
-                let anticipation_penalty = if anticipation_clear { 0.0 } else { 2.4 };
+                // Price a reachable interceptor (a defender who can step into the lane before the
+                // ball passes) harder, so the policy avoids passes that get cut out rather than
+                // merely nudging away from them. Bumped 2.4->3.4 to cut intercepted/misplaced balls.
+                let anticipation_penalty = if anticipation_clear { 0.0 } else { 3.4 };
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let dist = me_position.distance(position);
                 let support_fit = (dist - directive.support_depth_yards).abs();
@@ -28870,7 +28908,11 @@ impl WorldSnapshot {
             return point;
         }
         let attack = me.team.attack_dir();
-        let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
+        // Push forward in support when a teammate is carrying unpressured OR when the carrier is the
+        // furthest-forward teammate (the strong "get ahead of the ball" trigger) — either way the
+        // free/lone carrier should be supported forward in numbers, not left to dribble alone.
+        let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some()
+            || self.carrier_is_foremost_teammate(me.team).is_some();
         // In our own half a drop to receive is still valid — unless a teammate is carrying
         // the ball unpressured, which is the cue to push up and support forward instead.
         if !uncontested_support
