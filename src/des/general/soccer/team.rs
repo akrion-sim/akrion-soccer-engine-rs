@@ -3216,6 +3216,37 @@ pub(crate) fn soccer_formation_lp_objective_weights(
     weights
 }
 
+/// Local demo/testing override: force EVERY team's committed attack strategy to a chosen one so a
+/// specific combination pattern actually plays out and can be watched live (e.g.
+/// `SOCCER_FORCE_ATTACK_STRATEGY=give-and-go-central` for wall passes, `wing-overlap-left-cross` for
+/// overlaps, `third-man-run-central`, ...). Matches against `TeamAttackStrategy::as_str`. Unset (or
+/// an unrecognized name) = no effect, so normal play / learning is unchanged. Opt-in env, so set it
+/// only on the local server you want to demo — cluster jobs that don't set it are unaffected.
+fn soccer_forced_attack_strategy() -> Option<TeamAttackStrategy> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<TeamAttackStrategy>> = OnceLock::new();
+    *V.get_or_init(|| {
+        let raw = std::env::var("SOCCER_FORCE_ATTACK_STRATEGY").ok()?;
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+        let parsed = TeamAttackStrategy::ALL
+            .into_iter()
+            .find(|strategy| strategy.as_str() == raw);
+        match parsed {
+            Some(strategy) => eprintln!(
+                "# soccer: FORCING attack strategy = {} (SOCCER_FORCE_ATTACK_STRATEGY)",
+                strategy.as_str()
+            ),
+            None => eprintln!(
+                "# soccer: SOCCER_FORCE_ATTACK_STRATEGY='{raw}' matched no strategy; ignoring"
+            ),
+        }
+        parsed
+    })
+}
+
 /// Specialize the (single, guardrailed) LP objective toward the team's COMMITTED
 /// play, so it optimizes the right thing per strategy: a pressing trap maximizes
 /// high turnovers, a defensive shape prizes compactness/xGA and conserves energy,
@@ -4860,6 +4891,16 @@ impl CentralBrain {
             directive.attack_strategy = commitment.attack;
             directive.pair_attack_strategy = commitment.sub;
             directive.defense_strategy = commitment.defense;
+        }
+        // Local demo/testing override (gated by SOCCER_FORCE_ATTACK_STRATEGY; no-op when unset):
+        // pin the committed attack strategy so a chosen combination pattern (give-and-go wall
+        // passes, wing overlaps, ...) actually plays out and can be watched live. Recompute the
+        // nested sub-maneuver so the forced strategy's pair play (below) is consistent.
+        if let Some(forced) = soccer_forced_attack_strategy() {
+            directive.attack_strategy = forced;
+            commitment.attack = forced;
+            commitment.sub = select_nested_sub_maneuver(forced, ball_x, width, has_ball);
+            directive.pair_attack_strategy = commitment.sub;
         }
         // Execute the nested Pair maneuver concurrently with the Team shape by
         // overlaying its effect on the directive params the players read.
