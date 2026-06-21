@@ -8100,6 +8100,10 @@ impl SoccerMatch {
                 let dir = to_target / dist;
                 let speed = (dist * RUNAROUND_KNOCK_SPEED_PER_YARD)
                     .clamp(RUNAROUND_KNOCK_MIN_SPEED_YPS, RUNAROUND_KNOCK_MAX_SPEED_YPS);
+                // Firm first touch: push the ball off the foot past the carrier's own control reach
+                // so it is not re-grabbed the same tick and actually travels past the defender.
+                self.ball.position = (ball_pos + dir * RUNAROUND_KNOCK_NUDGE_YARDS)
+                    .clamp_to_pitch(self.config.field_width_yards, self.config.field_length_yards);
                 self.ball.velocity = dir * speed;
                 self.ball.altitude_yards = 0.0;
                 self.ball.curl_acceleration = Vec2::zero();
@@ -15186,7 +15190,9 @@ const RUNAROUND_DEFENDER_LATERAL_YARDS: f64 = 2.5;
 const RUNAROUND_DEFENDER_RANGE_YARDS: f64 = 5.5;
 const RUNAROUND_MIN_SPEED_ADVANTAGE: f64 = 0.4;
 const RUNAROUND_PUSH_AHEAD_YARDS: f64 = 4.5;
-const RUNAROUND_PUSH_LATERAL_YARDS: f64 = 1.6;
+// Push wide enough of the defender that the ball clears their reach as it goes by (a too-narrow
+// knock is simply intercepted — a listed failure mode).
+const RUNAROUND_PUSH_LATERAL_YARDS: f64 = 2.6;
 const RUNAROUND_RECOLLECT_AHEAD_YARDS: f64 = 7.0;
 const RUNAROUND_RECOLLECT_CLEAR_YARDS: f64 = 6.0;
 const RUNAROUND_LANE_HALF_WIDTH_YARDS: f64 = 1.0;
@@ -15194,9 +15200,14 @@ const RUNAROUND_TOUCHLINE_MARGIN_YARDS: f64 = 2.5;
 const RUNAROUND_MIN_QUALITY: f64 = 0.45;
 // Knock pace: sized to the push distance so the ball rolls just past the defender into the
 // re-collect zone without being overhit (a listed failure mode).
-const RUNAROUND_KNOCK_SPEED_PER_YARD: f64 = 1.4;
-const RUNAROUND_KNOCK_MIN_SPEED_YPS: f64 = 6.0;
-const RUNAROUND_KNOCK_MAX_SPEED_YPS: f64 = 11.0;
+// Faster knock so the ball is past the committed defender before they react (beat the reaction
+// lag); too slow and the defender simply steps across and intercepts.
+const RUNAROUND_KNOCK_SPEED_PER_YARD: f64 = 1.9;
+const RUNAROUND_KNOCK_MIN_SPEED_YPS: f64 = 8.0;
+const RUNAROUND_KNOCK_MAX_SPEED_YPS: f64 = 14.0;
+/// Immediate push of the ball off the foot on the knock — far enough past the carrier's own control
+/// reach (~2.3yd) that it isn't re-grabbed the same tick, so it actually travels past the defender.
+const RUNAROUND_KNOCK_NUDGE_YARDS: f64 = 2.7;
 
 /// Quality + geometry of a viable run-around dribble (see [`RunaroundDribble`]). The carrier reads
 /// this as a gated pre-empt appetite, mirroring the wall-pass plan.
