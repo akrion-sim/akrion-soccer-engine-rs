@@ -67764,6 +67764,54 @@ fn completed_one_two_return_credits_runner_and_wall() {
 }
 
 #[test]
+fn third_man_run_credits_the_running_receiver_not_a_static_outlet() {
+    // A -> B (feed), then B -> C where C is the running THIRD MAN. C must be credited for the run,
+    // and an otherwise-identical C standing still must get strictly less (no combination-run bonus).
+    let a = 5usize;
+    let b = 6usize;
+    let c = 7usize;
+    let c_reward = |c_forward_velocity: f64| -> f64 {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        sim.players[a].position = Vec2::new(40.0, 40.0);
+        sim.players[b].position = Vec2::new(42.0, 48.0);
+        sim.players[c].position = Vec2::new(44.0, 60.0);
+        // First pass A -> B registers the chain link into B (making C the third man).
+        let feed = test_pending_pass(
+            Team::Home,
+            a,
+            b,
+            sim.players[a].position,
+            sim.players[b].position,
+        );
+        sim.ball.position = feed.intended_target;
+        sim.record_completed_pass_reward(&feed, b);
+        // Second pass B -> C, with C running forward (or static) onto the ball.
+        let mut second = test_pending_pass(
+            Team::Home,
+            b,
+            c,
+            sim.players[b].position,
+            sim.players[c].position,
+        );
+        second.receiver_velocity_at_launch = Some(Vec2::new(0.0, c_forward_velocity));
+        sim.ball.position = second.intended_target;
+        sim.reward_events.clear();
+        sim.record_completed_pass_reward(&second, c);
+        sim.reward_events
+            .iter()
+            .filter(|e| e.player_id == c)
+            .map(|e| e.amount)
+            .sum()
+    };
+    let running = c_reward(5.0);
+    let static_outlet = c_reward(0.0);
+    assert!(
+        running > static_outlet,
+        "a third man running onto the ball must out-earn a static receiver: running={running} static={static_outlet}"
+    );
+}
+
+#[test]
 fn give_and_go_strategy_commits_to_wall_pass_and_runner_expectation() {
     let mut sim = wall_pass_scenario();
     sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;

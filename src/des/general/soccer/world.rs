@@ -5549,6 +5549,7 @@ impl SoccerMatch {
         self.record_completed_pass_chain_entry(pass, receiver);
         self.note_mpc_completed_pass_chain_latent(pass.team, receiver);
         self.record_completed_wall_pass_reward(pass, receiver);
+        self.record_combination_run_reward(pass, receiver);
     }
 
     /// Extra credit for completing a WALL PASS (one-two / give-and-go): the receiver of this pass is
@@ -5584,6 +5585,70 @@ impl SoccerMatch {
         // The runner (who beat the man via the one-two) gets full credit; the wall a share.
         self.record_reward_event(receiver, bonus);
         self.record_reward_event(pass.from, bonus * COMPLETED_WALL_PASS_WALL_CREDIT_SHARE);
+    }
+
+    /// Distinct credit to a RECEIVER who completes a combination via an off-ball forward RUN: a
+    /// THIRD-MAN run (a prior pass fed this passer; the receiver is the running third man) or an
+    /// OVERLAP (the receiver arrived wider than and beyond the passer on the same flank). Gated on
+    /// the receiver actually moving forward onto the ball so it rewards the RUN, not a static
+    /// outlet. Complements the passer-side "pass into stride" reward (which credits the passer).
+    /// Gated; default ON, byte-identical to baseline when disabled.
+    fn record_combination_run_reward(&mut self, pass: &PendingPass, receiver: usize) {
+        if dd_soccer_disable_combination_run_reward() {
+            return;
+        }
+        // Crosses / lofted balls have their own rewards; this targets ground combination play.
+        if pass.is_cross || pass.flight.is_aerial() {
+            return;
+        }
+        // Already credited as a one-two return — don't double-count.
+        let is_one_two = self
+            .players
+            .get(receiver)
+            .and_then(|r| r.one_two.as_ref())
+            .is_some_and(|o| o.wall_partner == pass.from);
+        if is_one_two {
+            return;
+        }
+        let attack_dir = pass.team.attack_dir();
+        let recv_pos = self.ball.position;
+        let passer_pos = pass.origin;
+        let forward = (recv_pos.y - passer_pos.y) * attack_dir;
+        if forward < COMBINATION_RUN_MIN_FORWARD_YARDS {
+            return;
+        }
+        // The receiver must be RUNNING forward onto the ball (an off-ball run), not standing.
+        let runner_forward_velocity = pass
+            .receiver_velocity_at_launch
+            .map_or(0.0, |v| v.y * attack_dir);
+        if runner_forward_velocity < COMBINATION_RUN_MIN_RUNNER_FORWARD_VELOCITY_YPS {
+            return;
+        }
+        // THIRD-MAN: a recent completed pass fed THIS passer from a different player.
+        let third_man = self
+            .recent_completed_pass_chain_into(pass.team, pass.from, 1)
+            .first()
+            .is_some_and(|link| link.from != receiver);
+        // OVERLAP: the runner arrived meaningfully wider than the passer on the SAME flank.
+        let half_width = self.config.field_width_yards * 0.5;
+        let passer_side = passer_pos.x - half_width;
+        let recv_side = recv_pos.x - half_width;
+        let same_flank = recv_side.abs() > 1e-3 && passer_side.signum() == recv_side.signum();
+        let overlap =
+            same_flank && recv_side.abs() > passer_side.abs() + COMBINATION_OVERLAP_MIN_WIDER_YARDS;
+        if !third_man && !overlap {
+            return;
+        }
+        let openness = pass.receiver_openness.clamp(0.0, 1.0);
+        let bonus = ((COMBINATION_RUN_BASE_POINTS
+            + forward.min(COMBINATION_RUN_FORWARD_CAP_YARDS) * COMBINATION_RUN_FORWARD_REWARD_PER_YARD)
+            * (0.5 + 0.5 * openness))
+            .clamp(0.0, COMBINATION_RUN_MAX_POINTS);
+        if bonus <= 1e-9 || !bonus.is_finite() {
+            return;
+        }
+        // Credit the RUNNER who completed the combination with their off-ball movement.
+        self.record_reward_event(receiver, bonus);
     }
 
     fn recent_completed_pass_chain_into(
@@ -14988,6 +15053,11 @@ fn dd_soccer_disable_wall_pass_reward() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WALL_PASS_REWARD").is_ok())
+}
+fn dd_soccer_disable_combination_run_reward() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_COMBINATION_RUN_REWARD").is_ok())
 }
 fn soccer_observation_telemetry_enabled() -> bool {
     use std::sync::OnceLock;

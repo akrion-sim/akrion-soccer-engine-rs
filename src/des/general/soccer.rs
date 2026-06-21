@@ -791,6 +791,18 @@ const COMPLETED_WALL_PASS_BASE_BONUS_POINTS: f64 = 4.0;
 const COMPLETED_WALL_PASS_FORWARD_REWARD_PER_YARD: f64 = 0.25;
 const COMPLETED_WALL_PASS_MAX_BONUS_POINTS: f64 = 7.0;
 const COMPLETED_WALL_PASS_WALL_CREDIT_SHARE: f64 = 0.7;
+// Distinct credit to a RECEIVER who completes a combination via an off-ball forward RUN — a
+// third-man run (a prior pass fed the passer; this player is the running third man) or an overlap
+// (the runner arrived wider + beyond the passer on the same flank). Tightly gated on the receiver
+// actually moving forward onto the ball, so it rewards the RUN that built the chance, not a static
+// outlet (the passer-side "pass into stride" reward already credits the passer). Modest magnitude.
+const COMBINATION_RUN_MIN_FORWARD_YARDS: f64 = 6.0;
+const COMBINATION_RUN_MIN_RUNNER_FORWARD_VELOCITY_YPS: f64 = 2.5;
+const COMBINATION_OVERLAP_MIN_WIDER_YARDS: f64 = 6.0;
+const COMBINATION_RUN_BASE_POINTS: f64 = 3.0;
+const COMBINATION_RUN_FORWARD_REWARD_PER_YARD: f64 = 0.18;
+const COMBINATION_RUN_FORWARD_CAP_YARDS: f64 = 25.0;
+const COMBINATION_RUN_MAX_POINTS: f64 = 6.0;
 // Choosing a floor pass when an opponent is sitting in the passing lane is a
 // near-certain turnover; penalize it at decision time (scaled by how blocked the
 // lane is) so the policy either skips the pass or lifts it aerially over the
