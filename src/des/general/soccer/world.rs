@@ -5463,6 +5463,25 @@ impl SoccerMatch {
             goal_pressure: goal_pressure
                 .map(finite_unit_interval)
                 .unwrap_or(current.goal_pressure),
+            // This feeder only updates continuity/shot/goal; keep the pattern intents as-is.
+            ..current
+        };
+        let updated = current.blended_with(target, self.config.mpc.latent_learning_rate);
+        *self.mpc_latent_objective_mut(team) = updated;
+    }
+
+    /// Blend ONLY the wall-pass / through-ball pattern intents of the MPC latent toward the given
+    /// unit targets (1.0 = the pattern just succeeded on this pass, 0.0 = it did not), leaving
+    /// continuity/shot/goal pressure untouched. No-op unless the latent objective is enabled.
+    fn note_mpc_pattern_latent(&mut self, team: Team, wall_pass: f64, through_ball: f64) {
+        if !self.config.mpc.latent_objective_enabled {
+            return;
+        }
+        let current = self.mpc_latent_objective(team);
+        let target = SoccerMpcLatentObjective {
+            wall_pass_intent: finite_unit_interval(wall_pass),
+            through_ball_intent: finite_unit_interval(through_ball),
+            ..current
         };
         let updated = current.blended_with(target, self.config.mpc.latent_learning_rate);
         *self.mpc_latent_objective_mut(team) = updated;
@@ -5523,6 +5542,12 @@ impl SoccerMatch {
             return;
         }
 
+        let killer_pass_reward = completed_killer_pass_reward(
+            pass,
+            receiver_player,
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
         let amount = completed_pass_reward(
             pass.team,
             pass.origin,
@@ -5535,12 +5560,7 @@ impl SoccerMatch {
                 self.config.field_width_yards,
                 self.config.field_length_yards,
             )
-            + completed_killer_pass_reward(
-                pass,
-                receiver_player,
-                self.config.field_width_yards,
-                self.config.field_length_yards,
-            )
+            + killer_pass_reward
             + progressive_pass_escape_reward(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
         self.record_possession_touch(pass.from);
@@ -5550,6 +5570,20 @@ impl SoccerMatch {
         self.note_mpc_completed_pass_chain_latent(pass.team, receiver);
         self.record_completed_wall_pass_reward(pass, receiver);
         self.record_combination_run_reward(pass, receiver);
+        // Feed the MPC pattern latents so the (opt-in) latent objective biases execution toward
+        // these patterns. No-op unless mpc.latent_objective_enabled, so zero cost on the default path.
+        if self.config.mpc.latent_objective_enabled {
+            let is_wall = self
+                .players
+                .get(receiver)
+                .and_then(|runner| runner.one_two.as_ref())
+                .is_some_and(|one_two| one_two.wall_partner == pass.from);
+            self.note_mpc_pattern_latent(
+                pass.team,
+                if is_wall { 1.0 } else { 0.0 },
+                if killer_pass_reward > 0.0 { 1.0 } else { 0.0 },
+            );
+        }
     }
 
     /// Extra credit for completing a WALL PASS (one-two / give-and-go): the receiver of this pass is

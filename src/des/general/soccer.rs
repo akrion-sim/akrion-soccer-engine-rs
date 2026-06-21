@@ -12156,6 +12156,13 @@ pub struct SoccerMpcLatentObjective {
     pub pass_chain_continuity: f64,
     pub shot_pressure: f64,
     pub goal_pressure: f64,
+    /// Recent success rate of wall-passes (one-twos) / through-balls, learned from completed-pass
+    /// events. Folds into `combined_pressure` so the MPC arrives more decisively forward when the
+    /// team is combining well. `#[serde(default)]` keeps older persisted objectives loadable.
+    #[serde(default)]
+    pub wall_pass_intent: f64,
+    #[serde(default)]
+    pub through_ball_intent: f64,
 }
 
 impl SoccerMpcLatentObjective {
@@ -12164,6 +12171,8 @@ impl SoccerMpcLatentObjective {
             pass_chain_continuity: finite_unit_interval(self.pass_chain_continuity),
             shot_pressure: finite_unit_interval(self.shot_pressure),
             goal_pressure: finite_unit_interval(self.goal_pressure),
+            wall_pass_intent: finite_unit_interval(self.wall_pass_intent),
+            through_ball_intent: finite_unit_interval(self.through_ball_intent),
         }
     }
 
@@ -12171,18 +12180,29 @@ impl SoccerMpcLatentObjective {
         let current = self.sanitized();
         let target = target.sanitized();
         let rate = finite_unit_interval(rate);
+        let blend = |a: f64, b: f64| a * (1.0 - rate) + b * rate;
         SoccerMpcLatentObjective {
-            pass_chain_continuity: current.pass_chain_continuity * (1.0 - rate)
-                + target.pass_chain_continuity * rate,
-            shot_pressure: current.shot_pressure * (1.0 - rate) + target.shot_pressure * rate,
-            goal_pressure: current.goal_pressure * (1.0 - rate) + target.goal_pressure * rate,
+            pass_chain_continuity: blend(
+                current.pass_chain_continuity,
+                target.pass_chain_continuity,
+            ),
+            shot_pressure: blend(current.shot_pressure, target.shot_pressure),
+            goal_pressure: blend(current.goal_pressure, target.goal_pressure),
+            wall_pass_intent: blend(current.wall_pass_intent, target.wall_pass_intent),
+            through_ball_intent: blend(current.through_ball_intent, target.through_ball_intent),
         }
         .sanitized()
     }
 
     fn combined_pressure(self) -> f64 {
         let s = self.sanitized();
-        (0.40 * s.pass_chain_continuity + 0.28 * s.shot_pressure + 0.32 * s.goal_pressure)
+        // Weights sum to 1.0 so the result stays a unit interval; the pattern intents give the
+        // forward-arrival bias a modest lift when the team is combining (one-twos / through-balls).
+        (0.30 * s.pass_chain_continuity
+            + 0.22 * s.shot_pressure
+            + 0.26 * s.goal_pressure
+            + 0.12 * s.wall_pass_intent
+            + 0.10 * s.through_ball_intent)
             .clamp(0.0, 1.0)
     }
 }

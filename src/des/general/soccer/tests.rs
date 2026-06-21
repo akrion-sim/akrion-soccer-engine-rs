@@ -292,6 +292,7 @@ fn mpc_latent_objective_shapes_controller_weights_but_keeps_short_horizon() {
         pass_chain_continuity: 1.0,
         shot_pressure: 0.5,
         goal_pressure: 0.25,
+        ..Default::default()
     };
     sim.ball.holder = Some(holder);
     sim.ball.position = sim.players[holder].position;
