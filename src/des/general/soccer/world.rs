@@ -15198,6 +15198,11 @@ const RUNAROUND_RECOLLECT_CLEAR_YARDS: f64 = 6.0;
 const RUNAROUND_LANE_HALF_WIDTH_YARDS: f64 = 1.0;
 const RUNAROUND_TOUCHLINE_MARGIN_YARDS: f64 = 2.5;
 const RUNAROUND_MIN_QUALITY: f64 = 0.45;
+// Appetite shaping: the move is much MORE inclined the bigger the speed differential over the
+// defender, and the clearer the space behind them (nobody to intercept the longer touch). These set
+// where each term saturates.
+const RUNAROUND_SPEED_ADVANTAGE_FULL_YPS: f64 = 3.0;
+const RUNAROUND_COVER_CLEARANCE_FULL_YARDS: f64 = 10.0;
 // Knock pace: sized to the push distance so the ball rolls just past the defender into the
 // re-collect zone without being overhit (a listed failure mode).
 // Faster knock so the ball is past the committed defender before they react (beat the reaction
@@ -21618,12 +21623,27 @@ impl WorldSnapshot {
             if !force && second_defender_near {
                 return None;
             }
+            // Clearance behind the defender for the LONGER touch: distance from the nearest COVERING
+            // opponent (not the beaten defender) to the re-collect zone — bigger means nobody can
+            // step across to intercept the knock. This is the primary "is it on" signal alongside pace.
+            let cover_dist = self
+                .players
+                .iter()
+                .filter(|p| p.team != carrier.team && p.id != defender_id)
+                .map(|p| self.player_snapshot_position(p).distance(recollect))
+                .fold(f64::INFINITY, f64::min);
+            let cover_clearance = ((cover_dist - RUNAROUND_RECOLLECT_CLEAR_YARDS)
+                / RUNAROUND_COVER_CLEARANCE_FULL_YARDS)
+                .clamp(0.0, 1.0);
+            let speed_term = (speed_advantage / RUNAROUND_SPEED_ADVANTAGE_FULL_YPS).clamp(0.0, 1.0);
             let space = self.space_score_at(recollect, carrier.team).clamp(0.0, 1.0);
-            let quality = (0.4
-                + 0.3 * space
-                + 0.3 * (speed_advantage.clamp(0.0, 2.0) / 2.0)
-                + if lane_clear { 0.1 } else { 0.0 })
-            .clamp(0.0, 1.0);
+            // MORE inclined the bigger the speed differential AND the clearer the space behind the
+            // defender; raw space is only a minor tiebreaker.
+            let quality = (0.18
+                + 0.42 * speed_term
+                + 0.30 * cover_clearance
+                + 0.10 * space)
+                .clamp(0.0, 1.0);
             Some((push, recollect, quality))
         };
         let (push_target, recollect_point, quality) = match (side_plan(1.0), side_plan(-1.0)) {
