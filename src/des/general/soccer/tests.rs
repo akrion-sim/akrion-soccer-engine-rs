@@ -26587,6 +26587,165 @@ fn pomdp_observation_tracks_per_player_position_confidence() {
 }
 
 #[test]
+fn pomdp_position_confidence_carries_motion_belief_for_occluded_player() {
+    fn configured_match(with_motion_history: bool) -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 14124,
+            ..Default::default()
+        });
+        let observer = 6;
+        let front_teammate = 7;
+        let behind_teammate = 8;
+        let behind_position = Vec2::new(40.0, 40.0);
+        let behind_velocity = Vec2::new(0.0, -4.0);
+        let dt_seconds = sim.config.dt_seconds;
+
+        sim.players[observer].position = Vec2::new(40.0, 60.0);
+        sim.players[observer].velocity = Vec2::zero();
+        sim.players[front_teammate].position = Vec2::new(40.0, 80.0);
+        sim.players[front_teammate].position_history.clear();
+        sim.players[behind_teammate].position = behind_position;
+        sim.players[behind_teammate].velocity = behind_velocity;
+        sim.players[behind_teammate].position_history.clear();
+        if with_motion_history {
+            let previous_position = behind_position - behind_velocity * dt_seconds;
+            sim.players[behind_teammate].position_history =
+                std::collections::VecDeque::from([previous_position, behind_position]);
+        }
+        sim.ball.position = Vec2::new(40.0, 82.0);
+        sim.ball.holder = None;
+        sim
+    }
+
+    let observer = 6;
+    let front_teammate = 7;
+    let behind_teammate = 8;
+    let baseline_snapshot = WorldSnapshot::from_match(&configured_match(false));
+    let baseline_observation = baseline_snapshot.observation_for(observer);
+    let baseline_behind = baseline_observation
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == behind_teammate)
+        .expect("baseline behind confidence")
+        .confidence;
+
+    let prior_snapshot = WorldSnapshot::from_match(&configured_match(true));
+    let prior_observation = prior_snapshot.observation_for(observer);
+    let front = prior_observation
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == front_teammate)
+        .expect("front confidence")
+        .confidence;
+    let posterior_behind = prior_observation
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == behind_teammate)
+        .expect("posterior behind confidence")
+        .confidence;
+    let point_confidence = prior_snapshot
+        .player_position_confidence_for_point(observer, Vec2::new(40.0, 40.0))
+        .expect("point confidence for exact player position");
+
+    assert!(
+        posterior_behind > baseline_behind + 0.10,
+        "coherent motion history should carry an occluded position belief: baseline={baseline_behind} posterior={posterior_behind}"
+    );
+    assert!(
+        (point_confidence - posterior_behind).abs() <= 1e-9,
+        "exact player-position point queries should use the same posterior confidence"
+    );
+    assert!(
+        posterior_behind < front,
+        "carried belief behind the observer should not overpower direct front vision: behind={posterior_behind} front={front}"
+    );
+}
+
+#[test]
+fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
+    fn configured_match(with_motion_history: bool) -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 14125,
+            ..Default::default()
+        });
+        let observer = 6;
+        let behind_teammate = 8;
+        let behind_position = Vec2::new(40.0, 40.0);
+        let behind_velocity = Vec2::new(0.0, -4.0);
+        let dt_seconds = sim.config.dt_seconds;
+
+        sim.players[observer].position = Vec2::new(40.0, 60.0);
+        sim.players[observer].velocity = Vec2::zero();
+        sim.players[behind_teammate].position = behind_position;
+        sim.players[behind_teammate].velocity = behind_velocity;
+        sim.players[behind_teammate].position_history.clear();
+        if with_motion_history {
+            let oldest_position = behind_position - behind_velocity * dt_seconds * 2.0;
+            let previous_position = behind_position - behind_velocity * dt_seconds;
+            sim.players[behind_teammate].position_history = std::collections::VecDeque::from([
+                oldest_position,
+                previous_position,
+                behind_position,
+            ]);
+        }
+        sim.ball.position = Vec2::new(40.0, 82.0);
+        sim
+    }
+
+    let observer = 6;
+    let behind_teammate = 8;
+    let baseline_snapshot =
+        WorldSnapshot::from_match_for_agent_decision(&configured_match(false));
+    let baseline_behind = baseline_snapshot
+        .observation_for(observer)
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == behind_teammate)
+        .expect("baseline behind confidence")
+        .confidence;
+
+    let prior_snapshot = WorldSnapshot::from_match_for_agent_decision(&configured_match(true));
+    let target = prior_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == behind_teammate)
+        .expect("behind player snapshot");
+    assert_eq!(
+        target.position_history.len(),
+        KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
+        "agent-decision snapshots should carry only the history tail needed for Kalman belief"
+    );
+    let posterior_behind = prior_snapshot
+        .observation_for(observer)
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == behind_teammate)
+        .expect("posterior behind confidence")
+        .confidence;
+
+    assert!(
+        posterior_behind > baseline_behind + 0.10,
+        "live player decisions should see the carried belief posterior: baseline={baseline_behind} posterior={posterior_behind}"
+    );
+
+    let mut ball_on_player = configured_match(true);
+    ball_on_player.ball.position = Vec2::new(40.0, 40.0);
+    ball_on_player.ball.holder = Some(behind_teammate);
+    let ball_snapshot = WorldSnapshot::from_match_for_agent_decision(&ball_on_player);
+    let ball_observation = ball_snapshot.observation_for(observer);
+    let player_point_confidence = ball_snapshot
+        .player_position_confidence_for_point(observer, Vec2::new(40.0, 40.0))
+        .expect("player point confidence");
+    assert!(
+        ball_observation.ball_position_confidence < player_point_confidence - 0.05,
+        "ball confidence should remain geometric and not inherit a nearby player's Kalman posterior: ball={} player={player_point_confidence}",
+        ball_observation.ball_position_confidence
+    );
+}
+
+#[test]
 fn pomdp_observation_tracks_look_behind_scan_confidence_and_drift_risk() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -30522,6 +30681,69 @@ fn neural_learning_pads_previous_snapshot_open_support_outlet_input() {
     assert_eq!(
         resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_FEATURE_OPEN_SUPPORT_OUTLETS], 0.0,
         "new open-support-outlet input should start neutral for 131-input snapshots"
+    );
+}
+
+#[test]
+fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_motion() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15093,
+        ..Default::default()
+    };
+    let mut previous_snapshot = SoccerMatch::default_11v11(config.clone())
+        .learning_snapshot()
+        .neural_network
+        .expect("initial neural snapshot");
+    let previous_dim = SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE;
+    assert_eq!(previous_dim, 330);
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&previous_dim));
+    let removed_weights = previous_snapshot
+        .layers
+        .first()
+        .map(|layer| layer.weights.len())
+        .unwrap_or(0)
+        .saturating_mul(SOCCER_NEURAL_FEATURE_DIM - previous_dim);
+    previous_snapshot.input_dim = previous_dim;
+    previous_snapshot.parameter_count = previous_snapshot
+        .parameter_count
+        .saturating_sub(removed_weights);
+    for row in &mut previous_snapshot.layers[0].weights {
+        row.truncate(previous_dim);
+    }
+    previous_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM] = 0.135_79;
+    previous_snapshot.layers[0].weights[0][previous_dim - 1] = 0.975_31;
+
+    let resumed = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(previous_snapshot)
+        .expect("resume previous full neural snapshot");
+    let resumed_snapshot = resumed
+        .learning_snapshot()
+        .neural_network
+        .expect("resumed neural snapshot");
+
+    assert_eq!(resumed_snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM],
+        0.135_79,
+        "first motion-block weight should remain aligned after belief-tail padding"
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][previous_dim - 1],
+        0.975_31,
+        "last old motion-block weight should remain aligned after belief-tail padding"
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],
+        0.0,
+        "new belief-tail input should start neutral for 330-input snapshots"
     );
 }
 
@@ -39498,13 +39720,15 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
-    // The named feature indices all live in the base block; the whole-field "moment of all 22 +
-    // ball" block is appended after it, then the Bayesian opponent-press belief block.
+    // The named decision/action feature indices live in the base block; the whole-field "moment
+    // of all 22 + ball" block appends after it, then the Kalman perception-belief block, then the
+    // Bayesian opponent-press belief block.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM
             + SOCCER_NEURAL_FIELD_MOTION_DIM
+            + SOCCER_NEURAL_BELIEF_FEATURE_DIM
             + SOCCER_NEURAL_OPP_BELIEF_DIM
     );
     // The previous total (base + motion, no belief) stays a recognised legacy input dim.
@@ -39544,6 +39768,16 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY, 189);
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT, 190);
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY, 191);
+    assert_eq!(SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE, 330);
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE,
+        331
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE,
+        332
+    );
+    assert_eq!(SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY, 333);
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&258));
@@ -39557,6 +39791,7 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&163));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&248));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&251));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&330));
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -39604,6 +39839,26 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     };
     let features = soccer_neural_transition_features(&transition);
     assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],
+        soccer_neural_unit(observation.ball_position_confidence)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE],
+        soccer_neural_unit(observation.teammate_position_confidence)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE],
+        soccer_neural_unit(observation.opponent_position_confidence)
+    );
+    let belief_floor = observation
+        .ball_position_confidence
+        .min(observation.teammate_position_confidence)
+        .min(observation.opponent_position_confidence);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY],
+        soccer_neural_unit(1.0 - belief_floor.clamp(0.0, 1.0))
+    );
     assert!(
         features[SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE] > 0.0,
         "the value head should see sustained teammate-overlap pressure"
@@ -51132,16 +51387,22 @@ fn opponent_belief_block_reaches_the_neural_feature_tail() {
     };
     let features = soccer_neural_transition_features(&transition);
     assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
-    let start = SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+    // The opponent-press block is stacked AFTER the Kalman perception-belief block, so it starts
+    // at base + motion + perception-belief, not at base + motion.
+    let start = SOCCER_NEURAL_BASE_FEATURE_DIM
+        + SOCCER_NEURAL_FIELD_MOTION_DIM
+        + SOCCER_NEURAL_BELIEF_FEATURE_DIM;
     for (i, &v) in belief.iter().enumerate() {
         assert_eq!(
             features[start + i],
             f64::from(v),
-            "belief channel {i} must appear in the neural feature tail"
+            "opponent-press belief channel {i} must appear in the neural feature tail"
         );
     }
-    // The previous total dim (no belief block) must remain a recognised legacy input so old
-    // nets migrate by zero-padding the new slots.
+    // Both earlier totals (base+motion and base+motion+perception) must remain recognised legacy
+    // input dims so older nets migrate by zero-padding the appended slots.
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM)));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&start));
 }
 
