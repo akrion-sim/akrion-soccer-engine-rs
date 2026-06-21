@@ -15419,7 +15419,7 @@ fn pending_pass_snapshot_from(
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorldSnapshotOptions {
-    include_player_histories: bool,
+    player_history_samples: usize,
     include_shared_histories: bool,
     include_player_decisions: bool,
     include_ball_history: bool,
@@ -15428,7 +15428,7 @@ pub(crate) struct WorldSnapshotOptions {
 
 impl WorldSnapshotOptions {
     const FULL: Self = Self {
-        include_player_histories: true,
+        player_history_samples: PLAYER_POSITION_HISTORY_LIMIT,
         include_shared_histories: true,
         include_player_decisions: true,
         include_ball_history: true,
@@ -15436,7 +15436,7 @@ impl WorldSnapshotOptions {
     };
 
     const AGENT_DECISION: Self = Self {
-        include_player_histories: false,
+        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -15444,7 +15444,7 @@ impl WorldSnapshotOptions {
     };
 
     pub(crate) const DEFENSIVE_OR_LOOSE_AGENT_DECISION: Self = Self {
-        include_player_histories: false,
+        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
@@ -15452,7 +15452,7 @@ impl WorldSnapshotOptions {
     };
 
     const LEARNING: Self = Self {
-        include_player_histories: false,
+        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -15460,7 +15460,7 @@ impl WorldSnapshotOptions {
     };
 
     const OFFICIAL_DECISION: Self = Self {
-        include_player_histories: false,
+        player_history_samples: 0,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
@@ -15468,7 +15468,7 @@ impl WorldSnapshotOptions {
     };
 
     const LIVE_HTTP_FRAME: Self = Self {
-        include_player_histories: true,
+        player_history_samples: PLAYER_POSITION_HISTORY_LIMIT,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -15641,8 +15641,10 @@ impl WorldSnapshot {
                 role: p.role,
                 shirt: p.shirt,
                 position: p.position,
-                position_history: if options.include_player_histories {
-                    p.position_history.iter().cloned().collect()
+                position_history: if options.player_history_samples > 0 {
+                    let history_len = p.position_history.len();
+                    let start = history_len.saturating_sub(options.player_history_samples);
+                    p.position_history.iter().skip(start).cloned().collect()
                 } else {
                     Vec::new()
                 },
@@ -18577,8 +18579,14 @@ impl WorldSnapshot {
         let ball_position_confidence = if has_ball {
             1.0
         } else {
-            self.player_position_confidence_for_point(me.id, self.ball.position)
-                .unwrap_or(0.0)
+            finite_metric(position_confidence_for_observer(
+                me,
+                me_position,
+                self.ball.position,
+                self.player_facing_direction(me),
+                false,
+            ))
+            .clamp(0.0, 1.0)
         };
         let mut player_position_confidences = self
             .players
@@ -20997,12 +21005,43 @@ impl WorldSnapshot {
         let observer_position = self
             .player_position(observer.id)
             .unwrap_or(observer.position);
-        Some(position_confidence_for_observer(
+        let facing = self.player_facing_direction(observer);
+        let observer_has_ball = self.ball.holder == Some(observer_id);
+        let measurement_confidence = finite_metric(position_confidence_for_observer(
             observer,
             observer_position,
             point,
-            self.player_facing_direction(observer),
-            self.ball.holder == Some(observer_id),
+            facing,
+            observer_has_ball,
+        ))
+        .clamp(0.0, 1.0);
+        let mut matched_target: Option<(&PlayerSnapshot, Vec2, f64)> = None;
+        for target in self.players.iter().filter(|player| player.id != observer_id) {
+            let target_position = self.player_snapshot_position(target);
+            let match_distance = target_position.distance(point);
+            if match_distance <= KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS
+                && matched_target
+                    .map(|(_, _, best_distance)| match_distance < best_distance)
+                    .unwrap_or(true)
+            {
+                matched_target = Some((target, target_position, match_distance));
+            }
+        }
+        let Some((target, target_position, _)) = matched_target else {
+            return Some(measurement_confidence);
+        };
+        let to_target = target_position - observer_position;
+        let in_front = facing
+            .map(|facing| facing.normalized().dot(to_target.normalized()) >= 0.0)
+            .unwrap_or(false);
+        Some(kalman_perception_position_confidence(
+            measurement_confidence,
+            target_position,
+            target.velocity,
+            &target.position_history,
+            self.dt_seconds,
+            in_front,
+            observer_has_ball,
         ))
     }
 
@@ -21021,18 +21060,29 @@ impl WorldSnapshot {
         let in_front = facing
             .map(|facing| facing.normalized().dot(to_target.normalized()) >= 0.0)
             .unwrap_or(false);
+        let observer_has_ball = self.ball.holder == Some(observer_id);
+        let measurement_confidence = finite_metric(position_confidence_for_observer(
+            observer,
+            observer_position,
+            target_position,
+            facing,
+            observer_has_ball,
+        ))
+        .clamp(0.0, 1.0);
         Some(PlayerPositionConfidence {
             observer_id,
             player_id: target.id,
             team: target.team,
             distance_yards: to_target.len(),
             in_front,
-            confidence: position_confidence_for_observer(
-                observer,
-                observer_position,
+            confidence: kalman_perception_position_confidence(
+                measurement_confidence,
                 target_position,
-                facing,
-                self.ball.holder == Some(observer_id),
+                target.velocity,
+                &target.position_history,
+                self.dt_seconds,
+                in_front,
+                observer_has_ball,
             ),
         })
     }

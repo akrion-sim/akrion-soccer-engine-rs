@@ -494,6 +494,16 @@ const BALL_HOLDER_CORE_VISION_DEGREES: f64 = 100.0;
 const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
 const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
 const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
+const KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS: f64 = 0.35;
+const KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES: usize = 2;
+const KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS: f64 = 0.15;
+const KALMAN_PERCEPTION_BASE_SIGMA_YARDS: f64 = 0.85;
+const KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS: f64 = 0.10;
+const KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS: f64 = 0.14;
+const KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE: f64 = 0.96;
+const KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE: f64 = 0.88;
+const KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE: f64 = 0.68;
+const KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE: f64 = 0.58;
 // Wing-backs push forward MORE often than central defenders — the back line should
 // not move as a symmetric block. This keeps the outside-back odds 30% above the
 // prior raised bias while the centre-backs hold (see also central_defender_forward_blocked).
@@ -2856,9 +2866,11 @@ const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 6;
 const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
     + SOCCER_NEURAL_FIELD_MOTION_BALLS)
     * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+const SOCCER_NEURAL_BELIEF_FEATURE_DIM: usize = 4;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` migrate by zero-padding the block.
-const SOCCER_NEURAL_FEATURE_DIM: usize =
-    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_FEATURE_DIM
+    + SOCCER_NEURAL_FIELD_MOTION_DIM
+    + SOCCER_NEURAL_BELIEF_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -2978,6 +2990,14 @@ const SOCCER_NEURAL_FEATURE_DRIBBLE_MPC_SPACE_MARGIN: usize = 188;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY: usize = 189;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT: usize = 190;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY: usize = 191;
+const SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE: usize =
+    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+const SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE: usize =
+    SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE + 1;
+const SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE: usize =
+    SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE + 1;
+const SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY: usize =
+    SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3029,6 +3049,7 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     182,
     324,
     186,
+    330,
     SOCCER_NEURAL_BASE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
@@ -30098,6 +30119,10 @@ fn soccer_neural_transition_features_with_action(
     // used, so feature positions/semantics and SOCCER_NEURAL_FEATURE_DIM are
     // unchanged — existing trained nets need no legacy-dim migration.
     let obs = &transition.observation;
+    let position_belief_floor = obs
+        .ball_position_confidence
+        .min(obs.teammate_position_confidence)
+        .min(obs.opponent_position_confidence);
     let player_grid = if transition.state.player_grid.fine.level == PitchGridLevel::WholePitch
         && obs.player_grid.fine.level != PitchGridLevel::WholePitch
     {
@@ -30595,6 +30620,17 @@ fn soccer_neural_transition_features_with_action(
             0.0
         };
     }
+    // Bayesian/Kalman perception belief tail: appended after the legacy whole-field
+    // motion block so older 330-input nets keep their motion weights aligned and
+    // simply zero-pad these new uncertainty channels.
+    features[SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE] =
+        soccer_neural_unit(obs.ball_position_confidence);
+    features[SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE] =
+        soccer_neural_unit(obs.teammate_position_confidence);
+    features[SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE] =
+        soccer_neural_unit(obs.opponent_position_confidence);
+    features[SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY] =
+        soccer_neural_unit(1.0 - position_belief_floor.clamp(0.0, 1.0));
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -43730,6 +43766,79 @@ fn position_confidence_for_observer(
     } else {
         confidence
     }
+}
+
+fn kalman_perception_position_confidence(
+    measurement_confidence: f64,
+    target_position: Vec2,
+    target_velocity: Vec2,
+    target_history: &[Vec2],
+    dt_seconds: f64,
+    in_front: bool,
+    observer_has_ball: bool,
+) -> f64 {
+    let measurement = finite_metric(measurement_confidence).clamp(0.0, 1.0);
+    if target_history.len() < KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES {
+        return measurement;
+    }
+
+    let latest = target_history[target_history.len() - 1];
+    let previous = target_history[target_history.len() - 2];
+    if !latest.x.is_finite()
+        || !latest.y.is_finite()
+        || !previous.x.is_finite()
+        || !previous.y.is_finite()
+        || !target_position.x.is_finite()
+        || !target_position.y.is_finite()
+    {
+        return measurement;
+    }
+
+    let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS);
+    let history_velocity = (latest - previous) / dt;
+    if !history_velocity.x.is_finite() || !history_velocity.y.is_finite() {
+        return measurement;
+    }
+    let target_velocity = finite_vec2(target_velocity, history_velocity);
+    let blended_velocity = history_velocity * 0.65 + target_velocity * 0.35;
+    let prediction = if latest.distance(target_position)
+        <= KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS
+    {
+        previous + history_velocity * dt
+    } else {
+        latest + blended_velocity * dt
+    };
+    let innovation_yards = prediction.distance(target_position);
+    let velocity_disagreement = history_velocity.distance(target_velocity);
+    let sigma_yards = (KALMAN_PERCEPTION_BASE_SIGMA_YARDS
+        + history_velocity.len().clamp(0.0, 12.0) * KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS * dt
+        + velocity_disagreement.clamp(0.0, 12.0)
+            * KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS
+            * dt)
+        .clamp(0.55, 5.0);
+    let prediction_fit =
+        (1.0 / (1.0 + (innovation_yards / sigma_yards).powi(2))).clamp(0.0, 1.0);
+    if prediction_fit <= 0.0 {
+        return measurement;
+    }
+
+    let prediction_cap = if measurement >= BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE {
+        KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE
+    } else if in_front {
+        KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE
+    } else if observer_has_ball {
+        KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE
+    } else {
+        KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE
+    };
+    let predicted_confidence = prediction_fit.min(prediction_cap);
+    let prediction_uncertainty = (1.0 - predicted_confidence).clamp(0.04, 0.96);
+    let measurement_uncertainty = (1.0 - measurement).clamp(0.04, 0.96);
+    let kalman_gain =
+        prediction_uncertainty / (prediction_uncertainty + measurement_uncertainty).max(1e-9);
+    let posterior = predicted_confidence + kalman_gain * (measurement - predicted_confidence);
+
+    posterior.max(measurement).clamp(0.0, 1.0)
 }
 
 fn pass_would_be_cross(
