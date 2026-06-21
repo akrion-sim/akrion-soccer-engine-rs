@@ -1061,13 +1061,28 @@ fn mpc_execution_estimate_for_action(
             lane_radius,
             speed,
         );
+        let lane_interception_risk = snapshot
+            .pass_lane_interception_risk(
+                current,
+                target_point,
+                player.team.other(),
+                lane_radius,
+                speed,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk;
         let nearest_opponent_to_lane = snapshot
             .players
             .iter()
             .filter(|opponent| opponent.team == player.team.other())
-            .map(|opponent| segment_distance_to_point(current, target_point, opponent.position))
+            .map(|opponent| {
+                let position = snapshot
+                    .player_position(opponent.id)
+                    .unwrap_or(opponent.position);
+                segment_distance_to_point(current, target_point, position)
+            })
             .fold(f64::INFINITY, f64::min);
-        let lane_fit = if clear_now {
+        let base_lane_fit = if clear_now {
             if clear_through_flight {
                 1.0
             } else {
@@ -1076,6 +1091,10 @@ fn mpc_execution_estimate_for_action(
         } else {
             0.08
         };
+        let dynamic_lane_gate = (1.0
+            - lane_interception_risk.clamp(0.0, 1.0) * PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH)
+            .clamp(0.12, 1.0);
+        let lane_fit = base_lane_fit * dynamic_lane_gate;
         let receiver_fit = action_target
             .as_ref()
             .and_then(|target| target.player_id)
@@ -1110,7 +1129,8 @@ fn mpc_execution_estimate_for_action(
             ((nearest_opponent_to_lane - lane_radius) / 4.0).clamp(0.0, 1.0)
         } else {
             1.0
-        };
+        }
+        .min((1.0 - lane_interception_risk * 0.58).clamp(0.18, 1.0));
         let pass_probability = (0.05
             + skill * 0.30
             + lane_fit * 0.30
@@ -1153,6 +1173,8 @@ fn mpc_execution_estimate_for_action(
                 .clamp(0.0, 9.0);
         estimate.reselect_reason = if !clear_now {
             "mpc-pass-lane-blocked-now"
+        } else if lane_interception_risk >= PASS_LANE_DYNAMIC_RISK_HIGH {
+            "mpc-pass-lane-risk-next-two-seconds"
         } else if !clear_through_flight {
             "mpc-pass-cut-out-during-flight"
         } else if ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60 {

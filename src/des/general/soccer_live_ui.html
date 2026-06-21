@@ -2865,6 +2865,24 @@ function drawAssistantOffsideLines(r) {
     }
   }
 }
+function finiteEventNumber(event, names) {
+  for (const name of names) {
+    const value = Number(event?.[name]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+function offsideSnapshotFromEvent(event) {
+  const parsed = String(event?.description || "").match(
+    /\((-?\d+(?:\.\d+)?)\s+beyond line\s+(-?\d+(?:\.\d+)?),\s*ball\s+(-?\d+(?:\.\d+)?)\)/i
+  );
+  return {
+    offenderX: finiteEventNumber(event, ["offsidePlayerX", "offside_player_x"]),
+    offenderY: finiteEventNumber(event, ["offsidePlayerY", "offside_player_y"]) ?? (parsed ? Number(parsed[1]) : null),
+    lineY: finiteEventNumber(event, ["offsideLineY", "offside_line_y", "secondLastDefenderY", "second_last_defender_y"]) ?? (parsed ? Number(parsed[2]) : null),
+    ballY: finiteEventNumber(event, ["offsideBallY", "offside_ball_y", "ballY", "ball_y"]) ?? (parsed ? Number(parsed[3]) : null),
+  };
+}
 // On an offside call, draw a solid red line across the pitch at the spot offside
 // occurred (the second-last-defender line), held for the pause window.
 function drawOffsideFlash(r) {
@@ -2874,6 +2892,21 @@ function drawOffsideFlash(r) {
   }
   const x = mapPoint({x: 0, y: offsideFlash.lineY}, r).x;
   ctx.save();
+  if (Number.isFinite(offsideFlash.ballY) && Math.abs(offsideFlash.ballY - offsideFlash.lineY) > 0.2) {
+    const ballX = mapPoint({x: 0, y: offsideFlash.ballY}, r).x;
+    ctx.beginPath();
+    ctx.moveTo(ballX, r.y);
+    ctx.lineTo(ballX, r.y + r.h);
+    ctx.strokeStyle = "rgba(245,158,11,0.78)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 7]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(245,158,11,0.95)";
+    ctx.font = "bold 14px sans-serif";
+    ctx.textBaseline = "top";
+    ctx.fillText("BALL PLAYED", Math.min(ballX + 6, r.x + r.w - 105), r.y + 38);
+  }
   ctx.beginPath();
   ctx.moveTo(x, r.y);
   ctx.lineTo(x, r.y + r.h);
@@ -2884,6 +2917,16 @@ function drawOffsideFlash(r) {
   ctx.font = "bold 22px sans-serif";
   ctx.textBaseline = "top";
   ctx.fillText("OFFSIDE", Math.min(x + 8, r.x + r.w - 110), r.y + 8);
+  if (Number.isFinite(offsideFlash.offenderX) && Number.isFinite(offsideFlash.offenderY)) {
+    const offender = mapPoint({x: offsideFlash.offenderX, y: offsideFlash.offenderY}, r);
+    ctx.beginPath();
+    ctx.arc(offender.x, offender.y, 10, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(239,68,68,0.22)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(239,68,68,0.96)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
   ctx.restore();
 }
 function pendingPassPhase(frame = state?.frame) {
@@ -5273,21 +5316,26 @@ async function stepOnce(options = {}) {
     // On an offside call, freeze a red line where it occurred and pause ~2s.
     const offsideEvent = response.events.find(e => String(e.kind || "").toLowerCase() === "offside");
     if (offsideEvent) {
-      const lines = assistantOffsideLines();
-      const line = lines.find(l => l.attackingTeam === offsideEvent.team) || lines[0];
-      // Freeze at the second-last-defender line (where offside is judged when the ball is played),
-      // not the ball-following effective limit; fall back to the effective line, then the player.
-      let lineY = line ? Number(line.secondLastDefenderY) : null;
+      // Freeze at the offside line FROM THE EVENT — the second-last-defender line at the moment the
+      // ball was played (parsed from the event's "beyond line Y"), which is where offside is judged;
+      // falls back below to the live second-last-defender line, then the effective line.
+      const offsideSnapshot = offsideSnapshotFromEvent(offsideEvent);
+      let lineY = offsideSnapshot.lineY;
       if (lineY == null || !Number.isFinite(lineY)) {
-        lineY = line ? Number(line.effectiveLineY) : null;
-      }
-      if (lineY == null || !Number.isFinite(lineY)) {
-        const p = (state.frame?.players || []).find(pl => pl.id === offsideEvent.playerId);
-        lineY = p?.position ? Number(p.position.y) : null;
+        const lines = assistantOffsideLines();
+        const line = lines.find(l => l.attackingTeam === offsideEvent.team) || lines[0];
+        lineY = line ? Number(line.secondLastDefenderY ?? line.effectiveLineY) : null;
       }
       if (lineY != null && Number.isFinite(lineY)) {
         const now = performance.now();
-        offsideFlash = { lineY, attackingTeam: offsideEvent.team, untilMs: now + OFFSIDE_FLASH_MS };
+        offsideFlash = {
+          lineY,
+          offenderX: Number.isFinite(offsideSnapshot.offenderX) ? offsideSnapshot.offenderX : null,
+          ballY: Number.isFinite(offsideSnapshot.ballY) ? offsideSnapshot.ballY : null,
+          offenderY: Number.isFinite(offsideSnapshot.offenderY) ? offsideSnapshot.offenderY : null,
+          attackingTeam: offsideEvent.team,
+          untilMs: now + OFFSIDE_FLASH_MS
+        };
         offsidePauseUntil = now + OFFSIDE_FLASH_MS;
       }
     }

@@ -1667,6 +1667,7 @@ impl SoccerMatch {
             team: Some(team),
             player_id: kickoff,
             description: format!("{taker} kickoff for {}", team.label()),
+            ..MatchEvent::default()
         });
     }
 
@@ -2233,6 +2234,7 @@ impl SoccerMatch {
             team: None,
             player_id: None,
             description: format!("period {} complete", period_number.saturating_sub(1)),
+            ..MatchEvent::default()
         });
         self.reset_after_goal(kickoff_team);
         self.events.push(MatchEvent {
@@ -2245,6 +2247,7 @@ impl SoccerMatch {
                 "period {period_number} kickoff for {}",
                 kickoff_team.label()
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -7212,6 +7215,7 @@ impl SoccerMatch {
                     team: Some(player_team),
                     player_id: Some(player_id),
                     description: format!("{} heavy touch", player.name),
+                    ..MatchEvent::default()
                 });
             } else {
                 let controlled_lead = touch
@@ -7526,6 +7530,7 @@ impl SoccerMatch {
             description: format!(
                 "keeper held the ball beyond {GK_HANDLING_HOLD_LIMIT_SECONDS:.0}s and was forced to clear"
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -7618,6 +7623,7 @@ impl SoccerMatch {
             team: Some(defender_team),
             player_id: Some(defender_id),
             description: format!("{defender_name} dispossessed {attacker_name}"),
+            ..MatchEvent::default()
         });
     }
 
@@ -7698,6 +7704,7 @@ impl SoccerMatch {
                 defender_name,
                 kind.label()
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -8813,6 +8820,7 @@ impl SoccerMatch {
                         team: Some(player_team),
                         player_id: Some(player_id),
                         description: format!("{} shot", self.players[player_id].name),
+                        ..MatchEvent::default()
                     });
                 }
                 self.move_player_towards(player_id, self.players[player_id].home_position, false);
@@ -10622,6 +10630,7 @@ impl SoccerMatch {
             team: None,
             player_id: third_man.map(|(id, _)| id),
             description: "possession livelock broken: ball played loose to a third man".to_string(),
+            ..MatchEvent::default()
         });
     }
 
@@ -11030,6 +11039,7 @@ impl SoccerMatch {
                     team: Some(defending_team),
                     player_id: Some(keeper_id),
                     description: format!("{keeper_name} saved a shot by {shooter_name}"),
+                    ..MatchEvent::default()
                 });
             }
             BallStepOutcome::KeeperParry {
@@ -11096,6 +11106,7 @@ impl SoccerMatch {
                     team: Some(defending_team),
                     player_id: Some(keeper_id),
                     description: format!("{keeper_name} parried a shot by {shooter_name}"),
+                    ..MatchEvent::default()
                 });
             }
             BallStepOutcome::Goal { scoring_team, shot } => {
@@ -11133,6 +11144,7 @@ impl SoccerMatch {
                     team: Some(shot.team),
                     player_id: Some(shot.shooter),
                     description: format!("{shooter_name} missed"),
+                    ..MatchEvent::default()
                 });
             }
             BallStepOutcome::ShotBlocked {
@@ -11186,6 +11198,7 @@ impl SoccerMatch {
                     team: Some(defending_team),
                     player_id: Some(blocker_id),
                     description: format!("{blocker_name} blocked {shooter_name}'s shot {detail}"),
+                    ..MatchEvent::default()
                 });
             }
             BallStepOutcome::OutOfPlay {
@@ -11226,6 +11239,7 @@ impl SoccerMatch {
             team: Some(shot.team),
             player_id: Some(shot.shooter),
             description: format!("{shooter_name} missed"),
+            ..MatchEvent::default()
         });
     }
 
@@ -11381,6 +11395,7 @@ impl SoccerMatch {
                 restart_kind_label(restart.kind),
                 restart.awarded_team.label()
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -11561,6 +11576,7 @@ impl SoccerMatch {
                 call.routine.as_label(),
                 call.restart
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -12293,6 +12309,7 @@ impl SoccerMatch {
                 "{} fouled {}",
                 self.players[fouler_id].name, self.players[fouled_id].name
             ),
+            ..MatchEvent::default()
         });
         self.apply_restart(BallRestart {
             kind: BallRestartKind::FreeKick,
@@ -12301,7 +12318,7 @@ impl SoccerMatch {
         });
     }
 
-    fn call_offside(&mut self, offside: PendingOffside) {
+    pub(crate) fn call_offside(&mut self, offside: PendingOffside) {
         let defending_team = offside.team.other();
         let restart_spot = offside.position.clamp_to_pitch(
             self.config.field_width_yards,
@@ -12391,6 +12408,11 @@ impl SoccerMatch {
                 "{target_name} flagged offside on {passer_name}'s pass ({:.1} beyond line {:.1}, ball {:.1})",
                 restart_spot.y, offside.second_last_defender_y, offside.ball_y
             ),
+            offside_line_y: Some(offside.second_last_defender_y),
+            offside_ball_y: Some(offside.ball_y),
+            offside_player_x: Some(offside.position.x),
+            offside_player_y: Some(offside.position.y),
+            ..MatchEvent::default()
         });
     }
 
@@ -12856,6 +12878,7 @@ impl SoccerMatch {
                 team: Some(holder_team),
                 player_id: Some(holder_id),
                 description: format!("{attacker_name} beat {defender_name} by dribble"),
+                ..MatchEvent::default()
             });
             self.record_reward_event_at(
                 before.tick,
@@ -12878,6 +12901,7 @@ impl SoccerMatch {
             team: Some(scoring_team),
             player_id: None,
             description: format!("{} goal", scoring_team.label()),
+            ..MatchEvent::default()
         });
         // Hold a brief celebration before the kickoff (the ball stays in the net)
         // so the goal sequence completes on screen instead of cutting straight to
@@ -12912,6 +12936,7 @@ impl SoccerMatch {
             team: None,
             player_id: None,
             description: format!("Break before half {}", next_half_index + 1),
+            ..MatchEvent::default()
         });
         for p in &mut self.players {
             p.position = p.home_position;
@@ -12986,6 +13011,7 @@ impl SoccerMatch {
                 kickoff_team.label(),
                 next_half_index + 1
             ),
+            ..MatchEvent::default()
         });
     }
 
@@ -13059,6 +13085,7 @@ impl SoccerMatch {
             team: Some(kickoff_team),
             player_id: kickoff,
             description: format!("{taker} kickoff for {}", kickoff_team.label()),
+            ..MatchEvent::default()
         });
     }
 
@@ -13258,6 +13285,7 @@ impl SoccerMatch {
             team: Some(player_team),
             player_id: Some(player_id),
             description: format!("{player_name} {action_label} into space"),
+            ..MatchEvent::default()
         });
     }
 
@@ -15972,11 +16000,40 @@ impl WorldSnapshot {
         Some((holder_id, holder_pos))
     }
 
-    /// The team's ball-carrier is the FURTHEST-FORWARD outfield teammate — the strong cue for
-    /// everyone else to sprint forward in support, so the carrier is not left as the lone advanced
-    /// man with no forward outlet (a common cause of stalls and turnovers). Pressure-independent
+    /// The team's ball-carrier is at the FRONT LINE — at most
+    /// `FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD` outfield teammates are ahead of it. The cue
+    /// for everyone else to push/sprint forward in support so the carrier is not left isolated up
+    /// top with no forward outlet (a common cause of stalls and turnovers). Pressure-independent
     /// (unlike `uncontested_carrier_advancing`). Gated (default on) by
     /// `DD_SOCCER_DISABLE_FOREMOST_CARRIER_SUPPORT`.
+    pub(crate) fn front_line_carrier_support_cue(&self, team: Team) -> Option<(usize, Vec2)> {
+        if dd_soccer_disable_foremost_carrier_support() {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team || holder.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        let attack = team.attack_dir();
+        let teammates_ahead = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == team
+                    && player.id != holder_id
+                    && player.role != PlayerRole::Goalkeeper
+                    && (self.player_snapshot_position(player).y - holder_pos.y) * attack
+                        > FOREMOST_CARRIER_AHEAD_MARGIN_YARDS
+            })
+            .count();
+        (teammates_ahead <= FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD)
+            .then_some((holder_id, holder_pos))
+    }
+
+    /// The carrier is the FURTHEST-FORWARD teammate (strictly nobody ahead) — the strongest form of
+    /// [`Self::front_line_carrier_support_cue`], for callers wanting just the id. Same gate.
     pub(crate) fn carrier_is_foremost_teammate(&self, team: Team) -> Option<usize> {
         if dd_soccer_disable_foremost_carrier_support() {
             return None;
@@ -16006,6 +16063,7 @@ impl WorldSnapshot {
             || self.attacking_carrier_driving_at_goal(team).is_some()
             || self.team_speed_surge_active(team)
             || self.forward_attacking_momentum(team)
+            || self.front_line_carrier_support_cue(team).is_some()
             || self.uncontested_carrier_advancing(team).is_some()
             || self.carrier_is_foremost_teammate(team).is_some()
     }
@@ -20398,7 +20456,9 @@ impl WorldSnapshot {
                 } else {
                     pass_quality.receiver_openness
                 };
-                let expected_completion_for_score = if half_open_forward_score {
+                let expected_completion_for_score = if half_open_forward_score
+                    && pass_quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH
+                {
                     pass_quality
                         .expected_completion
                         .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
@@ -20600,6 +20660,7 @@ impl WorldSnapshot {
                     - reception_congestion_penalty
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
+                    - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                     + over_the_top_invite_bonus
                     + own_box_play_out_adjustment
                     + forward_open_bonus
@@ -28908,14 +28969,15 @@ impl WorldSnapshot {
             return point;
         }
         let attack = me.team.attack_dir();
-        // Push forward in support when a teammate is carrying unpressured OR when the carrier is the
-        // furthest-forward teammate (the strong "get ahead of the ball" trigger) — either way the
-        // free/lone carrier should be supported forward in numbers, not left to dribble alone.
-        let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some()
-            || self.carrier_is_foremost_teammate(me.team).is_some();
+        // Push forward in support when a teammate is carrying unpressured OR when the carrier is at
+        // the front line (the strong "get ahead of the ball" trigger) — either way the free/lone
+        // carrier should be supported forward in numbers, not left to dribble alone.
+        let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
+        let front_line_support = self.front_line_carrier_support_cue(me.team).is_some();
+        let forward_support_cue = uncontested_support || front_line_support;
         // In our own half a drop to receive is still valid — unless a teammate is carrying
-        // the ball unpressured, which is the cue to push up and support forward instead.
-        if !uncontested_support
+        // unpressured OR the holder is the front line, which means runners must supply depth.
+        if !forward_support_cue
             && (self.ball.position.y - self.field_length * 0.5) * attack
                 < ATTACK_FORWARD_INTENT_MIN_BALL_DEPTH_YARDS
         {
@@ -28923,7 +28985,7 @@ impl WorldSnapshot {
         }
         let current = self.player_snapshot_position(me);
         let mut point = point;
-        if uncontested_support {
+        if forward_support_cue {
             // Edge the support point goalward to push up with the free carrier. The cap
             // allows a marginal 0-3yd offside stretch for open-space occupation; actual
             // offside is still handled when the pass is played.
@@ -28949,7 +29011,7 @@ impl WorldSnapshot {
                     .clamp_to_pitch(self.field_width, self.field_length);
             }
         }
-        let backward_tolerance = if uncontested_support {
+        let backward_tolerance = if forward_support_cue {
             0.0
         } else {
             ATTACK_FORWARD_INTENT_BACKWARD_TOLERANCE_YARDS
@@ -30388,6 +30450,104 @@ impl WorldSnapshot {
             }
         }
         (true, clear_through_flight)
+    }
+
+    pub(crate) fn pass_lane_interception_risk(
+        &self,
+        from: Vec2,
+        to: Vec2,
+        defending_team: Team,
+        radius: f64,
+        ball_speed_yps: f64,
+        lookahead_seconds: f64,
+    ) -> PassLaneInterceptionRisk {
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            let clear_now = self.clear_line(from, to, defending_team, radius);
+            return PassLaneInterceptionRisk {
+                risk: if clear_now { 0.0 } else { 1.0 },
+                clear_now,
+                clear_next_seconds: clear_now,
+                nearest_lane_margin_yards: 0.0,
+                earliest_arrival_margin_seconds: if clear_now { -lookahead_seconds } else { 0.0 },
+            };
+        }
+
+        let dir = lane * (1.0 / lane_len);
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let lookahead = lookahead_seconds
+            .clamp(DEFAULT_DT_SECONDS, PASS_LANE_DECISION_LOOKAHEAD_SECONDS);
+        let mut risk = 0.0f64;
+        let mut nearest_lane_margin_yards = f64::INFINITY;
+        let mut best_arrival_margin_seconds = f64::NEG_INFINITY;
+        for p in self.players.iter().filter(|p| p.team == defending_team) {
+            let position = self.player_snapshot_position(p);
+            let along = (position - from).dot(dir).clamp(0.0, lane_len);
+            let closest = from + dir * along;
+            let to_lane = closest - position;
+            let perp_gap = to_lane.len();
+            nearest_lane_margin_yards = nearest_lane_margin_yards.min(perp_gap - radius);
+            if perp_gap <= radius {
+                return PassLaneInterceptionRisk {
+                    risk: 1.0,
+                    clear_now: false,
+                    clear_next_seconds: false,
+                    nearest_lane_margin_yards: finite_metric(nearest_lane_margin_yards),
+                    earliest_arrival_margin_seconds: 0.0,
+                };
+            }
+
+            let ball_arrival = along / speed;
+            if ball_arrival > lookahead {
+                continue;
+            }
+
+            let sprint_speed = (player_top_speed_yps(p.role, &p.skills)
+                * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                * MovementGait::Sprint.speed_multiplier())
+            .max(0.85);
+            let velocity = self.player_velocity(p.id).unwrap_or(p.velocity);
+            let capped_velocity = if velocity.len() > sprint_speed {
+                velocity.normalized() * sprint_speed
+            } else {
+                velocity
+            };
+            let closing_speed = if perp_gap > 1e-6 {
+                capped_velocity.dot(to_lane.normalized()).max(0.0)
+            } else {
+                sprint_speed
+            };
+            let effective_closing_speed =
+                (sprint_speed * 0.72 + closing_speed.min(sprint_speed) * 0.28).max(0.85);
+            let gap_to_corridor =
+                (perp_gap - radius - INTERCEPT_LUNGE_REACH_YARDS).max(0.0);
+            let time_to_corridor =
+                PASS_LANE_INTERCEPT_REACTION_SECONDS + gap_to_corridor / effective_closing_speed;
+            let arrival_margin = ball_arrival - time_to_corridor;
+            best_arrival_margin_seconds = best_arrival_margin_seconds.max(arrival_margin);
+
+            let projected = position + capped_velocity * ball_arrival;
+            let projected_gap = segment_distance_to_point(from, to, projected);
+            let projected_risk = if projected_gap <= radius {
+                0.94
+            } else {
+                (1.0 - ((projected_gap - radius) / 2.4).clamp(0.0, 1.0)) * 0.62
+            };
+            let timing_risk = ((arrival_margin + 0.35) / 1.10).clamp(0.0, 1.0);
+            let gap_risk = (1.0 - gap_to_corridor / 8.0).clamp(0.0, 1.0);
+            let local_risk =
+                projected_risk.max((timing_risk * 0.72 + gap_risk * 0.28).clamp(0.0, 1.0));
+            risk = risk.max(local_risk);
+        }
+
+        PassLaneInterceptionRisk {
+            risk: risk.clamp(0.0, 1.0),
+            clear_now: true,
+            clear_next_seconds: risk < PASS_LANE_DYNAMIC_RISK_HIGH,
+            nearest_lane_margin_yards: finite_metric(nearest_lane_margin_yards),
+            earliest_arrival_margin_seconds: finite_metric(best_arrival_margin_seconds),
+        }
     }
 
     /// True if a defender's CURRENT trajectory carries it into the pass corridor before the

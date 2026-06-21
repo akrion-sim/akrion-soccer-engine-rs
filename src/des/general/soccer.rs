@@ -122,6 +122,14 @@ const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
 // point (large ball-time-to-arrival) hands a distant defender a huge reach (sprint × seconds),
 // flagging defenders 25+ yd off the lane. Bounds the reach to a believable step-in radius.
 const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
+// Decision-time pass safety looks beyond "is the lane clear right now" and asks whether
+// an opponent can step into the corridor over the next couple seconds. This is a graded
+// POMDP/MPC risk, not a hard physics outcome; the runtime resolver still decides who
+// actually controls the moving ball.
+const PASS_LANE_DECISION_LOOKAHEAD_SECONDS: f64 = 2.0;
+const PASS_LANE_DYNAMIC_RISK_HIGH: f64 = 0.62;
+const PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH: f64 = 0.74;
+const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
 // During the launch tick, same-team bystanders ignore the first sliver of an outgoing pass so
 // the passer cannot ping it into a teammate standing on top of the kick animation. After this
 // progress, normal controllable-trajectory logic may take over.
@@ -2480,6 +2488,9 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
 const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 10.0;
+/// If the holder has at most this many outfield teammates ahead, they are the front line
+/// (furthest/second-furthest forward) and off-ball attackers should sprint to supply runs.
+const FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD: usize = 1;
 /// A staging run in behind is held this far ONSIDE of the second-last defender when
 /// strict legality is required.
 const ONSIDE_RUN_HOLD_BUFFER_YARDS: f64 = 1.0;
@@ -18672,7 +18683,7 @@ impl SoccerPomdpObservation {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchEvent {
     pub tick: u64,
@@ -18681,6 +18692,14 @@ pub struct MatchEvent {
     pub team: Option<Team>,
     pub player_id: Option<usize>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offside_line_y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offside_ball_y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offside_player_x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offside_player_y: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37748,6 +37767,7 @@ pub fn soccer_moment_records_to_learning_dataset(
                     "{} replay for player {}",
                     record.window.summary.label, transition.player_id
                 ),
+                ..MatchEvent::default()
             });
         }
         transitions.push(transition);
@@ -41175,6 +41195,7 @@ fn tracking_goal_events(
             team: Some(Team::Home),
             player_id: before.ball.holder,
             description: "Home goal from tracking data".to_string(),
+            ..MatchEvent::default()
         });
     }
     if after.score_away > before.score_away {
@@ -41185,6 +41206,7 @@ fn tracking_goal_events(
             team: Some(Team::Away),
             player_id: before.ball.holder,
             description: "Away goal from tracking data".to_string(),
+            ..MatchEvent::default()
         });
     }
     if after.score_home == before.score_home && after.score_away == before.score_away {
@@ -41196,6 +41218,7 @@ fn tracking_goal_events(
                 team: Some(team),
                 player_id: before.ball.holder,
                 description: format!("{team:?} goal inferred from tracking goal-line crossing"),
+                ..MatchEvent::default()
             });
         }
     }
@@ -43869,10 +43892,20 @@ fn aerial_pass_interception_risk_for_snapshot(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PassLaneInterceptionRisk {
+    pub(crate) risk: f64,
+    pub(crate) clear_now: bool,
+    pub(crate) clear_next_seconds: bool,
+    pub(crate) nearest_lane_margin_yards: f64,
+    pub(crate) earliest_arrival_margin_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
     stride_fit: f64,
+    lane_interception_risk: f64,
     mpc_receipt_probability: f64,
     mpc_receipt_race_advantage_seconds: f64,
     mpc_receipt_qp_accel_fit: f64,
@@ -44393,6 +44426,7 @@ fn pass_target_quality_for_snapshot(
     // receiver is downfield, so the block must override target desirability rather than
     // being averaged against it (an additive lane term let an open receiver rescue a
     // blocked lane, reading a ball straight through a set defender as ~0.6 "safe").
+    let mut lane_interception_risk = 0.0;
     let lane_clearance = if flight.is_aerial() {
         let nearest_interceptor = snapshot
             .players
@@ -44427,7 +44461,16 @@ fn pass_target_quality_for_snapshot(
             2.5,
             nominal_speed,
         );
-        if !lane_clear_now {
+        let dynamic_risk = snapshot.pass_lane_interception_risk(
+            passer_position,
+            anticipated_target,
+            passer.team.other(),
+            2.5,
+            nominal_speed,
+            PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+        );
+        lane_interception_risk = dynamic_risk.risk;
+        let base_lane_clearance = if !lane_clear_now {
             // Defender in the corridor now: the ball would have to pass through them.
             // Genuinely low — whether they actually cut it out is left to the simulation.
             0.30
@@ -44437,7 +44480,11 @@ fn pass_target_quality_for_snapshot(
             // Clear now but a defender drifts in mid-flight — a real interception risk
             // the static check missed. Priced between blocked and clear (penalty, not veto).
             0.65
-        }
+        };
+        let dynamic_gate = (1.0
+            - lane_interception_risk.clamp(0.0, 1.0) * PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH)
+            .clamp(0.18, 1.0);
+        base_lane_clearance * dynamic_gate
     };
     let distance_fit = if flight.is_aerial() {
         (1.0 - (distance - 32.0).abs() / 58.0).clamp(0.24, 1.0)
@@ -44479,6 +44526,7 @@ fn pass_target_quality_for_snapshot(
     PassTargetQuality {
         receiver_openness,
         stride_fit,
+        lane_interception_risk,
         expected_completion: expected_completion.clamp(0.02, 0.98),
         mpc_receipt_probability: mpc_receipt.probability,
         mpc_receipt_race_advantage_seconds: mpc_receipt.race_advantage_seconds,
