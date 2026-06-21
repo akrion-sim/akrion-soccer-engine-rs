@@ -781,8 +781,12 @@ const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 1.0;
 const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 0.5;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
-const COMPLETED_KILLER_PASS_BONUS_POINTS: f64 = 4.8;
-const COMPLETED_KILLER_PASS_MAX_BONUS_POINTS: f64 = 6.0;
+// Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
+// POMDP bonus (one-twos -> wall-pass reward; third-man/overlap -> combination-run reward), so the
+// only lever to emphasise them is this existing magnitude. Bumped modestly (~+17%) to weight
+// line-splitting forward balls a little higher; further tuning should follow training feedback.
+const COMPLETED_KILLER_PASS_BONUS_POINTS: f64 = 5.6;
+const COMPLETED_KILLER_PASS_MAX_BONUS_POINTS: f64 = 7.0;
 // Completing a WALL PASS (one-two / give-and-go) is credited on top of the generic per-pass reward
 // so the policy learns to PREFER the give->burst->return pattern rather than seeing it as two
 // ordinary short passes. The runner (who laid it off and burst past the man) gets full credit; the
