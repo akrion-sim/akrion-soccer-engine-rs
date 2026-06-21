@@ -40168,6 +40168,7 @@ fn tracking_frame_to_world_snapshot(
                 learned_policy: None,
                 recent_reward: None,
                 one_two: None,
+                runaround: None,
                 hold_for_support: None,
                 slide_recovery_seconds: 0.0,
             }
@@ -41504,6 +41505,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         last_decision: None,
         decision_confidence: 1.0,
         one_two: player.one_two,
+        runaround: player.runaround,
         hold_for_support: player.hold_for_support.clone(),
         slide_recovery_seconds: player.slide_recovery_seconds,
     }
@@ -48784,6 +48786,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 last_decision: None,
                 decision_confidence: 1.0,
                 one_two: None,
+                runaround: None,
                 hold_for_support: None,
                 slide_recovery_seconds: 0.0,
             });

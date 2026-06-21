@@ -4299,6 +4299,48 @@ impl SoccerMatch {
         }
     }
 
+    /// Resolve run-around-dribble commitments (see [`RunaroundDribble`]): clear when the attacker
+    /// re-collects the ball (success), an opponent wins the loose ball (failure — the canonical
+    /// turnover engine penalizes it), or the short time-out elapses. A success re-collected
+    /// goal-side of the beaten defender earns the beat-the-man reward.
+    fn maintain_runaround_commitments(&mut self) {
+        let holder = self.ball.holder;
+        let holder_team = holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .map(|p| p.team);
+        let clock = self.clock_seconds;
+        let mut clears: Vec<usize> = Vec::new();
+        let mut successes: Vec<usize> = Vec::new();
+        for player in self.players.iter() {
+            let Some(run) = player.runaround else {
+                continue;
+            };
+            let regained = holder == Some(player.id);
+            let turnover = holder_team.is_some() && holder_team != Some(player.team);
+            let timed_out = clock - run.launch_clock_seconds > RUNAROUND_TTL_SECONDS;
+            if regained || turnover || timed_out {
+                clears.push(player.id);
+                if regained && !turnover {
+                    // Success only counts if re-collected goal-side of the beaten defender.
+                    let beaten = self.players.get(run.defender).map_or(true, |defender| {
+                        (player.position.y - defender.position.y) * player.team.attack_dir() > 0.0
+                    });
+                    if beaten {
+                        successes.push(player.id);
+                    }
+                }
+            }
+        }
+        for id in &clears {
+            if let Some(player) = self.players.get_mut(*id) {
+                player.runaround = None;
+            }
+        }
+        for id in successes {
+            self.record_reward_event(id, RUNAROUND_SUCCESS_REWARD_POINTS);
+        }
+    }
+
     /// Bleed off the carrier's hold-and-summon commitment (see [`HoldForSupport`]). It is only
     /// meaningful while THIS player is on the ball, so it clears the instant the ball leaves its
     /// feet (a pass / turnover / loose ball) and on the safety TTL — the bounded pause itself is
@@ -4354,6 +4396,7 @@ impl SoccerMatch {
         }
         self.stage_opening_kickoff_if_pending();
         self.maintain_one_two_commitments();
+        self.maintain_runaround_commitments();
         self.maintain_hold_for_support_commitments();
         self.maintain_slide_recoveries();
         let step_started = Instant::now();
@@ -8045,6 +8088,30 @@ impl SoccerMatch {
         self.players[player_id].action_facing = action_facing;
         self.record_near_goal_no_shot_penalty(player_id, &intent.action);
         self.record_excessive_hold_penalty(player_id, &intent.action);
+        // Run-around-dribble KNOCK: the carrier has just committed (runaround set, not yet knocked)
+        // and still holds the ball — release it toward the push target as a loose ball at a pace
+        // sized to the distance (so it rolls just past the defender, not overhit). The carrier's
+        // own MoveTo intent (to the re-collect point) then sprints the body around the other side.
+        if let Some(mut run) = self.players[player_id].runaround {
+            if !run.knocked && self.ball.holder == Some(player_id) {
+                let ball_pos = self.ball.position;
+                let to_target = run.push_target - ball_pos;
+                let dist = to_target.len().max(0.5);
+                let dir = to_target / dist;
+                let speed = (dist * RUNAROUND_KNOCK_SPEED_PER_YARD)
+                    .clamp(RUNAROUND_KNOCK_MIN_SPEED_YPS, RUNAROUND_KNOCK_MAX_SPEED_YPS);
+                self.ball.velocity = dir * speed;
+                self.ball.altitude_yards = 0.0;
+                self.ball.curl_acceleration = Vec2::zero();
+                self.ball.holder = None;
+                self.players[player_id].incoming_ball = None;
+                self.pending_pass = None;
+                self.pending_shot = None;
+                self.record_possession_touch(player_id);
+                run.knocked = true;
+                self.players[player_id].runaround = Some(run);
+            }
+        }
         // Direct human control: drive a controlled player's off-ball movement
         // responsively (tiered pace, hard brake on release) rather than via the AI
         // gait model. Only movement actions are overridden; on-ball actions
@@ -14576,6 +14643,8 @@ pub struct PlayerSnapshot {
     /// wall partner and the runner can read it from the shared snapshot.
     #[serde(default)]
     pub one_two: Option<OneTwoRun>,
+    #[serde(default)]
+    pub runaround: Option<RunaroundDribble>,
     /// Live hold-and-summon commitment (mirrors [`PlayerAgent::hold_for_support`]) so the
     /// summoned teammates can read the carrier's signal from the shared snapshot.
     #[serde(default)]
@@ -15093,6 +15162,51 @@ fn dd_soccer_disable_combination_run_reward() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_COMBINATION_RUN_REWARD").is_ok())
 }
+fn dd_soccer_disable_runaround_dribble() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RUNAROUND_DRIBBLE").is_ok())
+}
+/// Demo lever: relax the tight run-around gate (speed-advantage + lane/2nd-defender clearances)
+/// so the move triggers whenever it is remotely viable, to watch it locally. The geometry +
+/// in-play checks still apply. Unset = the realistic tight gate.
+fn soccer_force_runaround() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("SOCCER_FORCE_RUNAROUND").is_ok())
+}
+
+// Run-around-dribble (knock past + sprint the body the other side + re-collect behind) tunables.
+const RUNAROUND_TTL_SECONDS: f64 = 2.5;
+const RUNAROUND_SUCCESS_REWARD_POINTS: f64 = 8.0;
+const RUNAROUND_MIN_FORWARD_SPEED_YPS: f64 = 4.0;
+const RUNAROUND_DEFENDER_MIN_AHEAD_YARDS: f64 = 1.5;
+const RUNAROUND_DEFENDER_MAX_AHEAD_YARDS: f64 = 5.0;
+const RUNAROUND_DEFENDER_LATERAL_YARDS: f64 = 2.5;
+const RUNAROUND_DEFENDER_RANGE_YARDS: f64 = 5.5;
+const RUNAROUND_MIN_SPEED_ADVANTAGE: f64 = 0.4;
+const RUNAROUND_PUSH_AHEAD_YARDS: f64 = 4.5;
+const RUNAROUND_PUSH_LATERAL_YARDS: f64 = 1.6;
+const RUNAROUND_RECOLLECT_AHEAD_YARDS: f64 = 7.0;
+const RUNAROUND_RECOLLECT_CLEAR_YARDS: f64 = 6.0;
+const RUNAROUND_LANE_HALF_WIDTH_YARDS: f64 = 1.0;
+const RUNAROUND_TOUCHLINE_MARGIN_YARDS: f64 = 2.5;
+const RUNAROUND_MIN_QUALITY: f64 = 0.45;
+// Knock pace: sized to the push distance so the ball rolls just past the defender into the
+// re-collect zone without being overhit (a listed failure mode).
+const RUNAROUND_KNOCK_SPEED_PER_YARD: f64 = 1.4;
+const RUNAROUND_KNOCK_MIN_SPEED_YPS: f64 = 6.0;
+const RUNAROUND_KNOCK_MAX_SPEED_YPS: f64 = 11.0;
+
+/// Quality + geometry of a viable run-around dribble (see [`RunaroundDribble`]). The carrier reads
+/// this as a gated pre-empt appetite, mirroring the wall-pass plan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunaroundDribblePlan {
+    pub defender: usize,
+    pub push_target: Vec2,
+    pub recollect_point: Vec2,
+    pub quality: f64,
+}
 fn soccer_observation_telemetry_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -15511,6 +15625,7 @@ impl WorldSnapshot {
                 learned_policy: None,
                 recent_reward: None,
                 one_two: p.one_two,
+                runaround: p.runaround,
                 hold_for_support: p.hold_for_support.clone(),
                 slide_recovery_seconds: p.slide_recovery_seconds,
             })
@@ -21396,6 +21511,131 @@ impl WorldSnapshot {
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(id, _)| id)
+    }
+
+    /// A viable RUN-AROUND DRIBBLE the carrier can play right now: knock the ball past a committed
+    /// defender on one side and sprint the body the OTHER side to re-collect behind. Returns the
+    /// defender + knock target + re-collect rendezvous + a [0,1] quality, or `None` when the move
+    /// is not on. Tight by default (forward momentum + committed defender in range + speed
+    /// advantage + clear ball lane + open recollect zone + stays in play); `SOCCER_FORCE_RUNAROUND`
+    /// relaxes the speed/clearance bars for local demoing. The carrier reads this as a gated
+    /// pre-empt appetite, mirroring [`WorldSnapshot::wall_pass_option_for`].
+    pub(crate) fn runaround_dribble_option_for(
+        &self,
+        carrier_id: usize,
+    ) -> Option<RunaroundDribblePlan> {
+        if dd_soccer_disable_runaround_dribble() {
+            return None;
+        }
+        let carrier = self.players.iter().find(|p| p.id == carrier_id)?;
+        if self.ball.holder != Some(carrier_id)
+            || self.possession_team() != Some(carrier.team)
+            || carrier.role == PlayerRole::Goalkeeper
+        {
+            return None;
+        }
+        let force = soccer_force_runaround();
+        let attack_dir = carrier.team.attack_dir();
+        let carrier_pos = self.player_snapshot_position(carrier);
+        // Precondition: forward momentum (running AT the defender), not standing.
+        let forward_speed = carrier.velocity.y * attack_dir;
+        if !force && forward_speed < RUNAROUND_MIN_FORWARD_SPEED_YPS {
+            return None;
+        }
+        // The committed defender to beat: nearest opponent just ahead, roughly in the path.
+        let (defender_id, defender_pos, defender_dist) =
+            self.nearest_opponent_at(carrier.team, carrier_pos)?;
+        let ahead = (defender_pos.y - carrier_pos.y) * attack_dir;
+        if ahead < RUNAROUND_DEFENDER_MIN_AHEAD_YARDS
+            || ahead > RUNAROUND_DEFENDER_MAX_AHEAD_YARDS
+            || (defender_pos.x - carrier_pos.x).abs() > RUNAROUND_DEFENDER_LATERAL_YARDS
+            || defender_dist > RUNAROUND_DEFENDER_RANGE_YARDS
+        {
+            return None;
+        }
+        // Precondition: speed/acceleration advantage (pace beats them around).
+        let defender = self.players.get(defender_id)?;
+        let speed_advantage = (carrier.skills.top_speed - defender.skills.top_speed)
+            .max(forward_speed - defender.velocity.len());
+        if !force && speed_advantage < RUNAROUND_MIN_SPEED_ADVANTAGE {
+            return None;
+        }
+        // Score each side: ball knocked past on `sign`, body runs the opposite side to re-collect.
+        let side_plan = |sign: f64| -> Option<(Vec2, Vec2, f64)> {
+            let push = Vec2::new(
+                defender_pos.x + sign * RUNAROUND_PUSH_LATERAL_YARDS,
+                defender_pos.y + attack_dir * RUNAROUND_PUSH_AHEAD_YARDS,
+            );
+            let recollect = Vec2::new(
+                defender_pos.x + sign * RUNAROUND_PUSH_LATERAL_YARDS * 0.5,
+                defender_pos.y + attack_dir * RUNAROUND_RECOLLECT_AHEAD_YARDS,
+            );
+            // Stays in play (don't knock it out over the touchline).
+            let lo = RUNAROUND_TOUCHLINE_MARGIN_YARDS;
+            let hi = self.field_width - RUNAROUND_TOUCHLINE_MARGIN_YARDS;
+            if push.x < lo || push.x > hi || recollect.x < lo || recollect.x > hi {
+                return None;
+            }
+            // Ball lane clear: no opponent OTHER than the beaten defender can step into the knock
+            // path (the defender IS being gone around — the move accepts beating that one player).
+            let seg = push - carrier_pos;
+            let seg_len2 = seg.x * seg.x + seg.y * seg.y;
+            let lane_clear = !self.players.iter().any(|p| {
+                if p.team == carrier.team || p.id == defender_id {
+                    return false;
+                }
+                let pp = self.player_snapshot_position(p);
+                let t = if seg_len2 > 1e-6 {
+                    (((pp.x - carrier_pos.x) * seg.x + (pp.y - carrier_pos.y) * seg.y) / seg_len2)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let proj = Vec2::new(carrier_pos.x + seg.x * t, carrier_pos.y + seg.y * t);
+                pp.distance(proj) < RUNAROUND_LANE_HALF_WIDTH_YARDS
+            });
+            if !force && !lane_clear {
+                return None;
+            }
+            // Open space behind: no SECOND opponent covering the re-collect rendezvous.
+            let second_defender_near = self.players.iter().any(|p| {
+                p.team != carrier.team
+                    && p.id != defender_id
+                    && self.player_snapshot_position(p).distance(recollect)
+                        < RUNAROUND_RECOLLECT_CLEAR_YARDS
+            });
+            if !force && second_defender_near {
+                return None;
+            }
+            let space = self.space_score_at(recollect, carrier.team).clamp(0.0, 1.0);
+            let quality = (0.4
+                + 0.3 * space
+                + 0.3 * (speed_advantage.clamp(0.0, 2.0) / 2.0)
+                + if lane_clear { 0.1 } else { 0.0 })
+            .clamp(0.0, 1.0);
+            Some((push, recollect, quality))
+        };
+        let (push_target, recollect_point, quality) = match (side_plan(1.0), side_plan(-1.0)) {
+            (Some(a), Some(b)) => {
+                if a.2 >= b.2 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        if !force && quality < RUNAROUND_MIN_QUALITY {
+            return None;
+        }
+        Some(RunaroundDribblePlan {
+            defender: defender_id,
+            push_target,
+            recollect_point,
+            quality,
+        })
     }
 
     /// A viable wall-pass (one-two) the carrier can play right now: lay the ball off to a

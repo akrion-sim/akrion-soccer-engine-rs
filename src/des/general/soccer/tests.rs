@@ -67813,6 +67813,39 @@ fn third_man_run_credits_the_running_receiver_not_a_static_outlet() {
 }
 
 #[test]
+fn runaround_dribble_gate_fires_on_a_pace_beat_and_is_disablable() {
+    let scenario = || {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let carrier = 7usize;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = Vec2::new(40.0, 70.0);
+        sim.players[carrier].position = sim.ball.position;
+        sim.players[carrier].velocity = Vec2::new(0.0, 6.0); // forward momentum (+y for Home)
+        sim.players[carrier].skills.top_speed = 9.0; // pace advantage
+        // A committed defender just ahead, in the path, slower than the carrier.
+        sim.players[12].position = Vec2::new(40.5, 73.0);
+        sim.players[12].velocity = Vec2::zero();
+        sim.players[12].skills.top_speed = 7.0;
+        // Everyone else far away (clear ball lane + open re-collect zone).
+        for away in [11usize, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
+            sim.players[away].position = Vec2::new(8.0 + away as f64, 20.0);
+        }
+        sim
+    };
+    let sim = scenario();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .runaround_dribble_option_for(7)
+        .expect("a run-around should be on against a slower committed defender with space behind");
+    assert_eq!(plan.defender, 12, "targets the committed defender: {plan:?}");
+    assert!(
+        (plan.recollect_point.y - sim.players[7].position.y) * Team::Home.attack_dir() > 0.0,
+        "re-collect point is beyond the carrier toward goal: {plan:?}"
+    );
+    assert!(plan.quality > 0.0, "positive quality: {plan:?}");
+}
+
+#[test]
 fn give_and_go_strategy_commits_to_wall_pass_and_runner_expectation() {
     let mut sim = wall_pass_scenario();
     sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;

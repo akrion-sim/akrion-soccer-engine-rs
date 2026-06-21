@@ -53,6 +53,14 @@ fn dd_soccer_disable_power_duration_ceiling() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_POWER_DURATION_CEILING").is_ok())
 }
 
+/// Demo lever (mirrors the gate's `SOCCER_FORCE_RUNAROUND`): commit the run-around dribble whenever
+/// the (relaxed) gate offers one, so it can be watched locally. Unset = the realistic appetite.
+fn soccer_force_runaround_commit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("SOCCER_FORCE_RUNAROUND").is_ok())
+}
+
 // Viability floor for PRE-EMPT-committing a `long-ball-in-behind` — an immediate, single-option
 // aerial release that bypasses the ranked POMDP decision. Introspection of live play showed ~70%
 // of ALL passes were this forced commit, most with ~0.0 modelled completion to a covered/■ runner
@@ -558,6 +566,28 @@ pub struct OneTwoRun {
     pub return_target: Vec2,
 }
 
+/// A committed pace-dribble that beats a defender by SPLITTING them: the ball is knocked past on
+/// one side (`push_target`) while the attacker's body runs the OTHER side around the defender and
+/// re-collects behind at `recollect_point`. Like [`OneTwoRun`], it is a short-lived commitment that
+/// makes the carrier sprint to recover the knocked ball instead of treating it as a turnover.
+/// Cleared on re-collection, a turnover, the ball leaving play, or a time-out. Gated by
+/// `DD_SOCCER_DISABLE_RUNAROUND_DRIBBLE`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunaroundDribble {
+    /// The defender being run around.
+    pub defender: usize,
+    /// Match clock when the ball was knocked past; drives the time-out.
+    pub launch_clock_seconds: f64,
+    /// Where the ball was knocked (just past the defender, on the ball side).
+    pub push_target: Vec2,
+    /// The rendezvous behind the defender where the attacker re-collects the ball.
+    pub recollect_point: Vec2,
+    /// `true` once the knock has been played and the attacker is sprinting to re-collect.
+    #[serde(default)]
+    pub knocked: bool,
+}
+
 /// What a carrier holding the ball is *signalling* its teammates to do while it waits for
 /// the play to set up (see [`HoldForSupport`]). Both are a delay-before-pass: the carrier
 /// keeps the ball calmly and summons support rather than forcing a poor outlet.
@@ -691,6 +721,10 @@ pub struct PlayerAgent {
     /// [`OneTwoRun`]. `None` when not engaged in a give-and-go.
     #[serde(default)]
     pub one_two: Option<OneTwoRun>,
+    /// Active run-around-dribble commitment after this player has knocked the ball past a
+    /// committed defender — see [`RunaroundDribble`]. `None` when not running one.
+    #[serde(default)]
+    pub runaround: Option<RunaroundDribble>,
     /// Active "hold-and-summon support" commitment: this player is on the ball and has
     /// elected to delay the pass while signalling teammates to get into a better position —
     /// see [`HoldForSupport`]. `None` when not waiting on support.
@@ -5560,6 +5594,46 @@ impl PlayerAgent {
         }
 
         if has_ball {
+            // Run-around dribble (knock the ball past a committed defender on one side, sprint the
+            // body the OTHER side, re-collect behind). Gated pre-empt — parity-safe when disabled,
+            // fires only on a genuine pace-beat opportunity (or always under SOCCER_FORCE_RUNAROUND).
+            if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
+                let appetite = (0.15 + 0.60 * plan.quality).clamp(0.05, 0.85);
+                if soccer_force_runaround_commit()
+                    || agentic_action_commitment(
+                        appetite,
+                        snapshot.dt_seconds,
+                        &observation,
+                        self.role,
+                    )
+                {
+                    self.runaround = Some(RunaroundDribble {
+                        defender: plan.defender,
+                        launch_clock_seconds: snapshot.clock_seconds,
+                        push_target: plan.push_target,
+                        recollect_point: plan.recollect_point,
+                        knocked: false,
+                    });
+                    // The body runs to the re-collect point; the knock itself is applied in
+                    // `apply_player_intent`, and the MPC routes this MoveTo around the defender.
+                    let action = SoccerAction::MoveTo(plan.recollect_point);
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state,
+                        observation,
+                        belief,
+                        vec!["runaround-dribble".to_string()],
+                        single_action_option("runaround-dribble"),
+                        &action,
+                        "runaround-dribble",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: true,
+                    };
+                }
+            }
             let ground_killer_priority = observation.threaded_goal_pass_available
                 && observation.visible_forward_pass_options > 0
                 && observation.yards_to_goal <= 42.0
@@ -5625,6 +5699,29 @@ impl PlayerAgent {
         }
 
         if !has_ball {
+            // Run-around re-collect: after the knock, sprint the body to the rendezvous behind the
+            // defender to recover the loose ball — the MPC routes this MoveTo around the defender as
+            // a moving keep-out. Takes precedence over receiving a pass.
+            if let Some(run) = self.runaround {
+                if run.knocked {
+                    let action = SoccerAction::MoveTo(run.recollect_point);
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state,
+                        observation,
+                        belief,
+                        vec!["runaround-collect".to_string()],
+                        single_action_option("runaround-collect"),
+                        &action,
+                        "runaround-collect",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: true,
+                    };
+                }
+            }
             if let Some((target, sprint)) = snapshot.pending_pass_reception_target_for(self.id) {
                 let action = SoccerAction::MoveTo(target);
                 self.last_decision = Some(self.decision_trace(
