@@ -53,6 +53,36 @@ fn dd_soccer_disable_power_duration_ceiling() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_POWER_DURATION_CEILING").is_ok())
 }
 
+// Viability floor for PRE-EMPT-committing a `long-ball-in-behind` — an immediate, single-option
+// aerial release that bypasses the ranked POMDP decision. Introspection of live play showed ~70%
+// of ALL passes were this forced commit, most with ~0.0 modelled completion to a covered/■ runner
+// (reading as "passed to nobody / the other team"), and because it is NOT a ranked option the
+// learned policy could never down-weight it. Below these floors the long ball is a hopeful hoof, so
+// we fall through to the full ranked decision instead. Disable via the flag below for parity / A-B.
+const LONG_BALL_IN_BEHIND_MIN_AERIAL_COMPLETION: f64 = 0.40;
+const LONG_BALL_IN_BEHIND_MIN_RUNNER_OPENNESS: f64 = 0.30;
+const LONG_BALL_IN_BEHIND_MAX_INTERCEPTION_RISK: f64 = 0.55;
+
+fn dd_soccer_disable_long_ball_viability_gate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LONG_BALL_VIABILITY_GATE").is_ok())
+}
+
+/// Whether a `long-ball-in-behind` aerial release is on enough to PRE-EMPT-commit (skipping the
+/// ranked decision). Gated ON by default; the disable flag restores the old always-fire behaviour
+/// byte-for-byte. Reads only already-computed observation fields (no RNG, no mutation), so enabling
+/// changes only WHICH deterministic decision path runs — a hopeless long ball now defers to the
+/// full ranked POMDP decision (where ground passes / dribble / hold compete and the policy learns).
+fn long_ball_in_behind_is_viable(observation: &SoccerPomdpObservation) -> bool {
+    if dd_soccer_disable_long_ball_viability_gate() {
+        return true;
+    }
+    observation.expected_aerial_pass_completion >= LONG_BALL_IN_BEHIND_MIN_AERIAL_COMPLETION
+        && observation.best_aerial_pass_receiver_openness >= LONG_BALL_IN_BEHIND_MIN_RUNNER_OPENNESS
+        && observation.aerial_pass_interception_risk <= LONG_BALL_IN_BEHIND_MAX_INTERCEPTION_RISK
+}
+
 fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
     matches!(
         strategy,
@@ -5544,7 +5574,13 @@ impl PlayerAgent {
                     .max(threaded_goal_pass_quality_fit(&observation) * 0.82)
                     >= 0.40;
             if !ground_killer_priority {
-                if let Some(target) = snapshot.long_ball_in_behind_target(self.id) {
+                // Only PRE-EMPT-commit the long ball when it is genuinely on (an open onside runner
+                // the aerial pass can actually reach). Otherwise fall through to the full ranked
+                // decision instead of forcing a 0%-completion hoof. Gated; see the helper.
+                if let Some(target) = snapshot
+                    .long_ball_in_behind_target(self.id)
+                    .filter(|_| long_ball_in_behind_is_viable(&observation))
+                {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
                     let runner_multiplier = observation
