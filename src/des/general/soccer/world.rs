@@ -5548,6 +5548,42 @@ impl SoccerMatch {
         self.note_completed_possession_pass(pass.team, pass.origin, self.ball.position);
         self.record_completed_pass_chain_entry(pass, receiver);
         self.note_mpc_completed_pass_chain_latent(pass.team, receiver);
+        self.record_completed_wall_pass_reward(pass, receiver);
+    }
+
+    /// Extra credit for completing a WALL PASS (one-two / give-and-go): the receiver of this pass is
+    /// the player who earlier laid the ball off and burst forward, and the current passer is the
+    /// "wall" returning it first-time. The generic per-pass reward treats this as two ordinary short
+    /// passes; crediting the give->burst->return PATTERN (both players) gives the POMDP a learnable
+    /// signal to PREFER one-twos. Gated; default ON, byte-identical to baseline when disabled.
+    fn record_completed_wall_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {
+        if dd_soccer_disable_wall_pass_reward() {
+            return;
+        }
+        // This pass is the RETURN leg only if the receiver is mid-one-two and named THIS passer as
+        // its wall. (one_two persists from the give until the runner regains the ball, so it still
+        // names the partner at the instant the return is resolved.)
+        let is_return = self
+            .players
+            .get(receiver)
+            .and_then(|runner| runner.one_two.as_ref())
+            .is_some_and(|one_two| one_two.wall_partner == pass.from);
+        if !is_return {
+            return;
+        }
+        let attack_dir = pass.team.attack_dir();
+        let forward = (self.ball.position.y - pass.origin.y) * attack_dir;
+        let openness = pass.receiver_openness.clamp(0.0, 1.0);
+        let bonus = ((COMPLETED_WALL_PASS_BASE_BONUS_POINTS
+            + forward.max(0.0) * COMPLETED_WALL_PASS_FORWARD_REWARD_PER_YARD)
+            * (0.5 + 0.5 * openness))
+            .clamp(0.0, COMPLETED_WALL_PASS_MAX_BONUS_POINTS);
+        if bonus <= 1e-9 || !bonus.is_finite() {
+            return;
+        }
+        // The runner (who beat the man via the one-two) gets full credit; the wall a share.
+        self.record_reward_event(receiver, bonus);
+        self.record_reward_event(pass.from, bonus * COMPLETED_WALL_PASS_WALL_CREDIT_SHARE);
     }
 
     fn recent_completed_pass_chain_into(
@@ -14947,6 +14983,11 @@ fn dd_soccer_disable_one_two_give_to_feet() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONE_TWO_GIVE_TO_FEET").is_ok())
+}
+fn dd_soccer_disable_wall_pass_reward() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WALL_PASS_REWARD").is_ok())
 }
 fn soccer_observation_telemetry_enabled() -> bool {
     use std::sync::OnceLock;

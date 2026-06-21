@@ -783,6 +783,14 @@ const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 const COMPLETED_KILLER_PASS_BONUS_POINTS: f64 = 4.8;
 const COMPLETED_KILLER_PASS_MAX_BONUS_POINTS: f64 = 6.0;
+// Completing a WALL PASS (one-two / give-and-go) is credited on top of the generic per-pass reward
+// so the policy learns to PREFER the give->burst->return pattern rather than seeing it as two
+// ordinary short passes. The runner (who laid it off and burst past the man) gets full credit; the
+// "wall" who returned it first-time gets a share. Scaled by how far forward the return is played.
+const COMPLETED_WALL_PASS_BASE_BONUS_POINTS: f64 = 4.0;
+const COMPLETED_WALL_PASS_FORWARD_REWARD_PER_YARD: f64 = 0.25;
+const COMPLETED_WALL_PASS_MAX_BONUS_POINTS: f64 = 7.0;
+const COMPLETED_WALL_PASS_WALL_CREDIT_SHARE: f64 = 0.7;
 // Choosing a floor pass when an opponent is sitting in the passing lane is a
 // near-certain turnover; penalize it at decision time (scaled by how blocked the
 // lane is) so the policy either skips the pass or lifts it aerially over the

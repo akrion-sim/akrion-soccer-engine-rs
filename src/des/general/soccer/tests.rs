@@ -67712,6 +67712,58 @@ fn wall_pass_available_with_beatable_man_and_free_wall() {
 }
 
 #[test]
+fn completed_one_two_return_credits_runner_and_wall() {
+    // The runner (A) laid the ball off to the wall (B) and is mid one-two; B returns it first-time
+    // into A's forward run. Completing this give->burst->return must add a wall-pass bonus ON TOP of
+    // the generic pass reward, crediting BOTH players, so the POMDP can learn to prefer one-twos.
+    let runner = 6usize; // A: gave it, burst forward, receives the return
+    let wall = 7usize; // B: the wall, returns first-time
+    let wall_pos = Vec2::new(40.0, 60.0);
+    let runner_pos = Vec2::new(44.0, 70.0); // advanced, into the forward run
+    let pass = test_pending_pass(Team::Home, wall, runner, wall_pos, runner_pos);
+
+    let runner_reward = |with_one_two: bool| -> (f64, f64) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        sim.players[wall].position = wall_pos;
+        sim.players[runner].position = runner_pos;
+        if with_one_two {
+            sim.players[runner].one_two = Some(OneTwoRun {
+                wall_partner: wall,
+                launch_clock_seconds: sim.clock_seconds,
+                return_target: Vec2::new(44.0, 72.0),
+            });
+        }
+        sim.ball.position = pass.intended_target;
+        sim.reward_events.clear();
+        sim.record_completed_pass_reward(&pass, runner);
+        let r: f64 = sim
+            .reward_events
+            .iter()
+            .filter(|e| e.player_id == runner)
+            .map(|e| e.amount)
+            .sum();
+        let w: f64 = sim
+            .reward_events
+            .iter()
+            .filter(|e| e.player_id == wall)
+            .map(|e| e.amount)
+            .sum();
+        (r, w)
+    };
+
+    let (runner_with, wall_with) = runner_reward(true);
+    let (runner_plain, wall_plain) = runner_reward(false);
+    assert!(
+        runner_with > runner_plain + 2.0,
+        "completing a one-two return must add a wall-pass bonus to the runner: with={runner_with} plain={runner_plain}"
+    );
+    assert!(
+        wall_with > wall_plain,
+        "the wall (returner) must get extra credit for the lay-off+return: with={wall_with} plain={wall_plain}"
+    );
+}
+
+#[test]
 fn give_and_go_strategy_commits_to_wall_pass_and_runner_expectation() {
     let mut sim = wall_pass_scenario();
     sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;
