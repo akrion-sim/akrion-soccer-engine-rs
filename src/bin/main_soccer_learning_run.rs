@@ -74,6 +74,21 @@ fn env_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
     })
 }
 
+/// Minimum visit count an entry must have for the learner to LOAD it on resume.
+/// `0` (default) preserves the historical behavior of resuming the full policy exactly.
+/// A positive value loads only the high-visit core (like the live server's
+/// `SOCCER_LIVE_POLICY_MIN_VISITS`), so the Rust process holds a lean working set instead of
+/// dragging the whole multi-million-row tail into RAM. The full policy stays in Postgres (each
+/// cycle persists a NEW version; old versions are retained/pruned by the retention policy), so
+/// nothing is lost from the source of truth — only the in-process footprint shrinks. Tolerant
+/// parse: a malformed value falls back to 0 rather than failing the run.
+fn resume_min_visits() -> i32 {
+    env_value("SOCCER_RESUME_MIN_VISITS")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(0)
+        .max(0)
+}
+
 fn env_u32(name: &str, default: u32) -> Result<u32, Box<dyn Error>> {
     let Some(value) = env_value(name) else {
         return Ok(default);
@@ -749,7 +764,12 @@ fn refresh_postgres_policy_for_next_sim(
     }
     if refresh_decision.refresh_policy {
         if let Some(version) = store
-            .load_latest_active_policy(experiment_id, options.clone(), options.clone())
+            .load_latest_active_policy_with_min_visits(
+                experiment_id,
+                options.clone(),
+                options.clone(),
+                resume_min_visits(),
+            )
             .map_err(invalid_data)?
         {
             let version_neural_network_fingerprint = version
@@ -2503,7 +2523,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             .map_err(invalid_data)?;
         if pg_refresh_for_new_sims {
             if let Some(version) = store
-                .load_latest_active_policy(&experiment_id, options.clone(), options.clone())
+                .load_latest_active_policy_with_min_visits(
+                    &experiment_id,
+                    options.clone(),
+                    options.clone(),
+                    resume_min_visits(),
+                )
                 .map_err(invalid_data)?
             {
                 let version_neural_network_fingerprint = version
@@ -2647,6 +2672,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("postgres_required={postgres_required}");
     println!("postgres_tactical_learning_authoritative={pg_tactical_learning_authoritative}");
     println!("postgres_refresh_with_resume_artifact={pg_refresh_with_resume_artifact}");
+    println!("postgres_resume_min_visits={}", resume_min_visits());
     println!(
         "postgres_flush_policy_versions_before_new_sim={pg_flush_policy_versions_before_new_sim}"
     );
