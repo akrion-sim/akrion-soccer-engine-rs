@@ -681,10 +681,11 @@ impl SoccerLearningPgStore {
                 Ok(mut client) => {
                     // Bound server-side work so a slow/stuck query or an abandoned open
                     // transaction can't hang a long-lived queue/server loop indefinitely.
-                    if let Err(err) = client.batch_execute(
-                        "SET statement_timeout = '30s'; \
-                         SET idle_in_transaction_session_timeout = '60s'",
-                    ) {
+                    let statement_timeout = soccer_learning_pg_statement_timeout();
+                    if let Err(err) = client.batch_execute(&format!(
+                        "SET statement_timeout = '{statement_timeout}'; \
+                         SET idle_in_transaction_session_timeout = '60s'"
+                    )) {
                         return Err(format!(
                             "set soccer learning postgres session timeouts: {err}"
                         ));
@@ -1789,7 +1790,10 @@ impl SoccerLearningPgStore {
             }
         }
         // Always restore the connection's statement_timeout guard.
-        let _ = self.client.batch_execute("SET statement_timeout = '30s'");
+        let _ = self.client.batch_execute(&format!(
+            "SET statement_timeout = '{}'",
+            soccer_learning_pg_statement_timeout()
+        ));
         outcome.map(|()| total)
     }
 
@@ -4645,6 +4649,30 @@ fn soccer_learning_database_url() -> Option<String> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })
+}
+
+/// Session `statement_timeout` for soccer-learning PG connections. Defaults to "30s" so a slow or
+/// stuck query can't hang a long-lived queue/server loop, but is overridable via
+/// `SOCCER_PG_STATEMENT_TIMEOUT` (a Postgres interval such as "180s") for read-heavy clients like
+/// the live server, which must load a large policy from a temporarily bloated table where the scan
+/// can exceed 30s. The value is sanitized to `<int>[ms|s|min|h]` (falling back to "30s") since it
+/// is interpolated into SQL.
+fn soccer_learning_pg_statement_timeout() -> String {
+    const DEFAULT: &str = "30s";
+    let Some(raw) = std::env::var("SOCCER_PG_STATEMENT_TIMEOUT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return DEFAULT.to_string();
+    };
+    let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let unit = &raw[digits.len()..];
+    if !digits.is_empty() && matches!(unit, "" | "ms" | "s" | "min" | "h") {
+        raw
+    } else {
+        DEFAULT.to_string()
+    }
 }
 
 fn soccer_learning_pg_should_verify_certificates(database_url: &str) -> bool {
