@@ -1727,12 +1727,17 @@ impl SoccerLearningPgStore {
         if superseded.is_empty() {
             return Ok(0);
         }
+        // Disable the 30s statement_timeout for the cleanup: each batch is LIMIT-bounded and this
+        // is best-effort + post-commit, but later batches slow as dead tuples accumulate and were
+        // tripping the 30s cap (deleting one batch, then erroring -> the superseded gen never
+        // drained). Restored below on EVERY path so other queries on this shared connection keep
+        // their guard. Errors are captured (not `?`-propagated) so the restore always runs.
+        let _ = self.client.batch_execute("SET statement_timeout = 0");
         let mut total: u64 = 0;
+        let mut outcome: Result<(), String> = Ok(());
         loop {
-            let deleted = self
-                .client
-                .execute(
-                    r#"
+            match self.client.execute(
+                r#"
                     delete from des_soccer_learning_policy_entries
                     where ctid in (
                       select ctid
@@ -1741,18 +1746,24 @@ impl SoccerLearningPgStore {
                       limit $2
                     )
                     "#,
-                    &[&superseded, &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE],
-                )
-                .map_err(|err| format!("prune superseded branch entries (batch): {err}"))?;
-            total += deleted;
-            if deleted == 0 {
-                break;
+                &[&superseded, &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE],
+            ) {
+                Ok(deleted) => {
+                    total += deleted;
+                    if deleted == 0 {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    outcome = Err(format!("prune superseded branch entries (batch): {err}"));
+                    break;
+                }
             }
         }
-        // Entries are gone — flip the drained versions to not-retained (cheap; the policy-versions
-        // table is tiny). Mirrors the retention bookkeeping the old in-transaction prune did.
-        self.client
-            .execute(
+        if outcome.is_ok() {
+            // Entries are gone — flip the drained versions to not-retained (cheap; the
+            // policy-versions table is tiny). Mirrors the old in-transaction prune's bookkeeping.
+            if let Err(err) = self.client.execute(
                 r#"
                 update des_soccer_learning_policy_versions
                 set
@@ -1773,9 +1784,13 @@ impl SoccerLearningPgStore {
                 where id = any($1::text[]::uuid[])
                 "#,
                 &[&superseded, &tip_policy_version_id],
-            )
-            .map_err(|err| format!("mark superseded branch versions pruned: {err}"))?;
-        Ok(total)
+            ) {
+                outcome = Err(format!("mark superseded branch versions pruned: {err}"));
+            }
+        }
+        // Always restore the connection's statement_timeout guard.
+        let _ = self.client.batch_execute("SET statement_timeout = '30s'");
+        outcome.map(|()| total)
     }
 
     pub fn insert_completed_run(
