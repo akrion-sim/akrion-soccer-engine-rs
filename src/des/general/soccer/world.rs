@@ -20001,7 +20001,10 @@ impl WorldSnapshot {
                 } else {
                     (PassFlight::Floor, 0.18)
                 };
-                let quality = pass_target_quality_for_snapshot(
+                // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
+                // lane-interception-risk gate crush its completion below the floor below (which
+                // would hide the option). Risk is priced into the killer-pass score instead.
+                let quality = pass_target_quality_for_snapshot_threaded(
                     self,
                     me,
                     me_position,

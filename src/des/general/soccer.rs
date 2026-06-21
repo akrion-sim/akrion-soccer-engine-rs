@@ -44343,6 +44343,52 @@ fn pass_target_quality_for_snapshot(
     target_position: Vec2,
     flight: PassFlight,
 ) -> PassTargetQuality {
+    pass_target_quality_for_snapshot_inner(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        flight,
+        true,
+    )
+}
+
+/// THREADED / killer-pass variant: identical to [`pass_target_quality_for_snapshot`] but WITHOUT
+/// the dynamic lane-interception-risk completion gate. A killer ball through a congested defence is
+/// risky by nature; that risk is priced into the killer-pass SCORE (and the assessment's own
+/// ground-lane / loft-corridor checks), and must NOT crush its `expected_completion` below the
+/// selection floor — doing so hides the option entirely (the bug that regressed killer-pass
+/// selection near goal). `lane_interception_risk` is still computed and returned so the threaded
+/// caller can price it itself.
+fn pass_target_quality_for_snapshot_threaded(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    flight: PassFlight,
+) -> PassTargetQuality {
+    pass_target_quality_for_snapshot_inner(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        flight,
+        false,
+    )
+}
+
+fn pass_target_quality_for_snapshot_inner(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    flight: PassFlight,
+    apply_dynamic_lane_risk_gate: bool,
+) -> PassTargetQuality {
     let initial_is_cross = pass_would_be_cross(
         passer_position,
         target_position,
@@ -44481,9 +44527,15 @@ fn pass_target_quality_for_snapshot(
             // the static check missed. Priced between blocked and clear (penalty, not veto).
             0.65
         };
-        let dynamic_gate = (1.0
-            - lane_interception_risk.clamp(0.0, 1.0) * PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH)
-            .clamp(0.18, 1.0);
+        let dynamic_gate = if apply_dynamic_lane_risk_gate {
+            (1.0 - lane_interception_risk.clamp(0.0, 1.0) * PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH)
+                .clamp(0.18, 1.0)
+        } else {
+            // Threaded / killer-pass evaluation: don't let the dynamic interception risk crush the
+            // completion estimate (it's priced into the killer-pass score instead). Static lane
+            // clearance still applies via `base_lane_clearance`.
+            1.0
+        };
         base_lane_clearance * dynamic_gate
     };
     let distance_fit = if flight.is_aerial() {
