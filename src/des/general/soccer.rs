@@ -32955,6 +32955,48 @@ fn soccer_live_install_pg_policy(
     stamp
 }
 
+/// Process-wide cache of the live learned policy (trimmed tabular Q + neural snapshot). The FIRST
+/// live session pays the Postgres load; the background refresh thread keeps this current as newer
+/// generations are published. Every subsequent PER-GAME session clones it instead of re-running the
+/// PG load — so opening a new `?game=<id>` link is instant even when the entries table is large
+/// (each named game otherwise re-ran the full multi-second startup load). See `resolve` /
+/// `SoccerLiveServer::new`.
+#[cfg(feature = "postgres-persistence")]
+static SOCCER_LIVE_WARM_POLICY: std::sync::Mutex<
+    Option<(SoccerTeamQPolicies, Option<SoccerNeuralNetworkSnapshot>)>,
+> = std::sync::Mutex::new(None);
+
+/// Snapshot a sim's currently-installed policy into the process-wide warm cache (best-effort).
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_store_warm_policy(sim: &SoccerMatch) {
+    let Some(policies) = sim.team_policies().cloned() else {
+        return;
+    };
+    let net = sim.neural_network_snapshot();
+    if let Ok(mut guard) = SOCCER_LIVE_WARM_POLICY.lock() {
+        *guard = Some((policies, net));
+    }
+}
+
+/// Install the warm-cached policy into `sim` if one is present. Returns `true` when it did, so the
+/// caller can skip the (slow) Postgres load. The cache is only populated after a successful load,
+/// so a `true` here means a real learned policy is being reused.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_install_warm_policy(sim: &mut SoccerMatch) -> bool {
+    let Some((policies, net)) = SOCCER_LIVE_WARM_POLICY
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    else {
+        return false;
+    };
+    sim.set_team_policies(policies);
+    if let Some(net) = net {
+        let _ = sim.set_neural_network_snapshot(net);
+    }
+    true
+}
+
 impl SoccerLiveServer {
     pub fn new(config: SoccerLiveServerConfig) -> Self {
         let mut session = SoccerRealtimeSession::new(config.match_config.clone());
@@ -33057,30 +33099,41 @@ impl SoccerLiveServer {
         // when SOCCER_DATABASE_URL is unset, or when the DB is unreachable.
         #[cfg(feature = "postgres-persistence")]
         {
-            match soccer_live_pg_connect_for_policy(&session.sim.config) {
-                Ok(Some((mut store, experiment_id))) => {
-                    match soccer_live_fetch_latest_pg_policy(&mut store, &experiment_id) {
-                        Ok(Some(version)) => {
-                            let (generation, _) =
-                                soccer_live_install_pg_policy(&mut session.sim, version);
-                            println!(
-                                "# soccer-live: loaded learned policy gen {generation} from postgres (experiment {experiment_id})"
-                            );
+            // The FIRST live session pays the Postgres load; every subsequent per-game session
+            // clones that warm in-memory policy instead of re-querying PG, so opening a new game
+            // link is instant even when the entries table is large. The background refresh thread
+            // keeps the cache current as the cluster learner publishes newer generations.
+            if soccer_live_install_warm_policy(&mut session.sim) {
+                println!(
+                    "# soccer-live: reused warm in-memory learned policy (skipped postgres reload)"
+                );
+            } else {
+                match soccer_live_pg_connect_for_policy(&session.sim.config) {
+                    Ok(Some((mut store, experiment_id))) => {
+                        match soccer_live_fetch_latest_pg_policy(&mut store, &experiment_id) {
+                            Ok(Some(version)) => {
+                                let (generation, _) =
+                                    soccer_live_install_pg_policy(&mut session.sim, version);
+                                soccer_live_store_warm_policy(&session.sim);
+                                println!(
+                                    "# soccer-live: loaded learned policy gen {generation} from postgres (experiment {experiment_id})"
+                                );
+                            }
+                            Ok(None) => {
+                                println!(
+                                    "# soccer-live: no active postgres policy for experiment {experiment_id}; using local file"
+                                );
+                            }
+                            Err(err) => session
+                                .policy_autosave
+                                .record_error(format!("postgres policy load: {err}")),
                         }
-                        Ok(None) => {
-                            println!(
-                                "# soccer-live: no active postgres policy for experiment {experiment_id}; using local file"
-                            );
-                        }
-                        Err(err) => session
-                            .policy_autosave
-                            .record_error(format!("postgres policy load: {err}")),
                     }
+                    Ok(None) => {}
+                    Err(err) => session
+                        .policy_autosave
+                        .record_error(format!("postgres policy connect: {err}")),
                 }
-                Ok(None) => {}
-                Err(err) => session
-                    .policy_autosave
-                    .record_error(format!("postgres policy connect: {err}")),
             }
         }
         let input_queue = session.input_queue();
@@ -33159,7 +33212,12 @@ impl SoccerLiveServer {
                                     let (generation, installed) = {
                                         let mut guard =
                                             soccer_mutex_lock(&session, "soccer_live_session");
-                                        soccer_live_install_pg_policy(&mut guard.sim, version)
+                                        let stamp =
+                                            soccer_live_install_pg_policy(&mut guard.sim, version);
+                                        // Keep the per-game warm cache current so new game links
+                                        // started after this publish reuse the NEW generation.
+                                        soccer_live_store_warm_policy(&guard.sim);
+                                        stamp
                                     };
                                     last_seen = Some(installed.max(updated_at));
                                     println!(
