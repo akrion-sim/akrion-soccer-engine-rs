@@ -11992,10 +11992,19 @@ impl SoccerNeuralLearningBackend {
 #[serde(rename_all = "camelCase")]
 pub enum SoccerNeuralBlendMode {
     /// Decisions stay purely tabular; the value head is trained but not read.
-    #[default]
     Off,
     /// `Q_eff(s,a) = Q_tab(s,a) + λ·V_net(s,a)` (both in Q units). The net nudges;
     /// the tabular value is the floor.
+    ///
+    /// DEFAULT: the tabular Q-state (`SoccerMdpState`) is a coarse grid/facing/phase key that
+    /// aliases wildly different 22-player configurations onto the same bin, so it can't learn
+    /// position-dependent decisions — the long-standing learning plateau. The neural value
+    /// head, by contrast, conditions on the full canonical 22+ball motion vector
+    /// (position/velocity/acceleration/jerk), so blending it in grounds the decision in the
+    /// real kinematic state and de-aliases the bins. Inert until a neural learner is enabled
+    /// AND warm (`effective_lambda` ramps 0→λ over `warmup_steps`), so this is a no-op for the
+    /// tabular-only / non-neural runs and tests.
+    #[default]
     Additive,
     /// The tabular ranking chooses; the net only re-orders candidates whose
     /// tabular values sit within `tie_epsilon` of the best — never promotes a
@@ -12064,7 +12073,9 @@ fn default_soccer_neural_blend_warmup_steps() -> usize {
 impl Default for SoccerNeuralBlendConfig {
     fn default() -> Self {
         SoccerNeuralBlendConfig {
-            mode: SoccerNeuralBlendMode::Off,
+            // Additive (kinematic value head grounds decisions) once a neural learner is warm;
+            // inert otherwise. See `SoccerNeuralBlendMode::Additive`.
+            mode: SoccerNeuralBlendMode::Additive,
             lambda: default_soccer_neural_blend_lambda(),
             tie_epsilon: default_soccer_neural_blend_tie_epsilon(),
             min_confidence_visits: default_soccer_neural_blend_min_visits(),
@@ -28183,6 +28194,17 @@ pub struct SoccerNeuralNetworkSnapshot {
     pub parameter_count: usize,
     pub l2_norm: f64,
     pub layers: Vec<SoccerNeuralLayerSnapshot>,
+    /// Training progress carried with the weights so a net LOADED for inference (the live
+    /// server) or RESUMED for more training is recognised as already-warm by the decision-time
+    /// value blend (`SoccerNeuralBlendConfig::effective_lambda` ramps on these). Without this a
+    /// loaded net reads as cold (steps 0, no loss) and the kinematic value blend stays inert on
+    /// serve — so serving would fall back to the aliased tabular path while training used the
+    /// value head. `#[serde(default)]` keeps old persisted snapshots loadable (they resume cold,
+    /// exactly as before, and re-warm as they train).
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
 }
 
 /// Number of pass-specific scalar features appended to the 256-d config embedding for the learned
@@ -29239,6 +29261,19 @@ impl SoccerNeuralLearningStatsState {
     fn average_loss(&self) -> Option<f64> {
         (self.loss_count > 0).then(|| self.loss_sum / self.loss_count as f64)
     }
+
+    /// Seed progress for a net LOADED from a persisted snapshot so the decision-time value
+    /// blend treats it as already-warm (it is pre-trained). A finite persisted `average_loss`
+    /// is restored so `average_loss()` reports it; an absent one (old snapshot) leaves the
+    /// learner cold so it re-warms as it trains — the pre-jerk-era backward-compatible path.
+    fn seed_pretrained(&mut self, training_steps: usize, average_loss: Option<f64>) {
+        self.training_steps = self.training_steps.max(training_steps);
+        if let Some(loss) = average_loss.filter(|loss| loss.is_finite()) {
+            self.last_loss = Some(loss);
+            self.loss_sum = loss;
+            self.loss_count = 1;
+        }
+    }
 }
 
 struct SoccerNeuralLearningWorker {
@@ -29453,6 +29488,22 @@ impl SoccerNeuralLearner {
     fn new(config: &MatchConfig) -> Self {
         let network = build_soccer_neural_network(&config.neural_learning, config.seed);
         Self::from_network(config, network)
+    }
+
+    /// Build a learner around a network LOADED from a persisted snapshot (live serving or a
+    /// resumed training run), seeding its readiness from the snapshot's stamped progress so the
+    /// decision-time value blend recognises the pre-trained net immediately (rather than reading
+    /// it as cold and falling back to the aliased tabular path).
+    fn from_pretrained_snapshot(
+        config: &MatchConfig,
+        network: FeedForwardNetwork,
+        snapshot: &SoccerNeuralNetworkSnapshot,
+    ) -> Self {
+        let mut learner = Self::from_network(config, network);
+        learner
+            .stats
+            .seed_pretrained(snapshot.training_steps, snapshot.average_loss);
+        learner
     }
 
     fn from_network(config: &MatchConfig, network: FeedForwardNetwork) -> Self {
@@ -30160,6 +30211,10 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
                 biases: layer.biases.clone(),
             })
             .collect(),
+        // Progress is stamped by `neural_network_snapshot_for` (which has the learner stats)
+        // when the snapshot is exposed for persistence; the raw weight snapshot is neutral.
+        training_steps: 0,
+        average_loss: None,
     }
 }
 

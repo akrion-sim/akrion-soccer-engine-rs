@@ -5278,6 +5278,7 @@ mod tests {
                 weights: vec![vec![0.20, -0.15]],
                 biases: vec![0.05],
             }],
+            ..Default::default()
         }
     }
 

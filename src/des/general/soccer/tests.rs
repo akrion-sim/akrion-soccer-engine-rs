@@ -68840,6 +68840,7 @@ fn neural_snapshot_sidecar_round_trips_independently_of_tabular_artifact() {
         parameter_count: 3865,
         l2_norm: 1.25,
         layers: Vec::new(),
+        ..Default::default()
     };
     write_soccer_neural_snapshot(&policy_path, &snapshot).expect("write sidecar");
     // The sidecar exists on its own — the (over-cap) tabular artifact was never written.
@@ -69965,4 +69966,54 @@ fn pass_chain_meter_finalizes_on_possession_end_and_never_double_counts() {
     };
     assert_eq!(sim.summary().stats.pass_chains_away, 1);
     assert_eq!(sim.stats.pass_chains_away, 0);
+}
+
+#[test]
+fn neural_snapshot_carries_progress_so_loaded_net_is_warm() {
+    // Train an inline neural value head briefly, then persist + reload it. The loaded net must
+    // come back WARM (training progress restored) so the decision-time value blend treats it as
+    // authoritative on serve — otherwise serving falls back to the aliased tabular path while
+    // training used the kinematic value head.
+    let config = MatchConfig {
+        duration_seconds: 0.6,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            train_every_ticks: 1,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 4242,
+        ..Default::default()
+    };
+    let mut sim = SoccerMatch::default_11v11(config.clone())
+        .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
+    for _ in 0..60 {
+        sim.run_time_step();
+    }
+    let trained_steps = sim.learning_snapshot().neural_learning_training_steps;
+    assert!(trained_steps > 0, "inline neural learning should have trained");
+
+    let snapshot = sim
+        .neural_network_snapshot()
+        .expect("trained neural snapshot");
+    assert_eq!(
+        snapshot.training_steps, trained_steps,
+        "snapshot must carry the learner's training progress"
+    );
+    assert!(
+        snapshot.average_loss.is_some_and(|loss| loss.is_finite()),
+        "snapshot must carry a finite average loss"
+    );
+
+    // A freshly loaded net restores the progress (warm), not a cold step-0 learner.
+    let resumed = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(snapshot.clone())
+        .expect("resume persisted neural snapshot");
+    assert_eq!(
+        resumed.neural_training_steps_for(Team::Home),
+        snapshot.training_steps,
+        "loaded net must restore training progress so the value blend treats it as warm"
+    );
 }

@@ -1273,7 +1273,11 @@ impl SoccerMatch {
             return Ok(());
         }
         let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-        self.neural_learner = Some(SoccerNeuralLearner::from_network(&self.config, network));
+        self.neural_learner = Some(SoccerNeuralLearner::from_pretrained_snapshot(
+            &self.config,
+            network,
+            &snapshot,
+        ));
         Ok(())
     }
 
@@ -1339,8 +1343,16 @@ impl SoccerMatch {
     /// Latest trained value/critic snapshot for a specific team's brain. Used by
     /// the tournament to extract each competitor's learned net after a match.
     pub fn neural_network_snapshot_for(&self, team: Team) -> Option<SoccerNeuralNetworkSnapshot> {
-        self.neural_learner_for(team)
-            .and_then(|learner| learner.last_network_snapshot.clone())
+        self.neural_learner_for(team).and_then(|learner| {
+            learner.last_network_snapshot.clone().map(|mut snapshot| {
+                // Stamp the learner's live training progress so a net loaded for inference (or
+                // resumed for training) is recognised as already-warm by the decision-time value
+                // blend, keeping serve consistent with train.
+                snapshot.training_steps = learner.training_steps();
+                snapshot.average_loss = learner.average_loss();
+                snapshot
+            })
+        })
     }
 
     /// Gradient steps a team's brain has taken — per-team learning progress for
@@ -1382,7 +1394,7 @@ impl SoccerMatch {
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-                SoccerNeuralLearner::from_network(&self.config, network)
+                SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
             None => {
