@@ -9055,7 +9055,9 @@ impl SoccerMatch {
                                 receiver,
                             );
                             if plan.power > 0.68 {
-                                speed.max(plan.speed_yps).min(mph_to_yps(42.0))
+                                speed.max(plan.speed_yps).min(mph_to_yps(
+                                    GROUND_PASS_CEILING_MPH + PASS_SPEED_CEILING_OVERSHOOT_MPH,
+                                ))
                             } else {
                                 speed
                             }

@@ -46143,6 +46143,18 @@ fn shot_speed_yps_from_power(power: f64, skills: &SkillProfile) -> f64 {
     mph_to_yps(mph.clamp(SHOT_MIN_SPEED_MPH, SHOT_MAX_SPEED_MPH))
 }
 
+/// Hard-driven launch-speed ceilings (mph) that `power` scales up to in
+/// [`pass_speed_yps_from_power`]; a strong, skilled striker overshoots the ceiling by
+/// [`PASS_SPEED_CEILING_OVERSHOOT_MPH`]. Sized so a genuinely driven ball is realistic — a
+/// ~40mph ground pass, a ~50mph aerial — rather than the old ~34/~46mph caps. Crucially the
+/// ground ceiling is set so the hardest power bucket clears
+/// [`PASS_FAST_BYPASS_MIN_SPEED_YPS`] (~35mph): the policy can then ELECT a ball driven hard
+/// enough to thread a set trap at DECISION time, instead of that relief only emerging from
+/// the execution-side speed modulation (which already reached ~42mph).
+const GROUND_PASS_CEILING_MPH: f64 = 38.0;
+const AERIAL_PASS_CEILING_MPH: f64 = 46.0;
+const PASS_SPEED_CEILING_OVERSHOOT_MPH: f64 = 4.0;
+
 fn pass_speed_yps_from_power(
     power: f64,
     flight: PassFlight,
@@ -46171,11 +46183,15 @@ fn pass_speed_yps_from_power(
     } else {
         3.0
     };
-    let ceiling = if flight.is_aerial() { 42.0 } else { 30.0 };
+    let ceiling = if flight.is_aerial() {
+        AERIAL_PASS_CEILING_MPH
+    } else {
+        GROUND_PASS_CEILING_MPH
+    };
     let aerial_power_bonus = if flight.is_aerial() { 5.0 } else { 0.0 };
     let mph =
         floor + power.clamp(0.0, 1.0) * (ceiling - floor) + skill_power * 4.0 + aerial_power_bonus;
-    mph_to_yps(mph.clamp(3.0, ceiling + 4.0))
+    mph_to_yps(mph.clamp(3.0, ceiling + PASS_SPEED_CEILING_OVERSHOOT_MPH))
 }
 
 const DISCRETIZED_KICK_SPEED_BUCKETS: u8 = 10;
