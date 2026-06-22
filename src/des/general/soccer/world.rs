@@ -9493,6 +9493,24 @@ impl SoccerMatch {
         // Defensive recovery: when the opponent threatens and we're not goalside,
         // sprint back at full effort (max near a back-line 50:50).
         let recover_effort = self.defensive_recovery_effort(player_id);
+        // Overhead-ball discipline: while an aerial 50:50 is in flight TOWARD the opponent's
+        // goal (no settled holder) and THIS player is dropping toward our OWN goal under it,
+        // they walk back rather than sprint — the ball is going the other way and may be
+        // ours to win. Lifts the instant a holder settles or the ball turns back toward our
+        // goal; genuine ball-chasers (moving forward, at the ball) are unaffected. Human-
+        // controlled players keep full control of their pace.
+        let forward_aerial_walk_back = !dd_soccer_disable_forward_aerial_fifty_fifty_hold()
+            && self.ball.holder.is_none()
+            && self.ball.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS
+            && self.ball.velocity.y * my_team.attack_dir() > 0.0
+            && to_target.y * my_team.attack_dir() < 0.0
+            && self.players[player_id].controller_slot.is_none();
+        // Suppress the flat-out recovery sprint while walking back under the overhead ball.
+        let recover_effort = if forward_aerial_walk_back {
+            0.0
+        } else {
+            recover_effort
+        };
         // The recovery sprint only applies when the player is actually MOVING to recover.
         // A player holding station (target ≈ current position) is resting — it must not be
         // forced into a sprint by its line-consistency urgency (that would never let a
@@ -9655,6 +9673,16 @@ impl SoccerMatch {
         let previous_gait = self.players[player_id].movement_gait;
         let gait_held_seconds = self.players[player_id].locomotion.gait_held_seconds;
         let gait = commit_gait(previous_gait, gait, gait_held_seconds, gait_emergency);
+        // Cap the drop-back under a forward overhead ball to a walk: keep the back-pedal /
+        // forward orientation but never exceed walking pace (effort tier 1).
+        let gait = if forward_aerial_walk_back && gait.effort_tier() > 1 {
+            match gait {
+                MovementGait::BackJog | MovementGait::BackSkip => MovementGait::BackWalk,
+                _ => MovementGait::Walk,
+            }
+        } else {
+            gait
+        };
         // A turn-and-run to keep up with a fast attacker (chase / flat-out recovery)
         // bypasses the heading-reversal lock so the change of direction is never
         // delayed; ordinary play keeps its directional momentum.
@@ -15276,6 +15304,24 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
+}
+// While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
+// goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
+// up rather than turning and chasing their own goal under a ball that is going the other
+// way. Set DD_SOCCER_DISABLE_FORWARD_AERIAL_FIFTY_FIFTY_HOLD=1 to restore the old behaviour.
+pub(crate) fn dd_soccer_disable_forward_aerial_fifty_fifty_hold() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FORWARD_AERIAL_FIFTY_FIFTY_HOLD").is_ok())
+}
+// "Crash the box": with a team-mate carrying or crossing from a wide area in the attacking
+// final third, strikers + advancing attackers attack DISTINCT box zones (near post / penalty
+// spot / far post / cut-back edge) so the area is packed for the delivery. Set
+// DD_SOCCER_DISABLE_CRASH_THE_BOX=1 to fall back to the old single best-fit arrival.
+pub(crate) fn dd_soccer_disable_crash_the_box() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_CRASH_THE_BOX").is_ok())
 }
 fn dd_soccer_disable_power_duration_ceiling() -> bool {
     use std::sync::OnceLock;
@@ -26578,6 +26624,105 @@ impl WorldSnapshot {
             })
     }
 
+    /// "Crash the box" (the [`TeamAttackStrategy::CrashTheBox`] mechanic). When a team-mate
+    /// is carrying — or has just crossed — from a WIDE area in the attacking final third near
+    /// the opponent's goal, the strikers and advancing attackers attack DISTINCT zones of the
+    /// penalty area so the box is PACKED for the delivery rather than one lone runner. Each
+    /// eligible crasher is assigned its own zone — near post, far post, penalty spot, and the
+    /// cut-back/edge — matched left-to-right to the runners' lateral positions so they fan
+    /// across the box instead of clumping. Assignment is fully deterministic (sorted by x then
+    /// id, no RNG) so it is parity-safe. Returns this player's assigned box target, or `None`
+    /// when no box-crash is on.
+    pub(crate) fn crash_the_box_target_for(&self, player: &PlayerSnapshot) -> Option<Vec2> {
+        if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
+            return None;
+        }
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.controller_slot.is_some()
+            || !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        // Only attack-minded midfielders join the box-crash; a holding/defensive mid stays.
+        if player.role == PlayerRole::Midfielder
+            && player.preferences.defensive_mindedness > player.preferences.offensive_mindedness
+        {
+            return None;
+        }
+        let dir = player.team.attack_dir();
+        let center_x = self.field_width * 0.5;
+        let goal_y = player.team.goal_y(self.field_length);
+        // The wide deliverer = the position the cross comes from: our carrier if we hold the
+        // ball, else the (in-flight) ball itself. It must be in a wide lane and high up the
+        // pitch near the opponent's goal.
+        let crosser = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .filter(|p| p.team == player.team)
+            .map(|p| self.player_snapshot_position(p))
+            .unwrap_or(self.ball.position);
+        if self.ball.holder == Some(player.id) {
+            return None;
+        }
+        if flank_lane_score(crosser, self.field_width) < 0.55 {
+            return None;
+        }
+        // Crosser must be in the attacking final third (within ~22yd of the opponent goal).
+        if (goal_y - crosser.y) * dir > 22.0 || (goal_y - crosser.y) * dir < 0.0 {
+            return None;
+        }
+        let current = self.player_snapshot_position(player);
+        // A runner already inside its own half stays in shape — only advanced attackers crash.
+        if (current.y - self.field_length * 0.5) * dir < -8.0 {
+            return None;
+        }
+        // Which flank the delivery comes from (+1 = right of centre, -1 = left).
+        let source_side = if crosser.x >= center_x { 1.0 } else { -1.0 };
+        // Distinct box zones, in front of the opponent goal. Far post is the opposite side
+        // from the crosser; near post the same side; plus the penalty spot and the cut-back
+        // edge for the second-ball / pulled-back delivery.
+        let near_post = Vec2::new(center_x + source_side * 3.0, goal_y - dir * 5.8);
+        let penalty_spot = Vec2::new(center_x, goal_y - dir * 11.0);
+        let far_post = Vec2::new(center_x - source_side * 3.6, goal_y - dir * 5.2);
+        let cutback_edge = Vec2::new(center_x - source_side * 1.0, goal_y - dir * 16.5);
+        let mut zones = [far_post, penalty_spot, near_post, cutback_edge];
+        // Order the zones left-to-right so they can be matched to the runners' x order.
+        zones.sort_by(|a, b| a.x.total_cmp(&b.x));
+        // Eligible crashers on our team, ordered by x (then id) — the SAME deterministic
+        // population every crasher computes, so the assignment is consistent across players.
+        let mut crashers: Vec<(f64, usize)> = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == player.team
+                    && self.ball.holder != Some(p.id)
+                    && p.controller_slot.is_none()
+                    && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && !(p.role == PlayerRole::Midfielder
+                        && p.preferences.defensive_mindedness
+                            > p.preferences.offensive_mindedness)
+                    && (self.player_snapshot_position(p).y - self.field_length * 0.5) * dir >= -8.0
+            })
+            .map(|p| (self.player_snapshot_position(p).x, p.id))
+            .collect();
+        crashers.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let rank = crashers.iter().position(|(_, id)| *id == player.id)?;
+        // Match runners to zones left-to-right; any surplus runners beyond the four zones
+        // funnel to the penalty spot (still packing the box).
+        let zone = if rank < zones.len() {
+            zones[rank]
+        } else {
+            penalty_spot
+        };
+        let onside = self.clamp_forward_onside_support(player, zone);
+        if self.position_would_be_offside(player.team, onside) {
+            return None;
+        }
+        Some(onside.clamp_to_pitch(self.field_width, self.field_length))
+    }
+
     pub(crate) fn flank_cross_arrival_target_for(
         &self,
         player_id: usize,
@@ -30131,6 +30276,9 @@ impl WorldSnapshot {
         if self.possession_team() != Some(opponent) {
             return target;
         }
+        // NOTE: under a forward aerial 50:50 we still let players reposition goal-side, but
+        // the move is walk-capped (not a sprint back) in `move_player_towards` — see
+        // `dd_soccer_disable_forward_aerial_fifty_fifty_hold`.
         let strict_defender = player.role == PlayerRole::Defender;
         let ball = self.ball.position;
         if !strict_defender
@@ -30397,6 +30545,12 @@ impl WorldSnapshot {
         } else {
             proposed
         };
+        // Crash the box: an attacker arriving for a wide team-mate's cross is pulled into its
+        // assigned box zone, ahead of the generic shape target. Spacing/lane guards below
+        // still refine it so the runners don't overlap.
+        let chosen = self
+            .crash_the_box_target_for(player)
+            .unwrap_or(chosen);
         let chosen = self.off_carrier_lane_target(player, chosen);
         let chosen = self.defensive_goal_side_target(player, chosen);
         let chosen = self.teammate_spacing_path_adjusted_target(player, chosen);

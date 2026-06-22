@@ -14333,12 +14333,28 @@ fn tactical_directive_for_team(
         }
     } else if flank_attack_policy.is_flank() && (!in_final_third || deep_in_attack) {
         match ball_side {
-            StrategyLane::Left if deep_in_attack => {
-                TeamAttackStrategy::BylineCrossLeftToPenaltySpot
-            }
-            StrategyLane::Right if deep_in_attack => {
-                TeamAttackStrategy::BylineCrossRightToPenaltySpot
-            }
+            StrategyLane::Left if deep_in_attack => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
+                    0.50 + left_lane_fit * 0.16,
+                ),
+                // Pack the box for the wide delivery — favoured with a central numbers
+                // advantage to attack the cross.
+                (
+                    TeamAttackStrategy::CrashTheBox,
+                    0.44 + overload_score * 0.30 + central_fit * 0.12,
+                ),
+            ], strategy_draw),
+            StrategyLane::Right if deep_in_attack => best_team_attack_strategy(&[
+                (
+                    TeamAttackStrategy::BylineCrossRightToPenaltySpot,
+                    0.50 + right_lane_fit * 0.16,
+                ),
+                (
+                    TeamAttackStrategy::CrashTheBox,
+                    0.44 + overload_score * 0.30 + central_fit * 0.12,
+                ),
+            ], strategy_draw),
             StrategyLane::Left => best_team_attack_strategy(&[
                 (
                     TeamAttackStrategy::WingOverlapLeftCross,

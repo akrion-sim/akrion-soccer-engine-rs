@@ -141,10 +141,16 @@ pub enum TeamAttackStrategy {
     BylineCrossLeftToPenaltySpot,
     /// Mirror of [`Self::BylineCrossLeftToPenaltySpot`] down the right.
     BylineCrossRightToPenaltySpot,
+    /// Crash the box: with a team-mate carrying/crossing from a wide area near the opponent's
+    /// goal, the strikers (and advancing attackers) attack DISTINCT box zones — near post,
+    /// penalty spot, far post, and the cut-back/edge — packing the area for the delivery
+    /// instead of one lone runner. Drives the spread box-arrival run in
+    /// [`SoccerMatch::crash_the_box_target_for`].
+    CrashTheBox,
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 39] = [
+    pub const ALL: [TeamAttackStrategy; 40] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -184,6 +190,7 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::TransitionBurstOnRegain,
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
         TeamAttackStrategy::BylineCrossRightToPenaltySpot,
+        TeamAttackStrategy::CrashTheBox,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -229,6 +236,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::BylineCrossRightToPenaltySpot => {
                 "byline-cross-right-to-penalty-spot"
             }
+            TeamAttackStrategy::CrashTheBox => "crash-the-box",
         }
     }
 
@@ -285,6 +293,9 @@ impl TeamAttackStrategy {
             // Get to the byline wide, then whip it back central to the penalty spot.
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot => s(Left, Center, 3, 0.50),
             TeamAttackStrategy::BylineCrossRightToPenaltySpot => s(Right, Center, 3, 0.50),
+            // Wide delivery resolving central in the box; direct and few touches — get the
+            // cross in and finish.
+            TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.62),
         }
     }
 }
@@ -3373,6 +3384,11 @@ fn soccer_formation_lp_apply_strategy_profile(
             BylineCrossLeftToPenaltySpot | BylineCrossRightToPenaltySpot => {
                 weights.space_occupation *= 1.3;
                 weights.expected_goal *= 1.18;
+            }
+            // Crash the box: pack the area for the wide delivery and finish it.
+            CrashTheBox => {
+                weights.space_occupation *= 1.42;
+                weights.expected_goal *= 1.22;
             }
             _ => {}
         }
