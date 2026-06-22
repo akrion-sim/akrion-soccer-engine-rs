@@ -3389,6 +3389,8 @@ impl PlayerAgent {
         let directive = snapshot.tactical_directive(self.team);
         let exploit_space_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::ExploitSpace);
+        let crash_box_strategy_active =
+            matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
         let possession_team = snapshot.controlled_possession_team();
         let width_shortage = if possession_team == Some(self.team) {
             possession_width_shortage(snapshot, directive)
@@ -3559,6 +3561,15 @@ impl PlayerAgent {
                 - ((target.x - snapshot.field_width * 0.5).abs()
                     / (snapshot.field_width * 0.5).max(1.0)))
             .clamp(0.0, 1.0);
+            let crash_box_bonus = if crash_box_strategy_active {
+                if self.role == PlayerRole::Forward {
+                    0.54
+                } else {
+                    0.22
+                }
+            } else {
+                0.0
+            };
             options.push(AgentActionOptionTrace::new(
                 "shot-creation-run",
                 special_score(
@@ -3567,7 +3578,8 @@ impl PlayerAgent {
                         + centrality * 0.14
                         + shape_support_urgency * 0.20
                         + holder_pressure_urgency * 0.18
-                        + directive.flank_overlap_run_probability * 0.22,
+                        + directive.flank_overlap_run_probability * 0.22
+                        + crash_box_bonus,
                 ),
                 true,
             ));
@@ -3622,7 +3634,7 @@ impl PlayerAgent {
             && (wide_home
                 || wide_midfielder
                 || attacking_midfielder
-                || self.role == PlayerRole::Forward);
+                || (self.role == PlayerRole::Forward && !crash_box_strategy_active));
         if natural_support.action_label == "overlap-run" || policy_overlap_candidate {
             let overlap_support = if natural_support.action_label == "overlap-run" {
                 natural_support
@@ -3657,7 +3669,9 @@ impl PlayerAgent {
                 ),
                 true,
             ));
-            let min_share = if flank_policy_active {
+            let min_share = if crash_box_strategy_active && self.role == PlayerRole::Forward {
+                FLANK_OVERLAP_MIN_OPTION_SHARE
+            } else if flank_policy_active {
                 directive
                     .flank_overlap_run_probability
                     .clamp(FLANK_OVERLAP_MIN_OPTION_SHARE, 0.72)
@@ -3676,6 +3690,25 @@ impl PlayerAgent {
                 + holder_pressure_urgency * 0.14)
                 .clamp(0.18, 0.38);
             ensure_min_legal_option_probability(&mut options, "run-in-behind", run_floor);
+        }
+        if crash_box_strategy_active
+            && options
+                .iter()
+                .any(|option| option.legal && option.label == "shot-creation-run")
+        {
+            let crash_floor = (0.36
+                + if self.role == PlayerRole::Forward {
+                    0.20
+                } else {
+                    0.06
+                }
+                + directive.flank_overlap_run_probability * 0.12
+                + holder_pressure_urgency * 0.08)
+            .clamp(0.42, 0.68);
+            if self.role == PlayerRole::Forward {
+                scale_legal_option_score(&mut options, "overlap-run", 0.34);
+            }
+            ensure_min_legal_option_probability(&mut options, "shot-creation-run", crash_floor);
         }
         if options
             .iter()
@@ -3747,6 +3780,7 @@ impl PlayerAgent {
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", 0.58);
         }
         if flank_policy_active
+            && !(crash_box_strategy_active && self.role == PlayerRole::Forward)
             && options
                 .iter()
                 .any(|option| option.legal && option.label == "overlap-run")
@@ -7752,9 +7786,9 @@ impl PlayerAgent {
             let should_recover = lane_interceptor
                 || fifty_fifty_duel
                 || action_option_score(&loose_options, "recover") > 0.0;
-            action_options = loose_options;
-            order_names.extend(loose_order);
             if should_recover {
+                action_options = loose_options;
+                order_names.extend(loose_order);
                 let movement_target =
                     self.pomdp_mpc_loose_ball_recovery_target(snapshot, loose_ball_target);
                 // Win the race back to a ball that got away under pressure (notably
@@ -7778,7 +7812,19 @@ impl PlayerAgent {
                     SoccerAction::MoveTo(movement_target),
                     "recover".to_string(),
                 )
+            } else if let Some((support_target, sprint)) =
+                snapshot.aerial_attacking_support_intent_for(self.id, self.home_position)
+            {
+                action_options = single_action_option("support-push-up");
+                order_names.push("support-push-up".to_string());
+                push_up_sprint = sprint;
+                (
+                    SoccerAction::MoveTo(support_target),
+                    "support-push-up".to_string(),
+                )
             } else {
+                action_options = loose_options;
+                order_names.extend(loose_order);
                 let shape = snapshot.defensive_shape_for(self.id, self.home_position);
                 // Push up to fill the space ahead when the ball is far upfield.
                 let (shape, push_up) = snapshot.defensive_push_up_adjustment(self.id, shape);

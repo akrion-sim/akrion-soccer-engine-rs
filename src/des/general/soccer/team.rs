@@ -141,10 +141,12 @@ pub enum TeamAttackStrategy {
     BylineCrossLeftToPenaltySpot,
     /// Mirror of [`Self::BylineCrossLeftToPenaltySpot`] down the right.
     BylineCrossRightToPenaltySpot,
-    /// Crash the box: with a team-mate carrying/crossing from a wide area near the opponent's
-    /// goal, the strikers (and advancing attackers) attack DISTINCT box zones — near post,
-    /// penalty spot, far post, and the cut-back/edge — packing the area for the delivery
-    /// instead of one lone runner. Drives the spread box-arrival run in
+    /// Crash the box: when a wide team-mate has the ball — or is crossing — near the
+    /// opponent's goal, flood the six-yard / penalty-spot lanes so the delivery has multiple
+    /// committed finishers attacking it. The strikers (and advancing attackers) take DISTINCT
+    /// box zones — near post, penalty spot, far post, and the cut-back/edge — packing the area
+    /// instead of one lone runner. Drives the box-flood candidates in
+    /// [`SoccerMatch::flank_cross_arrival_target_for`] and the spread box-arrival run in
     /// [`SoccerMatch::crash_the_box_target_for`].
     CrashTheBox,
 }
@@ -293,9 +295,9 @@ impl TeamAttackStrategy {
             // Get to the byline wide, then whip it back central to the penalty spot.
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot => s(Left, Center, 3, 0.50),
             TeamAttackStrategy::BylineCrossRightToPenaltySpot => s(Right, Center, 3, 0.50),
-            // Wide delivery resolving central in the box; direct and few touches — get the
-            // cross in and finish.
-            TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.62),
+            // Immediate box flood around a wide final-third cross: direct, few touches —
+            // pack the box and finish.
+            TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.72),
         }
     }
 }

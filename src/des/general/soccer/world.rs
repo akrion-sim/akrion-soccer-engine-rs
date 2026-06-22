@@ -46,6 +46,10 @@ const BALL_RECEIPT_LP_TARGET_DECAY_YARDS: f64 = 18.0;
 const BALL_RECEIPT_LP_ANCHOR_DECAY_YARDS: f64 = 26.0;
 const BALL_RECEIPT_LP_ERROR_DECAY_YARDS: f64 = 16.0;
 const BALL_RECEIPT_RETRIEVAL_SHAPE_WEIGHT_YARDS: f64 = 1.45;
+const AERIAL_ATTACK_SUPPORT_MIN_FORWARD_SPEED_YPS: f64 = 3.0;
+const AERIAL_ATTACK_SUPPORT_MAX_DISTANCE_YARDS: f64 = 58.0;
+const AERIAL_ATTACK_SUPPORT_FORWARD_YARDS: f64 = 9.0;
+const AERIAL_ATTACK_SUPPORT_MIN_PUSH_YARDS: f64 = 4.0;
 const MPC_LATENT_PASS_CHAIN_SINGLE_TARGET: f64 = 0.18;
 const MPC_LATENT_PASS_CHAIN_TWO_TARGET: f64 = 0.58;
 const MPC_LATENT_PASS_CHAIN_THREE_TARGET: f64 = 1.0;
@@ -23559,6 +23563,86 @@ impl WorldSnapshot {
         Some((target, distance > 3.0))
     }
 
+    pub(crate) fn aerial_attacking_support_intent_for(
+        &self,
+        player_id: usize,
+        home: Vec2,
+    ) -> Option<(Vec2, bool)> {
+        let me = self.players.iter().find(|player| player.id == player_id)?;
+        if !matches!(me.role, PlayerRole::Midfielder | PlayerRole::Forward) {
+            return None;
+        }
+        if self.controlled_possession_team() == Some(me.team.other()) {
+            return None;
+        }
+
+        let attack = me.team.attack_dir();
+        let moving_goalward =
+            self.ball.velocity.y * attack >= AERIAL_ATTACK_SUPPORT_MIN_FORWARD_SPEED_YPS;
+        let target = if let Some(pass) = self
+            .pending_pass
+            .as_ref()
+            .filter(|pass| pass.team == me.team && pass.flight.is_aerial())
+        {
+            let total_forward = (pass.intended_target.y - pass.origin.y) * attack;
+            let remaining_forward = (pass.intended_target.y - self.ball.position.y) * attack;
+            if total_forward < FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS * 0.50
+                || (!moving_goalward && remaining_forward < -2.0)
+            {
+                return None;
+            }
+            pass.intended_target
+        } else {
+            let loose_owned_aerial = self.loose_untargeted_long_ball_team() == Some(me.team)
+                || (self.ball.holder.is_none()
+                    && self.pending_pass.is_none()
+                    && self.ball.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS
+                    && moving_goalward);
+            if !loose_owned_aerial {
+                return None;
+            }
+            let projected = self.projected_loose_ball_target().unwrap_or(self.ball.position);
+            if (projected.y - self.ball.position.y) * attack < -2.0 && !moving_goalward {
+                return None;
+            }
+            projected
+        }
+        .clamp_to_pitch(self.field_width, self.field_length);
+
+        let current = self.player_snapshot_position(me);
+        if current.distance(target) > AERIAL_ATTACK_SUPPORT_MAX_DISTANCE_YARDS {
+            return None;
+        }
+
+        let lateral_sign = if (current.x - target.x).abs() > 0.5 {
+            (current.x - target.x).signum()
+        } else if (home.x - target.x).abs() > 0.5 {
+            (home.x - target.x).signum()
+        } else if target.x < self.field_width * 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let forward_yards = if me.role == PlayerRole::Forward {
+            AERIAL_ATTACK_SUPPORT_FORWARD_YARDS + 3.0
+        } else {
+            AERIAL_ATTACK_SUPPORT_FORWARD_YARDS
+        };
+        let mut point = (target
+            + Vec2::new(
+                lateral_sign * LOOSE_BALL_PEEL_LATERAL_YARDS,
+                attack * forward_yards,
+            ))
+        .clamp_to_pitch(self.field_width, self.field_length);
+        let min_forward_y = current.y + attack * AERIAL_ATTACK_SUPPORT_MIN_PUSH_YARDS;
+        if (point.y - min_forward_y) * attack < 0.0 {
+            point = Vec2::new(point.x, min_forward_y)
+                .clamp_to_pitch(self.field_width, self.field_length);
+        }
+
+        Some((point, current.distance(point) > 3.5))
+    }
+
     /// True if this player is the closest teammate (outfield) to the loose ball,
     /// i.e. the one who should commit to retrieving it.
     /// Retrieval priority for a loose ball: distance to where the ball is heading,
@@ -24145,6 +24229,11 @@ impl WorldSnapshot {
             // avoid the three-defender swarm.
             let contesters = self.loose_ball_contester_count(player, target);
             if !self.is_among_closest_loose_ball_retrievers(player_id, target, contesters) {
+                if let Some((support, _)) =
+                    self.aerial_attacking_support_intent_for(player_id, player.home_position)
+                {
+                    return support;
+                }
                 return self.loose_ball_support_outlet_for(player_id, target);
             }
             // The committed retriever drives at its first-touch-timing plan target (trap the
@@ -26637,6 +26726,12 @@ impl WorldSnapshot {
         if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
             return None;
         }
+        // Unified with the feature-level box-flood in `flank_cross_arrival_target_for`: the
+        // direct distinct-zone movement override only engages when the team is actually
+        // running the CrashTheBox strategy.
+        if self.tactical_directive(player.team).attack_strategy != TeamAttackStrategy::CrashTheBox {
+            return None;
+        }
         if self.possession_team() != Some(player.team)
             || self.ball.holder == Some(player.id)
             || player.controller_slot.is_some()
@@ -26779,8 +26874,22 @@ impl WorldSnapshot {
         let penalty_spot = Vec2::new(center_x, goal_y - dir * 11.5);
         let far_post = Vec2::new(center_x - source_side * 3.8, goal_y - dir * 4.8);
         let far_header_lane = Vec2::new(center_x - source_side * 5.2, goal_y - dir * 8.2);
+        let crash_near_six = Vec2::new(center_x + source_side * 3.2, goal_y - dir * 5.4);
+        let crash_central_six = Vec2::new(center_x, goal_y - dir * 6.0);
+        let crash_far_six = Vec2::new(center_x - source_side * 4.6, goal_y - dir * 5.8);
+        let crash_penalty = Vec2::new(center_x - source_side * 0.8, goal_y - dir * 10.8);
         let current = self.player_snapshot_position(me);
-        let candidates: &[Vec2] = if directive.flank_attack_policy.prefers_high_cross() {
+        let crashing_box = matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
+        let candidates: &[Vec2] = if crashing_box && me.role == PlayerRole::Forward {
+            &[
+                crash_near_six,
+                crash_central_six,
+                crash_far_six,
+                crash_penalty,
+            ]
+        } else if crashing_box {
+            &[crash_penalty, cutback, penalty_spot]
+        } else if directive.flank_attack_policy.prefers_high_cross() {
             &[far_post, far_header_lane, penalty_spot]
         } else {
             &[near_post, cutback, penalty_spot]
@@ -26834,6 +26943,22 @@ impl WorldSnapshot {
                     (PlayerRole::Midfielder, FlankAttackPolicy::PlayDownFlankHighCross) => 0.18,
                     _ => 0.0,
                 };
+                let crash_box_fit = if crashing_box {
+                    let depth_from_goal = (goal_y - candidate.y).abs();
+                    let six_yard_fit =
+                        (1.0 - (depth_from_goal - 6.0).abs() / 7.0).clamp(0.0, 1.0);
+                    let penalty_fit =
+                        (1.0 - (depth_from_goal - 11.0).abs() / 6.0).clamp(0.0, 1.0);
+                    let role_crash_fit = if me.role == PlayerRole::Forward {
+                        0.72
+                    } else {
+                        0.24
+                    };
+                    six_yard_fit * 0.72 + penalty_fit * 0.24 + role_crash_fit
+                } else {
+                    0.0
+                };
+                let home_distance_penalty = if crashing_box { 0.004 } else { 0.010 };
                 let score = self.shooting_window_score_at(me, candidate) * 4.2
                     + self.space_score_at(candidate, me.team) * 0.055
                     + pass_receiver_openness_for_snapshots_with_teammates(
@@ -26848,8 +26973,9 @@ impl WorldSnapshot {
                     + policy_lane_fit
                     + aerial_fit
                     + role_fit
+                    + crash_box_fit
                     - candidate.distance(current) * 0.026
-                    - candidate.distance(home) * 0.010
+                    - candidate.distance(home) * home_distance_penalty
                     - {
                         let relief =
                             self.positional_shape_exception_relief_for_player_target(me, candidate);

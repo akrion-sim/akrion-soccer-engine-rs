@@ -37895,6 +37895,95 @@ fn flank_cross_policy_sends_box_runners_to_low_and_high_arrival_lanes() {
 }
 
 #[test]
+fn wide_final_third_wing_possession_selects_crash_the_box_strategy() {
+    let config = MatchConfig::default();
+    let directive = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(config.field_width_yards * 0.91, config.field_length_yards * 0.80),
+        0,
+        config.field_width_yards,
+        config.field_length_yards,
+        DefensiveCoverProfile::default(),
+        AttackingOverloadProfile {
+            attackers: 5,
+            defenders: 4,
+            advantage: 1,
+            score: 0.70,
+        },
+        false,
+    );
+
+    assert_eq!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
+    assert!(
+        directive.flank_attack_policy.is_flank(),
+        "crash the box should be tied to an active flank/cross policy: {directive:?}"
+    );
+    assert!(
+        directive.flank_overlap_run_probability >= 0.78,
+        "crash the box should lift cross support urgency: {directive:?}"
+    );
+}
+
+#[test]
+fn crash_the_box_sends_striker_to_six_yard_cross_arrival_lane() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let crosser = 8;
+    let striker = 9;
+    sim.ball.holder = Some(crosser);
+    sim.ball.position = Vec2::new(72.0, 102.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[crosser].position = sim.ball.position;
+    sim.players[striker].position = Vec2::new(38.0, 94.0);
+    sim.players[striker].home_position = sim.players[striker].position;
+    sim.players[striker].skills.height = 8.7;
+    sim.players[striker].skills.strength = 8.4;
+    for home in 5..9 {
+        sim.players[home].position.y = 84.0;
+        sim.players[home].home_position.y = 78.0;
+    }
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(24.0 + (away - 11) as f64 * 2.0, 116.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 119.0);
+
+    let mut directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        sim.config.field_width_yards,
+        sim.config.field_length_yards,
+    );
+    directive.attack_strategy = TeamAttackStrategy::CrashTheBox;
+    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    directive.flank_overlap_run_probability = 0.80;
+    sim.central_brain.home_directive = directive;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let target = snapshot
+        .flank_cross_arrival_target_for(striker, sim.players[striker].home_position)
+        .expect("crash-the-box strategy should stage a striker in the box");
+    let options = sim.players[striker].support_action_options(&snapshot);
+    let shot_run = options
+        .iter()
+        .find(|option| option.label == "shot-creation-run")
+        .expect("crash-the-box should expose shot-creation-run");
+    let goal_distance = (Team::Home.goal_y(sim.config.field_length_yards) - target.y).abs();
+
+    assert!(
+        goal_distance <= 10.0,
+        "striker should crash a six-yard/far-post lane, got target={target:?}"
+    );
+    assert!(
+        (target.y - sim.players[striker].position.y) * Team::Home.attack_dir() > 8.0,
+        "crash target should be a committed goalward run: target={target:?}"
+    );
+    assert!(
+        shot_run.probability >= 0.56,
+        "striker should strongly prefer the shot-creation run: {shot_run:?} options={options:?}"
+    );
+}
+
+#[test]
 fn flank_cross_arrival_support_reward_prefers_box_arrival_runs() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let crosser = 8;
@@ -42793,6 +42882,82 @@ fn route_one_second_ball_control_uses_aerial_duel_skill() {
     assert!(
         strong_wins > 250,
         "strong aerial player should win most route-one second balls: {strong_wins}/300"
+    );
+}
+
+#[test]
+fn off_ball_attackers_push_up_while_own_aerial_long_ball_is_unresolved() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 82_015,
+        ..Default::default()
+    });
+    let primary_runner = 8;
+    let support_mid = 7;
+    let away_marker = 13;
+    park_players_except(&mut sim, &[primary_runner, support_mid, away_marker]);
+    sim.players[primary_runner].role = PlayerRole::Forward;
+    sim.players[support_mid].role = PlayerRole::Midfielder;
+    sim.players[support_mid].preferences.offensive_mindedness = 0.88;
+    sim.players[support_mid].preferences.defensive_mindedness = 0.22;
+    sim.players[away_marker].role = PlayerRole::Defender;
+
+    sim.tick = 24;
+    sim.clock_seconds = 1.6;
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 52.0);
+    sim.ball.velocity = Vec2::new(0.0, 18.0);
+    sim.ball.altitude_yards = 6.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.ball
+        .record_decision(sim.tick, "route-one", Some(BALL_AGENT_ID));
+
+    let initial = WorldSnapshot::from_match(&sim);
+    let drop_zone = initial
+        .loose_long_ball_recovery_target()
+        .expect("route-one ball should expose a projected drop zone");
+    sim.players[primary_runner].position = Vec2::new(drop_zone.x - 1.2, drop_zone.y);
+    sim.players[primary_runner].velocity = Vec2::zero();
+    sim.players[away_marker].position = Vec2::new(drop_zone.x + 2.4, drop_zone.y);
+    sim.players[away_marker].velocity = Vec2::zero();
+    sim.players[support_mid].position = Vec2::new(drop_zone.x - 18.0, drop_zone.y - 2.0);
+    sim.players[support_mid].velocity = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let before_y = sim.players[support_mid].position.y;
+    let own_goal_peel = snapshot.loose_ball_support_outlet_for(support_mid, drop_zone);
+    assert!(
+        (own_goal_peel.y - before_y) * Team::Home.attack_dir() < 0.0,
+        "test setup should make the old generic loose-ball outlet a retreat: outlet={own_goal_peel:?} before_y={before_y}"
+    );
+
+    let mut support_agent = sim.players[support_mid].clone();
+    let intent = support_agent.run_time_step(&snapshot, None, None, &mut SeededRandom::new(82_015));
+    let SoccerAction::MoveTo(target) = intent.action else {
+        panic!("supporting attacker should move while aerial ball is alive, got {intent:?}");
+    };
+    assert!(
+        (target.y - before_y) * Team::Home.attack_dir() > 3.0,
+        "supporting mid/forward should push toward the opponent goal until possession is lost: target={target:?} before_y={before_y}"
+    );
+
+    sim.ball.last_touch_team = Some(Team::Away);
+    let deflected_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        deflected_snapshot
+            .aerial_attacking_support_intent_for(support_mid, sim.players[support_mid].home_position)
+            .is_some(),
+        "a loose aerial deflection should not kill the forward support cue while the ball is still traveling goalward"
+    );
+
+    sim.ball.holder = Some(away_marker);
+    sim.ball.position = sim.players[away_marker].position;
+    let lost_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        lost_snapshot
+            .aerial_attacking_support_intent_for(support_mid, sim.players[support_mid].home_position)
+            .is_none(),
+        "the aerial support cue should switch off once the other team controls possession"
     );
 }
 
