@@ -21188,30 +21188,41 @@ impl WorldSnapshot {
                         // the threaded/killer set already prices it, so the sweep is skipped
                         // there. The receiver is irrelevant to the threading pace, so it's
                         // omitted to skip the MPC receipt cost. Disabled ⇒ nominal, unchanged.
-                        let committed_cutout = require_reception_won && {
-                            let cutout_speed = if dd_soccer_disable_learnable_pass_velocity() {
-                                nominal_speed
-                            } else {
-                                pass_velocity_plan_for_snapshot(
-                                    self,
-                                    me,
-                                    me_position,
-                                    *aim_point,
-                                    PassFlight::Floor,
-                                    initial_is_cross,
-                                    None,
-                                )
-                                .min_clearing_speed_yps
-                                .max(nominal_speed)
-                            };
-                            self.pass_lane_committed_cutout(
+                        // Learnable velocity (item 5), reconciled with upstream's convergent
+                        // speed-aware veto model: BOTH hard hides that a driven ball can beat —
+                        // a committed (moving) cut-out and an unavoidable SET interceptor — are
+                        // evaluated at ONE threading pace (`min_clearing_speed`), not one at the
+                        // threading speed and the other at the 0.68 nominal. Upstream's
+                        // `pass_lane_control_is_unavoidable` already relaxes both with ball
+                        // speed (reach/timing + the fast-bypass), so feeding the threading pace
+                        // is what makes "a fast ball gets through" actually fire on the decision
+                        // side instead of only at execution. The receiver is irrelevant to the
+                        // threading pace, so it is omitted to skip the MPC receipt cost; the
+                        // plan's open-lane early-out keeps the common case to one risk probe.
+                        // Disabled ⇒ nominal speed for both, i.e. upstream behavior unchanged.
+                        let threading_speed = if dd_soccer_disable_learnable_pass_velocity() {
+                            nominal_speed
+                        } else {
+                            pass_velocity_plan_for_snapshot(
+                                self,
+                                me,
+                                me_position,
+                                *aim_point,
+                                PassFlight::Floor,
+                                initial_is_cross,
+                                None,
+                            )
+                            .min_clearing_speed_yps
+                            .max(nominal_speed)
+                        };
+                        let committed_cutout = require_reception_won
+                            && self.pass_lane_committed_cutout(
                                 me_position,
                                 *aim_point,
                                 me.team.other(),
                                 2.5,
-                                cutout_speed,
-                            )
-                        };
+                                threading_speed,
+                            );
                         // `race_won` already includes the qualified half-open forward exception:
                         // skilled passers keep those options visible. Direct-opponent endpoints
                         // are priced in the score/learned features below instead of hard-hidden.
@@ -21223,7 +21234,7 @@ impl WorldSnapshot {
                                 me_position,
                                 *aim_point,
                                 me.team,
-                                nominal_speed,
+                                threading_speed,
                             )
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
                             && !self.final_third_forward_pass_to_nobody(
