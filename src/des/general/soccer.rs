@@ -130,6 +130,13 @@ const PASS_LANE_DECISION_LOOKAHEAD_SECONDS: f64 = 2.0;
 const PASS_LANE_DYNAMIC_RISK_HIGH: f64 = 0.62;
 const PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH: f64 = 0.74;
 const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
+// Misplaced-pass guard: the linear risk penalty above is not enough on its own — a juicy
+// forward option can still outscore it and get played straight to an opponent. For a SAFE pass
+// (we need OUR man to actually receive it), pile on this STEEP extra penalty for every unit of
+// interception risk ABOVE the HIGH threshold, so a lane an opponent already owns drops out of
+// contention. Deliberate threaded/killer balls (`require_reception_won == false`) are exempt —
+// their risk is priced in, not vetoed.
+const PASS_LANE_SAFE_PASS_OVERRISK_PENALTY: f64 = 14.0;
 // ---------------------------------------------------------------------------
 // Bayesian opponent-press belief (lightweight Beta-Bernoulli filter).
 // ---------------------------------------------------------------------------

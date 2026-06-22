@@ -21197,6 +21197,16 @@ impl WorldSnapshot {
                     0.0
                 };
                 let long_backward_penalty = long_backward_pass_penalty(forward);
+                // Misplaced-pass guard (see `PASS_LANE_SAFE_PASS_OVERRISK_PENALTY`): for a safe
+                // pass, steeply penalise lanes an opponent already owns so the policy stops
+                // gifting the ball to the opposition. Killer/threaded balls keep their priced-in
+                // risk (no extra penalty).
+                let safe_pass_overrisk_penalty = if require_reception_won {
+                    (pass_quality.lane_interception_risk - PASS_LANE_DYNAMIC_RISK_HIGH).max(0.0)
+                        * PASS_LANE_SAFE_PASS_OVERRISK_PENALTY
+                } else {
+                    0.0
+                };
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
@@ -21207,6 +21217,7 @@ impl WorldSnapshot {
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
+                    - safe_pass_overrisk_penalty
                     + over_the_top_invite_bonus
                     + own_box_play_out_adjustment
                     + forward_open_bonus
