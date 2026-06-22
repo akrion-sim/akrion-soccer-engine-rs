@@ -651,6 +651,146 @@ fn mpc_pass_execution_prices_lane_and_ball_recipe() {
 }
 
 #[test]
+fn learnable_pass_velocity_drives_a_contested_lane_harder_than_an_open_one() {
+    // A ground pass up x=40 from y=58 to a receiver at y=76. With the lane OPEN the value
+    // trade-off keeps a weighted ball (the slowest bucket wins on the overhit penalty); with
+    // a defender closing on the corridor it chooses a DRIVEN ball to thread the gap before
+    // the defender steps in. This proves the learnable-velocity layer is live and
+    // discriminates ("price the speed needed, don't veto the lane"), not that it always maxes
+    // out. The geometry is asserted to be a real risk gradient so the test is deterministic.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    let receiver = 9usize;
+    let blocker = 13usize;
+    park_players_except(&mut sim, &[passer, receiver, blocker]);
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].skills.passing_completion_rate = 6.0;
+    sim.players[passer].skills.passing = 6.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 76.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[blocker].team = Team::Away;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let aim = Vec2::new(40.0, 76.0);
+    let slow_speed = pass_speed_yps_from_power(
+        PASS_VELOCITY_POWER_BUCKETS[0],
+        PassFlight::Floor,
+        false,
+        &sim.players[passer].skills,
+    );
+    let fast_speed = pass_speed_yps_from_power(
+        *PASS_VELOCITY_POWER_BUCKETS.last().unwrap(),
+        PassFlight::Floor,
+        false,
+        &sim.players[passer].skills,
+    );
+
+    let plan_for = |sim: &SoccerMatch| {
+        let snapshot = WorldSnapshot::from_match(sim);
+        let passer_snap = snapshot
+            .players
+            .iter()
+            .find(|p| p.id == passer)
+            .cloned()
+            .unwrap();
+        let receiver_pos = snapshot
+            .players
+            .iter()
+            .find(|p| p.id == receiver)
+            .map(|p| p.position)
+            .unwrap();
+        let receiver_snap = snapshot
+            .players
+            .iter()
+            .find(|p| p.id == receiver)
+            .cloned()
+            .unwrap();
+        let plan = pass_velocity_plan_for_snapshot(
+            &snapshot,
+            &passer_snap,
+            passer_snap.position,
+            aim,
+            PassFlight::Floor,
+            false,
+            Some((&receiver_snap, receiver_pos)),
+        );
+        let risk_slow = snapshot
+            .pass_lane_interception_risk(
+                passer_snap.position,
+                aim,
+                Team::Away,
+                2.5,
+                slow_speed,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk;
+        let risk_fast = snapshot
+            .pass_lane_interception_risk(
+                passer_snap.position,
+                aim,
+                Team::Away,
+                2.5,
+                fast_speed,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk;
+        (plan, risk_slow, risk_fast)
+    };
+
+    // (a) Open lane: blocker far away.
+    sim.players[blocker].position = Vec2::new(8.0, 20.0);
+    sim.players[blocker].velocity = Vec2::zero();
+    let (open_plan, _, _) = plan_for(&sim);
+
+    // (b) Contested lane: blocker off the corridor, closing on it. The perpendicular gap is
+    // tuned so a weighted ball lets the defender step in (high risk) while a driven ball
+    // beats it to the corridor (lower risk) — a genuine speed gradient.
+    sim.players[blocker].position = Vec2::new(45.5, 67.0);
+    sim.players[blocker].velocity = Vec2::new(-4.0, 0.0);
+    let (tight_plan, risk_slow, risk_fast) = plan_for(&sim);
+
+    // The crafted geometry must be a genuine speed gradient (slow ball riskier than fast).
+    assert!(
+        risk_slow > risk_fast + 1e-3,
+        "test geometry should make a weighted ball riskier than a driven one: \
+         risk_slow={risk_slow} risk_fast={risk_fast}"
+    );
+    // Open lane: a weighted ball is kept (slowest bucket).
+    assert!(
+        (open_plan.speed_yps - slow_speed).abs() < 1e-6,
+        "an open lane should keep the weighted ball: {open_plan:?}"
+    );
+    // Contested lane: the ball is driven harder than the open-lane choice.
+    assert!(
+        tight_plan.speed_yps > open_plan.speed_yps + 1e-6,
+        "a contested lane should be driven harder than an open one: tight={} open={}",
+        tight_plan.speed_yps,
+        open_plan.speed_yps
+    );
+    // And it is scored at the safer (faster) speed, not the weighted one.
+    assert!(
+        tight_plan.lane_interception_risk <= risk_slow + 1e-9,
+        "the chosen speed should not be riskier than the weighted bucket: chosen_risk={} risk_slow={}",
+        tight_plan.lane_interception_risk,
+        risk_slow
+    );
+    // The MPC feasibility floor is a real, finite threading pace.
+    assert!(
+        tight_plan.min_clearing_speed_yps >= slow_speed - 1e-6
+            && tight_plan.min_clearing_speed_yps.is_finite(),
+        "min clearing speed should be a finite threading pace: {tight_plan:?}"
+    );
+}
+
+#[test]
 fn mpc_reselects_normal_shot_when_execution_is_poor() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
