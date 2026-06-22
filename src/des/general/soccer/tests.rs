@@ -39809,15 +39809,20 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
-    // The named decision/action feature indices live in the base block; the
-    // whole-field "moment of all 22 + ball" block and belief tail append after it.
+    // The named decision/action feature indices live in the base block; the whole-field "moment
+    // of all 22 + ball" block appends after it, then the Kalman perception-belief block, then the
+    // Bayesian opponent-press belief block.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM
             + SOCCER_NEURAL_FIELD_MOTION_DIM
             + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+            + SOCCER_NEURAL_OPP_BELIEF_DIM
     );
+    // The previous total (base + motion, no belief) stays a recognised legacy input dim.
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM)));
     assert_eq!(SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE, 153);
     assert_eq!(SOCCER_NEURAL_FEATURE_LOCAL_MPC_GUIDANCE, 159);
     assert_eq!(SOCCER_NEURAL_FEATURE_SWITCH_PLAY_ACTION, 160);
@@ -51276,6 +51281,294 @@ fn pressured_holder_without_good_outlet_prefers_escape_over_panic_pass() {
         escape_score > pass_score * 1.15,
         "with no good outlet under steal pressure, retain by shielding/feinting rather than panic pass: escape={escape_score} pass={pass_score}"
     );
+}
+
+#[test]
+fn opponent_press_risk_modulation_is_neutral_at_prior_and_monotonic() {
+    // The prior-mean tendency leaves the analytic geometric risk unchanged (no Bayesian shift
+    // until the belief actually moves off the prior).
+    assert!((opponent_press_risk_modulation(OPPONENT_PRESS_NEUTRAL_TENDENCY) - 1.0).abs() < 1e-9);
+    // A passive defender discounts the priced lane risk; a proven aggressor amplifies it.
+    assert!(opponent_press_risk_modulation(0.2) < 1.0);
+    assert!(opponent_press_risk_modulation(0.9) > 1.0);
+    // Monotonic increasing in tendency.
+    assert!(opponent_press_risk_modulation(0.3) < opponent_press_risk_modulation(0.7));
+    // Bounded by the clamp either side.
+    assert!(opponent_press_risk_modulation(0.0) >= OPPONENT_PRESS_RISK_MODULATION_FLOOR - 1e-9);
+    assert!(opponent_press_risk_modulation(1.0) <= OPPONENT_PRESS_RISK_MODULATION_CEIL + 1e-9);
+    // Non-finite tendency degrades to neutral (no shift) rather than poisoning the risk.
+    assert!((opponent_press_risk_modulation(f64::NAN) - 1.0).abs() < 1e-9);
+    assert!((opponent_press_risk_modulation(f64::INFINITY) - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn opponent_press_belief_stays_bounded_and_finite_without_decay() {
+    // forget == 1.0 is the dt == 0 degenerate case (no decay). The concentration cap must keep
+    // alpha+beta finite and bounded over an arbitrarily long run, and the mean must stay sane.
+    let mut belief = OpponentPressBelief::default();
+    for _ in 0..100_000 {
+        belief.step(1.0, Some(1.0));
+    }
+    let m = belief.mean();
+    assert!(m.is_finite(), "mean must stay finite under unbounded evidence");
+    assert!(
+        m > 0.9 && m <= 1.0,
+        "sustained pressing with no decay should saturate high but bounded, got {m}"
+    );
+
+    // Non-finite evidence is dropped, not folded in.
+    let before = belief.mean();
+    belief.step(1.0, Some(f64::NAN));
+    belief.step(1.0, Some(f64::INFINITY));
+    assert!(
+        (belief.mean() - before).abs() < 1e-9,
+        "non-finite evidence must be a no-op"
+    );
+}
+
+#[test]
+fn opponent_press_belief_default_is_neutral_and_tracks_evidence() {
+    // Conjugate Beta-Bernoulli filter: prior mean is neutral, evidence moves it, and absence
+    // of observation forgets back toward the prior.
+    let belief = OpponentPressBelief::default();
+    assert!((belief.mean() - OPPONENT_PRESS_NEUTRAL_TENDENCY).abs() < 1e-9);
+
+    let mut pressing = OpponentPressBelief::default();
+    for _ in 0..30 {
+        pressing.step(1.0, Some(1.0));
+    }
+    assert!(
+        pressing.mean() > 0.8,
+        "sustained pressing => high tendency, got {}",
+        pressing.mean()
+    );
+
+    let mut holding = OpponentPressBelief::default();
+    for _ in 0..30 {
+        holding.step(1.0, Some(0.0));
+    }
+    assert!(
+        holding.mean() < 0.2,
+        "sustained holding => low tendency, got {}",
+        holding.mean()
+    );
+
+    // No observation + forget < 1 relaxes a learned belief back toward the prior mean.
+    let learned = pressing.mean();
+    for _ in 0..400 {
+        pressing.step(0.5, None);
+    }
+    assert!(
+        pressing.mean() < learned
+            && (pressing.mean() - OPPONENT_PRESS_NEUTRAL_TENDENCY).abs() < 1e-6,
+        "forgetting should relax toward the prior mean, got {}",
+        pressing.mean()
+    );
+}
+
+#[test]
+fn opponent_press_belief_disabled_by_default_keeps_belief_empty() {
+    // Default config has the feature OFF: the per-tick update is a no-op and the belief map
+    // stays empty, so pass-lane risk falls back to the analytic-only path (byte-identical).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    sim.update_opponent_press_beliefs(&snapshot);
+    assert!(
+        sim.opponent_press_belief.is_empty(),
+        "disabled belief must never populate"
+    );
+    assert!(WorldSnapshot::from_match(&sim)
+        .opponent_press_tendency
+        .is_empty());
+}
+
+#[test]
+fn opponent_press_belief_learns_press_vs_hold_from_geometry() {
+    // With the feature enabled, the per-tick update should learn a HIGH tendency for a defender
+    // who keeps driving onto the ball and a LOW one for a defender who sits off it.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        opponent_belief_enabled: true,
+        ..Default::default()
+    });
+    let presser = 14; // away
+    let holder = 16; // away
+    park_players_except(&mut sim, &[presser, holder]);
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.ball.holder = None;
+    sim.players[presser].position = Vec2::new(46.0, 50.0);
+    sim.players[presser].velocity = Vec2::new(-6.0, 0.0); // closing on the ball
+    sim.players[holder].position = Vec2::new(34.0, 50.0);
+    sim.players[holder].velocity = Vec2::zero(); // holding off
+
+    for _ in 0..40 {
+        let snapshot = WorldSnapshot::from_match(&sim);
+        sim.update_opponent_press_beliefs(&snapshot);
+    }
+
+    let tendencies = sim.opponent_press_tendency_map();
+    let p = tendencies[&presser];
+    let h = tendencies[&holder];
+    assert!(
+        p > 0.5 && h < 0.5 && p > h,
+        "presser should learn a high press tendency and holder a low one (presser={p}, holder={h})"
+    );
+}
+
+#[test]
+fn opponent_press_posterior_modulates_pass_lane_risk() {
+    // The learned posterior shades the analytic lane risk: a defender proven to sit off lowers
+    // the priced risk; a defender proven to step in raises it. An empty belief reproduces the
+    // analytic baseline exactly.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        opponent_belief_enabled: true,
+        ..Default::default()
+    });
+    let blocker = 14; // away
+    park_players_except(&mut sim, &[blocker]);
+    let from = Vec2::new(40.0, 40.0);
+    let to = Vec2::new(40.0, 58.0);
+    // 3yd off the lane but sprinting into it: a real geometric step-in risk (not in-corridor).
+    sim.players[blocker].position = Vec2::new(43.0, 49.0);
+    sim.players[blocker].velocity = Vec2::new(-8.0, 0.0);
+
+    let lane_risk = |sim: &SoccerMatch| -> f64 {
+        WorldSnapshot::from_match(sim)
+            .pass_lane_interception_risk(
+                from,
+                to,
+                Team::Away,
+                2.5,
+                17.0,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk
+    };
+
+    // Empty belief => analytic baseline (the modulation path is skipped).
+    let analytic = lane_risk(&sim);
+    assert!(analytic > 0.0, "the drifting defender must price some risk");
+
+    let mut passive = OpponentPressBelief::default();
+    for _ in 0..40 {
+        passive.step(1.0, Some(0.0));
+    }
+    sim.opponent_press_belief.insert(blocker, passive);
+    let posterior_passive = lane_risk(&sim);
+
+    let mut aggressive = OpponentPressBelief::default();
+    for _ in 0..40 {
+        aggressive.step(1.0, Some(1.0));
+    }
+    sim.opponent_press_belief.insert(blocker, aggressive);
+    let posterior_aggressive = lane_risk(&sim);
+
+    assert!(
+        posterior_passive < analytic,
+        "a defender proven to sit off should lower the posterior lane risk (passive={posterior_passive}, analytic={analytic})"
+    );
+    assert!(
+        posterior_aggressive >= analytic,
+        "a defender proven to step in should not lower the posterior lane risk (aggressive={posterior_aggressive}, analytic={analytic})"
+    );
+}
+
+#[test]
+fn opponent_belief_block_is_zero_when_disabled_and_signed_when_present() {
+    let actor = 3; // home
+    let actor_team = Team::Home;
+
+    // Disabled (default): the snapshot tendency map is empty, so the block is all zeros and a
+    // neural net sees the same input as before the feature existed.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.players[actor].position = Vec2::new(40.0, 50.0);
+    let off_block =
+        soccer_opponent_belief_block(&WorldSnapshot::from_match(&sim), actor, actor_team);
+    assert_eq!(off_block.len(), SOCCER_NEURAL_OPP_BELIEF_DIM);
+    assert!(
+        off_block.iter().all(|v| *v == 0.0),
+        "disabled belief => all-zero block (legacy-equivalent), got {off_block:?}"
+    );
+
+    // Enabled with a strongly-passive opponent right next to the actor: the nearest-tendency
+    // channel reads clearly below neutral and coverage is positive.
+    let mut sim_on = SoccerMatch::default_11v11(MatchConfig {
+        opponent_belief_enabled: true,
+        ..Default::default()
+    });
+    sim_on.ball.position = Vec2::new(40.0, 50.0);
+    sim_on.players[actor].position = Vec2::new(40.0, 50.0);
+    let opp = 14; // away
+    sim_on.players[opp].position = Vec2::new(42.0, 50.0);
+    let mut passive = OpponentPressBelief::default();
+    for _ in 0..40 {
+        passive.step(1.0, Some(0.0));
+    }
+    sim_on.opponent_press_belief.insert(opp, passive);
+
+    let on_block =
+        soccer_opponent_belief_block(&WorldSnapshot::from_match(&sim_on), actor, actor_team);
+    assert!(
+        on_block[0] < -0.1,
+        "nearest passive opponent should read below neutral, got {}",
+        on_block[0]
+    );
+    assert!(
+        on_block[3] > 0.0,
+        "coverage should be positive when a belief is held, got {}",
+        on_block[3]
+    );
+}
+
+#[test]
+fn opponent_belief_block_reaches_the_neural_feature_tail() {
+    // capture -> encode -> net input: a known belief block must surface at the dedicated tail
+    // slots, right after the whole-field motion block.
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let actor_id = 3;
+    let actor_team = sim.players[actor_id].team;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let belief = vec![0.3_f32, -0.2, 0.4, 1.0];
+    let decision = test_decision_trace(&snapshot, actor_id, "carry-forward");
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: actor_id,
+        team: actor_team,
+        role: sim.players[actor_id].role,
+        state: decision.mdp_state.clone(),
+        observation: snapshot.observation_for(actor_id),
+        belief: decision.belief.clone(),
+        action: decision.action.clone(),
+        action_target: decision.action_target.clone(),
+        decision_context: SoccerDecisionContext {
+            opponent_belief: belief.clone(),
+            ..Default::default()
+        },
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(actor_id),
+        next_observation: snapshot.observation_for(actor_id),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
+    // The opponent-press block is stacked AFTER the Kalman perception-belief block, so it starts
+    // at base + motion + perception-belief, not at base + motion.
+    let start = SOCCER_NEURAL_BASE_FEATURE_DIM
+        + SOCCER_NEURAL_FIELD_MOTION_DIM
+        + SOCCER_NEURAL_BELIEF_FEATURE_DIM;
+    for (i, &v) in belief.iter().enumerate() {
+        assert_eq!(
+            features[start + i],
+            f64::from(v),
+            "opponent-press belief channel {i} must appear in the neural feature tail"
+        );
+    }
+    // Both earlier totals (base+motion and base+motion+perception) must remain recognised legacy
+    // input dims so older nets migrate by zero-padding the appended slots.
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM)));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&start));
 }
 
 #[test]
