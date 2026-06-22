@@ -14072,7 +14072,7 @@ fn tactical_directive_for_team(
         risk_tolerance,
         overload_score,
     );
-    let flank_overlap_run_probability = if flank_attack_policy.is_flank() {
+    let mut flank_overlap_run_probability = if flank_attack_policy.is_flank() {
         ((1.0 / 3.0)
             + risk_tolerance * 0.16
             + overload_score * 0.12
@@ -14167,6 +14167,11 @@ fn tactical_directive_for_team(
     let attack_progress =
         ((ball_position.y - field_length * 0.5) * team.attack_dir() / (field_length * 0.5).max(1.0))
             .clamp(-1.0, 1.0);
+    let crash_box_context = has_ball
+        && flank_attack_policy.is_flank()
+        && in_final_third
+        && width_from_center >= 0.58
+        && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.30;
     let pressure_fit = ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64
         + 2.0)
         / 5.0)
@@ -14198,6 +14203,8 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::TransitionBurstOnRegain
     } else if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
+    } else if crash_box_context {
+        TeamAttackStrategy::CrashTheBox
     } else if build_up_phase {
         match ball_side {
             StrategyLane::Left => best_team_attack_strategy(&[
@@ -14492,6 +14499,9 @@ fn tactical_directive_for_team(
     } else {
         TeamAttackStrategy::HoldUpfieldUntilOpening
     };
+    if matches!(attack_strategy, TeamAttackStrategy::CrashTheBox) {
+        flank_overlap_run_probability = flank_overlap_run_probability.max(0.78).clamp(0.0, 0.86);
+    }
     let defense_strategy = if leading && defending {
         TeamDefenseStrategy::LowBlockCompact
     } else if press_intensity > 0.80 {

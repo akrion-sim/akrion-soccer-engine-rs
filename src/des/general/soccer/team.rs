@@ -141,10 +141,13 @@ pub enum TeamAttackStrategy {
     BylineCrossLeftToPenaltySpot,
     /// Mirror of [`Self::BylineCrossLeftToPenaltySpot`] down the right.
     BylineCrossRightToPenaltySpot,
+    /// When a wide teammate has the ball near the opponent's goal, flood the six-yard /
+    /// penalty-spot lanes so the cross has multiple committed finishers attacking it.
+    CrashTheBox,
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 39] = [
+    pub const ALL: [TeamAttackStrategy; 40] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -184,6 +187,7 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::TransitionBurstOnRegain,
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
         TeamAttackStrategy::BylineCrossRightToPenaltySpot,
+        TeamAttackStrategy::CrashTheBox,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -229,6 +233,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::BylineCrossRightToPenaltySpot => {
                 "byline-cross-right-to-penalty-spot"
             }
+            TeamAttackStrategy::CrashTheBox => "crash-the-box",
         }
     }
 
@@ -285,6 +290,8 @@ impl TeamAttackStrategy {
             // Get to the byline wide, then whip it back central to the penalty spot.
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot => s(Left, Center, 3, 0.50),
             TeamAttackStrategy::BylineCrossRightToPenaltySpot => s(Right, Center, 3, 0.50),
+            // Immediate box flood around a wide final-third cross.
+            TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.72),
         }
     }
 }
