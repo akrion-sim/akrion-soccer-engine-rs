@@ -12955,6 +12955,44 @@ pub struct MatchStats {
     pub passes_completed_backward_home: u32,
     #[serde(default)]
     pub passes_completed_backward_away: u32,
+    // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
+    // (can be negative); divide by passes_completed for the average yards gained per pass.
+    #[serde(default)]
+    pub completed_pass_gain_yards_home: f64,
+    #[serde(default)]
+    pub completed_pass_gain_yards_away: f64,
+    // Consecutive-completed-pass chains (>= 2 passes by the same team without a turnover):
+    // how many, their total gained yards, and how many ended in a NET yards loss (the
+    // "avoid sequences that go backwards" signal).
+    #[serde(default)]
+    pub pass_chains_home: u32,
+    #[serde(default)]
+    pub pass_chains_away: u32,
+    #[serde(default)]
+    pub pass_chain_gain_yards_home: f64,
+    #[serde(default)]
+    pub pass_chain_gain_yards_away: f64,
+    #[serde(default)]
+    pub pass_chains_net_loss_home: u32,
+    #[serde(default)]
+    pub pass_chains_net_loss_away: u32,
+    // Shots on target preceded by at least one completed pass in the same possession (a
+    // worked chance, not a solo/loose-ball effort).
+    #[serde(default)]
+    pub shots_after_pass_home: u32,
+    #[serde(default)]
+    pub shots_after_pass_away: u32,
+    // Assists: a goal scored directly off a completed pass to the scorer (the last completed
+    // pass of the goal's possession belonged to the scoring team).
+    #[serde(default)]
+    pub assists_home: u32,
+    #[serde(default)]
+    pub assists_away: u32,
+    // Completed crosses (a cross delivery brought under control by a team-mate).
+    #[serde(default)]
+    pub crosses_completed_home: u32,
+    #[serde(default)]
+    pub crosses_completed_away: u32,
     // Pass attempts/completions/interceptions split by the HALF the pass was played FROM
     // (relative to the passing team), aggregated over both teams. Real football completion is
     // a function of defender density + pressure, which rises in the opponent's half — so this
@@ -13024,6 +13062,111 @@ pub struct MatchStats {
     pub teamwork_near_ball_progress_away: f64,
 }
 
+/// Learning-progress pass metrics for one match, aggregated over BOTH teams (self-play uses
+/// one policy, so the team split is not meaningful for tracking how the policy is learning).
+/// These roll up per git commit in `des_soccer_learning_pass_metrics`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPassLearningMetrics {
+    pub passes_attempted: u64,
+    pub passes_completed: u64,
+    /// Sum of per-pass forward yards over completed passes (can be negative). Divide by
+    /// `passes_completed` for the average yards gained per pass.
+    pub completed_pass_gain_yards: f64,
+    /// Consecutive-completed-pass chains (>= 2 passes, no turnover between them).
+    pub pass_chains: u64,
+    /// Total gained yards across those chains.
+    pub pass_chain_gain_yards: f64,
+    /// Chains that ended in a NET yards loss (sequences that went backwards overall).
+    pub pass_chains_net_loss: u64,
+    pub shots_on_target: u64,
+    /// Shots on target preceded by at least one completed pass in the same possession.
+    pub shots_after_pass: u64,
+}
+
+impl SoccerPassLearningMetrics {
+    /// Pass completion rate in [0, 1], or 0 when no passes were attempted.
+    pub fn completion_rate(&self) -> f64 {
+        if self.passes_attempted == 0 {
+            0.0
+        } else {
+            self.passes_completed as f64 / self.passes_attempted as f64
+        }
+    }
+
+    /// Average yards gained per completed pass, or 0 when none completed.
+    pub fn average_yards_per_completed_pass(&self) -> f64 {
+        if self.passes_completed == 0 {
+            0.0
+        } else {
+            self.completed_pass_gain_yards / self.passes_completed as f64
+        }
+    }
+
+    /// Add another match's metrics into this running total (for a per-batch / per-commit roll-up).
+    pub fn accumulate(&mut self, other: &Self) {
+        self.passes_attempted += other.passes_attempted;
+        self.passes_completed += other.passes_completed;
+        self.completed_pass_gain_yards += other.completed_pass_gain_yards;
+        self.pass_chains += other.pass_chains;
+        self.pass_chain_gain_yards += other.pass_chain_gain_yards;
+        self.pass_chains_net_loss += other.pass_chains_net_loss;
+        self.shots_on_target += other.shots_on_target;
+        self.shots_after_pass += other.shots_after_pass;
+    }
+}
+
+impl MatchStats {
+    /// Fold a finished consecutive-pass chain (the [`PassChainMeter`] state) into the chain
+    /// counters. A chain counts only with two or more completed passes; it contributes its
+    /// total gained yards and is flagged when that total is a net loss. Shared by the live
+    /// finalize path and the non-destructive end-of-match summary fold.
+    pub(crate) fn fold_pass_chain(&mut self, meter: &PassChainMeter) {
+        let Some(team) = meter.team else {
+            return;
+        };
+        if meter.passes < 2 {
+            return;
+        }
+        match team {
+            Team::Home => {
+                self.pass_chains_home += 1;
+                self.pass_chain_gain_yards_home += meter.gain_yards;
+                if meter.gain_yards < 0.0 {
+                    self.pass_chains_net_loss_home += 1;
+                }
+            }
+            Team::Away => {
+                self.pass_chains_away += 1;
+                self.pass_chain_gain_yards_away += meter.gain_yards;
+                if meter.gain_yards < 0.0 {
+                    self.pass_chains_net_loss_away += 1;
+                }
+            }
+        }
+    }
+
+    /// Roll this match's per-team counters up into the both-teams [`SoccerPassLearningMetrics`].
+    pub fn pass_learning_metrics(&self) -> SoccerPassLearningMetrics {
+        SoccerPassLearningMetrics {
+            passes_attempted: u64::from(self.passes_attempted_home)
+                + u64::from(self.passes_attempted_away),
+            passes_completed: u64::from(self.passes_completed_home)
+                + u64::from(self.passes_completed_away),
+            completed_pass_gain_yards: self.completed_pass_gain_yards_home
+                + self.completed_pass_gain_yards_away,
+            pass_chains: u64::from(self.pass_chains_home) + u64::from(self.pass_chains_away),
+            pass_chain_gain_yards: self.pass_chain_gain_yards_home + self.pass_chain_gain_yards_away,
+            pass_chains_net_loss: u64::from(self.pass_chains_net_loss_home)
+                + u64::from(self.pass_chains_net_loss_away),
+            shots_on_target: u64::from(self.shots_on_target_home)
+                + u64::from(self.shots_on_target_away),
+            shots_after_pass: u64::from(self.shots_after_pass_home)
+                + u64::from(self.shots_after_pass_away),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingPass {
     team: Team,
@@ -13056,6 +13199,21 @@ pub(crate) struct PendingPass {
     /// label, so the model learns "from THIS whole-field configuration, does THIS pass complete?".
     /// Empty ⇒ not captured (no learning sample emitted).
     learn_features: Vec<f32>,
+}
+
+/// A goal counts as assisted only when the setting-up completed pass landed within this many
+/// seconds of the goal (so a stale earlier ball isn't credited).
+const ASSIST_RECENCY_SECONDS: f64 = 6.0;
+
+/// Running tally of the current consecutive-completed-pass chain for the learning-progress
+/// metrics. A "chain" is two or more completed passes in a row by the same team without a
+/// turnover. `gain_yards` is the sum of the per-pass forward yards (the chain's total gained
+/// yards, which can be negative). Finalised into [`MatchStats`] when the chain ends.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PassChainMeter {
+    pub(crate) team: Option<Team>,
+    pub(crate) passes: u32,
+    pub(crate) gain_yards: f64,
 }
 
 #[derive(Clone, Debug)]

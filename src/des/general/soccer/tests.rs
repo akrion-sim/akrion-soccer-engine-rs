@@ -69484,3 +69484,122 @@ fn support_summon_is_read_only_by_the_signalled_teammate() {
         "an opponent never reads our summon"
     );
 }
+
+#[test]
+fn pass_learning_metrics_rollup_and_rates() {
+    let mut stats = MatchStats::default();
+    stats.passes_attempted_home = 10;
+    stats.passes_completed_home = 8;
+    stats.passes_attempted_away = 6;
+    stats.passes_completed_away = 3;
+    stats.completed_pass_gain_yards_home = 40.0;
+    stats.completed_pass_gain_yards_away = 11.0;
+    stats.pass_chains_home = 2;
+    stats.pass_chains_away = 1;
+    stats.pass_chain_gain_yards_home = 18.0;
+    stats.pass_chains_net_loss_away = 1;
+    stats.shots_on_target_home = 2;
+    stats.shots_after_pass_home = 1;
+
+    let metrics = stats.pass_learning_metrics();
+    assert_eq!(metrics.passes_attempted, 16);
+    assert_eq!(metrics.passes_completed, 11);
+    assert!((metrics.completion_rate() - 11.0 / 16.0).abs() < 1e-9);
+    assert!((metrics.completed_pass_gain_yards - 51.0).abs() < 1e-9);
+    assert!((metrics.average_yards_per_completed_pass() - 51.0 / 11.0).abs() < 1e-9);
+    assert_eq!(metrics.pass_chains, 3);
+    assert_eq!(metrics.pass_chains_net_loss, 1);
+    assert_eq!(metrics.shots_after_pass, 1);
+
+    let mut total = SoccerPassLearningMetrics::default();
+    total.accumulate(&metrics);
+    total.accumulate(&metrics);
+    assert_eq!(total.passes_completed, 22);
+    assert_eq!(total.pass_chains, 6);
+    assert!((total.completed_pass_gain_yards - 102.0).abs() < 1e-9);
+
+    // No passes attempted => rates are a safe zero, not a divide-by-zero.
+    let empty = SoccerPassLearningMetrics::default();
+    assert_eq!(empty.completion_rate(), 0.0);
+    assert_eq!(empty.average_yards_per_completed_pass(), 0.0);
+}
+
+#[test]
+fn pass_chain_finalize_counts_only_real_chains() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+
+    // A 3-pass chain that gained 12 yards counts once.
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Home),
+        passes: 3,
+        gain_yards: 12.0,
+    };
+    sim.finalize_pass_chain_metrics();
+    assert_eq!(sim.stats.pass_chains_home, 1);
+    assert!((sim.stats.pass_chain_gain_yards_home - 12.0).abs() < 1e-9);
+    assert_eq!(sim.stats.pass_chains_net_loss_home, 0);
+    // The meter is consumed (reset) so a second finalize is a no-op.
+    assert_eq!(sim.pass_chain_meter.team, None);
+    sim.finalize_pass_chain_metrics();
+    assert_eq!(sim.stats.pass_chains_home, 1);
+
+    // A single completed pass is not a chain.
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Away),
+        passes: 1,
+        gain_yards: 5.0,
+    };
+    sim.finalize_pass_chain_metrics();
+    assert_eq!(sim.stats.pass_chains_away, 0);
+
+    // A 2-pass chain that lost ground is flagged as a net-loss chain.
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Away),
+        passes: 2,
+        gain_yards: -4.0,
+    };
+    sim.finalize_pass_chain_metrics();
+    assert_eq!(sim.stats.pass_chains_away, 1);
+    assert_eq!(sim.stats.pass_chains_net_loss_away, 1);
+
+    // summary() folds an open chain WITHOUT mutating live state.
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Home),
+        passes: 4,
+        gain_yards: 9.0,
+    };
+    let summary = sim.summary();
+    assert_eq!(summary.stats.pass_chains_home, 2);
+    assert_eq!(sim.stats.pass_chains_home, 1);
+    assert!(sim.pass_chain_meter.team.is_some());
+}
+
+#[test]
+fn pass_chain_meter_finalizes_on_possession_end_and_never_double_counts() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // An open chain finalises when the possession ends (this path is shared by turnover,
+    // goal, half-time, kickoff and dead-ball resets).
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Home),
+        passes: 3,
+        gain_yards: 15.0,
+    };
+    sim.finish_possession_progress_chain(false);
+    assert_eq!(sim.stats.pass_chains_home, 1);
+    assert!((sim.stats.pass_chain_gain_yards_home - 15.0).abs() < 1e-9);
+    // Meter is emptied, so the chain cannot leak into the next possession or across a half.
+    assert_eq!(sim.pass_chain_meter.team, None);
+
+    // summary() with an empty meter folds nothing extra (no double count of the chain above).
+    assert_eq!(sim.summary().stats.pass_chains_home, 1);
+
+    // A still-open chain at the whistle is counted exactly once by summary(), and summary()
+    // must NOT mutate the live stats.
+    sim.pass_chain_meter = PassChainMeter {
+        team: Some(Team::Away),
+        passes: 2,
+        gain_yards: 6.0,
+    };
+    assert_eq!(sim.summary().stats.pass_chains_away, 1);
+    assert_eq!(sim.stats.pass_chains_away, 0);
+}

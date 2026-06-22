@@ -16,9 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     MatchConfig, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerSelfPlayLearnedParams,
-    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
+    SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics, SoccerQPolicyOptions,
+    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
+    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
 };
 use soccer_engine::des::soccer_learning::{
     evolve_soccer_tactical_learning_weights_from_genomes, evolve_soccer_team_policies,
@@ -35,7 +35,7 @@ use soccer_engine::des::soccer_learning::{
     SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::{
-    SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
+    soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
 };
 use uuid::Uuid;
 
@@ -757,6 +757,21 @@ fn flush_postgres_completed_runs(
     let batch_size = inserts.len();
     let run_ids = store.insert_completed_runs(experiment_id, runner_id, &inserts)?;
     drop(inserts);
+    // Roll this batch's pass-quality metrics into the per-commit learning-progress series.
+    // Non-fatal: a metrics write must never fail the run persistence.
+    {
+        let mut pass_metrics = SoccerPassLearningMetrics::default();
+        for pending in pending_runs.iter() {
+            pass_metrics.accumulate(&pending.completed_game.summary.stats.pass_learning_metrics());
+        }
+        if let Err(err) = store.upsert_pass_learning_metrics(
+            &soccer_learning_git_commit(),
+            batch_size as u64,
+            &pass_metrics,
+        ) {
+            eprintln!("soccer-learning: pass-metrics upsert failed (non-fatal): {err}");
+        }
+    }
     if completed_run_retention_games > 0 {
         let prune = store
             .prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)?;

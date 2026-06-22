@@ -962,13 +962,88 @@ pub fn soccer_team_label(team: Team) -> &'static str {
 pub fn soccer_learning_run_score(summary: &MatchSummary) -> SoccerLearningRunScore {
     let home = soccer_learning_team_score(Team::Home, summary.score_home, summary.score_away);
     let away = soccer_learning_team_score(Team::Away, summary.score_away, summary.score_home);
-    let match_fitness = (home.fitness + away.fitness) * 0.5;
+    // The evolutionary search selects policies on `match_fitness`. The old definition,
+    // `(home.fitness + away.fitness) * 0.5`, was a SYMMETRIC average whose goal-difference
+    // terms cancel exactly to `0.04 * total_goals` — it carried no skill signal, so evolution
+    // had no gradient and fitness sat flat for dozens of generations. We instead score the
+    // BOTH-TEAMS quality of football produced: goals are the gold standard, with shots on
+    // target, completed forward passes (especially consecutive ones), assists and completed
+    // crosses as the dense proxies, and backward sequences penalised. This does not cancel
+    // between the two symmetric self-play sides, so it gives a real per-game gradient.
+    let match_fitness = soccer_match_quality_fitness(summary);
     SoccerLearningRunScore {
         home,
         away,
         match_fitness,
         match_fitness_micros: soccer_learning_to_micros(match_fitness),
     }
+}
+
+/// Weights for [`soccer_match_quality_fitness`]. Goals dominate; the proxies are the dense
+/// gradient between goals (the signals the user called the good proxies for "more goals":
+/// shots on target, completed forward passes — especially consecutive ones — assists, crosses).
+pub struct SoccerMatchQualityWeights {
+    pub goal: f64,
+    pub assist: f64,
+    pub shot_on_target: f64,
+    pub cross_completed: f64,
+    pub forward_pass: f64,
+    /// Per-yard reward for net-forward progression carried through consecutive-pass chains.
+    pub chain_forward_yard: f64,
+    pub shot_after_pass: f64,
+    /// Penalty per consecutive-pass chain that ended in a net yards LOSS (went backwards).
+    pub backward_chain_penalty: f64,
+}
+
+impl Default for SoccerMatchQualityWeights {
+    fn default() -> Self {
+        Self {
+            goal: 1.00,
+            assist: 0.45,
+            shot_on_target: 0.18,
+            cross_completed: 0.08,
+            forward_pass: 0.006,
+            chain_forward_yard: 0.004,
+            shot_after_pass: 0.10,
+            backward_chain_penalty: 0.12,
+        }
+    }
+}
+
+/// Both-teams play-quality fitness for a finished match (see [`soccer_learning_run_score`]).
+/// Goals are the gold standard; the remaining terms are progression/chance-creation proxies
+/// that give a dense gradient between goals. Aggregated over both sides, so it does not cancel
+/// in symmetric self-play.
+pub fn soccer_match_quality_fitness(summary: &MatchSummary) -> f64 {
+    soccer_match_quality_fitness_weighted(summary, &SoccerMatchQualityWeights::default())
+}
+
+pub fn soccer_match_quality_fitness_weighted(
+    summary: &MatchSummary,
+    weights: &SoccerMatchQualityWeights,
+) -> f64 {
+    let stats = &summary.stats;
+    let goals = f64::from(summary.score_home + summary.score_away);
+    let assists = f64::from(stats.assists_home + stats.assists_away);
+    let shots_on_target = f64::from(stats.shots_on_target_home + stats.shots_on_target_away);
+    let crosses = f64::from(stats.crosses_completed_home + stats.crosses_completed_away);
+    let forward_passes =
+        f64::from(stats.passes_completed_forward_home + stats.passes_completed_forward_away);
+    // Only net-FORWARD chain progression is rewarded (backward chains are penalised below, not
+    // credited here).
+    let chain_forward_yards =
+        (stats.pass_chain_gain_yards_home + stats.pass_chain_gain_yards_away).max(0.0);
+    let shots_after_pass = f64::from(stats.shots_after_pass_home + stats.shots_after_pass_away);
+    let backward_chains = f64::from(stats.pass_chains_net_loss_home + stats.pass_chains_net_loss_away);
+
+    goals * weights.goal
+        + assists * weights.assist
+        + shots_on_target * weights.shot_on_target
+        + crosses * weights.cross_completed
+        + forward_passes * weights.forward_pass
+        + chain_forward_yards * weights.chain_forward_yard
+        + shots_after_pass * weights.shot_after_pass
+        - backward_chains * weights.backward_chain_penalty
 }
 
 pub fn soccer_learning_team_score(
@@ -6107,5 +6182,71 @@ mod tests {
         let state = test_state();
         assert_eq!(state.phase, TacticalPhase::Kickoff);
         assert_eq!(state.role, PlayerRole::Midfielder);
+    }
+
+    #[test]
+    fn quality_fitness_does_not_cancel_and_rewards_skill() {
+        use crate::des::general::soccer::MatchStats;
+        let make = |score_home: u32, score_away: u32, f: &dyn Fn(&mut MatchStats)| {
+            let mut stats = MatchStats::default();
+            f(&mut stats);
+            MatchSummary {
+                score_home,
+                score_away,
+                ticks: 100,
+                simulated_seconds: 90.0,
+                stats,
+            }
+        };
+
+        // A dominant, incisive performance (goals + worked chances + forward progression)
+        // must score strictly higher than a sterile sideways-passing game with no end product.
+        let incisive = make(3, 1, &|s| {
+            s.shots_on_target_home = 7;
+            s.assists_home = 3;
+            s.crosses_completed_home = 4;
+            s.passes_completed_forward_home = 120;
+            s.pass_chain_gain_yards_home = 180.0;
+            s.shots_after_pass_home = 6;
+        });
+        let sterile = make(0, 0, &|s| {
+            // Lots of safe completions but backwards/sideways: no forward product, chains lose
+            // ground.
+            s.passes_completed_forward_home = 8;
+            s.pass_chains_net_loss_home = 14;
+            s.pass_chain_gain_yards_home = -40.0;
+        });
+        let incisive_fitness = soccer_match_quality_fitness(&incisive);
+        let sterile_fitness = soccer_match_quality_fitness(&sterile);
+        assert!(
+            incisive_fitness > sterile_fitness + 1.0,
+            "incisive ({incisive_fitness}) should clearly beat sterile ({sterile_fitness})"
+        );
+
+        // The old metric was ONLY total goals, so it was blind to HOW the goals came. With the
+        // SAME scoreline, the game richer in shots on target, assists and forward progression
+        // must score higher — that is the dense gradient the proxies are meant to provide.
+        let worked = make(2, 2, &|s| {
+            s.shots_on_target_home = 8;
+            s.shots_on_target_away = 8;
+            s.assists_home = 2;
+            s.assists_away = 2;
+            s.passes_completed_forward_home = 90;
+            s.passes_completed_forward_away = 90;
+            s.pass_chain_gain_yards_home = 140.0;
+            s.pass_chain_gain_yards_away = 140.0;
+        });
+        let scrappy = make(2, 2, &|s| {
+            s.shots_on_target_home = 2;
+            s.shots_on_target_away = 2;
+        });
+        assert!(
+            soccer_match_quality_fitness(&worked) > soccer_match_quality_fitness(&scrappy),
+            "same scoreline: more chance-creation/progression must rank higher"
+        );
+
+        // Backward, sterile passing is penalised below a clean zero-event baseline.
+        let baseline = make(0, 0, &|_s| {});
+        assert!(sterile_fitness < soccer_match_quality_fitness(&baseline));
     }
 }

@@ -13,7 +13,7 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     SoccerConfigMomentInsert, SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend,
-    SoccerPassOutcomeSample,
+    SoccerPassLearningMetrics, SoccerPassOutcomeSample,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
@@ -33,7 +33,7 @@ use soccer_engine::des::soccer_learning::{
     SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE,
 };
 use soccer_engine::des::soccer_learning_pg::{
-    SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
+    soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
 };
 use uuid::Uuid;
 
@@ -1945,6 +1945,21 @@ fn flush_postgres_completed_runs(
         .insert_completed_runs(experiment_id, runner_id, &inserts)
         .map_err(invalid_data)?;
     let persisted = run_row_ids.len();
+    // Roll this batch's pass-quality metrics into the per-commit learning-progress series.
+    // Non-fatal: a metrics write must never fail the run persistence.
+    {
+        let mut pass_metrics = SoccerPassLearningMetrics::default();
+        for pending in pending_runs.iter() {
+            pass_metrics.accumulate(&pending.game.summary.stats.pass_learning_metrics());
+        }
+        if let Err(err) = store.upsert_pass_learning_metrics(
+            &soccer_learning_git_commit(),
+            persisted as u64,
+            &pass_metrics,
+        ) {
+            eprintln!("soccer-learning: pass-metrics upsert failed (non-fatal): {err}");
+        }
+    }
     if completed_run_retention_games > 0 {
         let prune = store
             .prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)

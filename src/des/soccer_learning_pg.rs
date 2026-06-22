@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
-    SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
+    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
     SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
@@ -2265,6 +2265,95 @@ impl SoccerLearningPgStore {
         Ok(prune)
     }
 
+    /// Roll one completed run's both-teams pass metrics into the per-commit learning-progress
+    /// row in `des_soccer_learning_pass_metrics`, keyed by git commit. Each run from the same
+    /// commit accumulates, so the table is a running series of pass-quality metrics over
+    /// commits: completion rate (`passes_completed / passes_attempted`), average yards gained
+    /// per pass (`completed_pass_gain_yards / passes_completed`), consecutive-pass chains and
+    /// their total gained yards, chains that ended in a net loss, and shots on target that came
+    /// off at least one pass. Yard sums are stored as micros (integer) like the other tables.
+    pub fn upsert_pass_learning_metrics(
+        &mut self,
+        git_commit: &str,
+        runs: u64,
+        metrics: &SoccerPassLearningMetrics,
+    ) -> Result<(), String> {
+        self.ensure_connected()?;
+        let git_commit = {
+            let trimmed = git_commit.trim();
+            if trimmed.is_empty() {
+                "dev".to_string()
+            } else {
+                // Char-safe truncation to varchar(64) (avoid String::truncate's boundary panic).
+                trimmed.chars().take(64).collect::<String>()
+            }
+        };
+        let count = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let runs = count(runs);
+        let passes_attempted = count(metrics.passes_attempted);
+        let passes_completed = count(metrics.passes_completed);
+        let completed_pass_gain_yards_micros =
+            soccer_learning_to_micros(metrics.completed_pass_gain_yards);
+        let pass_chains = count(metrics.pass_chains);
+        let pass_chain_gain_yards_micros =
+            soccer_learning_to_micros(metrics.pass_chain_gain_yards);
+        let pass_chains_net_loss = count(metrics.pass_chains_net_loss);
+        let shots_on_target = count(metrics.shots_on_target);
+        let shots_after_pass = count(metrics.shots_after_pass);
+
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin pass-metrics upsert tx: {err}"))?;
+        ensure_soccer_learning_pass_metrics_table(&mut tx)?;
+        tx.execute(
+            r#"
+            insert into des_soccer_learning_pass_metrics as m (
+              git_commit,
+              runs,
+              passes_attempted,
+              passes_completed,
+              completed_pass_gain_yards_micros,
+              pass_chains,
+              pass_chain_gain_yards_micros,
+              pass_chains_net_loss,
+              shots_on_target,
+              shots_after_pass
+            )
+            values ($1, $10, $2, $3, $4, $5, $6, $7, $8, $9)
+            on conflict (git_commit) do update set
+              runs = m.runs + excluded.runs,
+              passes_attempted = m.passes_attempted + excluded.passes_attempted,
+              passes_completed = m.passes_completed + excluded.passes_completed,
+              completed_pass_gain_yards_micros =
+                m.completed_pass_gain_yards_micros + excluded.completed_pass_gain_yards_micros,
+              pass_chains = m.pass_chains + excluded.pass_chains,
+              pass_chain_gain_yards_micros =
+                m.pass_chain_gain_yards_micros + excluded.pass_chain_gain_yards_micros,
+              pass_chains_net_loss = m.pass_chains_net_loss + excluded.pass_chains_net_loss,
+              shots_on_target = m.shots_on_target + excluded.shots_on_target,
+              shots_after_pass = m.shots_after_pass + excluded.shots_after_pass,
+              updated_at = now()
+            "#,
+            &[
+                &git_commit,
+                &passes_attempted,
+                &passes_completed,
+                &completed_pass_gain_yards_micros,
+                &pass_chains,
+                &pass_chain_gain_yards_micros,
+                &pass_chains_net_loss,
+                &shots_on_target,
+                &shots_after_pass,
+                &runs,
+            ],
+        )
+        .map_err(|err| format!("upsert soccer learning pass metrics: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("commit pass-metrics upsert: {err}"))?;
+        Ok(())
+    }
+
     pub fn insert_set_play_training_artifact(
         &mut self,
         experiment_id: &str,
@@ -4265,6 +4354,42 @@ fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> 
     .map_err(|err| format!("ensure soccer moment embedding tables: {err}"))
 }
 
+fn ensure_soccer_learning_pass_metrics_table(
+    tx: &mut postgres::Transaction<'_>,
+) -> Result<(), String> {
+    tx.batch_execute(
+        r#"
+        create table if not exists des_soccer_learning_pass_metrics (
+          git_commit varchar(64) primary key,
+          runs bigint not null default 0,
+          passes_attempted bigint not null default 0,
+          passes_completed bigint not null default 0,
+          completed_pass_gain_yards_micros bigint not null default 0,
+          pass_chains bigint not null default 0,
+          pass_chain_gain_yards_micros bigint not null default 0,
+          pass_chains_net_loss bigint not null default 0,
+          shots_on_target bigint not null default 0,
+          shots_after_pass bigint not null default 0,
+          first_seen_at timestamptz default now() not null,
+          updated_at timestamptz default now() not null,
+          constraint des_soccer_learning_pass_metrics_counts_chk check (
+            runs >= 0
+            and passes_attempted >= 0
+            and passes_completed >= 0
+            and pass_chains >= 0
+            and pass_chains_net_loss >= 0
+            and shots_on_target >= 0
+            and shots_after_pass >= 0
+          )
+        );
+
+        create index if not exists des_soccer_learning_pass_metrics_updated_idx
+          on des_soccer_learning_pass_metrics (updated_at desc);
+        "#,
+    )
+    .map_err(|err| format!("ensure soccer learning pass metrics table: {err}"))
+}
+
 fn ensure_soccer_learning_set_play_tables(
     tx: &mut postgres::Transaction<'_>,
 ) -> Result<(), String> {
@@ -4632,6 +4757,31 @@ fn insert_normalized_set_play_training_records(
     .map_err(|err| format!("insert soccer neural run metrics: {err}"))?;
 
     Ok(())
+}
+
+/// The git commit the running binary was built from, used to key the per-commit learning
+/// progress metrics. Injected by the build/deploy (the k8s Job sets `SOCCER_GIT_COMMIT`, the
+/// same source the planner UI's `__PLANNER_GIT_COMMIT__` uses); falls back to `GIT_SHA`/
+/// `GIT_COMMIT`, then to "dev" for a local run with no commit injected. Truncated to 64 chars
+/// to fit the column.
+pub fn soccer_learning_git_commit() -> String {
+    [
+        "SOCCER_GIT_COMMIT",
+        "GIT_SHA",
+        "GIT_COMMIT",
+        "SOURCE_COMMIT",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+    // Char-safe truncation to the varchar(64) column width (`String::truncate` would panic on
+    // a non-ASCII byte boundary; env values are untrusted).
+    .map(|value| value.chars().take(64).collect::<String>())
+    .unwrap_or_else(|| "dev".to_string())
 }
 
 fn soccer_learning_database_url() -> Option<String> {

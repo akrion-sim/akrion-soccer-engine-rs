@@ -233,6 +233,11 @@ pub struct SoccerMatch {
     pub(crate) possession_chain: VecDeque<usize>,
     pub(crate) possession_chain_previous_touch_team: Option<Team>,
     pub(crate) completed_pass_chain: VecDeque<CompletedPassChainEntry>,
+    /// Running tally of the CURRENT consecutive-completed-pass chain, finalised into
+    /// [`MatchStats`] (chain count, total gained yards, chains ending in net loss) when the
+    /// chain ends (turnover / dead ball / match end). Not serialised — it is transient match
+    /// bookkeeping for the learning-progress metrics.
+    pub(crate) pass_chain_meter: PassChainMeter,
     pub(crate) home_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) away_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) possession_progress_tracker: Option<PossessionProgressTracker>,
@@ -1082,6 +1087,7 @@ impl SoccerMatch {
             possession_chain,
             possession_chain_previous_touch_team: None,
             completed_pass_chain: VecDeque::new(),
+            pass_chain_meter: PassChainMeter::default(),
             home_mpc_latent_objective: SoccerMpcLatentObjective::default(),
             away_mpc_latent_objective: SoccerMpcLatentObjective::default(),
             last_touch_player: None,
@@ -1747,12 +1753,16 @@ impl SoccerMatch {
     }
 
     pub fn summary(&self) -> MatchSummary {
+        // Include the still-open consecutive-pass chain (if any) so the final sequence of the
+        // match is counted, without mutating live state — `summary` is a read-only view.
+        let mut stats = self.stats.clone();
+        stats.fold_pass_chain(&self.pass_chain_meter);
         MatchSummary {
             score_home: self.score_home,
             score_away: self.score_away,
             ticks: self.tick,
             simulated_seconds: self.clock_seconds,
-            stats: self.stats.clone(),
+            stats,
         }
     }
 
@@ -5497,6 +5507,8 @@ impl SoccerMatch {
             .as_ref()
             .map_or(true, |tracker| tracker.team != team)
         {
+            // Possession has changed hands: `finish_possession_progress_chain` also finalises
+            // the consecutive-pass chain meter for the learning metrics.
             self.finish_possession_progress_chain(false);
             self.possession_chain.clear();
             self.possession_chain_previous_touch_team =
@@ -5565,6 +5577,12 @@ impl SoccerMatch {
     }
 
     fn finish_possession_progress_chain_at(&mut self, tick: u64, ended_with_goal: bool) {
+        // A possession sequence ending is exactly when the consecutive-pass chain ends, so
+        // finalise the learning-metrics chain meter here. This covers EVERY possession-end /
+        // reset path uniformly (turnover, goal, half-time, kickoff, dead ball), so an open
+        // chain can never leak across a possession boundary or a half. Idempotent (the meter is
+        // taken), and independent of whether a possession-progress tracker is present.
+        self.finalize_pass_chain_metrics();
         let Some(tracker) = self.possession_progress_tracker.take() else {
             return;
         };
@@ -5740,6 +5758,12 @@ impl SoccerMatch {
             + killer_pass_reward
             + progressive_pass_escape_reward(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
+        if pass.is_cross {
+            match pass.team {
+                Team::Home => self.stats.crosses_completed_home += 1,
+                Team::Away => self.stats.crosses_completed_away += 1,
+            }
+        }
         self.record_possession_touch(pass.from);
         self.record_possession_touch(receiver);
         self.note_completed_possession_pass(pass.team, pass.origin, self.ball.position);
@@ -13049,6 +13073,22 @@ impl SoccerMatch {
 
     pub(crate) fn score_goal(&mut self, scoring_team: Team) {
         self.finish_possession_progress_chain(true);
+        // Assist: the goal came directly off the scoring team's most recent completed pass
+        // (within a few seconds — not a stale earlier-possession ball).
+        if self
+            .completed_pass_chain
+            .back()
+            .is_some_and(|entry| {
+                entry.team == scoring_team
+                    && (self.clock_seconds - entry.clock_seconds) <= ASSIST_RECENCY_SECONDS
+            })
+        {
+            match scoring_team {
+                Team::Home => self.stats.assists_home += 1,
+                Team::Away => self.stats.assists_away += 1,
+            }
+        }
+        // (The pass-chain meter was already finalised by `finish_possession_progress_chain`.)
         match scoring_team {
             Team::Home => self.score_home += 1,
             Team::Away => self.score_away += 1,
@@ -13260,6 +13300,14 @@ impl SoccerMatch {
             Team::Home => self.stats.shots_on_target_home += 1,
             Team::Away => self.stats.shots_on_target_away += 1,
         }
+        // A worked chance: this shot was preceded by at least one completed pass in the same
+        // unbroken possession (the chain meter holds the current team's completed-pass count).
+        if self.pass_chain_meter.team == Some(team) && self.pass_chain_meter.passes >= 1 {
+            match team {
+                Team::Home => self.stats.shots_after_pass_home += 1,
+                Team::Away => self.stats.shots_after_pass_away += 1,
+            }
+        }
     }
 
     fn stat_shot_block(&mut self, team: Team) {
@@ -13313,6 +13361,32 @@ impl SoccerMatch {
                 Team::Away => self.stats.passes_completed_backward_away += 1,
             }
         }
+        self.accumulate_pass_chain_metrics(team, forward_yards);
+    }
+
+    /// Fold one COMPLETED pass into the learning-progress metrics: add its forward yards to the
+    /// running gain total and extend the current consecutive-pass chain. A pass by a different
+    /// team finalises the previous chain first (a turnover between the two completions).
+    fn accumulate_pass_chain_metrics(&mut self, team: Team, forward_yards: f64) {
+        match team {
+            Team::Home => self.stats.completed_pass_gain_yards_home += forward_yards,
+            Team::Away => self.stats.completed_pass_gain_yards_away += forward_yards,
+        }
+        if self.pass_chain_meter.team != Some(team) {
+            self.finalize_pass_chain_metrics();
+            self.pass_chain_meter.team = Some(team);
+        }
+        self.pass_chain_meter.passes += 1;
+        self.pass_chain_meter.gain_yards += forward_yards;
+    }
+
+    /// Finalise the current consecutive-pass chain into [`MatchStats`]: a chain of two or more
+    /// completed passes counts once, contributes its total gained yards, and is flagged if it
+    /// ended in a NET yards loss. Idempotent — resets the meter, so calling it again (from
+    /// another end signal) is a no-op.
+    pub(crate) fn finalize_pass_chain_metrics(&mut self) {
+        let meter = std::mem::take(&mut self.pass_chain_meter);
+        self.stats.fold_pass_chain(&meter);
     }
 
     /// Whether a pass played from `origin` by `team` started in that team's OWN half.
