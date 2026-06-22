@@ -7,6 +7,11 @@ use super::*;
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
 const STEAL_RISK_GOOD_OUTLET_PASS_LIFT: f64 = 1.05;
 const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
+// Turning your body to SHIELD a pinned ball needs no dribbling skill, so under genuine steal
+// pressure with no good outlet the protect-ball score gets a floor INDEPENDENT of the
+// (pressure-damped) dribble base — otherwise the one correct action collapses with the
+// carrier's dribble score and loses to a release-urgency-lifted panic pass into traffic.
+const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -2428,6 +2433,16 @@ impl PlayerAgent {
             + pressured_no_outlet_shield * 0.30
             + steal_risk_escape_lift * STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT)
             .clamp(0.88, 1.68);
+        // A pinned holder with no good outlet can always turn and shield, regardless of
+        // dribbling skill — so floor the shield on the pressured-no-outlet / steal-risk signal
+        // INDEPENDENTLY of the (pressure-damped) dribble base, capped at the same ceiling.
+        // This keeps the one correct action (protect possession) above a panic pass into
+        // traffic instead of collapsing with the carrier's dribble score. Collapses to ~0 in
+        // open play (no steal risk / a real outlet), so normal possession is unaffected.
+        let pinned_shield_floor = (pressured_no_outlet_shield
+            .max(steal_risk_escape_lift)
+            * PINNED_SHIELD_FLOOR_LIFT)
+            .clamp(0.0, protect_ball_ceiling);
         let protect_ball_score = (dribble_score
             * (0.12
                 + pressure_urgency.max(pressure) * 0.76
@@ -2442,7 +2457,8 @@ impl PlayerAgent {
                 + pressure_rising * 0.80
                 + (1.0 - observation.perceived_time_on_ball_seconds / 2.8).clamp(0.0, 1.0) * 0.24)
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, protect_ball_ceiling);
+            .clamp(0.01, protect_ball_ceiling)
+            .max(pinned_shield_floor);
         // Calm on the ball: when a clean pass is on and the holder is NOT under real
         // heat, they should settle and pass rather than throw flashy feints / side-steps
         // / swivels. This damps the evade moves by how good the available pass is, scaled
