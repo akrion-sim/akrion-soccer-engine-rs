@@ -1202,6 +1202,11 @@ const DEFENSIVE_CLEAR_AND_HOLD_SECOND_SECONDS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_REWARD_POINTS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_SECOND_REWARD_POINTS: f64 = 20.0;
 const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
+// While the back line is defending, train it mostly on LP/IPM position quality.
+// Ball-winning stays positive, but no longer dominates the shape gradient.
+const DEFENSIVE_POSITIONING_FOCUS_CHASE_REWARD_MULTIPLIER: f64 = 0.42;
+const DEFENSIVE_POSITIONING_FOCUS_POSSESSION_REWARD_MULTIPLIER: f64 = 0.34;
+const DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER: f64 = 2.25;
 // Losing the ball is a team failure, not just the dribbler's. When a defender wins
 // the ball, blame the recent possession chain: the player dispossessed eats the
 // largest share, and the previous one or two who built the move share the rest.
@@ -2854,10 +2859,10 @@ const SOCCER_MOMENT_WINDOW_SECONDS: f64 = 10.0;
 const SOCCER_MOMENT_HISTORY_LIMIT: usize = 24;
 const SOCCER_MOMENT_ACTION_LIMIT: usize = 12;
 const SOCCER_MOMENT_FEATURE_FRAME_SAMPLES: usize = 8;
-const SOCCER_MOMENT_EMBEDDER_VERSION: &str = "soccer-moment-local-v4";
+const SOCCER_MOMENT_EMBEDDER_VERSION: &str = "soccer-moment-local-v5";
 const ADVERSARIAL_EMBEDDING_SIGNAL_REFRESH_TICKS: u64 = 5;
 const SOCCER_MOMENT_ROLE_ALIGNED_PLAYERS: usize = 22;
-const SOCCER_MOMENT_FEATURES_PER_ENTITY: usize = 6;
+const SOCCER_MOMENT_FEATURES_PER_ENTITY: usize = 8;
 const SOCCER_MOMENT_FEATURES_PER_FRAME: usize =
     (SOCCER_MOMENT_ROLE_ALIGNED_PLAYERS + 1) * SOCCER_MOMENT_FEATURES_PER_ENTITY;
 const SOCCER_FORMATION_LP_PLAYER_CAPACITY: usize = 11;
@@ -2866,6 +2871,7 @@ const SOCCER_MATCH_PLAYER_COUNT: usize = 22;
 const SOCCER_MATCH_TEAM_PLAYER_COUNT: usize = 11;
 const SOCCER_MATCH_OFFICIAL_COUNT: usize = 3;
 const SOCCER_MATCH_ASSISTANT_REFEREE_COUNT: usize = 2;
+const SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES: usize = 8;
 const SOCCER_FORMATION_LP_CONTEXT_FEATURES: usize = 64;
 const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // Formation targets are tactical priors, not collision physics; refreshing them
@@ -2906,15 +2912,23 @@ const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 192;
 /// Whole-field "moment of all 22 + ball" block appended to every decision's feature
 /// vector: for the actor's team then the opponents (each ordered by player id),
 /// followed by the ball, the actor-relative canonical (forward, lateral) position,
-/// velocity, and acceleration. This lets the learned value/critic condition on the
+/// velocity, acceleration, and jerk. This lets the learned value/critic condition on the
 /// 12-lane/24-row grid plus the smooth motion vector of all field entities, not
 /// just local aggregates.
 const SOCCER_NEURAL_FIELD_MOTION_PLAYERS: usize = 22;
 const SOCCER_NEURAL_FIELD_MOTION_BALLS: usize = 1;
-const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 6;
+const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1: usize = 6;
+const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 8;
+const SOCCER_NEURAL_FIELD_MOTION_DIM_V1: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
+    + SOCCER_NEURAL_FIELD_MOTION_BALLS)
+    * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1;
 const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
     + SOCCER_NEURAL_FIELD_MOTION_BALLS)
     * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+const SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1: usize =
+    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1;
+const SOCCER_NEURAL_FIELD_MOTION_TAIL_START: usize =
+    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
 /// Kalman perception-confidence belief block: per-observer position-confidence beliefs (ball /
 /// teammate / opponent confidence + position uncertainty), appended right after the whole-field
 /// motion block at indices `[base+motion .. base+motion+4)`. Lets the value/critic condition on
@@ -2929,12 +2943,17 @@ const SOCCER_NEURAL_BELIEF_FEATURE_DIM: usize = 4;
 /// Stacked AFTER the perception-belief block, at indices `[base+motion+4 .. base+motion+8)`.
 const SOCCER_NEURAL_OPP_BELIEF_DIM: usize = 4;
 const SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS: f64 = 18.0;
+const SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM: usize = 4;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
-/// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding the appended belief blocks.
+/// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
+/// Six-channel whole-field motion snapshots are structurally migrated so
+/// pos/vel/acc columns stay aligned, new jerk columns start at zero, and later
+/// belief/MPC tail weights shift to the current tail start.
 const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_FEATURE_DIM
     + SOCCER_NEURAL_FIELD_MOTION_DIM
     + SOCCER_NEURAL_BELIEF_FEATURE_DIM
-    + SOCCER_NEURAL_OPP_BELIEF_DIM;
+    + SOCCER_NEURAL_OPP_BELIEF_DIM
+    + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3055,13 +3074,22 @@ const SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY: usize = 189;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT: usize = 190;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY: usize = 191;
 const SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE: usize =
-    SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START;
 const SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE: usize =
     SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE + 1;
 const SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE: usize =
     SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE + 1;
 const SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY: usize =
     SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE + 1;
+const SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLANNED: usize = SOCCER_NEURAL_FIELD_MOTION_TAIL_START
+    + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+    + SOCCER_NEURAL_OPP_BELIEF_DIM;
+const SOCCER_NEURAL_FEATURE_LEARNED_MPC_REJECTED_EXECUTION: usize =
+    SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLANNED + 1;
+const SOCCER_NEURAL_FEATURE_LEARNED_MPC_ORIGINAL_ACTION: usize =
+    SOCCER_NEURAL_FEATURE_LEARNED_MPC_REJECTED_EXECUTION + 1;
+const SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLACEMENT_ACTION: usize =
+    SOCCER_NEURAL_FEATURE_LEARNED_MPC_ORIGINAL_ACTION + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3113,14 +3141,25 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     182,
     324,
     186,
-    // base + whole-field motion (330), before either belief block.
-    330,
+    // Old base + whole-field motion (6 channels/entity), before belief blocks.
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1,
+    // Old base + whole-field motion (6 channels/entity) + perception-belief,
+    // before opponent belief.
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1 + SOCCER_NEURAL_BELIEF_FEATURE_DIM,
+    // Old base + whole-field motion (6 channels/entity) + perception/opponent
+    // belief, before the learned-MPC-replan tail was appended.
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+        + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+        + SOCCER_NEURAL_OPP_BELIEF_DIM,
+    // Full old total before whole-field jerk channels were added.
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+        + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+        + SOCCER_NEURAL_OPP_BELIEF_DIM
+        + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM,
     SOCCER_NEURAL_BASE_FEATURE_DIM,
-    // base + motion + perception-belief (334, origin/main's "add bayes"), before the
-    // opponent-press belief block — migrates forward by zero-padding that appended block.
-    SOCCER_NEURAL_BASE_FEATURE_DIM
-        + SOCCER_NEURAL_FIELD_MOTION_DIM
-        + SOCCER_NEURAL_BELIEF_FEATURE_DIM,
+    // Current base + motion + perception-belief, before the opponent-press
+    // belief block — migrates forward by zero-padding that appended block.
+    SOCCER_NEURAL_FIELD_MOTION_TAIL_START + SOCCER_NEURAL_BELIEF_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -4986,6 +5025,16 @@ pub struct SoccerDecisionContext {
     pub shot_mpc_qp_target_fit: f64,
     #[serde(default)]
     pub shot_mpc_goal_probability: f64,
+    /// Whether learned MDP/POMDP picked a technical action that MPC deemed
+    /// effectively unexecutable and replaced with the best feasible candidate.
+    #[serde(default)]
+    pub learned_mpc_replanned: bool,
+    #[serde(default)]
+    pub learned_mpc_rejected_execution_probability: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_mpc_original_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_mpc_replacement_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dribble_touch_angle_bucket: Option<u8>,
     #[serde(default)]
@@ -5006,6 +5055,17 @@ pub struct SoccerDecisionContext {
     pub defending_team_acceleration_yps2: f64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerLearnedMpcReplanTrace {
+    pub original_action: String,
+    pub replacement_action: String,
+    #[serde(default)]
+    pub rejected_execution_probability: f64,
+    #[serde(default)]
+    pub candidate_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDecisionTrace {
@@ -5021,6 +5081,8 @@ pub struct AgentDecisionTrace {
     pub action_target: Option<AgentActionTargetTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mdp_mpc_comparison: Option<SoccerMdpMpcComparisonTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
     pub action: String,
 }
 
@@ -15844,7 +15906,7 @@ fn soccer_decision_target_point(
 }
 
 /// Build the whole-field "moment of all 22 + ball" block for `actor_id` on
-/// `actor_team`: actor-relative position, velocity, and acceleration of every
+/// `actor_team`: actor-relative position, velocity, acceleration, and jerk of every
 /// player plus the ball, rotated into the actor team's attacking frame (so the
 /// block is identical for Home and Away — the same canonical orientation the
 /// retrieval moment vector uses). Players are ordered own-team then opponents,
@@ -15948,7 +16010,8 @@ fn soccer_field_player_motion_block(
         let pos = snapshot.player_position(id).unwrap_or(actor_pos);
         let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
         let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
-        push_soccer_field_motion_entity(&mut block, pos, vel, acc, actor_pos, dir);
+        let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
+        push_soccer_field_motion_entity(&mut block, pos, vel, acc, jerk, actor_pos, dir);
         player_slots += 1;
     }
     for _ in player_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
@@ -15959,6 +16022,7 @@ fn soccer_field_player_motion_block(
         snapshot.ball.position,
         snapshot.ball.velocity,
         snapshot.ball.acceleration,
+        snapshot.ball.jerk,
         actor_pos,
         dir,
     );
@@ -15971,6 +16035,7 @@ fn push_soccer_field_motion_entity(
     position: Vec2,
     velocity: Vec2,
     acceleration: Vec2,
+    jerk: Vec2,
     actor_pos: Vec2,
     attack_dir: f64,
 ) {
@@ -15981,6 +16046,8 @@ fn push_soccer_field_motion_entity(
     block.push(soccer_neural_scaled(velocity.x * attack_dir, 10.0) as f32);
     block.push(soccer_neural_scaled(acceleration.y * attack_dir, 12.0) as f32);
     block.push(soccer_neural_scaled(acceleration.x * attack_dir, 12.0) as f32);
+    block.push(soccer_neural_scaled(jerk.y * attack_dir, 40.0) as f32);
+    block.push(soccer_neural_scaled(jerk.x * attack_dir, 40.0) as f32);
 }
 
 fn soccer_decision_context_for(
@@ -16279,6 +16346,10 @@ fn soccer_decision_context_for(
         shot_mpc_accuracy_probability,
         shot_mpc_qp_target_fit,
         shot_mpc_goal_probability,
+        learned_mpc_replanned: false,
+        learned_mpc_rejected_execution_probability: 0.0,
+        learned_mpc_original_action: None,
+        learned_mpc_replacement_action: None,
         dribble_touch_angle_bucket,
         dribble_touch_distance_yards,
         dribble_touch_distance_bin,
@@ -16292,6 +16363,31 @@ fn soccer_decision_context_for(
         next_tracking_source_frame_id: None,
         tracking_confidence: 0.0,
     }
+}
+
+fn soccer_decision_context_with_trace(
+    player_id: usize,
+    team: Team,
+    decision: &AgentDecisionTrace,
+    before: &WorldSnapshot,
+    after: &WorldSnapshot,
+) -> SoccerDecisionContext {
+    let mut context = soccer_decision_context_for(
+        player_id,
+        team,
+        &decision.action,
+        decision.action_target.as_ref(),
+        before,
+        after,
+    );
+    if let Some(replan) = decision.learned_mpc_replan.as_ref() {
+        context.learned_mpc_replanned = true;
+        context.learned_mpc_rejected_execution_probability =
+            replan.rejected_execution_probability.clamp(0.0, 1.0);
+        context.learned_mpc_original_action = Some(replan.original_action.clone());
+        context.learned_mpc_replacement_action = Some(replan.replacement_action.clone());
+    }
+    context
 }
 
 fn player_normalized_last_action(player: &PlayerSnapshot) -> &str {
@@ -17564,8 +17660,14 @@ fn dense_soccer_transition_reward(
         let before_distance = before_pos.distance(before_target);
         let after_distance = after_pos.distance(after_target);
         let tracking_skill = ability01(player.skills.defensive_tracking);
-        reward +=
-            (before_distance - after_distance).clamp(-6.0, 6.0) * (0.055 + tracking_skill * 0.045);
+        let positioning_focus_multiplier = if player.role == PlayerRole::Defender {
+            DEFENSIVE_POSITIONING_FOCUS_CHASE_REWARD_MULTIPLIER
+        } else {
+            1.0
+        };
+        reward += (before_distance - after_distance).clamp(-6.0, 6.0)
+            * (0.055 + tracking_skill * 0.045)
+            * positioning_focus_multiplier;
         reward += defensive_goal_side_reward_for_role(player.team, player.role, before_pos, before);
         if player.role == PlayerRole::Goalkeeper {
             let before_line_score =
@@ -17602,13 +17704,18 @@ fn dense_soccer_transition_reward(
             (after.ball.position.y - before.ball.position.y) * player.team.other().attack_dir();
         reward -= opponent_forward.clamp(-8.0, 12.0) * 0.035;
         if matches!(SoccerActionLabel::classify(action), Some(SoccerActionLabel::Defend | SoccerActionLabel::Tackle)) && moved_yards > 0.10 {
-            reward += 0.06;
+            reward += 0.06 * positioning_focus_multiplier;
         }
         if after_possession == Some(player.team) {
-            reward += if after.ball.holder == Some(player.id) {
+            let recovered_reward = if after.ball.holder == Some(player.id) {
                 1.2
             } else {
                 0.28
+            };
+            reward += if player.role == PlayerRole::Defender {
+                recovered_reward * DEFENSIVE_POSITIONING_FOCUS_POSSESSION_REWARD_MULTIPLIER
+            } else {
+                recovered_reward
             };
         }
         if moved_yards < 0.06 && before_distance > 7.0 {
@@ -18576,9 +18683,23 @@ fn formation_lp_learning_trace_for_snapshots(
     };
     let alignment_reward = ((alignment_score + 1.0) * 0.5).clamp(0.0, 1.0);
     let disagreement_penalty = (disagreement_yards / 4.0).clamp(0.0, 1.0);
+    let role = before
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .map(|player| player.role);
+    let defending_back_line =
+        role == Some(PlayerRole::Defender)
+            && before.controlled_possession_team() == Some(guidance.team.other());
+    let defensive_focus_multiplier = if defending_back_line {
+        DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER
+    } else {
+        1.0
+    };
     let tactical_reward = (alignment_reward - 0.65 * disagreement_penalty)
         * weights.formation_lp_alignment_weight
-        * guidance.alignment_weight.clamp(0.20, 1.60);
+        * guidance.alignment_weight.clamp(0.20, 1.60)
+        * defensive_focus_multiplier;
     SoccerTacticalLearningTrace {
         formation_lp_guidance: true,
         local_mpc_guidance: guidance.local_mpc_guidance,
@@ -29860,6 +29981,60 @@ fn build_soccer_neural_network(
     )
 }
 
+fn soccer_neural_legacy_uses_field_motion_v1(input_dim: usize) -> bool {
+    input_dim == SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+        || input_dim
+            == SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1 + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+        || input_dim
+            == SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+                + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+                + SOCCER_NEURAL_OPP_BELIEF_DIM
+        || input_dim
+            == SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+                + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+                + SOCCER_NEURAL_OPP_BELIEF_DIM
+                + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM
+}
+
+fn migrate_soccer_neural_input_weight_row(row: &[f64], legacy_input_dim: usize) -> Vec<f64> {
+    if !soccer_neural_legacy_uses_field_motion_v1(legacy_input_dim) {
+        let mut migrated = row.to_vec();
+        migrated.resize(SOCCER_NEURAL_FEATURE_DIM, 0.0);
+        return migrated;
+    }
+
+    let mut migrated = vec![0.0; SOCCER_NEURAL_FEATURE_DIM];
+    let base_len = SOCCER_NEURAL_BASE_FEATURE_DIM.min(row.len());
+    migrated[..base_len].copy_from_slice(&row[..base_len]);
+
+    for entity in 0..(SOCCER_NEURAL_FIELD_MOTION_PLAYERS + SOCCER_NEURAL_FIELD_MOTION_BALLS) {
+        let old_start =
+            SOCCER_NEURAL_BASE_FEATURE_DIM + entity * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1;
+        let new_start =
+            SOCCER_NEURAL_BASE_FEATURE_DIM + entity * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+        let old_end = (old_start + SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1).min(row.len());
+        if old_start < old_end {
+            migrated[new_start..new_start + (old_end - old_start)]
+                .copy_from_slice(&row[old_start..old_end]);
+        }
+    }
+
+    let old_tail_len = legacy_input_dim
+        .saturating_sub(SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1)
+        .min(row.len().saturating_sub(SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1))
+        .min(SOCCER_NEURAL_FEATURE_DIM.saturating_sub(SOCCER_NEURAL_FIELD_MOTION_TAIL_START));
+    if old_tail_len > 0 {
+        migrated[SOCCER_NEURAL_FIELD_MOTION_TAIL_START
+            ..SOCCER_NEURAL_FIELD_MOTION_TAIL_START + old_tail_len]
+            .copy_from_slice(
+                &row[SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+                    ..SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1 + old_tail_len],
+            );
+    }
+
+    migrated
+}
+
 fn build_soccer_neural_network_from_snapshot(
     snapshot: &SoccerNeuralNetworkSnapshot,
 ) -> Result<FeedForwardNetwork, String> {
@@ -29923,7 +30098,7 @@ fn build_soccer_neural_network_from_snapshot(
         let mut weights = layer.weights.clone();
         if layer_index == 0 && migrates_legacy_input {
             for row in &mut weights {
-                row.resize(SOCCER_NEURAL_FEATURE_DIM, 0.0);
+                *row = migrate_soccer_neural_input_weight_row(row, snapshot.input_dim);
             }
         }
         layers.push(DenseLayerConfig {
@@ -30179,21 +30354,41 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "first-time-pass",
     "first-time-shot",
     "scoop-pass",
+    "carry-forward",
+    "carry-out-left",
+    "carry-out-right",
+    "protect-ball",
+    "side-step",
+    "left-cut",
+    "right-cut",
+    "nutmeg",
+    "fake-left-cut-right",
+    "fake-right-cut-left",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
 /// falls outside the policy vocabulary (rare set-piece roles / support actions —
-/// those simply don't train the actor). Dribble-carry and cut variants collapse into
-/// their family; first-touch pass/shot stay separate from ordinary pass/shoot because
-/// control-first is a mutually exclusive receiving decision.
+/// those simply don't train the actor). Dribble-carry, protection, cut, and feint
+/// variants get their own append-only families so the actor can learn technical
+/// execution choices; first-touch pass/shot stay separate from ordinary pass/shoot
+/// because control-first is a mutually exclusive receiving decision.
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
     let family = match SoccerActionLabel::classify(action)? {
         Hold => "hold",
         Space => "space",
         ControlTouch => "control-touch",
-        Dribble | CarryForward | CarryOutLeft | CarryOutRight | LeftCut | RightCut | Nutmeg
-        | FakeLeftCutRight | FakeRightCutLeft | SideStep | ProtectBall => "dribble",
+        Dribble => "dribble",
+        CarryForward => "carry-forward",
+        CarryOutLeft => "carry-out-left",
+        CarryOutRight => "carry-out-right",
+        ProtectBall => "protect-ball",
+        SideStep => "side-step",
+        LeftCut => "left-cut",
+        RightCut => "right-cut",
+        Nutmeg => "nutmeg",
+        FakeLeftCutRight => "fake-left-cut-right",
+        FakeRightCutLeft => "fake-right-cut-left",
         Pass => "pass",
         FirstTimePass => "first-time-pass",
         AerialPass => "aerial-pass",
@@ -30932,9 +31127,9 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(context.shot_mpc_goal_probability),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
-    // grid + motion vector of all 22. Older nets (input_dim == base) migrate by
-    // zero-padding this tail (see SOCCER_NEURAL_LEGACY_FEATURE_DIMS), so any slot left
-    // unfilled — a short/absent block — must stay 0.
+    // grid + motion vector of all 22. Base-only nets migrate by zero-padding this
+    // tail; old six-channel motion nets insert zero jerk slots in the snapshot
+    // migration helper, so any slot left unfilled must stay 0.
     let mut features = [0.0_f64; SOCCER_NEURAL_FEATURE_DIM];
     features[..SOCCER_NEURAL_BASE_FEATURE_DIM].copy_from_slice(&base_features);
     // The whole-field motion block fills exactly SOCCER_NEURAL_FIELD_MOTION_DIM slots after the
@@ -30962,9 +31157,9 @@ fn soccer_neural_transition_features_with_action(
     features[SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY] =
         soccer_neural_unit(1.0 - position_belief_floor.clamp(0.0, 1.0));
     // Append the Bayesian opponent-press belief block AFTER the perception-belief block.
-    // Empty/neutral (all-zeros) when the belief is disabled, so this tail stays 0 and a net
-    // trained at an earlier total (base+motion or base+motion+perception) migrates by
-    // zero-padding it.
+    // Empty/neutral (all-zeros) when the belief is disabled, so this tail stays 0.
+    // Earlier totals either zero-pad this block directly or, for six-channel
+    // motion snapshots, shift it after inserting zero jerk columns.
     let opp_belief_start = SOCCER_NEURAL_BASE_FEATURE_DIM
         + SOCCER_NEURAL_FIELD_MOTION_DIM
         + SOCCER_NEURAL_BELIEF_FEATURE_DIM;
@@ -30978,6 +31173,23 @@ fn soccer_neural_transition_features_with_action(
             0.0
         };
     }
+    // Learned-MPC replan trace: appended after the older base + motion + belief
+    // blocks so prior neural weights keep their channel alignment and simply
+    // zero-pad these new columns.
+    features[SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLANNED] =
+        soccer_neural_bool(context.learned_mpc_replanned);
+    features[SOCCER_NEURAL_FEATURE_LEARNED_MPC_REJECTED_EXECUTION] =
+        soccer_neural_unit(context.learned_mpc_rejected_execution_probability);
+    features[SOCCER_NEURAL_FEATURE_LEARNED_MPC_ORIGINAL_ACTION] = context
+        .learned_mpc_original_action
+        .as_deref()
+        .map(soccer_neural_action_hash)
+        .unwrap_or(0.0);
+    features[SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLACEMENT_ACTION] = context
+        .learned_mpc_replacement_action
+        .as_deref()
+        .map(soccer_neural_action_hash)
+        .unwrap_or(0.0);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -33065,6 +33277,7 @@ fn soccer_moment_feature_vector(
             frame.ball_position,
             frame.ball_velocity.unwrap_or_default(),
             frame.ball_acceleration.unwrap_or_default(),
+            frame.ball_jerk.unwrap_or_default(),
             team,
             config,
         );
@@ -33078,6 +33291,7 @@ fn soccer_moment_feature_vector(
                 player.position,
                 player.velocity.unwrap_or_default(),
                 player.motion_acceleration.unwrap_or_default(),
+                player.motion_jerk.unwrap_or_default(),
                 team,
                 config,
             );
@@ -33121,14 +33335,16 @@ fn push_canonical_motion_features(
     position: Vec2,
     velocity: Vec2,
     acceleration: Vec2,
+    jerk: Vec2,
     team: Team,
     config: &MatchConfig,
 ) {
     let (x, y) = canonical_pitch_point(position, team, config);
     let (vx, vy) = canonical_pitch_vector(velocity, team, config);
     let (ax, ay) = canonical_pitch_vector(acceleration, team, config);
+    let (jx, jy) = canonical_pitch_vector(jerk, team, config);
     vector.extend([
-        x as f32, y as f32, vx as f32, vy as f32, ax as f32, ay as f32,
+        x as f32, y as f32, vx as f32, vy as f32, ax as f32, ay as f32, jx as f32, jy as f32,
     ]);
 }
 
@@ -38002,6 +38218,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 action_options: single_action_option(&action),
                 action_target,
                 mdp_mpc_comparison: None,
+                learned_mpc_replan: None,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);

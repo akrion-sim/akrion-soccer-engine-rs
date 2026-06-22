@@ -4,7 +4,7 @@
 //! the cross-run layer: outcome scoring, policy deltas, weighted merge, simple
 //! evolutionary spawning, and a queue runner that keeps worker slots full.
 
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -17,8 +17,7 @@ use crate::des::general::prng::SeededRandom;
 use crate::des::general::soccer::{
     MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
-    SoccerQPolicyOptions,
-    SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
+    SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
     SoccerTeamQPolicies, Team,
 };
@@ -28,6 +27,57 @@ pub const SOCCER_LEARNING_FIXED_SCALE: i64 = 1_000_000;
 pub const SOCCER_POLICY_STATUS_ACTIVE: &str = "active";
 pub const SOCCER_POLICY_STATUS_ARCHIVED: &str = "archived";
 pub const SOCCER_EVOLUTION_MAX_POPULATION_SIZE: usize = 4096;
+const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.72;
+const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 0.28;
+const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.06;
+const SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN: f64 = 6.0;
+const SOCCER_MATCH_FITNESS_MIN: f64 = -8.0;
+const SOCCER_MATCH_FITNESS_MAX: f64 = 12.0;
+const SOCCER_POLICY_PLATEAU_FITNESS_SPREAD: f64 = 0.075;
+const SOCCER_POLICY_LOW_CEILING_FITNESS: f64 = 1.50;
+const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION: usize = 128;
+const SOCCER_POLICY_NOVELTY_MAX_STATES: usize = 256;
+const SOCCER_POLICY_NOVELTY_MAX_ACTIONS_PER_STATE: usize = 3;
+const SOCCER_POLICY_NOVELTY_VISIT_WEIGHT_MAX: f64 = 3.0;
+const SOCCER_POLICY_STATE_ACTION_COVERAGE_WEIGHT: f64 = 0.14;
+const SOCCER_POLICY_TECHNICAL_COVERAGE_WEIGHT: f64 = 0.05;
+const SOCCER_POLICY_TARGET_COVERAGE_WEIGHT: f64 = 0.07;
+const SOCCER_POLICY_DP_RESIDUAL_PENALTY_WEIGHT: f64 = 0.018;
+const SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS: &[&str] = &[
+    "dribble",
+    "carry-forward",
+    "carry-out-left",
+    "carry-out-right",
+    "protect-ball",
+    "side-step",
+    "left-cut",
+    "right-cut",
+    "nutmeg",
+    "fake-left-cut-right",
+    "fake-right-cut-left",
+];
+const SOCCER_POLICY_PASS_NOVELTY_ACTIONS: &[&str] = &[
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "switch-play",
+    "recycle-reset",
+    "wall-pass",
+    "surprise-pass",
+    "flick-on",
+    "scoop-pass",
+    "first-time-pass",
+];
+const SOCCER_POLICY_SHOT_NOVELTY_ACTIONS: &[&str] = &["shoot", "first-time-shot"];
+const SOCCER_POLICY_DEFENSE_NOVELTY_ACTIONS: &[&str] =
+    &["tackle", "press-cover", "clearance", "route-one"];
+const SOCCER_POLICY_SUPPORT_NOVELTY_ACTIONS: &[&str] = &[
+    "space",
+    "control-touch",
+    "vertical-attack",
+    "turnover-burst",
+    "vacate-space",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -962,88 +1012,28 @@ pub fn soccer_team_label(team: Team) -> &'static str {
 pub fn soccer_learning_run_score(summary: &MatchSummary) -> SoccerLearningRunScore {
     let home = soccer_learning_team_score(Team::Home, summary.score_home, summary.score_away);
     let away = soccer_learning_team_score(Team::Away, summary.score_away, summary.score_home);
-    // The evolutionary search selects policies on `match_fitness`. The old definition,
-    // `(home.fitness + away.fitness) * 0.5`, was a SYMMETRIC average whose goal-difference
-    // terms cancel exactly to `0.04 * total_goals` — it carried no skill signal, so evolution
-    // had no gradient and fitness sat flat for dozens of generations. We instead score the
-    // BOTH-TEAMS quality of football produced: goals are the gold standard, with shots on
-    // target, completed forward passes (especially consecutive ones), assists and completed
-    // crosses as the dense proxies, and backward sequences penalised. This does not cancel
-    // between the two symmetric self-play sides, so it gives a real per-game gradient.
-    let match_fitness = soccer_match_quality_fitness(summary);
+    // The evolutionary search selects on `match_fitness`. The OLD definition,
+    // `(home.fitness + away.fitness) * 0.5`, was a symmetric average whose goal-difference
+    // terms cancel to `0.04 * total_goals` — no skill signal, so fitness sat flat for dozens
+    // of generations. Both this branch and origin fixed it convergently; we keep origin's
+    // principled structure — the WINNER's (non-cancelling) goal-diff fitness, plus a
+    // normalised both-teams play-quality term (now enriched with the proxies for "more goals":
+    // assists, completed crosses, consecutive forward passes — see
+    // `soccer_learning_team_play_quality`), plus a decisive-margin bonus, all bounded.
+    let winner_fitness = home.fitness.max(away.fitness);
+    let play_quality = soccer_learning_match_play_quality(summary);
+    let decisive_margin = (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
+    let match_fitness = (winner_fitness * SOCCER_MATCH_FITNESS_WINNER_WEIGHT
+        + play_quality * SOCCER_MATCH_FITNESS_QUALITY_WEIGHT
+        + decisive_margin.min(SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN)
+            * SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT)
+        .clamp(SOCCER_MATCH_FITNESS_MIN, SOCCER_MATCH_FITNESS_MAX);
     SoccerLearningRunScore {
         home,
         away,
         match_fitness,
         match_fitness_micros: soccer_learning_to_micros(match_fitness),
     }
-}
-
-/// Weights for [`soccer_match_quality_fitness`]. Goals dominate; the proxies are the dense
-/// gradient between goals (the signals the user called the good proxies for "more goals":
-/// shots on target, completed forward passes — especially consecutive ones — assists, crosses).
-pub struct SoccerMatchQualityWeights {
-    pub goal: f64,
-    pub assist: f64,
-    pub shot_on_target: f64,
-    pub cross_completed: f64,
-    pub forward_pass: f64,
-    /// Per-yard reward for net-forward progression carried through consecutive-pass chains.
-    pub chain_forward_yard: f64,
-    pub shot_after_pass: f64,
-    /// Penalty per consecutive-pass chain that ended in a net yards LOSS (went backwards).
-    pub backward_chain_penalty: f64,
-}
-
-impl Default for SoccerMatchQualityWeights {
-    fn default() -> Self {
-        Self {
-            goal: 1.00,
-            assist: 0.45,
-            shot_on_target: 0.18,
-            cross_completed: 0.08,
-            forward_pass: 0.006,
-            chain_forward_yard: 0.004,
-            shot_after_pass: 0.10,
-            backward_chain_penalty: 0.12,
-        }
-    }
-}
-
-/// Both-teams play-quality fitness for a finished match (see [`soccer_learning_run_score`]).
-/// Goals are the gold standard; the remaining terms are progression/chance-creation proxies
-/// that give a dense gradient between goals. Aggregated over both sides, so it does not cancel
-/// in symmetric self-play.
-pub fn soccer_match_quality_fitness(summary: &MatchSummary) -> f64 {
-    soccer_match_quality_fitness_weighted(summary, &SoccerMatchQualityWeights::default())
-}
-
-pub fn soccer_match_quality_fitness_weighted(
-    summary: &MatchSummary,
-    weights: &SoccerMatchQualityWeights,
-) -> f64 {
-    let stats = &summary.stats;
-    let goals = f64::from(summary.score_home + summary.score_away);
-    let assists = f64::from(stats.assists_home + stats.assists_away);
-    let shots_on_target = f64::from(stats.shots_on_target_home + stats.shots_on_target_away);
-    let crosses = f64::from(stats.crosses_completed_home + stats.crosses_completed_away);
-    let forward_passes =
-        f64::from(stats.passes_completed_forward_home + stats.passes_completed_forward_away);
-    // Only net-FORWARD chain progression is rewarded (backward chains are penalised below, not
-    // credited here).
-    let chain_forward_yards =
-        (stats.pass_chain_gain_yards_home + stats.pass_chain_gain_yards_away).max(0.0);
-    let shots_after_pass = f64::from(stats.shots_after_pass_home + stats.shots_after_pass_away);
-    let backward_chains = f64::from(stats.pass_chains_net_loss_home + stats.pass_chains_net_loss_away);
-
-    goals * weights.goal
-        + assists * weights.assist
-        + shots_on_target * weights.shot_on_target
-        + crosses * weights.cross_completed
-        + forward_passes * weights.forward_pass
-        + chain_forward_yards * weights.chain_forward_yard
-        + shots_after_pass * weights.shot_after_pass
-        - backward_chains * weights.backward_chain_penalty
 }
 
 pub fn soccer_learning_team_score(
@@ -1081,6 +1071,114 @@ pub fn soccer_learning_team_score(
         merge_weight_micros: soccer_learning_to_micros(merge_weight),
         fitness,
         fitness_micros: soccer_learning_to_micros(fitness),
+    }
+}
+
+fn soccer_learning_match_play_quality(summary: &MatchSummary) -> f64 {
+    (soccer_learning_team_play_quality(Team::Home, summary)
+        + soccer_learning_team_play_quality(Team::Away, summary))
+        * 0.5
+}
+
+fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 {
+    let stats = &summary.stats;
+    let (
+        pass_attempts,
+        pass_completed,
+        forward_completed,
+        shots,
+        shots_on_target,
+        dribble_beats,
+        loose_recoveries,
+        upfield_progress,
+        near_ball_progress,
+        assists,
+        crosses_completed,
+        shots_after_pass,
+        chain_forward_yards,
+        chains_net_loss,
+    ) = match team {
+        Team::Home => (
+            stats.passes_attempted_home,
+            stats.passes_completed_home,
+            stats.passes_completed_forward_home,
+            stats.shots_home,
+            stats.shots_on_target_home,
+            stats.dribble_beats_home,
+            stats.loose_ball_recoveries_home,
+            stats.teamwork_upfield_progress_home,
+            stats.teamwork_near_ball_progress_home,
+            stats.assists_home,
+            stats.crosses_completed_home,
+            stats.shots_after_pass_home,
+            stats.pass_chain_gain_yards_home,
+            stats.pass_chains_net_loss_home,
+        ),
+        Team::Away => (
+            stats.passes_attempted_away,
+            stats.passes_completed_away,
+            stats.passes_completed_forward_away,
+            stats.shots_away,
+            stats.shots_on_target_away,
+            stats.dribble_beats_away,
+            stats.loose_ball_recoveries_away,
+            stats.teamwork_upfield_progress_away,
+            stats.teamwork_near_ball_progress_away,
+            stats.assists_away,
+            stats.crosses_completed_away,
+            stats.shots_after_pass_away,
+            stats.pass_chain_gain_yards_away,
+            stats.pass_chains_net_loss_away,
+        ),
+    };
+    let pass_volume = soccer_learning_bounded_count(pass_attempts, 60.0);
+    let pass_completion = soccer_learning_ratio(pass_completed, pass_attempts);
+    let forward_share = soccer_learning_ratio(forward_completed, pass_completed);
+    let shot_volume = soccer_learning_bounded_count(shots, 12.0);
+    let shot_accuracy = soccer_learning_ratio(shots_on_target, shots);
+    let dribble_quality = soccer_learning_bounded_count(dribble_beats, 8.0);
+    let recovery_quality = soccer_learning_bounded_count(loose_recoveries, 16.0);
+    let upfield_quality = (upfield_progress / 80.0).clamp(0.0, 1.0);
+    let near_ball_quality = (near_ball_progress / 80.0).clamp(0.0, 1.0);
+    // The user's explicit "good proxies for more goals": assists, completed crosses, worked
+    // chances (a shot off >=1 pass) and consecutive FORWARD passing (net-forward chain yards,
+    // penalised when chains went backwards).
+    let assist_quality = soccer_learning_bounded_count(assists, 4.0);
+    let cross_quality = soccer_learning_bounded_count(crosses_completed, 8.0);
+    let worked_chance_quality = soccer_learning_bounded_count(shots_after_pass, 8.0);
+    let chain_forward = (chain_forward_yards.max(0.0) / 120.0).clamp(0.0, 1.0);
+    let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
+    let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
+
+    (pass_volume * 0.05
+        + pass_completion * 0.20
+        + forward_share * 0.10
+        + shot_volume * 0.08
+        + shot_accuracy * 0.13
+        + dribble_quality * 0.05
+        + recovery_quality * 0.04
+        + upfield_quality * 0.08
+        + near_ball_quality * 0.03
+        + assist_quality * 0.09
+        + cross_quality * 0.03
+        + worked_chance_quality * 0.04
+        + chain_progress_quality * 0.08)
+        .clamp(0.0, 1.0)
+}
+
+fn soccer_learning_ratio(numerator: u32, denominator: u32) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn soccer_learning_bounded_count(count: u32, cap: f64) -> f64 {
+    if cap <= 0.0 {
+        0.0
+    } else {
+        (count as f64 / cap).clamp(0.0, 1.0)
     }
 }
 
@@ -1335,6 +1433,8 @@ pub fn evolve_soccer_team_policies(
     options: SoccerEvolutionOptions,
 ) -> Result<SoccerTeamQPolicies, String> {
     let options = normalize_soccer_evolution_options_for_learning_search(options)?;
+    let policy_pressure = soccer_policy_search_pressure(parents);
+    let options = adapt_soccer_evolution_options_for_policy_search(options, policy_pressure);
     let population_size = options.population_size;
     let mut best = None::<(SoccerTeamQPolicies, f64)>;
     for candidate_index in 0..population_size {
@@ -1342,7 +1442,8 @@ pub fn evolve_soccer_team_policies(
         candidate_options.population_size = 1;
         candidate_options.seed =
             candidate_seed(options.seed, candidate_index, 0x51f1_7ea9_8d12_0b1d);
-        let candidate = evolve_soccer_team_policy_candidate(parents, candidate_options)?;
+        let candidate =
+            evolve_soccer_team_policy_candidate(parents, candidate_options, policy_pressure)?;
         let score = soccer_team_policy_search_score(&candidate);
         if best
             .as_ref()
@@ -1358,6 +1459,7 @@ pub fn evolve_soccer_team_policies(
 fn evolve_soccer_team_policy_candidate(
     parents: &[(&SoccerTeamQPolicies, f64)],
     options: SoccerEvolutionOptions,
+    policy_pressure: f64,
 ) -> Result<SoccerTeamQPolicies, String> {
     let Some((first_parent, _)) = parents.first() else {
         return Err("at least one parent policy is required".to_string());
@@ -1404,6 +1506,12 @@ fn evolve_soccer_team_policy_candidate(
         &mut rng,
         options,
     );
+    inject_policy_plateau_novelty_actions(
+        &mut action_accumulators,
+        &mut rng,
+        options,
+        policy_pressure,
+    );
     explore_accumulators(&mut action_accumulators, &mut rng, options);
     explore_accumulators(&mut target_accumulators, &mut rng, options);
     mutate_accumulators(&mut action_accumulators, &mut rng, options);
@@ -1417,6 +1525,115 @@ fn evolve_soccer_team_policy_candidate(
     )
 }
 
+fn soccer_policy_search_pressure(parents: &[(&SoccerTeamQPolicies, f64)]) -> f64 {
+    let finite_fitness = parents
+        .iter()
+        .filter_map(|(_, fitness)| fitness.is_finite().then_some(*fitness))
+        .collect::<Vec<_>>();
+    let sample_fit = if finite_fitness.is_empty() {
+        0.35
+    } else {
+        (finite_fitness.len() as f64 / 4.0).clamp(0.35, 1.0)
+    };
+    let (best, worst) = finite_fitness.iter().fold(
+        (f64::NEG_INFINITY, f64::INFINITY),
+        |(best, worst), fitness| (best.max(*fitness), worst.min(*fitness)),
+    );
+    let plateau = if finite_fitness.len() >= 2 {
+        (1.0 - (best - worst).abs() / SOCCER_POLICY_PLATEAU_FITNESS_SPREAD).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let low_ceiling = if best.is_finite() {
+        (1.0 - best.max(0.0) / SOCCER_POLICY_LOW_CEILING_FITNESS).clamp(0.0, 1.0)
+    } else {
+        0.35
+    };
+    let coverage_gap = (1.0 - soccer_policy_parent_action_coverage(parents)).clamp(0.0, 1.0);
+
+    ((plateau * 0.52 + low_ceiling * 0.20 + coverage_gap * 0.28) * sample_fit).clamp(0.0, 1.0)
+}
+
+fn soccer_policy_parent_action_coverage(parents: &[(&SoccerTeamQPolicies, f64)]) -> f64 {
+    let mut families = HashSet::<String>::new();
+    for (policy, _) in parents {
+        for entry in policy
+            .home
+            .entries()
+            .into_iter()
+            .chain(policy.away.entries())
+        {
+            families.insert(entry.action);
+        }
+    }
+    (families.len() as f64 / soccer_policy_known_action_count() as f64).clamp(0.0, 1.0)
+}
+
+fn soccer_policy_known_action_count() -> usize {
+    let mut actions = HashSet::<&'static str>::new();
+    for family in [
+        SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS,
+        SOCCER_POLICY_PASS_NOVELTY_ACTIONS,
+        SOCCER_POLICY_SHOT_NOVELTY_ACTIONS,
+        SOCCER_POLICY_DEFENSE_NOVELTY_ACTIONS,
+        SOCCER_POLICY_SUPPORT_NOVELTY_ACTIONS,
+    ] {
+        actions.extend(family.iter().copied());
+    }
+    actions.len().max(1)
+}
+
+pub fn adapt_soccer_evolution_options_for_policy_search(
+    mut options: SoccerEvolutionOptions,
+    pressure: f64,
+) -> SoccerEvolutionOptions {
+    options.population_size =
+        soccer_evolution_population_size_for_learning_run(options.population_size);
+    let pressure = pressure.clamp(0.0, 1.0);
+    if pressure <= 1e-12 {
+        return options;
+    }
+    let search_enabled = options.population_size > 1
+        || options.mutation_rate > 0.0
+        || options.mutation_scale > 0.0
+        || options.crossover_rate > 0.0
+        || options.exploration_rate > 0.0
+        || options.exploration_scale > 0.0;
+    if !search_enabled {
+        return options;
+    }
+
+    if options.crossover_rate > 0.0 {
+        options.crossover_rate = (options.crossover_rate + pressure * 0.10).clamp(0.0, 0.90);
+    }
+    if options.mutation_rate > 0.0 || options.mutation_scale > 0.0 {
+        options.mutation_rate = (options.mutation_rate + pressure * 0.05).clamp(0.0, 0.55);
+        options.mutation_scale = (options.mutation_scale * (1.0 + pressure * 0.70))
+            .max(options.mutation_scale)
+            .min(1.20);
+    }
+    if options.exploration_rate > 0.0 || options.exploration_scale > 0.0 {
+        options.exploration_rate = (options.exploration_rate + pressure * 0.12).clamp(0.0, 0.65);
+        options.exploration_scale = (options.exploration_scale * (1.0 + pressure * 0.85))
+            .max(options.exploration_scale)
+            .min(1.60);
+    }
+    options.elite_weight_floor = options.elite_weight_floor.max(pressure * 0.04).min(0.16);
+    if options.population_size > 1 {
+        let extra_candidates = ((options.population_size as f64) * pressure * 1.5).ceil() as usize;
+        let cap = options
+            .population_size
+            .saturating_mul(3)
+            .min(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION);
+        options.population_size = options
+            .population_size
+            .saturating_add(extra_candidates)
+            .min(cap)
+            .max(2);
+    }
+    options
+}
+
 fn soccer_team_policy_search_score(policy: &SoccerTeamQPolicies) -> f64 {
     let (home_score, home_weight) = soccer_q_policy_search_score(&policy.home);
     let (away_score, away_weight) = soccer_q_policy_search_score(&policy.away);
@@ -1428,20 +1645,92 @@ fn soccer_team_policy_search_score(policy: &SoccerTeamQPolicies) -> f64 {
     }
 }
 
+#[derive(Default)]
+struct SoccerPolicyStateSearchStats {
+    total_weight: f64,
+    weighted_value_sum: f64,
+    best_value: f64,
+    best_visits: u32,
+    actions: HashSet<String>,
+    technical_actions: usize,
+}
+
 fn soccer_q_policy_search_score(policy: &SoccerQPolicy) -> (f64, f64) {
+    let entries = policy.entries();
+    let target_entries = policy.target_entries();
+    if entries.is_empty() && target_entries.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut states = HashMap::<SoccerQStateKey, SoccerPolicyStateSearchStats>::new();
+    for entry in entries {
+        let value = entry.value.clamp(-120.0, 120.0);
+        let visits = entry.visits.max(1);
+        let weight = f64::from(visits).sqrt();
+        let stats = states.entry(entry.state).or_default();
+        stats.total_weight += weight;
+        stats.weighted_value_sum += value * weight;
+        if stats.actions.is_empty() || value > stats.best_value {
+            stats.best_value = value;
+            stats.best_visits = visits;
+        }
+        if soccer_policy_action_is_technical_execution(&entry.action) {
+            stats.technical_actions += 1;
+        }
+        stats.actions.insert(entry.action);
+    }
+
     let mut weighted_score = 0.0;
     let mut total_weight = 0.0;
-    for entry in policy.entries() {
-        let weight = f64::from(entry.visits.max(1)).sqrt();
-        weighted_score += entry.value.clamp(-120.0, 120.0) * weight;
-        total_weight += weight;
+    for stats in states.values() {
+        if stats.total_weight <= 0.0 {
+            continue;
+        }
+        let mean_value = stats.weighted_value_sum / stats.total_weight;
+        let dp_residual = (stats.best_value - mean_value).max(0.0);
+        let action_coverage =
+            ((stats.actions.len().saturating_sub(1)) as f64 / 6.0).clamp(0.0, 1.0);
+        let technical_coverage = (stats.technical_actions as f64 / 4.0).clamp(0.0, 1.0);
+        let state_score = stats.best_value
+            + action_coverage * SOCCER_POLICY_STATE_ACTION_COVERAGE_WEIGHT
+            + technical_coverage * SOCCER_POLICY_TECHNICAL_COVERAGE_WEIGHT
+            - dp_residual.min(8.0) * SOCCER_POLICY_DP_RESIDUAL_PENALTY_WEIGHT;
+        let state_weight = stats.total_weight.max(f64::from(stats.best_visits).sqrt());
+        weighted_score += state_score * state_weight;
+        total_weight += state_weight;
     }
-    for entry in policy.target_entries() {
-        let weight = f64::from(entry.visits.max(1)).sqrt();
-        weighted_score += entry.value.clamp(-120.0, 120.0) * weight;
-        total_weight += weight;
+
+    let mut target_actions = HashSet::<String>::new();
+    let mut target_cells = HashSet::<(usize, usize, usize, usize)>::new();
+    let mut target_weighted_score = 0.0;
+    let mut target_weight = 0.0;
+    for entry in target_entries {
+        let weight = f64::from(entry.visits.max(1)).sqrt() * 0.45;
+        target_weighted_score += entry.value.clamp(-120.0, 120.0) * weight;
+        target_weight += weight;
+        target_actions.insert(entry.action);
+        target_cells.insert((
+            entry.target_fine_cell_id,
+            entry.target_tactical_cell_id,
+            entry.target_macro_cell_id,
+            entry.target_root_cell_id,
+        ));
     }
+    if target_weight > 0.0 {
+        let target_coverage = ((target_actions.len() as f64 / 5.0).clamp(0.0, 1.0) * 0.55)
+            + ((target_cells.len() as f64 / 24.0).clamp(0.0, 1.0) * 0.45);
+        weighted_score += target_weighted_score
+            + target_coverage * SOCCER_POLICY_TARGET_COVERAGE_WEIGHT * target_weight;
+        total_weight += target_weight;
+    }
+
     (weighted_score, total_weight)
+}
+
+fn soccer_policy_action_is_technical_execution(action: &str) -> bool {
+    SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS.contains(&action)
+        || SOCCER_POLICY_PASS_NOVELTY_ACTIONS.contains(&action)
+        || SOCCER_POLICY_SHOT_NOVELTY_ACTIONS.contains(&action)
 }
 
 pub fn evolve_soccer_tactical_learning_weights(
@@ -3870,6 +4159,162 @@ fn crossover_accumulators(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PolicyNoveltyStateKey {
+    team: &'static str,
+    state_hash: String,
+    state_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct PolicyNoveltyStateInfo {
+    state_key: SoccerQStateKey,
+    actions: Vec<String>,
+    weighted_value_sum: f64,
+    effective_visits: f64,
+}
+
+fn inject_policy_plateau_novelty_actions(
+    accumulators: &mut BTreeMap<PolicyEntryKey, MergeAccumulator>,
+    rng: &mut DeterministicRng,
+    options: SoccerEvolutionOptions,
+    pressure: f64,
+) {
+    let pressure = pressure.clamp(0.0, 1.0);
+    if pressure <= 0.05 {
+        return;
+    }
+    let search_can_create_novelty = options.exploration_rate > 0.0
+        || options.exploration_scale > 0.0
+        || options.mutation_rate > 0.0
+        || options.mutation_scale > 0.0;
+    if !search_can_create_novelty || accumulators.is_empty() {
+        return;
+    }
+
+    let novelty_rate = (options.exploration_rate.max(options.mutation_rate) * 0.56
+        + pressure * 0.54
+        + options.exploration_scale.min(1.6) * 0.08)
+        .clamp(0.0, 1.0);
+    if novelty_rate <= 0.0 {
+        return;
+    }
+
+    let mut states = BTreeMap::<PolicyNoveltyStateKey, PolicyNoveltyStateInfo>::new();
+    for (key, accumulator) in accumulators.iter() {
+        if key.entry_kind != SoccerLearningPolicyEntryKind::Action
+            || accumulator.effective_visits <= 0.0
+        {
+            continue;
+        }
+        let state_key = PolicyNoveltyStateKey {
+            team: key.team,
+            state_hash: key.state_hash.clone(),
+            state_json: key.state_json.clone(),
+        };
+        let info = states
+            .entry(state_key)
+            .or_insert_with(|| PolicyNoveltyStateInfo {
+                state_key: accumulator.state_key.clone(),
+                actions: Vec::new(),
+                weighted_value_sum: 0.0,
+                effective_visits: 0.0,
+            });
+        info.actions.push(key.action.clone());
+        info.weighted_value_sum += accumulator.weighted_value_sum;
+        info.effective_visits += accumulator.effective_visits;
+    }
+
+    let max_states =
+        ((options.population_size.max(1) as f64) * (8.0 + pressure * 24.0)).ceil() as usize;
+    for (state_key, info) in states
+        .into_iter()
+        .take(max_states.min(SOCCER_POLICY_NOVELTY_MAX_STATES))
+    {
+        if info.effective_visits <= 0.0 || rng.next_f64() > novelty_rate {
+            continue;
+        }
+        let candidates = soccer_policy_novelty_actions_for_existing(&info.actions);
+        if candidates.is_empty() {
+            continue;
+        }
+        let current_value = info.weighted_value_sum / info.effective_visits;
+        let visit_weight = (0.55 + pressure * 1.10 + options.exploration_scale.max(0.0) * 0.30)
+            .clamp(0.5, SOCCER_POLICY_NOVELTY_VISIT_WEIGHT_MAX);
+        let jitter_scale =
+            (0.04 + options.exploration_scale.max(options.mutation_scale) * 0.06).clamp(0.04, 0.18);
+        let start = rng.next_usize(candidates.len());
+        let mut added = 0usize;
+        for offset in 0..candidates.len() {
+            if added >= SOCCER_POLICY_NOVELTY_MAX_ACTIONS_PER_STATE {
+                break;
+            }
+            let action = candidates[(start + offset) % candidates.len()];
+            if info.actions.iter().any(|existing| existing == action) {
+                continue;
+            }
+            let novelty_key = PolicyEntryKey {
+                team: state_key.team,
+                entry_kind: SoccerLearningPolicyEntryKind::Action,
+                state_hash: state_key.state_hash.clone(),
+                state_json: state_key.state_json.clone(),
+                action: action.to_string(),
+                target_fine_cell_id: -1,
+                target_tactical_cell_id: -1,
+                target_macro_cell_id: -1,
+                target_root_cell_id: -1,
+            };
+            if accumulators.contains_key(&novelty_key) {
+                continue;
+            }
+            let centered_jitter = (rng.next_f64() * 2.0 - 1.0) * jitter_scale;
+            let value = (current_value - 0.06 + centered_jitter).clamp(-120.0, 120.0);
+            accumulators.insert(
+                novelty_key,
+                MergeAccumulator {
+                    state_key: info.state_key.clone(),
+                    action: action.to_string(),
+                    weighted_value_sum: value * visit_weight,
+                    effective_visits: visit_weight,
+                    display_visits: 1,
+                    target_fine_cell_id: -1,
+                    target_tactical_cell_id: -1,
+                    target_macro_cell_id: -1,
+                    target_root_cell_id: -1,
+                },
+            );
+            added += 1;
+        }
+    }
+}
+
+fn soccer_policy_novelty_actions_for_existing(existing: &[String]) -> Vec<&'static str> {
+    let has_any = |families: &[&str]| {
+        existing
+            .iter()
+            .any(|action| families.contains(&action.as_str()))
+    };
+    let mut candidates = Vec::<&'static str>::new();
+    if has_any(SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS) {
+        candidates.extend_from_slice(SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS);
+    }
+    if has_any(SOCCER_POLICY_PASS_NOVELTY_ACTIONS) {
+        candidates.extend_from_slice(SOCCER_POLICY_PASS_NOVELTY_ACTIONS);
+    }
+    if has_any(SOCCER_POLICY_SHOT_NOVELTY_ACTIONS) {
+        candidates.extend_from_slice(SOCCER_POLICY_SHOT_NOVELTY_ACTIONS);
+    }
+    if has_any(SOCCER_POLICY_DEFENSE_NOVELTY_ACTIONS) {
+        candidates.extend_from_slice(SOCCER_POLICY_DEFENSE_NOVELTY_ACTIONS);
+    }
+    if candidates.is_empty() || has_any(SOCCER_POLICY_SUPPORT_NOVELTY_ACTIONS) {
+        candidates.extend_from_slice(SOCCER_POLICY_SUPPORT_NOVELTY_ACTIONS);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
 fn explore_accumulators(
     accumulators: &mut BTreeMap<PolicyEntryKey, MergeAccumulator>,
     rng: &mut DeterministicRng,
@@ -4062,7 +4507,7 @@ fn build_policies_from_accumulators(
 mod tests {
     use super::*;
     use crate::des::general::soccer::{
-        PlayerRole, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
+        MatchStats, PlayerRole, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
         SoccerNeuralLearningConfig, TacticalPhase,
     };
 
@@ -4194,6 +4639,24 @@ mod tests {
         }
     }
 
+    fn policy_with_home_actions(actions: &[(&str, f64, u32)]) -> SoccerTeamQPolicies {
+        let state = test_state();
+        let entries = actions
+            .iter()
+            .map(|(action, value, visits)| SoccerQEntry {
+                state: state.clone(),
+                action: (*action).to_string(),
+                value: *value,
+                visits: *visits,
+            })
+            .collect::<Vec<_>>();
+        SoccerTeamQPolicies {
+            home: SoccerQPolicy::from_entries(SoccerQPolicyOptions::default(), &entries)
+                .expect("home policy"),
+            away: SoccerQPolicy::new(SoccerQPolicyOptions::default()),
+        }
+    }
+
     #[test]
     fn losing_team_delta_is_weighted_below_winning_team_delta() {
         let score = soccer_learning_run_score(&MatchSummary {
@@ -4208,6 +4671,99 @@ mod tests {
         assert_eq!(score.away.outcome, SoccerLearningOutcome::Win);
         assert!(score.home.merge_weight < score.away.merge_weight);
         assert!(score.home.merge_weight < 0.30);
+    }
+
+    #[test]
+    fn match_fitness_preserves_goal_difference_for_evolution() {
+        let dominant_win = soccer_learning_run_score(&MatchSummary {
+            score_home: 5,
+            score_away: 0,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: Default::default(),
+        });
+        let one_goal_win = soccer_learning_run_score(&MatchSummary {
+            score_home: 1,
+            score_away: 0,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: Default::default(),
+        });
+        let chaotic_draw = soccer_learning_run_score(&MatchSummary {
+            score_home: 3,
+            score_away: 3,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: Default::default(),
+        });
+
+        assert!(
+            dominant_win.match_fitness > chaotic_draw.match_fitness,
+            "5-0 must outrank 3-3 for evolution: win={}, draw={}",
+            dominant_win.match_fitness,
+            chaotic_draw.match_fitness
+        );
+        assert!(
+            one_goal_win.match_fitness > chaotic_draw.match_fitness,
+            "1-0 must still preserve goal-diff signal over high-scoring churn: win={}, draw={}",
+            one_goal_win.match_fitness,
+            chaotic_draw.match_fitness
+        );
+    }
+
+    #[test]
+    fn match_fitness_uses_non_cancelling_play_quality_for_draws() {
+        let high_quality = soccer_learning_run_score(&MatchSummary {
+            score_home: 1,
+            score_away: 1,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: MatchStats {
+                passes_attempted_home: 42,
+                passes_attempted_away: 40,
+                passes_completed_home: 34,
+                passes_completed_away: 31,
+                passes_completed_forward_home: 18,
+                passes_completed_forward_away: 16,
+                shots_home: 6,
+                shots_away: 5,
+                shots_on_target_home: 4,
+                shots_on_target_away: 3,
+                dribble_beats_home: 5,
+                dribble_beats_away: 4,
+                loose_ball_recoveries_home: 8,
+                loose_ball_recoveries_away: 7,
+                teamwork_upfield_progress_home: 48.0,
+                teamwork_upfield_progress_away: 44.0,
+                teamwork_near_ball_progress_home: 30.0,
+                teamwork_near_ball_progress_away: 28.0,
+                ..Default::default()
+            },
+        });
+        let low_quality = soccer_learning_run_score(&MatchSummary {
+            score_home: 1,
+            score_away: 1,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: MatchStats {
+                passes_attempted_home: 42,
+                passes_attempted_away: 40,
+                passes_completed_home: 15,
+                passes_completed_away: 14,
+                passes_completed_forward_home: 2,
+                passes_completed_forward_away: 2,
+                shots_home: 1,
+                shots_away: 1,
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            high_quality.match_fitness > low_quality.match_fitness + 0.05,
+            "play quality should shape symmetric draws: high={}, low={}",
+            high_quality.match_fitness,
+            low_quality.match_fitness
+        );
     }
 
     #[test]
@@ -4337,6 +4893,90 @@ mod tests {
         assert!(
             soccer_team_policy_search_score(&population)
                 >= soccer_team_policy_search_score(&single) - 1e-12
+        );
+    }
+
+    #[test]
+    fn policy_search_adapts_budget_when_parent_fitness_plateaus() {
+        let low_coverage = policy_with_home_actions(&[("pass", 0.8, 4)]);
+        let pressure =
+            soccer_policy_search_pressure(&[(&low_coverage, 0.40), (&low_coverage, 0.41)]);
+        assert!(
+            pressure > 0.40,
+            "flat low-coverage parents should create anti-plateau pressure, got {pressure}"
+        );
+
+        let base = SoccerEvolutionOptions::default();
+        let adapted = adapt_soccer_evolution_options_for_policy_search(base, pressure);
+        assert!(adapted.population_size > base.population_size);
+        assert!(adapted.mutation_rate > base.mutation_rate);
+        assert!(adapted.mutation_scale > base.mutation_scale);
+        assert!(adapted.exploration_rate > base.exploration_rate);
+        assert!(adapted.exploration_scale > base.exploration_scale);
+
+        let disabled = SoccerEvolutionOptions {
+            mutation_rate: 0.0,
+            mutation_scale: 0.0,
+            crossover_rate: 0.0,
+            exploration_rate: 0.0,
+            exploration_scale: 0.0,
+            elite_weight_floor: 0.0,
+            population_size: 1,
+            seed: 77,
+        };
+        assert_eq!(
+            adapt_soccer_evolution_options_for_policy_search(disabled, pressure).population_size,
+            disabled.population_size
+        );
+    }
+
+    #[test]
+    fn policy_plateau_novelty_injects_missing_sibling_actions() {
+        let policy = policy_with_home_actions(&[("pass", 1.0, 6)]);
+        let mut action_accumulators = BTreeMap::<PolicyEntryKey, MergeAccumulator>::new();
+        let mut target_accumulators = BTreeMap::<PolicyEntryKey, MergeAccumulator>::new();
+        seed_policy_accumulators(
+            Team::Home,
+            &policy.home,
+            1.0,
+            &mut action_accumulators,
+            &mut target_accumulators,
+        );
+        let mut rng = DeterministicRng::new(90210);
+        let options = SoccerEvolutionOptions {
+            mutation_rate: 0.25,
+            mutation_scale: 0.55,
+            exploration_rate: 1.0,
+            exploration_scale: 1.0,
+            crossover_rate: 0.0,
+            elite_weight_floor: 0.0,
+            population_size: 8,
+            seed: 90210,
+        };
+
+        inject_policy_plateau_novelty_actions(&mut action_accumulators, &mut rng, options, 1.0);
+
+        assert!(
+            action_accumulators
+                .keys()
+                .any(|key| key.action != "pass" && SOCCER_POLICY_PASS_NOVELTY_ACTIONS.contains(&key.action.as_str())),
+            "plateau novelty should add at least one pass-family sibling action: {action_accumulators:?}"
+        );
+    }
+
+    #[test]
+    fn policy_search_score_rewards_dp_action_coverage_when_values_tie() {
+        let one_action = policy_with_home_actions(&[("pass", 1.0, 4)]);
+        let covered = policy_with_home_actions(&[
+            ("pass", 1.0, 4),
+            ("killer-pass", 1.0, 4),
+            ("recycle-reset", 1.0, 4),
+        ]);
+
+        assert!(
+            soccer_team_policy_search_score(&covered)
+                > soccer_team_policy_search_score(&one_action),
+            "equal-value policies should prefer broader DP action coverage"
         );
     }
 
@@ -6216,37 +6856,43 @@ mod tests {
             s.pass_chains_net_loss_home = 14;
             s.pass_chain_gain_yards_home = -40.0;
         });
-        let incisive_fitness = soccer_match_quality_fitness(&incisive);
-        let sterile_fitness = soccer_match_quality_fitness(&sterile);
+        let fitness = |summary: &MatchSummary| soccer_learning_run_score(summary).match_fitness;
+        let incisive_fitness = fitness(&incisive);
+        let sterile_fitness = fitness(&sterile);
         assert!(
             incisive_fitness > sterile_fitness + 1.0,
             "incisive ({incisive_fitness}) should clearly beat sterile ({sterile_fitness})"
         );
 
         // The old metric was ONLY total goals, so it was blind to HOW the goals came. With the
-        // SAME scoreline, the game richer in shots on target, assists and forward progression
-        // must score higher — that is the dense gradient the proxies are meant to provide.
+        // SAME scoreline (so equal winner-fitness and margin), the game richer in shots on
+        // target, assists and forward progression must score higher — the dense gradient the
+        // play-quality proxies are meant to provide.
         let worked = make(2, 2, &|s| {
+            s.shots_home = 12;
+            s.shots_away = 12;
             s.shots_on_target_home = 8;
             s.shots_on_target_away = 8;
             s.assists_home = 2;
             s.assists_away = 2;
             s.passes_completed_forward_home = 90;
             s.passes_completed_forward_away = 90;
+            s.crosses_completed_home = 4;
+            s.crosses_completed_away = 4;
+            s.shots_after_pass_home = 6;
+            s.shots_after_pass_away = 6;
             s.pass_chain_gain_yards_home = 140.0;
             s.pass_chain_gain_yards_away = 140.0;
         });
         let scrappy = make(2, 2, &|s| {
+            s.shots_home = 3;
+            s.shots_away = 3;
             s.shots_on_target_home = 2;
             s.shots_on_target_away = 2;
         });
         assert!(
-            soccer_match_quality_fitness(&worked) > soccer_match_quality_fitness(&scrappy),
+            fitness(&worked) > fitness(&scrappy),
             "same scoreline: more chance-creation/progression must rank higher"
         );
-
-        // Backward, sterile passing is penalised below a clean zero-event baseline.
-        let baseline = make(0, 0, &|_s| {});
-        assert!(sterile_fitness < soccer_match_quality_fitness(&baseline));
     }
 }

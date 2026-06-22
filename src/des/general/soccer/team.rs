@@ -1295,7 +1295,9 @@ impl SoccerFormationLpBrain {
 
         let players_start = c.len();
         for slot in 0..SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY {
-            for component in ["pos_x", "pos_y", "vel_x", "vel_y", "acc_x", "acc_y"] {
+            for component in [
+                "pos_x", "pos_y", "vel_x", "vel_y", "acc_x", "acc_y", "jerk_x", "jerk_y",
+            ] {
                 add_var(
                     &mut c,
                     &mut lb,
@@ -1308,7 +1310,9 @@ impl SoccerFormationLpBrain {
             }
         }
         let ball_start = c.len();
-        for component in ["pos_x", "pos_y", "vel_x", "vel_y", "acc_x", "acc_y"] {
+        for component in [
+            "pos_x", "pos_y", "vel_x", "vel_y", "acc_x", "acc_y", "jerk_x", "jerk_y",
+        ] {
             add_var(
                 &mut c,
                 &mut lb,
@@ -4406,8 +4410,8 @@ pub(crate) fn soccer_formation_lp_state_values(
 ) -> Vec<f64> {
     let mut values = vec![
         0.0;
-        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * 6
-            + 6
+        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
+            + SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
             + SOCCER_FORMATION_LP_CONTEXT_FEATURES
     ];
     let (width, length) = sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
@@ -4419,7 +4423,7 @@ pub(crate) fn soccer_formation_lp_state_values(
         .take(SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY)
         .enumerate()
     {
-        let base = slot * 6;
+        let base = slot * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES;
         let position = finite_pitch_point(
             snapshot
                 .player_position(player.id)
@@ -4430,25 +4434,35 @@ pub(crate) fn soccer_formation_lp_state_values(
         );
         let velocity = finite_vec2(player.velocity, Vec2::zero());
         let acceleration = finite_vec2(player.acceleration, Vec2::zero());
+        let jerk = finite_vec2(
+            snapshot.player_jerk(player.id).unwrap_or(player.jerk),
+            Vec2::zero(),
+        );
         values[base] = (position.x / width * 2.0 - 1.0).clamp(-2.0, 2.0);
         values[base + 1] = (position.y / length * 2.0 - 1.0).clamp(-2.0, 2.0);
         values[base + 2] = soccer_lp_scaled(velocity.x, 12.0);
         values[base + 3] = soccer_lp_scaled(velocity.y, 12.0);
         values[base + 4] = soccer_lp_scaled(acceleration.x, 18.0);
         values[base + 5] = soccer_lp_scaled(acceleration.y, 18.0);
+        values[base + 6] = soccer_lp_scaled(jerk.x, 60.0);
+        values[base + 7] = soccer_lp_scaled(jerk.y, 60.0);
     }
-    let ball_base = SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * 6;
+    let ball_base =
+        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES;
     let ball_position = finite_pitch_point(snapshot.ball.position, width, length, center);
     let ball_velocity = finite_vec2(snapshot.ball.velocity, Vec2::zero());
     let ball_acceleration = finite_vec2(snapshot.ball.acceleration, Vec2::zero());
+    let ball_jerk = finite_vec2(snapshot.ball.jerk, Vec2::zero());
     values[ball_base] = (ball_position.x / width * 2.0 - 1.0).clamp(-2.0, 2.0);
     values[ball_base + 1] = (ball_position.y / length * 2.0 - 1.0).clamp(-2.0, 2.0);
     values[ball_base + 2] = soccer_lp_scaled(ball_velocity.x, 24.0);
     values[ball_base + 3] = soccer_lp_scaled(ball_velocity.y, 24.0);
     values[ball_base + 4] = soccer_lp_scaled(ball_acceleration.x, 36.0);
     values[ball_base + 5] = soccer_lp_scaled(ball_acceleration.y, 36.0);
+    values[ball_base + 6] = soccer_lp_scaled(ball_jerk.x, 180.0);
+    values[ball_base + 7] = soccer_lp_scaled(ball_jerk.y, 180.0);
 
-    let context_base = ball_base + 6;
+    let context_base = ball_base + SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES;
     let possession = snapshot
         .controlled_possession_team()
         .or_else(|| snapshot.possession_team());

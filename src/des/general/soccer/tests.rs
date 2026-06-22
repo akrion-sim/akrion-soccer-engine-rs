@@ -58,6 +58,7 @@ fn test_decision_trace(
         action_options: single_action_option(action),
         action_target: None,
         mdp_mpc_comparison: None,
+        learned_mpc_replan: None,
         action: action.to_string(),
     }
 }
@@ -573,6 +574,7 @@ fn learned_mdp_action_reselects_when_mpc_cannot_execute_it() {
         action: "vertical-attack".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(72.0, 112.0)),
+        mpc_replan: None,
     };
     let mut player = sim.players[holder].clone();
     let _intent = player.run_time_step(
@@ -4956,6 +4958,7 @@ fn possession_run_time_step_folds_scoop_pass_into_weighted_order() {
         action: "scoop-pass".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let observation = strategy_snapshot.observation_for(holder);
     let (action, label) = sim.players[holder]
@@ -9103,7 +9106,9 @@ fn adversarial_embedding_memory_biases_team_brain_directives() {
     assert!(away_lp_weights.expected_goals_against > neutral_away_weights.expected_goals_against);
 
     let post_step = WorldSnapshot::from_match(&sim);
-    let context_base = SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * 6 + 6;
+    let context_base = SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY
+        * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
+        + SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES;
     let home_state_values =
         soccer_formation_lp_state_values(&post_step, Team::Home, home_lp_weights);
     let away_state_values =
@@ -9704,11 +9709,13 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
     sim.players[mate].position = Vec2::new(40.0, 55.0 + 10.0 * attack);
     sim.players[mate].velocity = Vec2::new(0.0, 4.0 * attack);
     sim.players[mate].acceleration = Vec2::new(0.0, 6.0 * attack);
-    // The ball owns the final entity slot, with the same position/velocity/acceleration
+    sim.players[mate].jerk = Vec2::new(0.0, 18.0 * attack);
+    // The ball owns the final entity slot, with the same position/velocity/acceleration/jerk
     // channels as players.
     sim.ball.position = Vec2::new(40.0, 55.0 + 6.0 * attack);
     sim.ball.velocity = Vec2::new(0.0, 9.0 * attack);
     sim.ball.acceleration = Vec2::new(0.0, 7.0 * attack);
+    sim.ball.jerk = Vec2::new(0.0, 21.0 * attack);
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let block = soccer_field_player_motion_block(&snapshot, actor_id, actor_team);
@@ -9747,6 +9754,10 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
         block[mate_slot * per + 4] > 0.0,
         "a team-mate accelerating forward -> positive forward acceleration channel"
     );
+    assert!(
+        block[mate_slot * per + 6] > 0.0,
+        "a team-mate increasing acceleration forward -> positive forward jerk channel"
+    );
     let ball_slot = SOCCER_NEURAL_FIELD_MOTION_PLAYERS;
     assert!(
         block[ball_slot * per] > 0.0,
@@ -9759,6 +9770,10 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
     assert!(
         block[ball_slot * per + 4] > 0.0,
         "the ball slot should expose forward acceleration"
+    );
+    assert!(
+        block[ball_slot * per + 6] > 0.0,
+        "the ball slot should expose forward jerk"
     );
 
     // The block reaches the neural feature tail (capture -> encode -> net input).
@@ -11054,7 +11069,7 @@ fn formation_lp_is_enabled_for_live_gameplay_config() {
 
 #[test]
 fn formation_lp_cold_solve_is_optimal_via_sparse_ipm() {
-    // The formation LP (521 vars / 750 constraints) is solved by the sparse
+    // The formation LP is solved by the sparse
     // interior-point (Clarabel), which reaches optimality directly in a few ms.
     // It returns an optimal *point*, not a vertex, so there is no basis to chain:
     // re-solving each tick beats the IPM->simplex crossover/polish a basis would
@@ -11251,6 +11266,117 @@ fn formation_lp_guidance_feeds_realtime_pomdp_and_mdp_state() {
         refreshed
             .observation_for(player_id)
             .formation_lp_guidance_present
+    );
+}
+
+#[test]
+fn defensive_back_line_learning_weights_lp_shape_above_ball_chasing() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_918,
+        ..Default::default()
+    });
+    let base = WorldSnapshot::from_match(&sim);
+    let defender_id = base
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Defender)
+        .expect("home defender")
+        .id;
+    let home_holder = base
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.id != defender_id)
+        .expect("home holder")
+        .id;
+    let away_holder = base
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away)
+        .expect("away holder")
+        .id;
+    let before_pos = base
+        .player_position(defender_id)
+        .expect("defender position");
+    let target = before_pos + Vec2::new(0.0, -4.0);
+    let weights = SoccerTacticalLearningWeights::default();
+
+    let snapshot_with_guidance = |holder_id: usize| {
+        let mut snapshot = base.clone();
+        snapshot.ball.holder = Some(holder_id);
+        snapshot.ball.position = snapshot
+            .player_position(holder_id)
+            .expect("holder position");
+        snapshot.ball.last_touch_team = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == holder_id)
+            .map(|player| player.team);
+        snapshot.formation_lp_guidance.clear();
+        snapshot.formation_lp_guidance.push(SoccerFormationLpPlayerGuidance {
+            team: Team::Home,
+            player_id: defender_id,
+            slot: defender_id,
+            current: before_pos,
+            target,
+            formation_anchor: target,
+            pressure_target: None,
+            recommended_move: target - before_pos,
+            target_velocity: Vec2::zero(),
+            target_acceleration: Vec2::zero(),
+            local_mpc_guidance: false,
+            recommended_move_yards: before_pos.distance(target),
+            recommended_speed_yps: 0.0,
+            recommended_acceleration_yps2: 0.0,
+            formation_error_yards: before_pos.distance(target),
+            movement_error_yards: 0.0,
+            pair_error_yards: 0.0,
+            role_line_error_yards: 0.0,
+            pressure_error_yards: 0.0,
+            fore_aft_speed_error_yps: 0.0,
+            pressure_weight: 1.0,
+            speed_match_weight: 0.0,
+            alignment_weight: 1.0,
+            reduced_cost_target_x: 0.0,
+            reduced_cost_target_y: 0.0,
+            solver_status: "optimal".to_string(),
+            solver_objective: 0.0,
+            solver_iterations: Some(1),
+            solver_elapsed_ms: 0.0,
+            variable_count: 1,
+            constraint_count: 1,
+        });
+        snapshot
+    };
+
+    let defending = snapshot_with_guidance(away_holder);
+    let in_possession = snapshot_with_guidance(home_holder);
+    let defending_trace = formation_lp_learning_trace_for_snapshots(
+        defender_id,
+        &defending,
+        before_pos,
+        target,
+        &weights,
+    );
+    let in_possession_trace = formation_lp_learning_trace_for_snapshots(
+        defender_id,
+        &in_possession,
+        before_pos,
+        target,
+        &weights,
+    );
+
+    assert!(defending_trace.formation_lp_guidance);
+    assert!(in_possession_trace.formation_lp_guidance);
+    assert!(
+        (defending_trace.tactical_reward
+            - in_possession_trace.tactical_reward
+                * DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER)
+            .abs()
+            < 1e-9,
+        "defending trace should prioritise LP/IPM positioning: defending={} in_possession={}",
+        defending_trace.tactical_reward,
+        in_possession_trace.tactical_reward
     );
 }
 
@@ -11681,6 +11807,7 @@ fn formation_lp_sanitizes_non_finite_snapshot_inputs() {
     snapshot.ball.position = Vec2::new(f64::NAN, f64::INFINITY);
     snapshot.ball.velocity = Vec2::new(f64::INFINITY, f64::NAN);
     snapshot.ball.acceleration = Vec2::new(f64::NAN, f64::NEG_INFINITY);
+    snapshot.ball.jerk = Vec2::new(f64::NEG_INFINITY, f64::NAN);
     snapshot.ball_history = vec![BallPositionSample {
         tick: 0,
         clock_seconds: f64::NAN,
@@ -11698,6 +11825,7 @@ fn formation_lp_sanitizes_non_finite_snapshot_inputs() {
         player.position = Vec2::new(f64::NAN, f64::INFINITY);
         player.velocity = Vec2::new(f64::INFINITY, f64::NAN);
         player.acceleration = Vec2::new(f64::NAN, f64::NEG_INFINITY);
+        player.jerk = Vec2::new(f64::INFINITY, f64::NAN);
         player.home_position = Vec2::new(f64::NAN, f64::INFINITY);
         player.fatigue = f64::NAN;
     }
@@ -11705,6 +11833,7 @@ fn formation_lp_sanitizes_non_finite_snapshot_inputs() {
         player.position = Vec2::new(f64::INFINITY, f64::NAN);
         player.velocity = Vec2::new(f64::NAN, f64::INFINITY);
         player.acceleration = Vec2::new(f64::NEG_INFINITY, f64::NAN);
+        player.jerk = Vec2::new(f64::NAN, f64::NEG_INFINITY);
         player.home_position = Vec2::new(f64::INFINITY, f64::NAN);
         player.fatigue = f64::INFINITY;
     }
@@ -11759,6 +11888,12 @@ fn formation_lp_sanitizes_non_finite_snapshot_inputs() {
     }));
 
     let state_values = soccer_formation_lp_state_values(&snapshot, Team::Home, &weights);
+    assert_eq!(
+        state_values.len(),
+        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
+            + SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
+            + SOCCER_FORMATION_LP_CONTEXT_FEATURES
+    );
     assert!(state_values.iter().all(|value| value.is_finite()));
 
     let mut brain = SoccerFormationLpBrain::new(Team::Home);
@@ -15024,11 +15159,13 @@ fn learned_pass_plan_cannot_bypass_pomdp_visibility() {
         action: "pass".to_string(),
         target_player: Some(hidden_teammate),
         target_point: None,
+        mpc_replan: None,
     };
     let hidden_low_cross_plan = SoccerLearnedPlan {
         action: "play-down-flank-low-cross".to_string(),
         target_player: Some(hidden_teammate),
         target_point: None,
+        mpc_replan: None,
     };
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(passer);
@@ -22553,8 +22690,16 @@ fn moment_feature_vector_infers_motion_from_position_only_window() {
     let field_length = tracking.config.field_length_yards;
     assert!((vector[frame_base + 3] as f64 - 8.0 / field_length).abs() < 1e-6);
     assert!((vector[frame_base + 5] as f64 - 40.0 / field_length).abs() < 1e-6);
+    assert!(
+        (vector[frame_base + 7] as f64 - 1.0).abs() < 1e-6,
+        "ball jerk should be inferred and clamped into the canonical motion vector"
+    );
     assert!((vector[player_base + 3] as f64 - 3.0 / field_length).abs() < 1e-6);
     assert!((vector[player_base + 5] as f64 - 20.0 / field_length).abs() < 1e-6);
+    assert!(
+        (vector[player_base + 7] as f64 - 1.0).abs() < 1e-6,
+        "player jerk should be inferred and clamped into the canonical motion vector"
+    );
 }
 
 #[test]
@@ -25747,6 +25892,7 @@ fn learned_policy_can_take_open_lane_speculative_long_shot() {
         action: "shoot".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
 
     let (action, label) = sim.players[attacker]
@@ -26213,11 +26359,15 @@ fn policy_action_index_maps_families_and_rejects_out_of_vocab() {
         soccer_policy_action_index("shoot"),
         SOCCER_POLICY_ACTIONS.iter().position(|&a| a == "shoot")
     );
-    // Dribble variants collapse into the "dribble" family.
-    let dribble = SOCCER_POLICY_ACTIONS.iter().position(|&a| a == "dribble");
-    assert_eq!(soccer_policy_action_index("carry-forward"), dribble);
-    assert_eq!(soccer_policy_action_index("nutmeg"), dribble);
-    assert_eq!(soccer_policy_action_index("left-cut"), dribble);
+    // Technical dribble variants keep their own policy heads so the learner can
+    // distinguish carries, cuts, shielding, and nutmegs instead of flattening them.
+    for label in ["carry-forward", "nutmeg", "left-cut"] {
+        assert_eq!(
+            soccer_policy_action_index(label),
+            SOCCER_POLICY_ACTIONS.iter().position(|&a| a == label),
+            "{label} should stay in its own actor family"
+        );
+    }
     // "move" normalizes to "space".
     assert_eq!(
         soccer_policy_action_index("move"),
@@ -29876,6 +30026,80 @@ fn neural_learning_pads_legacy_snapshot_team_shape_inputs() {
             "new team-shape input weights should start neutral"
         );
     }
+}
+
+#[test]
+fn neural_learning_inserts_jerk_columns_when_resuming_field_motion_v1_snapshot() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15078,
+        ..Default::default()
+    };
+    let mut legacy_snapshot = SoccerMatch::default_11v11(config.clone())
+        .learning_snapshot()
+        .neural_network
+        .expect("initial neural snapshot");
+    let legacy_dim = SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1
+        + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+        + SOCCER_NEURAL_OPP_BELIEF_DIM
+        + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM;
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&legacy_dim));
+    let old_entity_start = SOCCER_NEURAL_BASE_FEATURE_DIM;
+    let old_belief_start = SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1;
+    let old_opp_start = old_belief_start + SOCCER_NEURAL_BELIEF_FEATURE_DIM;
+    let old_replan_start = old_opp_start + SOCCER_NEURAL_OPP_BELIEF_DIM;
+    legacy_snapshot.input_dim = legacy_dim;
+    legacy_snapshot.parameter_count = 0;
+    for row in &mut legacy_snapshot.layers[0].weights {
+        row.truncate(legacy_dim);
+    }
+    let row = &mut legacy_snapshot.layers[0].weights[0];
+    for value in row.iter_mut() {
+        *value = 0.0;
+    }
+    row[0] = 0.111;
+    row[old_entity_start + 4] = 0.222;
+    row[old_belief_start] = 0.333;
+    row[old_opp_start] = 0.444;
+    row[old_replan_start] = 0.555;
+
+    let resumed = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(legacy_snapshot)
+        .expect("resume field-motion-v1 neural snapshot");
+    let resumed_snapshot = resumed
+        .learning_snapshot()
+        .neural_network
+        .expect("resumed neural snapshot");
+    let migrated = &resumed_snapshot.layers[0].weights[0];
+
+    assert_eq!(resumed_snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(migrated.len(), SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(migrated[0], 0.111);
+    assert_eq!(migrated[SOCCER_NEURAL_BASE_FEATURE_DIM + 4], 0.222);
+    assert_eq!(migrated[SOCCER_NEURAL_BASE_FEATURE_DIM + 6], 0.0);
+    assert_eq!(migrated[SOCCER_NEURAL_BASE_FEATURE_DIM + 7], 0.0);
+    assert_eq!(
+        migrated[SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1],
+        0.0,
+        "old belief tail must not remain inside the expanded motion block"
+    );
+    assert_eq!(
+        migrated[SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],
+        0.333
+    );
+    assert_eq!(
+        migrated[SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE
+            + SOCCER_NEURAL_BELIEF_FEATURE_DIM],
+        0.444
+    );
+    assert_eq!(migrated[SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLANNED], 0.555);
 }
 
 #[test]
@@ -38538,6 +38762,7 @@ fn learned_support_target_points_are_shape_guarded() {
         action: "support-shape".to_string(),
         target_player: None,
         target_point: Some(bad_target),
+        mpc_replan: None,
     };
     let (action, label) = sim.players[runner]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -39810,19 +40035,28 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 #[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named decision/action feature indices live in the base block; the whole-field "moment
-    // of all 22 + ball" block appends after it, then the Kalman perception-belief block, then the
-    // Bayesian opponent-press belief block.
+    // of all 22 + ball" block appends after it, then the Kalman perception-belief block, the
+    // Bayesian opponent-press belief block, and the learned-MPC replan tail.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
+    assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER, 8);
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM
             + SOCCER_NEURAL_FIELD_MOTION_DIM
             + SOCCER_NEURAL_BELIEF_FEATURE_DIM
             + SOCCER_NEURAL_OPP_BELIEF_DIM
+            + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM
     );
-    // The previous total (base + motion, no belief) stays a recognised legacy input dim.
+    // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
-        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM)));
+        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1)));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
+        &(SOCCER_NEURAL_BASE_FEATURE_DIM
+            + SOCCER_NEURAL_FIELD_MOTION_DIM_V1
+            + SOCCER_NEURAL_BELIEF_FEATURE_DIM
+            + SOCCER_NEURAL_OPP_BELIEF_DIM
+            + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM)
+    ));
     assert_eq!(SOCCER_NEURAL_FEATURE_TEAMMATE_OVERLAP_PRESSURE, 153);
     assert_eq!(SOCCER_NEURAL_FEATURE_LOCAL_MPC_GUIDANCE, 159);
     assert_eq!(SOCCER_NEURAL_FEATURE_SWITCH_PLAY_ACTION, 160);
@@ -39857,16 +40091,23 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY, 189);
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT, 190);
     assert_eq!(SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY, 191);
-    assert_eq!(SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE, 330);
+    let belief_start = SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM;
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE,
+        belief_start
+    );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_BELIEF_TEAMMATE_POSITION_CONFIDENCE,
-        331
+        belief_start + 1
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_BELIEF_OPPONENT_POSITION_CONFIDENCE,
-        332
+        belief_start + 2
     );
-    assert_eq!(SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY, 333);
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY,
+        belief_start + 3
+    );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&258));
@@ -42206,6 +42447,7 @@ fn learned_route_one_uses_visible_runner_shaped_landing_zone() {
         action: "route-one".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -42709,6 +42951,7 @@ fn flank_cross_policies_offer_low_and_high_cross_actions() {
         action: "play-down-flank-low-cross".to_string(),
         target_player: Some(striker),
         target_point: None,
+        mpc_replan: None,
     };
     let (low_action, low_label) = sim.players[crosser]
         .action_from_learned_plan(&low_plan, &snapshot, &observation)
@@ -42726,6 +42969,7 @@ fn flank_cross_policies_offer_low_and_high_cross_actions() {
         action: "play-down-flank-high-cross".to_string(),
         target_player: Some(striker),
         target_point: None,
+        mpc_replan: None,
     };
     let (high_action, high_label) = sim.players[crosser]
         .action_from_learned_plan(&high_plan, &snapshot, &observation)
@@ -43654,6 +43898,7 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             action_options: single_action_option("pass"),
             action_target: Some(action_target),
             mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
             action: "pass".to_string(),
         };
         soccer_transition_reward(
@@ -43788,6 +44033,7 @@ fn learned_support_policy_can_choose_check_to_ball() {
         action: "check_to_ball".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[receiver]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -43845,6 +44091,7 @@ fn learned_check_to_ball_target_is_shape_guarded_from_teammate_space() {
         action: "check_to_ball".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[receiver]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -44338,6 +44585,7 @@ fn learned_support_policy_can_choose_wide_outlet() {
         action: "wide_outlet".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[winger]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -44408,6 +44656,7 @@ fn learned_support_policy_can_choose_in_behind_run() {
         action: "run_in_behind".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[runner]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -46715,6 +46964,7 @@ fn goalkeeper_learned_off_ball_plans_preserve_ball_goal_line() {
             action: action.to_string(),
             target_player: None,
             target_point: Some(off_line_target),
+            mpc_replan: None,
         };
         let (learned_action, _) = sim.players[keeper]
             .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -46741,6 +46991,7 @@ fn goalkeeper_learned_off_ball_plans_preserve_ball_goal_line() {
         action: "tackle".to_string(),
         target_player: Some(threat),
         target_point: None,
+        mpc_replan: None,
     };
     assert!(
         !tackle_snapshot.goalkeeper_direct_intervention_is_safe(keeper),
@@ -50010,6 +50261,9 @@ fn pressured_holder_releases_good_pass_after_carry_window_closes() {
     let retention_score = carry_forward_score
         .max(action_option_score(&options, "protect-ball"))
         .max(action_option_score(&options, "side-step"))
+        .max(action_option_score(&options, "left-cut"))
+        .max(action_option_score(&options, "right-cut"))
+        .max(action_option_score(&options, "nutmeg"))
         .max(action_option_score(&options, "fake-left-cut-right"))
         .max(action_option_score(&options, "fake-right-cut-left"));
     assert!(
@@ -50183,6 +50437,68 @@ fn non_elite_long_hold_shifts_choice_from_carry_to_release() {
             overheld_pass / overheld_carry > fresh_pass / fresh_carry * 1.35,
             "non-elite overheld possession should shift release-vs-carry ratio: fresh={fresh_pass}/{fresh_carry} overheld={overheld_pass}/{overheld_carry}"
         );
+}
+
+#[test]
+fn possession_action_options_offer_cut_and_nutmeg_choices() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 26_108,
+        ..Default::default()
+    });
+    let holder = 8;
+    let marker = 12;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 72.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 9.0;
+    sim.players[holder].skills.acceleration = 8.6;
+    sim.players[holder].skills.first_touch = 8.8;
+    sim.players[holder].skills.flair_passing = 9.1;
+    sim.players[holder].preferences.dribble_bias = 1.0;
+    sim.players[holder].preferences.pass_bias = 0.65;
+    sim.players[marker].position = Vec2::new(40.8, 73.0);
+    sim.players[marker].velocity = Vec2::new(0.0, -2.2);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut observation = snapshot.observation_for(holder);
+    observation.has_ball = true;
+    observation.nearest_opponent_distance = 1.3;
+    observation.perceived_pressure = 0.86;
+    observation.pressure_urgency = 0.88;
+    observation.immediate_dispossession_risk = 0.76;
+    observation.decision_urgency = 0.82;
+    observation.forward_dribble_space_yards = 5.5;
+    observation.expected_pass_completion = 0.24;
+    observation.best_pass_receiver_openness = 0.18;
+    observation.floor_pass_lane_score = 0.20;
+    observation.yards_to_goal = 48.0;
+    observation.yards_to_own_goal = 72.0;
+
+    let options = sim.players[holder].possession_action_options(
+        &observation,
+        &snapshot.tactical_directive(Team::Home),
+        1,
+        0,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    for label in ["left-cut", "right-cut", "nutmeg"] {
+        let option = options
+            .iter()
+            .find(|option| option.label == label)
+            .unwrap_or_else(|| panic!("missing {label} from possession options: {options:?}"));
+        assert!(option.legal, "{label} should be legal under close pressure: {option:?}");
+        assert!(
+            option.score > 0.0,
+            "{label} needs learnable score under close pressure: {option:?}"
+        );
+    }
 }
 
 #[test]
@@ -50835,6 +51151,7 @@ fn pressured_holder_can_protect_ball_with_body_shield() {
         action: "protect_ball".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -51273,6 +51590,9 @@ fn pressured_holder_without_good_outlet_prefers_escape_over_panic_pass() {
     );
     let escape_score = action_option_score(&options, "protect-ball")
         .max(action_option_score(&options, "side-step"))
+        .max(action_option_score(&options, "left-cut"))
+        .max(action_option_score(&options, "right-cut"))
+        .max(action_option_score(&options, "nutmeg"))
         .max(action_option_score(&options, "fake-left-cut-right"))
         .max(action_option_score(&options, "fake-right-cut-left"));
     let pass_score = action_option_score(&options, "pass1");
@@ -51564,10 +51884,15 @@ fn opponent_belief_block_reaches_the_neural_feature_tail() {
             "opponent-press belief channel {i} must appear in the neural feature tail"
         );
     }
-    // Both earlier totals (base+motion and base+motion+perception) must remain recognised legacy
-    // input dims so older nets migrate by zero-padding the appended slots.
+    // Both earlier six-channel motion totals (base+motion and base+motion+perception)
+    // must remain recognised legacy input dims so older nets migrate by zero-padding.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
-        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM)));
+        .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1)));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
+        &(SOCCER_NEURAL_BASE_FEATURE_DIM
+            + SOCCER_NEURAL_FIELD_MOTION_DIM_V1
+            + SOCCER_NEURAL_BELIEF_FEATURE_DIM)
+    ));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&start));
 }
 
@@ -52211,6 +52536,7 @@ fn wide_striker_in_approach_band_drives_at_goal_not_endline() {
         action: "carry-out-right".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(78.0, 118.0)),
+        mpc_replan: None,
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -52374,6 +52700,7 @@ fn pressured_wide_striker_still_drives_goalward_in_approach_band() {
         action: "protect-ball".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(78.0, 118.0)),
+        mpc_replan: None,
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -52464,6 +52791,7 @@ fn wide_midfielder_in_approach_band_drives_at_goal_not_endline() {
         action: "carry-out-right".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(78.0, 118.0)),
+        mpc_replan: None,
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -52595,6 +52923,7 @@ fn learned_endline_dribble_near_goal_is_rewritten_to_goalmouth_drive() {
             action: action.to_string(),
             target_player: None,
             target_point: Some(stale_endline_target),
+            mpc_replan: None,
         };
         let (learned_action, label) = sim.players[holder]
             .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -53283,6 +53612,7 @@ fn learned_stale_non_elite_dribble_releases_to_open_outlet() {
         action: "carry-forward".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(38.0, 48.0)),
+        mpc_replan: None,
     };
 
     let (action, label) = sim.players[holder]
@@ -53747,6 +54077,7 @@ fn learned_stale_defender_dribble_is_overridden_to_clearance() {
         action: "carry_forward".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(39.0, 28.0)),
+        mpc_replan: None,
     };
     let (action, label) = sim.players[defender]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -61426,6 +61757,7 @@ fn blocked_close_attacker_does_not_fire_must_shoot_intent() {
         action: "shoot".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     assert!(sim.players[attacker]
         .action_from_learned_plan(&plan, &snapshot, &observation)
@@ -62477,6 +62809,7 @@ fn near_box_carry_bends_toward_goal_instead_of_endline() {
         action: "carry-forward".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let intent = player.run_time_step(&snapshot, None, Some(&plan), &mut mulberry32(22_280));
     let SoccerAction::DribbleMove { target, .. } = intent.action else {
@@ -62549,6 +62882,7 @@ fn wide_attacker_switches_from_goalmouth_drive_to_shot() {
         action: "carry-forward".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let intent = player.run_time_step(
         &blocked_snapshot,
@@ -62726,6 +63060,7 @@ fn first_touch_near_goal_controls_toward_goal_not_endline() {
         action: "control-touch".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let player = sim.players[attacker].clone();
     let (action, label) = player
@@ -62805,6 +63140,7 @@ fn pressured_first_touch_cushions_away_from_marker() {
         action: "control-touch".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let player = sim.players[receiver].clone();
     let (action, label) = player
@@ -62871,6 +63207,7 @@ fn clear_goal_approach_striker_shoots_instead_of_extra_dribble() {
         action: "carry-forward".to_string(),
         target_player: None,
         target_point: Some(Vec2::new(72.0, 118.0)),
+        mpc_replan: None,
     };
     for seed in 0..80 {
         let mut player = sim.players[attacker].clone();
@@ -64415,6 +64752,7 @@ fn learned_generic_pass_upgrades_to_killer_pass_near_goal() {
         action: "pass".to_string(),
         target_player: None,
         target_point: None,
+        mpc_replan: None,
     };
     let mut player = sim.players[attacker].clone();
     let intent = player.run_time_step_with_context(

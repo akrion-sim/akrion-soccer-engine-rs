@@ -9,6 +9,10 @@ use crate::des::general::mpc_point_mass::PlanarMpcConfig;
 use crate::des::general::soccer_genome::SoccerTeamGenome;
 
 const SOCCER_RETRIEVAL_ACTION_PRIOR_SCALE: f64 = 2.0;
+const LEARNED_MPC_REPLAN_CANDIDATES: usize = 8;
+const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
+const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
+const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
 const TEAMMATE_LANE_GUARD_SAME_ROLE_RADIUS_YARDS: f64 = 3.35;
@@ -644,6 +648,54 @@ mod tests {
             sim.players.iter().any(|player| player.role == PlayerRole::Forward),
             "uniform learning still keeps positional roles"
         );
+    }
+
+    #[test]
+    fn learned_mpc_replan_flags_impossible_technical_actions_only() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let impossible_pass = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let hold = SoccerLearnedPlan {
+            action: "hold".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+
+        assert!(SoccerMatch::learned_plan_needs_mpc_replan(
+            &snapshot,
+            5,
+            &impossible_pass
+        ));
+        assert!(!SoccerMatch::learned_plan_needs_mpc_replan(
+            &snapshot, 5, &hold
+        ));
+    }
+
+    #[test]
+    fn policy_head_keeps_technical_dribble_families_distinct() {
+        let dribble = soccer_policy_action_index("dribble").expect("dribble policy family");
+        for label in [
+            "carry-forward",
+            "carry-out-left",
+            "carry-out-right",
+            "protect-ball",
+            "side-step",
+            "left-cut",
+            "right-cut",
+            "nutmeg",
+            "fake-left-cut-right",
+            "fake-right-cut-left",
+        ] {
+            let index = soccer_policy_action_index(label).expect("technical dribble family");
+            assert_ne!(index, dribble, "{label} collapsed back into dribble");
+            assert_eq!(SOCCER_POLICY_ACTIONS[index], label);
+        }
     }
 
     #[test]
@@ -2540,7 +2592,7 @@ impl SoccerMatch {
                     )
                 })
             {
-                return Some(Self::learned_plan_for_policy(
+                return Some(Self::mpc_reconciled_learned_plan_for_policy(
                     policy, snapshot, player_id, action,
                 ));
             }
@@ -2568,7 +2620,12 @@ impl SoccerMatch {
                 )
             })
             .map(|action| {
-                Self::learned_plan_for_policy(learned_policy, snapshot, player_id, action)
+                Self::mpc_reconciled_learned_plan_for_policy(
+                    learned_policy,
+                    snapshot,
+                    player_id,
+                    action,
+                )
             })
     }
 
@@ -2962,6 +3019,7 @@ impl SoccerMatch {
             action,
             target_player: None,
             target_point: None,
+            mpc_replan: None,
         };
         if is_pass {
             let candidates = if matches!(
@@ -2991,6 +3049,219 @@ impl SoccerMatch {
                 .and_then(|target| snapshot.player_position(target));
         }
         plan
+    }
+
+    fn mpc_reconciled_learned_plan_for_policy(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: String,
+    ) -> SoccerLearnedPlan {
+        let plan = Self::learned_plan_for_policy(policy, snapshot, player_id, action);
+        if !Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan) {
+            return plan;
+        }
+        let original_action = normalize_soccer_action_label(&plan.action).to_string();
+        let rejected_execution_probability =
+            Self::learned_plan_mpc_execution_probability(snapshot, player_id, &plan)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+        let Some((_, ranked)) = policy.ranked_action_values_for_snapshot(
+            snapshot,
+            player_id,
+            LEARNED_MPC_REPLAN_CANDIDATES,
+        ) else {
+            return plan;
+        };
+        let mut candidate_count = 0usize;
+        for candidate in ranked.iter().filter(|candidate| candidate.legal) {
+            if normalize_soccer_action_label(&candidate.label) == original_action {
+                continue;
+            }
+            candidate_count += 1;
+            let mut candidate_plan =
+                Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
+            if !Self::learned_plan_needs_mpc_replan(snapshot, player_id, &candidate_plan) {
+                candidate_plan.mpc_replan = Some(SoccerLearnedMpcReplanTrace {
+                    original_action: original_action.clone(),
+                    replacement_action: normalize_soccer_action_label(&candidate_plan.action)
+                        .to_string(),
+                    rejected_execution_probability,
+                    candidate_count,
+                });
+                return candidate_plan;
+            }
+        }
+        plan
+    }
+
+    fn learned_plan_needs_mpc_replan(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) -> bool {
+        let label = normalize_soccer_action_label(&plan.action);
+        let threshold = if pass_like_action_flight(label).is_some() {
+            Some(LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY)
+        } else if is_dribble_action_label(label) {
+            Some(LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY)
+        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            Some(LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY)
+        } else {
+            None
+        };
+        let Some(threshold) = threshold else {
+            return false;
+        };
+        Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
+            .is_some_and(|probability| probability < threshold)
+    }
+
+    fn learned_plan_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) -> Option<f64> {
+        let label = normalize_soccer_action_label(&plan.action);
+        if let Some(flight) = pass_like_action_flight(label) {
+            return Some(Self::learned_pass_mpc_execution_probability(
+                snapshot, player_id, plan, flight,
+            ));
+        }
+        if let Some(kind) = dribble_move_kind_for_action_label(label) {
+            return Some(Self::learned_dribble_mpc_execution_probability(
+                snapshot, player_id, kind,
+            ));
+        }
+        if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            return Some(Self::learned_shot_mpc_execution_probability(
+                snapshot, player_id, label,
+            ));
+        }
+        None
+    }
+
+    fn learned_pass_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        flight: PassFlight,
+    ) -> f64 {
+        let Some(passer) = snapshot.players.iter().find(|player| player.id == player_id) else {
+            return 0.0;
+        };
+        let Some(target_id) = plan.target_player else {
+            return 0.0;
+        };
+        let Some(target) = snapshot.players.iter().find(|player| player.id == target_id) else {
+            return 0.0;
+        };
+        if target.team != passer.team {
+            return 0.0;
+        }
+        let passer_position = snapshot
+            .player_position(player_id)
+            .unwrap_or(passer.position);
+        let target_position = plan
+            .target_point
+            .or_else(|| snapshot.player_position(target_id))
+            .unwrap_or(target.position);
+        pass_target_quality_for_snapshot(
+            snapshot,
+            passer,
+            passer_position,
+            target,
+            target_position,
+            flight,
+        )
+        .mpc_receipt_probability
+        .clamp(0.0, 1.0)
+    }
+
+    fn learned_dribble_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        kind: DribbleMoveKind,
+    ) -> f64 {
+        let Some(player) = snapshot.players.iter().find(|player| player.id == player_id) else {
+            return 0.0;
+        };
+        let position = snapshot.player_position(player_id).unwrap_or(player.position);
+        let velocity = snapshot.player_velocity(player_id).unwrap_or(player.velocity);
+        let touch = snapshot.deterministic_dribble_touch_decision_for(player_id, kind);
+        let target =
+            snapshot.dribble_move_target_for_touch(player_id, player.home_position, kind, touch);
+        dribble_mpc_control_estimate_for_snapshot(
+            snapshot,
+            player.id,
+            player.team,
+            player.role,
+            &player.skills,
+            player.fatigue,
+            position,
+            velocity,
+            target,
+            touch.distance_yards,
+        )
+        .control_probability
+        .clamp(0.0, 1.0)
+    }
+
+    fn learned_shot_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        label: &str,
+    ) -> f64 {
+        let Some(player) = snapshot.players.iter().find(|player| player.id == player_id) else {
+            return 0.0;
+        };
+        let position = snapshot.player_position(player_id).unwrap_or(player.position);
+        let velocity = snapshot.player_velocity(player_id).unwrap_or(player.velocity);
+        let first_time = matches!(label, "first-time-shot" | "first-time-header");
+        let finish_skill = if label == "first-time-header" {
+            aerial_duel_skill_from_snapshot(player)
+        } else {
+            (ability01(
+                player
+                    .skills
+                    .right_foot_shot_power
+                    .max(player.skills.left_foot_shot_power),
+            ) * 0.62
+                + ability01(player.skills.shooting) * 0.26
+                + ability01(player.skills.first_touch) * 0.12)
+                .clamp(0.0, 1.0)
+        };
+        let power = if first_time {
+            shot_power_for_finish_skill(finish_skill)
+        } else {
+            shot_power_for_skill(ability01(player.skills.shooting))
+        };
+        let shot_speed = shot_speed_yps_from_power(power, &player.skills);
+        let nearest_opponent_distance = snapshot
+            .players
+            .iter()
+            .filter(|opponent| opponent.team == player.team.other())
+            .map(|opponent| {
+                snapshot
+                    .player_position(opponent.id)
+                    .unwrap_or(opponent.position)
+                    .distance(position)
+            })
+            .fold(f64::INFINITY, f64::min);
+        shot_mpc_accuracy_estimate_for_snapshot(
+            snapshot,
+            player.id,
+            player.team,
+            &player.skills,
+            player.fatigue,
+            position,
+            velocity,
+            shot_speed,
+            first_time,
+            pressure_from_nearest_distance(nearest_opponent_distance),
+        )
+        .accuracy_probability
+        .clamp(0.0, 1.0)
     }
 
     fn ensure_neural_learner(&mut self) {
@@ -6496,11 +6767,10 @@ impl SoccerMatch {
             belief: decision.belief.clone(),
             action: decision.action.clone(),
             action_target: decision.action_target.clone(),
-            decision_context: soccer_decision_context_for(
+            decision_context: soccer_decision_context_with_trace(
                 player.id,
                 player.team,
-                &decision.action,
-                decision.action_target.as_ref(),
+                decision,
                 &snapshot,
                 &snapshot,
             ),
@@ -13704,11 +13974,10 @@ impl SoccerMatch {
                 belief: decision.belief.clone(),
                 action: decision.action.clone(),
                 action_target: decision.action_target.clone(),
-                decision_context: soccer_decision_context_for(
+                decision_context: soccer_decision_context_with_trace(
                     player.id,
                     player.team,
-                    &decision.action,
-                    decision.action_target.as_ref(),
+                    decision,
                     before,
                     after,
                 ),
