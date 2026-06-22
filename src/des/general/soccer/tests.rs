@@ -788,6 +788,18 @@ fn learnable_pass_velocity_drives_a_contested_lane_harder_than_an_open_one() {
             && tight_plan.min_clearing_speed_yps.is_finite(),
         "min clearing speed should be a finite threading pace: {tight_plan:?}"
     );
+    // The execution layer fires only when the plan elects to DRIVE (power above the 0.68
+    // nominal). An open lane keeps the weighted bucket (so execution leaves the ball
+    // untouched); a contested lane elects a driven bucket (so execution firms it). These two
+    // facts are exactly what the `plan.power > 0.68` execution gate keys on.
+    assert!(
+        open_plan.power <= 0.68,
+        "an open lane must not elect a driven bucket (execution would wrongly firm it): {open_plan:?}"
+    );
+    assert!(
+        tight_plan.power > 0.68,
+        "a contested-but-threadable lane should elect a driven bucket so execution firms it: {tight_plan:?}"
+    );
 }
 
 #[test]

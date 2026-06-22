@@ -9021,13 +9021,17 @@ impl SoccerMatch {
                         }
                         None => modulated_speed,
                     };
-                    // Learnable pass velocity (execution side): when the lane to the chosen
-                    // aim is genuinely contested, firm the struck ball UP to the threading
-                    // pace the decision priced (`min_clearing_speed`) so the executed pass
-                    // matches the bet the policy made — a driven ball beats the defender to
-                    // the corridor instead of being a weighted gift. Never SLOWS an open ball
-                    // (only raises a contested one), and is gated to ground passes (aerials
-                    // keep their gravity-fixed calibration). Disabled ⇒ unchanged.
+                    // Learnable pass velocity (execution side): honor the speed the decision
+                    // priced. The value trade-off (receipt-aware) elects a power bucket; when
+                    // it chose to DRIVE the ball (above the 0.68 nominal) the lane was
+                    // contested and a firmer pass beats the defender to the corridor, so firm
+                    // the struck ball UP to that chosen pace. When it kept a weighted ball (an
+                    // open lane) the executed speed is left untouched — an uncontested pass is
+                    // never firmed or slowed. Firming to the CHOSEN speed (not the raw
+                    // `min_clearing` floor) keeps a contested ball receivable: the chosen speed
+                    // already balances threading the lane against the receiver controlling it,
+                    // so it can't over-drive into an uncontrollable rocket. Ground only;
+                    // aerials keep their gravity-fixed calibration. Disabled ⇒ unchanged.
                     let speed = if !flight.is_aerial()
                         && !dd_soccer_disable_learnable_pass_velocity()
                     {
@@ -9050,8 +9054,8 @@ impl SoccerMatch {
                                 is_cross,
                                 receiver,
                             );
-                            if plan.lane_interception_risk >= PASS_LANE_DYNAMIC_RISK_MODERATE {
-                                speed.max(plan.min_clearing_speed_yps).min(mph_to_yps(44.0))
+                            if plan.power > 0.68 {
+                                speed.max(plan.speed_yps).min(mph_to_yps(42.0))
                             } else {
                                 speed
                             }
@@ -21179,32 +21183,35 @@ impl WorldSnapshot {
                         // than the fixed 0.68-power nominal. A lane a driven ball can split is
                         // then kept visible and PRICED (the `anticipation_penalty` /
                         // dynamic-risk score penalty), not hidden — only a defender's body
-                        // literally in the corridor still removes the option. The receiver is
-                        // irrelevant to the threading pace, so it's omitted to skip the MPC
-                        // receipt cost. Disabled ⇒ nominal speed, unchanged.
-                        let cutout_speed = if dd_soccer_disable_learnable_pass_velocity() {
-                            nominal_speed
-                        } else {
-                            pass_velocity_plan_for_snapshot(
-                                self,
-                                me,
-                                me_position,
-                                *aim_point,
-                                PassFlight::Floor,
-                                initial_is_cross,
-                                None,
-                            )
-                            .min_clearing_speed_yps
-                            .max(nominal_speed)
-                        };
-                        let committed_cutout = require_reception_won
-                            && self.pass_lane_committed_cutout(
+                        // literally in the corridor still removes the option. Only evaluated
+                        // when this candidate set hides on cut-out (`require_reception_won`);
+                        // the threaded/killer set already prices it, so the sweep is skipped
+                        // there. The receiver is irrelevant to the threading pace, so it's
+                        // omitted to skip the MPC receipt cost. Disabled ⇒ nominal, unchanged.
+                        let committed_cutout = require_reception_won && {
+                            let cutout_speed = if dd_soccer_disable_learnable_pass_velocity() {
+                                nominal_speed
+                            } else {
+                                pass_velocity_plan_for_snapshot(
+                                    self,
+                                    me,
+                                    me_position,
+                                    *aim_point,
+                                    PassFlight::Floor,
+                                    initial_is_cross,
+                                    None,
+                                )
+                                .min_clearing_speed_yps
+                                .max(nominal_speed)
+                            };
+                            self.pass_lane_committed_cutout(
                                 me_position,
                                 *aim_point,
                                 me.team.other(),
                                 2.5,
                                 cutout_speed,
-                            );
+                            )
+                        };
                         // `race_won` already includes the qualified half-open forward exception:
                         // skilled passers keep those options visible. Direct-opponent endpoints
                         // are priced in the score/learned features below instead of hard-hidden.

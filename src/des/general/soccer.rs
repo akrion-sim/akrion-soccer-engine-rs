@@ -134,9 +134,6 @@ const PASS_FAST_BYPASS_REACTION_WINDOW_SECONDS: f64 = 0.16;
 // actually controls the moving ball.
 const PASS_LANE_DECISION_LOOKAHEAD_SECONDS: f64 = 2.0;
 const PASS_LANE_DYNAMIC_RISK_HIGH: f64 = 0.62;
-// A contested-but-not-blocked lane: at/above this the execution layer firms the struck ball
-// up to the threading pace the decision chose (the learnable-velocity "drive it through").
-const PASS_LANE_DYNAMIC_RISK_MODERATE: f64 = 0.35;
 const PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH: f64 = 0.74;
 const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
 // Misplaced-pass guard: the linear risk penalty above is not enough on its own — a juicy
@@ -45223,6 +45220,10 @@ fn dd_soccer_disable_learnable_pass_velocity() -> bool {
 /// head then learns to weight per situation — the engine never *forbids* a ball through an
 /// occupied lane, it prices the speed needed to thread it.
 const PASS_VELOCITY_POWER_BUCKETS: [f64; 4] = [0.50, 0.68, 0.84, 1.0];
+/// Below this lane-interception risk a pass is treated as uncontested: the weighted-ball
+/// fast path is taken and no speed sweep runs. Small enough that any genuinely threatened
+/// lane still sweeps and can be driven.
+const PASS_VELOCITY_OPEN_LANE_RISK_EPSILON: f64 = 0.02;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PassVelocityPlan {
@@ -45292,6 +45293,33 @@ fn pass_velocity_plan_for_snapshot(
             lane_interception_risk: risk,
             min_clearing_speed_yps: nominal,
             mpc_receipt_probability: receipt_at(nominal),
+        };
+    }
+    // Fast path for the common wide-open pass: if even the SLOWEST (most interceptable)
+    // bucket faces a negligible lane, no faster bucket can do better (a quicker ball is only
+    // ever safer in the lane but harder to receive), so the value trade-off would pick the
+    // weighted ball anyway. Return it without sweeping — this keeps an uncontested ball
+    // identical to the full-sweep result while skipping 3 buckets × every opponent (the bulk
+    // of passes are to open targets, and this runs per candidate during ranking).
+    let slowest_speed =
+        pass_speed_yps_from_power(PASS_VELOCITY_POWER_BUCKETS[0], flight, is_cross, &passer.skills);
+    let slowest_risk = snapshot
+        .pass_lane_interception_risk(
+            passer_position,
+            aim_point,
+            passer.team.other(),
+            2.5,
+            slowest_speed,
+            PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+        )
+        .risk;
+    if slowest_risk < PASS_VELOCITY_OPEN_LANE_RISK_EPSILON {
+        return PassVelocityPlan {
+            speed_yps: slowest_speed,
+            power: PASS_VELOCITY_POWER_BUCKETS[0],
+            lane_interception_risk: slowest_risk,
+            min_clearing_speed_yps: slowest_speed,
+            mpc_receipt_probability: receipt_at(slowest_speed),
         };
     }
     let hardest_speed = pass_speed_yps_from_power(
