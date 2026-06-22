@@ -3734,9 +3734,14 @@ mod tests {
         assert_continuous_manifest_contains(
             "/usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_learning_run",
         );
+        assert_continuous_manifest_contains(
+            "ready_file=\"/tmp/${run_prefix}-ready-${HOSTNAME:-pod}\"",
+        );
         assert_continuous_manifest_contains("touch \"${ready_file}\"");
         assert_continuous_manifest_contains("readinessProbe:");
-        assert_continuous_manifest_contains("test -f /tmp/codex-soccer-learning-overnight-ready");
+        assert_continuous_manifest_contains(
+            "test -f \"/tmp/codex-soccer-learning-overnight-ready-${HOSTNAME:-pod}\"",
+        );
         assert_continuous_manifest_contains("progressDeadlineSeconds: 1200");
         assert_continuous_manifest_contains("revisionHistoryLimit: 2");
     }

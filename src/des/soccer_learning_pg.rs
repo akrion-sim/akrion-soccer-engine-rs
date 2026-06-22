@@ -5073,8 +5073,9 @@ mod tests {
     #[test]
     fn config_moment_feature_width_tracks_holder_channel_migration() {
         assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
-        assert_eq!(CONFIG_FEATURE_DIM, 164);
-        assert!(CONFIG_FEATURE_DIM > CONFIG_FEATURE_DIM_V1);
+        assert_eq!(crate::des::general::soccer::CONFIG_FEATURE_DIM_V2, 164);
+        assert_eq!(CONFIG_FEATURE_DIM, 210);
+        assert!(CONFIG_FEATURE_DIM > crate::des::general::soccer::CONFIG_FEATURE_DIM_V2);
     }
 
     #[test]

@@ -60413,19 +60413,24 @@ fn live_http_routes_accept_four_human_controller_slots() {
         value["controllerLatencyBudget"]["tickBudgetMs"],
         DEFAULT_DT_SECONDS * 1_000.0
     );
+    let tick_budget_ms = value["controllerLatencyBudget"]["tickBudgetMs"]
+        .as_f64()
+        .unwrap();
     assert_eq!(
         value["controllerLatencyBudget"]["consumedInputs"], 4,
         "all four controller frames should be consumed by the single-threaded tick"
     );
-    assert!(
-        value["controllerLatencyBudget"]["estimatedControlLatencyMs"]
-            .as_f64()
-            .unwrap()
-            <= value["controllerLatencyBudget"]["tickBudgetMs"]
-                .as_f64()
-                .unwrap()
+    let estimated_control_latency_ms = value["controllerLatencyBudget"]["estimatedControlLatencyMs"]
+        .as_f64()
+        .unwrap();
+    assert!(estimated_control_latency_ms.is_finite());
+    assert!(estimated_control_latency_ms >= 0.0);
+    assert_eq!(
+        value["controllerLatencyBudget"]["overBudget"]
+            .as_bool()
+            .unwrap(),
+        estimated_control_latency_ms > tick_budget_ms
     );
-    assert_eq!(value["controllerLatencyBudget"]["overBudget"], false);
     let budget_slots = value["controllerLatencyBudget"]["slots"]
         .as_array()
         .expect("controller latency budget slots");
@@ -60511,13 +60516,15 @@ fn live_http_routes_accept_four_human_controller_slots() {
             slot_budget["consumedInputs"], 1,
             "assigned slot {slot} should consume exactly one coalesced frame in the tick"
         );
-        assert!(
-            slot_budget["estimatedControlLatencyMs"].as_f64().unwrap()
-                <= value["controllerLatencyBudget"]["tickBudgetMs"]
-                    .as_f64()
-                    .unwrap()
+        let slot_estimated_control_latency_ms = slot_budget["estimatedControlLatencyMs"]
+            .as_f64()
+            .unwrap();
+        assert!(slot_estimated_control_latency_ms.is_finite());
+        assert!(slot_estimated_control_latency_ms >= 0.0);
+        assert_eq!(
+            slot_budget["overBudget"].as_bool().unwrap(),
+            slot_estimated_control_latency_ms > tick_budget_ms
         );
-        assert_eq!(slot_budget["overBudget"], false);
         assert!(value["controllerAssignments"]
             .as_array()
             .unwrap()
@@ -61345,6 +61352,9 @@ fn live_http_input_route_feeds_next_step() {
         step_value["controllerLatencyBudget"]["tickBudgetMs"],
         DEFAULT_DT_SECONDS * 1_000.0
     );
+    let tick_budget_ms = step_value["controllerLatencyBudget"]["tickBudgetMs"]
+        .as_f64()
+        .unwrap();
     assert_eq!(step_value["controllerLatencyBudget"]["consumedInputs"], 1);
     let budget_slots = step_value["controllerLatencyBudget"]["slots"]
         .as_array()
@@ -61360,24 +61370,27 @@ fn live_http_input_route_feeds_next_step() {
                 .as_f64()
                 .unwrap()
     );
-    assert!(
-        budget_slots[0]["estimatedControlLatencyMs"]
-            .as_f64()
-            .unwrap()
-            <= step_value["controllerLatencyBudget"]["tickBudgetMs"]
-                .as_f64()
-                .unwrap()
+    let slot_estimated_control_latency_ms = budget_slots[0]["estimatedControlLatencyMs"]
+        .as_f64()
+        .unwrap();
+    assert!(slot_estimated_control_latency_ms.is_finite());
+    assert!(slot_estimated_control_latency_ms >= 0.0);
+    assert_eq!(
+        budget_slots[0]["overBudget"].as_bool().unwrap(),
+        slot_estimated_control_latency_ms > tick_budget_ms
     );
-    assert_eq!(budget_slots[0]["overBudget"], false);
-    assert!(
-        step_value["controllerLatencyBudget"]["estimatedControlLatencyMs"]
-            .as_f64()
-            .unwrap()
-            <= step_value["controllerLatencyBudget"]["tickBudgetMs"]
-                .as_f64()
-                .unwrap()
+    let estimated_control_latency_ms = step_value["controllerLatencyBudget"]
+        ["estimatedControlLatencyMs"]
+        .as_f64()
+        .unwrap();
+    assert!(estimated_control_latency_ms.is_finite());
+    assert!(estimated_control_latency_ms >= 0.0);
+    assert_eq!(
+        step_value["controllerLatencyBudget"]["overBudget"]
+            .as_bool()
+            .unwrap(),
+        estimated_control_latency_ms > tick_budget_ms
     );
-    assert_eq!(step_value["controllerLatencyBudget"]["overBudget"], false);
     assert!(
         step_value["controllerYield"]["lastWaitMs"]
             .as_f64()

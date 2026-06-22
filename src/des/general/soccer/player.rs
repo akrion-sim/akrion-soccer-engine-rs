@@ -7,6 +7,7 @@ use super::*;
 const DEFENDER_DRIBBLE_CLOSING_PASS_LIFT: f64 = 0.48;
 const STEAL_RISK_GOOD_OUTLET_PASS_LIFT: f64 = 1.05;
 const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
+const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 10.40;
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -2169,8 +2170,11 @@ impl PlayerAgent {
             + steal_pressure * good_escape_outlet_fit * STEAL_RISK_GOOD_OUTLET_PASS_LIFT)
             .clamp(1.0, 1.90);
         let panic_pass_damp = (1.0
-            / (1.0 + steal_pressure * bad_escape_outlet_fit.powi(2) * 6.20))
-            .clamp(0.22, 1.0);
+            / (1.0
+                + steal_pressure
+                    * bad_escape_outlet_fit.powi(2)
+                    * STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH))
+            .clamp(0.14, 1.0);
         let closing_good_outlet_pass_lift =
             (1.0 + pressure_rising * open_outlet_fit * 0.44).clamp(1.0, 1.38);
         let defender_closing_pass_lift = if self.role == PlayerRole::Defender {
