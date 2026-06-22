@@ -838,6 +838,171 @@ fn holder_cannot_strike_ball_during_first_touch_settle() {
 }
 
 #[test]
+fn pass_release_pulls_opponent_aimed_floor_ball_back_to_receiver() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_243,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let opponent = 13;
+    park_players_except(&mut sim, &[passer, receiver, opponent]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].skills.passing_completion_rate = 10.0;
+    sim.players[passer].skills.passing = 10.0;
+    sim.players[passer].skills.vision = 10.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 74.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::new(0.0, 7.0);
+    sim.players[opponent].team = Team::Away;
+    sim.players[opponent].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 0.25);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let power = 0.72;
+    for _ in 0..4 {
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let speed =
+            pass_speed_yps_from_power(power, PassFlight::Floor, false, &sim.players[passer].skills);
+        let led_target = snapshot
+            .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, speed)
+            .expect("test should produce a led target");
+        sim.players[opponent].position = led_target;
+    }
+    let led_before_release = WorldSnapshot::from_match(&sim)
+        .anticipated_pass_reception_point(
+            passer,
+            receiver,
+            PassFlight::Floor,
+            pass_speed_yps_from_power(power, PassFlight::Floor, false, &sim.players[passer].skills),
+        )
+        .expect("test should produce a final led target");
+    assert!(
+        led_before_release.distance(sim.players[opponent].position)
+            <= PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS + 1e-6,
+        "test setup should put the release lead on top of an opponent"
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            power,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+
+    let pass = sim.pending_pass.as_ref().expect("pass should launch");
+    let receiver_distance = pass
+        .intended_target
+        .distance(sim.players[receiver].position);
+    let opponent_distance = pass
+        .intended_target
+        .distance(sim.players[opponent].position);
+    assert!(
+        receiver_distance <= PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS + 1e-6,
+        "unsafe led pass should be pulled back to the receiver's feet, got target {:?}",
+        pass.intended_target
+    );
+    assert!(
+        opponent_distance > receiver_distance + PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS,
+        "released floor pass must not aim closer to an opponent than the teammate: target={:?} receiver_distance={receiver_distance} opponent_distance={opponent_distance}",
+        pass.intended_target
+    );
+}
+
+#[test]
+fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_244,
+        ..Default::default()
+    });
+    let passer = 7;
+    let safer_receiver = 6;
+    let receiver = 9;
+    let opponent = 13;
+    park_players_except(&mut sim, &[passer, safer_receiver, receiver, opponent]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].skills.passing_completion_rate = 10.0;
+    sim.players[passer].skills.passing = 10.0;
+    sim.players[passer].skills.vision = 10.0;
+    sim.players[safer_receiver].team = Team::Home;
+    sim.players[safer_receiver].role = PlayerRole::Forward;
+    sim.players[safer_receiver].position = Vec2::new(53.0, 76.0);
+    sim.players[safer_receiver].home_position = sim.players[safer_receiver].position;
+    sim.players[safer_receiver].velocity = Vec2::new(0.0, 6.5);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 74.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::new(0.0, 7.0);
+    sim.players[opponent].team = Team::Away;
+    sim.players[opponent].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 0.25);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+    let led_target = snapshot
+        .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, speed)
+        .expect("test should produce a led target");
+    sim.players[opponent].position = led_target + Vec2::new(3.6, 0.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_point_directly_favors_opponent(
+            Team::Home,
+            sim.players[receiver].position,
+            led_target,
+        ),
+        "test setup should make the led control point favor the opponent"
+    );
+    assert!(
+        snapshot.clear_line(sim.players[passer].position, led_target, Team::Away, 2.5),
+        "test setup should leave the lane nominally clear so only direct-opponent risk prices it"
+    );
+    let direct_risk = snapshot.pass_point_direct_opponent_control_risk(
+        Team::Home,
+        sim.players[receiver].position,
+        sim.players[passer].position,
+        led_target,
+        speed,
+    );
+    assert!(
+        direct_risk > 0.15,
+        "test setup should create a learnable direct-opponent control risk, got {direct_risk}"
+    );
+
+    let ranked = snapshot.ranked_visible_pass_targets(passer, 11);
+    let safer_rank = ranked
+        .iter()
+        .position(|&id| id == safer_receiver)
+        .expect("safer receiver should remain available");
+    let risky_rank = ranked
+        .iter()
+        .position(|&id| id == receiver)
+        .expect("risky pass should remain learnable instead of being hard-vetoed");
+    assert!(
+        safer_rank < risky_rank,
+        "direct-opponent control risk should be priced below a safer outlet, not deleted; ranked={ranked:?}"
+    );
+}
+
+#[test]
 fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     // Rule B: a mid/forward that lingers offside past the 3s grace is pulled back onside,
     // unless it is through on goal with the ball / being played in, the opponent last
@@ -6408,6 +6573,22 @@ fn slow_opponent_in_pass_lane_is_a_set_interceptor() {
     assert!(
         WorldSnapshot::from_match(&sim).pass_lane_has_set_interceptor(from, to, Team::Home),
         "a set opponent in the lane should be flagged as a set interceptor"
+    );
+
+    sim.players[opp].position = Vec2::new(41.0, 42.0);
+    let near_fast_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        near_fast_snapshot.pass_lane_has_set_interceptor(from, to, Team::Home),
+        "geometric set-interceptor diagnostic should still see the nearby lane sitter"
+    );
+    assert!(
+        !near_fast_snapshot.pass_lane_has_unavoidable_set_interceptor_at_speed(
+            from,
+            to,
+            Team::Home,
+            PASS_FAST_BYPASS_MIN_SPEED_YPS + 1.0,
+        ),
+        "a fast pass arriving inside the reaction window should remain learnable, not hard-vetoed"
     );
 
     // The same opponent moving fast is committed/in-motion — not a set interceptor.
@@ -30926,9 +31107,16 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
         .learning_snapshot()
         .neural_network
         .expect("initial neural snapshot");
-    let previous_dim = SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE;
+    let previous_dim = SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1;
     assert_eq!(previous_dim, 330);
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&previous_dim));
+    let last_legacy_motion_entity = SOCCER_NEURAL_FIELD_MOTION_PLAYERS
+        + SOCCER_NEURAL_FIELD_MOTION_BALLS
+        - 1;
+    let migrated_last_legacy_motion_index = SOCCER_NEURAL_BASE_FEATURE_DIM
+        + last_legacy_motion_entity * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER
+        + SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1
+        - 1;
     let removed_weights = previous_snapshot
         .layers
         .first()
@@ -30960,9 +31148,19 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
         "first motion-block weight should remain aligned after belief-tail padding"
     );
     assert_eq!(
-        resumed_snapshot.layers[0].weights[0][previous_dim - 1],
+        resumed_snapshot.layers[0].weights[0][migrated_last_legacy_motion_index],
         0.975_31,
         "last old motion-block weight should remain aligned after belief-tail padding"
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM + 6],
+        0.0,
+        "new jerk-x input should start neutral for pre-jerk snapshots"
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM + 7],
+        0.0,
+        "new jerk-y input should start neutral for pre-jerk snapshots"
     );
     assert_eq!(
         resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],

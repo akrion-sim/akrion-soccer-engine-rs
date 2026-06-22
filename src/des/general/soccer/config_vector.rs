@@ -862,11 +862,13 @@ mod tests {
             p.position = Vec2::new(w - p.position.x, p.position.y);
             p.velocity = Vec2::new(-p.velocity.x, p.velocity.y);
             p.acceleration = Vec2::new(-p.acceleration.x, p.acceleration.y);
+            p.jerk = Vec2::new(-p.jerk.x, p.jerk.y);
         }
         mirrored.ball.position = Vec2::new(w - mirrored.ball.position.x, mirrored.ball.position.y);
         mirrored.ball.velocity = Vec2::new(-mirrored.ball.velocity.x, mirrored.ball.velocity.y);
         mirrored.ball.acceleration =
             Vec2::new(-mirrored.ball.acceleration.x, mirrored.ball.acceleration.y);
+        mirrored.ball.jerk = Vec2::new(-mirrored.ball.jerk.x, mirrored.ball.jerk.y);
         let reflected = SoccerConfigVector::from_snapshot(&mirrored, Team::Home).to_features();
 
         assert!(
@@ -897,6 +899,7 @@ mod tests {
             p.position = Vec2::new(w - p.position.x, p.position.y);
             p.velocity = Vec2::new(-p.velocity.x, p.velocity.y);
             p.acceleration = Vec2::new(-p.acceleration.x, p.acceleration.y);
+            p.jerk = Vec2::new(-p.jerk.x, p.jerk.y);
             // The assigned mode sorts by home_position, so the formation anchors
             // must reflect with the board.
             p.home_position = Vec2::new(w - p.home_position.x, p.home_position.y);
@@ -905,6 +908,7 @@ mod tests {
         mirrored.ball.velocity = Vec2::new(-mirrored.ball.velocity.x, mirrored.ball.velocity.y);
         mirrored.ball.acceleration =
             Vec2::new(-mirrored.ball.acceleration.x, mirrored.ball.acceleration.y);
+        mirrored.ball.jerk = Vec2::new(-mirrored.ball.jerk.x, mirrored.ball.jerk.y);
         let reflected = SoccerConfigVector::from_snapshot_with(
             &mirrored,
             Team::Home,

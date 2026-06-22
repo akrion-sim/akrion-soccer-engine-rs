@@ -673,6 +673,38 @@ mod tests {
     }
 
     #[test]
+    fn installed_policy_inference_runs_without_online_learning() {
+        let config = MatchConfig::live_gameplay();
+        assert!(!config.learning_enabled);
+
+        let mut sim = SoccerMatch::default_11v11(config);
+        assert!(!sim.learned_policy_inference_enabled());
+
+        sim.set_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
+        assert!(sim.learned_policy_inference_enabled());
+    }
+
+    #[test]
+    fn imported_frozen_neural_network_is_ready_for_inference() {
+        let config = MatchConfig::live_gameplay();
+        assert!(!config.learning_enabled);
+        let network = build_soccer_neural_network(&config.neural_learning, config.seed);
+        let snapshot = soccer_neural_network_snapshot(&network);
+
+        let mut sim = SoccerMatch::default_11v11(config);
+        sim.set_neural_network_snapshot(snapshot)
+            .expect("imported neural snapshot");
+        let learner = sim
+            .neural_learner_for(Team::Home)
+            .expect("imported learner");
+
+        assert!(learner.has_prediction_network());
+        assert_eq!(learner.training_steps(), 0);
+        assert!(learner.average_loss().is_none());
+        assert!(sim.neural_blend_lambda_for_learner(learner) > 0.0);
+    }
+
+    #[test]
     fn policy_head_keeps_technical_dribble_families_distinct() {
         let dribble = soccer_policy_action_index("dribble").expect("dribble policy family");
         for label in [
@@ -1467,6 +1499,33 @@ impl SoccerMatch {
         self.config.adversarial_embedding_exploitation_enabled
             && self.sanitized_adversarial_moment_memory_limit() > 0
             && !self.adversarial_moment_memory.is_empty()
+    }
+
+    fn learned_policy_inference_enabled(&self) -> bool {
+        self.config.learning_enabled
+            || self.team_policies.is_some()
+            || self.learned_policy.is_some()
+    }
+
+    fn neural_blend_readiness_for_learner(&self, learner: &SoccerNeuralLearner) -> f64 {
+        let readiness = self
+            .neural_blend
+            .readiness(learner.training_steps(), learner.average_loss());
+        if readiness > 0.0 {
+            return readiness;
+        }
+        if !self.config.learning_enabled && learner.has_prediction_network() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn neural_blend_lambda_for_learner(&self, learner: &SoccerNeuralLearner) -> f64 {
+        if !self.neural_blend.lambda.is_finite() || self.neural_blend.lambda <= 0.0 {
+            return 0.0;
+        }
+        self.neural_blend.lambda * self.neural_blend_readiness_for_learner(learner)
     }
 
     fn with_adversarial_moment_index<R>(
@@ -2658,11 +2717,10 @@ impl SoccerMatch {
         }
     }
 
-    /// Re-rank the top tabular candidates with the trained value head per
-    /// `neural_blend`, returning the chosen action label or `None` to fall back to
-    /// the tabular greedy pick. Always safe: candidates come from the tabular
-    /// legal-filtered ranking, the value head is only consulted once warmed up,
-    /// and any non-finite prediction degrades to the tabular value.
+    /// Re-rank legal tabular candidates with the trained value head per
+    /// `neural_blend`, then supplement from the fixed neural action vocabulary
+    /// when a warmed critic exists. That lets the 22+ball kinematic critic
+    /// de-alias sparse Q buckets without letting an untrained net into play.
     fn neural_blended_action(
         &self,
         policy: &SoccerQPolicy,
@@ -2695,9 +2753,7 @@ impl SoccerMatch {
         // Value-blend weight (ramped); 0 when the value blend is off or still cold.
         let lambda = if value_active {
             learner
-                .map(|learner| {
-                    blend.effective_lambda(learner.training_steps(), learner.average_loss())
-                })
+                .map(|learner| self.neural_blend_lambda_for_learner(learner))
                 .unwrap_or(0.0)
         } else {
             0.0
@@ -2711,12 +2767,8 @@ impl SoccerMatch {
             player_id,
             blend.candidates.max(2),
         )?;
-        let legal: Vec<&SoccerLearnedActionTrace> =
-            ranked.iter().filter(|action| action.legal).collect();
-        if legal.len() < 2 {
-            // Nothing to re-rank — let the tabular greedy path decide.
-            return None;
-        }
+        let mut legal: Vec<SoccerLearnedActionTrace> =
+            ranked.into_iter().filter(|action| action.legal).collect();
 
         // The value head trains on `(reward + γ·max_next) / target_scale`; undo the
         // scale so neural value lands in the same Q units as the tabular values.
@@ -2771,10 +2823,39 @@ impl SoccerMatch {
                 .copied()
                 .unwrap_or(0.0)
         };
+        if learner.is_some() {
+            for &label in SOCCER_POLICY_ACTIONS {
+                let normalized = normalize_soccer_action_label(label);
+                if legal
+                    .iter()
+                    .any(|candidate| normalize_soccer_action_label(&candidate.label) == normalized)
+                {
+                    continue;
+                }
+                if !learned_action_label_is_legal(normalized, snapshot, player_id) {
+                    continue;
+                }
+                legal.push(SoccerLearnedActionTrace {
+                    label: normalized.to_string(),
+                    value: 0.0,
+                    visits: 0,
+                    probability: 0.0,
+                    legal: true,
+                    level: PitchGridLevel::WholePitch,
+                });
+            }
+        }
+        if legal.is_empty() {
+            return None;
+        }
+        if legal.len() < 2 && learner.is_none() {
+            // Nothing to re-rank — let the tabular greedy path decide.
+            return None;
+        }
 
         let mut best_label: Option<&str> = None;
         let mut best_score = f64::NEG_INFINITY;
-        for candidate in &legal {
+        for candidate in legal.iter() {
             // Value contribution (0-weighted when the value blend is off/cold).
             let value_score = match blend.mode {
                 SoccerNeuralBlendMode::Off => candidate.value,
@@ -2834,9 +2915,7 @@ impl SoccerMatch {
             if !learner.has_prediction_network() {
                 continue;
             }
-            let readiness = self
-                .neural_blend
-                .readiness(learner.training_steps(), learner.average_loss());
+            let readiness = self.neural_blend_readiness_for_learner(learner);
             if readiness <= 0.0 {
                 continue;
             }
@@ -4971,7 +5050,7 @@ impl SoccerMatch {
                         observation.human_input_queue_age_ms =
                             Some(input_frame.queue_age_ms.min(60_000));
                     }
-                    let learned_plan = if self.config.learning_enabled {
+                    let learned_plan = if self.learned_policy_inference_enabled() {
                         self.learned_action_for_player_with_context(
                             &snapshot,
                             scheduled.id,
@@ -8921,40 +9000,50 @@ impl SoccerMatch {
                         self.config.field_length_yards,
                     );
                     if !flight.is_aerial() {
-                        if let Some((receiver_position, receiver_velocity)) =
+                        if let Some(receiver_position) =
                             target_id.and_then(|target| {
                                 self.players
                                     .iter()
                                     .find(|player| {
                                         player.id == target && player.team == player_team
                                     })
-                                    .map(|player| (player.position, player.velocity))
+                                    .map(|player| player.position)
                             })
                         {
-                            let receiver_forward_velocity =
-                                receiver_velocity.y * player_team.attack_dir();
-                            let aimed_opponent_distance = self
-                                .players
-                                .iter()
-                                .filter(|player| player.team == player_team.other())
-                                .map(|player| player.position.distance(aimed_target))
-                                .fold(f64::INFINITY, f64::min);
-                            let aimed_receiver_distance = aimed_target.distance(receiver_position);
-                            if pass_skill < 0.55
-                                && receiver_forward_velocity < 1.0
-                                && aimed_opponent_distance < aimed_receiver_distance
+                            let aimed_risk = snapshot.pass_point_direct_opponent_control_risk(
+                                player_team,
+                                receiver_position,
+                                player_pos,
+                                aimed_target,
+                                speed,
+                            );
+                            let led_risk = snapshot.pass_point_direct_opponent_control_risk(
+                                player_team,
+                                receiver_position,
+                                player_pos,
+                                led_target,
+                                speed,
+                            );
+                            let receiver_risk = snapshot.pass_point_direct_opponent_control_risk(
+                                player_team,
+                                receiver_position,
+                                player_pos,
+                                receiver_position,
+                                speed,
+                            );
+                            let safer_release_risk = led_risk.min(receiver_risk);
+                            if aimed_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
+                                || aimed_risk
+                                    >= safer_release_risk
+                                        + PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN
                             {
-                                let led_opponent_distance = self
-                                    .players
-                                    .iter()
-                                    .filter(|player| player.team == player_team.other())
-                                    .map(|player| player.position.distance(led_target))
-                                    .fold(f64::INFINITY, f64::min);
-                                let led_receiver_distance = led_target.distance(receiver_position);
-                                aimed_target = if led_opponent_distance < led_receiver_distance {
+                                aimed_target = if led_risk < aimed_risk && led_risk <= receiver_risk
+                                {
+                                    led_target
+                                } else if receiver_risk < aimed_risk {
                                     receiver_position
                                 } else {
-                                    led_target
+                                    aimed_target
                                 };
                             }
                         }
@@ -16752,6 +16841,133 @@ impl WorldSnapshot {
             .unwrap_or(f64::INFINITY)
     }
 
+    pub(crate) fn pass_point_directly_favors_opponent(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_point: Vec2,
+    ) -> bool {
+        let opponent_distance = self.nearest_opponent_distance_at(team, pass_point);
+        let receiver_distance = receiver_position.distance(pass_point);
+        let opponent_advantage = receiver_distance - opponent_distance;
+        opponent_distance.is_finite()
+            && opponent_distance <= PASS_RECEPTION_CONGESTION_RADIUS_YARDS
+            && opponent_advantage >= PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS
+    }
+
+    pub(crate) fn pass_point_direct_opponent_control_risk(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_origin: Vec2,
+        pass_point: Vec2,
+        ball_speed_yps: f64,
+    ) -> f64 {
+        let Some((opponent_id, opponent_position, opponent_distance)) =
+            self.nearest_opponent_at(team, pass_point)
+        else {
+            return 0.0;
+        };
+        if opponent_distance > PASS_RECEPTION_CONGESTION_RADIUS_YARDS {
+            return 0.0;
+        }
+        let receiver_distance = receiver_position.distance(pass_point);
+        let opponent_advantage = receiver_distance - opponent_distance;
+        if opponent_advantage <= PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS {
+            return 0.0;
+        }
+        let lane = pass_point - pass_origin;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            return 0.0;
+        }
+        let Some(opponent) = self.players.iter().find(|player| player.id == opponent_id) else {
+            return 0.0;
+        };
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let dir = lane * (1.0 / lane_len);
+        let along = (opponent_position - pass_origin)
+            .dot(dir)
+            .clamp(0.0, lane_len);
+        let ball_arrival = along / speed;
+        let fast_bypass_relief = if speed >= PASS_FAST_BYPASS_MIN_SPEED_YPS
+            && ball_arrival <= PASS_FAST_BYPASS_REACTION_WINDOW_SECONDS
+        {
+            0.35
+        } else {
+            1.0
+        };
+        let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        let reach = INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window;
+        let reach_fit = if opponent_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS {
+            1.0
+        } else {
+            (1.0
+                - ((opponent_distance - reach) / PASS_RECEPTION_CONGESTION_RADIUS_YARDS)
+                    .clamp(0.0, 1.0))
+            .clamp(0.0, 1.0)
+        };
+        let opponent_velocity = self
+            .player_velocity(opponent.id)
+            .unwrap_or(opponent.velocity);
+        let control_quality =
+            self.snapshot_player_facing_control_multiplier(opponent, pass_point, speed);
+        let mpc_fit = mpc_ball_control_execution_fit(
+            opponent.role,
+            &opponent.skills,
+            opponent.fatigue,
+            opponent_position,
+            opponent_velocity,
+            control_quality,
+            pass_point,
+            dir * speed,
+            ball_arrival,
+            PASS_RECEPTION_CONGESTION_RADIUS_YARDS,
+        );
+        let skill_fit = (ability01(opponent.skills.first_touch) * 0.38
+            + ability01(opponent.skills.defending) * 0.38
+            + ability01(opponent.skills.aggression) * 0.24)
+            .clamp(0.0, 1.0);
+        let mut control_fit = (reach_fit * 0.42
+            + mpc_fit.probability * 0.34
+            + control_quality * 0.14
+            + skill_fit * 0.10)
+            .clamp(0.0, 1.0);
+        if opponent_distance <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS {
+            control_fit = control_fit.max(0.95);
+        }
+        let directness = ((opponent_advantage - PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS)
+            / (PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS * 2.0).max(1.0))
+        .clamp(0.0, 1.0);
+        (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn no_target_pass_point_directly_favors_opponent(
+        &self,
+        team: Team,
+        passer_id: usize,
+        pass_point: Vec2,
+    ) -> bool {
+        let opponent_distance = self.nearest_opponent_distance_at(team, pass_point);
+        if !opponent_distance.is_finite()
+            || opponent_distance > PASS_RECEPTION_CONGESTION_RADIUS_YARDS
+        {
+            return false;
+        }
+        let teammate_distance = self
+            .players
+            .iter()
+            .filter(|player| player.team == team && player.id != passer_id)
+            .map(|player| self.player_snapshot_position(player).distance(pass_point))
+            .fold(f64::INFINITY, f64::min);
+        teammate_distance - opponent_distance >= PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS
+    }
+
     pub(crate) fn no_pressure_at(&self, team: Team, position: Vec2) -> bool {
         self.nearest_opponent_distance_at(team, position) > NO_PRESSURE_BACK_PASS_THRESHOLD_YARDS
     }
@@ -20794,13 +21010,18 @@ impl WorldSnapshot {
                                 nominal_speed,
                             );
                         // `race_won` already includes the qualified half-open forward exception:
-                        // skilled passers keep those options visible, while hard giveaways are
-                        // still vetoed below.
+                        // skilled passers keep those options visible. Direct-opponent endpoints
+                        // are priced in the score/learned features below instead of hard-hidden.
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || race_won)
                             && !committed_cutout
                             && !backward_into_coverage
-                            && !self.pass_lane_has_set_interceptor(me_position, *aim_point, me.team)
+                            && !self.pass_lane_has_unavoidable_set_interceptor_at_speed(
+                                me_position,
+                                *aim_point,
+                                me.team,
+                                nominal_speed,
+                            )
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
                             && !self.final_third_forward_pass_to_nobody(
                                 me.team,
@@ -21034,6 +21255,17 @@ impl WorldSnapshot {
                 // Relieved inside the final third where contested receptions are worth it.
                 let reception_congestion_penalty =
                     self.reception_congestion_penalty_at(me.team, pass_point);
+                let score_nominal_speed =
+                    pass_speed_yps_from_power(0.68, PassFlight::Floor, is_cross, &me.skills);
+                let direct_opponent_control_risk = self.pass_point_direct_opponent_control_risk(
+                    me.team,
+                    position,
+                    me_position,
+                    pass_point,
+                    score_nominal_speed,
+                );
+                let direct_opponent_aim_penalty =
+                    PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * direct_opponent_control_risk;
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -21084,6 +21316,7 @@ impl WorldSnapshot {
                     - anticipation_penalty
                     - reception_teammate_penalty
                     - reception_congestion_penalty
+                    - direct_opponent_aim_penalty
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
@@ -30975,6 +31208,61 @@ impl WorldSnapshot {
             })
     }
 
+    fn pass_lane_control_is_unavoidable(
+        &self,
+        player: &PlayerSnapshot,
+        from: Vec2,
+        to: Vec2,
+        lane_point: Vec2,
+        perp_gap: f64,
+        control_radius: f64,
+        ball_speed_yps: f64,
+    ) -> bool {
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            return perp_gap <= control_radius;
+        }
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let dir = lane * (1.0 / lane_len);
+        let along = (lane_point - from).dot(dir).clamp(0.0, lane_len);
+        let ball_arrival = along / speed;
+        if speed >= PASS_FAST_BYPASS_MIN_SPEED_YPS
+            && ball_arrival <= PASS_FAST_BYPASS_REACTION_WINDOW_SECONDS
+        {
+            return false;
+        }
+        let sprint_speed = (player_top_speed_yps(player.role, &player.skills)
+            * fatigue_speed_factor(player.skills.stamina, player.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let intercept_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        let reach = INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * intercept_window;
+        if perp_gap > reach.max(CONTROL_AT_FEET_TRAP_RADIUS_YARDS) {
+            return false;
+        }
+        let position = self.player_snapshot_position(player);
+        let velocity = self.player_velocity(player.id).unwrap_or(player.velocity);
+        let control_quality = self.snapshot_player_facing_control_multiplier(player, lane_point, speed);
+        let mpc_fit = mpc_ball_control_execution_fit(
+            player.role,
+            &player.skills,
+            player.fatigue,
+            position,
+            velocity,
+            control_quality,
+            lane_point,
+            dir * speed,
+            ball_arrival,
+            control_radius,
+        );
+        (control_quality >= CONTROL_MIN_VIABLE_QUALITY
+            || perp_gap <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+            && (mpc_fit.qp_accel_fit >= MPC_BALL_CONTROL_FORCED_MIN_QP_ACCEL_FIT
+                || perp_gap <= CONTROL_AT_FEET_TRAP_RADIUS_YARDS)
+    }
+
     /// Movement-aware [`clear_line`]: a defender currently OUTSIDE the lane corridor
     /// still cuts the ball out if their velocity carries them INTO it before the ball
     /// passes their point on the lane. For each defender, project their position to the
@@ -31008,9 +31296,25 @@ impl WorldSnapshot {
         for p in self.players.iter().filter(|p| p.team == defending_team) {
             let position = self.player_snapshot_position(p);
             let perp_gap = segment_distance_to_point(from, to, position);
-            // Already sitting in the corridor → blocked now (hard veto), short-circuit.
+            // Already sitting in the corridor is only a hard block when the physics/MPC
+            // says the defender can actually control it; a driven ball inside the reaction
+            // window stays legal but gets risk-priced downstream.
             if perp_gap <= radius {
-                return (false, false);
+                let along = (position - from).dot(dir).clamp(0.0, lane_len);
+                let lane_point = from + dir * along;
+                if self.pass_lane_control_is_unavoidable(
+                    p,
+                    from,
+                    to,
+                    lane_point,
+                    perp_gap,
+                    radius,
+                    speed,
+                ) {
+                    return (false, false);
+                }
+                clear_through_flight = false;
+                continue;
             }
             // Can the defender REACH the corridor before the ball passes their nearest point?
             // The ball arrives at that point in `t_ball`; in that time the defender can cover
@@ -31073,13 +31377,18 @@ impl WorldSnapshot {
             let perp_gap = to_lane.len();
             nearest_lane_margin_yards = nearest_lane_margin_yards.min(perp_gap - radius);
             if perp_gap <= radius {
-                return PassLaneInterceptionRisk {
-                    risk: 1.0,
-                    clear_now: false,
-                    clear_next_seconds: false,
-                    nearest_lane_margin_yards: finite_metric(nearest_lane_margin_yards),
-                    earliest_arrival_margin_seconds: 0.0,
-                };
+                if self.pass_lane_control_is_unavoidable(
+                    p, from, to, closest, perp_gap, radius, speed,
+                ) {
+                    return PassLaneInterceptionRisk {
+                        risk: 1.0,
+                        clear_now: false,
+                        clear_next_seconds: false,
+                        nearest_lane_margin_yards: finite_metric(nearest_lane_margin_yards),
+                        earliest_arrival_margin_seconds: 0.0,
+                    };
+                }
+                risk = risk.max(0.72);
             }
 
             let ball_arrival = along / speed;
@@ -31226,6 +31535,41 @@ impl WorldSnapshot {
             p.velocity.len() < SLOW_OPPONENT_INTERCEPT_YPS
                 && segment_distance_to_point(from, to, position)
                     <= PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS
+        })
+    }
+
+    pub(crate) fn pass_lane_has_unavoidable_set_interceptor_at_speed(
+        &self,
+        from: Vec2,
+        to: Vec2,
+        passer_team: Team,
+        ball_speed_yps: f64,
+    ) -> bool {
+        let defending = passer_team.other();
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            return self.pass_lane_has_set_interceptor(from, to, passer_team);
+        }
+        let dir = lane * (1.0 / lane_len);
+        self.players.iter().any(|p| {
+            if p.team != defending || p.velocity.len() >= SLOW_OPPONENT_INTERCEPT_YPS {
+                return false;
+            }
+            let position = self.player_snapshot_position(p);
+            let along = (position - from).dot(dir).clamp(0.0, lane_len);
+            let lane_point = from + dir * along;
+            let perp_gap = position.distance(lane_point);
+            perp_gap <= PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS
+                && self.pass_lane_control_is_unavoidable(
+                    p,
+                    from,
+                    to,
+                    lane_point,
+                    perp_gap,
+                    PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS,
+                    ball_speed_yps,
+                )
         })
     }
 

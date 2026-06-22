@@ -122,6 +122,12 @@ const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
 // point (large ball-time-to-arrival) hands a distant defender a huge reach (sprint × seconds),
 // flagging defenders 25+ yd off the lane. Bounds the reach to a believable step-in radius.
 const PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS: f64 = 0.6;
+// Decision-time fast-bypass relief: a driven floor pass above ~35mph that reaches a defender
+// inside most of the reaction window is not treated as an automatic set interception. It is
+// still risk-priced by the lane/MPC model, but left legal so learning can discover when speed
+// beats the trap.
+const PASS_FAST_BYPASS_MIN_SPEED_YPS: f64 = 17.1;
+const PASS_FAST_BYPASS_REACTION_WINDOW_SECONDS: f64 = 0.16;
 // Decision-time pass safety looks beyond "is the lane clear right now" and asks whether
 // an opponent can step into the corridor over the next couple seconds. This is a graded
 // POMDP/MPC risk, not a hard physics outcome; the runtime resolver still decides who
@@ -1011,6 +1017,15 @@ const PASS_RECEPTION_CONGESTION_FLOOR: f64 = 0.28;
 // under 1.0 because the opponent-arrival estimate assumes a perfect sprint (no reaction
 // delay) and the receiver is also contesting the point.
 const PASS_RECEPTION_OPPONENT_TIME_MARGIN: f64 = 0.95;
+// Release-time safety net: if endpoint noise/MPC lead would aim a floor pass this much
+// closer to an opponent than the intended teammate, pull it back toward the teammate/lead.
+const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
+// Selection-time counterpart to the release guard: a led floor-pass point that is
+// materially nearer an opponent than the teammate is a likely direct giveaway.
+const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
+const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.92;
+const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.18;
+const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 3.8;
 // A BACKWARD ball (aim point this far behind the passer along the attack direction)
 // is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
 // the ball back toward the opponent. A backward pass whose receiver has an opponent
@@ -33386,6 +33401,20 @@ fn soccer_live_policy_min_visits() -> i32 {
         .unwrap_or(0)
 }
 
+/// Fast local-viewer path: load the neural snapshot and learned tactical weights immediately
+/// without scanning the retained tabular Q entries table. The full tabular load remains the
+/// default when this is unset.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_neural_tactical_only() -> bool {
+    std::env::var("SOCCER_LIVE_POLICY_NEURAL_TACTICAL_ONLY")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 // ── Postgres → live-server policy bridge ───────────────────────────────────────────────
 // Built only with the `postgres-persistence` feature. When `SOCCER_DATABASE_URL` is set the
 // live server loads the latest ACTIVE learned policy (tabular Q + neural net) for the
@@ -33429,6 +33458,24 @@ fn soccer_live_fetch_latest_pg_policy(
     experiment_id: &str,
 ) -> Result<Option<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion>, String> {
     let options = SoccerQPolicyOptions::default();
+    if soccer_live_pg_neural_tactical_only() {
+        let Some(metadata) = store.load_latest_active_policy_metadata(experiment_id)? else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion {
+                id: metadata.id,
+                generation: metadata.generation,
+                updated_at_micros: metadata.updated_at_micros,
+                policy_fingerprint: metadata.policy_fingerprint,
+                policy_entry_count: metadata.policy_entry_count,
+                policies: SoccerTeamQPolicies::new(options),
+                neural_network: metadata.neural_network,
+                tactical_learning: metadata.tactical_learning,
+                search_metadata: metadata.search_metadata,
+            },
+        ));
+    }
     // The live server does inference only, so it loads the neural net (always, in full)
     // plus the well-learned tabular core — entries visited at least
     // `SOCCER_LIVE_POLICY_MIN_VISITS` times — instead of hauling the full
@@ -33452,6 +33499,9 @@ fn soccer_live_install_pg_policy(
 ) -> (i32, i64) {
     let stamp = (version.generation, version.updated_at_micros);
     sim.set_team_policies(version.policies);
+    if let Some(tactical_learning) = version.tactical_learning {
+        sim.config.tactical_learning = tactical_learning;
+    }
     if let Some(net) = version.neural_network {
         // A malformed/mismatched net is non-fatal — keep the tabular policy.
         let _ = sim.set_neural_network_snapshot(net);
@@ -33467,7 +33517,11 @@ fn soccer_live_install_pg_policy(
 /// `SoccerLiveServer::new`.
 #[cfg(feature = "postgres-persistence")]
 static SOCCER_LIVE_WARM_POLICY: std::sync::Mutex<
-    Option<(SoccerTeamQPolicies, Option<SoccerNeuralNetworkSnapshot>)>,
+    Option<(
+        SoccerTeamQPolicies,
+        Option<SoccerNeuralNetworkSnapshot>,
+        SoccerTacticalLearningWeights,
+    )>,
 > = std::sync::Mutex::new(None);
 
 /// Snapshot a sim's currently-installed policy into the process-wide warm cache (best-effort).
@@ -33477,8 +33531,9 @@ fn soccer_live_store_warm_policy(sim: &SoccerMatch) {
         return;
     };
     let net = sim.neural_network_snapshot();
+    let tactical_learning = sim.config.tactical_learning.clone();
     if let Ok(mut guard) = SOCCER_LIVE_WARM_POLICY.lock() {
-        *guard = Some((policies, net));
+        *guard = Some((policies, net, tactical_learning));
     }
 }
 
@@ -33487,7 +33542,7 @@ fn soccer_live_store_warm_policy(sim: &SoccerMatch) {
 /// so a `true` here means a real learned policy is being reused.
 #[cfg(feature = "postgres-persistence")]
 fn soccer_live_install_warm_policy(sim: &mut SoccerMatch) -> bool {
-    let Some((policies, net)) = SOCCER_LIVE_WARM_POLICY
+    let Some((policies, net, tactical_learning)) = SOCCER_LIVE_WARM_POLICY
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
@@ -33495,6 +33550,7 @@ fn soccer_live_install_warm_policy(sim: &mut SoccerMatch) -> bool {
         return false;
     };
     sim.set_team_policies(policies);
+    sim.config.tactical_learning = tactical_learning;
     if let Some(net) = net {
         let _ = sim.set_neural_network_snapshot(net);
     }
@@ -44871,11 +44927,24 @@ fn pass_mpc_receipt_estimate_for_snapshot(
     } else {
         ability01(target.skills.first_touch) * 0.22
     };
+    let direct_opponent_control_risk = if flight.is_aerial() {
+        0.0
+    } else {
+        snapshot.pass_point_direct_opponent_control_risk(
+            passer.team,
+            target_position,
+            passer_position,
+            target_point,
+            pass_speed_yps,
+        )
+    };
+    let opponent_control_gate = (1.0 - direct_opponent_control_risk * 0.58).clamp(0.34, 1.0);
     let probability =
         (0.06 + qp_accel_fit * 0.38 + meet_fit * 0.22 + race_fit * 0.24 + aerial_control)
-            .clamp(0.0, 0.99);
+            .clamp(0.0, 0.99)
+            * opponent_control_gate;
     PassMpcReceiptEstimate {
-        probability,
+        probability: probability.clamp(0.0, 0.99),
         race_advantage_seconds: finite_metric(race_advantage_seconds),
         qp_accel_fit,
     }
