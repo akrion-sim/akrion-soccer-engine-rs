@@ -2467,6 +2467,51 @@ impl PlayerAgent {
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, (0.82 + steal_escape_urgency * 0.52).clamp(0.82, 1.34));
+        let technical_escape_pressure = pressure_urgency
+            .max(pressure)
+            .max(observation.immediate_dispossession_risk.clamp(0.0, 1.0))
+            .max(pressure_from_nearest_distance(
+                observation.nearest_opponent_distance,
+            ))
+            .clamp(0.0, 1.0);
+        let cut_legal = observation.nearest_opponent_distance <= 4.8
+            && technical_escape_pressure >= 0.30
+            && !goalmouth_carry_forced
+            && !goal_attack_shot_blocks_alternatives;
+        let left_cut_legal = cut_legal && left_room > 1.5;
+        let right_cut_legal = cut_legal && right_room > 1.5;
+        let cut_score_base = (dribble_score
+            * (0.18
+                + technical_escape_pressure * 0.68
+                + decision_urgency * 0.16
+                + steal_escape_urgency * 0.52
+                + steal_risk_escape_lift * 0.42)
+            * (0.74 + dribbling * 0.36 + ability01(self.skills.first_touch) * 0.16)
+            * calm_pass_focus
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.01, (0.66 + steal_escape_urgency * 0.32).clamp(0.66, 0.98));
+        let left_cut_score = (cut_score_base
+            * (0.82 + (left_room / 12.0).clamp(0.0, 1.0) * 0.28))
+            .clamp(0.01, 1.02);
+        let right_cut_score = (cut_score_base
+            * (0.82 + (right_room / 12.0).clamp(0.0, 1.0) * 0.28))
+            .clamp(0.01, 1.02);
+        let flair = ability01(self.skills.flair_passing);
+        let nutmeg_legal = observation.nearest_opponent_distance <= 2.6
+            && technical_escape_pressure >= 0.38
+            && self.role != PlayerRole::Goalkeeper
+            && !own_half
+            && !goalmouth_carry_forced
+            && !goal_attack_shot_blocks_alternatives;
+        let nutmeg_score = (dribble_score
+            * (0.08
+                + technical_escape_pressure * 0.52
+                + decision_urgency * 0.18
+                + steal_escape_urgency * 0.34)
+            * (0.52 + dribbling * 0.34 + flair * 0.30 + ability01(self.skills.first_touch) * 0.14)
+            * calm_pass_focus
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.01, (0.42 + steal_escape_urgency * 0.24 + flair * 0.18).clamp(0.42, 0.84));
         let feint_legal =
             observation.nearest_opponent_distance <= 5.2 && pressure_urgency.max(pressure) >= 0.34;
         // Feints are already pressure-gated (feint_legal). Keep the ceiling low so a
@@ -2516,6 +2561,9 @@ impl PlayerAgent {
             ),
             AgentActionOptionTrace::new("protect-ball", protect_ball_score, protect_ball_legal),
             AgentActionOptionTrace::new("side-step", side_step_score, side_step_legal),
+            AgentActionOptionTrace::new("left-cut", left_cut_score, left_cut_legal),
+            AgentActionOptionTrace::new("right-cut", right_cut_score, right_cut_legal),
+            AgentActionOptionTrace::new("nutmeg", nutmeg_score, nutmeg_legal),
             AgentActionOptionTrace::new("fake-left-cut-right", feint_score, feint_legal),
             AgentActionOptionTrace::new("fake-right-cut-left", feint_score, feint_legal),
             AgentActionOptionTrace::new(
@@ -4161,6 +4209,7 @@ impl PlayerAgent {
             action_options,
             action_target,
             mdp_mpc_comparison,
+            learned_mpc_replan: None,
             action: action_label,
         }
     }
@@ -4699,6 +4748,7 @@ impl PlayerAgent {
                         action: action.to_string(),
                         target_player: input.target_player,
                         target_point: None,
+                        mpc_replan: None,
                     },
                     snapshot,
                     observation,
@@ -5734,7 +5784,7 @@ impl PlayerAgent {
                             power: 0.80 + 0.14 * crossing.max(passing_skill),
                             flight: PassFlight::Aerial,
                         };
-                        self.last_decision = Some(self.decision_trace(
+                        let decision = self.decision_trace(
                             snapshot,
                             mdp_state,
                             observation,
@@ -5743,7 +5793,8 @@ impl PlayerAgent {
                             single_action_option("aerial-pass"),
                             &action,
                             "aerial-pass",
-                        ));
+                        );
+                        self.last_decision = Some(decision);
                         return PlayerIntent {
                             player_id: self.id,
                             action,
@@ -5986,7 +6037,7 @@ impl PlayerAgent {
                             kind,
                             touch,
                         };
-                        self.last_decision = Some(self.decision_trace(
+                        let mut decision = self.decision_trace(
                             snapshot,
                             mdp_state,
                             observation,
@@ -5999,7 +6050,9 @@ impl PlayerAgent {
                             single_action_option(kind.label()),
                             &defer_action,
                             kind.label(),
-                        ));
+                        );
+                        decision.learned_mpc_replan = plan.mpc_replan.clone();
+                        self.last_decision = Some(decision);
                         return PlayerIntent {
                             player_id: self.id,
                             action: defer_action,
@@ -6019,7 +6072,7 @@ impl PlayerAgent {
                             });
                         }
                     }
-                    self.last_decision = Some(self.decision_trace(
+                    let mut decision = self.decision_trace(
                         snapshot,
                         mdp_state,
                         observation,
@@ -6028,7 +6081,9 @@ impl PlayerAgent {
                         single_action_option(&action_label),
                         &action,
                         action_label,
-                    ));
+                    );
+                    decision.learned_mpc_replan = plan.mpc_replan.clone();
+                    self.last_decision = Some(decision);
                     return PlayerIntent {
                         player_id: self.id,
                         action,
@@ -6205,6 +6260,18 @@ impl PlayerAgent {
                 (
                     "side-step".to_string(),
                     action_option_score(&action_options, "side-step"),
+                ),
+                (
+                    "left-cut".to_string(),
+                    action_option_score(&action_options, "left-cut"),
+                ),
+                (
+                    "right-cut".to_string(),
+                    action_option_score(&action_options, "right-cut"),
+                ),
+                (
+                    "nutmeg".to_string(),
+                    action_option_score(&action_options, "nutmeg"),
                 ),
                 (
                     "fake-left-cut-right".to_string(),
@@ -6420,16 +6487,22 @@ impl PlayerAgent {
                             break;
                         }
                     }
-                    "fake-left-cut-right" | "fake-right-cut-left" => {
-                        let kind = if op == "fake-left-cut-right" {
-                            DribbleMoveKind::FakeLeftCutRight
-                        } else {
-                            DribbleMoveKind::FakeRightCutLeft
+                    "left-cut"
+                    | "right-cut"
+                    | "nutmeg"
+                    | "fake-left-cut-right"
+                    | "fake-right-cut-left" => {
+                        let kind = match op.as_str() {
+                            "left-cut" => DribbleMoveKind::LeftCut,
+                            "right-cut" => DribbleMoveKind::RightCut,
+                            "nutmeg" => DribbleMoveKind::Nutmeg,
+                            "fake-left-cut-right" => DribbleMoveKind::FakeLeftCutRight,
+                            _ => DribbleMoveKind::FakeRightCutLeft,
                         };
                         order_names.push(kind.label().to_string());
-                        let feint_chance = action_option_score(&action_options, kind.label());
+                        let technical_chance = action_option_score(&action_options, kind.label());
                         if agentic_action_commitment(
-                            feint_chance,
+                            technical_chance,
                             snapshot.dt_seconds,
                             &observation,
                             self.role,
@@ -9094,4 +9167,5 @@ pub struct SoccerLearnedPlan {
     pub action: String,
     pub target_player: Option<usize>,
     pub target_point: Option<Vec2>,
+    pub mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
 }

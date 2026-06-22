@@ -1,6 +1,6 @@
 //! Canonical kinematic **configuration vector** of the whole field — the 22
-//! players + ball, each with position / velocity / acceleration, plus the ball
-//! holder and ball altitude — for retrieval ("have we seen a state like this before?").
+//! players + ball, each with position / velocity / acceleration / jerk, plus
+//! the ball holder and ball altitude — for retrieval ("have we seen a state like this before?").
 //!
 //! This is the substrate for the vector-search side of the retrieval-guided
 //! decision pipeline. A live snapshot `S1` is projected into a fixed-width,
@@ -10,10 +10,10 @@
 //! `SoccerConfigMomentInsert` / `search_nearest_config_moments`).
 //!
 //! ## Why canonicalize (and why here, not in the embedding net)
-//! Raw `(x, y, vx, vy, ax, ay)` per player is not comparable across moments: the
-//! two teams attack opposite ways, the same shape can be mirrored left/right, and
-//! player *identities/order* are arbitrary. Cosine distance over the raw vector
-//! would call mirror-images "far apart". So before projecting we:
+//! Raw `(x, y, vx, vy, ax, ay, jx, jy)` per player is not comparable across
+//! moments: the two teams attack opposite ways, the same shape can be mirrored
+//! left/right, and player *identities/order* are arbitrary. Cosine distance over
+//! the raw vector would call mirror-images "far apart". So before projecting we:
 //!   1. **Orient** so the perspective team always attacks +y (length axis). Home
 //!      is identity; Away is a 180° rotation about the pitch centre (the engine's
 //!      Y axis is goal-to-goal — `opponent_goal = (width/2, goal_y(length))`).
@@ -33,13 +33,16 @@ use super::*;
 /// 11; fewer (red card) pad with zeros, more truncate — keeping the width stable.
 pub const CONFIG_PLAYERS_PER_TEAM: usize = 11;
 /// Legacy raw feature width before the per-player possession channel existed.
-pub const CONFIG_FEATURE_DIM_V1: usize =
-    2 * CONFIG_PLAYERS_PER_TEAM * 6 + CONFIG_BALL_FLOATS + CONFIG_SCALAR_FLOATS;
-/// Floats per player: `pos.x, pos.y, vel.x, vel.y, acc.x, acc.y, has_possession` (canonical).
-pub const CONFIG_PER_PLAYER_FLOATS: usize = 7;
-/// Floats for the ball: `pos.x, pos.y, altitude, vel.x, vel.y, acc.x, acc.y`.
+pub const CONFIG_FEATURE_DIM_V1: usize = 2 * CONFIG_PLAYERS_PER_TEAM * 6 + 7 + CONFIG_SCALAR_FLOATS;
+/// Raw feature width before jerk channels were added.
+pub const CONFIG_FEATURE_DIM_V2: usize = 2 * CONFIG_PLAYERS_PER_TEAM * 7 + 7 + CONFIG_SCALAR_FLOATS;
+/// Floats per player: `pos.x, pos.y, vel.x, vel.y, acc.x, acc.y, jerk.x, jerk.y,
+/// has_possession` (canonical).
+pub const CONFIG_PER_PLAYER_FLOATS: usize = 9;
+/// Floats for the ball: `pos.x, pos.y, altitude, vel.x, vel.y, acc.x, acc.y,
+/// jerk.x, jerk.y`.
 /// (The engine's ball has no vertical velocity channel; altitude is its own.)
-pub const CONFIG_BALL_FLOATS: usize = 7;
+pub const CONFIG_BALL_FLOATS: usize = 9;
 /// Trailing scalars: `possession_relative, phase_code, score_diff`.
 pub const CONFIG_SCALAR_FLOATS: usize = 3;
 
@@ -54,8 +57,10 @@ pub const CONFIG_FEATURE_DIM: usize = 2 * CONFIG_PLAYERS_PER_TEAM * CONFIG_PER_P
 // accel ~8 yd/s², a struck ball ~45 yd/s, a high ball ~12 yd of altitude).
 const PLAYER_SPEED_SCALE_YPS: f64 = 11.0;
 const PLAYER_ACCEL_SCALE_YPS2: f64 = 8.0;
+const PLAYER_JERK_SCALE_YPS3: f64 = 40.0;
 const BALL_SPEED_SCALE_YPS: f64 = 45.0;
 const BALL_ACCEL_SCALE_YPS2: f64 = 60.0;
+const BALL_JERK_SCALE_YPS3: f64 = 180.0;
 const BALL_ALTITUDE_SCALE_YARDS: f64 = 12.0;
 
 /// Which of the two whole-field comparisons to build. The modes differ **only**
@@ -137,11 +142,14 @@ pub struct SoccerPlayerKin {
     pub vel: Vec2,
     /// Canonical, scale-normalised acceleration.
     pub acc: Vec2,
+    /// Canonical, scale-normalised jerk.
+    pub jerk: Vec2,
     /// `1` if this exact player holds the ball in the source snapshot, else `0`.
     pub has_possession: f64,
-    /// Ball-proximity weight in `[0, 1]` applied to this player's `pos/vel/acc`
-    /// channels when flattening to features (the `has_possession` flag stays
-    /// unscaled). `0` ⇒ fully discounted (far behind the ball during an attack).
+    /// Ball-proximity weight in `[0, 1]` applied to this player's
+    /// `pos/vel/acc/jerk` channels when flattening to features (the
+    /// `has_possession` flag stays unscaled). `0` ⇒ fully discounted (far behind
+    /// the ball during an attack).
     pub weight: f64,
 }
 
@@ -160,6 +168,8 @@ pub struct SoccerConfigVector {
     pub ball_vel: [f64; 2],
     /// Ball: normalised `(ax, ay)`.
     pub ball_acc: [f64; 2],
+    /// Ball: normalised `(jx, jy)`.
+    pub ball_jerk: [f64; 2],
     /// `+1` perspective team holds the ball, `-1` opponent holds, `0` loose.
     pub possession_relative: f64,
     /// Perspective-relative phase code (own-attack `+1` … opp-attack `-1`).
@@ -170,7 +180,7 @@ pub struct SoccerConfigVector {
 
 /// Affine canonicalisation of the pitch for a perspective team: orient so the
 /// team attacks +y, then mirror x to a canonical handedness. Applied identically
-/// to every position (`is_vector = false`) and every velocity/acceleration
+/// to every position (`is_vector = false`) and every velocity/acceleration/jerk
 /// (`is_vector = true`, which drops the translation).
 #[derive(Clone, Copy, Debug)]
 struct Canonicalizer {
@@ -290,8 +300,7 @@ impl SoccerConfigVector {
 
         // (sort key, player) so the two comparison modes share one build pass and
         // differ only in the ordering key applied just below.
-        let mut own: Vec<([f64; 3], SoccerPlayerKin)> =
-            Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
+        let mut own: Vec<([f64; 3], SoccerPlayerKin)> = Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
         let mut opponents: Vec<([f64; 3], SoccerPlayerKin)> =
             Vec::with_capacity(CONFIG_PLAYERS_PER_TEAM);
         let holder = snapshot.ball.holder;
@@ -331,6 +340,7 @@ impl SoccerConfigVector {
                 pos: canon.norm_pos(player.position),
                 vel: canon.norm_vel(player.velocity, PLAYER_SPEED_SCALE_YPS),
                 acc: canon.norm_vel(player.acceleration, PLAYER_ACCEL_SCALE_YPS2),
+                jerk: canon.norm_vel(player.jerk, PLAYER_JERK_SCALE_YPS3),
                 has_possession: if holder == Some(player.id) { 1.0 } else { 0.0 },
                 weight,
             };
@@ -339,9 +349,7 @@ impl SoccerConfigVector {
             let key = match comparison {
                 // Nearest the ball (or the planned path, when given) first; canonical pos
                 // breaks ties.
-                SoccerConfigComparison::PositionAgnostic => {
-                    [proximity_dist, kin.pos.y, kin.pos.x]
-                }
+                SoccerConfigComparison::PositionAgnostic => [proximity_dist, kin.pos.y, kin.pos.x],
                 // Assigned formation slot (deepest home first ⇒ GK leads), so
                 // like-for-like positions align across configs.
                 SoccerConfigComparison::AssignedPosition => {
@@ -362,6 +370,7 @@ impl SoccerConfigVector {
         let bpos = canon.norm_pos(ball.position);
         let bvel = canon.norm_vel(ball.velocity, BALL_SPEED_SCALE_YPS);
         let bacc = canon.norm_vel(ball.acceleration, BALL_ACCEL_SCALE_YPS2);
+        let bjerk = canon.norm_vel(ball.jerk, BALL_JERK_SCALE_YPS3);
 
         let possession_relative = match snapshot.possession_team() {
             Some(t) if t == perspective => 1.0,
@@ -386,6 +395,7 @@ impl SoccerConfigVector {
             ],
             ball_vel: [bvel.x, bvel.y],
             ball_acc: [bacc.x, bacc.y],
+            ball_jerk: [bjerk.x, bjerk.y],
             possession_relative,
             phase_code: perspective_phase_code(snapshot.phase, perspective),
             score_diff,
@@ -402,6 +412,7 @@ impl SoccerConfigVector {
         out.extend_from_slice(&self.ball_pos);
         out.extend_from_slice(&self.ball_vel);
         out.extend_from_slice(&self.ball_acc);
+        out.extend_from_slice(&self.ball_jerk);
         out.push(self.possession_relative);
         out.push(self.phase_code);
         out.push(self.score_diff);
@@ -415,10 +426,11 @@ impl SoccerConfigVector {
     }
 }
 
-/// Flatten one team's players into the feature stream. Each player's `pos/vel/acc`
-/// channels are scaled by its ball-proximity `weight` (so near-ball players
-/// dominate the cosine and fully-discounted players contribute nothing); the
-/// `has_possession` flag is left **unscaled** as a categorical holder marker.
+/// Flatten one team's players into the feature stream. Each player's
+/// `pos/vel/acc/jerk` channels are scaled by its ball-proximity `weight` (so
+/// near-ball players dominate the cosine and fully-discounted players contribute
+/// nothing); the `has_possession` flag is left **unscaled** as a categorical
+/// holder marker.
 fn push_team(out: &mut Vec<f64>, team: &[SoccerPlayerKin]) {
     for slot in 0..CONFIG_PLAYERS_PER_TEAM {
         if let Some(k) = team.get(slot) {
@@ -430,6 +442,8 @@ fn push_team(out: &mut Vec<f64>, team: &[SoccerPlayerKin]) {
                 k.vel.y * w,
                 k.acc.x * w,
                 k.acc.y * w,
+                k.jerk.x * w,
+                k.jerk.y * w,
                 k.has_possession,
             ]);
         } else {
@@ -976,10 +990,10 @@ mod tests {
         let f_on = feats(on);
         let f_off = feats(off);
 
-        // Energy of one own slot's six weighted pos/vel/acc channels.
+        // Energy of one own slot's weighted pos/vel/acc/jerk channels.
         let slot_energy = |f: &[f64], slot: usize| -> f64 {
             let base = slot * CONFIG_PER_PLAYER_FLOATS;
-            (0..6).map(|c| f[base + c] * f[base + c]).sum()
+            (0..8).map(|c| f[base + c] * f[base + c]).sum()
         };
         // Slot 0 is the nearest own player to the ball; the last own slot the
         // farthest (position-agnostic sorts own players by ball distance).
@@ -997,7 +1011,10 @@ mod tests {
             "far player must be down-weighted more than the near player \
              (near {near_ratio}, far {far_ratio})"
         );
-        assert!(far_ratio < 1.0, "far player energy must shrink (got {far_ratio})");
+        assert!(
+            far_ratio < 1.0,
+            "far player energy must shrink (got {far_ratio})"
+        );
     }
 
     /// A planned ball path re-centres the proximity weighting on the LANE: an opponent far up the
@@ -1044,8 +1061,9 @@ mod tests {
     #[test]
     fn behind_ball_discount_gate() {
         let opts = ConfigWeightOptions::default();
-        let ball_y = 90.0_f64; // opponent's end
-        let deep_y = ball_y - 10.0; // 10 yd behind the ball
+        // Opponent's end, with the player 10 yd behind the ball.
+        let ball_y = 90.0_f64;
+        let deep_y = ball_y - 10.0;
         // All conditions met ⇒ fully discounted.
         assert_eq!(
             config_player_weight(40.0, deep_y, ball_y, true, true, &opts),
@@ -1101,7 +1119,7 @@ mod tests {
             (0..CONFIG_PLAYERS_PER_TEAM)
                 .filter(|slot| {
                     let base = slot * CONFIG_PER_PLAYER_FLOATS;
-                    (0..6).all(|c| f[base + c] == 0.0)
+                    (0..8).all(|c| f[base + c] == 0.0)
                 })
                 .count()
         };
@@ -1120,11 +1138,12 @@ mod tests {
         let cfg = SoccerConfigVector::from_snapshot(&snap, Team::Home);
         assert_eq!(cfg.to_features().len(), CONFIG_FEATURE_DIM);
         assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
+        assert_eq!(CONFIG_FEATURE_DIM_V2, 164);
         assert_eq!(cfg.embedding().len(), SOCCER_MOMENT_EMBEDDING_DIM);
     }
 
     #[test]
-    fn feature_vector_contains_ball_altitude_and_holder_flags() {
+    fn feature_vector_contains_ball_altitude_jerk_and_holder_flags() {
         let mut snap = sample_snapshot();
         let holder = snap
             .players
@@ -1134,8 +1153,10 @@ mod tests {
             .id;
         snap.ball.holder = Some(holder);
         snap.ball.altitude_yards = 6.0;
+        snap.ball.jerk = Vec2::new(18.0, -36.0);
 
         let features = SoccerConfigVector::from_snapshot(&snap, Team::Home).to_features();
+        let cfg = SoccerConfigVector::from_snapshot(&snap, Team::Home);
         let own_flags = (0..CONFIG_PLAYERS_PER_TEAM)
             .map(|slot| features[slot * CONFIG_PER_PLAYER_FLOATS + CONFIG_PER_PLAYER_FLOATS - 1])
             .collect::<Vec<_>>();
@@ -1153,6 +1174,8 @@ mod tests {
         assert_eq!(own_flags.iter().filter(|&&flag| flag == 1.0).count(), 1);
         assert!(opponent_flags.iter().all(|&flag| flag == 0.0));
         assert!((features[ball_offset + 2] - 0.5).abs() < 1e-9);
+        assert_eq!(features[ball_offset + 7], cfg.ball_jerk[0]);
+        assert_eq!(features[ball_offset + 8], cfg.ball_jerk[1]);
     }
 
     #[test]
