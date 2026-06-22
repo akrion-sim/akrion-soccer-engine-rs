@@ -4356,6 +4356,8 @@ mod tests {
             parameter_count: 8,
             l2_norm: 0.625,
             layers: Vec::new(),
+            training_steps: 0,
+            average_loss: None,
         };
 
         assert_eq!(policies.home.entries()[0].visits, 1);

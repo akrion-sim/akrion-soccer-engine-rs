@@ -1120,6 +1120,8 @@ mod tests {
             parameter_count: 0,
             l2_norm: 0.0,
             layers: vec![layer],
+            training_steps: 0,
+            average_loss: None,
         };
         refresh_snapshot_norm(&mut snapshot);
         snapshot

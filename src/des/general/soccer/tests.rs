@@ -31303,6 +31303,43 @@ fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() 
 }
 
 #[test]
+fn live_gameplay_trains_when_operator_enables_learning() {
+    let mut config = MatchConfig::live_gameplay();
+    config.learning_enabled = true;
+    config.learning_logging_enabled = true;
+    config.learning_interval_ticks = 1;
+    config.policy_train_max_transitions_per_tick = 64;
+    config.full_game_learning_enabled = true;
+    config.neural_learning.enabled = true;
+    config.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+    config.neural_learning.train_every_ticks = 1;
+    config.neural_learning.batch_size = 4;
+    config.neural_learning.max_batches_per_tick = 2;
+    config.neural_learning.hidden_units = 8;
+
+    let mut sim = SoccerMatch::default_11v11(config)
+        .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
+
+    for _ in 0..4 {
+        sim.run_time_step();
+    }
+
+    let learning = sim.learning_snapshot();
+    assert!(learning.learning_enabled);
+    assert!(learning.learning_logging_enabled);
+    assert!(learning.full_game_learning_enabled);
+    assert!(learning.team_policies_enabled);
+    assert!(learning.total_transitions > 0);
+    assert!(learning.full_game_learning_episode_transitions > 0);
+    assert!(learning.home_policy_entries + learning.away_policy_entries > 0);
+    assert!(learning.home_policy_visits + learning.away_policy_visits > 0);
+    assert!(learning.neural_learning_enabled);
+    assert_eq!(learning.neural_learning_backend, "inline");
+    assert!(learning.neural_learning_training_steps > 0);
+    assert!(learning.neural_learning_samples > 0);
+}
+
+#[test]
 fn live_gameplay_executes_tier2_mpc_and_records_reconciliation() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
     assert!(sim.config.mpc.tier2_player_enabled);
