@@ -30926,7 +30926,10 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
         .learning_snapshot()
         .neural_network
         .expect("initial neural snapshot");
-    let previous_dim = SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE;
+    // A legacy snapshot trained on base + the OLD six-channel whole-field motion block (no
+    // jerk, no belief tail). Migration must interleave two zero jerk channels into each
+    // entity's motion slot (6 → 8 channels) and zero-pad the appended belief tail.
+    let previous_dim = SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1;
     assert_eq!(previous_dim, 330);
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&previous_dim));
     let removed_weights = previous_snapshot
@@ -30954,20 +30957,42 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
         .expect("resumed neural snapshot");
 
     assert_eq!(resumed_snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+    // Entity 0, channel 0 sits at the very start of the motion block — its index is unchanged
+    // by the 6→8 interleave.
     assert_eq!(
         resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM],
         0.135_79,
-        "first motion-block weight should remain aligned after belief-tail padding"
+        "first motion-block weight should remain aligned after jerk interleave"
+    );
+    // The LAST old motion channel (the final entity's 6th channel) is remapped from its old
+    // 6-channel slot to its new 8-channel slot: base + entity*8 + channel.
+    let last_old_offset = previous_dim - 1 - SOCCER_NEURAL_BASE_FEATURE_DIM;
+    let last_entity = last_old_offset / SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1;
+    let last_channel = last_old_offset % SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1;
+    let last_new_idx = SOCCER_NEURAL_BASE_FEATURE_DIM
+        + last_entity * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER
+        + last_channel;
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][last_new_idx],
+        0.975_31,
+        "last old motion-block weight should be remapped (not shifted/lost) by the jerk interleave"
+    );
+    // The two NEW jerk channels of entity 0 (channels 6 and 7 of its 8-channel slot) start neutral.
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM + 6],
+        0.0,
+        "new jerk.x channel should start neutral after migration"
     );
     assert_eq!(
-        resumed_snapshot.layers[0].weights[0][previous_dim - 1],
-        0.975_31,
-        "last old motion-block weight should remain aligned after belief-tail padding"
+        resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_BASE_FEATURE_DIM + 7],
+        0.0,
+        "new jerk.y channel should start neutral after migration"
     );
+    // The appended belief tail (right after the jerk-augmented motion block) starts neutral.
     assert_eq!(
         resumed_snapshot.layers[0].weights[0][SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],
         0.0,
-        "new belief-tail input should start neutral for 330-input snapshots"
+        "new belief-tail input should start neutral for a legacy six-channel-motion snapshot"
     );
 }
 
