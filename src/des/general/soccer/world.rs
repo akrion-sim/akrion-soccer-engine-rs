@@ -23632,10 +23632,89 @@ impl WorldSnapshot {
         default
     }
 
-    /// Whether the keeper should leave its box to claim a loose ball at `target`: only
-    /// when near-certain to win it — clearly first ahead of any opponent (arriving in well
-    /// under the nearest opponent's time) AND beating its own nearest teammate to it by
-    /// more than 0.5s. Inside its own penalty area it always claims.
+    /// True if `p` is inside this team's own 6-yard box (goal area): within
+    /// [`SIX_YARD_BOX_DEPTH_YARDS`] of the goal line and within a post + 6yd half-width.
+    pub(crate) fn point_in_own_goal_area(&self, team: Team, p: Vec2) -> bool {
+        let central = (p.x - self.field_width * 0.5).abs()
+            <= self.goal_width * 0.5 + SIX_YARD_BOX_POST_EXTENSION_YARDS;
+        let goal_y = self.own_goal_y_for(team);
+        let depth = (p.y - goal_y) * team.attack_dir();
+        central && (-0.5..=SIX_YARD_BOX_DEPTH_YARDS).contains(&depth)
+    }
+
+    /// Whether the keeper is permitted to LEAVE its 6-yard box to move to `target`. Strong
+    /// box affinity: it only ventures out when (a) the ball has already entered its own
+    /// penalty area (18-yard box) AND (b) BOTH a POMDP race-margin estimate
+    /// ([`keeper_first_to_ball_probability`]) and an MPC bounded-acceleration estimate
+    /// ([`pass_receipt_qp_accel_fit`]) put it ≥ [`GK_LEAVE_BOX_MIN_WIN_PROBABILITY`] likely to
+    /// reach `target` before the EARLIEST of (the nearest attacker, its own nearest teammate)
+    /// — so it never charges out into a 50/50 or across a covering defender. A target already
+    /// inside the 6-yard box, or a non-keeper, is always allowed.
+    pub(crate) fn goalkeeper_may_leave_six_yard_box(&self, keeper_id: usize, target: Vec2) -> bool {
+        let Some(gk) = self.players.iter().find(|p| p.id == keeper_id) else {
+            return false;
+        };
+        if gk.role != PlayerRole::Goalkeeper || self.point_in_own_goal_area(gk.team, target) {
+            return true;
+        }
+        // (a) The ball (this is the loose-ball point the keeper would race to) must be inside
+        // our own penalty area — the keeper never ventures out of its box for a ball that has
+        // not even entered the 18-yard box.
+        if !self.point_in_own_penalty_area(gk.team, target) {
+            return false;
+        }
+        let sprint_time = |p: &PlayerSnapshot| {
+            let speed = (player_top_speed_yps(p.role, &p.skills)
+                * fatigue_speed_factor(p.skills.stamina, p.fatigue)
+                * MovementGait::Sprint.speed_multiplier())
+            .max(1.0);
+            self.player_snapshot_position(p).distance(target) / speed
+        };
+        let gk_time = sprint_time(gk);
+        let opponent_time = self.nearest_opponent_arrival_time_to(gk.team, target);
+        let teammate_time = self
+            .players
+            .iter()
+            .filter(|p| p.team == gk.team && p.id != keeper_id)
+            .map(sprint_time)
+            .fold(f64::INFINITY, f64::min);
+        // Beating the EARLIER rival implies beating both ("before an attacker AND before his
+        // own teammate"), so the earliest arrival is the single binding budget.
+        let earliest_rival = opponent_time.min(teammate_time);
+        if !earliest_rival.is_finite() {
+            return true;
+        }
+        // (b1) POMDP: analytic race-margin probability the keeper is clearly first (top-speed
+        // sprint times).
+        let pomdp_win = keeper_first_to_ball_probability(gk_time, earliest_rival);
+        // (b2) MPC: bounded-acceleration reachability — does the keeper, ramping from its
+        // current closing speed under its acceleration cap, physically get there within the
+        // earliest rival's window? Stricter than the POMDP estimate (it pays the accel ramp).
+        let gk_pos = self.player_snapshot_position(gk);
+        let gk_vel = self.player_velocity(gk.id).unwrap_or(gk.velocity);
+        let distance = gk_pos.distance(target);
+        let speed_toward = if distance > 1e-6 {
+            gk_vel.dot((target - gk_pos) * (1.0 / distance))
+        } else {
+            0.0
+        };
+        let top_speed = (player_top_speed_yps(gk.role, &gk.skills)
+            * fatigue_speed_factor(gk.skills.stamina, gk.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.5);
+        let accel_cap = acceleration_yps2_from_score(gk.skills.acceleration)
+            * fatigue_speed_factor(gk.skills.stamina, gk.fatigue);
+        let mpc_win =
+            keeper_mpc_reach_probability(distance, speed_toward, top_speed, accel_cap, earliest_rival);
+        pomdp_win >= GK_LEAVE_BOX_MIN_WIN_PROBABILITY && mpc_win >= GK_LEAVE_BOX_MIN_WIN_PROBABILITY
+    }
+
+    /// Whether the keeper should leave its box to claim a loose ball at `target`. The keeper
+    /// holds a strong affinity for its 6-yard box: a claim that stays inside the goal area
+    /// uses the existing safe-defer logic (come unless a teammate clearly wins), but a claim
+    /// that would take it OUT of the 6-yard box is allowed only under the strict
+    /// [`Self::goalkeeper_may_leave_six_yard_box`] gate (ball in the 18-yard box + dual
+    /// POMDP/MPC 95% race win over the earliest of attacker / teammate).
     pub(crate) fn goalkeeper_should_commit_to_loose_ball(
         &self,
         keeper_id: usize,
@@ -23659,35 +23738,34 @@ impl WorldSnapshot {
             .filter(|p| p.team == gk.team && p.id != keeper_id)
             .map(sprint_time)
             .fold(f64::INFINITY, f64::min);
-        if self.point_in_own_penalty_area(gk.team, target) {
-            let keeper_can_handle = self
-                .ball
-                .last_touch_team
-                .map_or(true, |last| last != gk.team);
-            if !keeper_can_handle {
-                return gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time;
-            }
-            // In his own box the keeper may come for an opponent-touched loose ball
-            // and use his hands, BUT must NOT charge through a covering teammate who
-            // is the clear favourite to win it — rushing out when a defender is ~99%
-            // going to reach it first caused collisions / own-goals and was a real
-            // flaw. Defer ONLY to a teammate who reaches it clearly before BOTH the
-            // keeper and any opponent (a safe, uncontested win); in a contested 50/50
-            // the keeper still commits.
-            // Genome `gk_commit_aggression` scales how readily he commits: an
-            // aggressive keeper needs the teammate to beat it by a larger margin
-            // before backing off (commits more); a passive keeper defers sooner.
-            // Neutral (0.5) keeps the base margins.
-            let margin_scale = 0.5 + self.genome_for(gk.team).gk_commit_aggression;
-            let defer_margin = GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS * margin_scale;
-            let over_opp_margin = GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS * margin_scale;
-            let teammate_clearly_wins = teammate_time + defer_margin < gk_time
-                && teammate_time + over_opp_margin < opponent_time;
-            return !teammate_clearly_wins;
+        // A claim that would take the keeper OUT of its 6-yard box is allowed only under the
+        // strict leave-box gate: the ball must be in the 18-yard box and BOTH the POMDP and
+        // MPC estimates must put it ≥95% to beat the earliest of (attacker, teammate). This
+        // is the strong box affinity — no charging out into a 50/50 or across a covering man.
+        if !self.point_in_own_goal_area(gk.team, target) {
+            return self.goalkeeper_may_leave_six_yard_box(keeper_id, target);
         }
-        // Out of the box the keeper only sweeps with ~99% certainty: arrive in ≤65% of
-        // the opponent's time AND beat the nearest teammate to it by more than 0.5s.
-        gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time
+        // Inside the 6-yard box (⊂ the penalty area): the keeper claims with his hands, but
+        // must NOT charge through a covering teammate who is the clear favourite to win it —
+        // rushing in when a defender is ~99% going to reach it first caused collisions /
+        // own-goals. Defer ONLY to a teammate who reaches it clearly before BOTH the keeper
+        // and any opponent (a safe, uncontested win); in a contested 50/50 the keeper commits.
+        let keeper_can_handle = self
+            .ball
+            .last_touch_team
+            .map_or(true, |last| last != gk.team);
+        if !keeper_can_handle {
+            return gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time;
+        }
+        // Genome `gk_commit_aggression` scales how readily he commits: an aggressive keeper
+        // needs the teammate to beat it by a larger margin before backing off (commits more);
+        // a passive keeper defers sooner. Neutral (0.5) keeps the base margins.
+        let margin_scale = 0.5 + self.genome_for(gk.team).gk_commit_aggression;
+        let defer_margin = GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS * margin_scale;
+        let over_opp_margin = GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS * margin_scale;
+        let teammate_clearly_wins = teammate_time + defer_margin < gk_time
+            && teammate_time + over_opp_margin < opponent_time;
+        !teammate_clearly_wins
     }
 
     fn nearest_opponent_arrival_time_to(&self, team: Team, target: Vec2) -> f64 {

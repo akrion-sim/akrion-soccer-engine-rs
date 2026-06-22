@@ -803,6 +803,79 @@ fn learnable_pass_velocity_drives_a_contested_lane_harder_than_an_open_one() {
 }
 
 #[test]
+fn goalkeeper_holds_six_yard_box_unless_clear_winner_in_penalty_area() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 31_337,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("home keeper");
+    let away_outfielder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    // Park everyone but the keeper far upfield so they are no rival to a ball near our goal.
+    for p in sim.players.iter_mut() {
+        if p.id != keeper {
+            p.position = Vec2::new(40.0, 95.0);
+            p.velocity = Vec2::zero();
+        }
+    }
+    sim.players[keeper].position = Vec2::new(40.0, 1.0);
+    sim.players[keeper].velocity = Vec2::zero();
+
+    let cx = sim.config.field_width_yards * 0.5;
+    let in_box_target = Vec2::new(cx, 3.0); // inside the 6-yard box
+    let out_box_target = Vec2::new(cx, 11.0); // outside the 6-yard box, inside the 18
+
+    // Geometry helpers.
+    {
+        let snap = WorldSnapshot::from_match(&sim);
+        assert!(snap.point_in_own_goal_area(Team::Home, in_box_target));
+        assert!(!snap.point_in_own_goal_area(Team::Home, out_box_target));
+    }
+
+    // (1) Loose ball OUTSIDE the penalty area: the keeper must not leave its box, whatever
+    // the race — it never chases a ball that has not even entered the 18-yard box.
+    {
+        let far_target = Vec2::new(cx, 30.0); // beyond the 18-yard box
+        let snap = WorldSnapshot::from_match(&sim);
+        assert!(
+            !snap.goalkeeper_may_leave_six_yard_box(keeper, far_target),
+            "ball outside the 18-yard box: keeper holds its 6-yard box"
+        );
+    }
+
+    // (2) Ball INSIDE the penalty area, keeper uncontested (rivals parked away): may leave.
+    {
+        let snap = WorldSnapshot::from_match(&sim);
+        assert!(
+            snap.goalkeeper_may_leave_six_yard_box(keeper, out_box_target),
+            "ball in the 18-yard box and keeper a clear winner: may leave to claim it"
+        );
+        assert!(snap.goalkeeper_should_commit_to_loose_ball(keeper, out_box_target));
+    }
+
+    // (3) Same ball, but an attacker sits right on the target — a 50/50, not a 95% win.
+    sim.players[away_outfielder].position = Vec2::new(cx, 12.0);
+    {
+        let snap = WorldSnapshot::from_match(&sim);
+        assert!(
+            !snap.goalkeeper_may_leave_six_yard_box(keeper, out_box_target),
+            "contested ball: neither POMDP nor MPC clears 95%, so the keeper holds"
+        );
+        assert!(!snap.goalkeeper_should_commit_to_loose_ball(keeper, out_box_target));
+    }
+}
+
+#[test]
 fn mpc_reselects_normal_shot_when_execution_is_poor() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -46582,8 +46655,12 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         .id;
     let width = sim.config.field_width_yards;
     let length = sim.config.field_length_yards;
-    let target = Vec2::new(width * 0.5, 8.0); // a loose ball inside the home box
+    // A loose ball in the penalty area but OUTSIDE the keeper's 6-yard box: under the strong
+    // box-affinity rule the keeper leaves the 6-box for it only when it clearly wins the race
+    // (POMDP + MPC ≥95%) ahead of both the nearest attacker and its own nearest teammate.
+    let target = Vec2::new(width * 0.5, 8.0);
     assert!(sim.point_in_own_penalty_area(Team::Home, target));
+    assert!(!WorldSnapshot::from_match(&sim).point_in_own_goal_area(Team::Home, target));
     park_players_except(&mut sim, &[keeper, defender, threat]);
     sim.players[keeper].position = Vec2::new(width * 0.5, 1.0); // deep on his line
     sim.players[threat].position = Vec2::new(width - 6.0, length - 5.0);
@@ -46605,22 +46682,24 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         "keeper must commit to the in-box loose ball when no teammate is winning it"
     );
 
-    // If the loose ball was touched last by his own team, the keeper cannot use
-    // hands. With an opponent near, the old automatic in-box claim must not fire.
+    // An attacker right on top of the ball means the keeper is no longer a ≥95% winner of the
+    // race out of its box — so under the strong box-affinity rule it holds, whether the ball
+    // was last touched by its own team (no hand-claim) ...
     sim.ball.last_touch_team = Some(Team::Home);
     sim.players[threat].position = target + Vec2::new(2.0, 0.0);
     let snapshot = WorldSnapshot::from_match(&sim);
     assert!(
         !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
-        "keeper must not get an automatic hand-claim path after an own-team touch"
+        "keeper holds its box when an attacker is on the ball (own-team touch)"
     );
 
-    // The same geometry is claimable when the opponent touched it last.
+    // ... or by the opponent: a contested ball outside the 6-yard box is no longer an
+    // automatic claim — the keeper only leaves the box for a clear (≥95%) win.
     sim.ball.last_touch_team = Some(Team::Away);
     let snapshot = WorldSnapshot::from_match(&sim);
     assert!(
-        snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
-        "keeper may claim the same in-box loose ball when the opponent touched it last"
+        !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper holds its box for a contested out-of-6-box ball even on an opponent touch"
     );
 }
 

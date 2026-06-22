@@ -2711,6 +2711,13 @@ const GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS: f64 = 0.25;
 /// ball, rushing through a covering defender who was ~99% going to win it (a real
 /// flaw: collisions / own-goals). In a contested 50/50 the keeper still commits.
 const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
+/// Strong 6-yard-box affinity: the keeper only ventures OUT of its goal area when the ball
+/// has entered its own penalty area AND BOTH a POMDP race-margin estimate and an MPC
+/// bounded-acceleration estimate put it at least this likely to reach the ball before the
+/// earliest of (the nearest attacker, its own nearest teammate). Otherwise it holds in the
+/// box. 0.95 ⇒ it arrives in roughly ≤70% of the earliest rival's time AND the QP solver
+/// confirms it can physically get there in that window.
+const GK_LEAVE_BOX_MIN_WIN_PROBABILITY: f64 = 0.95;
 /// The keeper EXECUTES its positioning strategy (line height / angle / sweep) via
 /// the MPC layer too, over a wider range than an outfield presser (it tracks the
 /// ball from its line), so it joins the MPC active subset whenever the ball is
@@ -45737,6 +45744,53 @@ fn goalkeeper_flank_width_score(position: Vec2, field_width: f64) -> f64 {
     let center_x = field_width * 0.5;
     let half_width = center_x.max(1.0);
     ((position.x - center_x).abs() / half_width).clamp(0.0, 1.0)
+}
+
+/// POMDP race-margin estimate: the probability the keeper reaches the ball before the
+/// `earliest_rival_time` (the smaller of the nearest attacker's and nearest teammate's sprint
+/// time). 0.5 at a dead heat, rising with the keeper's fractional time lead — it reaches ~0.95
+/// when the keeper arrives in ~70% of the rival's time (the same "near-certain" margin the
+/// keeper already uses to sweep). Beating the earliest rival implies beating both, so this one
+/// scalar expresses "before an attacker AND before his own teammate".
+fn keeper_first_to_ball_probability(gk_time: f64, earliest_rival_time: f64) -> f64 {
+    if !earliest_rival_time.is_finite() {
+        return 1.0;
+    }
+    if gk_time <= 1e-6 {
+        return 1.0;
+    }
+    let lead = (earliest_rival_time - gk_time) / earliest_rival_time.max(gk_time).max(0.2);
+    (0.5 + lead * 1.55).clamp(0.0, 1.0)
+}
+
+/// MPC bounded-acceleration estimate: the probability the keeper physically reaches a point
+/// `distance` away within `budget` seconds, starting from its current closing speed
+/// `speed_toward` and ramping under its acceleration cap up to `top_speed`. Unlike the POMDP
+/// estimate (which uses the instantaneous top-speed sprint time), this models the
+/// acceleration ramp — so a keeper starting from rest is correctly judged slower to arrive —
+/// and is the second, independent confirmation the keeper must clear before leaving its box.
+fn keeper_mpc_reach_probability(
+    distance: f64,
+    speed_toward: f64,
+    top_speed: f64,
+    accel: f64,
+    budget: f64,
+) -> f64 {
+    if distance <= PLAYER_CONTROL_RADIUS_YARDS {
+        return 1.0;
+    }
+    let v0 = speed_toward.clamp(0.0, top_speed);
+    let vmax = top_speed.max(0.5);
+    let a = accel.max(0.5);
+    let time_to_vmax = ((vmax - v0) / a).max(0.0);
+    let distance_to_vmax = v0 * time_to_vmax + 0.5 * a * time_to_vmax * time_to_vmax;
+    let reach_time = if distance_to_vmax >= distance {
+        // Reaches the point while still accelerating: solve 0.5·a·t² + v0·t − d = 0.
+        (-v0 + (v0 * v0 + 2.0 * a * distance).sqrt()) / a
+    } else {
+        time_to_vmax + (distance - distance_to_vmax) / vmax
+    };
+    keeper_first_to_ball_probability(reach_time, budget)
 }
 
 fn goalkeeper_backward_emergency_release_allowed(
