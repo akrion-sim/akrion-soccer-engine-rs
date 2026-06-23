@@ -930,6 +930,75 @@ fn goalkeeper_mpc_distribution_avoids_a_marked_teammate_for_a_deliverable_one() 
 }
 
 #[test]
+fn goalkeeper_mpc_distribution_rolls_when_clear_and_lofts_over_a_block() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_001,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("home keeper");
+    let mate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("home outfielder");
+    let blocker = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let cx = width * 0.5;
+    // Make `mate` the ONLY sensible play-out: bury every other team-mate at the far end
+    // (undeliverable) and every opponent far away, so only `blocker` matters to the lane.
+    for p in sim.players.iter_mut() {
+        p.velocity = Vec2::zero();
+        if p.id == keeper {
+            p.position = Vec2::new(cx, 2.0);
+        } else if p.id == mate {
+            p.position = Vec2::new(cx, 30.0);
+        } else if p.team == Team::Home {
+            p.position = Vec2::new(cx, length - 8.0);
+        } else {
+            p.position = Vec2::new(width - 4.0, length - 4.0);
+        }
+    }
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = Vec2::new(cx, 2.0);
+
+    // A clear ground lane → roll it out (the controllable technique).
+    let (target, flight) = WorldSnapshot::from_match(&sim)
+        .goalkeeper_mpc_distribution_for(keeper)
+        .expect("a deliverable play-out");
+    assert_eq!(target, mate);
+    assert_eq!(
+        flight,
+        PassFlight::Floor,
+        "MPC should roll a clear ground lane rather than loft it"
+    );
+
+    // A defender squarely in the ground lane → loft OVER it (the ground roll is undeliverable).
+    sim.players[blocker].position = Vec2::new(cx, 16.0);
+    let (target2, flight2) = WorldSnapshot::from_match(&sim)
+        .goalkeeper_mpc_distribution_for(keeper)
+        .expect("a deliverable play-out");
+    assert_eq!(target2, mate);
+    assert_eq!(
+        flight2,
+        PassFlight::Aerial,
+        "MPC should loft over a defender blocking the ground lane"
+    );
+}
+
+#[test]
 fn goalkeeper_cannot_handle_the_ball_outside_its_box() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");

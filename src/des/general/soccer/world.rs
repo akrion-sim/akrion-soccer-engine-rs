@@ -23667,11 +23667,11 @@ impl WorldSnapshot {
     /// Whether the keeper is permitted to LEAVE its 6-yard box to move to `target`. Strong
     /// box affinity: it only ventures out when (a) the ball has already entered its own
     /// penalty area (18-yard box) AND (b) BOTH a POMDP race-margin estimate
-    /// ([`keeper_first_to_ball_probability`]) and an MPC bounded-acceleration estimate
-    /// ([`pass_receipt_qp_accel_fit`]) put it ≥ [`GK_LEAVE_BOX_MIN_WIN_PROBABILITY`] likely to
-    /// reach `target` before the EARLIEST of (the nearest attacker, its own nearest teammate)
-    /// — so it never charges out into a 50/50 or across a covering defender. A target already
-    /// inside the 6-yard box, or a non-keeper, is always allowed.
+    /// ([`keeper_first_to_ball_probability`]) and an MPC bounded-acceleration reachability
+    /// estimate ([`keeper_mpc_reach_probability`]) put it ≥ [`GK_LEAVE_BOX_MIN_WIN_PROBABILITY`]
+    /// likely to reach `target` before the EARLIEST of (the nearest attacker, its own nearest
+    /// teammate) — so it never charges out into a 50/50 or across a covering defender. A target
+    /// already inside the 6-yard box, or a non-keeper, is always allowed.
     pub(crate) fn goalkeeper_may_leave_six_yard_box(&self, keeper_id: usize, target: Vec2) -> bool {
         let Some(gk) = self.players.iter().find(|p| p.id == keeper_id) else {
             return false;
@@ -23745,6 +23745,14 @@ impl WorldSnapshot {
         let Some(gk) = self.players.iter().find(|p| p.id == keeper_id) else {
             return false;
         };
+        // A claim that would take the keeper OUT of its 6-yard box is allowed only under the
+        // strict leave-box gate: the ball must be in the 18-yard box and BOTH the POMDP and
+        // MPC estimates must put it ≥95% to beat the earliest of (attacker, teammate). This
+        // is the strong box affinity — no charging out into a 50/50 or across a covering man.
+        // Checked first so the in-box race below is only computed for an in-box claim.
+        if !self.point_in_own_goal_area(gk.team, target) {
+            return self.goalkeeper_may_leave_six_yard_box(keeper_id, target);
+        }
         let sprint_time = |p: &PlayerSnapshot| {
             let speed = (player_top_speed_yps(p.role, &p.skills)
                 * fatigue_speed_factor(p.skills.stamina, p.fatigue)
@@ -23760,13 +23768,6 @@ impl WorldSnapshot {
             .filter(|p| p.team == gk.team && p.id != keeper_id)
             .map(sprint_time)
             .fold(f64::INFINITY, f64::min);
-        // A claim that would take the keeper OUT of its 6-yard box is allowed only under the
-        // strict leave-box gate: the ball must be in the 18-yard box and BOTH the POMDP and
-        // MPC estimates must put it ≥95% to beat the earliest of (attacker, teammate). This
-        // is the strong box affinity — no charging out into a 50/50 or across a covering man.
-        if !self.point_in_own_goal_area(gk.team, target) {
-            return self.goalkeeper_may_leave_six_yard_box(keeper_id, target);
-        }
         // Inside the 6-yard box (⊂ the penalty area): the keeper claims with his hands, but
         // must NOT charge through a covering teammate who is the clear favourite to win it —
         // rushing in when a defender is ~99% going to reach it first caused collisions /
@@ -23856,9 +23857,19 @@ impl WorldSnapshot {
                     keeper_pressure,
                 );
                 // MPC deliverability dominates; receiver openness and the territorial flank
-                // preference only shade the choice among genuinely deliverable options.
-                let score =
-                    mpc.probability * 3.0 + openness * 1.2 + distribution_preference * 0.12;
+                // preference only shade the choice among genuinely deliverable options. A clear
+                // ground lane gets a small technique nudge so the keeper rolls a controllable
+                // ball out when it can, and only lofts when the ground option is blocked.
+                let technique_preference = if matches!(flight, PassFlight::Floor) && lane_clear_now
+                {
+                    GK_MPC_DISTRIBUTION_GROUND_TECHNIQUE_PREF
+                } else {
+                    0.0
+                };
+                let score = mpc.probability * 3.0
+                    + openness * 1.2
+                    + distribution_preference * 0.12
+                    + technique_preference;
                 if best.as_ref().map_or(true, |(best_score, _, _)| score > *best_score) {
                     best = Some((score, receiver.id, flight));
                 }

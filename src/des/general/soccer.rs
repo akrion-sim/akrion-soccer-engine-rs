@@ -2724,6 +2724,11 @@ const GK_LEAVE_BOX_MIN_WIN_PROBABILITY: f64 = 0.95;
 /// must clear this floor for the (receiver, technique) to be a candidate. Below it nothing is
 /// cleanly deliverable and the keeper holds / clears via the existing logic.
 const GK_MPC_DISTRIBUTION_MIN_RECEIPT: f64 = 0.45;
+/// Small preference for rolling the ball out along the ground (a controllable, fast-arriving
+/// delivery) when that lane is clear, so the keeper only lofts it when the ground option is
+/// blocked or a loft is markedly more deliverable. Keeps the ground-vs-aerial technique choice
+/// deterministic and sensible rather than flipping on a near-tie.
+const GK_MPC_DISTRIBUTION_GROUND_TECHNIQUE_PREF: f64 = 0.35;
 /// The keeper EXECUTES its positioning strategy (line height / angle / sweep) via
 /// the MPC layer too, over a wider range than an outfield presser (it tracks the
 /// ball from its line), so it joins the MPC active subset whenever the ball is
