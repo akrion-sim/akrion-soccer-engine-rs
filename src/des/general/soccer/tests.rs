@@ -256,6 +256,9 @@ fn mpc_latent_objective_learns_from_pass_chains_shots_and_goals() {
     let after_three = sim.mpc_latent_objective(Team::Home);
     assert!(after_three.pass_chain_continuity > after_two.pass_chain_continuity);
 
+    // Shot-on-target credit is now distance-gated to within 20yd of goal, so the shooter must be
+    // in genuine shooting range for the latent objective to register shot pressure.
+    sim.players[home_ids[3]].position = Vec2::new(40.0, 108.0);
     sim.record_shot_on_target_rewards(Team::Home, home_ids[3]);
     let after_shot = sim.mpc_latent_objective(Team::Home);
     assert!(after_shot.shot_pressure > 0.0);
@@ -4289,15 +4292,16 @@ fn goal_proximity_raises_shot_and_killer_pass_pressure() {
     // and the floor's monotonic rise with proximity can be exercised.
     observation.opposing_goalkeeper_out_of_position = 0.9;
 
-    observation.yards_to_goal = 42.0;
+    // Ranges within the 30yd shot cap (no shot is taken beyond it now), ramping in toward goal.
+    observation.yards_to_goal = 28.0;
     observation.goal_attack_window_score = 0.08;
     let long_range_shot_floor =
         goal_proximity_shot_pressure_floor(&observation, PlayerRole::Forward, ability01(8.2));
-    observation.yards_to_goal = 34.0;
+    observation.yards_to_goal = 18.0;
     observation.goal_attack_window_score = 0.22;
     let mid_range_shot_floor =
         goal_proximity_shot_pressure_floor(&observation, PlayerRole::Forward, ability01(8.2));
-    observation.yards_to_goal = 28.0;
+    observation.yards_to_goal = 10.0;
     observation.goal_attack_window_score = 0.44;
     let close_range_shot_floor =
         goal_proximity_shot_pressure_floor(&observation, PlayerRole::Forward, ability01(8.2));
@@ -4650,7 +4654,7 @@ fn near_goal_decisive_pressure_prefers_shot_or_killer_pass_over_recycling() {
         Some(receiver)
     );
     let mut observation = snapshot.observation_for(passer);
-    observation.yards_to_goal = 34.0;
+    observation.yards_to_goal = 24.0;
     observation.shot_lane_open = true;
     observation.shot_block_probability = 0.20;
     observation.shot_on_frame_probability = 0.64;
@@ -27549,7 +27553,9 @@ fn clean_twenty_yard_window_forces_shot_even_below_quality_gate() {
 }
 
 #[test]
-fn elite_shot_speed_can_reach_sixty_mph_cap() {
+fn elite_shot_speed_reaches_seventy_near_the_cap() {
+    // Shots now leave the boot at 50-72 mph (clearly faster than any pass). An elite full-power
+    // strike reaches ~70 mph, just under the 72 mph hard cap.
     let skills = SkillProfile {
         shooting: 10.0,
         right_foot_shot_power: 10.0,
@@ -27560,17 +27566,17 @@ fn elite_shot_speed_can_reach_sixty_mph_cap() {
 
     let speed = shot_speed_yps_from_power(shot_power_for_skill(1.0), &skills);
 
-    assert!(speed <= mph_to_yps(60.0) + 1e-9);
-    assert!(speed >= mph_to_yps(59.0));
+    assert!(speed <= mph_to_yps(72.0) + 1e-9);
+    assert!(speed >= mph_to_yps(69.0));
 }
 
 #[test]
-fn shot_launch_speed_stays_within_forty_to_sixty_mph_band() {
-    // A shot on goal must leave the boot at 40-60 mph: even a zero-power placed
-    // effort clears the 40 mph floor, and a full-power elite strike is capped at
-    // 60. Sweep the whole power x technique space; every launch stays in band.
-    let floor = mph_to_yps(40.0);
-    let cap = mph_to_yps(60.0);
+fn shot_launch_speed_stays_within_fifty_to_seventytwo_mph_band() {
+    // A shot on goal must leave the boot at 50-72 mph (clearly above the pass band so it reads as
+    // a strike): even a zero-power placed effort clears the 50 mph floor, and a full-power elite
+    // strike tops out near 70, under the 72 mph cap. Sweep the whole power x technique space.
+    let floor = mph_to_yps(50.0);
+    let cap = mph_to_yps(72.0);
     let weak = SkillProfile {
         shooting: 0.0,
         right_foot_shot_power: 0.0,
@@ -27598,22 +27604,23 @@ fn shot_launch_speed_stays_within_forty_to_sixty_mph_band() {
             let speed = shot_speed_yps_from_power(power, skills);
             assert!(
                 speed >= floor - 1e-9 && speed <= cap + 1e-9,
-                "shot launch must stay in the 40-60 mph band (power={power}, speed_yps={speed})"
+                "shot launch must stay in the 50-72 mph band (power={power}, speed_yps={speed})"
             );
         }
     }
 
-    // The floor is genuinely reached: a zero-power poke still leaves at exactly 40 mph.
+    // The floor is genuinely reached: a zero-power poke still leaves at exactly 50 mph.
     assert!((shot_speed_yps_from_power(0.0, &weak) - floor).abs() < 1e-9);
-    // The cap is genuinely reached: an elite full-power strike tops out at 60 mph.
-    assert!((shot_speed_yps_from_power(1.0, &elite) - cap).abs() < mph_to_yps(0.5));
+    // An elite full-power strike tops out near 70 mph (just under the 72 mph cap).
+    let elite_full = shot_speed_yps_from_power(1.0, &elite);
+    assert!(elite_full >= mph_to_yps(69.0) && elite_full <= cap + 1e-9);
 }
 
 #[test]
-fn struck_shot_releases_the_ball_in_the_forty_to_sixty_band() {
+fn struck_shot_releases_the_ball_in_the_fifty_to_seventytwo_band() {
     // End-to-end guard on the launch path (`apply_player_intent` -> Shoot): a
     // planted shooter (no body momentum, so the kick-power factor is a full 1.0)
-    // must send the ball away at the 40-60 mph shot pace, not a slow roll.
+    // must send the ball away at the 50-72 mph shot pace, not a slow roll.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 7_788,
@@ -27643,8 +27650,8 @@ fn struck_shot_releases_the_ball_in_the_forty_to_sixty_band() {
     assert!(sim.ball.holder.is_none(), "the strike must release the ball");
     let launch = sim.ball.velocity.len();
     assert!(
-        launch >= mph_to_yps(40.0) - 1e-6 && launch <= mph_to_yps(60.0) + 1e-6,
-        "a planted strike must leave the boot at 40-60 mph (got {launch} yps)"
+        launch >= mph_to_yps(50.0) - 1e-6 && launch <= mph_to_yps(72.0) + 1e-6,
+        "a planted strike must leave the boot at 50-72 mph (got {launch} yps)"
     );
 }
 
@@ -65583,7 +65590,8 @@ fn near_goal_shot_and_killer_pass_pressure_both_ramp_over_recycling() {
 
     let mut previous_decisive = 0.0;
     let mut previous_thread_pressure = 0.0;
-    for (idx, y) in [82.0, 88.0, 94.0].into_iter().enumerate() {
+    // Positions within the 30yd shot cap (yards_to_goal = 120 - y => 26, 20, 14), ramping in.
+    for (idx, y) in [94.0, 100.0, 106.0].into_iter().enumerate() {
         sim.players[attacker].position = Vec2::new(39.0, y);
         sim.players[attacker].velocity = Vec2::new(0.2, 4.0);
         sim.players[runner].position = Vec2::new(47.0, (y + 12.0).min(108.0));
@@ -65655,10 +65663,15 @@ fn near_goal_shot_and_killer_pass_pressure_both_ramp_over_recycling() {
                     "goal approach should preserve a real shot threat once inside the shot-pressure window: y={y} shoot={shoot} options={options:?}"
                 );
         }
-        assert!(
+        // The killer-pass option is preserved through the build-up, but very close to goal it
+        // deliberately yields to the shot (decisive prob saturates) — only require it while the
+        // shot family has not saturated.
+        if decisive < 0.95 {
+            assert!(
                 killer >= 0.16,
-                "goal approach should preserve the single killer-pass option: y={y} killer={killer} options={options:?}"
+                "build-up should preserve the single killer-pass option: y={y} killer={killer} options={options:?}"
             );
+        }
         let decisive_recycle_ratio = if idx == 0 { 1.0 } else { 2.4 };
         assert!(
                 decisive > recycle * decisive_recycle_ratio,
@@ -65706,7 +65719,8 @@ fn goal_proximity_lifts_shot_and_single_threaded_pass_together() {
     let mut previous_killer_score = 0.0;
     let mut previous_decisive_probability = 0.0;
     let mut previous_recycle_probability = f64::INFINITY;
-    for (idx, y) in [82.0, 88.0, 94.0].into_iter().enumerate() {
+    // Positions within the 30yd shot cap (yards_to_goal = 120 - y => 26, 20, 14), ramping in.
+    for (idx, y) in [94.0, 100.0, 106.0].into_iter().enumerate() {
         sim.players[attacker].position = Vec2::new(39.0, y);
         sim.players[attacker].velocity = Vec2::new(0.2, 3.8);
         sim.players[runner].position = Vec2::new(47.0, (y + 12.0).min(108.0));
@@ -65759,10 +65773,14 @@ fn goal_proximity_lifts_shot_and_single_threaded_pass_together() {
                     shot_score > previous_shot_score,
                     "shot score should rise as the same attacker gets closer to goal: y={y} shot={shot_score} previous={previous_shot_score} options={options:?}"
                 );
+            // The killer pass strengthens through the build-up, then yields to the shot very close
+            // to goal (deliberately suppressed in favour of shooting) — so require it to rise OR to
+            // have given way to a still-rising shot.
             assert!(
-                    killer_score > previous_killer_score,
-                    "single threaded killer-pass score should rise with goal proximity: y={y} killer={killer_score} previous={previous_killer_score} options={options:?}"
-                );
+                killer_score > previous_killer_score
+                    || (killer_score <= 1e-9 && shot_score > previous_shot_score),
+                "killer-pass should rise with goal proximity or yield to the dominant shot: y={y} killer={killer_score} previous={previous_killer_score} shot={shot_score} options={options:?}"
+            );
             if previous_decisive_probability < 0.95 {
                 assert!(
                         decisive_probability > previous_decisive_probability + 0.035,
@@ -66312,7 +66330,8 @@ fn clear_goal_approach_shot_probability_ramps_before_must_shoot_window() {
     sim.players[keeper].skills.goalkeeping = 5.0;
 
     let mut previous_shoot = 0.0;
-    for (idx, y) in [88.0, 94.0, 100.0].into_iter().enumerate() {
+    // Within the 30yd shot cap (yards_to_goal = 120 - y => 26, 20, 14), ramping toward goal.
+    for (idx, y) in [94.0, 100.0, 106.0].into_iter().enumerate() {
         sim.players[attacker].position = Vec2::new(40.0, y);
         sim.players[attacker].velocity = Vec2::new(0.0, 4.0);
         sim.ball.holder = Some(attacker);
@@ -66345,10 +66364,18 @@ fn clear_goal_approach_shot_probability_ramps_before_must_shoot_window() {
             .map(|option| option.probability)
             .unwrap_or(0.0);
         if idx > 0 {
-            assert!(
+            if previous_shoot < 0.9 {
+                assert!(
                     shoot > previous_shoot + 0.05,
                     "clear shot probability should ramp as goal gets closer: y={y} shoot={shoot} previous={previous_shoot} options={options:?}"
                 );
+            } else {
+                // Inside the 30yd cap a clean shot saturates quickly; once high it must stay high.
+                assert!(
+                    shoot >= previous_shoot - 1e-6,
+                    "saturated clear shot probability should stay high near goal: y={y} shoot={shoot} previous={previous_shoot} options={options:?}"
+                );
+            }
         }
         previous_shoot = shoot;
     }
@@ -66375,7 +66402,8 @@ fn away_clear_goal_approach_shot_probability_ramps_toward_home_goal() {
     sim.players[keeper].skills.goalkeeping = 5.0;
 
     let mut previous_shoot = 0.0;
-    for (idx, y) in [32.0_f64, 26.0, 20.0].into_iter().enumerate() {
+    // Within the 30yd shot cap (Away goal at y=0 => yards = y => 26, 20, 14), ramping toward goal.
+    for (idx, y) in [26.0_f64, 20.0, 14.0].into_iter().enumerate() {
         sim.players[attacker].position = Vec2::new(40.0, y);
         sim.players[attacker].velocity = Vec2::new(0.0, -4.0);
         sim.ball.holder = Some(attacker);
@@ -66417,10 +66445,18 @@ fn away_clear_goal_approach_shot_probability_ramps_toward_home_goal() {
             })
             .sum::<f64>();
         if idx > 0 {
-            assert!(
+            if previous_shoot < 0.9 {
+                assert!(
                     shoot > previous_shoot + 0.05,
                     "away clear shot probability should ramp as home goal gets closer: y={y} shoot={shoot} previous={previous_shoot} options={options:?}"
                 );
+            } else {
+                // Inside the 30yd cap a clean shot saturates quickly; once high it must stay high.
+                assert!(
+                    shoot >= previous_shoot - 1e-6,
+                    "saturated away clear shot probability should stay high near goal: y={y} shoot={shoot} previous={previous_shoot} options={options:?}"
+                );
+            }
         }
         // Beyond ~30 yds the keeper saves ~95%, so shooting is (correctly) no
         // longer favored over driving/recycling — only assert it inside range.
