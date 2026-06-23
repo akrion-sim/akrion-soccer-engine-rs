@@ -614,6 +614,35 @@ impl SoccerStepTimingStats {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SoccerNeuralMctsCandidate {
+    label: String,
+    score: f64,
+    prior: f64,
+    q_visits: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SoccerNeuralMctsNode {
+    label: String,
+    raw_score: f64,
+    value_estimate: f64,
+    prior: f64,
+    q_visits: u32,
+    search_visits: u32,
+    total_value: f64,
+}
+
+impl SoccerNeuralMctsNode {
+    fn mean_value(&self) -> f64 {
+        if self.search_visits == 0 {
+            self.value_estimate
+        } else {
+            self.total_value / f64::from(self.search_visits)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,6 +1007,35 @@ mod tests {
             assert_ne!(index, dribble, "{label} collapsed back into dribble");
             assert_eq!(SOCCER_POLICY_ACTIONS[index], label);
         }
+    }
+
+    #[test]
+    fn neural_mcts_uses_priors_when_values_are_tied() {
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 4,
+            mcts_candidates: 2,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                score: 0.5,
+                prior: 0.8,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                score: 0.5,
+                prior: 0.1,
+                q_visits: 1,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates).as_deref(),
+            Some("pass")
+        );
     }
 
     #[test]
@@ -2377,6 +2435,20 @@ impl SoccerMatch {
             neural_learning_parameter_count: neural_stats
                 .map(|stats| stats.parameter_count)
                 .unwrap_or(0),
+            marl_learning_enabled: self.config.learning_enabled && self.config.neural_learning.marl_enabled(),
+            marl_algorithm: self.config.neural_learning.marl_algorithm.as_str().to_string(),
+            marl_team_reward_weight: self
+                .config
+                .neural_learning
+                .sanitized_marl_team_reward_weight(),
+            marl_intermediate_reward_weight: self
+                .config
+                .neural_learning
+                .sanitized_marl_intermediate_reward_weight(),
+            mappo_enabled: self.config.learning_enabled
+                && self.config.neural_learning.mappo_enabled()
+                && self.neural_blend.actor_critic,
+            mappo_clip_epsilon: self.config.neural_learning.sanitized_mappo_clip_epsilon(),
             neural_learning_target_clip: self.config.neural_learning.sanitized_target_clip(),
             neural_learning_snapshot_every_batches: self
                 .config
@@ -3079,6 +3151,141 @@ impl SoccerMatch {
         }
     }
 
+    fn neural_mcts_action_from_candidates(
+        blend: SoccerNeuralBlendConfig,
+        candidates: &[SoccerNeuralMctsCandidate],
+    ) -> Option<String> {
+        if !blend.mcts_enabled {
+            return None;
+        }
+        let candidate_count = blend.sanitized_mcts_candidates().min(candidates.len());
+        if candidate_count < 2 {
+            return None;
+        }
+        let simulations = blend.sanitized_mcts_simulations();
+        let exploration = blend.sanitized_mcts_exploration();
+        let candidates = &candidates[..candidate_count];
+        let min_score = candidates
+            .iter()
+            .map(|candidate| candidate.score)
+            .fold(f64::INFINITY, f64::min);
+        let max_score = candidates
+            .iter()
+            .map(|candidate| candidate.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !min_score.is_finite() || !max_score.is_finite() {
+            return None;
+        }
+        let score_span = (max_score - min_score).abs();
+        let mut raw_priors = Vec::with_capacity(candidate_count);
+        let mut prior_sum = 0.0;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let rank_floor = 0.05 / (index as f64 + 1.0);
+            let raw = candidate.prior.max(0.0) + rank_floor;
+            raw_priors.push(raw);
+            prior_sum += raw;
+        }
+        let uniform_prior = 1.0 / candidate_count as f64;
+        let mut nodes = candidates
+            .iter()
+            .zip(raw_priors.iter())
+            .map(|(candidate, raw_prior)| {
+                let value_estimate = if score_span > 1e-9 {
+                    (((candidate.score - min_score) / score_span) * 2.0 - 1.0).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                SoccerNeuralMctsNode {
+                    label: candidate.label.clone(),
+                    raw_score: candidate.score,
+                    value_estimate,
+                    prior: if prior_sum > 1e-9 {
+                        raw_prior / prior_sum
+                    } else {
+                        uniform_prior
+                    },
+                    q_visits: candidate.q_visits,
+                    search_visits: 0,
+                    total_value: 0.0,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..simulations {
+            let total_visits = nodes
+                .iter()
+                .map(|node| f64::from(node.search_visits))
+                .sum::<f64>()
+                .max(1.0);
+            let sqrt_total = total_visits.sqrt();
+            let mut best_index = 0usize;
+            let mut best_puct = f64::NEG_INFINITY;
+            for (index, node) in nodes.iter().enumerate() {
+                let exploit = node.mean_value();
+                let explore = exploration * node.prior * sqrt_total
+                    / (1.0 + f64::from(node.search_visits));
+                let puct = exploit + explore;
+                let replace = puct
+                    .total_cmp(&best_puct)
+                    .then_with(|| node.raw_score.total_cmp(&nodes[best_index].raw_score))
+                    .then_with(|| nodes[best_index].q_visits.cmp(&node.q_visits))
+                    .is_gt();
+                if replace {
+                    best_index = index;
+                    best_puct = puct;
+                }
+            }
+            let rollout_value = nodes[best_index].value_estimate;
+            nodes[best_index].total_value += rollout_value;
+            nodes[best_index].search_visits = nodes[best_index].search_visits.saturating_add(1);
+        }
+
+        nodes
+            .into_iter()
+            .max_by(|a, b| {
+                a.search_visits
+                    .cmp(&b.search_visits)
+                    .then_with(|| a.mean_value().total_cmp(&b.mean_value()))
+                    .then_with(|| a.raw_score.total_cmp(&b.raw_score))
+                    .then_with(|| b.q_visits.cmp(&a.q_visits))
+            })
+            .map(|node| node.label)
+    }
+
+    fn neural_mcts_model_rollout_value(
+        &self,
+        learner: Option<&SoccerNeuralLearner>,
+        transition: &SoccerLearningTransition,
+        target_scale: f64,
+        depth: usize,
+        gamma: f64,
+    ) -> f64 {
+        if depth <= 1 {
+            return 0.0;
+        }
+        let Some(world_model) = self.world_model.as_ref() else {
+            return 0.0;
+        };
+        let Some(learner) = learner else {
+            return 0.0;
+        };
+        let mut features = soccer_neural_transition_features(transition);
+        let mut discount = gamma.clamp(0.0, 0.999);
+        let mut value = 0.0;
+        for _ in 1..depth {
+            let Some(predicted) = world_model.predict_next(&features) else {
+                break;
+            };
+            let Some(predicted_value) = learner.predict_value(&predicted) else {
+                break;
+            };
+            value += discount * predicted_value * target_scale;
+            features = predicted;
+            discount *= gamma.clamp(0.0, 0.999);
+        }
+        value
+    }
+
     /// Re-rank legal tabular candidates with the trained value head per
     /// `neural_blend`, then supplement from the fixed neural action vocabulary
     /// when a warmed critic exists. That lets the 22+ball kinematic critic
@@ -3163,12 +3370,6 @@ impl SoccerMatch {
             None
         };
 
-        let mut neural_q = |label: &str| -> Option<f64> {
-            let learner = learner?;
-            base.action = label.to_string();
-            let features = soccer_neural_transition_features(&base);
-            learner.predict_value(&features).map(|v| v * target_scale)
-        };
         let policy_bonus = |label: &str| -> f64 {
             match &policy_log_probs {
                 Some(log_probs) => soccer_policy_action_index(label)
@@ -3215,27 +3416,45 @@ impl SoccerMatch {
             return None;
         }
 
-        let mut best_label: Option<&str> = None;
-        let mut best_score = f64::NEG_INFINITY;
+        let gamma = soccer_q_sanitized_gamma(policy.options.gamma);
+        let mcts_depth = if blend.mcts_enabled {
+            blend.sanitized_mcts_depth()
+        } else {
+            1
+        };
+        let mcts_model_weight = if blend.mcts_enabled {
+            blend.sanitized_mcts_model_weight()
+        } else {
+            0.0
+        };
+        let neural_q = |transition: &SoccerLearningTransition| -> Option<f64> {
+            let learner = learner?;
+            let features = soccer_neural_transition_features(transition);
+            learner.predict_value(&features).map(|v| v * target_scale)
+        };
+        let mut scored_candidates = Vec::with_capacity(legal.len());
         for candidate in legal.iter() {
+            let mut transition = base.clone();
+            transition.action = candidate.label.clone();
+            let neural_value = neural_q(&transition);
             // Value contribution (0-weighted when the value blend is off/cold).
             let value_score = match blend.mode {
                 SoccerNeuralBlendMode::Off => candidate.value,
                 SoccerNeuralBlendMode::Additive => {
-                    candidate.value + lambda * neural_q(&candidate.label).unwrap_or(0.0)
+                    candidate.value + lambda * neural_value.unwrap_or(0.0)
                 }
                 SoccerNeuralBlendMode::TieBreak => {
                     if best_tabular - candidate.value > blend.tie_epsilon {
                         // Outside the tie window — not a candidate for re-ranking.
                         continue;
                     }
-                    candidate.value + lambda * neural_q(&candidate.label).unwrap_or(0.0)
+                    candidate.value + lambda * neural_value.unwrap_or(0.0)
                 }
                 SoccerNeuralBlendMode::ConfidenceGated => {
                     if candidate.visits < blend.min_confidence_visits {
                         // Tabular is blind here — blend toward the net's estimate.
                         let weight = lambda.min(1.0);
-                        let nv = neural_q(&candidate.label).unwrap_or(candidate.value);
+                        let nv = neural_value.unwrap_or(candidate.value);
                         (1.0 - weight) * candidate.value + weight * nv
                     } else {
                         candidate.value
@@ -3243,14 +3462,45 @@ impl SoccerMatch {
                 }
             };
             // Actor bias: nudge toward the family the learned policy prefers.
-            let score =
-                value_score + policy_bonus(&candidate.label) + retrieval_bonus(&candidate.label);
-            if score > best_score {
-                best_score = score;
-                best_label = Some(candidate.label.as_str());
+            let actor_bonus = policy_bonus(&candidate.label);
+            let retrieved_bonus = retrieval_bonus(&candidate.label);
+            let model_bonus = mcts_model_weight
+                * self.neural_mcts_model_rollout_value(
+                    learner,
+                    &transition,
+                    target_scale,
+                    mcts_depth,
+                    gamma,
+                );
+            let score = value_score + actor_bonus + retrieved_bonus + model_bonus;
+            if !score.is_finite() {
+                continue;
             }
+            let actor_prior = policy_log_probs
+                .as_ref()
+                .and_then(|log_probs| {
+                    soccer_policy_action_index(&candidate.label).and_then(|i| log_probs.get(i))
+                })
+                .map(|log_p| log_p.exp())
+                .unwrap_or(0.0);
+            scored_candidates.push(SoccerNeuralMctsCandidate {
+                label: candidate.label.clone(),
+                score,
+                prior: actor_prior + retrieved_bonus.max(0.0),
+                q_visits: candidate.visits,
+            });
         }
-        best_label.map(|label| label.to_string())
+        scored_candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.q_visits.cmp(&b.q_visits))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        if let Some(mcts_label) = Self::neural_mcts_action_from_candidates(blend, &scored_candidates)
+        {
+            return Some(mcts_label);
+        }
+        scored_candidates.first().map(|candidate| candidate.label.clone())
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
@@ -3735,9 +3985,9 @@ impl SoccerMatch {
     }
 
     /// Build critic training samples. `team_filter` restricts which transitions
-    /// *emit* a sample (used to feed each team's own brain), while the zero-sum
-    /// opponent-centering is always computed across the **full** replay so the
-    /// reward shaping is identical whether one shared net or per-team brains are
+    /// *emit* a sample (used to feed each team's own brain), while centralized
+    /// MARL reward shaping is always computed across the full replay so the
+    /// reward signal is identical whether one shared net or per-team brains are
     /// trained.
     fn neural_training_samples_filtered(
         &self,
@@ -3749,49 +3999,13 @@ impl SoccerMatch {
         }
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
-        let mut tick_rewards: HashMap<u64, (f64, u32, f64, u32)> = HashMap::new();
-        if self.team_policies.is_some() {
-            for transition in transitions {
-                let entry = tick_rewards.entry(transition.tick).or_default();
-                let reward = finite_metric(transition.reward);
-                match transition.team {
-                    Team::Home => {
-                        entry.0 += reward;
-                        entry.1 += 1;
-                    }
-                    Team::Away => {
-                        entry.2 += reward;
-                        entry.3 += 1;
-                    }
-                }
-            }
-        }
+        let tick_rewards = soccer_marl_tick_rewards(transitions);
         transitions
             .iter()
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
-                let reward = finite_metric(transition.reward);
-                let adjusted_reward = if let Some((home_sum, home_count, away_sum, away_count)) =
-                    tick_rewards.get(&transition.tick).copied()
-                {
-                    let home_avg = if home_count == 0 {
-                        0.0
-                    } else {
-                        home_sum / f64::from(home_count)
-                    };
-                    let away_avg = if away_count == 0 {
-                        0.0
-                    } else {
-                        away_sum / f64::from(away_count)
-                    };
-                    let opponent_avg = match transition.team {
-                        Team::Home => away_avg,
-                        Team::Away => home_avg,
-                    };
-                    reward - opponent_avg
-                } else {
-                    reward
-                };
+                let adjusted_reward =
+                    soccer_marl_adjusted_reward(transition, &tick_rewards, &self.config.neural_learning);
                 let next_state = SoccerQStateKey::from_next_transition(transition);
                 let (gamma, max_next) = self
                     .team_policies
@@ -4087,48 +4301,17 @@ impl SoccerMatch {
                 .unwrap_or_else(|| soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma))
         };
 
-        // Per-tick team reward aggregation for the zero-sum opponent centering.
-        let mut tick_rewards: HashMap<u64, (f64, u32, f64, u32)> = HashMap::new();
-        for transition in replay {
-            let entry = tick_rewards.entry(transition.tick).or_default();
-            let reward = finite_metric(transition.reward);
-            match transition.team {
-                Team::Home => {
-                    entry.0 += reward;
-                    entry.1 += 1;
-                }
-                Team::Away => {
-                    entry.2 += reward;
-                    entry.3 += 1;
-                }
-            }
-        }
+        // Per-tick team reward aggregation for centralized MARL shaping.
+        let tick_rewards = soccer_marl_tick_rewards(replay);
 
-        // Per-transition row: opponent-centered reward, critic value (in reward
+        // Per-transition row: MARL-adjusted reward, critic value (in reward
         // units), terminal flag, action index, and state features.
-        let opponent_centered_reward = |transition: &SoccerLearningTransition| -> f64 {
-            let (home_sum, home_count, away_sum, away_count) = tick_rewards
-                .get(&transition.tick)
-                .copied()
-                .unwrap_or_default();
-            let home_avg = if home_count == 0 {
-                0.0
-            } else {
-                home_sum / f64::from(home_count)
-            };
-            let away_avg = if away_count == 0 {
-                0.0
-            } else {
-                away_sum / f64::from(away_count)
-            };
-            let opponent_avg = match transition.team {
-                Team::Home => away_avg,
-                Team::Away => home_avg,
-            };
-            finite_metric(transition.reward) - opponent_avg
-        };
-
-        let reward_adv: Vec<f64> = replay.iter().map(opponent_centered_reward).collect();
+        let reward_adv: Vec<f64> = replay
+            .iter()
+            .map(|transition| {
+                soccer_marl_adjusted_reward(transition, &tick_rewards, &self.config.neural_learning)
+            })
+            .collect();
         let values: Vec<f64> = replay
             .iter()
             .map(|transition| {
@@ -4196,10 +4379,18 @@ impl SoccerMatch {
                 } else {
                     advantages[index]
                 };
+                let state_features = self.policy_state_features(transition);
+                let old_action_probability = self
+                    .policy_head
+                    .as_ref()
+                    .and_then(|head| head.action_distribution(&state_features))
+                    .and_then(|probs| probs.get(action_index).copied())
+                    .filter(|probability| probability.is_finite() && *probability > 0.0);
                 advantage.is_finite().then(|| SoccerPolicySample {
-                    state_features: self.policy_state_features(transition),
+                    state_features,
                     action_index,
                     advantage,
+                    old_action_probability,
                 })
             })
             .collect()
@@ -4353,8 +4544,13 @@ impl SoccerMatch {
         self.train_neural_value_models(&replay);
         if !policy_samples.is_empty() {
             self.ensure_policy_head();
+            let mappo_clip_epsilon = self
+                .config
+                .neural_learning
+                .mappo_enabled()
+                .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
             if let Some(policy_head) = &mut self.policy_head {
-                policy_head.train(&policy_samples);
+                policy_head.train(&policy_samples, mappo_clip_epsilon);
             }
         }
         if !world_model_pairs.is_empty() {

@@ -27960,16 +27960,18 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     state_features: state,
                     action_index: reinforced,
                     advantage: 1.0,
+                    old_action_probability: None,
                 },
                 SoccerPolicySample {
                     state_features: state,
                     action_index: penalised,
                     advantage: -1.0,
+                    old_action_probability: None,
                 },
             ]
         })
         .collect();
-    head.train(&samples);
+    head.train(&samples, None);
     let after = head.action_distribution(&state).expect("finite dist");
     assert!(
         after[reinforced] > before[reinforced],
@@ -27986,6 +27988,40 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
     assert!(head.training_steps > 0);
     let sum: f64 = after.iter().sum();
     assert!((sum - 1.0).abs() < 1e-9 && after.iter().all(|p| p.is_finite()));
+}
+
+#[test]
+fn policy_head_mappo_clip_bounds_old_policy_ratio() {
+    let head = SoccerPolicyHead::new(19);
+    let mut state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
+    state[0] = 0.25;
+    state[8] = 0.75;
+    let action_index = soccer_policy_action_index("pass").expect("pass policy action");
+    let current_probability = head.action_distribution(&state).expect("finite dist")[action_index];
+
+    let positive_sample = SoccerPolicySample {
+        state_features: state,
+        action_index,
+        advantage: 2.0,
+        old_action_probability: Some(current_probability / 10.0),
+    };
+    let positive = head.clipped_mappo_advantage(&positive_sample, 0.2);
+    assert!(
+        (positive - 2.4).abs() < 1e-9,
+        "positive MAPPO advantage must clip high ratios: {positive}"
+    );
+
+    let negative_sample = SoccerPolicySample {
+        state_features: state,
+        action_index,
+        advantage: -2.0,
+        old_action_probability: Some(current_probability * 10.0),
+    };
+    let negative = head.clipped_mappo_advantage(&negative_sample, 0.2);
+    assert!(
+        (negative + 1.6).abs() < 1e-9,
+        "negative MAPPO advantage must clip low ratios: {negative}"
+    );
 }
 
 #[test]
@@ -32573,6 +32609,22 @@ fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() 
         LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS
     );
     assert_eq!(config.neural_learning.max_batches_per_tick, 1);
+    assert_eq!(
+        config.neural_learning.marl_algorithm,
+        SoccerMarlAlgorithm::Mappo
+    );
+    assert_eq!(
+        config.neural_learning.marl_team_reward_weight,
+        DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT
+    );
+    assert_eq!(
+        config.neural_learning.marl_intermediate_reward_weight,
+        DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT
+    );
+    assert_eq!(
+        config.neural_learning.mappo_clip_epsilon,
+        DEFAULT_SOCCER_MAPPO_CLIP_EPSILON
+    );
     assert!(config.adversarial_embedding_exploitation_enabled);
     assert!(config.opponent_belief_enabled);
     // Synergy must be ACTIVE in real games, not just trained-and-ignored: the
@@ -32580,6 +32632,10 @@ fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() 
     // critic couples back to the LP formation solver.
     assert_eq!(config.neural_blend.mode, SoccerNeuralBlendMode::Additive);
     assert!(config.neural_blend.actor_critic);
+    assert!(config.neural_blend.mcts_enabled);
+    assert_eq!(config.neural_blend.mcts_simulations, 8);
+    assert_eq!(config.neural_blend.mcts_candidates, 4);
+    assert_eq!(config.neural_blend.mcts_depth, 1);
     assert!(config.neural_learning.lp_coupling_enabled);
 }
 
@@ -32616,6 +32672,13 @@ fn live_gameplay_trains_when_operator_enables_learning() {
     assert!(learning.home_policy_visits + learning.away_policy_visits > 0);
     assert!(learning.neural_learning_enabled);
     assert_eq!(learning.neural_learning_backend, "inline");
+    assert!(learning.marl_learning_enabled);
+    assert_eq!(learning.marl_algorithm, "mappo");
+    assert!(learning.mappo_enabled);
+    assert_eq!(
+        learning.mappo_clip_epsilon,
+        DEFAULT_SOCCER_MAPPO_CLIP_EPSILON
+    );
     assert!(learning.neural_learning_training_steps > 0);
     assert!(learning.neural_learning_samples > 0);
 }
@@ -65358,6 +65421,259 @@ fn clear_goal_approach_striker_shoots_instead_of_extra_dribble() {
                 "clear goal-approach striker should shoot before taking another touch, seed {seed}, got {intent:?}"
             );
     }
+}
+
+#[test]
+fn learned_open_pass_lane_dribbles_short_to_unblock_teammate_lane() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        dt_seconds: 1.0,
+        seed: 2232,
+        ..Default::default()
+    });
+    let carrier = 8;
+    let receiver = 9;
+    let blocker = 13;
+    park_players_except(&mut sim, &[carrier, receiver, blocker]);
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].velocity = Vec2::zero();
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].skills.dribbling = 8.7;
+    sim.players[carrier].skills.acceleration = 8.5;
+    sim.players[carrier].skills.passing = 8.2;
+    sim.players[carrier].skills.passing_completion_rate = 8.3;
+    sim.players[carrier].skills.vision = 8.4;
+    sim.players[carrier].skills.shooting = 2.0;
+    sim.players[carrier].skills.decision_noise = 0.0;
+    sim.players[carrier].preferences.pass_bias = 0.92;
+    sim.players[carrier].preferences.dribble_bias = 1.0;
+    sim.players[carrier].preferences.shoot_bias = 0.01;
+    sim.players[receiver].position = Vec2::new(40.0, 82.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].skills.top_speed = 8.2;
+    sim.players[receiver].skills.acceleration = 8.1;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.players[receiver].skills.vision = 8.2;
+    sim.players[blocker].position = Vec2::new(40.0, 70.0);
+    sim.players[blocker].home_position = sim.players[blocker].position;
+    sim.players[blocker].velocity = Vec2::zero();
+    sim.players[blocker].skills.defending = 8.4;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[carrier].position;
+    let receiver_pos = sim.players[receiver].position;
+    let blockers_before = snapshot.opponents_on_pass_path(origin, receiver_pos, Team::Away, 1.8);
+    assert!(
+        blockers_before >= 1,
+        "fixture should start with the intended pass lane blocked"
+    );
+
+    let plan = SoccerLearnedPlan {
+        action: "open-pass-lane".to_string(),
+        target_player: Some(receiver),
+        target_point: None,
+        mpc_replan: None,
+    };
+    let observation = snapshot.observation_for(carrier);
+    let direct_plan_action =
+        sim.players[carrier].action_from_learned_plan(&plan, &snapshot, &observation);
+    assert!(
+        matches!(
+            direct_plan_action,
+            Some((SoccerAction::DribbleMove { .. }, ref label)) if label == "open-pass-lane"
+        ),
+        "learned open-pass-lane should resolve to a short dribble before normal fallback: {:?}",
+        direct_plan_action
+    );
+    let mut player = sim.players[carrier].clone();
+    let intent = player.run_time_step(&snapshot, None, Some(&plan), &mut mulberry32(22_332));
+
+    let SoccerAction::DribbleMove { target, .. } = intent.action else {
+        panic!("open pass lane plan should take a dribble touch, got {intent:?}");
+    };
+    assert_eq!(
+        player.last_decision.as_ref().map(|decision| decision.action.as_str()),
+        Some("open-pass-lane")
+    );
+    assert!(
+        !intent.sprint,
+        "moderate-pressure lane opening should be a quick run, not an automatic sprint"
+    );
+    let step_yards = origin.distance(target);
+    assert!(
+        (1.0..=8.05).contains(&step_yards),
+        "lane-opening touch should stay within 1-8 yards: origin={origin:?} target={target:?}"
+    );
+    assert!(
+        (target.y - origin.y) * Team::Home.attack_dir() >= -0.65,
+        "lane-opening touch should not retreat meaningfully: origin={origin:?} target={target:?}"
+    );
+    let blockers_after = snapshot.opponents_on_pass_path(target, receiver_pos, Team::Away, 1.8);
+    assert!(
+        blockers_after < blockers_before,
+        "short dribble should open the teammate passing lane: before={blockers_before} after={blockers_after} target={target:?}"
+    );
+}
+
+#[test]
+fn tracked_open_pass_lane_can_extend_to_eight_yards_and_sprint() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        dt_seconds: 1.0,
+        seed: 2233,
+        ..Default::default()
+    });
+    let carrier = 8;
+    let receiver = 9;
+    let blocker = 13;
+    let right_blocker = 14;
+    let tracker = 15;
+    let left_blocker = 16;
+    park_players_except(
+        &mut sim,
+        &[carrier, receiver, blocker, right_blocker, tracker, left_blocker],
+    );
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].velocity = Vec2::zero();
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].skills.dribbling = 8.9;
+    sim.players[carrier].skills.acceleration = 8.8;
+    sim.players[carrier].skills.passing_completion_rate = 8.4;
+    sim.players[carrier].skills.vision = 8.5;
+    sim.players[carrier].skills.decision_noise = 0.0;
+    sim.players[receiver].position = Vec2::new(40.0, 82.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].skills.first_touch = 8.2;
+    sim.players[blocker].position = Vec2::new(40.0, 70.0);
+    sim.players[blocker].velocity = Vec2::zero();
+    sim.players[right_blocker].position = Vec2::new(42.2, 70.0);
+    sim.players[right_blocker].velocity = Vec2::zero();
+    sim.players[left_blocker].position = Vec2::new(37.8, 70.0);
+    sim.players[left_blocker].velocity = Vec2::zero();
+    sim.players[tracker].position = Vec2::new(43.2, 60.0);
+    sim.players[tracker].velocity = Vec2::new(6.2, 0.0);
+    sim.players[tracker].skills.acceleration = 8.6;
+    sim.players[tracker].skills.defending = 8.5;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[carrier].position;
+    let receiver_pos = sim.players[receiver].position;
+    let blockers_before = snapshot.opponents_on_pass_path(origin, receiver_pos, Team::Away, 1.8);
+    let four_yards_right = origin + Vec2::new(4.0, 0.0);
+    let four_yards_left = origin + Vec2::new(-4.0, 0.0);
+    assert!(blockers_before >= 1, "fixture should start with a blocked lane");
+    assert!(
+        snapshot.opponents_on_pass_path(four_yards_right, receiver_pos, Team::Away, 1.8) >= 1
+            && snapshot.opponents_on_pass_path(four_yards_left, receiver_pos, Team::Away, 1.8)
+                >= 1,
+        "fixture should keep both 4-yard lateral lane changes blocked"
+    );
+
+    let plan = SoccerLearnedPlan {
+        action: "open-pass-lane".to_string(),
+        target_player: Some(receiver),
+        target_point: None,
+        mpc_replan: None,
+    };
+    let mut player = sim.players[carrier].clone();
+    let intent = player.run_time_step(&snapshot, None, Some(&plan), &mut mulberry32(22_333));
+    let SoccerAction::DribbleMove { target, .. } = intent.action else {
+        panic!("tracked open-pass-lane should dribble, got {intent:?}");
+    };
+    let step_yards = origin.distance(target);
+    assert!(
+        step_yards > 4.05 && step_yards <= 8.05,
+        "tracking pressure should allow a longer 4-8 yard lane-opening burst: target={target:?}"
+    );
+    assert!(intent.sprint, "tracked lane-opening burst should sprint");
+    let blockers_after = snapshot.opponents_on_pass_path(target, receiver_pos, Team::Away, 1.8);
+    assert!(
+        blockers_after < blockers_before,
+        "extended burst should open the lane: before={blockers_before} after={blockers_after}"
+    );
+}
+
+#[test]
+fn open_pass_lane_can_target_bounded_backfield_receiver() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        dt_seconds: 1.0,
+        seed: 2234,
+        ..Default::default()
+    });
+    let carrier = 8;
+    let receiver = 7;
+    let blocker = 13;
+    park_players_except(&mut sim, &[carrier, receiver, blocker]);
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].velocity = Vec2::zero();
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].skills.dribbling = 8.4;
+    sim.players[carrier].skills.acceleration = 8.1;
+    sim.players[carrier].skills.passing_completion_rate = 8.0;
+    sim.players[carrier].skills.vision = 8.1;
+    sim.players[receiver].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.players[blocker].position = Vec2::new(40.0, 55.0);
+    sim.players[blocker].velocity = Vec2::zero();
+    sim.players[blocker].skills.defending = 8.3;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[carrier].position;
+    let receiver_pos = sim.players[receiver].position;
+    let blockers_before = snapshot.opponents_on_pass_path(origin, receiver_pos, Team::Away, 1.8);
+    assert!(
+        blockers_before >= 1,
+        "fixture should start with the backfield lane blocked"
+    );
+
+    let plan = SoccerLearnedPlan {
+        action: "open-pass-lane".to_string(),
+        target_player: Some(receiver),
+        target_point: None,
+        mpc_replan: None,
+    };
+    let observation = snapshot.observation_for(carrier);
+    let direct_plan_action =
+        sim.players[carrier].action_from_learned_plan(&plan, &snapshot, &observation);
+    assert!(
+        matches!(
+            direct_plan_action,
+            Some((SoccerAction::DribbleMove { .. }, ref label)) if label == "open-pass-lane"
+        ),
+        "bounded backfield receiver should still be eligible for lane opening: {:?}",
+        direct_plan_action
+    );
+    let Some((SoccerAction::DribbleMove { target, .. }, _)) = direct_plan_action else {
+        unreachable!("asserted direct open-pass-lane dribble above");
+    };
+    let blockers_after = snapshot.opponents_on_pass_path(target, receiver_pos, Team::Away, 1.8);
+    assert!(
+        blockers_after < blockers_before,
+        "short dribble should open the backfield receiver lane: before={blockers_before} after={blockers_after}"
+    );
 }
 
 #[test]

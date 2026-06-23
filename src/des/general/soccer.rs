@@ -3396,6 +3396,9 @@ const DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY: usize = 512;
 const DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK: usize = 16;
 const DEFAULT_SOCCER_NEURAL_TARGET_CLIP: f64 = 3.0;
 const DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 16;
+const DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT: f64 = 0.35;
+const DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT: f64 = 1.0;
+const DEFAULT_SOCCER_MAPPO_CLIP_EPSILON: f64 = 0.20;
 /// Global L2 gradient-norm ceiling for the value-head SGD step. Targets are
 /// already bounded to ±`target_clip` (default 3.0) and the learning rate to
 /// ≤ 0.25, so a healthy gradient stays well under this; the clamp only engages
@@ -3416,8 +3419,8 @@ const SOCCER_NEURAL_FORMATION_INTENT_SCALE: f64 = 2.0;
 const SOCCER_NEURAL_FORMATION_INTENT_REFRESH_TICKS: u64 = secs_to_ticks(2.0);
 const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// Neural **policy head** (actor) hyperparameters. The actor learns `π(family|s)`
-/// by advantage policy-gradient from the critic; these are module constants (not
-/// serde config) to keep the `SoccerNeuralLearningConfig` surface unchanged.
+/// by advantage policy-gradient from the critic; stable baseline values live here,
+/// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Entropy bonus — keeps the actor from collapsing onto one family too early.
@@ -3699,6 +3702,18 @@ fn default_soccer_neural_target_clip() -> f64 {
 
 fn default_soccer_neural_snapshot_every_batches() -> usize {
     DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES
+}
+
+fn default_soccer_marl_team_reward_weight() -> f64 {
+    DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT
+}
+
+fn default_soccer_marl_intermediate_reward_weight() -> f64 {
+    DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT
+}
+
+fn default_soccer_mappo_clip_epsilon() -> f64 {
+    DEFAULT_SOCCER_MAPPO_CLIP_EPSILON
 }
 
 fn default_period_count() -> usize {
@@ -9427,6 +9442,72 @@ impl SoccerTeamQPolicies {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SoccerMarlTickReward {
+    home_sum: f64,
+    home_count: u32,
+    away_sum: f64,
+    away_count: u32,
+}
+
+impl SoccerMarlTickReward {
+    fn record(&mut self, team: Team, reward: f64) {
+        let reward = finite_metric(reward);
+        match team {
+            Team::Home => {
+                self.home_sum += reward;
+                self.home_count = self.home_count.saturating_add(1);
+            }
+            Team::Away => {
+                self.away_sum += reward;
+                self.away_count = self.away_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn average_for(self, team: Team) -> f64 {
+        match team {
+            Team::Home if self.home_count > 0 => self.home_sum / f64::from(self.home_count),
+            Team::Away if self.away_count > 0 => self.away_sum / f64::from(self.away_count),
+            _ => 0.0,
+        }
+    }
+}
+
+pub(crate) fn soccer_marl_tick_rewards(
+    transitions: &[SoccerLearningTransition],
+) -> HashMap<u64, SoccerMarlTickReward> {
+    let mut tick_rewards = HashMap::new();
+    for transition in transitions {
+        tick_rewards
+            .entry(transition.tick)
+            .or_insert_with(SoccerMarlTickReward::default)
+            .record(transition.team, transition.reward);
+    }
+    tick_rewards
+}
+
+pub(crate) fn soccer_marl_adjusted_reward(
+    transition: &SoccerLearningTransition,
+    tick_rewards: &HashMap<u64, SoccerMarlTickReward>,
+    config: &SoccerNeuralLearningConfig,
+) -> f64 {
+    let reward = finite_metric(transition.reward);
+    if !config.marl_enabled() {
+        return reward;
+    }
+    let intermediate = reward * config.sanitized_marl_intermediate_reward_weight();
+    if config.marl_algorithm != SoccerMarlAlgorithm::Mappo {
+        return intermediate;
+    }
+    let Some(tick_reward) = tick_rewards.get(&transition.tick).copied() else {
+        return intermediate;
+    };
+    let team_component =
+        tick_reward.average_for(transition.team) - tick_reward.average_for(transition.team.other());
+    intermediate + team_component * config.sanitized_marl_team_reward_weight()
+}
+
 fn soccer_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
 ) -> Vec<SoccerLearningTransition> {
@@ -9660,7 +9741,7 @@ fn is_attacking_support_action_label(action: &str) -> bool {
 fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
-        LeftCut | SideStep | Dribble | HoldUpFlank => Some(DribbleMoveKind::LeftCut),
+        LeftCut | SideStep | Dribble | HoldUpFlank | OpenPassLane => Some(DribbleMoveKind::LeftCut),
         CarryForward | VerticalAttack | TurnoverBurst => Some(DribbleMoveKind::CarryForward),
         ProtectBall => Some(DribbleMoveKind::ProtectBall),
         XaviTurn => Some(DribbleMoveKind::XaviTurn),
@@ -12378,6 +12459,26 @@ impl SoccerNeuralLearningBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SoccerMarlAlgorithm {
+    Off,
+    IndependentActorCritic,
+    #[default]
+    #[serde(alias = "MAPPO", alias = "mappo")]
+    Mappo,
+}
+
+impl SoccerMarlAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoccerMarlAlgorithm::Off => "off",
+            SoccerMarlAlgorithm::IndependentActorCritic => "independentActorCritic",
+            SoccerMarlAlgorithm::Mappo => "mappo",
+        }
+    }
+}
+
 /// How the trained value head is combined with the tabular Q-policy at decision
 /// time. The value head learns the continuous interactions the discretised Q-key
 /// destroys (the "hidden variables" governing emergent shape); these modes pick
@@ -12445,6 +12546,30 @@ pub struct SoccerNeuralBlendConfig {
     /// not alter action selection on its own.)
     #[serde(default)]
     pub world_model: bool,
+    /// Budgeted neural-guided MCTS re-ranker over the already-legal MDP/POMDP
+    /// action candidates. This is deliberately action-level only: no full match
+    /// clone, no joint/team MPC, and no per-player MPC solve inside the tree.
+    #[serde(default)]
+    pub mcts_enabled: bool,
+    /// Root simulations per decision. Kept tiny for live play; each simulation
+    /// uses cached candidate value/actor/retrieval estimates.
+    #[serde(default = "default_soccer_neural_mcts_simulations")]
+    pub mcts_simulations: usize,
+    /// Candidate cap searched by MCTS after the normal neural blend has scored
+    /// legal actions.
+    #[serde(default = "default_soccer_neural_mcts_candidates")]
+    pub mcts_candidates: usize,
+    /// Optional learned-world-model rollout depth. `1` means root-only (no world
+    /// model); deeper values are clamped and only matter when `world_model` has a
+    /// trained predictor available.
+    #[serde(default = "default_soccer_neural_mcts_depth")]
+    pub mcts_depth: usize,
+    /// PUCT-style exploration constant used inside the small action tree.
+    #[serde(default = "default_soccer_neural_mcts_exploration")]
+    pub mcts_exploration: f64,
+    /// Weight for optional world-model rollout value added to MCTS leaf scoring.
+    #[serde(default = "default_soccer_neural_mcts_model_weight")]
+    pub mcts_model_weight: f64,
 }
 
 fn default_soccer_neural_blend_lambda() -> f64 {
@@ -12465,6 +12590,21 @@ fn default_soccer_neural_blend_candidates() -> usize {
 fn default_soccer_neural_blend_warmup_steps() -> usize {
     200
 }
+fn default_soccer_neural_mcts_simulations() -> usize {
+    8
+}
+fn default_soccer_neural_mcts_candidates() -> usize {
+    4
+}
+fn default_soccer_neural_mcts_depth() -> usize {
+    1
+}
+fn default_soccer_neural_mcts_exploration() -> f64 {
+    1.25
+}
+fn default_soccer_neural_mcts_model_weight() -> f64 {
+    0.35
+}
 
 impl Default for SoccerNeuralBlendConfig {
     fn default() -> Self {
@@ -12479,6 +12619,12 @@ impl Default for SoccerNeuralBlendConfig {
             warmup_steps: default_soccer_neural_blend_warmup_steps(),
             actor_critic: false,
             world_model: false,
+            mcts_enabled: false,
+            mcts_simulations: default_soccer_neural_mcts_simulations(),
+            mcts_candidates: default_soccer_neural_mcts_candidates(),
+            mcts_depth: default_soccer_neural_mcts_depth(),
+            mcts_exploration: default_soccer_neural_mcts_exploration(),
+            mcts_model_weight: default_soccer_neural_mcts_model_weight(),
         }
     }
 }
@@ -12501,6 +12647,34 @@ impl SoccerNeuralBlendConfig {
             return 0.0;
         }
         self.lambda * self.readiness(training_steps, average_loss)
+    }
+
+    fn sanitized_mcts_simulations(&self) -> usize {
+        self.mcts_simulations.clamp(1, 32)
+    }
+
+    fn sanitized_mcts_candidates(&self) -> usize {
+        self.mcts_candidates.clamp(2, 8)
+    }
+
+    fn sanitized_mcts_depth(&self) -> usize {
+        self.mcts_depth.clamp(1, 3)
+    }
+
+    fn sanitized_mcts_exploration(&self) -> f64 {
+        if self.mcts_exploration.is_finite() {
+            self.mcts_exploration.clamp(0.0, 4.0)
+        } else {
+            default_soccer_neural_mcts_exploration()
+        }
+    }
+
+    fn sanitized_mcts_model_weight(&self) -> f64 {
+        if self.mcts_model_weight.is_finite() {
+            self.mcts_model_weight.clamp(0.0, 1.0)
+        } else {
+            default_soccer_neural_mcts_model_weight()
+        }
     }
 }
 
@@ -12547,6 +12721,20 @@ pub struct SoccerNeuralLearningConfig {
     /// units differ from the per-tick centered reward.
     #[serde(default)]
     pub critic_baseline_weight: f64,
+    /// Multi-agent learning mode. MAPPO keeps one decentralized actor per player
+    /// decision while shaping the critic/advantage with centralized team rewards.
+    #[serde(default)]
+    pub marl_algorithm: SoccerMarlAlgorithm,
+    /// Weight on the cooperative team component: team average reward minus the
+    /// opponent team's same-tick average reward.
+    #[serde(default = "default_soccer_marl_team_reward_weight")]
+    pub marl_team_reward_weight: f64,
+    /// Weight on the actor's own dense/intermediate reward signal.
+    #[serde(default = "default_soccer_marl_intermediate_reward_weight")]
+    pub marl_intermediate_reward_weight: f64,
+    /// PPO clip epsilon for MAPPO actor updates.
+    #[serde(default = "default_soccer_mappo_clip_epsilon")]
+    pub mappo_clip_epsilon: f64,
 }
 
 impl Default for SoccerNeuralLearningConfig {
@@ -12567,6 +12755,10 @@ impl Default for SoccerNeuralLearningConfig {
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
+            marl_algorithm: SoccerMarlAlgorithm::Mappo,
+            marl_team_reward_weight: DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT,
+            marl_intermediate_reward_weight: DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT,
+            mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
         }
     }
 }
@@ -12604,6 +12796,38 @@ impl SoccerNeuralLearningConfig {
         } else {
             0.0
         }
+    }
+
+    fn sanitized_marl_team_reward_weight(&self) -> f64 {
+        if self.marl_team_reward_weight.is_finite() {
+            self.marl_team_reward_weight.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT
+        }
+    }
+
+    fn sanitized_marl_intermediate_reward_weight(&self) -> f64 {
+        if self.marl_intermediate_reward_weight.is_finite() {
+            self.marl_intermediate_reward_weight.clamp(0.0, 2.0)
+        } else {
+            DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT
+        }
+    }
+
+    fn sanitized_mappo_clip_epsilon(&self) -> f64 {
+        if self.mappo_clip_epsilon.is_finite() {
+            self.mappo_clip_epsilon.clamp(0.01, 1.0)
+        } else {
+            DEFAULT_SOCCER_MAPPO_CLIP_EPSILON
+        }
+    }
+
+    fn marl_enabled(&self) -> bool {
+        self.enabled && self.marl_algorithm != SoccerMarlAlgorithm::Off
+    }
+
+    fn mappo_enabled(&self) -> bool {
+        self.enabled && self.marl_algorithm == SoccerMarlAlgorithm::Mappo
     }
 
     fn sanitized_target_scale(&self) -> f64 {
@@ -13227,11 +13451,17 @@ impl MatchConfig {
                 train_every_ticks: LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS,
                 max_batches_per_tick: 1,
                 lp_coupling_enabled: true,
+                marl_algorithm: SoccerMarlAlgorithm::Mappo,
+                mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
                 ..SoccerNeuralLearningConfig::default()
             },
             neural_blend: SoccerNeuralBlendConfig {
                 mode: SoccerNeuralBlendMode::Additive,
                 actor_critic: true,
+                mcts_enabled: true,
+                mcts_simulations: 8,
+                mcts_candidates: 4,
+                mcts_depth: 1,
                 ..SoccerNeuralBlendConfig::default()
             },
             mpc: SoccerMpcConfig {
@@ -26913,6 +27143,10 @@ pub struct SoccerLearningRewardContract {
     pub failed_dispossession_penalty_points: f64,
     pub beaten_by_dribble_penalty_points: f64,
     pub shot_block_defender_reward_points: f64,
+    pub marl_default_algorithm: String,
+    pub marl_team_reward_weight: f64,
+    pub marl_intermediate_reward_weight: f64,
+    pub mappo_clip_epsilon: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26938,6 +27172,12 @@ pub struct SoccerLearningRuntimeContract {
     pub neural_learning_batch_size: usize,
     pub neural_learning_max_batches_per_tick: usize,
     pub neural_learning_replay_capacity: usize,
+    pub marl_learning_enabled: bool,
+    pub marl_algorithm: String,
+    pub marl_team_reward_weight: f64,
+    pub marl_intermediate_reward_weight: f64,
+    pub mappo_enabled: bool,
+    pub mappo_clip_epsilon: f64,
     pub tracking_dataset_training_enabled: bool,
     pub tracking_csv_import_enabled: bool,
     pub tracking_jsonl_import_enabled: bool,
@@ -27060,6 +27300,10 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
         failed_dispossession_penalty_points: FAILED_DISPOSSESSION_PENALTY_POINTS,
         beaten_by_dribble_penalty_points: BEATEN_BY_DRIBBLE_PENALTY_POINTS,
         shot_block_defender_reward_points: SHOT_BLOCK_DEFENDER_REWARD_POINTS,
+        marl_default_algorithm: SoccerMarlAlgorithm::Mappo.as_str().to_string(),
+        marl_team_reward_weight: DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT,
+        marl_intermediate_reward_weight: DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT,
+        mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
     }
 }
 
@@ -27086,6 +27330,14 @@ fn soccer_learning_runtime_contract(config: &MatchConfig) -> SoccerLearningRunti
         neural_learning_batch_size: config.neural_learning.sanitized_batch_size(),
         neural_learning_max_batches_per_tick: config.neural_learning.max_batches_per_tick.max(1),
         neural_learning_replay_capacity: config.neural_learning.replay_capacity,
+        marl_learning_enabled: config.neural_learning.marl_enabled(),
+        marl_algorithm: config.neural_learning.marl_algorithm.as_str().to_string(),
+        marl_team_reward_weight: config.neural_learning.sanitized_marl_team_reward_weight(),
+        marl_intermediate_reward_weight: config
+            .neural_learning
+            .sanitized_marl_intermediate_reward_weight(),
+        mappo_enabled: config.neural_learning.mappo_enabled() && config.neural_blend.actor_critic,
+        mappo_clip_epsilon: config.neural_learning.sanitized_mappo_clip_epsilon(),
         tracking_dataset_training_enabled: true,
         tracking_csv_import_enabled: true,
         tracking_jsonl_import_enabled: true,
@@ -29072,6 +29324,18 @@ pub struct SoccerLearningSnapshot {
     #[serde(default)]
     pub neural_learning_parameter_count: usize,
     #[serde(default)]
+    pub marl_learning_enabled: bool,
+    #[serde(default)]
+    pub marl_algorithm: String,
+    #[serde(default)]
+    pub marl_team_reward_weight: f64,
+    #[serde(default)]
+    pub marl_intermediate_reward_weight: f64,
+    #[serde(default)]
+    pub mappo_enabled: bool,
+    #[serde(default)]
+    pub mappo_clip_epsilon: f64,
+    #[serde(default)]
     pub neural_learning_target_clip: f64,
     #[serde(default)]
     pub neural_learning_snapshot_every_batches: usize,
@@ -30008,6 +30272,7 @@ struct SoccerPolicySample {
     state_features: [f64; SOCCER_NEURAL_FEATURE_DIM],
     action_index: usize,
     advantage: f64,
+    old_action_probability: Option<f64>,
 }
 
 /// The neural **actor**: `π(family | s)` over [`SOCCER_POLICY_ACTIONS`], trained
@@ -30055,15 +30320,49 @@ impl SoccerPolicyHead {
         probs.iter().all(|p| p.is_finite()).then_some(probs)
     }
 
+    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
+        let Some(old_prob) = sample.old_action_probability else {
+            return sample.advantage;
+        };
+        if !old_prob.is_finite() || old_prob <= 1e-9 {
+            return sample.advantage;
+        }
+        let Some(current_probs) = self.action_distribution(&sample.state_features) else {
+            return sample.advantage;
+        };
+        let Some(current_prob) = current_probs.get(sample.action_index).copied() else {
+            return sample.advantage;
+        };
+        if !current_prob.is_finite() || current_prob <= 0.0 {
+            return 0.0;
+        }
+        let epsilon = clip_epsilon.clamp(0.01, 1.0);
+        let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
+        let clipped = ratio.clamp(1.0 - epsilon, 1.0 + epsilon);
+        let ppo_ratio = if sample.advantage >= 0.0 {
+            ratio.min(clipped)
+        } else {
+            ratio.max(clipped)
+        };
+        sample.advantage * ppo_ratio
+    }
+
     /// One advantage policy-gradient pass over a batch of samples.
-    fn train(&mut self, samples: &[SoccerPolicySample]) {
+    fn train(&mut self, samples: &[SoccerPolicySample], mappo_clip_epsilon: Option<f64>) {
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         for sample in samples {
+            let advantage = match mappo_clip_epsilon {
+                Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon),
+                None => sample.advantage,
+            };
+            if !advantage.is_finite() {
+                continue;
+            }
             let result = self.network.train_policy_gradient_sample(
                 &sample.state_features[..],
                 sample.action_index,
-                sample.advantage,
+                advantage,
                 SOCCER_POLICY_ENTROPY_COEFF,
                 SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
@@ -31056,11 +31355,11 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
         label.as_ref(),
         Some(
             Shoot | Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
-                | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft | Pass
-                | KillerPass | AerialPass | WallPass | CornerFlagCross | SurprisePass | FlickOn
-                | VerticalAttack | TurnoverBurst | SwitchPlay | RecycleReset | FlankLowCross
-                | FlankHighCross | RouteOne | FirstTimeShot | FirstTimeHeader | FirstTimePass
-                | Clearance
+                | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
+                | OpenPassLane | Pass | KillerPass | AerialPass | WallPass | CornerFlagCross
+                | SurprisePass | FlickOn | VerticalAttack | TurnoverBurst | SwitchPlay
+                | RecycleReset | FlankLowCross | FlankHighCross | RouteOne | FirstTimeShot
+                | FirstTimeHeader | FirstTimePass | Clearance
         )
     );
     let defense = matches!(
@@ -31135,7 +31434,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         Hold => "hold",
         Space => "space",
         ControlTouch => "control-touch",
-        Dribble => "dribble",
+        Dribble | OpenPassLane => "dribble",
         CarryForward => "carry-forward",
         CarryOutLeft => "carry-out-left",
         CarryOutRight => "carry-out-right",
@@ -33790,6 +34089,12 @@ impl SoccerRealtimeSession {
             "awayFrozen": sim.away_neural_frozen,
             "blend": val(serde_json::to_value(sim.neural_blend)),
             "actorCriticEnabled": sim.policy_head.is_some(),
+            "marlAlgorithm": sim.config.neural_learning.marl_algorithm.as_str(),
+            "marlLearningEnabled": sim.config.learning_enabled && sim.config.neural_learning.marl_enabled(),
+            "mappoEnabled": sim.config.learning_enabled
+                && sim.config.neural_learning.mappo_enabled()
+                && sim.neural_blend.actor_critic,
+            "mappoClipEpsilon": sim.config.neural_learning.sanitized_mappo_clip_epsilon(),
             "worldModelEnabled": sim.world_model.is_some(),
         });
 
@@ -42450,9 +42755,9 @@ fn tracking_action_target_trace(
             Some(
                 Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
                 | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
-                | ControlTouch | Space | SupportShape | SupportRoam | CheckToBall | RunInBehind
-                | ExploitSpaceRun | WideOutlet | ShotCreationRun | OverlapRun | SupportScreen
-                | VacateSpace | Defend,
+                | OpenPassLane | ControlTouch | Space | SupportShape | SupportRoam | CheckToBall
+                | RunInBehind | ExploitSpaceRun | WideOutlet | ShotCreationRun | OverlapRun
+                | SupportScreen | VacateSpace | Defend,
             ) => (
                 next_player.map(|p| p.position).unwrap_or(player.position),
                 None,
@@ -49852,7 +50157,7 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                 && snapshot.best_aerial_pass_target(player_id).is_some()
         }
         "control-touch" => observation.has_ball && observation.first_touch_available,
-        "dribble" | "carry-forward" => observation.has_ball,
+        "dribble" | "carry-forward" | "open-pass-lane" => observation.has_ball,
         "vertical-attack" => {
             observation.has_ball
                 || (!observation.has_ball

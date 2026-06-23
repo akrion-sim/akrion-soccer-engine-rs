@@ -80,6 +80,9 @@ pub enum SoccerActionLabel {
     /// improve their position before releasing (delay-before-pass). See
     /// `WorldSnapshot::hold_for_support_option_for`.
     WaitForSupport,
+    /// On-ball: a short carrier dribble to change the passing angle and open a
+    /// currently-blocked teammate lane.
+    OpenPassLane,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -150,6 +153,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::VerticalAttack => "vertical-attack",
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
+            SoccerActionLabel::OpenPassLane => "open-pass-lane",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -215,6 +219,7 @@ impl SoccerActionLabel {
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
+            "open-pass-lane" => SoccerActionLabel::OpenPassLane,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -315,6 +320,15 @@ impl SoccerActionLabel {
             | "delay-pass"
             | "delay_pass"
             | "delaypass" => "wait-for-support",
+            "open-pass-lane"
+            | "open_pass_lane"
+            | "openpasslane"
+            | "pass-lane-dribble"
+            | "pass_lane_dribble"
+            | "passlanedribble"
+            | "dribble-to-pass"
+            | "dribble_to_pass"
+            | "dribbletopass" => "open-pass-lane",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"

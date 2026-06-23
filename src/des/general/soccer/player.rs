@@ -25,6 +25,295 @@ const WIDE_OUTLET_WIDTH_TARGET_FRACTION: f64 = 0.92;
 const WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT: f64 = 0.42;
 const WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT: f64 = 0.20;
 const WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING: f64 = 0.18;
+const OPEN_PASS_LANE_ACTION_LABEL: &str = "open-pass-lane";
+const OPEN_PASS_LANE_MIN_DRIBBLE_YARDS: f64 = 1.0;
+const OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS: f64 = 4.0;
+const OPEN_PASS_LANE_MAX_DRIBBLE_YARDS: f64 = 8.0;
+const OPEN_PASS_LANE_RADIUS_YARDS: f64 = 1.8;
+const OPEN_PASS_LANE_ALREADY_SAFE_COMPLETION: f64 = 0.62;
+const OPEN_PASS_LANE_ALREADY_SAFE_RISK: f64 = 0.28;
+const OPEN_PASS_LANE_MIN_RECEIVER_OPENNESS: f64 = 0.24;
+const OPEN_PASS_LANE_MIN_NEW_COMPLETION: f64 = 0.42;
+const OPEN_PASS_LANE_MIN_LANE_GAIN: f64 = 0.16;
+const OPEN_PASS_LANE_MIN_COMPLETION_GAIN: f64 = 0.10;
+const OPEN_PASS_LANE_MIN_RISK_DROP: f64 = 0.14;
+const OPEN_PASS_LANE_MAX_BACKWARD_STEP_YARDS: f64 = 0.65;
+const OPEN_PASS_LANE_MIN_CANDIDATE_OPPONENT_SPACE: f64 = 1.35;
+const OPEN_PASS_LANE_TARGET_SEARCH_LIMIT: usize = 8;
+const OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS: f64 = 18.0;
+const OPEN_PASS_LANE_TRACKING_RADIUS_YARDS: f64 = 12.0;
+const OPEN_PASS_LANE_TRACKING_REF_SPEED_YPS: f64 = 7.0;
+const OPEN_PASS_LANE_SPRINT_PRESSURE: f64 = 0.62;
+const OPEN_PASS_LANE_SPRINT_TRACKING: f64 = 0.42;
+const OPEN_PASS_LANE_SPRINT_CLOSE_OPPONENT_YARDS: f64 = 3.6;
+
+#[derive(Clone, Copy, Debug)]
+struct OpenPassLaneSituation {
+    pressure: f64,
+    tracking: f64,
+    extension: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpenPassLaneEval {
+    clear_now: bool,
+    clear_through: bool,
+    risk: f64,
+    blockers: usize,
+    receiver_openness: f64,
+    expected_completion: f64,
+    lane_score: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpenPassLaneDribblePlan {
+    target: Vec2,
+    kind: DribbleMoveKind,
+    touch: DribbleTouchDecision,
+    score: f64,
+}
+
+fn open_pass_lane_touch_for_target(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+) -> Option<DribbleTouchDecision> {
+    let delta = target - origin;
+    let distance = delta.len();
+    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
+        .contains(&distance)
+    {
+        return None;
+    }
+    let direction = delta.normalized();
+    if direction.len() <= 1e-6 {
+        return None;
+    }
+    let lateral = direction.x * team.attack_dir();
+    let forward = direction.y * team.attack_dir();
+    let mut angle_degrees = lateral.atan2(forward).to_degrees();
+    if angle_degrees < 0.0 {
+        angle_degrees += 360.0;
+    }
+    let bucket = ((angle_degrees / DRIBBLE_TOUCH_BUCKET_DEGREES).round() as u8)
+        % DRIBBLE_TOUCH_ANGLE_BUCKETS;
+    Some(DribbleTouchDecision::new(bucket, distance))
+}
+
+fn open_pass_lane_kind_for_target(team: Team, origin: Vec2, target: Vec2) -> DribbleMoveKind {
+    let delta = target - origin;
+    let forward = delta.y * team.attack_dir();
+    if forward > delta.x.abs() * 1.25 {
+        return DribbleMoveKind::CarryForward;
+    }
+    let left_x_sign = -team.attack_dir();
+    if delta.x.signum() == left_x_sign.signum() {
+        DribbleMoveKind::LeftCut
+    } else {
+        DribbleMoveKind::RightCut
+    }
+}
+
+fn open_pass_lane_pressure_signal(observation: &SoccerPomdpObservation) -> f64 {
+    observation
+        .pressure_urgency
+        .max(observation.perceived_pressure)
+        .max(observation.immediate_dispossession_risk)
+        .max(pressure_rising_signal(observation) * 0.92)
+        .clamp(0.0, 1.0)
+}
+
+fn open_pass_lane_tracking_signal(
+    snapshot: &WorldSnapshot,
+    team: Team,
+    current: Vec2,
+    target: Vec2,
+) -> f64 {
+    let dribble_vector = target - current;
+    if dribble_vector.len() <= 1e-6 {
+        return 0.0;
+    }
+    let dribble_dir = dribble_vector.normalized();
+    let mut best = 0.0_f64;
+    for opponent in snapshot
+        .players
+        .iter()
+        .filter(|opponent| opponent.team == team.other())
+    {
+        let position = snapshot
+            .player_position(opponent.id)
+            .unwrap_or(opponent.position);
+        let velocity = snapshot
+            .player_velocity(opponent.id)
+            .unwrap_or(opponent.velocity);
+        if !velocity.x.is_finite() || !velocity.y.is_finite() {
+            continue;
+        }
+        let current_distance = position.distance(current);
+        let target_distance = position.distance(target);
+        let proximity = (1.0
+            - current_distance.min(target_distance) / OPEN_PASS_LANE_TRACKING_RADIUS_YARDS)
+            .clamp(0.0, 1.0);
+        if proximity <= 0.0 {
+            continue;
+        }
+        let closing_current = if current_distance > 1e-6 {
+            velocity.dot((current - position).normalized()).max(0.0)
+        } else {
+            velocity.len()
+        };
+        let closing_target = if target_distance > 1e-6 {
+            velocity.dot((target - position).normalized()).max(0.0)
+        } else {
+            velocity.len()
+        };
+        let matching_run = velocity.dot(dribble_dir).max(0.0) * 0.82;
+        let tracking_speed = closing_current.max(closing_target).max(matching_run);
+        let speed_fit = (tracking_speed / OPEN_PASS_LANE_TRACKING_REF_SPEED_YPS).clamp(0.0, 1.0);
+        best = best.max(speed_fit * proximity);
+    }
+    best.clamp(0.0, 1.0)
+}
+
+fn open_pass_lane_situation_for_target(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    observation: &SoccerPomdpObservation,
+    current: Vec2,
+    target: Vec2,
+    lane_blocker_signal: f64,
+) -> OpenPassLaneSituation {
+    let pressure = open_pass_lane_pressure_signal(observation)
+        .max(pressure_from_nearest_distance(
+            snapshot.nearest_opponent_distance_at(player.team, current),
+        ) * 0.88)
+        .clamp(0.0, 1.0);
+    let tracking = open_pass_lane_tracking_signal(snapshot, player.team, current, target);
+    let extension = pressure
+        .max(tracking)
+        .max(lane_blocker_signal.clamp(0.0, 1.0) * 0.92)
+        .clamp(0.0, 1.0);
+    OpenPassLaneSituation {
+        pressure,
+        tracking,
+        extension,
+    }
+}
+
+fn open_pass_lane_dynamic_max_dribble_yards(situation: OpenPassLaneSituation) -> f64 {
+    (OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS
+        + (OPEN_PASS_LANE_MAX_DRIBBLE_YARDS - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+            * situation.extension)
+        .clamp(
+            OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS,
+            OPEN_PASS_LANE_MAX_DRIBBLE_YARDS,
+        )
+}
+
+fn open_pass_lane_should_sprint(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    observation: &SoccerPomdpObservation,
+    current: Vec2,
+    target: Vec2,
+) -> bool {
+    let situation =
+        open_pass_lane_situation_for_target(snapshot, player, observation, current, target, 0.0);
+    situation.pressure >= OPEN_PASS_LANE_SPRINT_PRESSURE
+        || situation.tracking >= OPEN_PASS_LANE_SPRINT_TRACKING
+        || observation.nearest_opponent_distance <= OPEN_PASS_LANE_SPRINT_CLOSE_OPPONENT_YARDS
+}
+
+fn open_pass_lane_sprint_for_action(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    observation: &SoccerPomdpObservation,
+    action_label: &str,
+    action: &SoccerAction,
+) -> bool {
+    if action_label != OPEN_PASS_LANE_ACTION_LABEL {
+        return false;
+    }
+    let SoccerAction::DribbleMove { target, .. } = action else {
+        return false;
+    };
+    let current = snapshot
+        .player_position(player.id)
+        .unwrap_or(player.position)
+        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+    open_pass_lane_should_sprint(snapshot, player, observation, current, *target)
+}
+
+fn open_pass_lane_eval_for_target(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    from: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+) -> OpenPassLaneEval {
+    let is_cross = pass_would_be_cross(
+        from,
+        target_position,
+        passer.team,
+        snapshot.field_width,
+        snapshot.field_length,
+    );
+    let speed = pass_speed_yps_from_power(0.68, PassFlight::Floor, is_cross, &passer.skills);
+    let (clear_now, clear_through) = snapshot.pass_lane_clearance(
+        from,
+        target_position,
+        passer.team.other(),
+        OPEN_PASS_LANE_RADIUS_YARDS,
+        speed,
+    );
+    let risk = snapshot
+        .pass_lane_interception_risk(
+            from,
+            target_position,
+            passer.team.other(),
+            OPEN_PASS_LANE_RADIUS_YARDS,
+            speed,
+            PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+        )
+        .risk
+        .clamp(0.0, 1.0);
+    let blockers = snapshot.opponents_on_pass_path(
+        from,
+        target_position,
+        passer.team.other(),
+        OPEN_PASS_LANE_RADIUS_YARDS,
+    );
+    let quality = pass_target_quality_for_snapshot(
+        snapshot,
+        passer,
+        from,
+        target,
+        target_position,
+        PassFlight::Floor,
+    );
+    let clear_fit = if clear_through {
+        1.0
+    } else if clear_now {
+        0.66
+    } else {
+        0.08
+    };
+    let traffic_fit = (1.0 - blockers as f64 * 0.24).clamp(0.0, 1.0);
+    let lane_score = (clear_fit * 0.38
+        + (1.0 - risk) * 0.30
+        + quality.expected_completion.clamp(0.0, 1.0) * 0.24
+        + traffic_fit * 0.08)
+        .clamp(0.0, 1.0);
+    OpenPassLaneEval {
+        clear_now,
+        clear_through,
+        risk,
+        blockers,
+        receiver_openness: quality.receiver_openness.clamp(0.0, 1.0),
+        expected_completion: quality.expected_completion.clamp(0.0, 1.0),
+        lane_score,
+    }
+}
 
 fn snapshot_team_lateral_width_yards(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let mut min_x = f64::INFINITY;
@@ -774,6 +1063,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "first-time-shot"
             | "first-time-header"
             | "dribble"
+            | "open-pass-lane"
             | "carry-forward"
             | "carry-out-left"
             | "carry-out-right"
@@ -1328,6 +1618,7 @@ fn mpc_execution_estimate_for_action(
             | "side-step"
             | "left-cut"
             | "right-cut"
+            | "open-pass-lane"
             | "nutmeg"
             | "xavi-turn"
             | "fake-left-cut-right"
@@ -1339,6 +1630,7 @@ fn mpc_execution_estimate_for_action(
             .as_ref()
             .and_then(|target| target.point)
             .unwrap_or(current);
+        let open_pass_lane = label == OPEN_PASS_LANE_ACTION_LABEL;
         let nearest_opponent = snapshot
             .players
             .iter()
@@ -1358,6 +1650,13 @@ fn mpc_execution_estimate_for_action(
             .map(|opponent| opponent.position.distance(target))
             .fold(f64::INFINITY, f64::min);
         let to_target = target - current;
+        if open_pass_lane {
+            let sprint_horizon = to_target.len()
+                / (player_top_speed_yps(player.role, &player.skills)
+                    * MovementGait::Sprint.speed_multiplier())
+                .max(1.0);
+            estimate.horizon_seconds = sprint_horizon.clamp(estimate.horizon_seconds, 0.82);
+        }
         let forward_dir = Vec2::new(0.0, player.team.attack_dir());
         let left_dir = Vec2::new(-player.team.attack_dir(), 0.0);
         let right_dir = Vec2::new(player.team.attack_dir(), 0.0);
@@ -1395,10 +1694,36 @@ fn mpc_execution_estimate_for_action(
         let target_space_fit = ((target_clearance / 5.5).clamp(0.0, 1.0) * 0.62
             + dribble_mpc.control_probability * 0.38)
             .clamp(0.0, 1.0);
+        let open_lane_situation = if open_pass_lane {
+            Some(open_pass_lane_situation_for_target(
+                snapshot,
+                player,
+                &snapshot.observation_for(player.id),
+                current,
+                target,
+                0.0,
+            ))
+        } else {
+            None
+        };
         let touch_fit = action_target
             .as_ref()
             .and_then(|target| target.dribble_touch)
-            .map(|touch| (1.0 - (touch.distance_yards - 2.2).abs() / 3.4).clamp(0.25, 1.0))
+            .map(|touch| {
+                if open_pass_lane && touch.distance_yards > OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS {
+                    let extra = ((touch.distance_yards - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                        / (OPEN_PASS_LANE_MAX_DRIBBLE_YARDS
+                            - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                            .max(1e-6))
+                    .clamp(0.0, 1.0);
+                    let situation_fit = open_lane_situation
+                        .map(|situation| 0.70 + situation.extension * 0.34)
+                        .unwrap_or(0.70);
+                    ((0.90 - extra * 0.18) * situation_fit).clamp(0.34, 0.98)
+                } else {
+                    (1.0 - (touch.distance_yards - 2.2).abs() / 3.4).clamp(0.25, 1.0)
+                }
+            })
             .unwrap_or(0.72);
         let qp_control_gate = (0.70 + dribble_mpc.qp_accel_fit * 0.30).clamp(0.50, 1.0);
         let forward_fit = normalized_target.dot(forward_dir).clamp(-0.4, 1.0);
@@ -1436,6 +1761,12 @@ fn mpc_execution_estimate_for_action(
                     .clamp(0.12, 0.96)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
+            "open-pass-lane" => {
+                let situational_boost = open_lane_situation
+                    .map(|situation| situation.pressure.max(situation.tracking) * 0.12)
+                    .unwrap_or(0.0);
+                direct_prob.max(left_prob).max(right_prob) * (0.88 + situational_boost)
+            }
             _ => direct_prob.max(if left_prob > right_prob {
                 left_prob * 0.92
             } else {
@@ -1965,6 +2296,288 @@ impl PlayerAgent {
             w_prime = w_prime.clamp(0.0, w_prime_max);
             self.anaerobic_load = (1.0 - w_prime / w_prime_max).clamp(0.0, 1.0);
         }
+    }
+
+    fn open_pass_lane_dribble_plan_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        pass_targets: &[usize],
+    ) -> Option<OpenPassLaneDribblePlan> {
+        if !observation.has_ball
+            || self.role == PlayerRole::Goalkeeper
+            || goal_attack_shot_blocks_alternatives(observation, self.role)
+        {
+            return None;
+        }
+
+        let current = snapshot
+            .player_position(self.id)
+            .unwrap_or(self.position)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let Some(me_snapshot) = snapshot.players.iter().find(|player| player.id == self.id) else {
+            return None;
+        };
+        let attack_dir = self.team.attack_dir();
+        let distances = [
+            1.15,
+            1.65,
+            2.25,
+            3.0,
+            3.65,
+            OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS,
+            5.0,
+            6.25,
+            OPEN_PASS_LANE_MAX_DRIBBLE_YARDS,
+        ];
+        let candidate_dirs = [
+            Vec2::new(-1.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(-0.94, 0.28 * attack_dir).normalized(),
+            Vec2::new(0.94, 0.28 * attack_dir).normalized(),
+            Vec2::new(-0.78, -0.18 * attack_dir).normalized(),
+            Vec2::new(0.78, -0.18 * attack_dir).normalized(),
+            Vec2::new(-0.42, 0.78 * attack_dir).normalized(),
+            Vec2::new(0.42, 0.78 * attack_dir).normalized(),
+        ];
+
+        let mut target_candidates: Vec<(usize, f64)> = snapshot
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == self.team
+                    && player.id != self.id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .filter_map(|player| {
+                let target_position = snapshot
+                    .player_position(player.id)
+                    .unwrap_or(player.position)
+                    .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                let pass_distance = current.distance(target_position);
+                if !(5.0..=44.0).contains(&pass_distance) {
+                    return None;
+                }
+                let receiver_forward = (target_position.y - current.y) * attack_dir;
+                if receiver_forward < -OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS {
+                    return None;
+                }
+                let ranked_bonus = pass_targets
+                    .iter()
+                    .position(|target_id| *target_id == player.id)
+                    .map(|rank| {
+                        if rank == 0 {
+                            48.0
+                        } else {
+                            5.0 - rank.min(5) as f64 * 0.45
+                        }
+                    })
+                    .unwrap_or(0.0);
+                let forward_bonus = receiver_forward.max(0.0).min(24.0) * 0.18;
+                Some((
+                    player.id,
+                    pass_distance + (-receiver_forward).max(0.0) * 3.0
+                        - ranked_bonus
+                        - forward_bonus,
+                ))
+            })
+            .collect();
+        target_candidates
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let target_ids: Vec<usize> = target_candidates
+            .into_iter()
+            .take(OPEN_PASS_LANE_TARGET_SEARCH_LIMIT)
+            .map(|(target_id, _)| target_id)
+            .collect();
+
+        let mut best: Option<OpenPassLaneDribblePlan> = None;
+        for target_id in target_ids {
+            let Some(target) = snapshot.players.iter().find(|player| {
+                player.id == target_id && player.team == self.team && player.id != self.id
+            }) else {
+                continue;
+            };
+            if target.role == PlayerRole::Goalkeeper
+                || snapshot
+                    .pending_offside_for_pass(self.id, target.id)
+                    .is_some()
+            {
+                continue;
+            }
+            let target_position = snapshot
+                .player_position(target.id)
+                .unwrap_or(target.position)
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            let pass_distance = current.distance(target_position);
+            if !(5.0..=44.0).contains(&pass_distance) {
+                continue;
+            }
+            let receiver_forward = (target_position.y - current.y) * attack_dir;
+            if receiver_forward < -OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS {
+                continue;
+            }
+
+            let current_eval = open_pass_lane_eval_for_target(
+                snapshot,
+                me_snapshot,
+                current,
+                target,
+                target_position,
+            );
+            if current_eval.receiver_openness < OPEN_PASS_LANE_MIN_RECEIVER_OPENNESS {
+                continue;
+            }
+            let current_lane_already_safe = current_eval.clear_through
+                && current_eval.blockers == 0
+                && current_eval.risk <= OPEN_PASS_LANE_ALREADY_SAFE_RISK
+                && current_eval.expected_completion >= OPEN_PASS_LANE_ALREADY_SAFE_COMPLETION;
+            if current_lane_already_safe {
+                continue;
+            }
+            let current_blocked_fit = if current_eval.clear_now {
+                0.0_f64
+            } else {
+                0.72_f64
+            }
+            .max(((current_eval.risk - OPEN_PASS_LANE_ALREADY_SAFE_RISK) / 0.50).clamp(0.0, 1.0))
+            .max((current_eval.blockers as f64 / 2.0).clamp(0.0, 1.0) * 0.72);
+            let lane_blocker_extension = if current_eval.clear_now {
+                0.0
+            } else {
+                (current_eval.blockers as f64 / 2.0).clamp(0.0, 1.0)
+            };
+
+            for dir in candidate_dirs {
+                if dir.len() <= 1e-6 {
+                    continue;
+                }
+                for distance in distances {
+                    let raw_candidate = current + dir * distance;
+                    let candidate =
+                        raw_candidate.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                    let actual_distance = current.distance(candidate);
+                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS
+                        ..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
+                        .contains(&actual_distance)
+                    {
+                        continue;
+                    }
+                    let situation = open_pass_lane_situation_for_target(
+                        snapshot,
+                        self,
+                        observation,
+                        current,
+                        candidate,
+                        lane_blocker_extension,
+                    );
+                    let dynamic_max_yards = open_pass_lane_dynamic_max_dribble_yards(situation);
+                    if actual_distance > dynamic_max_yards + 1e-6 {
+                        continue;
+                    }
+                    let carrier_step_forward = (candidate.y - current.y) * attack_dir;
+                    if carrier_step_forward < -OPEN_PASS_LANE_MAX_BACKWARD_STEP_YARDS {
+                        continue;
+                    }
+                    let opponent_space = snapshot.nearest_opponent_distance_at(self.team, candidate);
+                    if opponent_space < OPEN_PASS_LANE_MIN_CANDIDATE_OPPONENT_SPACE {
+                        continue;
+                    }
+                    let occupancy =
+                        snapshot.candidate_occupancy_at(self.team, candidate, Some(self.id));
+                    let teammate_penalty = occupancy.teammate_occupied_space_penalty(0.0);
+                    if teammate_penalty >= 0.78 {
+                        continue;
+                    }
+
+                    let candidate_eval = open_pass_lane_eval_for_target(
+                        snapshot,
+                        me_snapshot,
+                        candidate,
+                        target,
+                        target_position,
+                    );
+                    let lane_gain = candidate_eval.lane_score - current_eval.lane_score;
+                    let completion_gain =
+                        candidate_eval.expected_completion - current_eval.expected_completion;
+                    let risk_drop = current_eval.risk - candidate_eval.risk;
+                    let blocker_drop =
+                        current_eval.blockers.saturating_sub(candidate_eval.blockers) as f64;
+                    let materially_opens = candidate_eval.clear_now
+                        && (!current_eval.clear_now
+                            || blocker_drop >= 1.0
+                            || risk_drop >= OPEN_PASS_LANE_MIN_RISK_DROP);
+                    if !materially_opens
+                        && lane_gain < OPEN_PASS_LANE_MIN_LANE_GAIN
+                        && completion_gain < OPEN_PASS_LANE_MIN_COMPLETION_GAIN
+                        && risk_drop < OPEN_PASS_LANE_MIN_RISK_DROP
+                    {
+                        continue;
+                    }
+                    if candidate_eval.expected_completion < OPEN_PASS_LANE_MIN_NEW_COMPLETION
+                        && !candidate_eval.clear_now
+                    {
+                        continue;
+                    }
+
+                    let distance_fit =
+                        if actual_distance <= OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS {
+                            (1.0 - (actual_distance - 2.4).abs() / 2.3).clamp(0.42, 1.0)
+                        } else {
+                            let extra = ((actual_distance - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                                / (OPEN_PASS_LANE_MAX_DRIBBLE_YARDS
+                                    - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                                    .max(1e-6))
+                            .clamp(0.0, 1.0);
+                            ((0.92 - extra * 0.20) * (0.70 + situation.extension * 0.36))
+                                .clamp(0.38, 0.98)
+                        };
+                    let space_fit = (opponent_space / 7.0).clamp(0.0, 1.0);
+                    let receiver_forward_fit = (receiver_forward / 26.0).clamp(0.0, 1.0);
+                    let receiver_backward_penalty =
+                        ((-receiver_forward).max(0.0) / OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS)
+                            .clamp(0.0, 1.0)
+                            * 0.08;
+                    let long_touch_penalty =
+                        (actual_distance - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS).max(0.0)
+                            * 0.055
+                            * (1.0 - situation.extension).clamp(0.0, 1.0);
+                    let score = (0.10
+                        + current_blocked_fit * 0.18
+                        + lane_gain.max(0.0) * 0.56
+                        + completion_gain.max(0.0) * 0.52
+                        + risk_drop.max(0.0) * 0.28
+                        + blocker_drop.min(3.0) * 0.08
+                        + space_fit * 0.08
+                        + receiver_forward_fit * 0.06
+                        + situation.pressure.max(situation.tracking) * 0.05
+                        - teammate_penalty * 0.20
+                        - receiver_backward_penalty
+                        - long_touch_penalty
+                        - (-carrier_step_forward).max(0.0) * 0.08)
+                        * distance_fit;
+                    let score = score.clamp(0.0, 0.92);
+                    if score <= 0.0 {
+                        continue;
+                    }
+                    let Some(touch) =
+                        open_pass_lane_touch_for_target(self.team, current, candidate)
+                    else {
+                        continue;
+                    };
+                    let kind = open_pass_lane_kind_for_target(self.team, current, candidate);
+                    let plan = OpenPassLaneDribblePlan {
+                        target: candidate,
+                        kind,
+                        touch,
+                        score,
+                    };
+                    if best.is_none_or(|best| plan.score > best.score) {
+                        best = Some(plan);
+                    }
+                }
+            }
+        }
+        best
     }
 
     pub(crate) fn possession_action_options(
@@ -5040,6 +5653,9 @@ impl PlayerAgent {
         let defending_skill = ability01(self.skills.defending);
         let aggression_skill = ability01(self.skills.aggression);
         let held_restart = held_restart_action_for_snapshot(snapshot, self.id);
+        let learned_open_pass_lane_requested = learned_plan.is_some_and(|plan| {
+            normalize_soccer_action_label(&plan.action) == OPEN_PASS_LANE_ACTION_LABEL
+        });
 
         if let Some(input) = human_input {
             let (action, action_label) = if let Some(restart_label) = held_restart {
@@ -5924,7 +6540,7 @@ impl PlayerAgent {
                     .max(single_pass_goal_thread_pressure_score(&observation))
                     .max(threaded_goal_pass_quality_fit(&observation) * 0.82)
                     >= 0.40;
-            if !ground_killer_priority {
+            if !ground_killer_priority && !learned_open_pass_lane_requested {
                 // Only PRE-EMPT-commit the long ball when it is genuinely on (an open onside runner
                 // the aerial pass can actually reach). Otherwise fall through to the full ranked
                 // decision instead of forcing a 0%-completion hoof. Gated; see the helper.
@@ -6243,6 +6859,13 @@ impl PlayerAgent {
                             });
                         }
                     }
+                    let sprint = open_pass_lane_sprint_for_action(
+                        snapshot,
+                        self,
+                        &observation,
+                        &action_label,
+                        &action,
+                    );
                     let mut decision = self.decision_trace(
                         snapshot,
                         mdp_state,
@@ -6258,7 +6881,7 @@ impl PlayerAgent {
                     return PlayerIntent {
                         player_id: self.id,
                         action,
-                        sprint: false,
+                        sprint,
                     };
                 }
             }
@@ -6278,6 +6901,18 @@ impl PlayerAgent {
                 snapshot.dt_seconds,
                 snapshot.field_width,
             );
+            let open_pass_lane_plan = self.open_pass_lane_dribble_plan_for(
+                snapshot,
+                &observation,
+                &strategic_pass_targets,
+            );
+            if let Some(plan) = open_pass_lane_plan {
+                action_options.push(AgentActionOptionTrace::new(
+                    OPEN_PASS_LANE_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
             let killer_pass_preempt_chance = if snapshot
                 .killer_pass_target_for(self.id, &pass_targets)
                 .is_some()
@@ -6566,6 +7201,12 @@ impl PlayerAgent {
                 weighted_ops.push((
                     "wait-for-support".to_string(),
                     action_option_score(&action_options, "wait-for-support"),
+                ));
+            }
+            if open_pass_lane_plan.is_some() {
+                weighted_ops.push((
+                    OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                    action_option_score(&action_options, OPEN_PASS_LANE_ACTION_LABEL),
                 ));
             }
             if xavi_turn_offered {
@@ -7222,6 +7863,29 @@ impl PlayerAgent {
                             }
                         }
                     }
+                    "open-pass-lane" => {
+                        order_names.push(OPEN_PASS_LANE_ACTION_LABEL.to_string());
+                        if let Some(plan) = open_pass_lane_plan {
+                            let chance =
+                                action_option_score(&action_options, OPEN_PASS_LANE_ACTION_LABEL);
+                            if agentic_action_commitment(
+                                chance,
+                                snapshot.dt_seconds,
+                                &observation,
+                                self.role,
+                            ) {
+                                chosen = Some((
+                                    SoccerAction::DribbleMove {
+                                        target: plan.target,
+                                        kind: plan.kind,
+                                        touch: plan.touch,
+                                    },
+                                    OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
                     pass_label if pass_label.starts_with("pass") => {
                         let rank = pass_label
                             .trim_start_matches("pass")
@@ -7403,6 +8067,15 @@ impl PlayerAgent {
                             touch,
                         },
                         kind.label().to_string(),
+                    )
+                } else if let Some(plan) = open_pass_lane_plan {
+                    (
+                        SoccerAction::DribbleMove {
+                            target: plan.target,
+                            kind: plan.kind,
+                            touch: plan.touch,
+                        },
+                        OPEN_PASS_LANE_ACTION_LABEL.to_string(),
                     )
                 } else if let Some(target) = pass_targets.first() {
                     (
@@ -7668,6 +8341,16 @@ impl PlayerAgent {
                                     label.to_string(),
                                 ))
                             }
+                            "open-pass-lane" => open_pass_lane_plan.map(|plan| {
+                                (
+                                    SoccerAction::DribbleMove {
+                                        target: plan.target,
+                                        kind: plan.kind,
+                                        touch: plan.touch,
+                                    },
+                                    OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                                )
+                            }),
                             "dribble" => {
                                 let kind = self.agentic_fallback_dribble_kind(
                                     snapshot,
@@ -7788,11 +8471,18 @@ impl PlayerAgent {
                 action_label = fallback_label;
             }
             let sprint = matches!(action, SoccerAction::DribbleMove { .. })
-                && (self.role == PlayerRole::Forward
+                && (open_pass_lane_sprint_for_action(
+                    snapshot,
+                    self,
+                    &observation,
+                    &action_label,
+                    &action,
+                ) || (action_label != OPEN_PASS_LANE_ACTION_LABEL
+                    && (self.role == PlayerRole::Forward
                     || observation.forward_dribble_space_yards > 3.0
                     || observation.perceived_pressure > 0.35
                     || observation.decision_urgency > 0.46
-                    || observation.offensive_urgency > 0.34);
+                    || observation.offensive_urgency > 0.34)));
             self.last_decision = Some(self.decision_trace(
                 snapshot,
                 mdp_state,
@@ -8738,6 +9428,67 @@ impl PlayerAgent {
                     },
                     "hold-up-flank".to_string(),
                 ))
+            }
+            "open-pass-lane" if observation.has_ball => {
+                let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                let mut lane_targets = Vec::with_capacity(visible_targets.len() + 1);
+                if let Some(target_player) = plan.target_player {
+                    lane_targets.push(target_player);
+                }
+                for target_id in visible_targets {
+                    if !lane_targets.contains(&target_id) {
+                        lane_targets.push(target_id);
+                    }
+                }
+                let current = snapshot
+                    .player_position(self.id)
+                    .unwrap_or(self.position)
+                    .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                let learned_target = plan.target_point.and_then(|target| {
+                    let target = target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                    let step = target - current;
+                    let step_distance = step.len();
+                    let forward = step.y * self.team.attack_dir();
+                    let situation = open_pass_lane_situation_for_target(
+                        snapshot,
+                        self,
+                        observation,
+                        current,
+                        target,
+                        0.0,
+                    );
+                    let dynamic_max_yards = open_pass_lane_dynamic_max_dribble_yards(situation);
+                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS
+                        ..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
+                        .contains(&step_distance)
+                        || step_distance > dynamic_max_yards + 1e-6
+                        || forward < -OPEN_PASS_LANE_MAX_BACKWARD_STEP_YARDS
+                        || snapshot.nearest_opponent_distance_at(self.team, target)
+                            < OPEN_PASS_LANE_MIN_CANDIDATE_OPPONENT_SPACE
+                    {
+                        return None;
+                    }
+                    let touch = open_pass_lane_touch_for_target(self.team, current, target)?;
+                    let kind = open_pass_lane_kind_for_target(self.team, current, target);
+                    Some(OpenPassLaneDribblePlan {
+                        target,
+                        kind,
+                        touch,
+                        score: 0.0,
+                    })
+                });
+                self.open_pass_lane_dribble_plan_for(snapshot, observation, &lane_targets)
+                    .or(learned_target)
+                    .map(|lane_plan| {
+                        (
+                            SoccerAction::DribbleMove {
+                                target: lane_plan.target,
+                                kind: lane_plan.kind,
+                                touch: lane_plan.touch,
+                            },
+                            OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                        )
+                    })
             }
             "dribble"
             | "vertical-attack"

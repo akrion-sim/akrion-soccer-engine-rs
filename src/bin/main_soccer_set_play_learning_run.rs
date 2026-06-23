@@ -8,7 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     train_soccer_set_play_restarts_with_events, MatchConfig, SoccerNeuralBlendConfig,
-    SoccerNeuralBlendMode, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    SoccerMarlAlgorithm, SoccerNeuralBlendMode, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerSetPlayRestartKind,
     SoccerSetPlayTrainingEvent, SoccerSetPlayTrainingRequest, SoccerTeamQPolicies, Team, Vec2,
 };
@@ -63,6 +64,24 @@ fn env_neural_backend() -> Result<SoccerNeuralLearningBackend, Box<dyn Error>> {
         "threaded" | "thread" | "worker" => Ok(SoccerNeuralLearningBackend::Threaded),
         "inline" | "sync" => Ok(SoccerNeuralLearningBackend::Inline),
         _ => Err(format!("SOCCER_NEURAL_LEARNING_BACKEND={value:?} is invalid").into()),
+    }
+}
+
+fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorithm, Box<dyn Error>> {
+    let Some(value) =
+        env_value("SOCCER_MARL_ALGORITHM").or_else(|| env_value("SOCCER_NEURAL_MARL_ALGORITHM"))
+    else {
+        return Ok(default);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" => Ok(SoccerMarlAlgorithm::Off),
+        "independent" | "independent-actor-critic" | "independent_actor_critic"
+        | "independentactorcritic" => Ok(SoccerMarlAlgorithm::IndependentActorCritic),
+        "mappo" | "ppo" => Ok(SoccerMarlAlgorithm::Mappo),
+        _ => Err(format!(
+            "SOCCER_MARL_ALGORITHM must be off, independentActorCritic, or mappo, got {value:?}"
+        )
+        .into()),
     }
 }
 
@@ -307,6 +326,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         lp_coupling_enabled: env_bool(
             "SOCCER_NEURAL_LP_COUPLING_ENABLED",
             SoccerNeuralLearningConfig::default().lp_coupling_enabled,
+        )?,
+        marl_algorithm: env_marl_algorithm(SoccerNeuralLearningConfig::default().marl_algorithm)?,
+        marl_team_reward_weight: env_parse(
+            "SOCCER_MARL_TEAM_REWARD_WEIGHT",
+            SoccerNeuralLearningConfig::default().marl_team_reward_weight,
+        )?,
+        marl_intermediate_reward_weight: env_parse(
+            "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT",
+            SoccerNeuralLearningConfig::default().marl_intermediate_reward_weight,
+        )?,
+        mappo_clip_epsilon: env_parse(
+            "SOCCER_MAPPO_CLIP_EPSILON",
+            SoccerNeuralLearningConfig::default().mappo_clip_epsilon,
         )?,
     };
     validate_soccer_neural_learning_config_for_learning_run(&config.neural_learning)
