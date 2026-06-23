@@ -6247,6 +6247,49 @@ impl PlayerAgent {
                     hold_for_support_offered = true;
                 }
             }
+            // XAVI TURN: a high-skill shielded pirouette that turns a tight defender the
+            // long way around, keeping the ball on the far side throughout. Offered (like
+            // the wall-pass / wait-for-support options) only in its window — a defender
+            // right on top with the forward path blocked — and only when live
+            // (`xavi_turn_enabled`). Added conditionally so the option set is byte-identical
+            // to baseline outside this window, which keeps a disabled match in lock-step.
+            let mut xavi_turn_offered = false;
+            if snapshot.xavi_turn_enabled
+                && self.role != PlayerRole::Goalkeeper
+                && observation.nearest_opponent_distance <= XAVI_TURN_MAX_DEFENDER_YARDS
+                // Never wheel and turn your back deep in your own defensive third.
+                && observation.yards_to_own_goal >= XAVI_TURN_MIN_OWN_GOAL_YARDS
+                && !goal_approach_forces_goalmouth_carry(&observation, self.role)
+            {
+                let press = observation
+                    .perceived_pressure
+                    .max(observation.pressure_urgency)
+                    .clamp(0.0, 1.0);
+                let forward_blocked = (1.0
+                    - observation.forward_dribble_space_yards / XAVI_TURN_FORWARD_BLOCK_YARDS)
+                    .clamp(0.0, 1.0);
+                if press >= XAVI_TURN_MIN_PRESSURE && forward_blocked >= 0.25 {
+                    // Heavily skill-weighted: only a genuinely technical carrier reaches an
+                    // appetite that can edge out a side-step / cut and rival a static shield;
+                    // a journeyman stays well below them and keeps the ball more simply. The
+                    // skill gate is superlinear (`^1.6`) so the elite/average gap is wide
+                    // enough that, even when totally boxed in, an average carrier shields
+                    // rather than attempting a turn it cannot reliably pull off.
+                    let technique = (ability01(self.skills.dribbling) * 0.62
+                        + ability01(self.skills.flair_passing) * 0.20
+                        + ability01(self.skills.first_touch) * 0.18)
+                        .clamp(0.0, 1.0);
+                    let skill_gate = 0.10 + technique.powf(1.6) * 1.85;
+                    let appetite = (XAVI_TURN_BASE_APPETITE
+                        * self.preferences.dribble_bias.clamp(0.4, 1.2)
+                        * skill_gate
+                        * (0.55 + press * 0.85)
+                        * (0.55 + forward_blocked * 0.80))
+                        .clamp(0.0, XAVI_TURN_MAX_APPETITE);
+                    action_options.push(AgentActionOptionTrace::new("xavi-turn", appetite, true));
+                    xavi_turn_offered = true;
+                }
+            }
             action_options = normalize_action_options(action_options);
             annotate_tick_probabilities_from_scores(&mut action_options, snapshot.dt_seconds);
             let mut weighted_ops = vec![
@@ -6365,6 +6408,12 @@ impl PlayerAgent {
                 weighted_ops.push((
                     "wait-for-support".to_string(),
                     action_option_score(&action_options, "wait-for-support"),
+                ));
+            }
+            if xavi_turn_offered {
+                weighted_ops.push((
+                    "xavi-turn".to_string(),
+                    action_option_score(&action_options, "xavi-turn"),
                 ));
             }
             for rank in 0..pass_targets.len() {
@@ -6551,6 +6600,35 @@ impl PlayerAgent {
                             break;
                         }
                     }
+                    "xavi-turn" => {
+                        order_names.push("xavi-turn".to_string());
+                        let xavi_chance = action_option_score(&action_options, "xavi-turn");
+                        if agentic_action_commitment(
+                            xavi_chance,
+                            snapshot.dt_seconds,
+                            &observation,
+                            self.role,
+                        ) {
+                            let kind = DribbleMoveKind::XaviTurn;
+                            let touch =
+                                snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                            let target = snapshot.dribble_move_target_for_touch(
+                                self.id,
+                                self.home_position,
+                                kind,
+                                touch,
+                            );
+                            chosen = Some((
+                                SoccerAction::DribbleMove {
+                                    target,
+                                    kind,
+                                    touch,
+                                },
+                                "xavi-turn".to_string(),
+                            ));
+                            break;
+                        }
+                    }
                     "side-step" => {
                         order_names.push("side-step".to_string());
                         let side_step_chance = action_option_score(&action_options, "side-step");
@@ -6596,7 +6674,7 @@ impl PlayerAgent {
                                     | DribbleMoveKind::ProtectBall => 0,
                                     DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                                     DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
-                                    DribbleMoveKind::Nutmeg => 0,
+                                    DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn => 0,
                                     DribbleMoveKind::FakeLeftCutRight
                                     | DribbleMoveKind::FakeRightCutLeft => 0,
                                 };
@@ -7127,7 +7205,7 @@ impl PlayerAgent {
                         DribbleMoveKind::CarryForward | DribbleMoveKind::ProtectBall => 0,
                         DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                         DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
-                        DribbleMoveKind::Nutmeg => 0,
+                        DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn => 0,
                         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0,
                     };
                     (
@@ -8484,7 +8562,7 @@ impl PlayerAgent {
                     DribbleMoveKind::CarryForward | DribbleMoveKind::ProtectBall => 0,
                     DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                     DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
-                    DribbleMoveKind::Nutmeg => 0,
+                    DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn => 0,
                     DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0,
                 };
                 Some((
@@ -9085,6 +9163,13 @@ pub enum DribbleMoveKind {
     Nutmeg,
     FakeLeftCutRight,
     FakeRightCutLeft,
+    /// The "Xavi turn": a near-full (~280-300°) shielded pirouette. The carrier keeps
+    /// the ball on the FAR side of the nearest defender for the whole arc and wheels
+    /// the long way AROUND them — a longer but safer path that turns the defender
+    /// rather than trying to knock the ball past. While turning, the ball is so well
+    /// protected that a clean steal is capped near 10% (see
+    /// [`XAVI_TURN_TACKLE_SUCCESS_CAP`]). Gated by [`xavi_turn_enabled`].
+    XaviTurn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -9133,6 +9218,7 @@ impl DribbleMoveKind {
             DribbleMoveKind::Nutmeg => "nutmeg",
             DribbleMoveKind::FakeLeftCutRight => "fake-left-cut-right",
             DribbleMoveKind::FakeRightCutLeft => "fake-right-cut-left",
+            DribbleMoveKind::XaviTurn => "xavi-turn",
         }
     }
 
@@ -9151,6 +9237,9 @@ impl DribbleMoveKind {
             DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => {
                 DRIBBLE_BEAT_REWARD_POINTS * 1.08
             }
+            // Wheeling a defender with a Xavi turn cleanly beats them and buys time on
+            // the ball — a full-value beat.
+            DribbleMoveKind::XaviTurn => DRIBBLE_BEAT_REWARD_POINTS,
         }
     }
 }

@@ -7676,6 +7676,8 @@ impl SoccerMatch {
                 Some(DribbleMoveKind::CarryForward) => 0.78,
                 Some(DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight) => 0.86,
                 Some(DribbleMoveKind::ProtectBall) => 0.48,
+                // Close-control shielded turn: keep the ball glued to the feet.
+                Some(DribbleMoveKind::XaviTurn) => 0.42,
                 Some(DribbleMoveKind::Nutmeg) => 1.18,
                 Some(DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut) => 1.04,
                 Some(DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft) => 1.10,
@@ -8295,10 +8297,10 @@ impl SoccerMatch {
         dispossession_probability = (dispossession_probability
             * (1.0 + attacker_dizziness * DIZZINESS_DISPOSSESSION_RISK))
             .clamp(0.0, 0.95);
-        // Shielding forces possession ~80%: cap the hold-up steal at 20%.
-        if kind == DribbleMoveKind::ProtectBall {
-            dispossession_probability =
-                dispossession_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+        // A body-shielding move forces possession: cap the hold-up steal — ~20% for a
+        // static `protect-ball` shield, ~10% while turning the man with a `xavi-turn`.
+        if let Some(cap) = xavi_turn_tackle_success_cap(kind) {
+            dispossession_probability = dispossession_probability.min(cap);
         }
         // Physical body-shield / rear challenge: if the carrier has the ball pushed
         // out in front and this defender is behind the body or the led ball, there is
@@ -9498,13 +9500,14 @@ impl SoccerMatch {
                         success_probability = (success_probability
                             * (1.0 + holder_dizziness * DIZZINESS_DISPOSSESSION_RISK))
                             .clamp(0.0, 0.95);
-                        // Shielding (body between ball and defender) forces
-                        // possession ~80% of the time: cap the steal at 20%.
+                        // Shielding (body between ball and defender) forces possession:
+                        // cap the steal — ~20% for a static shield, ~10% mid xavi-turn.
                         let holder_is_shielding =
                             matches!(target_dribble_kind, Some(DribbleMoveKind::ProtectBall));
-                        if holder_is_shielding {
-                            success_probability =
-                                success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+                        if let Some(cap) =
+                            target_dribble_kind.and_then(xavi_turn_tackle_success_cap)
+                        {
+                            success_probability = success_probability.min(cap);
                         }
                         // Physical body-shield: the carrier has the ball pushed out
                         // in front with this tackler behind the body and off the ball.
@@ -9639,9 +9642,10 @@ impl SoccerMatch {
                             .clamp(0.0, 0.97);
                         let holder_is_shielding =
                             matches!(target_dribble_kind, Some(DribbleMoveKind::ProtectBall));
-                        if holder_is_shielding {
-                            success_probability =
-                                success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+                        if let Some(cap) =
+                            target_dribble_kind.and_then(xavi_turn_tackle_success_cap)
+                        {
+                            success_probability = success_probability.min(cap);
                         }
                         let mpc_steal_fit =
                             self.mpc_steal_execution_fit(player_id, target_player, true);
@@ -15466,6 +15470,11 @@ pub struct WorldSnapshot {
     /// pre-empt; defaults on.
     #[serde(default = "default_true")]
     pub(crate) slide_tackle_enabled: bool,
+    /// Whether the `xavi-turn` shielded-pirouette dribble move may be offered this match
+    /// (mirrors [`xavi_turn_enabled`] over the match config). Read by the on-ball decision
+    /// to gate the candidate; defaults on.
+    #[serde(default = "default_true")]
+    pub(crate) xavi_turn_enabled: bool,
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
@@ -16488,6 +16497,7 @@ impl WorldSnapshot {
             local_mpc_enabled: m.config.local_mpc_enabled,
             trace_mdp_mpc_comparison: options.trace_mdp_mpc_comparison,
             slide_tackle_enabled: slide_tackle_enabled(&m.config),
+            xavi_turn_enabled: xavi_turn_enabled(&m.config),
             pass_anticipation_enabled: m.config.pass_anticipation_enabled,
             local_mpc_max_players_per_team: m.config.local_mpc_max_players_per_team,
             home_team_possession_seconds,
@@ -29121,7 +29131,9 @@ impl WorldSnapshot {
                     + forward_component.max(0.0) * 0.24
                     + (1.0 - pressure) * 0.14
             }
-            DribbleMoveKind::ProtectBall => pressure * 0.26 - forward_component.max(0.0) * 0.18,
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn => {
+                pressure * 0.26 - forward_component.max(0.0) * 0.18
+            }
             DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => {
                 lateral_component.abs() * 0.42
                     + pressure * 0.18
@@ -29183,7 +29195,7 @@ impl WorldSnapshot {
         } else {
             DRIBBLE_MAX_TOUCH_YARDS
         };
-        if kind == DribbleMoveKind::ProtectBall {
+        if matches!(kind, DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn) {
             return distance.clamp(0.62, 1.45);
         }
         if kind == DribbleMoveKind::CarryForward {
@@ -29220,7 +29232,7 @@ impl WorldSnapshot {
         }
         if matches!(
             dribble_final_cut_kind(kind),
-            DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
         ) {
             return base_direction;
         }
@@ -29379,6 +29391,30 @@ impl WorldSnapshot {
                     (current - defender_position).normalized()
                 })
                 .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir())),
+            // XAVI TURN: wheel the LONG way AROUND the defender on the shielded side. Move
+            // along the tangent of the circle centred on the defender, committed to one
+            // rotational sense (the carrier's existing angular momentum, else seeded toward
+            // the open middle) so the pirouette never reverses mid-turn. A little radial
+            // "away" keeps the body between defender and ball so the arc never collapses
+            // inward onto the challenge — and so the step is never toward the defender.
+            DribbleMoveKind::XaviTurn => nearest_defender
+                .map(|(_, defender_position, _)| {
+                    let away = current - defender_position;
+                    let away = if away.len() > 1e-6 {
+                        away.normalized()
+                    } else {
+                        Vec2::new(0.0, me.team.attack_dir())
+                    };
+                    let tangent = xavi_turn_wheel_tangent(
+                        away,
+                        me.velocity,
+                        current.x,
+                        self.field_width * 0.5,
+                        me.team.attack_dir(),
+                    );
+                    (tangent * 0.82 + away * 0.34).normalized()
+                })
+                .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir())),
             _ => touch.direction_for_team(me.team),
         };
         let direction = self.attacking_dribble_goal_drive_direction(me, current, direction, kind);
@@ -29411,7 +29447,7 @@ impl WorldSnapshot {
         if me.role == PlayerRole::Defender
             && !matches!(
                 dribble_final_cut_kind(kind),
-                DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg
+                DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
             )
         {
             if let Some((_, defender_position, defender_distance)) = nearest_defender {
@@ -29448,7 +29484,10 @@ impl WorldSnapshot {
         }
         if player.role == PlayerRole::Goalkeeper
             || self.ball.holder != Some(player.id)
-            || matches!(dribble_final_cut_kind(kind), DribbleMoveKind::ProtectBall)
+            || matches!(
+                dribble_final_cut_kind(kind),
+                DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn
+            )
         {
             return base_direction;
         }
@@ -29477,6 +29516,7 @@ impl WorldSnapshot {
             DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 0.62,
             DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight => 0.46,
             DribbleMoveKind::ProtectBall
+            | DribbleMoveKind::XaviTurn
             | DribbleMoveKind::FakeLeftCutRight
             | DribbleMoveKind::FakeRightCutLeft => 0.0,
         };
@@ -29505,7 +29545,9 @@ impl WorldSnapshot {
         touch: DribbleTouchDecision,
     ) -> Option<Vec2> {
         let me = self.players.iter().find(|p| p.id == player_id)?;
-        if me.role == PlayerRole::Goalkeeper || kind == DribbleMoveKind::ProtectBall {
+        if me.role == PlayerRole::Goalkeeper
+            || matches!(kind, DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn)
+        {
             return None;
         }
         let attack_dir = me.team.attack_dir();
@@ -29567,7 +29609,7 @@ impl WorldSnapshot {
             DribbleMoveKind::CarryForward | DribbleMoveKind::Nutmeg => 0.96,
             DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight => 0.90,
             DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 0.82,
-            DribbleMoveKind::ProtectBall => return None,
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn => return None,
             DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0.82,
         };
         let mut target = goal_step * goal_blend + base_target * (1.0 - goal_blend);
@@ -29617,7 +29659,7 @@ impl WorldSnapshot {
             | DribbleMoveKind::ProtectBall => 0,
             DribbleMoveKind::LeftCut => 9,
             DribbleMoveKind::RightCut => 3,
-            DribbleMoveKind::Nutmeg => 0,
+            DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn => 0,
             DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0,
         };
         self.dribble_move_target_for_touch(

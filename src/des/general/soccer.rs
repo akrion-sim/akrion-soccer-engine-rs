@@ -417,6 +417,37 @@ const POSSESSION_REGAIN_GRACE_TICKS: u64 = secs_to_ticks(0.5);
 /// ball (`protect-ball`): body between ball and defender ⇒ possession is forced
 /// ~80% of the time, but at the cost of progression (modelled elsewhere).
 const SHIELDED_HOLDER_TACKLE_SUCCESS_CAP: f64 = 0.20;
+/// Steal/tackle success ceiling against a carrier mid-`xavi-turn`: the ball is kept on
+/// the far side of the defender for the whole ~290° arc and wheeled the long way around,
+/// so while turning the man a clean dispossession tops out near 10% — even tighter than a
+/// standing body-shield. Applied (like the shield cap) after the dizziness lift, so a fast
+/// pirouette cannot push the steal back above it. See [`xavi_turn_tackle_success_cap`].
+const XAVI_TURN_TACKLE_SUCCESS_CAP: f64 = 0.10;
+/// The nearest defender must be within this range for a `xavi-turn` to be offered — you
+/// can only wheel the long way AROUND a man who is actually on top of you.
+const XAVI_TURN_MAX_DEFENDER_YARDS: f64 = 3.0;
+/// Forward dribble space at/under which the path counts as "blocked" for the xavi-turn
+/// decision; a fully blocked front is the strongest reason to turn rather than force on.
+const XAVI_TURN_FORWARD_BLOCK_YARDS: f64 = 4.0;
+/// A `xavi-turn` is only offered above this combined pressure (perceived / urgency): it is
+/// a release-the-pressure move to keep the ball, never a flourish thrown in open space.
+const XAVI_TURN_MIN_PRESSURE: f64 = 0.34;
+/// A `xavi-turn` is suppressed when the carrier is this close to its OWN goal — wheeling and
+/// turning your back deep in your own defensive third gifts chances; clear/shield instead.
+const XAVI_TURN_MIN_OWN_GOAL_YARDS: f64 = 30.0;
+/// Base and ceiling for the `xavi-turn` decision appetite. Sized to clear the strong
+/// pressured-holder shield floor (`protect-ball`, kept deliberately high on this base to
+/// stop panic passes) only for a genuinely WORLD-CLASS carrier (dribbling ~9+) in the
+/// niche — tight goal-side defender, forward blocked, under pressure, outside his own third
+/// and outside goal-approach range (so it never crowds out a shot or a real outlet). A
+/// merely good carrier (≤~7) still shields; the superlinear skill gate keeps the
+/// elite/average split wide. High in absolute terms because it competes with that high
+/// static-shield floor.
+const XAVI_TURN_BASE_APPETITE: f64 = 0.95;
+const XAVI_TURN_MAX_APPETITE: f64 = 2.60;
+/// Below this tangential speed (yps) a `xavi-turn` carrier is treated as not yet wheeling, so
+/// the wheel sense is seeded from geometry rather than from its (negligible) momentum.
+const XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS: f64 = 0.5;
 /// A ball-carrier is better at retaining possession in a 1v1 than the raw skill-vs-skill
 /// steal odds imply — they protect it with their body, ride the challenge, and pick the
 /// moment. Applied as a multiplier on the defender's steal probability (both the hold-up
@@ -619,6 +650,10 @@ const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 7.0;
 // Special moves (cuts / fakes / nutmeg) chop the ball across the body far faster.
 const CARRY_ORBIT_SPECIAL_RATE_RAD_S: f64 = 11.0;
+// The xavi-turn sweeps the ball the long way AROUND the body on the shielded side as
+// the carrier wheels ~290°; a touch quicker than a normal carry so the ball keeps up
+// with the pirouette, but still arcs around (never chopped through, unlike a cut).
+const CARRY_ORBIT_XAVI_RATE_RAD_S: f64 = 9.0;
 // The ball stays at least this far from the carrier's feet on ordinary play, so
 // it arcs AROUND the body. Only special moves may pull it closer (passing it
 // THROUGH the player line).
@@ -9332,6 +9367,7 @@ fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
         CarryOutRight => Some(DribbleMoveKind::CarryOutRight),
         FakeLeftCutRight => Some(DribbleMoveKind::FakeLeftCutRight),
         FakeRightCutLeft => Some(DribbleMoveKind::FakeRightCutLeft),
+        XaviTurn => Some(DribbleMoveKind::XaviTurn),
         _ => None,
     }
 }
@@ -9431,6 +9467,18 @@ fn dribble_touch_angle_weight(kind: DribbleMoveKind, bucket: u8) -> f64 {
         DribbleMoveKind::Nutmeg => {
             let through_lane = forward.max(0.0).powi(2);
             0.45 + through_lane * 2.75
+        }
+        // The xavi-turn drags the ball laterally/behind on the shielded side as the body
+        // wheels around — favour the across-and-back angles, never straight forward into
+        // the defender (mirrors the protect-ball shielding weighting).
+        DribbleMoveKind::XaviTurn => {
+            if forward < -0.20 {
+                1.70
+            } else if lateral.abs() > 0.35 {
+                1.40
+            } else {
+                0.40
+            }
         }
         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => {
             unreachable!("feints are resolved into their final cut before angle weighting")
@@ -12761,6 +12809,13 @@ pub struct MatchConfig {
     /// disabled match is byte-identical to one where no such window arises.
     #[serde(default)]
     pub disable_slide_tackle: bool,
+    /// Force the `xavi-turn` shielded-pirouette dribble move OFF for THIS match, independent
+    /// of the process-wide `DD_SOCCER_DISABLE_XAVI_TURN` env flag. Default `false` => the move
+    /// is live. When disabled the `xavi-turn` option is never offered, so no such action is
+    /// ever produced and the match is byte-identical to one where it never arises. See
+    /// [`xavi_turn_enabled`].
+    #[serde(default)]
+    pub disable_xavi_turn: bool,
     /// Enable the lightweight Bayesian opponent-press belief: a per-player
     /// Beta-Bernoulli posterior over how readily each opponent steps into pass
     /// lanes, which shades the analytic pass-lane interception risk into a Bayesian
@@ -12810,6 +12865,7 @@ impl Default for MatchConfig {
             adversarial_embedding_memory_limit: DEFAULT_ADVERSARIAL_MOMENT_MEMORY_LIMIT,
             disable_tick_order_shuffle: false,
             disable_slide_tackle: false,
+            disable_xavi_turn: false,
             opponent_belief_enabled: false,
             max_human_players: 4,
             seed: 2026,
@@ -41066,6 +41122,7 @@ fn tracking_frame_to_world_snapshot(
         local_mpc_enabled: config.local_mpc_enabled,
         trace_mdp_mpc_comparison: true,
         slide_tackle_enabled: slide_tackle_enabled(config),
+        xavi_turn_enabled: xavi_turn_enabled(config),
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
@@ -42400,6 +42457,9 @@ fn dribble_beat_probability(
         DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 1.0,
         DribbleMoveKind::Nutmeg => 0.82,
         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 1.05,
+        // Turning a committed defender with a shielded pirouette beats them cleanly more
+        // often than not — they are wrong-footed by the long way around.
+        DribbleMoveKind::XaviTurn => 0.96,
     };
     let response_multiplier = match response {
         DefenderDribbleResponse::HoldUp => 1.0,
@@ -42434,6 +42494,9 @@ fn dribble_beat_geometry_is_valid(
 fn dribble_dispossession_kind_multiplier(kind: DribbleMoveKind) -> f64 {
     match kind {
         DribbleMoveKind::ProtectBall => 0.58,
+        // Even more secure than a static shield: the body stays between defender and ball
+        // through the whole turn. (The hard 10% ceiling is applied separately.)
+        DribbleMoveKind::XaviTurn => 0.40,
         DribbleMoveKind::CarryForward => 0.86,
         DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight => 0.78,
         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0.92,
@@ -42499,6 +42562,34 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
+}
+
+fn dd_soccer_disable_xavi_turn() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_XAVI_TURN").is_ok())
+}
+
+/// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on
+/// unless the process-wide `DD_SOCCER_DISABLE_XAVI_TURN` env flag or the per-match config
+/// field disables it. Mirrored onto [`WorldSnapshot::xavi_turn_enabled`] so the decision
+/// layer reads one source of truth; when off, the `xavi-turn` option is never offered, so
+/// the move is never produced and the byte-stream is identical to baseline.
+fn xavi_turn_enabled(config: &MatchConfig) -> bool {
+    !dd_soccer_disable_xavi_turn() && !config.disable_xavi_turn
+}
+
+/// The clean-steal ceiling for a carrier executing a body-shielding dribble move: a
+/// standing `protect-ball` shield caps the steal at [`SHIELDED_HOLDER_TACKLE_SUCCESS_CAP`],
+/// and a `xavi-turn` (ball kept on the far side through the whole wheel) at the tighter
+/// [`XAVI_TURN_TACKLE_SUCCESS_CAP`]. `None` for any other move (no shield cap applies).
+/// Single source of truth for the hold-up, standing-tackle and slide-tackle paths.
+fn xavi_turn_tackle_success_cap(kind: DribbleMoveKind) -> Option<f64> {
+    match kind {
+        DribbleMoveKind::ProtectBall => Some(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP),
+        DribbleMoveKind::XaviTurn => Some(XAVI_TURN_TACKLE_SUCCESS_CAP),
+        _ => None,
+    }
 }
 
 /// Whether the committed slide-tackle mechanic is live for this match: on unless the
@@ -42569,6 +42660,51 @@ fn carried_ball_lead(player: &PlayerAgent) -> Vec2 {
     facing * DRIBBLE_TOUCH_LEAD_YARDS
 }
 
+/// The unit tangent a `xavi-turn` carrier wheels along — perpendicular to the
+/// defender→carrier line, committed to ONE rotational side so the ~290° pirouette never
+/// reverses partway through (which would unwind the turn and briefly swing the ball back
+/// toward the defender).
+///
+/// `away` is the unit vector from the defender to the carrier (the shielded side). The
+/// rotational sense is taken from the carrier's existing angular momentum about the
+/// defender (`cross(away, velocity)`): once it is wheeling, it keeps wheeling that way
+/// regardless of how far the defender's bearing has swept — this is what a per-tick
+/// geometric test cannot guarantee, since `away` rotates a full circle through the turn.
+/// Before it has tangential momentum (just initiating, or moving radially) the sense is
+/// seeded toward the open middle of the pitch — a flip-resistant choice that also curls the
+/// carrier away from the touchline rather than into it — and leans goalward when there is no
+/// lateral preference (defender square to the carrier, or the carrier on the halfway line).
+fn xavi_turn_wheel_tangent(
+    away: Vec2,
+    velocity: Vec2,
+    current_x: f64,
+    field_center_x: f64,
+    attack_dir: f64,
+) -> Vec2 {
+    // +90° (counter-clockwise) rotation of `away`.
+    let base = Vec2::new(-away.y, away.x);
+    if base.len() <= 1e-9 {
+        return Vec2::new(0.0, attack_dir.signum());
+    }
+    // cross(away, velocity) > 0 ⇒ the carrier is already orbiting counter-clockwise ⇒ +base.
+    let angular_momentum = away.x * velocity.y - away.y * velocity.x;
+    let sense = if angular_momentum.abs() > XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS {
+        angular_momentum
+    } else {
+        let toward_center = field_center_x - current_x;
+        if base.x.abs() > 1e-6 && toward_center.abs() > 0.5 {
+            base.x * toward_center
+        } else {
+            base.y * attack_dir
+        }
+    };
+    if sense >= 0.0 {
+        base
+    } else {
+        base * -1.0
+    }
+}
+
 /// Where the carrier wants the ball this tick — the resting spot the orbital
 /// model eases toward. Returns `(desired_world_dir, desired_radius, allow_through_body,
 /// max_orbit_rate_rad_s)`.
@@ -42627,11 +42763,21 @@ fn carried_ball_orbit_command(
             let shield_dir = shield_dir.unwrap_or_else(|| dir_at(0.0));
             (shield_dir, false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
         }
+        // XAVI TURN: like the shield, the ball is held on the FAR side of the defender —
+        // but swept a touch faster so it tracks the body as the carrier wheels ~290° the
+        // long way around. It arcs AROUND the body (never through), and the long protective
+        // path emerges as the carrier's pivot keeps rotating the shield bearing.
+        Some(DribbleMoveKind::XaviTurn) => {
+            let shield_dir = shield_dir.unwrap_or_else(|| dir_at(0.0));
+            (shield_dir, false, CARRY_ORBIT_XAVI_RATE_RAD_S)
+        }
         // Carry-forward, plain hold: keep the ball ahead of the body.
         _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
     };
     let shield_blend = match move_kind {
-        Some(DribbleMoveKind::ProtectBall) | Some(DribbleMoveKind::Nutmeg) => 0.0,
+        Some(DribbleMoveKind::ProtectBall)
+        | Some(DribbleMoveKind::XaviTurn)
+        | Some(DribbleMoveKind::Nutmeg) => 0.0,
         Some(DribbleMoveKind::LeftCut)
         | Some(DribbleMoveKind::RightCut)
         | Some(DribbleMoveKind::FakeLeftCutRight)
