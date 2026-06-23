@@ -69,6 +69,8 @@ pub enum SoccerActionLabel {
     LeftCut,
     RightCut,
     Nutmeg,
+    /// The "Xavi turn": a ~280-300 degree shielded pirouette that keeps the ball on the far
+    /// side of the defender and wheels the long way around to turn them.
     XaviTurn,
     FakeLeftCutRight,
     FakeRightCutLeft,
@@ -410,8 +412,14 @@ impl SoccerActionLabel {
             "xavi"
             | "xaviturn"
             | "xavi_turn"
+            | "xavi-turn"
             | "xavi-turn-dribble"
-            | "xavi_turn_dribble" => "xavi-turn",
+            | "xavi_turn_dribble"
+            | "la-pelopina"
+            | "la_pelopina"
+            | "shielded-turn"
+            | "shielded_turn"
+            | "turn-and-shield" => "xavi-turn",
             "fake_left_cut_right" | "fake-left-right" | "fake-left-cut-right-dribble" => {
                 "fake-left-cut-right"
             }

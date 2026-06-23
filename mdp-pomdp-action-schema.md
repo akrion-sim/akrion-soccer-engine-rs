@@ -124,7 +124,7 @@ Targeting resolves to `PassIntent { ToPlayer(id) | ToSpace(Vec2) | ToLead(id,amt
 
 | Axis | Buckets | Status | Mask / notes |
 |---|---|---|---|
-| move / feint | carry / cut L,R / out L,R / nutmeg / fake-cut L,R / stepover / … | `DribbleMoveKind` exists | extend set |
+| move / feint | carry / cut L,R / out L,R / nutmeg / fake-cut L,R / xavi-turn / stepover / … | `DribbleMoveKind` exists | extend set |
 | direction (target) | 36 absolute (10°) | change from attack-relative | where the carry goes |
 | facing offset | in-stride / openable / hard-turn / behind (4) | partial | `abs_dir − facing_yaw`, bounded by `MAX_BODY_YAW_RATE_RAD_S`; **couples with move/feint** (cuts are *how* facing changes) + caps carry speed; in key |
 | touch distance | close-control ↔ knock-and-chase (3–4) | `DribbleTouchDecision.distance` exists | |

@@ -13628,6 +13628,81 @@ fn backward_pass_length_preference_favours_the_short_drop() {
 }
 
 #[test]
+fn long_backward_pass_penalty_grows_linearly_with_retreat() {
+    // Forward, square and short-backward (<=5yd) balls are untouched.
+    assert_eq!(long_backward_pass_penalty(6.0), 0.0);
+    assert_eq!(long_backward_pass_penalty(0.0), 0.0);
+    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
+    // Beyond the 5yd short cap the demerit rises LINEARLY (constant per-yard slope): the
+    // gap from 6->10yd back equals the gap from 10->14yd back.
+    let p6 = long_backward_pass_penalty(-6.0);
+    let p10 = long_backward_pass_penalty(-10.0);
+    let p14 = long_backward_pass_penalty(-14.0);
+    assert!(p6 > 0.0 && p10 > p6 && p14 > p10);
+    assert!(
+        ((p10 - p6) - (p14 - p10)).abs() < 1e-9,
+        "penalty must be linear in backward distance"
+    );
+    // A >10yd backward ball is heavily demoted, and the ramp keeps growing linearly.
+    assert!(p10 >= 6.0);
+    assert!(long_backward_pass_penalty(-40.0) > p14);
+    assert!(
+        (long_backward_pass_penalty(-40.0)
+            - (40.0 - LONG_BACKWARD_PASS_YARDS) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn backward_pass_path_risk_scales_with_retreat_and_opponents() {
+    // No opponents on the path, or a forward/near-square ball, carries no path risk.
+    assert_eq!(backward_pass_path_risk_penalty(-12.0, 0), 0.0);
+    assert_eq!(backward_pass_path_risk_penalty(8.0, 3), 0.0);
+    assert_eq!(backward_pass_path_risk_penalty(-0.5, 3), 0.0);
+    // The further BACK the ball is played, the higher the risk (more territory through a
+    // congested lane).
+    assert!(
+        backward_pass_path_risk_penalty(-20.0, 2) > backward_pass_path_risk_penalty(-8.0, 2)
+    );
+    // The MORE opponents sit on the path, the higher the risk for the same distance.
+    assert!(
+        backward_pass_path_risk_penalty(-12.0, 3) > backward_pass_path_risk_penalty(-12.0, 1)
+    );
+    // A 20yd backward ball through 3 players follows the same uncapped linear traffic formula.
+    let deep_traffic = backward_pass_path_risk_penalty(-20.0, 3);
+    let expected = (20.0 - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS)
+        * 3.0
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD;
+    assert!((deep_traffic - expected).abs() < 1e-9);
+    assert!(
+        backward_pass_path_risk_penalty(-40.0, 3) > deep_traffic,
+        "path traffic risk should keep growing with deeper backward passes"
+    );
+}
+
+#[test]
+fn wall_pass_leg_backward_risk_is_soft_and_traffic_weighted() {
+    // A forward or square leg carries no backward risk.
+    assert_eq!(wall_pass_leg_backward_risk(6.0, 3), 0.0);
+    assert_eq!(wall_pass_leg_backward_risk(0.0, 3), 0.0);
+    // A short backpass with a clear corridor is only a mild demerit (never a veto): it stays
+    // well under the worst-case cap so a good one-two is still committed.
+    let short_clear = wall_pass_leg_backward_risk(-3.0, 0);
+    assert!(short_clear > 0.0 && short_clear < WALL_PASS_BACKWARD_RISK_MAX);
+    // The further BACK the leg is played, the higher the risk.
+    assert!(wall_pass_leg_backward_risk(-8.0, 0) > wall_pass_leg_backward_risk(-3.0, 0));
+    // The MORE opponents sit in the corridor, the higher the risk for the same distance —
+    // backward THROUGH traffic is the dangerous case.
+    assert!(wall_pass_leg_backward_risk(-5.0, 3) > wall_pass_leg_backward_risk(-5.0, 0));
+    // It is bounded (a soft penalty, not an unbounded veto).
+    assert_eq!(
+        wall_pass_leg_backward_risk(-40.0, 5),
+        WALL_PASS_BACKWARD_RISK_MAX
+    );
+}
+
+#[test]
 fn lateral_pass_penalty_demotes_square_recycling() {
     assert_eq!(lateral_pass_penalty(0.0, false), GROUND_LATERAL_PASS_PENALTY);
     assert_eq!(lateral_pass_penalty(1.25, true), AERIAL_LATERAL_PASS_PENALTY);
@@ -52419,12 +52494,13 @@ fn xavi_turn_orbit_keeps_far_side_and_winds_the_long_way() {
         sim.ball.position
     );
     assert!((XAVI_TURN_DISPOSSESSION_PROBABILITY - 0.10).abs() < 1e-12);
+    assert_eq!(
+        xavi_turn_tackle_success_cap(DribbleMoveKind::XaviTurn),
+        Some(XAVI_TURN_TACKLE_SUCCESS_CAP)
+    );
     assert!(
-        (dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
-            * HOLD_UP_DISPOSSESSION_PROBABILITY
-            - 0.10)
-            .abs()
-            < 1e-12
+        dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
+            < dribble_dispossession_kind_multiplier(DribbleMoveKind::ProtectBall)
     );
 }
 
@@ -52575,6 +52651,316 @@ fn protect_ball_orbit_settles_into_a_body_shield() {
          ball={:?} carrier={carrier_pos:?} defender={:?}",
         sim.ball.position,
         sim.players[defender].position
+    );
+}
+
+#[test]
+fn xavi_turn_label_round_trips_and_folds_aliases() {
+    // The new dribble label is a first-class member of the action vocabulary.
+    assert_eq!(SoccerActionLabel::from_label("xavi-turn"), SoccerActionLabel::XaviTurn);
+    assert_eq!(SoccerActionLabel::XaviTurn.as_str(), "xavi-turn");
+    for alias in ["xaviturn", "xavi_turn", "la-pelopina", "shielded-turn", "turn-and-shield"] {
+        assert_eq!(
+            SoccerActionLabel::from_label(alias).as_str(),
+            "xavi-turn",
+            "alias {alias} should fold onto xavi-turn"
+        );
+    }
+    // The decision/execution layers resolve the label back to the move kind.
+    assert_eq!(
+        dribble_move_kind_for_action_label("xavi-turn"),
+        Some(DribbleMoveKind::XaviTurn)
+    );
+    assert_eq!(DribbleMoveKind::XaviTurn.label(), "xavi-turn");
+}
+
+#[test]
+fn xavi_turn_flag_defaults_on_and_respects_config() {
+    // The xavi-turn is live by default (unless a process-wide env flag pins it off for a
+    // parity run), and the per-match config flag can always force it off.
+    if std::env::var("DD_SOCCER_DISABLE_XAVI_TURN").is_err() {
+        assert!(xavi_turn_enabled(&MatchConfig::default()));
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        assert!(WorldSnapshot::from_match(&sim).xavi_turn_enabled);
+    }
+    assert!(!xavi_turn_enabled(&MatchConfig {
+        disable_xavi_turn: true,
+        ..Default::default()
+    }));
+    let off = SoccerMatch::default_11v11(MatchConfig {
+        disable_xavi_turn: true,
+        ..Default::default()
+    });
+    assert!(!WorldSnapshot::from_match(&off).xavi_turn_enabled);
+}
+
+#[test]
+fn xavi_turn_clean_steal_is_capped_at_ten_percent() {
+    // The headline mechanic: while turning the man, a clean dispossession tops out at 10%
+    // — tighter than a static body-shield (20%), and nothing for every other move.
+    assert_eq!(
+        xavi_turn_tackle_success_cap(DribbleMoveKind::XaviTurn),
+        Some(XAVI_TURN_TACKLE_SUCCESS_CAP)
+    );
+    assert!((XAVI_TURN_TACKLE_SUCCESS_CAP - 0.10).abs() < 1e-9);
+    assert_eq!(
+        xavi_turn_tackle_success_cap(DribbleMoveKind::ProtectBall),
+        Some(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP)
+    );
+    assert!(XAVI_TURN_TACKLE_SUCCESS_CAP < SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+    for kind in [
+        DribbleMoveKind::CarryForward,
+        DribbleMoveKind::LeftCut,
+        DribbleMoveKind::Nutmeg,
+    ] {
+        assert_eq!(xavi_turn_tackle_success_cap(kind), None);
+    }
+    // The move is also priced as the most secure dribble in the kind multiplier.
+    assert!(
+        dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
+            < dribble_dispossession_kind_multiplier(DribbleMoveKind::ProtectBall)
+    );
+}
+
+#[test]
+fn xavi_turn_orbit_keeps_ball_on_far_side_and_arcs_around() {
+    // The carried-ball orbit on a xavi-turn holds the ball on the FAR side of the defender
+    // (like a shield) and arcs it AROUND the body (never through), swept a touch faster.
+    let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
+    let to_defender = Vec2::new(1.0, 0.0); // defender off to the carrier's +x
+    let (dir, _radius, allow_through, prefer_long_orbit, winding_cap, rate) =
+        carried_ball_orbit_command(
+            facing,
+            Some(DribbleMoveKind::XaviTurn),
+            1.6,
+            Some(to_defender),
+        );
+    assert!(
+        dot(dir, to_defender) < -0.5,
+        "xavi-turn orbit must keep the ball opposite the defender: dir={dir:?}"
+    );
+    assert!(!allow_through, "the ball arcs around the body, never through it");
+    assert!(prefer_long_orbit, "xavi-turn must request the long orbit");
+    assert!(
+        winding_cap >= XAVI_TURN_MAX_ORBIT_RAD - 1e-9,
+        "xavi-turn should preserve the 300-degree winding cap: {winding_cap}"
+    );
+    assert!(
+        (rate - CARRY_ORBIT_XAVI_RATE_RAD_S).abs() < 1e-9,
+        "xavi-turn uses its own sweep rate: rate={rate}"
+    );
+}
+
+#[test]
+fn xavi_turn_move_target_wheels_around_the_defender() {
+    // The carrier's movement target traces the long way AROUND the defender: mostly
+    // tangential (perpendicular to the defender axis), never stepping toward the defender.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 8usize;
+    let defender = 12usize;
+    park_players_except(&mut sim, &[carrier, defender]);
+    let carrier_pos = Vec2::new(40.0, 60.0);
+    sim.players[carrier].position = carrier_pos;
+    sim.players[carrier].home_position = carrier_pos;
+    let defender_pos = Vec2::new(41.5, 60.0); // defender tight on the +x side
+    sim.players[defender].position = defender_pos;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = carrier_pos;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let target = snapshot.dribble_move_target_for_touch(
+        carrier,
+        carrier_pos,
+        DribbleMoveKind::XaviTurn,
+        DribbleTouchDecision::new(0, 1.2),
+    );
+    let to_target = target - carrier_pos;
+    let to_defender = defender_pos - carrier_pos;
+    assert!(
+        dot(to_target, to_defender) < 0.0,
+        "xavi-turn must wheel AWAY from the defender, never into them: to_target={to_target:?}"
+    );
+    assert!(
+        (target.y - carrier_pos.y).abs() > (target.x - carrier_pos.x).abs(),
+        "the turn should be dominated by the tangential (around-the-man) component: \
+         to_target={to_target:?}"
+    );
+}
+
+#[test]
+fn xavi_turn_hold_up_contest_retains_possession() {
+    // Same exposed-ball hold-up geometry that lets a strong defender rob a weak dribbler
+    // mid-cut — but on a xavi-turn the 10% steal cap keeps the probability below the
+    // dispossession threshold, so the carrier keeps the ball while turning the man.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 0;
+    let attacker = 11;
+    sim.players[defender].position = Vec2::new(40.0, 60.0);
+    sim.players[defender].skills.defending = 9.4;
+    sim.players[defender].skills.aggression = 8.0;
+    sim.players[attacker].position = Vec2::new(41.0, 60.0);
+    sim.players[attacker].skills.dribbling = 2.0;
+    sim.players[attacker].skills.first_touch = 2.0;
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = Vec2::new(40.55, 60.0);
+    let before = WorldSnapshot::from_match(&sim);
+    sim.players[attacker].last_decision = Some(test_decision_trace(&before, attacker, "xavi-turn"));
+    sim.players[defender].last_decision = Some(test_decision_trace(&before, defender, "defend"));
+    assert!(
+        !sim.carrier_shields_ball_from_defender(attacker, defender),
+        "setup keeps the ball exposed, so the 10% cap (not the geometric shield) is what holds it"
+    );
+
+    sim.resolve_dribble_hold_up_contests();
+
+    assert_eq!(
+        sim.ball.holder,
+        Some(attacker),
+        "a xavi-turn carrier is not dispossessed by a hold-up contest (steal capped at 10%)"
+    );
+    assert!(!sim
+        .events
+        .iter()
+        .any(|event| event.kind == "hold-up-dispossession"));
+}
+
+#[test]
+fn xavi_turn_wheel_keeps_one_rotational_sense() {
+    // Hardening: once the carrier is wheeling, the committed tangent must NOT reverse as the
+    // defender's bearing sweeps the full circle through the turn — otherwise the pirouette
+    // would unwind mid-move (and momentarily swing the ball back toward the defender). The
+    // sense is taken from the carrier's angular momentum, so it is self-consistent all the way
+    // around. (A naive per-tick goalward test flips twice per orbit — the bug this fixes.)
+    let center_x = 40.0;
+    let attack_dir = 1.0;
+    for deg in (0..360).step_by(15) {
+        let a = (deg as f64).to_radians();
+        let away = Vec2::new(a.cos(), a.sin());
+        // Counter-clockwise momentum (velocity along the +90° tangent) keeps the CCW tangent.
+        let ccw_vel = Vec2::new(-away.y, away.x) * 3.0;
+        let t = xavi_turn_wheel_tangent(away, ccw_vel, 38.0, center_x, attack_dir);
+        assert!(
+            away.x * t.y - away.y * t.x > 0.0,
+            "deg={deg}: a CCW wheel must stay CCW (no mid-turn reversal)"
+        );
+        // Clockwise momentum keeps the CW tangent.
+        let cw_vel = Vec2::new(away.y, -away.x) * 3.0;
+        let t = xavi_turn_wheel_tangent(away, cw_vel, 38.0, center_x, attack_dir);
+        assert!(
+            away.x * t.y - away.y * t.x < 0.0,
+            "deg={deg}: a CW wheel must stay CW (no mid-turn reversal)"
+        );
+    }
+}
+
+#[test]
+fn xavi_turn_wheel_initiates_toward_open_middle() {
+    // From a near-standstill (no committed momentum yet) the wheel seeds toward the middle of
+    // the pitch, so a boxed-in carrier near a touchline turns infield rather than into the line.
+    let center_x = 40.0;
+    let away = Vec2::new(0.0, -1.0); // defender square, goal-side
+    let near_left = xavi_turn_wheel_tangent(away, Vec2::zero(), 8.0, center_x, 1.0);
+    assert!(near_left.x > 0.0, "near the left touchline the wheel curls toward centre: {near_left:?}");
+    let near_right = xavi_turn_wheel_tangent(away, Vec2::zero(), 72.0, center_x, 1.0);
+    assert!(near_right.x < 0.0, "near the right touchline the wheel curls toward centre: {near_right:?}");
+}
+
+#[test]
+fn xavi_turn_is_chosen_by_a_skilled_boxed_in_carrier() {
+    // Reachability hardening: a technical carrier, boxed in by a tight goal-side defender with
+    // the forward path shut, actually SELECTS the xavi-turn through the real on-ball decision —
+    // it is not dead-coded behind options (protect-ball / side-step) that always outrank it.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 8usize;
+    let defender = 12usize;
+    park_players_except(&mut sim, &[carrier, defender]);
+    let cpos = Vec2::new(40.0, 60.0);
+    sim.players[carrier].position = cpos;
+    sim.players[carrier].home_position = cpos;
+    sim.players[carrier].skills.dribbling = 9.4;
+    sim.players[carrier].skills.flair_passing = 8.4;
+    sim.players[carrier].skills.first_touch = 8.4;
+    sim.players[defender].position = Vec2::new(40.2, 61.6); // ~1.6yd, goal-side: forward shut
+    sim.players[defender].skills.defending = 7.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = cpos;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut player = sim.players[carrier].clone();
+    let mut rng = mulberry32(99);
+    let _ = player.run_time_step(&snapshot, None, None, &mut rng);
+    let decision = player.last_decision.as_ref().unwrap();
+    assert_eq!(
+        decision.action, "xavi-turn",
+        "a skilled, boxed-in carrier should wheel out of it; order={:?}",
+        decision.operation_order
+    );
+}
+
+#[test]
+fn xavi_turn_journeyman_shields_instead_of_turning() {
+    // Skill-gate hardening: in the SAME boxed-in geometry, a low-skill carrier keeps it simple.
+    // The superlinear skill gate keeps the turn's appetite below the shield, so a journeyman
+    // does not attempt a xavi-turn he cannot reliably pull off.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 8usize;
+    let defender = 12usize;
+    park_players_except(&mut sim, &[carrier, defender]);
+    let cpos = Vec2::new(40.0, 60.0);
+    sim.players[carrier].position = cpos;
+    sim.players[carrier].home_position = cpos;
+    sim.players[carrier].skills.dribbling = 3.5;
+    sim.players[carrier].skills.flair_passing = 3.0;
+    sim.players[carrier].skills.first_touch = 3.0;
+    sim.players[defender].position = Vec2::new(40.2, 61.6);
+    sim.players[defender].skills.defending = 7.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = cpos;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut player = sim.players[carrier].clone();
+    let mut rng = mulberry32(99);
+    let _ = player.run_time_step(&snapshot, None, None, &mut rng);
+    let decision = player.last_decision.as_ref().unwrap();
+    assert_ne!(
+        decision.action, "xavi-turn",
+        "a journeyman should shield, not turn; order={:?}",
+        decision.operation_order
+    );
+}
+
+#[test]
+fn xavi_turn_not_offered_deep_in_own_defensive_third() {
+    // Safety hardening: even a technical carrier does not turn his back deep in his own third —
+    // the option is never even offered there, so a trick-induced turnover near his own goal
+    // is impossible.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 8usize;
+    let defender = 12usize;
+    park_players_except(&mut sim, &[carrier, defender]);
+    let cpos = Vec2::new(40.0, 16.0); // deep in Home's own third (own goal at low y)
+    sim.players[carrier].position = cpos;
+    sim.players[carrier].home_position = cpos;
+    sim.players[carrier].skills.dribbling = 9.4;
+    sim.players[carrier].skills.flair_passing = 8.4;
+    sim.players[carrier].skills.first_touch = 8.4;
+    sim.players[defender].position = Vec2::new(40.2, 17.6); // tight, goal-side
+    sim.players[defender].skills.defending = 7.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = cpos;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(carrier);
+    assert!(
+        observation.yards_to_own_goal < XAVI_TURN_MIN_OWN_GOAL_YARDS,
+        "scenario must sit inside the guard: yards_to_own_goal={}",
+        observation.yards_to_own_goal
+    );
+    let mut player = sim.players[carrier].clone();
+    let mut rng = mulberry32(99);
+    let _ = player.run_time_step(&snapshot, None, None, &mut rng);
+    let decision = player.last_decision.as_ref().unwrap();
+    assert!(
+        !decision.operation_order.iter().any(|label| label == "xavi-turn"),
+        "xavi-turn must not be offered deep in own third; order={:?}",
+        decision.operation_order
     );
 }
 

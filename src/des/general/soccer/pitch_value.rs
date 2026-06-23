@@ -1,0 +1,386 @@
+//! Spatial **pitch-control × expected-threat** value model (2D).
+//!
+//! The rest of the engine's learning rewards are *local, hand-crafted events*
+//! (a completed pass, a cross into the box, a blocked-lane penalty). None of
+//! them credit a player for the thing soccer is actually about off the ball:
+//! *taking control of valuable space*. A winger who pulls a full-back wide, a
+//! striker who pins the last defender, a midfielder who occupies the half-space
+//! — these change the team's territorial control of dangerous areas without ever
+//! touching the ball, and the local rewards are blind to them.
+//!
+//! This module gives the learner one **dense, field-wide signal** for that:
+//!
+//! 1. [`pitch_control_home`] — for any point, the probability the **home** team
+//!    controls it, from a velocity-aware *time-to-arrive* race between the two
+//!    teams' nearest players, softened through a logistic (a 2D simplification of
+//!    Spearman-style pitch control). Away control is `1 - home`.
+//! 2. [`expected_threat`] — a closed-form *value of possessing the ball here*
+//!    surface, oriented to a team's attacking direction: it rises steeply toward
+//!    the opponent goal and is weighted up centrally in the shooting zones. This
+//!    is a **seed** the learners may later replace with a learned Markov xT grid;
+//!    it is deliberately simple, deterministic, and RNG-free.
+//! 3. [`team_expected_threat`] — the integral over a grid of
+//!    `control(team) × expected_threat(team)`: a single scalar for how much
+//!    *dangerous space the team controls right now*.
+//!
+//! [`pitch_value_reward_delta`] turns that into a learning reward: the change in
+//! the acting team's **net** territorial threat (its own minus the opponent's)
+//! between the before/after snapshots of a transition. Any action — pass,
+//! dribble, or pure off-ball run — that grows the team's grip on valuable space
+//! is credited; any that cedes it is penalized.
+//!
+//! ## Parity
+//!
+//! The reward is **gated off by default** (`DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`).
+//! When unset, [`pitch_value_reward_delta`] returns `0.0` before touching the
+//! grid, so an unconfigured process is byte-identical to before this module
+//! existed. The model functions themselves are pure and side-effect-free, so the
+//! inspector / tests can read the surface without enabling the reward.
+
+use super::*;
+
+/// Grid resolution across the pitch width (x axis). Kept modest: the reward path
+/// evaluates the whole grid twice per transition (before + after).
+const PITCH_VALUE_GRID_COLS: usize = 10;
+/// Grid resolution along the pitch length (y axis, goal-to-goal).
+const PITCH_VALUE_GRID_ROWS: usize = 16;
+
+/// Logistic temperature (seconds) on the time-to-arrive advantage. Larger = a
+/// softer, more shared control field; smaller = sharper hand-off at the midline
+/// between the two nearest players.
+const PITCH_CONTROL_TEMPERATURE_SECONDS: f64 = 0.45;
+/// How many seconds of current momentum count as a head start in the arrival
+/// race: a player already sprinting toward a cell reaches it sooner than a
+/// stationary one the same distance away.
+const PITCH_CONTROL_MOMENTUM_SECONDS: f64 = 0.6;
+/// Floor on a player's modeled top speed (yd/s) so a missing/degenerate skill
+/// profile can never divide the arrival time by ~0.
+const PITCH_CONTROL_MIN_TOP_SPEED_YPS: f64 = 4.0;
+
+/// Steepness of the territorial value ramp toward the opponent goal. Cube keeps
+/// midfield cheap and the final third expensive.
+const EXPECTED_THREAT_FORWARD_EXPONENT: f64 = 3.0;
+/// Extra weight on central, advanced cells (the shooting zones).
+const EXPECTED_THREAT_SHOOTING_WEIGHT: f64 = 0.8;
+/// How sharply the shooting-zone bonus concentrates near the opponent goal.
+const EXPECTED_THREAT_SHOOTING_EXPONENT: f64 = 4.0;
+
+/// Env gate enabling the dense pitch-value reward term. Off (unset) by default so
+/// an unconfigured process stays byte-identical.
+const PITCH_VALUE_REWARD_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_PITCH_VALUE_REWARD";
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let v = raw.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the dense territorial pitch-value reward is enabled this process.
+pub fn pitch_value_reward_enabled() -> bool {
+    env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV)
+}
+
+/// Forward progress fraction in `[0, 1]` for `team` at point `p`: 0 on the team's
+/// own goal line, 1 on the opponent goal line. Orientation-symmetric between the
+/// two teams (mirror a point and swap the team and you get the same value).
+fn forward_fraction(team: Team, p: Vec2, field_length: f64) -> f64 {
+    if field_length <= 0.0 || !field_length.is_finite() {
+        return 0.5;
+    }
+    let centered = (p.y - field_length * 0.5) / field_length;
+    (0.5 + team.attack_dir() * centered).clamp(0.0, 1.0)
+}
+
+/// Closed-form **expected threat** of possessing the ball at `p` for `team`,
+/// oriented to that team's attacking direction. Bounded to roughly `[0, 1.8]`;
+/// only relative values matter (the reward uses differences).
+pub fn expected_threat(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
+    let fwd = forward_fraction(team, p, field_length);
+    let territorial = fwd.powf(EXPECTED_THREAT_FORWARD_EXPONENT);
+    // Central-ness in [0,1]: 1 on the spine of the pitch, 0 at the touchline.
+    let centrality = if field_width > 0.0 && field_width.is_finite() {
+        (1.0 - (p.x - field_width * 0.5).abs() / (field_width * 0.5)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let shooting =
+        EXPECTED_THREAT_SHOOTING_WEIGHT * fwd.powf(EXPECTED_THREAT_SHOOTING_EXPONENT) * centrality;
+    territorial + shooting
+}
+
+/// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
+/// race can never divide by ~0.
+fn player_top_speed(player: &PlayerSnapshot) -> f64 {
+    super::player_top_speed_yps(player.role, &player.skills).max(PITCH_CONTROL_MIN_TOP_SPEED_YPS)
+}
+
+/// Velocity-aware time (seconds) for `player` to arrive at `cell`. A player
+/// already moving toward the cell gets a momentum head start; one moving away
+/// pays for it.
+fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
+    let to_cell = cell - player.position;
+    let dist = to_cell.len();
+    let vmax = player_top_speed(player);
+    if dist <= 1e-6 {
+        return 0.0;
+    }
+    let dir = Vec2::new(to_cell.x / dist, to_cell.y / dist);
+    let vel_toward = player.velocity.dot(dir);
+    let head_start = vel_toward * PITCH_CONTROL_MOMENTUM_SECONDS;
+    let effective_dist = (dist - head_start).max(0.0);
+    effective_dist / vmax
+}
+
+/// Minimum arrival time over a team's players, or `None` if the team has nobody.
+fn team_min_arrival(players: &[PlayerSnapshot], team: Team, cell: Vec2) -> Option<f64> {
+    players
+        .iter()
+        .filter(|p| p.team == team)
+        .map(|p| arrival_time_seconds(p, cell))
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |best| best.min(t)))
+        })
+}
+
+/// Probability the **home** team controls `cell`, from the time-to-arrive race
+/// (logistic on the home-minus-away advantage). `0.5` when neither team can be
+/// scored (e.g. an empty side), so it stays neutral rather than NaN.
+pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
+    let home = team_min_arrival(players, Team::Home, cell);
+    let away = team_min_arrival(players, Team::Away, cell);
+    match (home, away) {
+        (Some(h), Some(a)) => {
+            // Home controls more when it arrives sooner (h < a).
+            let advantage = (a - h) / PITCH_CONTROL_TEMPERATURE_SECONDS;
+            1.0 / (1.0 + (-advantage).exp())
+        }
+        (Some(_), None) => 1.0,
+        (None, Some(_)) => 0.0,
+        (None, None) => 0.5,
+    }
+}
+
+/// Integral of `control(team) × expected_threat(team)` over the grid — a single
+/// scalar for how much **dangerous space the team currently controls**. Averaged
+/// over cells, so it is bounded on the same scale as [`expected_threat`].
+pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
+    let field_width = snapshot.field_width;
+    let field_length = snapshot.field_length;
+    if field_width <= 0.0 || field_length <= 0.0 {
+        return 0.0;
+    }
+    let players = &snapshot.players;
+    let mut total = 0.0;
+    let cols = PITCH_VALUE_GRID_COLS;
+    let rows = PITCH_VALUE_GRID_ROWS;
+    for j in 0..rows {
+        let y = (j as f64 + 0.5) / rows as f64 * field_length;
+        for i in 0..cols {
+            let x = (i as f64 + 0.5) / cols as f64 * field_width;
+            let cell = Vec2::new(x, y);
+            let home_control = pitch_control_home(players, cell);
+            let control = match team {
+                Team::Home => home_control,
+                Team::Away => 1.0 - home_control,
+            };
+            let threat = expected_threat(team, cell, field_width, field_length);
+            total += control * threat;
+        }
+    }
+    total / (cols * rows) as f64
+}
+
+/// Net territorial threat for `team`: its controlled threat minus the opponent's.
+/// Positive means the team grips more dangerous space than it concedes.
+pub fn territorial_advantage(snapshot: &WorldSnapshot, team: Team) -> f64 {
+    team_expected_threat(snapshot, team) - team_expected_threat(snapshot, team.other())
+}
+
+/// Dense learning reward for the acting `team`: the change in its **net**
+/// territorial threat from `before` to `after`, scaled by the tunable
+/// `reward.pitch_value_threat_delta_points`.
+///
+/// Returns `0.0` (without touching the grid) unless
+/// [`pitch_value_reward_enabled`] is set, keeping the default process
+/// byte-identical.
+pub fn pitch_value_reward_delta(before: &WorldSnapshot, after: &WorldSnapshot, team: Team) -> f64 {
+    if !pitch_value_reward_enabled() {
+        return 0.0;
+    }
+    let scale = tunables().reward.pitch_value_threat_delta_points;
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let delta = territorial_advantage(after, team) - territorial_advantage(before, team);
+    if !delta.is_finite() {
+        return 0.0;
+    }
+    delta * scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: f64 = DEFAULT_FIELD_WIDTH_YARDS;
+    const L: f64 = DEFAULT_FIELD_LENGTH_YARDS;
+
+    #[test]
+    fn expected_threat_rises_toward_opponent_goal() {
+        // Home attacks toward y = L. A central point near the away goal must be
+        // worth more than one near the home goal.
+        let near_away_goal = Vec2::new(W * 0.5, L * 0.92);
+        let near_home_goal = Vec2::new(W * 0.5, L * 0.08);
+        assert!(
+            expected_threat(Team::Home, near_away_goal, W, L)
+                > expected_threat(Team::Home, near_home_goal, W, L)
+        );
+    }
+
+    #[test]
+    fn expected_threat_is_mirror_symmetric_between_teams() {
+        // The same physical point is worth as much to Home attacking up as the
+        // mirrored point is to Away attacking down.
+        let p = Vec2::new(W * 0.30, L * 0.75);
+        let mirrored = Vec2::new(W * 0.30, L - p.y);
+        let home_v = expected_threat(Team::Home, p, W, L);
+        let away_v = expected_threat(Team::Away, mirrored, W, L);
+        assert!((home_v - away_v).abs() < 1e-9, "{home_v} vs {away_v}");
+    }
+
+    #[test]
+    fn expected_threat_prefers_central_shooting_zones() {
+        let central = Vec2::new(W * 0.5, L * 0.9);
+        let wide = Vec2::new(W * 0.02, L * 0.9);
+        assert!(
+            expected_threat(Team::Home, central, W, L)
+                > expected_threat(Team::Home, wide, W, L)
+        );
+    }
+
+    // The snapshot structs deliberately don't derive `Default` (they're large and
+    // always built from a live match). Build one real 11v11 snapshot once and
+    // clone a player out of it as a mutable template for the controlled fixtures.
+    fn base_snapshot() -> WorldSnapshot {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        WorldSnapshot::from_match(&sim)
+    }
+
+    fn player_template() -> PlayerSnapshot {
+        base_snapshot().players[0].clone()
+    }
+
+    fn player_at(id: usize, team: Team, pos: Vec2, vel: Vec2) -> PlayerSnapshot {
+        let mut p = player_template();
+        p.id = id;
+        p.team = team;
+        p.position = pos;
+        p.velocity = vel;
+        p.acceleration = Vec2::zero();
+        p
+    }
+
+    #[test]
+    fn pitch_control_favors_the_nearer_team() {
+        let cell = Vec2::new(W * 0.5, L * 0.5);
+        let players = vec![
+            player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 2.0), Vec2::zero()),
+            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 20.0), Vec2::zero()),
+        ];
+        let home = pitch_control_home(&players, cell);
+        assert!(home > 0.5, "home is far closer, expected >0.5, got {home}");
+    }
+
+    #[test]
+    fn pitch_control_rewards_momentum_toward_the_cell() {
+        let cell = Vec2::new(W * 0.5, L * 0.5);
+        // Both equidistant, but the home player is sprinting in and the away
+        // player is stationary.
+        let toward = Vec2::new(0.0, 6.0);
+        let moving = vec![
+            player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 10.0), toward),
+            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 10.0), Vec2::zero()),
+        ];
+        let still = vec![
+            player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 10.0), Vec2::zero()),
+            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 10.0), Vec2::zero()),
+        ];
+        assert!(pitch_control_home(&moving, cell) > pitch_control_home(&still, cell));
+    }
+
+    fn snapshot_with(players: Vec<PlayerSnapshot>, ball: Vec2) -> WorldSnapshot {
+        let mut snap = base_snapshot();
+        snap.field_width = W;
+        snap.field_length = L;
+        snap.players = players;
+        snap.ball.position = ball;
+        snap
+    }
+
+    #[test]
+    fn advancing_into_the_final_third_raises_team_threat() {
+        let make = |home_y: f64| {
+            snapshot_with(
+                vec![
+                    player_at(0, Team::Home, Vec2::new(W * 0.5, home_y), Vec2::zero()),
+                    player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5), Vec2::zero()),
+                ],
+                Vec2::new(W * 0.5, home_y),
+            )
+        };
+        let deep = team_expected_threat(&make(L * 0.30), Team::Home);
+        let high = team_expected_threat(&make(L * 0.85), Team::Home);
+        assert!(high > deep, "advancing should raise threat: {deep} -> {high}");
+    }
+
+    #[test]
+    fn reward_delta_respects_gate_and_rewards_advancing() {
+        // Use a real 11v11 formation: pushing one attacker into the final third
+        // adds forward control WITHOUT uncovering the back line (the degenerate
+        // 1v1 case is intentionally not rewarded — vacating your whole half cedes
+        // more valuable-to-the-opponent space than the lone run gains, which is
+        // the zero-sum model behaving correctly).
+        let before = base_snapshot();
+        // The home attacker furthest forward (largest y, since Home attacks +y).
+        let forward_idx = before
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.team == Team::Home)
+            .max_by(|(_, a), (_, b)| a.position.y.total_cmp(&b.position.y))
+            .map(|(i, _)| i)
+            .expect("home team has players");
+        let mut after = before.clone();
+        after.players[forward_idx].position.y = L * 0.88;
+        after.players[forward_idx].position.x = W * 0.5;
+
+        // Both gate states are asserted in one test so they never race on the
+        // process-global enable var with another parallel test.
+        std::env::remove_var(PITCH_VALUE_REWARD_ENABLE_ENV);
+        assert_eq!(pitch_value_reward_delta(&before, &after, Team::Home), 0.0);
+
+        std::env::set_var(PITCH_VALUE_REWARD_ENABLE_ENV, "1");
+        let home_reward = pitch_value_reward_delta(&before, &after, Team::Home);
+        let away_reward = pitch_value_reward_delta(&before, &after, Team::Away);
+        std::env::remove_var(PITCH_VALUE_REWARD_ENABLE_ENV);
+        assert!(home_reward > 0.0, "advancing into space should reward Home: {home_reward}");
+        assert!(away_reward < 0.0, "Home advancing should penalize Away: {away_reward}");
+    }
+
+    #[test]
+    fn territorial_advantage_is_zero_sum_between_teams() {
+        let snap = snapshot_with(
+            vec![
+                player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.6), Vec2::zero()),
+                player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.4), Vec2::zero()),
+            ],
+            Vec2::new(W * 0.5, L * 0.5),
+        );
+        let home_adv = territorial_advantage(&snap, Team::Home);
+        let away_adv = territorial_advantage(&snap, Team::Away);
+        assert!((home_adv + away_adv).abs() < 1e-9, "{home_adv} + {away_adv}");
+    }
+}

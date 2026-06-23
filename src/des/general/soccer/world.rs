@@ -619,6 +619,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loose_ball_corridor_obstruction_only_penalises_bodies_between_chaser_and_ball() {
+        let from = Vec2::new(0.0, 0.0);
+        let to = Vec2::new(0.0, 10.0);
+
+        // Gate-off path: no opponents supplied ⇒ no detour, reach test stays straight-line.
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[], from, to), 0.0);
+
+        // A body dead-centre in the corridor forces the full bounded detour.
+        let blocked = loose_ball_corridor_obstruction_yards(&[Vec2::new(0.0, 5.0)], from, to);
+        assert!(
+            (blocked - LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS).abs() < 1e-9,
+            "centre block should add the max detour, got {blocked}"
+        );
+
+        // A body well to the side of the corridor does not impede the run.
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[Vec2::new(3.0, 5.0)], from, to),
+            0.0
+        );
+
+        // Bodies behind the chaser, or at/past the intercept point (the contest at the ball
+        // itself), are not the corridor's concern.
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[Vec2::new(0.0, -2.0)], from, to),
+            0.0
+        );
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[Vec2::new(0.0, 9.9)], from, to),
+            0.0
+        );
+
+        // Half-way into the corridor ⇒ roughly half the detour, and the result is capped.
+        let half = loose_ball_corridor_obstruction_yards(
+            &[Vec2::new(LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS * 0.5, 5.0)],
+            from,
+            to,
+        );
+        assert!(
+            (half - LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS * 0.5).abs() < 1e-9,
+            "half-corridor incursion should add ~half the detour, got {half}"
+        );
+        assert!(blocked <= LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS + 1e-9);
+
+        // Short dash: a fixed 0.5yd end-margin would empty the corridor window and silently disable
+        // the check; the clamped margin still detects a body centred on a sub-yard corridor.
+        let short = loose_ball_corridor_obstruction_yards(
+            &[Vec2::new(0.0, 0.4)],
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.8),
+        );
+        assert!(short > 0.0, "centred body on a short corridor must still register, got {short}");
+
+        // Non-finite inputs never poison the result (NaN opponent / degenerate path -> 0).
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[Vec2::new(f64::NAN, 5.0)], from, to),
+            0.0
+        );
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[Vec2::new(0.0, 5.0)], from, Vec2::new(f64::NAN, 0.0)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn obstacle_aware_intercept_gate_folds_config_into_snapshot() {
+        // The per-match config flag is folded into the snapshot bool at build (env is OR-ed in too,
+        // but is unset under test). Default off; on when the match config opts in.
+        let off = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig::default()));
+        assert!(!off.obstacle_aware_intercept_enabled);
+        let on = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig {
+            enable_obstacle_aware_intercept: true,
+            ..MatchConfig::default()
+        }));
+        assert!(on.obstacle_aware_intercept_enabled);
+    }
+
+    #[test]
+    fn obstacle_aware_intercept_defers_a_dash_through_a_wall() {
+        // A chaser behind a wall of opponents, chasing a ball rolling away. With the feature off the
+        // chaser claims it on the straight-line reach; on, the bodies in the corridor inflate the
+        // required gap so the catch is deferred further down the roll. Same positions both ways —
+        // only the snapshot gate flips — so the difference is attributable to the feature alone.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7,
+            ..Default::default()
+        });
+        for player in sim.players.iter_mut() {
+            player.position = Vec2::new(2.0, 2.0);
+            player.velocity = Vec2::zero();
+        }
+        let chaser = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .unwrap();
+        sim.players[chaser].position = Vec2::new(40.0, 10.0);
+        let wall: Vec<usize> = sim
+            .players
+            .iter()
+            .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .take(3)
+            .collect();
+        for (k, &id) in wall.iter().enumerate() {
+            sim.players[id].position = Vec2::new(40.0, 11.0 + k as f64 * 0.6);
+        }
+        sim.ball.holder = None;
+        sim.pending_pass = None;
+        sim.ball.position = Vec2::new(40.0, 12.5);
+        sim.ball.velocity = Vec2::new(0.0, 3.0); // gently rolling away (+y)
+        sim.ball.altitude_yards = 0.0;
+
+        let mut snap = WorldSnapshot::from_match(&sim);
+        snap.obstacle_aware_intercept_enabled = false;
+        let target_off = snap.loose_ball_trajectory_intercept_for(chaser);
+        snap.obstacle_aware_intercept_enabled = true;
+        let target_on = snap.loose_ball_trajectory_intercept_for(chaser);
+
+        // Obstruction can only DEFER the catch, never advance it (monotone in the required gap).
+        assert!(
+            target_on.y >= target_off.y - 1e-6,
+            "obstruction must not advance the catch: off={target_off:?} on={target_on:?}"
+        );
+        // And with this wall genuinely in the corridor it defers measurably.
+        assert!(
+            target_on.y > target_off.y + 1e-2,
+            "a wall in the dash corridor should defer the catch further down the roll: \
+             off={target_off:?} on={target_on:?}"
+        );
+    }
+
+    #[test]
     fn uniform_elite_players_removes_skill_and_preference_gaps() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
 
@@ -7854,7 +7988,8 @@ impl SoccerMatch {
                 Some(DribbleMoveKind::CarryForward) => 0.78,
                 Some(DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight) => 0.86,
                 Some(DribbleMoveKind::ProtectBall) => 0.48,
-                Some(DribbleMoveKind::XaviTurn) => 0.62,
+                // Close-control shielded turn: keep the ball glued to the feet.
+                Some(DribbleMoveKind::XaviTurn) => 0.42,
                 Some(DribbleMoveKind::Nutmeg) => 1.18,
                 Some(DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut) => 1.04,
                 Some(DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft) => 1.10,
@@ -8446,10 +8581,10 @@ impl SoccerMatch {
         dispossession_probability = (dispossession_probability
             * (1.0 + attacker_dizziness * DIZZINESS_DISPOSSESSION_RISK))
             .clamp(0.0, 0.95);
-        // Shielding forces possession ~80%: cap the hold-up steal at 20%.
-        if kind == DribbleMoveKind::ProtectBall {
-            dispossession_probability =
-                dispossession_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+        // A body-shielding move forces possession: cap the hold-up steal — ~20% for a
+        // static `protect-ball` shield, ~10% while turning the man with a `xavi-turn`.
+        if let Some(cap) = xavi_turn_tackle_success_cap(kind) {
+            dispossession_probability = dispossession_probability.min(cap);
         }
         // Physical body-shield / rear challenge: if the carrier has the ball pushed
         // out in front and this defender is behind the body or the led ball, there is
@@ -9596,17 +9731,15 @@ impl SoccerMatch {
                         success_probability = (success_probability
                             * (1.0 + holder_dizziness * DIZZINESS_DISPOSSESSION_RISK))
                             .clamp(0.0, 0.95);
-                        // Shielding (body between ball and defender) forces
-                        // possession ~80% of the time: cap the steal at 20%.
                         let holder_is_xavi_turn =
                             matches!(target_dribble_kind, Some(DribbleMoveKind::XaviTurn));
-                        let holder_is_shielding = matches!(
-                            target_dribble_kind,
-                            Some(DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn)
-                        );
-                        if holder_is_shielding {
-                            success_probability =
-                                success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+                        // Shielding (body between ball and defender) forces possession:
+                        // cap the steal — ~20% for a static shield, ~10% mid xavi-turn.
+                        let shield_cap =
+                            target_dribble_kind.and_then(xavi_turn_tackle_success_cap);
+                        let holder_is_shielding = shield_cap.is_some();
+                        if let Some(cap) = shield_cap {
+                            success_probability = success_probability.min(cap);
                         }
                         // Physical body-shield: the carrier has the ball pushed out
                         // in front with this tackler behind the body and off the ball.
@@ -9744,13 +9877,11 @@ impl SoccerMatch {
                             .clamp(0.0, 0.97);
                         let holder_is_xavi_turn =
                             matches!(target_dribble_kind, Some(DribbleMoveKind::XaviTurn));
-                        let holder_is_shielding = matches!(
-                            target_dribble_kind,
-                            Some(DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn)
-                        );
-                        if holder_is_shielding {
-                            success_probability =
-                                success_probability.min(SHIELDED_HOLDER_TACKLE_SUCCESS_CAP);
+                        let shield_cap =
+                            target_dribble_kind.and_then(xavi_turn_tackle_success_cap);
+                        let holder_is_shielding = shield_cap.is_some();
+                        if let Some(cap) = shield_cap {
+                            success_probability = success_probability.min(cap);
                         }
                         let mpc_steal_fit =
                             self.mpc_steal_execution_fit(player_id, target_player, true);
@@ -15623,6 +15754,17 @@ pub struct WorldSnapshot {
     /// pre-empt; defaults on.
     #[serde(default = "default_true")]
     pub(crate) slide_tackle_enabled: bool,
+    /// Whether the `xavi-turn` shielded-pirouette dribble move may be offered this match
+    /// (mirrors [`xavi_turn_enabled`] over the match config). Read by the on-ball decision
+    /// to gate the candidate; defaults on.
+    #[serde(default = "default_true")]
+    pub(crate) xavi_turn_enabled: bool,
+    /// Whether obstacle-aware loose-ball intercept feasibility is active this match (the env flag
+    /// `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` OR the match config, folded once at snapshot
+    /// build). Read by [`WorldSnapshot::loose_ball_intercept_solution_for`]; defaults off so the
+    /// straight-line reach is byte-identical.
+    #[serde(default)]
+    pub(crate) obstacle_aware_intercept_enabled: bool,
     #[serde(default = "default_pass_anticipation_enabled")]
     pub pass_anticipation_enabled: bool,
     #[serde(default = "default_local_mpc_max_players_per_team")]
@@ -16186,6 +16328,43 @@ fn soccer_mpc_pass_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MPC_PASS").is_ok())
 }
 
+/// Bounded detour (yards) the worst opponent body sitting in the dash corridor from `from` toward a
+/// candidate intercept point `to` adds to the gap a chaser must actually cover. Pure geometry: with
+/// an empty `opponents` slice (the gate-off path) it returns 0, so the straight-line reach test is
+/// unchanged. Opponents behind the chaser or at/past the intercept point are NOT counted — the
+/// former are irrelevant and the latter are the contest at the ball itself, owned by the existing
+/// contest-cut logic; only bodies genuinely between the chaser and the ball impede the run.
+fn loose_ball_corridor_obstruction_yards(opponents: &[Vec2], from: Vec2, to: Vec2) -> f64 {
+    let path = to - from;
+    let path_len = path.len();
+    if !path_len.is_finite() || path_len < 1e-3 {
+        return 0.0;
+    }
+    let dir = path * (1.0 / path_len);
+    // End dead-zone, clamped to a fraction of the path so a centred body is still detected on a
+    // short dash (a fixed 0.5yd margin would empty the window — and silently disable the check —
+    // for any corridor under ~1yd).
+    let end_margin = LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS.min(path_len * 0.4);
+    let mut worst = 0.0_f64;
+    for &op in opponents {
+        if !op.x.is_finite() || !op.y.is_finite() {
+            continue;
+        }
+        let along = (op - from).dot(dir);
+        if along <= end_margin || along >= path_len - end_margin {
+            continue;
+        }
+        let perp = segment_distance_to_point(from, to, op);
+        if perp >= LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS {
+            continue;
+        }
+        let detour = (1.0 - perp / LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS)
+            * LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS;
+        worst = worst.max(detour);
+    }
+    worst.min(LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS)
+}
+
 fn pending_pass_snapshot_from(
     pass: &PendingPass,
     ball_position: Vec2,
@@ -16643,6 +16822,8 @@ impl WorldSnapshot {
             local_mpc_enabled: m.config.local_mpc_enabled,
             trace_mdp_mpc_comparison: options.trace_mdp_mpc_comparison,
             slide_tackle_enabled: slide_tackle_enabled(&m.config),
+            xavi_turn_enabled: xavi_turn_enabled(&m.config),
+            obstacle_aware_intercept_enabled: obstacle_aware_intercept_enabled(&m.config),
             pass_anticipation_enabled: m.config.pass_anticipation_enabled,
             local_mpc_max_players_per_team: m.config.local_mpc_max_players_per_team,
             home_team_possession_seconds,
@@ -22079,6 +22260,9 @@ impl WorldSnapshot {
                     0.0
                 };
                 let long_backward_penalty = long_backward_pass_penalty(forward);
+                // A backward ball played through opponents is doubly dangerous. The path
+                // traffic is already counted in `pass_quality` and scaled by backward depth
+                // for both floor and aerial candidates, so use that single source of truth.
                 let backward_path_traffic_penalty = pass_quality.backward_path_traffic_penalty;
                 // Misplaced-pass guard (see `PASS_LANE_SAFE_PASS_OVERRISK_PENALTY`): for a safe
                 // pass, steeply penalise lanes an opponent already owns so the policy stops
@@ -22375,6 +22559,8 @@ impl WorldSnapshot {
                     + keeper_distribution_bonus
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
+                    // A backward loft still has to clear opponents on the path; this
+                    // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
                     - lateral_penalty
                     - reception_teammate_penalty;
@@ -23365,8 +23551,33 @@ impl WorldSnapshot {
                     (1.0 - (man_dist / WALL_PASS_MAN_TO_BEAT_RANGE_YARDS)).clamp(0.0, 1.0);
                 let partner_open =
                     ((partner_space - WALL_PASS_PARTNER_MIN_SPACE_YARDS) / 4.0).clamp(0.0, 1.0);
-                let quality =
-                    (run_space * 0.42 + man_beatable * 0.34 + partner_open * 0.24).clamp(0.0, 1.0);
+                // Soft backward-traffic risk on BOTH legs: a one-two can include a short
+                // backpass, but a long backward give (or a return that has to go back toward
+                // our own goal) — especially through opponents standing in the corridor — is
+                // risky, so demote (never veto) it. The give leg is carrier→wall; the return
+                // leg is wall→the led run target.
+                let give_backward_risk = wall_pass_leg_backward_risk(
+                    give.y * attack_dir,
+                    self.opponents_on_pass_path(
+                        carrier_pos,
+                        partner_pos,
+                        carrier.team.other(),
+                        BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS,
+                    ),
+                );
+                let return_backward_risk = wall_pass_leg_backward_risk(
+                    (return_target.y - partner_pos.y) * attack_dir,
+                    self.opponents_on_pass_path(
+                        partner_pos,
+                        return_target,
+                        carrier.team.other(),
+                        BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS,
+                    ),
+                );
+                let quality = (run_space * 0.42 + man_beatable * 0.34 + partner_open * 0.24
+                    - give_backward_risk
+                    - return_backward_risk)
+                    .clamp(0.0, 1.0);
                 Some(WallPassPlan {
                     wall_partner: partner.id,
                     return_target,
@@ -23631,7 +23842,21 @@ impl WorldSnapshot {
                 if !led_open && !feet_open {
                     return None;
                 }
-                let score = forward + if led_open { 4.0 } else { 2.0 };
+                // Soft backward-traffic risk: the return is normally a forward ball into the
+                // run, but if it has to go back toward our own goal — and the more opponents
+                // sit in the wall→run corridor — the riskier it is. Demote (don't veto) so a
+                // cleaner/more-forward committed runner wins; the lane vetoes above already
+                // handle a fully blocked return.
+                let backward_risk = wall_pass_leg_backward_risk(
+                    forward,
+                    self.opponents_on_pass_path(
+                        wall_pos,
+                        one_two.return_target,
+                        wall.team.other(),
+                        BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS,
+                    ),
+                );
+                let score = forward + if led_open { 4.0 } else { 2.0 } - backward_risk * 8.0;
                 Some((runner.id, score))
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -25272,6 +25497,20 @@ impl WorldSnapshot {
             } else {
                 0.0
             };
+        // Obstacle-aware reach (opt-in): opponent body positions to skirt on the dash. Collected
+        // once here and empty when the feature is off, so the reach test below stays byte-identical.
+        // The gate (env OR match config) is folded into the snapshot at build time, so this path is
+        // deterministic and unit-testable rather than reading a process-global env cache per tick.
+        let obstruction_opponents: Vec<Vec2> = if self.obstacle_aware_intercept_enabled {
+            self.players
+                .iter()
+                .filter(|p| p.team != me.team)
+                .map(|p| self.player_snapshot_position(p))
+                .filter(|p| p.x.is_finite() && p.y.is_finite())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut t = 0.0;
         while t <= LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS {
             let ball_t = self.predicted_ball_position(t);
@@ -25285,7 +25524,11 @@ impl WorldSnapshot {
                 top_speed
             };
             let reach = Self::point_mass_reach_yards(s0, accel, top_speed, t) + lunge;
-            if reach >= gap {
+            // A clear straight-line dash needs only `reach >= gap`; an opponent body in the corridor
+            // forces a detour, raising the gap the chaser must actually cover (opt-in, else 0).
+            let required =
+                gap + loose_ball_corridor_obstruction_yards(&obstruction_opponents, my_pos, ball_t);
+            if reach >= required {
                 return (
                     ball_t.clamp_to_pitch(self.field_width, self.field_length),
                     t,
@@ -29539,7 +29782,7 @@ impl WorldSnapshot {
         } else {
             DRIBBLE_MAX_TOUCH_YARDS
         };
-        if kind == DribbleMoveKind::ProtectBall {
+        if matches!(kind, DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn) {
             return distance.clamp(0.62, 1.45);
         }
         if kind == DribbleMoveKind::XaviTurn {
@@ -29727,7 +29970,7 @@ impl WorldSnapshot {
                 };
                 Vec2::new(outward_x * 0.52, me.team.attack_dir() * 0.78).normalized()
             }
-            DribbleMoveKind::ProtectBall | DribbleMoveKind::XaviTurn => nearest_defender
+            DribbleMoveKind::ProtectBall => nearest_defender
                 .map(|(_, defender_position, _)| {
                     // Body-shield: lead the ball to the EXACT opposite side of the body
                     // from the defender, so the holder's own body is the barrier between
@@ -29736,6 +29979,30 @@ impl WorldSnapshot {
                     // comes from the side). The body then trails the ball toward the
                     // defender by one touch-lead, planting itself in between.
                     (current - defender_position).normalized()
+                })
+                .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir())),
+            // XAVI TURN: wheel the LONG way AROUND the defender on the shielded side. Move
+            // along the tangent of the circle centred on the defender, committed to one
+            // rotational sense (the carrier's existing angular momentum, else seeded toward
+            // the open middle) so the pirouette never reverses mid-turn. A little radial
+            // "away" keeps the body between defender and ball so the arc never collapses
+            // inward onto the challenge — and so the step is never toward the defender.
+            DribbleMoveKind::XaviTurn => nearest_defender
+                .map(|(_, defender_position, _)| {
+                    let away = current - defender_position;
+                    let away = if away.len() > 1e-6 {
+                        away.normalized()
+                    } else {
+                        Vec2::new(0.0, me.team.attack_dir())
+                    };
+                    let tangent = xavi_turn_wheel_tangent(
+                        away,
+                        me.velocity,
+                        current.x,
+                        self.field_width * 0.5,
+                        me.team.attack_dir(),
+                    );
+                    (tangent * 0.82 + away * 0.34).normalized()
                 })
                 .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir())),
             _ => touch.direction_for_team(me.team),
@@ -32278,6 +32545,38 @@ impl WorldSnapshot {
     /// check (no defender in the corridor right now — the hard veto); `clear_through_flight`
     /// additionally rejects a defender whose velocity carries them INTO the corridor before
     /// the ball passes their point (used as a penalty, not a veto).
+    /// Count opponents whose body sits within `radius` yards (laterally) of the straight
+    /// pass corridor `from`→`to` AND between the two endpoints (the perpendicular foot lies
+    /// on the segment). Used to price the risk of a (backward) pass that must travel past
+    /// defenders — aerial or grounded — so the further back through more bodies, the higher
+    /// the demerit (see [`backward_pass_path_risk_penalty`]). A defender level with the
+    /// passer or receiver but off to the side does not count.
+    pub(crate) fn opponents_on_pass_path(
+        &self,
+        from: Vec2,
+        to: Vec2,
+        defending_team: Team,
+        radius: f64,
+    ) -> usize {
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < 1e-3 {
+            return 0;
+        }
+        let dir = lane * (1.0 / lane_len);
+        self.players
+            .iter()
+            .filter(|p| p.team == defending_team)
+            .filter(|p| {
+                let position = self.player_snapshot_position(p);
+                let along = (position - from).dot(dir);
+                along > 0.0
+                    && along < lane_len
+                    && segment_distance_to_point(from, to, position) <= radius
+            })
+            .count()
+    }
+
     pub(crate) fn pass_lane_clearance(
         &self,
         from: Vec2,

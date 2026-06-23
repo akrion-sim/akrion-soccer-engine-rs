@@ -168,6 +168,13 @@ pub struct RewardTunables {
     /// Penalty for a forced pass played under low pressure (no need to rush). Was
     /// `LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS`.
     pub low_pressure_forced_pass_penalty_points: f64,
+    /// Scale on the dense **territorial pitch-control × expected-threat** delta
+    /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
+    /// net change in the acting team's controlled threat between the before/after
+    /// snapshots. Only applied when the reward is enabled by
+    /// `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`; the gate keeps an unconfigured
+    /// process byte-identical to before this term existed.
+    pub pitch_value_threat_delta_points: f64,
 }
 
 impl Default for RewardTunables {
@@ -181,6 +188,7 @@ impl Default for RewardTunables {
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
             blocked_lane_floor_pass_penalty_points: 6.0,
             low_pressure_forced_pass_penalty_points: 1.75,
+            pitch_value_threat_delta_points: 12.0,
         }
     }
 }
@@ -377,6 +385,7 @@ impl RewardTunables {
         sanitize_f64("reward.center_back_ahead_of_wingback_penalty_per_yard", &mut self.center_back_ahead_of_wingback_penalty_per_yard, default.center_back_ahead_of_wingback_penalty_per_yard, 0.0, 10.0, 0.0, 2.0);
         sanitize_f64("reward.blocked_lane_floor_pass_penalty_points", &mut self.blocked_lane_floor_pass_penalty_points, default.blocked_lane_floor_pass_penalty_points, 0.0, 200.0, 0.0, 40.0);
         sanitize_f64("reward.low_pressure_forced_pass_penalty_points", &mut self.low_pressure_forced_pass_penalty_points, default.low_pressure_forced_pass_penalty_points, 0.0, 200.0, 0.0, 25.0);
+        sanitize_f64("reward.pitch_value_threat_delta_points", &mut self.pitch_value_threat_delta_points, default.pitch_value_threat_delta_points, 0.0, 500.0, 0.0, 60.0);
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
@@ -388,6 +397,7 @@ impl RewardTunables {
         validate_f64(prefix, "center_back_ahead_of_wingback_penalty_per_yard", self.center_back_ahead_of_wingback_penalty_per_yard, 0.0, 10.0, errors);
         validate_f64(prefix, "blocked_lane_floor_pass_penalty_points", self.blocked_lane_floor_pass_penalty_points, 0.0, 200.0, errors);
         validate_f64(prefix, "low_pressure_forced_pass_penalty_points", self.low_pressure_forced_pass_penalty_points, 0.0, 200.0, errors);
+        validate_f64(prefix, "pitch_value_threat_delta_points", self.pitch_value_threat_delta_points, 0.0, 500.0, errors);
     }
 }
 

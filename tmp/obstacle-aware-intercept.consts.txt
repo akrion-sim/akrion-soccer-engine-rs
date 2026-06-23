@@ -1,0 +1,9 @@
+# Obstacle-aware loose-ball intercept (opt-in, gate DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT)
+# Recovery: (1) git apply tmp/obstacle-aware-intercept.world.patch  (2) add these 2 consts to soccer.rs
+#   after LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS (~line 2432):
+const LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS: f64 = 1.1;
+const LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS: f64 = 1.6;
+
+# Also (same session): removed dead `tier1_team_enabled` from SoccerMpcConfig
+#   (struct field+doc ~line 12343, and the `tier1_team_enabled: false,` Default entry).
+#   Per directive "MPC individual only" — no team MPC. serde-safe (no deny_unknown_fields).
