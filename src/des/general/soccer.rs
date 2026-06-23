@@ -447,6 +447,37 @@ const XAVI_TURN_MIN_OWN_GOAL_YARDS: f64 = 30.0;
 /// static-shield floor.
 const XAVI_TURN_BASE_APPETITE: f64 = 0.95;
 const XAVI_TURN_MAX_APPETITE: f64 = 2.60;
+// --- "Dribble to open a passing lane" ---
+// When the carrier wants a specific teammate but the DIRECT lane is blocked by an opponent, a
+// short, quick (sprinting) sideways carry of 1-4yd can shift the lane off the blocker and open the
+// pass. These tune the search + the decision appetite. Default ON; disable with
+// `DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE`. Offered only in its window (a valuable blocked lane that a
+// short step opens), so a disabled / out-of-window match is byte-identical (the on-ball path is
+// deterministic, so a conditionally-pushed option draws no RNG).
+const OPEN_LANE_DRIBBLE_TARGET_CANDIDATES: usize = 4;
+const OPEN_LANE_DRIBBLE_MIN_PASS_YARDS: f64 = 6.0;
+const OPEN_LANE_DRIBBLE_MAX_PASS_YARDS: f64 = 42.0;
+// Corridor half-width: an opponent within this of the lane segment blocks it (and after the step
+// the new lane must have NO opponent within it to count as opened).
+const OPEN_LANE_DRIBBLE_CORRIDOR_YARDS: f64 = 1.8;
+// Candidate step sizes (yards), smallest first — the least carry that opens the lane is chosen.
+// 1-8yd: a yard or two is usually enough to shift the angle off a tight blocker, but a wider step
+// is allowed when the blocker sits deeper in the lane and needs more displacement.
+const OPEN_LANE_DRIBBLE_STEP_YARDS: [f64; 6] = [1.5, 3.0, 4.5, 6.0, 7.0, 8.0];
+// A step is rejected if it would dribble straight onto another opponent (must have this much space).
+const OPEN_LANE_DRIBBLE_MIN_SPOT_SPACE_YARDS: f64 = 1.6;
+// Sprint (vs a controlled run) when the carrier is under very high pressure, OR when the nearest
+// opponent is tracking quickly toward it (closing speed ≥ this) — then burst to make the angle
+// before the lane re-closes / to exceed the tracker's pace. Otherwise run (conserve energy).
+const OPEN_LANE_DRIBBLE_SPRINT_PRESSURE: f64 = 0.60;
+const OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS: f64 = 4.5;
+// Decision (MDP/POMDP) appetite: a solid option (it keeps the ball AND creates a pass), lifted by
+// pressure and by how PROGRESSIVE the opened pass is (an upfield receiver is worth more than a
+// backward one), but capped so it never overrides an already-clear direct pass — which outranks it,
+// since this is only offered when the good targets are BLOCKED.
+const OPEN_LANE_DRIBBLE_BASE_APPETITE: f64 = 0.62;
+const OPEN_LANE_DRIBBLE_MAX_APPETITE: f64 = 1.20;
+const OPEN_LANE_DRIBBLE_UPFIELD_APPETITE_BONUS: f64 = 0.40;
 /// Below this tangential speed (yps) a `xavi-turn` carrier is treated as not yet wheeling, so
 /// the wheel sense is seeded from geometry rather than from its (negligible) momentum.
 const XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS: f64 = 0.5;
@@ -43198,6 +43229,12 @@ fn dd_soccer_disable_xavi_turn() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_XAVI_TURN").is_ok())
+}
+
+fn dd_soccer_disable_dribble_open_lane() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on

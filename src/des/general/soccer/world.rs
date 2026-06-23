@@ -33000,6 +33000,114 @@ impl WorldSnapshot {
             })
     }
 
+    /// "Dribble to open a passing lane": the carrier has an ideal receiver (usually upfield,
+    /// sometimes back) but the DIRECT lane is blocked by an opponent. A short (1-8yd) carry to one
+    /// side shifts the lane off the blocker and opens the pass. Returns `(spot, receiver, sprint)`:
+    /// where to carry the ball, who it opens a lane to, and whether to SPRINT (very high pressure or
+    /// an opponent tracking quickly) vs run. `None` when no valuable lane is blocked, no short step
+    /// opens one, or the feature is disabled (`DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE`) — so the
+    /// carrier's decision is unchanged otherwise. Pure read of the snapshot (no RNG); the chosen
+    /// carry is executed through the per-player MPC like any other dribble.
+    pub(crate) fn dribble_to_open_passing_lane_for(
+        &self,
+        carrier_id: usize,
+    ) -> Option<(Vec2, usize, bool)> {
+        if dd_soccer_disable_dribble_open_lane() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == carrier_id)?;
+        if me.role == PlayerRole::Goalkeeper || self.ball.holder != Some(carrier_id) {
+            return None;
+        }
+        let from = self.player_snapshot_position(me);
+        if !from.x.is_finite() || !from.y.is_finite() {
+            return None;
+        }
+        let opp = me.team.other();
+        let attack_dir = me.team.attack_dir();
+        let goalward = Vec2::new(0.0, attack_dir);
+
+        // Sprint decision: burst when under very high pressure, OR when the nearest opponent is
+        // tracking quickly toward the carrier (close the angle before it re-shuts / exceed their
+        // pace). Otherwise a controlled run. Computed once for the carrier.
+        let nearest_opp = self
+            .players
+            .iter()
+            .filter(|p| p.team == opp)
+            .map(|p| {
+                let pos = self.player_snapshot_position(p);
+                (p, pos, pos.distance(from))
+            })
+            .filter(|(_, _, d)| d.is_finite())
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let pressure = nearest_opp
+            .as_ref()
+            .map(|(_, _, d)| pressure_from_nearest_distance(*d))
+            .unwrap_or(0.0);
+        let opp_closing_yps = nearest_opp
+            .as_ref()
+            .map(|(p, pos, d)| {
+                if *d <= 1e-3 {
+                    return 0.0;
+                }
+                let toward = (from - *pos) * (1.0 / *d);
+                self.player_velocity(p.id)
+                    .unwrap_or(p.velocity)
+                    .dot(toward)
+                    .max(0.0)
+            })
+            .unwrap_or(0.0);
+        let sprint = pressure >= OPEN_LANE_DRIBBLE_SPRINT_PRESSURE
+            || opp_closing_yps >= OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS;
+
+        for receiver_id in
+            self.ranked_visible_pass_targets(carrier_id, OPEN_LANE_DRIBBLE_TARGET_CANDIDATES)
+        {
+            let Some(receiver) = self
+                .players
+                .iter()
+                .find(|p| p.id == receiver_id && p.team == me.team)
+            else {
+                continue;
+            };
+            if receiver.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let to = self.player_snapshot_position(receiver);
+            let lane = to - from;
+            let lane_len = lane.len();
+            if !(OPEN_LANE_DRIBBLE_MIN_PASS_YARDS..=OPEN_LANE_DRIBBLE_MAX_PASS_YARDS)
+                .contains(&lane_len)
+            {
+                continue;
+            }
+            // Only act when the DIRECT lane is genuinely blocked right now (else just pass it).
+            if self.clear_line(from, to, opp, OPEN_LANE_DRIBBLE_CORRIDOR_YARDS) {
+                continue;
+            }
+            let dir = lane * (1.0 / lane_len);
+            let perp = Vec2::new(-dir.y, dir.x);
+            // Smallest step (with a slight goalward bias so it is a productive carry, not a pure
+            // sideways shuffle) that moves the blocker out of the corridor and clears the new lane.
+            for &step in OPEN_LANE_DRIBBLE_STEP_YARDS.iter() {
+                for &sign in &[1.0_f64, -1.0] {
+                    let spot = (from + perp * (sign * step) + goalward * (step * 0.3))
+                        .clamp_to_pitch(self.field_width, self.field_length);
+                    // Don't carry straight onto another opponent.
+                    if self.nearest_opponent_distance_at(me.team, spot)
+                        < OPEN_LANE_DRIBBLE_MIN_SPOT_SPACE_YARDS
+                    {
+                        continue;
+                    }
+                    if self.clear_line(spot, to, opp, OPEN_LANE_DRIBBLE_CORRIDOR_YARDS) {
+                        return Some((spot, receiver_id, sprint));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn pass_lane_control_is_unavoidable(
         &self,
         player: &PlayerSnapshot,

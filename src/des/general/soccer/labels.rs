@@ -74,6 +74,10 @@ pub enum SoccerActionLabel {
     /// The "Xavi turn": a ~280-300° shielded pirouette that keeps the ball on the far
     /// side of the defender and wheels the long way around to turn them.
     XaviTurn,
+    /// A short, quick (sprinting) 1-4yd carry to shift a blocked passing lane off the
+    /// opponent in it and open the pass to a teammate. See
+    /// `WorldSnapshot::dribble_to_open_passing_lane_for`.
+    OpenPassingLane,
     VerticalAttack,
     TurnoverBurst,
     /// On-ball: the carrier deliberately keeps the ball and *signals* teammates to
@@ -145,6 +149,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::RightCut => "right-cut",
             SoccerActionLabel::Nutmeg => "nutmeg",
             SoccerActionLabel::XaviTurn => "xavi-turn",
+            SoccerActionLabel::OpenPassingLane => "open-passing-lane",
             SoccerActionLabel::FakeLeftCutRight => "fake-left-cut-right",
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
@@ -212,6 +217,7 @@ impl SoccerActionLabel {
             "fake-left-cut-right" => SoccerActionLabel::FakeLeftCutRight,
             "fake-right-cut-left" => SoccerActionLabel::FakeRightCutLeft,
             "xavi-turn" => SoccerActionLabel::XaviTurn,
+            "open-passing-lane" => SoccerActionLabel::OpenPassingLane,
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
@@ -420,6 +426,13 @@ impl SoccerActionLabel {
             | "shielded-turn"
             | "shielded_turn"
             | "turn-and-shield" => "xavi-turn",
+            "open_passing_lane"
+            | "open-lane"
+            | "open_lane"
+            | "open-passing-lane-dribble"
+            | "create-passing-lane"
+            | "create-passing-angle"
+            | "dribble-open-lane" => "open-passing-lane",
             "fake_left_cut_right" | "fake-left-right" | "fake-left-cut-right-dribble" => {
                 "fake-left-cut-right"
             }

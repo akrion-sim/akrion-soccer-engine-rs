@@ -781,6 +781,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "right-cut"
             | "nutmeg"
             | "xavi-turn"
+            | "open-passing-lane"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1330,6 +1331,7 @@ fn mpc_execution_estimate_for_action(
             | "right-cut"
             | "nutmeg"
             | "xavi-turn"
+            | "open-passing-lane"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1434,6 +1436,12 @@ fn mpc_execution_estimate_for_action(
             "xavi-turn" => {
                 (0.28 + dribble_skill * 0.32 + pressure * 0.26 + target_space_fit * 0.12)
                     .clamp(0.12, 0.96)
+            }
+            "open-passing-lane" => {
+                // A short carry into a clear, opponent-free spot (chosen to have space) — inherently
+                // feasible; scales with control + the space at the spot, lightly damped by pressure.
+                (0.46 + dribble_skill * 0.26 + target_space_fit * 0.18 - pressure * 0.12)
+                    .clamp(0.18, 0.97)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
             _ => direct_prob.max(if left_prob > right_prob {
@@ -6399,6 +6407,55 @@ impl PlayerAgent {
             // right on top with the forward path blocked — and only when live
             // (`xavi_turn_enabled`). Added conditionally so the option set is byte-identical
             // to baseline outside this window, which keeps a disabled match in lock-step.
+            // DRIBBLE TO OPEN A PASSING LANE: the ideal receiver's direct lane is blocked, so a
+            // short (1-8yd) quick carry to one side shifts the angle off the blocker and opens the
+            // pass. Computed once; offered as its own option and executed as an MPC-driven carry to
+            // the spot. Returns the spot, the receiver it opens, and whether to sprint (very high
+            // pressure / a fast-tracking opponent) vs run.
+            let open_lane_dribble = if self.role != PlayerRole::Goalkeeper {
+                snapshot.dribble_to_open_passing_lane_for(self.id)
+            } else {
+                None
+            };
+            let mut open_lane_offered = false;
+            if let Some((_spot, receiver_id, _sprint)) = open_lane_dribble {
+                let press = observation
+                    .perceived_pressure
+                    .max(observation.pressure_urgency)
+                    .clamp(0.0, 1.0);
+                // MDP/POMDP value: worth more when it opens a PROGRESSIVE (upfield) pass, and
+                // lifted by pressure (the more boxed in, the more the angle is worth making).
+                let upfield = snapshot
+                    .players
+                    .iter()
+                    .find(|p| p.id == receiver_id)
+                    .map(|r| {
+                        ((snapshot.player_snapshot_position(r).y - self.position.y)
+                            * self.team.attack_dir()
+                            / 20.0)
+                            .clamp(0.0, 1.0)
+                    })
+                    .unwrap_or(0.0);
+                let appetite = (OPEN_LANE_DRIBBLE_BASE_APPETITE
+                    * self.preferences.dribble_bias.clamp(0.5, 1.2)
+                    * (0.70 + press * 0.50)
+                    + OPEN_LANE_DRIBBLE_UPFIELD_APPETITE_BONUS * upfield)
+                    .clamp(0.0, OPEN_LANE_DRIBBLE_MAX_APPETITE);
+                if let Some(option) = action_options
+                    .iter_mut()
+                    .find(|option| option.label == "open-passing-lane")
+                {
+                    option.legal = true;
+                    option.score = option.score.max(appetite);
+                } else {
+                    action_options.push(AgentActionOptionTrace::new(
+                        "open-passing-lane",
+                        appetite,
+                        true,
+                    ));
+                }
+                open_lane_offered = true;
+            }
             let mut xavi_turn_offered = false;
             if snapshot.xavi_turn_enabled
                 && self.role != PlayerRole::Goalkeeper
@@ -6574,6 +6631,12 @@ impl PlayerAgent {
                     action_option_score(&action_options, "xavi-turn"),
                 ));
             }
+            if open_lane_offered {
+                weighted_ops.push((
+                    "open-passing-lane".to_string(),
+                    action_option_score(&action_options, "open-passing-lane"),
+                ));
+            }
             for rank in 0..pass_targets.len() {
                 let label = format!("pass{}", rank + 1);
                 weighted_ops.push((label.clone(), action_option_score(&action_options, &label)));
@@ -6589,6 +6652,9 @@ impl PlayerAgent {
                 order_names.push(format!("learned-mpc-reselect:{}", label));
             }
             let mut chosen = None;
+            // Set by the open-passing-lane arm to its precise sprint decision (very high pressure /
+            // a fast-tracking opponent), overriding the generic carry sprint rule below.
+            let mut open_lane_sprint: Option<bool> = None;
             for op in ops {
                 match op.as_str() {
                     "shoot" => {
@@ -6788,6 +6854,35 @@ impl PlayerAgent {
                                 "xavi-turn".to_string(),
                             ));
                             break;
+                        }
+                    }
+                    "open-passing-lane" => {
+                        order_names.push("open-passing-lane".to_string());
+                        let open_lane_chance =
+                            action_option_score(&action_options, "open-passing-lane");
+                        if let Some((spot, _receiver, sprint_flag)) = open_lane_dribble {
+                            if agentic_action_commitment(
+                                open_lane_chance,
+                                snapshot.dt_seconds,
+                                &observation,
+                                self.role,
+                            ) {
+                                // A controlled carry to the spot, executed through the per-player
+                                // MPC like any dribble; sprint per the maneuver's own decision.
+                                let kind = DribbleMoveKind::CarryForward;
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
+                                open_lane_sprint = Some(sprint_flag);
+                                chosen = Some((
+                                    SoccerAction::DribbleMove {
+                                        target: spot,
+                                        kind,
+                                        touch,
+                                    },
+                                    "open-passing-lane".to_string(),
+                                ));
+                                break;
+                            }
                         }
                     }
                     "side-step" => {
@@ -7787,12 +7882,17 @@ impl PlayerAgent {
                 action = fallback_action;
                 action_label = fallback_label;
             }
-            let sprint = matches!(action, SoccerAction::DribbleMove { .. })
-                && (self.role == PlayerRole::Forward
-                    || observation.forward_dribble_space_yards > 3.0
-                    || observation.perceived_pressure > 0.35
-                    || observation.decision_urgency > 0.46
-                    || observation.offensive_urgency > 0.34);
+            // The open-passing-lane carry uses its OWN sprint decision (very high pressure or a
+            // fast-tracking opponent → burst, else a controlled run to conserve energy); every
+            // other carry uses the generic rule.
+            let sprint = open_lane_sprint.unwrap_or_else(|| {
+                matches!(action, SoccerAction::DribbleMove { .. })
+                    && (self.role == PlayerRole::Forward
+                        || observation.forward_dribble_space_yards > 3.0
+                        || observation.perceived_pressure > 0.35
+                        || observation.decision_urgency > 0.46
+                        || observation.offensive_urgency > 0.34)
+            });
             self.last_decision = Some(self.decision_trace(
                 snapshot,
                 mdp_state,
