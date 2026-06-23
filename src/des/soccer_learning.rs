@@ -260,6 +260,294 @@ impl Default for SoccerEvolutionOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoccerLearningCurriculumStage {
+    Locomotion,
+    BallSkills,
+    Duels,
+    SmallSided,
+    TeamShape,
+    FullMatch,
+}
+
+impl SoccerLearningCurriculumStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Locomotion => "locomotion",
+            Self::BallSkills => "ball_skills",
+            Self::Duels => "duels",
+            Self::SmallSided => "small_sided",
+            Self::TeamShape => "team_shape",
+            Self::FullMatch => "full_match",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerLearningCurriculumConfig {
+    pub ball_skills_after_games: usize,
+    pub duels_after_games: usize,
+    pub small_sided_after_games: usize,
+    pub team_shape_after_games: usize,
+    pub full_match_after_games: usize,
+}
+
+impl Default for SoccerLearningCurriculumConfig {
+    fn default() -> Self {
+        Self {
+            ball_skills_after_games: 8,
+            duels_after_games: 24,
+            small_sided_after_games: 64,
+            team_shape_after_games: 128,
+            full_match_after_games: 256,
+        }
+    }
+}
+
+pub fn validate_soccer_learning_curriculum_config_for_learning_run(
+    config: &SoccerLearningCurriculumConfig,
+) -> Result<(), String> {
+    let thresholds = [
+        config.ball_skills_after_games,
+        config.duels_after_games,
+        config.small_sided_after_games,
+        config.team_shape_after_games,
+        config.full_match_after_games,
+    ];
+    if thresholds.windows(2).any(|window| window[0] > window[1]) {
+        return Err("curriculum thresholds must be monotonic".to_string());
+    }
+    Ok(())
+}
+
+pub fn soccer_learning_curriculum_stage_for_completed_games(
+    completed_games: usize,
+    config: &SoccerLearningCurriculumConfig,
+) -> SoccerLearningCurriculumStage {
+    if completed_games >= config.full_match_after_games {
+        SoccerLearningCurriculumStage::FullMatch
+    } else if completed_games >= config.team_shape_after_games {
+        SoccerLearningCurriculumStage::TeamShape
+    } else if completed_games >= config.small_sided_after_games {
+        SoccerLearningCurriculumStage::SmallSided
+    } else if completed_games >= config.duels_after_games {
+        SoccerLearningCurriculumStage::Duels
+    } else if completed_games >= config.ball_skills_after_games {
+        SoccerLearningCurriculumStage::BallSkills
+    } else {
+        SoccerLearningCurriculumStage::Locomotion
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPolicyPromotionGateConfig {
+    pub enabled: bool,
+    pub min_sample_games: usize,
+    pub min_mean_match_fitness: f64,
+    pub min_best_match_fitness: f64,
+    pub min_mean_play_quality: f64,
+    pub max_mean_conceded_goals: f64,
+    pub max_mean_goal_margin: f64,
+    pub max_mean_chain_net_loss: f64,
+}
+
+impl Default for SoccerPolicyPromotionGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_sample_games: 1,
+            min_mean_match_fitness: -0.25,
+            min_best_match_fitness: 0.0,
+            min_mean_play_quality: 0.0,
+            max_mean_conceded_goals: 6.0,
+            max_mean_goal_margin: 8.0,
+            max_mean_chain_net_loss: 20.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPolicyPromotionGateEvaluation {
+    pub enabled: bool,
+    pub eligible: bool,
+    pub sample_games: usize,
+    pub min_sample_games: usize,
+    pub mean_match_fitness: f64,
+    pub best_match_fitness: f64,
+    pub mean_play_quality: f64,
+    pub mean_conceded_goals: f64,
+    pub mean_goal_margin: f64,
+    pub mean_chain_net_loss: f64,
+    pub rejection_reasons: Vec<String>,
+}
+
+pub fn validate_soccer_policy_promotion_gate_config_for_learning_run(
+    config: &SoccerPolicyPromotionGateConfig,
+) -> Result<(), String> {
+    if config.min_sample_games == 0 {
+        return Err("promotion gate minSampleGames must be at least 1".to_string());
+    }
+    for (name, value) in [
+        ("minMeanMatchFitness", config.min_mean_match_fitness),
+        ("minBestMatchFitness", config.min_best_match_fitness),
+        ("minMeanPlayQuality", config.min_mean_play_quality),
+        ("maxMeanConcededGoals", config.max_mean_conceded_goals),
+        ("maxMeanGoalMargin", config.max_mean_goal_margin),
+        ("maxMeanChainNetLoss", config.max_mean_chain_net_loss),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("promotion gate {name} must be finite"));
+        }
+    }
+    if config.min_mean_play_quality < 0.0 {
+        return Err("promotion gate minMeanPlayQuality must be non-negative".to_string());
+    }
+    if config.max_mean_conceded_goals < 0.0 {
+        return Err("promotion gate maxMeanConcededGoals must be non-negative".to_string());
+    }
+    if config.max_mean_goal_margin < 0.0 {
+        return Err("promotion gate maxMeanGoalMargin must be non-negative".to_string());
+    }
+    if config.max_mean_chain_net_loss < 0.0 {
+        return Err("promotion gate maxMeanChainNetLoss must be non-negative".to_string());
+    }
+    Ok(())
+}
+
+pub fn evaluate_soccer_policy_promotion_gate<'a, I>(
+    summaries: I,
+    config: SoccerPolicyPromotionGateConfig,
+) -> SoccerPolicyPromotionGateEvaluation
+where
+    I: IntoIterator<Item = &'a MatchSummary>,
+{
+    let mut sample_games = 0usize;
+    let mut match_fitness_sum = 0.0;
+    let mut best_match_fitness = f64::NEG_INFINITY;
+    let mut play_quality_sum = 0.0;
+    let mut conceded_goals_sum = 0.0;
+    let mut goal_margin_sum = 0.0;
+    let mut chain_net_loss_sum = 0.0;
+    let mut non_finite_metric_samples = 0usize;
+
+    for summary in summaries {
+        sample_games = sample_games.saturating_add(1);
+        if soccer_summary_has_non_finite_learning_metrics(summary) {
+            non_finite_metric_samples = non_finite_metric_samples.saturating_add(1);
+        }
+        let match_fitness = soccer_learning_run_score(summary).match_fitness;
+        match_fitness_sum += match_fitness;
+        best_match_fitness = best_match_fitness.max(match_fitness);
+        play_quality_sum += soccer_learning_match_play_quality(summary);
+        conceded_goals_sum += (summary.score_home + summary.score_away) as f64 * 0.5;
+        goal_margin_sum += (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
+        chain_net_loss_sum += (summary.stats.pass_chains_net_loss_home
+            + summary.stats.pass_chains_net_loss_away) as f64
+            * 0.5;
+    }
+
+    let denominator = sample_games.max(1) as f64;
+    let mean_match_fitness = match_fitness_sum / denominator;
+    let mean_play_quality = play_quality_sum / denominator;
+    let mean_conceded_goals = conceded_goals_sum / denominator;
+    let mean_goal_margin = goal_margin_sum / denominator;
+    let mean_chain_net_loss = chain_net_loss_sum / denominator;
+    let best_match_fitness = if best_match_fitness.is_finite() {
+        best_match_fitness
+    } else {
+        SOCCER_MATCH_FITNESS_MIN
+    };
+    let mut rejection_reasons = Vec::new();
+
+    if config.enabled {
+        if sample_games < config.min_sample_games {
+            rejection_reasons.push(format!(
+                "sample_games {sample_games} below min_sample_games {}",
+                config.min_sample_games
+            ));
+        }
+        if non_finite_metric_samples > 0 {
+            rejection_reasons.push(format!(
+                "non_finite_learning_metrics {non_finite_metric_samples} samples"
+            ));
+        }
+        if mean_match_fitness < config.min_mean_match_fitness {
+            rejection_reasons.push(format!(
+                "mean_match_fitness {mean_match_fitness:.4} below min_mean_match_fitness {:.4}",
+                config.min_mean_match_fitness
+            ));
+        }
+        if best_match_fitness < config.min_best_match_fitness {
+            rejection_reasons.push(format!(
+                "best_match_fitness {best_match_fitness:.4} below min_best_match_fitness {:.4}",
+                config.min_best_match_fitness
+            ));
+        }
+        if mean_play_quality < config.min_mean_play_quality {
+            rejection_reasons.push(format!(
+                "mean_play_quality {mean_play_quality:.4} below min_mean_play_quality {:.4}",
+                config.min_mean_play_quality
+            ));
+        }
+        if mean_conceded_goals > config.max_mean_conceded_goals {
+            rejection_reasons.push(format!(
+                "mean_conceded_goals {mean_conceded_goals:.4} above max_mean_conceded_goals {:.4}",
+                config.max_mean_conceded_goals
+            ));
+        }
+        if mean_goal_margin > config.max_mean_goal_margin {
+            rejection_reasons.push(format!(
+                "mean_goal_margin {mean_goal_margin:.4} above max_mean_goal_margin {:.4}",
+                config.max_mean_goal_margin
+            ));
+        }
+        if mean_chain_net_loss > config.max_mean_chain_net_loss {
+            rejection_reasons.push(format!(
+                "mean_chain_net_loss {mean_chain_net_loss:.4} above max_mean_chain_net_loss {:.4}",
+                config.max_mean_chain_net_loss
+            ));
+        }
+    }
+
+    SoccerPolicyPromotionGateEvaluation {
+        enabled: config.enabled,
+        eligible: !config.enabled || rejection_reasons.is_empty(),
+        sample_games,
+        min_sample_games: config.min_sample_games,
+        mean_match_fitness,
+        best_match_fitness,
+        mean_play_quality,
+        mean_conceded_goals,
+        mean_goal_margin,
+        mean_chain_net_loss,
+        rejection_reasons,
+    }
+}
+
+fn soccer_summary_has_non_finite_learning_metrics(summary: &MatchSummary) -> bool {
+    let stats = &summary.stats;
+    [
+        stats.completed_pass_gain_yards_home,
+        stats.completed_pass_gain_yards_away,
+        stats.pass_chain_gain_yards_home,
+        stats.pass_chain_gain_yards_away,
+        stats.defensive_chase_load_home,
+        stats.defensive_chase_load_away,
+        stats.possession_chase_advantage_home,
+        stats.possession_chase_advantage_away,
+        stats.teamwork_upfield_progress_home,
+        stats.teamwork_upfield_progress_away,
+        stats.teamwork_near_ball_progress_home,
+        stats.teamwork_near_ball_progress_away,
+    ]
+    .into_iter()
+    .any(|value| !value.is_finite())
+}
+
 pub fn validate_soccer_evolution_options_for_learning_run(
     options: &SoccerEvolutionOptions,
 ) -> Result<(), String> {
@@ -1138,15 +1426,15 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let shot_accuracy = soccer_learning_ratio(shots_on_target, shots);
     let dribble_quality = soccer_learning_bounded_count(dribble_beats, 8.0);
     let recovery_quality = soccer_learning_bounded_count(loose_recoveries, 16.0);
-    let upfield_quality = (upfield_progress / 80.0).clamp(0.0, 1.0);
-    let near_ball_quality = (near_ball_progress / 80.0).clamp(0.0, 1.0);
+    let upfield_quality = soccer_learning_bounded_metric(upfield_progress, 80.0);
+    let near_ball_quality = soccer_learning_bounded_metric(near_ball_progress, 80.0);
     // The user's explicit "good proxies for more goals": assists, completed crosses, worked
     // chances (a shot off >=1 pass) and consecutive FORWARD passing (net-forward chain yards,
     // penalised when chains went backwards).
     let assist_quality = soccer_learning_bounded_count(assists, 4.0);
     let cross_quality = soccer_learning_bounded_count(crosses_completed, 8.0);
     let worked_chance_quality = soccer_learning_bounded_count(shots_after_pass, 8.0);
-    let chain_forward = (chain_forward_yards.max(0.0) / 120.0).clamp(0.0, 1.0);
+    let chain_forward = soccer_learning_bounded_metric(chain_forward_yards, 120.0);
     let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
     let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
 
@@ -1179,6 +1467,14 @@ fn soccer_learning_bounded_count(count: u32, cap: f64) -> f64 {
         0.0
     } else {
         (count as f64 / cap).clamp(0.0, 1.0)
+    }
+}
+
+fn soccer_learning_bounded_metric(value: f64, cap: f64) -> f64 {
+    if !value.is_finite() || !cap.is_finite() || cap <= 0.0 {
+        0.0
+    } else {
+        (value.max(0.0) / cap).clamp(0.0, 1.0)
     }
 }
 
@@ -4990,6 +5286,118 @@ mod tests {
         assert!(options.crossover_rate >= 0.40);
         assert!(options.exploration_rate >= 0.05);
         assert!(options.exploration_scale >= 0.50);
+    }
+
+    #[test]
+    fn curriculum_stage_advances_monotonically_by_completed_games() {
+        let config = SoccerLearningCurriculumConfig {
+            ball_skills_after_games: 2,
+            duels_after_games: 4,
+            small_sided_after_games: 6,
+            team_shape_after_games: 8,
+            full_match_after_games: 10,
+        };
+
+        validate_soccer_learning_curriculum_config_for_learning_run(&config)
+            .expect("monotonic curriculum");
+        assert_eq!(
+            soccer_learning_curriculum_stage_for_completed_games(0, &config),
+            SoccerLearningCurriculumStage::Locomotion
+        );
+        assert_eq!(
+            soccer_learning_curriculum_stage_for_completed_games(2, &config),
+            SoccerLearningCurriculumStage::BallSkills
+        );
+        assert_eq!(
+            soccer_learning_curriculum_stage_for_completed_games(5, &config),
+            SoccerLearningCurriculumStage::Duels
+        );
+        assert_eq!(
+            soccer_learning_curriculum_stage_for_completed_games(10, &config),
+            SoccerLearningCurriculumStage::FullMatch
+        );
+
+        let invalid = SoccerLearningCurriculumConfig {
+            ball_skills_after_games: 5,
+            duels_after_games: 4,
+            ..config
+        };
+        assert!(validate_soccer_learning_curriculum_config_for_learning_run(&invalid).is_err());
+    }
+
+    #[test]
+    fn promotion_gate_uses_quality_and_sample_floor_before_activation() {
+        use crate::des::general::soccer::MatchStats;
+
+        let mut strong_stats = MatchStats::default();
+        strong_stats.shots_home = 8;
+        strong_stats.shots_away = 7;
+        strong_stats.shots_on_target_home = 5;
+        strong_stats.shots_on_target_away = 4;
+        strong_stats.passes_attempted_home = 50;
+        strong_stats.passes_attempted_away = 48;
+        strong_stats.passes_completed_home = 38;
+        strong_stats.passes_completed_away = 36;
+        strong_stats.passes_completed_forward_home = 18;
+        strong_stats.passes_completed_forward_away = 17;
+        strong_stats.assists_home = 2;
+        strong_stats.assists_away = 1;
+        strong_stats.shots_after_pass_home = 4;
+        strong_stats.shots_after_pass_away = 3;
+        strong_stats.pass_chain_gain_yards_home = 90.0;
+        strong_stats.pass_chain_gain_yards_away = 80.0;
+        let strong = MatchSummary {
+            score_home: 2,
+            score_away: 1,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: strong_stats,
+        };
+
+        let strict = SoccerPolicyPromotionGateConfig {
+            min_sample_games: 2,
+            min_mean_match_fitness: 0.0,
+            min_best_match_fitness: 0.5,
+            min_mean_play_quality: 0.05,
+            max_mean_conceded_goals: 3.0,
+            max_mean_goal_margin: 3.0,
+            max_mean_chain_net_loss: 2.0,
+            ..SoccerPolicyPromotionGateConfig::default()
+        };
+        let one_sample = evaluate_soccer_policy_promotion_gate([&strong], strict);
+        assert!(!one_sample.eligible);
+        assert!(one_sample
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("sample_games")));
+
+        let two_samples = evaluate_soccer_policy_promotion_gate([&strong, &strong], strict);
+        assert!(two_samples.eligible, "{two_samples:?}");
+
+        let mut poor_stats = MatchStats::default();
+        poor_stats.pass_chains_net_loss_home = 9;
+        poor_stats.pass_chains_net_loss_away = 9;
+        let poor = MatchSummary {
+            score_home: 0,
+            score_away: 5,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: poor_stats,
+        };
+        let poor_eval = evaluate_soccer_policy_promotion_gate([&poor, &poor], strict);
+        assert!(!poor_eval.eligible);
+        assert!(poor_eval.rejection_reasons.iter().any(|reason| {
+            reason.contains("mean_goal_margin") || reason.contains("mean_chain_net_loss")
+        }));
+
+        let mut dirty = strong.clone();
+        dirty.stats.pass_chain_gain_yards_home = f64::NAN;
+        let dirty_eval = evaluate_soccer_policy_promotion_gate([&strong, &dirty], strict);
+        assert!(!dirty_eval.eligible);
+        assert!(dirty_eval
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("non_finite_learning_metrics")));
     }
 
     #[test]

@@ -270,6 +270,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     config.learning_enabled = true;
     config.learning_logging_enabled = false;
     config.max_human_players = 0;
+    config.opponent_belief_enabled = env_bool(
+        "SOCCER_OPPONENT_BELIEF_ENABLED",
+        env_bool("SOCCER_OPPONENT_BELIEF", true)?,
+    )?;
     config.neural_learning = SoccerNeuralLearningConfig {
         enabled: env_bool("SOCCER_NEURAL_LEARNING_ENABLED", true)?,
         backend: env_neural_backend()?,

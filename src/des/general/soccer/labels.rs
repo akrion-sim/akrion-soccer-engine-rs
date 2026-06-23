@@ -144,9 +144,9 @@ impl SoccerActionLabel {
             SoccerActionLabel::LeftCut => "left-cut",
             SoccerActionLabel::RightCut => "right-cut",
             SoccerActionLabel::Nutmeg => "nutmeg",
+            SoccerActionLabel::XaviTurn => "xavi-turn",
             SoccerActionLabel::FakeLeftCutRight => "fake-left-cut-right",
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
-            SoccerActionLabel::XaviTurn => "xavi-turn",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
@@ -409,14 +409,15 @@ impl SoccerActionLabel {
             "leftcut" | "left_cut" | "left-cut-dribble" | "cut-left" => "left-cut",
             "rightcut" | "right_cut" | "right-cut-dribble" | "cut-right" => "right-cut",
             "nut-meg" | "nut_meg" | "meg" => "nutmeg",
+            "xavi" | "xaviturn" | "xavi_turn" | "xavi-turn-dribble" | "xavi_turn_dribble"
+            | "la-pelopina" | "la_pelopina" | "shielded-turn" | "shielded_turn"
+            | "turn-and-shield" => "xavi-turn",
             "fake_left_cut_right" | "fake-left-right" | "fake-left-cut-right-dribble" => {
                 "fake-left-cut-right"
             }
             "fake_right_cut_left" | "fake-right-left" | "fake-right-cut-left-dribble" => {
                 "fake-right-cut-left"
             }
-            "xavi-turn" | "xavi_turn" | "xaviturn" | "xavi" | "la-pelopina" | "la_pelopina"
-            | "shielded-turn" | "shielded_turn" | "turn-and-shield" => "xavi-turn",
             "supportshape" | "support_shape" => "support-shape",
             "supportroam" | "support_roam" => "support-roam",
             "checktoball" | "check_to_ball" | "check-ball" | "checkrun" => "check-to-ball",
@@ -570,6 +571,7 @@ mod tests {
             "hold",
             "defend",
             "space",
+            "xavi-turn",
         ] {
             let label = SoccerActionLabel::from_label(canonical);
             assert_eq!(label.as_str(), canonical, "round-trip for {canonical}");
@@ -582,6 +584,7 @@ mod tests {
         assert_eq!(SoccerActionLabel::from_label("hoof").as_str(), "clearance");
         assert_eq!(SoccerActionLabel::from_label("move").as_str(), "space");
         assert_eq!(SoccerActionLabel::from_label("through-pass").as_str(), "killer-pass");
+        assert_eq!(SoccerActionLabel::from_label("xavi_turn").as_str(), "xavi-turn");
     }
 
     #[test]

@@ -53,8 +53,6 @@ mod labels;
 pub use labels::*;
 mod tunables;
 pub use tunables::*;
-mod pitch_value;
-pub use pitch_value::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -652,10 +650,6 @@ const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 7.0;
 // Special moves (cuts / fakes / nutmeg) chop the ball across the body far faster.
 const CARRY_ORBIT_SPECIAL_RATE_RAD_S: f64 = 11.0;
-// The xavi-turn sweeps the ball the long way AROUND the body on the shielded side as
-// the carrier wheels ~290°; a touch quicker than a normal carry so the ball keeps up
-// with the pirouette, but still arcs around (never chopped through, unlike a cut).
-const CARRY_ORBIT_XAVI_RATE_RAD_S: f64 = 9.0;
 // The ball stays at least this far from the carrier's feet on ordinary play, so
 // it arcs AROUND the body. Only special moves may pull it closer (passing it
 // THROUGH the player line).
@@ -671,10 +665,11 @@ const CARRY_LOOSE_RADIUS_YARDS: f64 = 1.00;
 const CARRY_TIGHT_CONTROL_RANGE_YARDS: f64 = 5.0;
 // How fast the carried ball's radius eases toward the target radius (yds/s).
 const CARRY_ORBIT_RADIUS_EASE_YPS: f64 = 6.0;
-// Per-possession winding soft cap: the ball rarely wraps more than 270 deg around
-// the carrier in one possession. On reaching it, a rare roll either unlocks
-// further winding or clamps it.
+// Ordinary per-possession winding soft cap: most carried touches rarely wrap more
+// than 270 deg around the carrier. Special moves can pass a different cap.
 const CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD: f64 = 4.712_388_980_384_69; // 270 deg
+const XAVI_TURN_MIN_ORBIT_RAD: f64 = 4.886_921_905_584_122; // 280 deg
+const XAVI_TURN_MAX_ORBIT_RAD: f64 = 5.235_987_755_982_989; // 300 deg
 const SHOT_KEEPER_BEAT_MIN_PROBABILITY: f64 = 0.30;
 const SHOT_BAILOUT_NEAR_GOAL_YARDS: f64 = 12.0;
 const SHOT_BAILOUT_DISPOSSESSION_RISK: f64 = 0.80;
@@ -1162,9 +1157,16 @@ const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
 // backward pass is preferred over a long backward one whenever both are on offer.
 const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
 // Per-yard demerit for every yard a backward pass travels beyond LONG_BACKWARD_PASS_YARDS.
-const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 0.85;
-// Cap so an extreme backward ball can't single-handedly dominate the ranking score.
-const LONG_BACKWARD_PASS_PENALTY_MAX: f64 = 6.5;
+const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 1.45;
+// Opponents standing in the path of a backward pass make that retreat progressively riskier.
+// This is intentionally linear in both backward depth and traffic count, and applies to both
+// floor and aerial candidates; short 3-5yd resets stay unpriced.
+const BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS: f64 = 4.0;
+const BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS: f64 = 5.0;
+const BACKWARD_PASS_PATH_TRAFFIC_ENDPOINT_FRACTION: f64 = 0.08;
+const BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.012;
+const BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.20;
+const BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH: f64 = 0.78;
 // Backward recycling should be a short support bounce, not a retreating outlet.
 // If a backward pass is needed, prefer a 3-5yd reset and increasingly demote
 // balls played more than 5yd back toward our own goal.
@@ -1353,11 +1355,19 @@ const DRIBBLE_BACKWARD_ANGLE_WEIGHT: f64 = 1.0;
 const DRIBBLE_MIN_TOUCH_YARDS: f64 = 0.80;
 const DRIBBLE_MAX_TOUCH_YARDS: f64 = 6.80;
 const HOLD_UP_DISPOSSESSION_PROBABILITY: f64 = 0.20;
+const XAVI_TURN_DISPOSSESSION_PROBABILITY: f64 = 0.10;
 const COMMIT_DISPOSSESSION_PROBABILITY: f64 = 0.50;
 const COMMIT_DRIBBLE_BEAT_MULTIPLIER: f64 = 1.50;
 const DRIBBLE_HOLD_UP_CONTEST_RADIUS_YARDS: f64 = 2.6;
 const GOALKEEPER_FLANK_DISTRIBUTION_MIN_WIDTH: f64 = 0.34;
 const GOALKEEPER_BACKWARD_EMERGENCY_PRESSURE: f64 = 0.76;
+const GOALKEEPER_PLAY_OUT_MPC_CANDIDATES: usize = 6;
+const GOALKEEPER_PLAY_OUT_MIN_COMPLETION: f64 = 0.34;
+const GOALKEEPER_PLAY_OUT_MIN_OPENNESS: f64 = 0.42;
+const GOALKEEPER_PLAY_OUT_MAX_LANE_RISK: f64 = 0.72;
+const GOALKEEPER_PLAY_OUT_FLOOR_POWER: f64 = 0.70;
+const GOALKEEPER_PLAY_OUT_AERIAL_POWER: f64 = 0.86;
+const GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS: f64 = 6.0;
 const POSSESSION_PROGRESS_MILESTONE_YARDS: f64 = 30.0;
 const POSSESSION_PROGRESS_REWARD_POINTS: f64 = 30.0;
 const POSSESSION_STALL_PASS_THRESHOLD: usize = 4;
@@ -2157,7 +2167,11 @@ const DEFENSIVE_LINE_BREAK_URGENT_RETREAT_GAP_YARDS: f64 = 24.0;
 const DEFENSIVE_LINE_BREAK_HARD_RETREAT_GAP_YARDS: f64 = 9.0;
 const DEFENSIVE_LINE_BREAK_CARRIER_LOOKAHEAD_SECONDS: f64 = 1.55;
 const DEFENSIVE_LINE_BREAK_CARRIER_SPEED_TRIGGER_YPS: f64 = 4.5;
-const GOALKEEPER_LOOSE_BALL_COLLECTION_WINDOW_YARDS: f64 = 5.5;
+const GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS: f64 = SIX_YARD_BOX_DEPTH_YARDS - 0.25;
+const GOALKEEPER_LEAVE_SIX_YARD_OWN_BOX_DEPTH_YARDS: f64 = 18.0;
+const GOALKEEPER_LEAVE_SIX_YARD_MIN_CONFIDENCE: f64 = 0.95;
+const GOALKEEPER_LEAVE_SIX_YARD_RACE_MARGIN_SECONDS: f64 = 1.25;
+const GOALKEEPER_LEAVE_SIX_YARD_MPC_HORIZON_SECONDS: f64 = 3.0;
 // "The keeper has it" trust: when a loose ball is travelling to our own keeper fast
 // enough to be a clear back-pass/clearance, the keeper is deep (behind the 15-yard
 // line), and no opponent is within 15 yds to contest, the back four stop tracking
@@ -2748,13 +2762,6 @@ const GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS: f64 = 0.25;
 /// ball, rushing through a covering defender who was ~99% going to win it (a real
 /// flaw: collisions / own-goals). In a contested 50/50 the keeper still commits.
 const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
-/// Strong 6-yard-box affinity: the keeper only ventures OUT of its goal area when the ball
-/// has entered its own penalty area AND BOTH a POMDP race-margin estimate and an MPC
-/// bounded-acceleration estimate put it at least this likely to reach the ball before the
-/// earliest of (the nearest attacker, its own nearest teammate). Otherwise it holds in the
-/// box. 0.95 ⇒ it arrives in roughly ≤70% of the earliest rival's time AND the QP solver
-/// confirms it can physically get there in that window.
-const GK_LEAVE_BOX_MIN_WIN_PROBABILITY: f64 = 0.95;
 /// MPC keeper distribution: the keeper plays the ball OUT only to a team-mate the
 /// receding-horizon rendezvous can actually deliver to — the receiver's MPC receipt
 /// probability (it wins the meeting under bounded acceleration ahead of the nearest opponent)
@@ -3021,16 +3028,21 @@ const SOCCER_NEURAL_BELIEF_FEATURE_DIM: usize = 4;
 const SOCCER_NEURAL_OPP_BELIEF_DIM: usize = 4;
 const SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS: f64 = 18.0;
 const SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM: usize = 4;
+const SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM: usize = 8;
+const SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM: usize = 4;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
 /// pos/vel/acc columns stay aligned, new jerk columns start at zero, and later
 /// belief/MPC tail weights shift to the current tail start.
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_FEATURE_DIM
+const SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_FEATURE_DIM
     + SOCCER_NEURAL_FIELD_MOTION_DIM
     + SOCCER_NEURAL_BELIEF_FEATURE_DIM
     + SOCCER_NEURAL_OPP_BELIEF_DIM
     + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
+    + SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM
+    + SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3167,6 +3179,30 @@ const SOCCER_NEURAL_FEATURE_LEARNED_MPC_ORIGINAL_ACTION: usize =
     SOCCER_NEURAL_FEATURE_LEARNED_MPC_REJECTED_EXECUTION + 1;
 const SOCCER_NEURAL_FEATURE_LEARNED_MPC_REPLACEMENT_ACTION: usize =
     SOCCER_NEURAL_FEATURE_LEARNED_MPC_ORIGINAL_ACTION + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_LEGAL_FRACTION: usize =
+    SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_OPTION_CHOSEN_PROBABILITY: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_LEGAL_FRACTION + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_SCORE_MARGIN: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_CHOSEN_PROBABILITY + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_ENTROPY: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_SCORE_MARGIN + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_MPC_FEASIBILITY: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_ENTROPY + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_CONTROL_COST: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_MPC_FEASIBILITY + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_LEGAL_COUNT: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_CONTROL_COST + 1;
+const SOCCER_NEURAL_FEATURE_OPTION_TOTAL_COUNT: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_LEGAL_COUNT + 1;
+const SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_OPTION_TOTAL_COUNT + 1;
+const SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_HAS_BALL: usize =
+    SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_DISTANCE + 1;
+const SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_HAS_BALL + 1;
+const SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE: usize =
+    SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_PRESSURE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3237,6 +3273,9 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     // Current base + motion + perception-belief, before the opponent-press
     // belief block — migrates forward by zero-padding that appended block.
     SOCCER_NEURAL_FIELD_MOTION_TAIL_START + SOCCER_NEURAL_BELIEF_FEATURE_DIM,
+    // Current base + motion + belief + opponent belief + learned-MPC tail,
+    // before option-mask and human-intent features were appended.
+    SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5125,6 +5164,32 @@ pub struct SoccerDecisionContext {
     pub learned_mpc_original_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_mpc_replacement_action: Option<String>,
+    #[serde(default)]
+    pub action_option_count: usize,
+    #[serde(default)]
+    pub legal_action_option_count: usize,
+    #[serde(default)]
+    pub chosen_action_probability: f64,
+    #[serde(default)]
+    pub chosen_action_score: f64,
+    #[serde(default)]
+    pub best_legal_action_score: f64,
+    #[serde(default)]
+    pub action_score_margin: f64,
+    #[serde(default)]
+    pub action_option_entropy: f64,
+    #[serde(default)]
+    pub chosen_action_mpc_feasibility: f64,
+    #[serde(default)]
+    pub chosen_action_control_cost: f64,
+    #[serde(default)]
+    pub human_teammate_intent_distance_yards: f64,
+    #[serde(default)]
+    pub human_teammate_has_ball: bool,
+    #[serde(default)]
+    pub human_teammate_pressure: f64,
+    #[serde(default)]
+    pub human_support_score: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dribble_touch_angle_bucket: Option<u8>,
     #[serde(default)]
@@ -5419,12 +5484,149 @@ fn single_action_option(label: &str) -> Vec<AgentActionOptionTrace> {
     }]
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SoccerActionOptionLearningContext {
+    action_option_count: usize,
+    legal_action_option_count: usize,
+    chosen_action_probability: f64,
+    chosen_action_score: f64,
+    best_legal_action_score: f64,
+    action_score_margin: f64,
+    action_option_entropy: f64,
+}
+
+fn soccer_finite_nonnegative_metric(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn soccer_finite_option_probability(option: &AgentActionOptionTrace) -> f64 {
+    finite_unit_interval(option.probability).max(finite_unit_interval(option.tick_probability))
+}
+
+fn soccer_finite_option_score(option: &AgentActionOptionTrace) -> f64 {
+    soccer_finite_nonnegative_metric(option.score)
+}
+
+fn soccer_action_option_learning_context(
+    action: &str,
+    options: &[AgentActionOptionTrace],
+) -> SoccerActionOptionLearningContext {
+    if options.is_empty() {
+        return SoccerActionOptionLearningContext::default();
+    }
+    let action = normalize_soccer_action_label(action);
+    let action_option_count = options.len();
+    let legal_action_option_count = options.iter().filter(|option| option.legal).count();
+    let chosen = options
+        .iter()
+        .find(|option| normalize_soccer_action_label(&option.label) == action);
+    let chosen_action_probability = chosen
+        .map(soccer_finite_option_probability)
+        .unwrap_or(0.0);
+    let chosen_action_score = chosen
+        .map(soccer_finite_option_score)
+        .unwrap_or(0.0);
+    let best_legal_action_score = options
+        .iter()
+        .filter(|option| option.legal)
+        .map(soccer_finite_option_score)
+        .fold(0.0, f64::max);
+    let best_other_legal_action_score = options
+        .iter()
+        .filter(|option| {
+            option.legal && normalize_soccer_action_label(&option.label) != action
+        })
+        .map(soccer_finite_option_score)
+        .fold(0.0, f64::max);
+    let action_score_margin = chosen_action_score - best_other_legal_action_score;
+    let entropy = options
+        .iter()
+        .filter(|option| option.legal)
+        .map(|option| finite_unit_interval(option.probability))
+        .filter(|probability| *probability > 1e-9)
+        .map(|probability| -probability * probability.ln())
+        .sum::<f64>();
+    let max_entropy = if legal_action_option_count > 1 {
+        (legal_action_option_count as f64).ln()
+    } else {
+        1.0
+    };
+    SoccerActionOptionLearningContext {
+        action_option_count,
+        legal_action_option_count,
+        chosen_action_probability,
+        chosen_action_score,
+        best_legal_action_score,
+        action_score_margin,
+        action_option_entropy: (entropy / max_entropy).clamp(0.0, 1.0),
+    }
+}
+
+fn soccer_action_mpc_feasibility_from_context(
+    action: &str,
+    pass_mpc_receipt_probability: f64,
+    pass_receipt_qp_accel_fit: f64,
+    dribble_mpc_control_probability: f64,
+    dribble_mpc_qp_accel_fit: f64,
+    shot_mpc_accuracy_probability: f64,
+    shot_mpc_qp_target_fit: f64,
+) -> f64 {
+    let action = normalize_soccer_action_label(action);
+    let pass_mpc_receipt_probability = finite_unit_interval(pass_mpc_receipt_probability);
+    let pass_receipt_qp_accel_fit = finite_unit_interval(pass_receipt_qp_accel_fit);
+    let dribble_mpc_control_probability = finite_unit_interval(dribble_mpc_control_probability);
+    let dribble_mpc_qp_accel_fit = finite_unit_interval(dribble_mpc_qp_accel_fit);
+    let shot_mpc_accuracy_probability = finite_unit_interval(shot_mpc_accuracy_probability);
+    let shot_mpc_qp_target_fit = finite_unit_interval(shot_mpc_qp_target_fit);
+    if is_pass_like_action(action) {
+        (pass_mpc_receipt_probability * 0.68 + pass_receipt_qp_accel_fit * 0.32).clamp(0.0, 1.0)
+    } else if is_dribble_action_label(action) {
+        (dribble_mpc_control_probability * 0.72 + dribble_mpc_qp_accel_fit * 0.28)
+            .clamp(0.0, 1.0)
+    } else if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        (shot_mpc_accuracy_probability * 0.70 + shot_mpc_qp_target_fit * 0.30).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn soccer_action_control_cost_from_context(
+    action: &str,
+    target_distance_yards: f64,
+    target_angle_degrees: f64,
+    action_ball_speed_yps: f64,
+    mpc_feasibility: f64,
+) -> f64 {
+    let action = normalize_soccer_action_label(action);
+    let distance_cost = (soccer_finite_nonnegative_metric(target_distance_yards) / 70.0)
+        .clamp(0.0, 1.0);
+    let turn_cost = (soccer_finite_nonnegative_metric(target_angle_degrees.abs()) / 180.0)
+        .clamp(0.0, 1.0);
+    let speed_cost = (soccer_finite_nonnegative_metric(action_ball_speed_yps) / 42.0)
+        .clamp(0.0, 1.0);
+    let feasibility_cost = 1.0 - finite_unit_interval(mpc_feasibility);
+    let base = if is_pass_like_action(action) {
+        distance_cost * 0.38 + turn_cost * 0.12 + speed_cost * 0.12 + feasibility_cost * 0.38
+    } else if is_dribble_action_label(action) {
+        distance_cost * 0.22 + turn_cost * 0.24 + speed_cost * 0.08 + feasibility_cost * 0.46
+    } else if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        distance_cost * 0.22 + turn_cost * 0.18 + speed_cost * 0.14 + feasibility_cost * 0.46
+    } else {
+        distance_cost * 0.18 + turn_cost * 0.16 + feasibility_cost * 0.16
+    };
+    base.clamp(0.0, 1.0)
+}
+
 fn action_option_score(options: &[AgentActionOptionTrace], label: &str) -> f64 {
     options
         .iter()
         .find(|option| option.label == label)
         .filter(|option| option.legal)
-        .map(|option| option.score.max(0.0))
+        .map(soccer_finite_option_score)
         .unwrap_or(0.0)
 }
 
@@ -9363,13 +9565,13 @@ fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
         LeftCut | SideStep | Dribble | HoldUpFlank => Some(DribbleMoveKind::LeftCut),
         CarryForward | VerticalAttack | TurnoverBurst => Some(DribbleMoveKind::CarryForward),
         ProtectBall => Some(DribbleMoveKind::ProtectBall),
+        XaviTurn => Some(DribbleMoveKind::XaviTurn),
         RightCut => Some(DribbleMoveKind::RightCut),
         Nutmeg => Some(DribbleMoveKind::Nutmeg),
         CarryOutLeft => Some(DribbleMoveKind::CarryOutLeft),
         CarryOutRight => Some(DribbleMoveKind::CarryOutRight),
         FakeLeftCutRight => Some(DribbleMoveKind::FakeLeftCutRight),
         FakeRightCutLeft => Some(DribbleMoveKind::FakeRightCutLeft),
-        XaviTurn => Some(DribbleMoveKind::XaviTurn),
         _ => None,
     }
 }
@@ -12935,6 +13137,7 @@ impl MatchConfig {
                 ..SoccerMpcConfig::default()
             },
             adversarial_embedding_exploitation_enabled: true,
+            opponent_belief_enabled: true,
             max_human_players: 4,
             ..MatchConfig::default()
         }
@@ -16369,6 +16572,30 @@ fn soccer_decision_context_for(
     let shot_mpc_goal_probability = shot_mpc_for_action
         .map(|estimate| estimate.goal_probability)
         .unwrap_or(0.0);
+    let chosen_action_mpc_feasibility = soccer_action_mpc_feasibility_from_context(
+        action,
+        pass_mpc_receipt_probability,
+        pass_receipt_qp_accel_fit,
+        dribble_mpc_control_probability,
+        dribble_mpc_qp_accel_fit,
+        shot_mpc_accuracy_probability,
+        shot_mpc_qp_target_fit,
+    );
+    let chosen_action_control_cost = soccer_action_control_cost_from_context(
+        action,
+        target_distance_yards,
+        target_angle_degrees,
+        action_ball_speed_yps,
+        chosen_action_mpc_feasibility,
+    );
+    let human_intent = soccer_human_intent_support_context(
+        before,
+        player_id,
+        team,
+        action,
+        actor_position,
+        target_point,
+    );
     let (attacking_team_speed_yps, attacking_team_acceleration_yps2) =
         team_kinematic_average(before, team);
     let (defending_team_speed_yps, defending_team_acceleration_yps2) =
@@ -16480,6 +16707,19 @@ fn soccer_decision_context_for(
         learned_mpc_rejected_execution_probability: 0.0,
         learned_mpc_original_action: None,
         learned_mpc_replacement_action: None,
+        action_option_count: 0,
+        legal_action_option_count: 0,
+        chosen_action_probability: 0.0,
+        chosen_action_score: 0.0,
+        best_legal_action_score: 0.0,
+        action_score_margin: 0.0,
+        action_option_entropy: 0.0,
+        chosen_action_mpc_feasibility,
+        chosen_action_control_cost,
+        human_teammate_intent_distance_yards: human_intent.distance_yards,
+        human_teammate_has_ball: human_intent.has_ball,
+        human_teammate_pressure: human_intent.pressure,
+        human_support_score: human_intent.support_score,
         dribble_touch_angle_bucket,
         dribble_touch_distance_yards,
         dribble_touch_distance_bin,
@@ -16517,6 +16757,33 @@ fn soccer_decision_context_with_trace(
         context.learned_mpc_original_action = Some(replan.original_action.clone());
         context.learned_mpc_replacement_action = Some(replan.replacement_action.clone());
     }
+    let option_context =
+        soccer_action_option_learning_context(&decision.action, &decision.action_options);
+    context.action_option_count = option_context.action_option_count;
+    context.legal_action_option_count = option_context.legal_action_option_count;
+    context.chosen_action_probability = option_context.chosen_action_probability;
+    context.chosen_action_score = option_context.chosen_action_score;
+    context.best_legal_action_score = option_context.best_legal_action_score;
+    context.action_score_margin = option_context.action_score_margin;
+    context.action_option_entropy = option_context.action_option_entropy;
+    if let Some(comparison) = decision.mdp_mpc_comparison.as_ref() {
+        let execution_probability = finite_unit_interval(comparison.mpc_execution_probability);
+        if execution_probability > 0.0 {
+            context.chosen_action_mpc_feasibility = context
+                .chosen_action_mpc_feasibility
+                .min(execution_probability);
+        }
+        let comparison_cost =
+            (soccer_finite_nonnegative_metric(comparison.target_delta_yards) / 18.0)
+                .clamp(0.0, 1.0)
+                * 0.55
+                + (soccer_finite_nonnegative_metric(comparison.velocity_delta_yps) / 18.0)
+                    .clamp(0.0, 1.0)
+                    * 0.45;
+        context.chosen_action_control_cost = context
+            .chosen_action_control_cost
+            .max(comparison_cost.clamp(0.0, 1.0));
+    }
     context
 }
 
@@ -16526,6 +16793,94 @@ fn player_normalized_last_action(player: &PlayerSnapshot) -> &str {
         .as_ref()
         .map(|decision| normalize_soccer_action_label(&decision.action))
         .unwrap_or("hold")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SoccerHumanIntentSupportContext {
+    distance_yards: f64,
+    has_ball: bool,
+    pressure: f64,
+    support_score: f64,
+}
+
+fn soccer_human_intent_support_context(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    team: Team,
+    action: &str,
+    actor_position: Vec2,
+    target_point: Option<Vec2>,
+) -> SoccerHumanIntentSupportContext {
+    let Some(human) = snapshot
+        .players
+        .iter()
+        .filter(|player| {
+            player.team == team && player.id != player_id && player.controller_slot.is_some()
+        })
+        .min_by(|a, b| {
+            let a_pos = snapshot.player_position(a.id).unwrap_or(a.position);
+            let b_pos = snapshot.player_position(b.id).unwrap_or(b.position);
+            let a_key = if snapshot.ball.holder == Some(a.id) {
+                0.0
+            } else {
+                1.0
+            } + actor_position.distance(a_pos) / 1000.0;
+            let b_key = if snapshot.ball.holder == Some(b.id) {
+                0.0
+            } else {
+                1.0
+            } + actor_position.distance(b_pos) / 1000.0;
+            a_key
+                .partial_cmp(&b_key)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return SoccerHumanIntentSupportContext::default();
+    };
+    let human_position = snapshot.player_position(human.id).unwrap_or(human.position);
+    let distance_yards = actor_position.distance(human_position);
+    let has_ball = snapshot.ball.holder == Some(human.id);
+    let pressure = pressure_from_nearest_distance(
+        snapshot.nearest_opponent_distance_at(team, human_position),
+    );
+    let action = normalize_soccer_action_label(action);
+    let action_supports_human = matches!(
+        action,
+        "support-shape"
+            | "support-roam"
+            | "check-to-ball"
+            | "wide-outlet"
+            | "overlap-run"
+            | "run-in-behind"
+            | "shot-creation-run"
+            | "wall-pass"
+            | "pass"
+            | "killer-pass"
+            | "first-time-pass"
+            | "recycle-reset"
+    );
+    let outlet_score = target_point
+        .map(|target| {
+            let outlet_distance = target.distance(human_position);
+            let distance_fit = (1.0 - (outlet_distance - 18.0).abs() / 24.0).clamp(0.0, 1.0);
+            let forward = ((target.y - human_position.y) * team.attack_dir() / 24.0)
+                .clamp(-0.5, 1.0);
+            let width = ((target.x - human_position.x).abs() / 18.0).clamp(0.0, 1.0);
+            (distance_fit * 0.45 + forward.max(0.0) * 0.30 + width * 0.25).clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0);
+    let support_score = if has_ball || pressure > 0.25 {
+        let action_fit = if action_supports_human { 1.0 } else { 0.35 };
+        (outlet_score * 0.62 + action_fit * 0.22 + pressure * 0.16).clamp(0.0, 1.0)
+    } else {
+        (outlet_score * 0.45 + if action_supports_human { 0.15 } else { 0.0 }).clamp(0.0, 1.0)
+    };
+    SoccerHumanIntentSupportContext {
+        distance_yards,
+        has_ball,
+        pressure,
+        support_score,
+    }
 }
 
 fn team_average_defensive_depth(snapshot: &WorldSnapshot, team: Team) -> f64 {
@@ -16855,7 +17210,7 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
             Shoot | FirstTimeShot | FirstTimeHeader | Pass | KillerPass | AerialPass
                 | FlankLowCross | FlankHighCross | FirstTimePass | Dribble | CarryForward
                 | CarryOutLeft | CarryOutRight | ProtectBall | SideStep | LeftCut | RightCut
-                | Nutmeg | FakeLeftCutRight | FakeRightCutLeft | HoldUpFlank | Space
+                | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft | HoldUpFlank | Space
                 | SupportShape | SupportRoam | CheckToBall | RunInBehind | ExploitSpaceRun
                 // NB: original had the DEAD `"support-push-up"` arm but no live
                 // `"vertical-attack"`, so vertical-attack is intentionally excluded.
@@ -16983,7 +17338,8 @@ fn soccer_goal_credit_transition_score(
         }
         Some(
             Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | HoldUpFlank
-            | SideStep | LeftCut | RightCut | Nutmeg | FakeLeftCutRight | FakeRightCutLeft,
+            | SideStep | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight
+            | FakeRightCutLeft,
         ) => {
             let goal_approach_carry_yards = tunables().shooting.goal_approach_carry_yards;
             let goal_approach_fit = ((goal_approach_carry_yards - obs.yards_to_goal)
@@ -17225,6 +17581,41 @@ fn soccer_transition_reward_with_tactics(
     reward
 }
 
+fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
+    let option_context =
+        soccer_action_option_learning_context(&decision.action, &decision.action_options);
+    let mut reward = 0.0;
+    if option_context.action_option_count > 0 {
+        let legal_fraction = option_context.legal_action_option_count as f64
+            / option_context.action_option_count.max(1) as f64;
+        let chosen_legal = decision.action_options.iter().any(|option| {
+            option.legal
+                && normalize_soccer_action_label(&option.label)
+                    == normalize_soccer_action_label(&decision.action)
+        });
+        if chosen_legal {
+            reward += option_context.chosen_action_probability.clamp(0.0, 1.0) * 0.16;
+            reward += (option_context.action_score_margin / 8.0).clamp(-0.18, 0.18);
+            reward += legal_fraction.clamp(0.0, 1.0) * 0.04;
+        } else {
+            reward -= 0.75;
+        }
+    }
+    if let Some(replan) = decision.learned_mpc_replan.as_ref() {
+        reward -= 0.45 + replan.rejected_execution_probability.clamp(0.0, 1.0) * 1.10;
+    }
+    if let Some(comparison) = decision.mdp_mpc_comparison.as_ref() {
+        reward += finite_unit_interval(comparison.mpc_execution_probability) * 0.18;
+        reward -= (soccer_finite_nonnegative_metric(comparison.target_delta_yards) / 24.0)
+            .clamp(0.0, 1.0)
+            * 0.20;
+        reward -= (soccer_finite_nonnegative_metric(comparison.velocity_delta_yps) / 22.0)
+            .clamp(0.0, 1.0)
+            * 0.12;
+    }
+    reward
+}
+
 fn dense_soccer_transition_reward(
     player: &PlayerAgent,
     decision: &AgentDecisionTrace,
@@ -17244,6 +17635,7 @@ fn dense_soccer_transition_reward(
     let ball_forward = (after.ball.position.y - before.ball.position.y) * attack_dir;
     let player_forward = (after_pos.y - before_pos.y) * attack_dir;
     let mut reward = 0.0;
+    reward += soccer_decision_option_control_reward(decision);
     // Territorial spacing (cover ground): a small, always-on shaping term. Reward
     // easing out of a sustained teammate overlap, and gently discourage camping in
     // one — modest weights, so it stays balanced against goals/possession and the
@@ -17885,14 +18277,6 @@ fn dense_soccer_transition_reward(
             0.20
         };
     }
-
-    // Dense territorial pitch-control x expected-threat shaping: credit the
-    // acting team for any action — including a pure off-ball run — that grows its
-    // net control of dangerous space, the signal the local event rewards above
-    // are blind to. Gated off by default (returns 0.0 before touching the grid
-    // unless `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`), so the baseline stays
-    // byte-identical. See `pitch_value`.
-    reward += pitch_value_reward_delta(before, after, player.team);
 
     reward.clamp(-4.0, 4.0)
 }
@@ -30482,7 +30866,7 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
         label.as_ref(),
         Some(
             Shoot | Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
-                | LeftCut | RightCut | Nutmeg | FakeLeftCutRight | FakeRightCutLeft | Pass
+                | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft | Pass
                 | KillerPass | AerialPass | WallPass | CornerFlagCross | SurprisePass | FlickOn
                 | VerticalAttack | TurnoverBurst | SwitchPlay | RecycleReset | FlankLowCross
                 | FlankHighCross | RouteOne | FirstTimeShot | FirstTimeHeader | FirstTimePass
@@ -30546,6 +30930,7 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "nutmeg",
     "fake-left-cut-right",
     "fake-right-cut-left",
+    "xavi-turn",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
@@ -30569,6 +30954,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         LeftCut => "left-cut",
         RightCut => "right-cut",
         Nutmeg => "nutmeg",
+        XaviTurn => "xavi-turn",
         FakeLeftCutRight => "fake-left-cut-right",
         FakeRightCutLeft => "fake-right-cut-left",
         Pass => "pass",
@@ -31372,6 +31758,38 @@ fn soccer_neural_transition_features_with_action(
         .as_deref()
         .map(soccer_neural_action_hash)
         .unwrap_or(0.0);
+    let option_count = context.action_option_count.max(1) as f64;
+    features[SOCCER_NEURAL_FEATURE_OPTION_LEGAL_FRACTION] =
+        (context.legal_action_option_count as f64 / option_count).clamp(0.0, 1.0);
+    features[SOCCER_NEURAL_FEATURE_OPTION_CHOSEN_PROBABILITY] =
+        soccer_neural_unit(context.chosen_action_probability);
+    features[SOCCER_NEURAL_FEATURE_OPTION_SCORE_MARGIN] =
+        soccer_neural_scaled(context.action_score_margin, 8.0);
+    features[SOCCER_NEURAL_FEATURE_OPTION_ENTROPY] =
+        soccer_neural_unit(context.action_option_entropy);
+    features[SOCCER_NEURAL_FEATURE_OPTION_MPC_FEASIBILITY] =
+        soccer_neural_unit(context.chosen_action_mpc_feasibility);
+    features[SOCCER_NEURAL_FEATURE_OPTION_CONTROL_COST] =
+        soccer_neural_unit(context.chosen_action_control_cost);
+    features[SOCCER_NEURAL_FEATURE_OPTION_LEGAL_COUNT] =
+        soccer_neural_scaled(context.legal_action_option_count as f64, 16.0);
+    features[SOCCER_NEURAL_FEATURE_OPTION_TOTAL_COUNT] =
+        soccer_neural_scaled(context.action_option_count as f64, 16.0);
+    features[SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_DISTANCE] = if context
+        .human_teammate_intent_distance_yards
+        .is_finite()
+        && context.human_teammate_intent_distance_yards > 0.0
+    {
+        1.0 - soccer_neural_scaled(context.human_teammate_intent_distance_yards, 42.0)
+    } else {
+        0.0
+    };
+    features[SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_HAS_BALL] =
+        soccer_neural_bool(context.human_teammate_has_ball);
+    features[SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_PRESSURE] =
+        soccer_neural_unit(context.human_teammate_pressure);
+    features[SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE] =
+        soccer_neural_unit(context.human_support_score);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -38458,11 +38876,10 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
             );
             let tracking_confidence = tracking_transition_confidence(&pair[0], &pair[1], player.id);
             let reward = reward * tracking_reward_confidence_multiplier(tracking_confidence);
-            let mut decision_context = soccer_decision_context_for(
+            let mut decision_context = soccer_decision_context_with_trace(
                 player.id,
                 player.team,
-                &decision.action,
-                decision.action_target.as_ref(),
+                &decision,
                 &before,
                 &after,
             );
@@ -41150,6 +41567,7 @@ fn tracking_frame_to_world_snapshot(
         } else {
             0.0
         },
+        gk_handling_since_clock: None,
         formation_lp_guidance: Vec::new(),
         formation_lp_teams: Vec::new(),
         teammate_spacing_notices: Vec::new(),
@@ -41840,9 +42258,10 @@ fn tracking_action_target_trace(
             // bucket — preserve that exactly (do not add VerticalAttack here).
             Some(
                 Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
-                | LeftCut | RightCut | Nutmeg | FakeLeftCutRight | FakeRightCutLeft | ControlTouch
-                | Space | SupportShape | SupportRoam | CheckToBall | RunInBehind | ExploitSpaceRun
-                | WideOutlet | ShotCreationRun | OverlapRun | SupportScreen | VacateSpace | Defend,
+                | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
+                | ControlTouch | Space | SupportShape | SupportRoam | CheckToBall | RunInBehind
+                | ExploitSpaceRun | WideOutlet | ShotCreationRun | OverlapRun | SupportScreen
+                | VacateSpace | Defend,
             ) => (
                 next_player.map(|p| p.position).unwrap_or(player.position),
                 None,
@@ -42270,11 +42689,21 @@ fn soccer_moment_replay_transition(
         .filter(|reward| reward.is_finite())
         .unwrap_or(0.0);
     let reward = marker_reward + base_reward * reward_scale;
-    let mut decision_context = soccer_decision_context_for(
+    let mut decision_context = soccer_decision_context_with_trace(
         player_id,
         player.team,
-        &action,
-        action_target.as_ref(),
+        &AgentDecisionTrace {
+            mdp_state: before.mdp_state_for_player(player_id),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            operation_order: vec!["moment-replay".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option(&action),
+            action_target: action_target.clone(),
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            action: action.clone(),
+        },
         &before,
         &after,
     );
@@ -42466,10 +42895,10 @@ fn dribble_beat_probability(
         DribbleMoveKind::ProtectBall => 0.46,
         DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 1.0,
         DribbleMoveKind::Nutmeg => 0.82,
-        DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 1.05,
         // Turning a committed defender with a shielded pirouette beats them cleanly more
         // often than not — they are wrong-footed by the long way around.
         DribbleMoveKind::XaviTurn => 0.96,
+        DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 1.05,
     };
     let response_multiplier = match response {
         DefenderDribbleResponse::HoldUp => 1.0,
@@ -42506,7 +42935,7 @@ fn dribble_dispossession_kind_multiplier(kind: DribbleMoveKind) -> f64 {
         DribbleMoveKind::ProtectBall => 0.58,
         // Even more secure than a static shield: the body stays between defender and ball
         // through the whole turn. (The hard 10% ceiling is applied separately.)
-        DribbleMoveKind::XaviTurn => 0.40,
+        DribbleMoveKind::XaviTurn => 0.50,
         DribbleMoveKind::CarryForward => 0.86,
         DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight => 0.78,
         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0.92,
@@ -42717,7 +43146,7 @@ fn xavi_turn_wheel_tangent(
 
 /// Where the carrier wants the ball this tick — the resting spot the orbital
 /// model eases toward. Returns `(desired_world_dir, desired_radius, allow_through_body,
-/// max_orbit_rate_rad_s)`.
+/// prefer_long_orbit, winding_cap_rad, max_orbit_rate_rad_s)`.
 ///
 /// - Direction is derived from the body facing and the active dribble move: an
 ///   ordinary carry keeps the ball ahead; carry-outs nudge it to a front-side; cuts
@@ -42725,6 +43154,8 @@ fn xavi_turn_wheel_tangent(
 /// - Radius is close control: ~0.25 yd under tight pressure out to ~1.0 yd in space
 ///   (tighter the nearer the closest opponent).
 /// - Only special moves set `allow_through_body` (ordinary play arcs AROUND the body).
+/// - The Xavi turn deliberately takes the long way around the carrier (280-300 deg)
+///   while keeping the ball on the defender's far side.
 fn carried_ball_orbit_command(
     facing_yaw: f64,
     move_kind: Option<DribbleMoveKind>,
@@ -42732,7 +43163,12 @@ fn carried_ball_orbit_command(
     // Unit vector from the carrier TOWARD the nearest opponent (None if none/degenerate).
     // Used to shield: the protected ball is held on the OPPOSITE side of the body.
     nearest_opponent_dir: Option<Vec2>,
-) -> (Vec2, f64, bool, f64) {
+) -> (Vec2, f64, bool, bool, f64, f64) {
+    let facing_yaw = if facing_yaw.is_finite() {
+        facing_yaw
+    } else {
+        std::f64::consts::FRAC_PI_2
+    };
     let tightness = if nearest_opponent_distance.is_finite() {
         ((CARRY_TIGHT_CONTROL_RANGE_YARDS - nearest_opponent_distance)
             / (CARRY_TIGHT_CONTROL_RANGE_YARDS - 1.0).max(1e-6))
@@ -42749,21 +43185,84 @@ fn carried_ball_orbit_command(
     let shield_dir = nearest_opponent_dir
         .filter(|toward| toward.len() > 1e-6)
         .map(|toward| toward.normalized() * -1.0);
-    let (base_dir, allow_through, rate) = match move_kind {
-        Some(DribbleMoveKind::CarryOutLeft) => (dir_at(32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
-        Some(DribbleMoveKind::CarryOutRight) => {
-            (dir_at(-32.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
+    let xavi_turn_dir = || {
+        let fallback = dir_at(280.0);
+        let Some(shield_dir) = shield_dir else {
+            return fallback;
+        };
+        let mut best = fallback.normalized();
+        let mut best_dot = best.dot(shield_dir);
+        for candidate in [dir_at(280.0), dir_at(300.0), dir_at(-280.0), dir_at(-300.0)] {
+            let candidate = candidate.normalized();
+            let score = candidate.dot(shield_dir);
+            if score > best_dot {
+                best = candidate;
+                best_dot = score;
+            }
         }
-        Some(DribbleMoveKind::LeftCut) => (dir_at(78.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
-        Some(DribbleMoveKind::RightCut) => (dir_at(-78.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
+        if best_dot >= 0.40 {
+            best
+        } else {
+            shield_dir
+        }
+    };
+    let (base_dir, allow_through, prefer_long_orbit, winding_cap, rate) = match move_kind {
+        Some(DribbleMoveKind::CarryOutLeft) => (
+            dir_at(32.0),
+            false,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+            CARRY_ORBIT_NORMAL_RATE_RAD_S,
+        ),
+        Some(DribbleMoveKind::CarryOutRight) => {
+            (
+                dir_at(-32.0),
+                false,
+                false,
+                CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+                CARRY_ORBIT_NORMAL_RATE_RAD_S,
+            )
+        }
+        Some(DribbleMoveKind::LeftCut) => (
+            dir_at(78.0),
+            true,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+            CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+        ),
+        Some(DribbleMoveKind::RightCut) => (
+            dir_at(-78.0),
+            true,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+            CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+        ),
         Some(DribbleMoveKind::FakeLeftCutRight) => {
-            (dir_at(-72.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
+            (
+                dir_at(-72.0),
+                true,
+                false,
+                CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+                CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+            )
         }
         Some(DribbleMoveKind::FakeRightCutLeft) => {
-            (dir_at(72.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S)
+            (
+                dir_at(72.0),
+                true,
+                false,
+                CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+                CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+            )
         }
         // A nutmeg pushes the ball straight through the gap — close and through.
-        Some(DribbleMoveKind::Nutmeg) => (dir_at(0.0), true, CARRY_ORBIT_SPECIAL_RATE_RAD_S),
+        Some(DribbleMoveKind::Nutmeg) => (
+            dir_at(0.0),
+            true,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+            CARRY_ORBIT_SPECIAL_RATE_RAD_S,
+        ),
         // SHIELD: protecting the ball means keeping it on the FAR side of the body from the
         // nearest defender — the carrier's body is the barrier between defender and ball,
         // which is what `carrier_shields_ball_from_defender` rewards with a near-zero steal.
@@ -42771,23 +43270,39 @@ fn carried_ball_orbit_command(
         // defender to shield from, fall back to keeping it ahead of the body.
         Some(DribbleMoveKind::ProtectBall) => {
             let shield_dir = shield_dir.unwrap_or_else(|| dir_at(0.0));
-            (shield_dir, false, CARRY_ORBIT_NORMAL_RATE_RAD_S)
+            (
+                shield_dir,
+                false,
+                false,
+                CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+                CARRY_ORBIT_NORMAL_RATE_RAD_S,
+            )
         }
         // XAVI TURN: like the shield, the ball is held on the FAR side of the defender —
         // but swept a touch faster so it tracks the body as the carrier wheels ~290° the
-        // long way around. It arcs AROUND the body (never through), and the long protective
-        // path emerges as the carrier's pivot keeps rotating the shield bearing.
-        Some(DribbleMoveKind::XaviTurn) => {
-            let shield_dir = shield_dir.unwrap_or_else(|| dir_at(0.0));
-            (shield_dir, false, CARRY_ORBIT_XAVI_RATE_RAD_S)
-        }
+        // long way around. It arcs AROUND the body (never through, the `true` long-orbit
+        // flag), capped at the 300° max orbit, and the long protective path emerges as the
+        // carrier's pivot keeps rotating the shield bearing.
+        Some(DribbleMoveKind::XaviTurn) => (
+            xavi_turn_dir(),
+            false,
+            true,
+            XAVI_TURN_MAX_ORBIT_RAD,
+            CARRY_ORBIT_SPECIAL_RATE_RAD_S * 0.86,
+        ),
         // Carry-forward, plain hold: keep the ball ahead of the body.
-        _ => (dir_at(0.0), false, CARRY_ORBIT_NORMAL_RATE_RAD_S),
+        _ => (
+            dir_at(0.0),
+            false,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
+            CARRY_ORBIT_NORMAL_RATE_RAD_S,
+        ),
     };
     let shield_blend = match move_kind {
         Some(DribbleMoveKind::ProtectBall)
-        | Some(DribbleMoveKind::XaviTurn)
-        | Some(DribbleMoveKind::Nutmeg) => 0.0,
+        | Some(DribbleMoveKind::Nutmeg)
+        | Some(DribbleMoveKind::XaviTurn) => 0.0,
         Some(DribbleMoveKind::LeftCut)
         | Some(DribbleMoveKind::RightCut)
         | Some(DribbleMoveKind::FakeLeftCutRight)
@@ -42804,7 +43319,20 @@ fn carried_ball_orbit_command(
     } else {
         base_dir
     };
-    (dir.normalized(), radius, allow_through, rate)
+    let radius = if matches!(move_kind, Some(DribbleMoveKind::XaviTurn)) {
+        (radius + 0.18 + tightness * 0.12)
+            .clamp(CARRY_TIGHT_RADIUS_YARDS, CARRY_MAX_ORBIT_RADIUS_YARDS)
+    } else {
+        radius
+    };
+    (
+        dir.normalized(),
+        radius,
+        allow_through,
+        prefer_long_orbit,
+        winding_cap,
+        rate,
+    )
 }
 
 fn dribble_heavy_touch_probability(player: &PlayerAgent, pressure: f64) -> f64 {
@@ -44935,9 +45463,66 @@ struct PassTargetQuality {
     /// execution layer firms a contested ball up to this so the struck pass matches the
     /// decision.
     min_clearing_speed_yps: f64,
+    backward_path_opponent_count: usize,
+    backward_path_traffic_risk: f64,
+    backward_path_traffic_penalty: f64,
     mpc_receipt_probability: f64,
     mpc_receipt_race_advantage_seconds: f64,
     mpc_receipt_qp_accel_fit: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BackwardPassPathTraffic {
+    opponent_count: usize,
+    risk: f64,
+    score_penalty: f64,
+}
+
+fn backward_pass_path_traffic_for_snapshot(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target_point: Vec2,
+) -> BackwardPassPathTraffic {
+    let forward_yards = (target_point.y - passer_position.y) * passer.team.attack_dir();
+    if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
+        return BackwardPassPathTraffic::default();
+    }
+    let priced_backward_yards =
+        (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
+    if priced_backward_yards <= 0.0 {
+        return BackwardPassPathTraffic::default();
+    }
+    if passer_position.distance(target_point) <= 1e-6 {
+        return BackwardPassPathTraffic::default();
+    }
+    let opponent_count = snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == passer.team.other())
+        .filter(|player| {
+            let position = snapshot
+                .player_position(player.id)
+                .unwrap_or(player.position);
+            let along = segment_projection_factor(passer_position, target_point, position);
+            (BACKWARD_PASS_PATH_TRAFFIC_ENDPOINT_FRACTION
+                ..=(1.0 - BACKWARD_PASS_PATH_TRAFFIC_ENDPOINT_FRACTION))
+                .contains(&along)
+                && segment_distance_to_point(passer_position, target_point, position)
+                    <= BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS
+        })
+        .count();
+    if opponent_count == 0 {
+        return BackwardPassPathTraffic::default();
+    }
+    let scaled = opponent_count as f64 * priced_backward_yards;
+    BackwardPassPathTraffic {
+        opponent_count,
+        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
+            .clamp(0.0, 0.95),
+        score_penalty: scaled
+            * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -45670,6 +46255,12 @@ fn pass_target_quality_for_snapshot_inner(
         Some(target.id),
     );
     let target_forward = (anticipated_target.y - passer_position.y) * passer.team.attack_dir();
+    let backward_path_traffic = backward_pass_path_traffic_for_snapshot(
+        snapshot,
+        passer,
+        passer_position,
+        anticipated_target,
+    );
     let anticipation_weight = if target_forward > 2.0 {
         0.38 + pass_skill * 0.34
     } else if target_forward >= -1.25 {
@@ -45709,7 +46300,7 @@ fn pass_target_quality_for_snapshot_inner(
     // being averaged against it (an additive lane term let an open receiver rescue a
     // blocked lane, reading a ball straight through a set defender as ~0.6 "safe").
     let mut lane_interception_risk = 0.0;
-    let lane_clearance = if flight.is_aerial() {
+    let mut lane_clearance = if flight.is_aerial() {
         let nearest_interceptor = snapshot
             .players
             .iter()
@@ -45774,6 +46365,13 @@ fn pass_target_quality_for_snapshot_inner(
         };
         base_lane_clearance * dynamic_gate
     };
+    if backward_path_traffic.risk > 0.0 {
+        lane_interception_risk =
+            (lane_interception_risk + backward_path_traffic.risk).clamp(0.0, 1.0);
+        lane_clearance *=
+            (1.0 - backward_path_traffic.risk * BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH)
+                .clamp(0.18, 1.0);
+    }
     let distance_fit = if flight.is_aerial() {
         (1.0 - (distance - 32.0).abs() / 58.0).clamp(0.24, 1.0)
     } else {
@@ -45817,6 +46415,9 @@ fn pass_target_quality_for_snapshot_inner(
         lane_interception_risk,
         chosen_speed_yps: velocity_plan.speed_yps,
         min_clearing_speed_yps: velocity_plan.min_clearing_speed_yps,
+        backward_path_opponent_count: backward_path_traffic.opponent_count,
+        backward_path_traffic_risk: backward_path_traffic.risk,
+        backward_path_traffic_penalty: backward_path_traffic.score_penalty,
         expected_completion: expected_completion.clamp(0.02, 0.98),
         mpc_receipt_probability: mpc_receipt.probability,
         mpc_receipt_race_advantage_seconds: mpc_receipt.race_advantage_seconds,
@@ -45911,53 +46512,6 @@ fn goalkeeper_flank_width_score(position: Vec2, field_width: f64) -> f64 {
     let center_x = field_width * 0.5;
     let half_width = center_x.max(1.0);
     ((position.x - center_x).abs() / half_width).clamp(0.0, 1.0)
-}
-
-/// POMDP race-margin estimate: the probability the keeper reaches the ball before the
-/// `earliest_rival_time` (the smaller of the nearest attacker's and nearest teammate's sprint
-/// time). 0.5 at a dead heat, rising with the keeper's fractional time lead — it reaches ~0.95
-/// when the keeper arrives in ~70% of the rival's time (the same "near-certain" margin the
-/// keeper already uses to sweep). Beating the earliest rival implies beating both, so this one
-/// scalar expresses "before an attacker AND before his own teammate".
-fn keeper_first_to_ball_probability(gk_time: f64, earliest_rival_time: f64) -> f64 {
-    if !earliest_rival_time.is_finite() {
-        return 1.0;
-    }
-    if gk_time <= 1e-6 {
-        return 1.0;
-    }
-    let lead = (earliest_rival_time - gk_time) / earliest_rival_time.max(gk_time).max(0.2);
-    (0.5 + lead * 1.55).clamp(0.0, 1.0)
-}
-
-/// MPC bounded-acceleration estimate: the probability the keeper physically reaches a point
-/// `distance` away within `budget` seconds, starting from its current closing speed
-/// `speed_toward` and ramping under its acceleration cap up to `top_speed`. Unlike the POMDP
-/// estimate (which uses the instantaneous top-speed sprint time), this models the
-/// acceleration ramp — so a keeper starting from rest is correctly judged slower to arrive —
-/// and is the second, independent confirmation the keeper must clear before leaving its box.
-fn keeper_mpc_reach_probability(
-    distance: f64,
-    speed_toward: f64,
-    top_speed: f64,
-    accel: f64,
-    budget: f64,
-) -> f64 {
-    if distance <= PLAYER_CONTROL_RADIUS_YARDS {
-        return 1.0;
-    }
-    let v0 = speed_toward.clamp(0.0, top_speed);
-    let vmax = top_speed.max(0.5);
-    let a = accel.max(0.5);
-    let time_to_vmax = ((vmax - v0) / a).max(0.0);
-    let distance_to_vmax = v0 * time_to_vmax + 0.5 * a * time_to_vmax * time_to_vmax;
-    let reach_time = if distance_to_vmax >= distance {
-        // Reaches the point while still accelerating: solve 0.5·a·t² + v0·t − d = 0.
-        (-v0 + (v0 * v0 + 2.0 * a * distance).sqrt()) / a
-    } else {
-        time_to_vmax + (distance - distance_to_vmax) / vmax
-    };
-    keeper_first_to_ball_probability(reach_time, budget)
 }
 
 fn goalkeeper_backward_emergency_release_allowed(
@@ -48688,15 +49242,14 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
 
 /// Escalating demerit for a *long* backward pass. Returns 0 for forward, square, or
 /// short-backward (≤5yd) balls so a 3–5yd reset is untouched, then grows per-yard
-/// (capped) for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
+/// for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
 /// `forward_yards` is signed attacking-direction progress (negative = backward).
 fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= 0.0 {
         return 0.0;
     }
     let backward_yards = -forward_yards;
-    ((backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
-        .min(LONG_BACKWARD_PASS_PENALTY_MAX)
+    (backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD
 }
 
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
