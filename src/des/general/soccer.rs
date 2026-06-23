@@ -2490,19 +2490,30 @@ const LOOSE_BALL_POUNCE_CLOSING_YPS: f64 = 2.0;
 // an earlier intercept — it stretches/lunges this much further to reach the ball sooner and
 // beat them to it, rather than meeting it at the latest comfortable point on the roll.
 const LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS: f64 = 1.0;
-// Obstacle-aware loose-ball intercept (opt-in, gate `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT`).
-// The straight-line kinematic reach assumes a clear run to the ball. When an opponent body sits in
-// the dash corridor the chaser must skirt around it, so each candidate intercept point has its
-// required gap inflated by a bounded detour penalty before the reach test — deferring commitment on
-// balls that cannot actually be reached through traffic to the later contest-cut target instead.
-// Half-width (yards) of the corridor an opponent body must fall inside to impede the dash (~a body).
+// Obstacle-aware loose-ball intercept (opt-in: `MatchConfig::enable_obstacle_aware_intercept` OR env
+// `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT`). The straight-line kinematic reach assumes a clear run
+// to the ball. When an opponent body will be in the dash corridor — predicted forward from its
+// position, velocity AND acceleration, time-aligned to when the chaser passes each point — the chaser
+// must skirt it, so each candidate intercept has its required gap inflated by a bounded detour before
+// the reach test, deferring commitment on balls that cannot be reached through traffic. The chosen
+// candidate is then confirmed by a single individual point-mass MPC plan around the predicted movers.
+// Half-width (yards) of the corridor an opponent body must come within to impede the dash (~a body).
 const LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS: f64 = 1.1;
 // Max detour (yards) a single blocking body adds to the required gap, and the overall obstruction cap.
 const LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS: f64 = 1.6;
 // Dead-zone (yards) at each end of the corridor: a body within this of the chaser or the intercept
-// point is not "between" them (the latter is the contest at the ball, owned by the contest-cut). On
-// a short dash the margin is clamped to a fraction of the path so a centred body is still detected.
+// point is not "between" them (the latter is the contest at the ball, owned by the contest-cut). On a
+// short dash the margin is clamped to a fraction of the path so a centred body is still detected.
 const LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS: f64 = 0.5;
+// Samples along the dash for the swept closest-approach between the chaser and each predicted mover.
+const LOOSE_BALL_INTERCEPT_CORRIDOR_SAMPLES: usize = 12;
+// The MPC commit confirmation accepts an intercept whose planned (obstacle-avoiding) arrival is within
+// this slack of the kinematic deadline; beyond it the avoidance path is too slow, so the chaser marches
+// on to a later point rather than committing to a ball it cannot actually reach in time through traffic.
+const LOOSE_BALL_INTERCEPT_MPC_ARRIVAL_TOLERANCE_SECONDS: f64 = 0.12;
+// Max number of candidate intercepts per search that get the (heavier) MPC commit confirmation, so a
+// fully-blocked dash cannot run the solver once per 0.05s step; past it the swept estimate decides.
+const LOOSE_BALL_INTERCEPT_MPC_CONFIRM_BUDGET: usize = 4;
 // First-touch TIMING decision (trap now vs let it run). A ball at/below this speed is a clean
 // first touch; faster than this it risks a miscontrol when trapped on the move.
 const LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS: f64 = 6.0;
@@ -13054,8 +13065,9 @@ pub struct MatchConfig {
     /// Enable obstacle-aware loose-ball intercept feasibility for THIS match, independent of the
     /// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag (either turns it on).
     /// Default `false` => the straight-line kinematic reach is used unchanged (byte-identical). When
-    /// on, an opponent body in the dash corridor inflates the gap a chaser must cover so it does not
-    /// commit to a ball it cannot reach through traffic. See [`loose_ball_corridor_obstruction_yards`].
+    /// on, opponent bodies predicted (position + velocity + acceleration) into the dash corridor
+    /// inflate the gap a chaser must cover, and the chosen intercept is MPC-confirmed reachable in
+    /// time. See [`obstacle_aware_intercept_enabled`] and [`loose_ball_corridor_obstruction_yards`].
     #[serde(default)]
     pub enable_obstacle_aware_intercept: bool,
     /// Enable the lightweight Bayesian opponent-press belief: a per-player

@@ -618,6 +618,189 @@ impl SoccerStepTimingStats {
 mod tests {
     use super::*;
 
+    fn corridor_obstacle(pos: Vec2, vel: Vec2, acc: Vec2) -> CorridorObstacle {
+        CorridorObstacle { pos, vel, acc }
+    }
+
+    #[test]
+    fn loose_ball_corridor_obstruction_only_penalises_bodies_between_chaser_and_ball() {
+        let from = Vec2::new(0.0, 0.0);
+        let to = Vec2::new(0.0, 10.0);
+        let stat = |p: Vec2| corridor_obstacle(p, Vec2::zero(), Vec2::zero());
+
+        // Gate-off path: no opponents supplied ⇒ no detour, reach test stays straight-line.
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[], from, to, 1.0), 0.0);
+
+        // A stationary body dead-centre in the corridor forces the full bounded detour.
+        let blocked = loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(0.0, 5.0))], from, to, 1.0);
+        assert!(
+            (blocked - LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS).abs() < 1e-9,
+            "centre block should add the max detour, got {blocked}"
+        );
+
+        // A body well to the side of the corridor does not impede the run.
+        assert_eq!(
+            loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(3.0, 5.0))], from, to, 1.0),
+            0.0
+        );
+
+        // Bodies behind the chaser, or at/past the intercept point, are not the corridor's concern.
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(0.0, -2.0))], from, to, 1.0), 0.0);
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(0.0, 9.9))], from, to, 1.0), 0.0);
+
+        // Half-way into the corridor ⇒ roughly half the detour, capped.
+        let half = loose_ball_corridor_obstruction_yards(
+            &[stat(Vec2::new(LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS * 0.5, 5.0))],
+            from,
+            to,
+            1.0,
+        );
+        assert!(
+            (half - LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS * 0.5).abs() < 1e-9,
+            "half-corridor incursion should add ~half the detour, got {half}"
+        );
+
+        // Short dash: clamped end-margin still detects a body centred on a sub-yard corridor.
+        let short =
+            loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(0.0, 0.4))], Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.8), 0.2);
+        assert!(short > 0.0, "centred body on a short corridor must still register, got {short}");
+
+        // Non-finite inputs never poison the result.
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(f64::NAN, 5.0))], from, to, 1.0), 0.0);
+        assert_eq!(loose_ball_corridor_obstruction_yards(&[stat(Vec2::new(0.0, 5.0))], from, Vec2::new(f64::NAN, 0.0), 1.0), 0.0);
+    }
+
+    #[test]
+    fn loose_ball_corridor_obstruction_predicts_future_positions() {
+        // Dash from (0,0) to (0,10) over 1.5s; the chaser is at the corridor mid-point (0,5) at the
+        // f=0.5 sample, i.e. t=0.75s — so a body that arrives at (0,5) then collides with it.
+        let from = Vec2::new(0.0, 0.0);
+        let to = Vec2::new(0.0, 10.0);
+        let arrival = 1.5;
+        let centre = Vec2::new(0.0, 5.0);
+        let stat = |p: Vec2| corridor_obstacle(p, Vec2::zero(), Vec2::zero());
+
+        // A body parked on the lane blocks; the SAME body sprinting laterally OUT of it (yards wide
+        // by the time the chaser arrives) does not — the static read would have wrongly flagged it.
+        let parked = loose_ball_corridor_obstruction_yards(&[stat(centre)], from, to, arrival);
+        let vacating =
+            loose_ball_corridor_obstruction_yards(&[corridor_obstacle(centre, Vec2::new(8.0, 0.0), Vec2::zero())], from, to, arrival);
+        assert!(parked > 1.0, "a parked body on the lane must block, got {parked}");
+        assert_eq!(vacating, 0.0, "a body sprinting out of the lane must not block, got {vacating}");
+
+        // A body starting OUTSIDE the lane but moving INTO it — reaching (0,5) exactly as the chaser
+        // passes (start x=6, vel_x=-8 over t=0.75s) — blocks. Static would have wrongly cleared it.
+        let outside = Vec2::new(6.0, 5.0);
+        let static_clear = loose_ball_corridor_obstruction_yards(&[stat(outside)], from, to, arrival);
+        let entering =
+            loose_ball_corridor_obstruction_yards(&[corridor_obstacle(outside, Vec2::new(-8.0, 0.0), Vec2::zero())], from, to, arrival);
+        assert_eq!(static_clear, 0.0, "a body wide of the lane is clear when static, got {static_clear}");
+        assert!(entering > 1.0, "a body moving into the lane must block, got {entering}");
+
+        // Acceleration alone (zero initial velocity): 0.5·a·t² = -4 at t=0.75s ⇒ a_x ≈ -14.22 carries
+        // a body from (4,5) to (0,5) as the chaser passes.
+        let by_accel = loose_ball_corridor_obstruction_yards(
+            &[corridor_obstacle(Vec2::new(4.0, 5.0), Vec2::zero(), Vec2::new(-4.0 / (0.5 * 0.75 * 0.75), 0.0))],
+            from,
+            to,
+            arrival,
+        );
+        assert!(by_accel > 1.0, "acceleration into the lane must block, got {by_accel}");
+    }
+
+    #[test]
+    fn obstacle_aware_intercept_gate_folds_config_into_snapshot() {
+        // Opting in via the match config always folds through to the snapshot bool.
+        let on = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig {
+            enable_obstacle_aware_intercept: true,
+            ..MatchConfig::default()
+        }));
+        assert!(on.obstacle_aware_intercept_enabled);
+        // A default config is off — unless the process-wide env flag is set (which OR-s in), so only
+        // assert the default-off case when the env is actually unset.
+        if std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_err() {
+            let off = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig::default()));
+            assert!(!off.obstacle_aware_intercept_enabled);
+        }
+    }
+
+    #[test]
+    fn mpc_intercept_reachable_by_respects_the_deadline() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        for player in sim.players.iter_mut() {
+            player.position = Vec2::new(2.0, 2.0);
+            player.velocity = Vec2::zero();
+        }
+        let me_id = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .unwrap();
+        sim.players[me_id].position = Vec2::new(40.0, 10.0);
+        let snap = WorldSnapshot::from_match(&sim);
+        let me = snap.players.iter().find(|p| p.id == me_id).unwrap();
+        // A nearby target with a generous deadline and a clear path is reachable.
+        assert!(snap.mpc_intercept_reachable_by(me, Vec2::new(40.0, 14.0), 2.0));
+        // A far target with a tiny deadline is not — the plan cannot arrive in time.
+        assert!(!snap.mpc_intercept_reachable_by(me, Vec2::new(40.0, 40.0), 0.2));
+    }
+
+    #[test]
+    fn obstacle_aware_intercept_defers_a_dash_through_a_wall() {
+        // A chaser behind a wall of opponents, chasing a ball rolling away. With the feature off the
+        // chaser claims it on the straight-line reach; on, the predicted bodies in the corridor
+        // inflate the required gap (and the MPC confirms the avoidance path) so the catch is deferred
+        // further down the roll. Same positions both ways — only the gate flips.
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7,
+            ..Default::default()
+        });
+        for player in sim.players.iter_mut() {
+            player.position = Vec2::new(2.0, 2.0);
+            player.velocity = Vec2::zero();
+        }
+        let chaser = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .unwrap();
+        sim.players[chaser].position = Vec2::new(40.0, 10.0);
+        let wall: Vec<usize> = sim
+            .players
+            .iter()
+            .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .take(3)
+            .collect();
+        for (k, &id) in wall.iter().enumerate() {
+            sim.players[id].position = Vec2::new(40.0, 11.0 + k as f64 * 0.6);
+        }
+        sim.ball.holder = None;
+        sim.pending_pass = None;
+        sim.ball.position = Vec2::new(40.0, 12.5);
+        sim.ball.velocity = Vec2::new(0.0, 3.0); // gently rolling away (+y)
+        sim.ball.altitude_yards = 0.0;
+
+        let mut snap = WorldSnapshot::from_match(&sim);
+        snap.obstacle_aware_intercept_enabled = false;
+        let target_off = snap.loose_ball_trajectory_intercept_for(chaser);
+        snap.obstacle_aware_intercept_enabled = true;
+        let target_on = snap.loose_ball_trajectory_intercept_for(chaser);
+
+        assert!(
+            target_on.y >= target_off.y - 1e-6,
+            "obstruction must not advance the catch: off={target_off:?} on={target_on:?}"
+        );
+        assert!(
+            target_on.y > target_off.y + 1e-2,
+            "a wall in the dash corridor should defer the catch further down the roll: \
+             off={target_off:?} on={target_on:?}"
+        );
+    }
+
     #[test]
     fn loose_ball_corridor_obstruction_only_penalises_bodies_between_chaser_and_ball() {
         let from = Vec2::new(0.0, 0.0);
@@ -16426,39 +16609,85 @@ fn soccer_mpc_pass_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MPC_PASS").is_ok())
 }
 
-/// Bounded detour (yards) the worst opponent body sitting in the dash corridor from `from` toward a
-/// candidate intercept point `to` adds to the gap a chaser must actually cover. Pure geometry: with
-/// an empty `opponents` slice (the gate-off path) it returns 0, so the straight-line reach test is
-/// unchanged. Opponents behind the chaser or at/past the intercept point are NOT counted — the
-/// former are irrelevant and the latter are the contest at the ball itself, owned by the existing
-/// contest-cut logic; only bodies genuinely between the chaser and the ball impede the run.
-fn loose_ball_corridor_obstruction_yards(opponents: &[Vec2], from: Vec2, to: Vec2) -> f64 {
+/// A potential obstruction in a loose-ball chaser's dash corridor: current position plus the
+/// velocity and acceleration used to PREDICT where the body will be when the chaser passes it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CorridorObstacle {
+    pub pos: Vec2,
+    pub vel: Vec2,
+    pub acc: Vec2,
+}
+
+/// Bounded detour (yards) the worst obstacle in a chaser's dash corridor adds to the gap it must
+/// actually cover, accounting for where each body will BE (not just where it is now). The chaser is
+/// modelled progressing along `from`→`to` over `arrival_seconds`; each obstacle is propagated by its
+/// velocity + acceleration to the matching instant; the swept closest approach over the dash drives
+/// the detour. Pure + deterministic: an empty slice (the gate-off path) returns 0, so the straight-
+/// line reach is unchanged. Bodies that close on the corridor only near the chaser's feet (already
+/// past) or at/after the intercept point (the contest at the ball, owned by the contest-cut) are not
+/// counted — only ones genuinely in the running lane mid-dash. Non-finite inputs are skipped.
+pub(crate) fn loose_ball_corridor_obstruction_yards(
+    opponents: &[CorridorObstacle],
+    from: Vec2,
+    to: Vec2,
+    arrival_seconds: f64,
+) -> f64 {
     let path = to - from;
-    let path_len = path.len();
-    if !path_len.is_finite() || path_len < 1e-3 {
+    let gap = path.len();
+    if !gap.is_finite() || gap < 1e-3 {
         return 0.0;
     }
-    let dir = path * (1.0 / path_len);
-    // End dead-zone, clamped to a fraction of the path so a centred body is still detected on a
-    // short dash (a fixed 0.5yd margin would empty the window — and silently disable the check —
-    // for any corridor under ~1yd).
-    let end_margin = LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS.min(path_len * 0.4);
+    let arrival = if arrival_seconds.is_finite() {
+        arrival_seconds.clamp(0.0, LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS)
+    } else {
+        0.0
+    };
+    let dir = path * (1.0 / gap);
+    // End dead-zone (yards along the corridor), clamped so a short dash still admits its middle. A
+    // body whose PREDICTED position projects within this of the chaser's start is one it is already
+    // past; within this of the ball is the contest at the ball itself, owned by the contest-cut.
+    let end_margin = LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS.min(gap * 0.4);
+    let samples = LOOSE_BALL_INTERCEPT_CORRIDOR_SAMPLES.max(2);
+    let radius = LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS;
     let mut worst = 0.0_f64;
-    for &op in opponents {
-        if !op.x.is_finite() || !op.y.is_finite() {
+    for opp in opponents {
+        if !opp.pos.x.is_finite() || !opp.pos.y.is_finite() {
             continue;
         }
-        let along = (op - from).dot(dir);
-        if along <= end_margin || along >= path_len - end_margin {
-            continue;
+        let vel = if opp.vel.x.is_finite() && opp.vel.y.is_finite() {
+            opp.vel
+        } else {
+            Vec2::zero()
+        };
+        let acc = if opp.acc.x.is_finite() && opp.acc.y.is_finite() {
+            opp.acc
+        } else {
+            Vec2::zero()
+        };
+        // Swept closest approach: distance between the chaser and the body's PREDICTED position at
+        // the moment the chaser reaches each point of the corridor (linear progress in time).
+        let mut min_dist = f64::INFINITY;
+        for s in 0..=samples {
+            let f = s as f64 / samples as f64;
+            let tau = f * arrival;
+            let chaser = from + path * f;
+            let predicted = opp.pos + vel * tau + acc * (0.5 * tau * tau);
+            // Only count the body while it is genuinely in the running lane span at this instant —
+            // keyed on the body's own projection so a mover at/after the ball or behind the chaser
+            // is excluded regardless of how the dash is sampled.
+            let proj = (predicted - from).dot(dir);
+            if proj <= end_margin || proj >= gap - end_margin {
+                continue;
+            }
+            let d = chaser.distance(predicted);
+            if d < min_dist {
+                min_dist = d;
+            }
         }
-        let perp = segment_distance_to_point(from, to, op);
-        if perp >= LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS {
-            continue;
+        if min_dist < radius {
+            let detour = (1.0 - min_dist / radius) * LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS;
+            worst = worst.max(detour);
         }
-        let detour = (1.0 - perp / LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS)
-            * LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS;
-        worst = worst.max(detour);
     }
     worst.min(LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS)
 }
@@ -25751,13 +25980,74 @@ impl WorldSnapshot {
         v.dot(v0 * (1.0 / v0.len())).max(0.0)
     }
 
+    /// Individual point-mass MPC confirmation that `target` is reachable by `deadline_seconds`:
+    /// plans `me`'s OWN trajectory around every other player + the ball as predicted moving keep-outs
+    /// (position + velocity + acceleration, via [`soccer_local_mpc_planar_obstacles`]), then checks
+    /// the plan first comes within reach of the target no later than the deadline (plus a small
+    /// slack). Conservative — any solver/degenerate failure returns `true` (defer to the kinematic
+    /// decision rather than wrongly vetoing). This is an INDIVIDUAL-player MPC (one actor's own path
+    /// around others-as-obstacles); there is deliberately no team/collective MPC.
+    fn mpc_intercept_reachable_by(
+        &self,
+        me: &PlayerSnapshot,
+        target: Vec2,
+        deadline_seconds: f64,
+    ) -> bool {
+        use crate::des::general::mpc_point_mass::{
+            PlanarPointMassMpc, PlanarReference, PlanarState,
+        };
+        let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
+        let pos = self.player_snapshot_position(me);
+        let vel = self.player_velocity(me.id).unwrap_or(me.velocity);
+        let accel_cap = acceleration_yps2_from_score(me.skills.acceleration).clamp(2.5, 12.0);
+        let deadline = deadline_seconds.clamp(0.0, LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS);
+        // Horizon spans the deadline (plus slack) so a plan that needs the whole dash is visible.
+        let horizon = (((deadline + LOOSE_BALL_INTERCEPT_MPC_ARRIVAL_TOLERANCE_SECONDS) / dt).ceil()
+            as usize
+            + 2)
+            .clamp(4, 48);
+        let cfg = PlanarMpcConfig {
+            horizon,
+            dt,
+            a_max: accel_cap,
+            ..PlanarMpcConfig::default()
+        };
+        let Ok(mut controller) = PlanarPointMassMpc::new(cfg) else {
+            return true;
+        };
+        let target = target.clamp_to_pitch(width, length);
+        let state = PlanarState {
+            pos: [pos.x, pos.y],
+            vel: [vel.x, vel.y],
+        };
+        let obstacles = soccer_local_mpc_planar_obstacles(self, me, dt, width, length);
+        controller.control_with_obstacles(
+            state,
+            &[PlanarReference::arrive([target.x, target.y])],
+            &obstacles,
+        );
+        let path = controller.predicted_path(state);
+        let reach_radius = INTERCEPT_LUNGE_REACH_YARDS.max(1.0);
+        for (step, point) in path.iter().enumerate() {
+            if Vec2::new(point[0], point[1]).distance(target) <= reach_radius {
+                let arrival = step as f64 * dt;
+                return arrival <= deadline + LOOSE_BALL_INTERCEPT_MPC_ARRIVAL_TOLERANCE_SECONDS;
+            }
+        }
+        // Never came within reach over the planning horizon ⇒ the avoidance path can't make it in
+        // time; the search marches on to a later intercept point.
+        false
+    }
+
     /// Kinematic pursuit solution for `player_id` against the loose ball: the earliest point on
     /// the ball's predicted trajectory it can physically reach (point-mass reach from current
     /// velocity under accel + fatigue-limited top speed, plus a last-ditch lunge that stretches
-    /// further when an opponent contests the drop). Returns `(point, contact_seconds,
-    /// ball_speed_at_contact, reachable)`. When the ball outruns the chaser inside the search
-    /// horizon, `reachable` is false and `point` is the fraction-based contest cut (a leading
-    /// chase aim, cut earlier when contested).
+    /// further when an opponent contests the drop). When the obstacle-aware feature is on, bodies
+    /// predicted into the dash corridor inflate the gap and the committed point is MPC-confirmed
+    /// reachable in time. Returns `(point, contact_seconds, ball_speed_at_contact, reachable)`. When
+    /// the ball outruns the chaser inside the search horizon, `reachable` is false and `point` is the
+    /// fraction-based contest cut (a leading chase aim, cut earlier when contested).
     fn loose_ball_intercept_solution_for(&self, player_id: usize) -> (Vec2, f64, f64, bool) {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return (self.ball.position, 0.0, self.ball.velocity.len(), false);
@@ -25781,20 +26071,26 @@ impl WorldSnapshot {
             } else {
                 0.0
             };
-        // Obstacle-aware reach (opt-in): opponent body positions to skirt on the dash. Collected
-        // once here and empty when the feature is off, so the reach test below stays byte-identical.
-        // The gate (env OR match config) is folded into the snapshot at build time, so this path is
-        // deterministic and unit-testable rather than reading a process-global env cache per tick.
-        let obstruction_opponents: Vec<Vec2> = if self.obstacle_aware_intercept_enabled {
+        // Obstacle-aware reach (opt-in): opponent bodies (position + velocity + acceleration) to
+        // PREDICT into the dash corridor. Collected once, empty when the feature is off so the reach
+        // test below stays byte-identical. The gate (env OR match config) is folded into the snapshot
+        // at build, so this path is deterministic and unit-testable.
+        let obstruction_opponents: Vec<CorridorObstacle> = if self.obstacle_aware_intercept_enabled {
             self.players
                 .iter()
                 .filter(|p| p.team != me.team)
-                .map(|p| self.player_snapshot_position(p))
-                .filter(|p| p.x.is_finite() && p.y.is_finite())
+                .map(|p| CorridorObstacle {
+                    pos: self.player_snapshot_position(p),
+                    vel: self.player_velocity(p.id).unwrap_or(p.velocity),
+                    acc: p.acceleration,
+                })
                 .collect()
         } else {
             Vec::new()
         };
+        // Confirming each reachable candidate with a full MPC plan is bounded so a fully-blocked
+        // search cannot run the solver once per step; past the budget the swept estimate decides.
+        let mut mpc_confirmations_left = LOOSE_BALL_INTERCEPT_MPC_CONFIRM_BUDGET;
         let mut t = 0.0;
         while t <= LOOSE_BALL_INTERCEPT_SEARCH_HORIZON_SECONDS {
             let ball_t = self.predicted_ball_position(t);
@@ -25808,17 +26104,30 @@ impl WorldSnapshot {
                 top_speed
             };
             let reach = Self::point_mass_reach_yards(s0, accel, top_speed, t) + lunge;
-            // A clear straight-line dash needs only `reach >= gap`; an opponent body in the corridor
-            // forces a detour, raising the gap the chaser must actually cover (opt-in, else 0).
+            // A clear straight-line dash needs only `reach >= gap`; bodies predicted into the corridor
+            // force a detour, raising the gap the chaser must actually cover (opt-in, else +0).
             let required =
-                gap + loose_ball_corridor_obstruction_yards(&obstruction_opponents, my_pos, ball_t);
+                gap + loose_ball_corridor_obstruction_yards(&obstruction_opponents, my_pos, ball_t, t);
             if reach >= required {
-                return (
-                    ball_t.clamp_to_pitch(self.field_width, self.field_length),
-                    t,
-                    self.predicted_ball_speed(t),
-                    true,
-                );
+                // Commit confirmation: an individual point-mass MPC must be able to actually reach
+                // this point — bending around the predicted movers — within the deadline. If the
+                // avoidance path is too slow, march on to a later point rather than committing to a
+                // ball that cannot be reached in time through traffic. Cheap path (feature off, or
+                // budget spent) trusts the analytic/swept decision and stays byte-identical when off.
+                let committed = !self.obstacle_aware_intercept_enabled
+                    || mpc_confirmations_left == 0
+                    || {
+                        mpc_confirmations_left -= 1;
+                        self.mpc_intercept_reachable_by(me, ball_t, t)
+                    };
+                if committed {
+                    return (
+                        ball_t.clamp_to_pitch(self.field_width, self.field_length),
+                        t,
+                        self.predicted_ball_speed(t),
+                        true,
+                    );
+                }
             }
             t += LOOSE_BALL_INTERCEPT_SEARCH_STEP_SECONDS;
         }
