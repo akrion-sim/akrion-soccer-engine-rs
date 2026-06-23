@@ -688,7 +688,7 @@ const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 // passes, pokes, or control touches; once an action is classified as Shoot, rendering and
 // physics should both see a real strike.
 const SHOT_MIN_SPEED_MPH: f64 = 40.0;
-const SHOT_MAX_SPEED_MPH: f64 = 60.0;
+const SHOT_MAX_SPEED_MPH: f64 = 70.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
@@ -701,18 +701,17 @@ const SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS: f64 = 14.0;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY: f64 = 0.54;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_AERIAL_QUALITY: f64 = 0.56;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_OPENNESS: f64 = 0.50;
-const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 45.0;
+const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 30.0;
 const SPECULATIVE_LONG_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.46;
 const SPECULATIVE_LONG_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.10;
 const SPECULATIVE_LONG_SHOT_SKILL_GATE: f64 = 0.68;
-// Long-shot distance discipline. ~25 yds is a fine range; beyond ~26 yds a shot is
-// discouraged and only opens up if the keeper is out of position; beyond ~33 yds it
-// is off entirely unless the keeper is *totally* out of position. "Out of position"
-// is the distance-agnostic `opposing_goalkeeper_out_of_position` signal (how far the
-// keeper has strayed off his line / angle), NOT `shot_beat_goalkeeper_probability`
-// (which is dominated by range and so would block every long shot indiscriminately).
-const LONG_SHOT_DISCOURAGED_YARDS: f64 = 26.0;
-const LONG_SHOT_KEEPER_DEPENDENT_YARDS: f64 = 33.0;
+// Long-shot distance discipline. Inside 20yd is the reward band; 20-26yd is possible
+// but discouraged, 26-30yd requires a visibly stranded keeper, and >30yd is illegal.
+// "Out of position" is the distance-agnostic `opposing_goalkeeper_out_of_position`
+// signal (how far the keeper has strayed off his line / angle), NOT
+// `shot_beat_goalkeeper_probability` (which is dominated by range).
+const LONG_SHOT_DISCOURAGED_YARDS: f64 = 20.0;
+const LONG_SHOT_KEEPER_DEPENDENT_YARDS: f64 = 26.0;
 const LONG_SHOT_GK_OUT_OF_POSITION: f64 = 0.45;
 const LONG_SHOT_GK_TOTALLY_OUT: f64 = 0.80;
 const KILLER_PASS_MAX_YARDS_TO_GOAL: f64 = 52.0;
@@ -755,6 +754,11 @@ const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
 /// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.15;
+const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 1.45;
+const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 2.35;
+const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
+const SCOOP_MIN_SPEED_MPH: f64 = 12.0;
+const SCOOP_MAX_SPEED_MPH: f64 = 24.0;
 /// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
 /// attacking area), the classic territory-winning long ball. Only balls at least this long, and
 /// only when forward (toward the opponent's goal line), earn the affinity — a long SIDEWAYS or
@@ -871,11 +875,11 @@ const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 40.0;
 // Floor on the distance scoring-scale so a long shot on frame still earns a sliver.
 const SHOT_ON_TARGET_SCORING_SCALE_FLOOR: f64 = 0.04;
-// Shot-on-frame reward is full inside this distance, then reduced per yard beyond. Kept
-// to genuine shooting range and tapered hard so strikers stop firing from distance: full
-// inside ~16yd, ~0.7 at 20yd, ~0.45 at 25yd, ~0.16 at 30yd, floored beyond.
-const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 16.0;
-const SHOT_REWARD_TAPER_PER_YARD: f64 = 0.065;
+// Shot-on-frame reward is full inside 20yd, then reduced per yard beyond. Shots past
+// 30yd are illegal, so the taper mainly teaches that the edge-of-box chance is much
+// more valuable than a speculative 25-30yd effort.
+const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 20.0;
+const SHOT_REWARD_TAPER_PER_YARD: f64 = 0.085;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
@@ -1068,9 +1072,9 @@ const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
 // Selection-time counterpart to the release guard: a led floor-pass point that is
 // materially nearer an opponent than the teammate is a likely direct giveaway.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
-const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.92;
-const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.18;
-const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 3.8;
+const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.58;
+const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.08;
+const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 6.2;
 // A BACKWARD ball (aim point this far behind the passer along the attack direction)
 // is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
 // the ball back toward the opponent. A backward pass whose receiver has an opponent
@@ -19968,11 +19972,11 @@ fn attacking_shape_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
     let centroid_gap = ((shape.centroid_to_ball_yards - 14.0) / 30.0).clamp(0.0, 1.0);
     let spread_gap = ((shape.spread_yards - 18.0) / 22.0).clamp(0.0, 1.0);
     let retreating_shape = (-shape.forward_velocity_yps / 5.0).clamp(0.0, 1.0);
-    (near_ball_shortage * 0.42 + centroid_gap * 0.30 + spread_gap * 0.20 + retreating_shape * 0.08)
+    (near_ball_shortage * 0.52 + centroid_gap * 0.26 + spread_gap * 0.16 + retreating_shape * 0.06)
         .clamp(0.0, 1.0)
 }
 
-const OPEN_SUPPORT_OUTLET_RADIUS_YARDS: f64 = 24.0;
+const OPEN_SUPPORT_OUTLET_RADIUS_YARDS: f64 = 18.0;
 
 fn open_support_outlet_count(
     snapshot: &WorldSnapshot,
@@ -20039,7 +20043,7 @@ fn holder_pressure_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
         OPEN_SUPPORT_OUTLET_RADIUS_YARDS,
     );
     let open_outlet_shortage = ((3.0 - open_outlets as f64) / 3.0).clamp(0.0, 1.0);
-    (pressure * 0.50 + crowding * 0.28 + open_outlet_shortage * 0.22).clamp(0.0, 1.0)
+    (pressure * 0.42 + crowding * 0.24 + open_outlet_shortage * 0.34).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43746,7 +43750,13 @@ fn goal_attack_window_score_for_role(
     }
 
     let mut distance_fit = ((window_yards - yards_to_goal) / window_yards).clamp(0.0, 1.0);
-    if role == PlayerRole::Forward && yards_to_goal <= tunables().shooting.striker_shot_window_yards {
+    if role == PlayerRole::Forward
+        && yards_to_goal
+            <= tunables()
+                .shooting
+                .striker_shot_window_yards
+                .min(SPECULATIVE_LONG_SHOT_MAX_YARDS)
+    {
         distance_fit = distance_fit.max(0.30);
     }
     if yards_to_goal <= TEAMMATE_MUST_SHOOT_YARDS {
@@ -43779,7 +43789,7 @@ fn goal_attack_window_score_for_role(
 }
 
 fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
-    if !observation.shot_lane_open {
+    if !observation.shot_lane_open || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
         return false;
     }
     let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
@@ -43801,6 +43811,9 @@ fn shot_decision_is_qualified_for_role(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> bool {
+    if observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+        return false;
+    }
     shot_decision_is_qualified(observation)
         || attacking_goal_pressure_shot_is_qualified(observation, role)
         || clean_twenty_yard_shot_is_qualified(observation, role)
@@ -43812,7 +43825,10 @@ fn attacking_goal_pressure_shot_is_qualified(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> bool {
-    if role == PlayerRole::Goalkeeper || !observation.shot_lane_open {
+    if role == PlayerRole::Goalkeeper
+        || !observation.shot_lane_open
+        || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS
+    {
         return false;
     }
     observation.yards_to_goal <= ATTACKING_GOAL_PRESSURE_SHOT_YARDS
@@ -43861,8 +43877,8 @@ fn speculative_long_shot_is_qualified(
     if !(TEAMMATE_MUST_SHOOT_YARDS..=SPECULATIVE_LONG_SHOT_MAX_YARDS).contains(&distance) {
         return false;
     }
-    // Distance discipline: 25 yds is fine; ~30 yds is only on if the keeper is out of
-    // position; ~33+ yds is only on if the keeper is totally out of position.
+    // Distance discipline: 20+ yds is discouraged, 26-30 yds only opens up when
+    // the keeper is stranded, and >30 yds is blocked by the range guard above.
     let keeper_out = observation
         .opposing_goalkeeper_out_of_position
         .clamp(0.0, 1.0);
@@ -44121,7 +44137,11 @@ fn striker_shot_window_is_qualified(
         return false;
     }
     let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
-    observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards
+    let striker_window_yards = tunables()
+        .shooting
+        .striker_shot_window_yards
+        .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
+    observation.yards_to_goal <= striker_window_yards
         && observation.shot_lane_open
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
@@ -44219,7 +44239,10 @@ fn striker_legal_shot_attempt_bonus(observation: &SoccerPomdpObservation, role: 
         return 0.0;
     }
     let window_yards = if role == PlayerRole::Forward {
-        tunables().shooting.striker_shot_window_yards
+        tunables()
+            .shooting
+            .striker_shot_window_yards
+            .min(SPECULATIVE_LONG_SHOT_MAX_YARDS)
     } else {
         TEAMMATE_MUST_SHOOT_YARDS
     };
@@ -44262,7 +44285,10 @@ fn near_goal_shot_pressure_floor(
         return 0.0;
     }
     let window_yards = match role {
-        PlayerRole::Forward => tunables().shooting.striker_shot_window_yards,
+        PlayerRole::Forward => tunables()
+            .shooting
+            .striker_shot_window_yards
+            .min(SPECULATIVE_LONG_SHOT_MAX_YARDS),
         PlayerRole::Midfielder | PlayerRole::Defender => TEAMMATE_MUST_SHOOT_YARDS,
         PlayerRole::Goalkeeper => return 0.0,
     };
@@ -44839,13 +44865,17 @@ fn close_clear_shot_attempt_probability(
         return 0.0;
     }
     let (window_yards, ramp_yards) = match role {
-        PlayerRole::Forward => (tunables().shooting.striker_shot_window_yards, 18.0),
+        PlayerRole::Forward => (
+            tunables()
+                .shooting
+                .striker_shot_window_yards
+                .min(SPECULATIVE_LONG_SHOT_MAX_YARDS),
+            18.0,
+        ),
         _ => (TEAMMATE_MUST_SHOOT_YARDS, 16.0),
     };
     let mut close_fit = ((window_yards - observation.yards_to_goal) / ramp_yards).clamp(0.0, 1.0);
-    if role == PlayerRole::Forward
-        && observation.yards_to_goal <= tunables().shooting.striker_shot_window_yards
-    {
+    if role == PlayerRole::Forward && observation.yards_to_goal <= window_yards {
         close_fit = close_fit.max(0.24);
     }
     if striker_must_shoot(observation, role) {
@@ -44876,7 +44906,10 @@ fn close_clear_shot_attempt_probability(
         PlayerRole::Goalkeeper => 0.0,
     };
     let striker_window_bonus = if role == PlayerRole::Forward {
-        let striker_shot_window_yards = tunables().shooting.striker_shot_window_yards;
+        let striker_shot_window_yards = tunables()
+            .shooting
+            .striker_shot_window_yards
+            .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
         let window_fit = ((striker_shot_window_yards - observation.yards_to_goal)
             / (striker_shot_window_yards - STRIKER_MUST_SHOOT_YARDS).max(1e-6))
         .clamp(0.0, 1.0);
@@ -46782,15 +46815,20 @@ fn aerial_interception_multiplier(pass: &PendingPass, ball_position: Vec2) -> f6
 // driven by gravity over TIME, exactly like every other bit of motion in the sim.
 const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
+fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
+    let distance_fit = ((distance_yards.max(0.0) - 4.0) / 10.0).clamp(0.0, 1.0);
+    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.35 + unit.clamp(0.0, 1.0) * 0.55)
+        .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
+}
+
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
-        // A scoop LOOPS high despite being short and slow — that steep loft drops it over the
-        // close defender's head. Apex UNIFORM in 9-15ft (3-5yd), seeded per-pass from the
-        // launch tick so it's stable across the flight but varies shot to shot.
+        // A scoop pops over a close foot, not into a hanging balloon arc. Keep it low
+        // (roughly 4-7ft) with a little stable per-pass variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
-        3.0 + unit * 2.0
+        scoop_loft_apex_yards(pass.distance_yards, unit)
     } else {
         // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
         // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
@@ -46986,10 +47024,10 @@ fn shot_speed_yps_from_power(power: f64, skills: &SkillProfile) -> f64 {
     );
     let strength = ability01(skills.strength);
     let technique_power = (shooting * 0.42 + foot_power * 0.40 + strength * 0.18).clamp(0.0, 1.0);
-    // A real shot on goal travels 40-60mph: even a placed/low-power shot leaves the boot at ~40,
-    // and a full-power strike from a powerful technique reaches 60. (Below this is a pass/poke,
+    // A real shot on goal travels 40-70mph: even a placed/low-power shot leaves the boot at ~40,
+    // and a full-power strike from a powerful technique reaches 70. (Below this is a pass/poke,
     // handled elsewhere — this is the SHOT speed.)
-    let mph = SHOT_MIN_SPEED_MPH + power.clamp(0.0, 1.0) * (8.0 + technique_power * 12.0);
+    let mph = SHOT_MIN_SPEED_MPH + power.clamp(0.0, 1.0) * (12.0 + technique_power * 18.0);
     mph_to_yps(mph.clamp(SHOT_MIN_SPEED_MPH, SHOT_MAX_SPEED_MPH))
 }
 
@@ -47011,11 +47049,10 @@ fn pass_speed_yps_from_power(
     is_cross: bool,
     skills: &SkillProfile,
 ) -> f64 {
-    // A scoop is a delicate dink: ~10mph horizontally, independent of power (the floor of a
-    // normal aerial is ~19mph, so a scoop simply cannot be expressed as one). A touch of
-    // skill-based variation keeps it lively but it stays slow.
+    // A scoop is a low, short dink over a close defender: slower than a driven aerial but
+    // not a balloon. Gravity calibration below still decides the final launch speed.
     if flight.is_scoop() {
-        return mph_to_yps(9.0 + ability01(skills.flair_passing) * 3.0);
+        return mph_to_yps(SCOOP_MIN_SPEED_MPH + ability01(skills.flair_passing) * 4.0);
     }
     let passing = ability01(skills.passing_completion_rate);
     let crossing = ability01(skills.crossing_left.max(skills.crossing_right));
@@ -47399,14 +47436,23 @@ fn modulated_pass_speed_yps(
     receiver_openness: f64,
     _rng: &mut SeededRandom,
 ) -> f64 {
-    // A scoop keeps its slow fixed launch speed — distance-calibration would speed it back
-    // up to a normal lofted pass and defeat the purpose (a gentle dink over a close defender).
-    if flight.is_scoop() {
-        return raw_speed_yps;
-    }
     let distance = from.distance(target).max(0.1);
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
+    if flight.is_scoop() {
+        // Low scoop calibration: the apex is only around head height, so it must be
+        // struck firmly enough to land near the target during that short hang time.
+        let apex_yards = scoop_loft_apex_yards(distance, 0.5);
+        let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
+        let land_at_target =
+            (distance / hang_time.max(0.35)) * SCOOP_LAND_AT_TARGET_DRAG_COMP;
+        let pressure_firm = 1.0 + pressure * 0.08 - openness * 0.03;
+        let desired_speed = land_at_target * pressure_firm;
+        let skill = passing_skill.clamp(0.0, 1.0);
+        let fit = (0.55 + skill * 0.30 + openness * 0.08).clamp(0.55, 0.93);
+        return (raw_speed_yps + (desired_speed - raw_speed_yps) * fit)
+            .clamp(mph_to_yps(SCOOP_MIN_SPEED_MPH), mph_to_yps(SCOOP_MAX_SPEED_MPH));
+    }
     if flight.is_aerial() {
         // Aerial flight calibration ("the MPC should help"): the ball is a projectile aloft for a
         // gravity-fixed hang time T = 2·√(2·apex/g), where the apex scales with distance (see

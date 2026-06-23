@@ -9316,19 +9316,24 @@ impl SoccerMatch {
                     // A ball with no resolved receiver ("to nobody in particular") is only a
                     // legitimate delivery into space when it is genuinely FORWARD and LONG —
                     // within ~70° of the line to the opponent's goal and more than ~25yd. A
-                    // shorter or lateral/backward ball aimed at no one is a giveaway, so the
-                    // carrier keeps possession (turning to face the intended line) and re-decides
-                    // next tick rather than launching it nowhere. Restart takers are exempt — the
-                    // restart rules govern their release (a clear long is forward by construction).
+                    // shorter/lateral/backward ball, or a fallback point the opponent visibly owns,
+                    // is a giveaway, so the carrier keeps possession (turning to face the intended
+                    // line) and re-decides next tick rather than launching it nowhere. Restart takers
+                    // are exempt — the restart rules govern their release.
+                    let no_target_release_is_legal = pass_to_nobody_is_legal(
+                        player_pos,
+                        led_target,
+                        player_team,
+                        self.config.field_width_yards,
+                        self.config.field_length_yards,
+                    ) && !snapshot.no_target_pass_point_directly_favors_opponent(
+                        player_team,
+                        player_id,
+                        led_target,
+                    );
                     if target_id.is_none()
                         && self.restart_double_touch_guard != Some(player_id)
-                        && !pass_to_nobody_is_legal(
-                            player_pos,
-                            led_target,
-                            player_team,
-                            self.config.field_width_yards,
-                            self.config.field_length_yards,
-                        )
+                        && !no_target_release_is_legal
                     {
                         let look = led_target - player_pos;
                         if look.len() > 1e-6 {
@@ -9465,53 +9470,46 @@ impl SoccerMatch {
                         self.config.field_width_yards,
                         self.config.field_length_yards,
                     );
-                    if !flight.is_aerial() {
-                        if let Some(receiver_position) =
-                            target_id.and_then(|target| {
-                                self.players
-                                    .iter()
-                                    .find(|player| {
-                                        player.id == target && player.team == player_team
-                                    })
-                                    .map(|player| player.position)
-                            })
+                    if let Some(receiver_position) = target_id.and_then(|target| {
+                        self.players
+                            .iter()
+                            .find(|player| player.id == target && player.team == player_team)
+                            .map(|player| player.position)
+                    }) {
+                        let aimed_risk = snapshot.pass_point_direct_opponent_control_risk(
+                            player_team,
+                            receiver_position,
+                            player_pos,
+                            aimed_target,
+                            speed,
+                        );
+                        let led_risk = snapshot.pass_point_direct_opponent_control_risk(
+                            player_team,
+                            receiver_position,
+                            player_pos,
+                            led_target,
+                            speed,
+                        );
+                        let receiver_risk = snapshot.pass_point_direct_opponent_control_risk(
+                            player_team,
+                            receiver_position,
+                            player_pos,
+                            receiver_position,
+                            speed,
+                        );
+                        let safer_release_risk = led_risk.min(receiver_risk);
+                        if aimed_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
+                            || aimed_risk
+                                >= safer_release_risk
+                                    + PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN
                         {
-                            let aimed_risk = snapshot.pass_point_direct_opponent_control_risk(
-                                player_team,
-                                receiver_position,
-                                player_pos,
-                                aimed_target,
-                                speed,
-                            );
-                            let led_risk = snapshot.pass_point_direct_opponent_control_risk(
-                                player_team,
-                                receiver_position,
-                                player_pos,
-                                led_target,
-                                speed,
-                            );
-                            let receiver_risk = snapshot.pass_point_direct_opponent_control_risk(
-                                player_team,
-                                receiver_position,
-                                player_pos,
-                                receiver_position,
-                                speed,
-                            );
-                            let safer_release_risk = led_risk.min(receiver_risk);
-                            if aimed_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
-                                || aimed_risk
-                                    >= safer_release_risk
-                                        + PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN
-                            {
-                                aimed_target = if led_risk < aimed_risk && led_risk <= receiver_risk
-                                {
-                                    led_target
-                                } else if receiver_risk < aimed_risk {
-                                    receiver_position
-                                } else {
-                                    aimed_target
-                                };
-                            }
+                            aimed_target = if led_risk < aimed_risk && led_risk <= receiver_risk {
+                                led_target
+                            } else if receiver_risk < aimed_risk {
+                                receiver_position
+                            } else {
+                                aimed_target
+                            };
                         }
                     }
                     let pass_curl_probability = pass_curl_probability_for_player(
@@ -22808,6 +22806,17 @@ impl WorldSnapshot {
                 };
                 let reception_teammate_penalty =
                     self.teammate_occupied_space_penalty_at(me.team, pass_point, Some(p.id), 0.0);
+                let score_nominal_speed =
+                    pass_speed_yps_from_power(0.68, PassFlight::Aerial, is_cross, &me.skills);
+                let direct_opponent_control_risk = self.pass_point_direct_opponent_control_risk(
+                    me.team,
+                    position,
+                    me_position,
+                    pass_point,
+                    score_nominal_speed,
+                );
+                let direct_opponent_aim_penalty =
+                    PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * direct_opponent_control_risk;
                 let keeper_distribution_bonus = if me.role == PlayerRole::Goalkeeper {
                     goalkeeper_distribution_score(
                         me.team,
@@ -22861,6 +22870,7 @@ impl WorldSnapshot {
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
                     - lateral_penalty
+                    - direct_opponent_aim_penalty
                     - reception_teammate_penalty;
                 (p.id, score)
             })

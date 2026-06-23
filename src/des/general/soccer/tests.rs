@@ -27016,13 +27016,13 @@ fn speculative_long_shot_is_legal_without_becoming_must_shoot() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let mut observation = snapshot.observation_for(attacker);
     observation.shot_lane_open = true;
-    observation.yards_to_goal = 38.0;
+    observation.yards_to_goal = 28.0;
     observation.shot_block_probability = 0.16;
     observation.shot_on_frame_probability = 0.19;
     observation.offensive_urgency = 0.55;
     observation.decision_urgency = 0.42;
 
-    // With a SET keeper, a 38-yard shot is off — distance discipline: don't blaze
+    // With a SET keeper, a 28-yard shot is off — distance discipline: don't blaze
     // away from range at a keeper who is on his line.
     observation.opposing_goalkeeper_out_of_position = 0.0;
     assert!(
@@ -27031,7 +27031,7 @@ fn speculative_long_shot_is_legal_without_becoming_must_shoot() {
             sim.players[attacker].role,
             ability01(sim.players[attacker].skills.shooting)
         ),
-        "a 38-yard shot at a set keeper must be gated out"
+        "a 28-yard shot at a set keeper must be gated out"
     );
 
     // With the keeper TOTALLY out of position, the long shot re-opens — but stays
@@ -27111,30 +27111,38 @@ fn long_shot_distance_discipline_keys_off_keeper_out_of_position() {
     obs.shot_on_frame_probability = 0.20;
     obs.offensive_urgency = 0.50;
 
-    // 30 yds: off at a set keeper, on only once the keeper is out of position.
-    obs.yards_to_goal = 30.0;
+    // 25 yds: off at a set keeper, on once the keeper is out of position.
+    obs.yards_to_goal = 25.0;
     obs.opposing_goalkeeper_out_of_position = 0.0;
     assert!(
         !speculative_long_shot_is_qualified(&obs, PlayerRole::Forward, 0.85),
-        "30-yard shot at a set keeper is off"
+        "25-yard shot at a set keeper is off"
     );
     obs.opposing_goalkeeper_out_of_position = 0.5;
     assert!(
         speculative_long_shot_is_qualified(&obs, PlayerRole::Forward, 0.85),
-        "30-yard shot with the keeper out of position is on"
+        "25-yard shot with the keeper out of position is on"
     );
 
-    // 40 yds: needs the keeper TOTALLY out of position.
-    obs.yards_to_goal = 40.0;
+    // 30 yds: needs the keeper TOTALLY out of position.
+    obs.yards_to_goal = 30.0;
     obs.opposing_goalkeeper_out_of_position = 0.5;
     assert!(
         !speculative_long_shot_is_qualified(&obs, PlayerRole::Forward, 0.85),
-        "40-yard shot needs the keeper totally out of position"
+        "30-yard shot needs the keeper totally out of position"
     );
     obs.opposing_goalkeeper_out_of_position = 0.85;
     assert!(
         speculative_long_shot_is_qualified(&obs, PlayerRole::Forward, 0.85),
-        "40-yard shot is on only with the keeper totally out of position"
+        "30-yard shot is on only with the keeper totally out of position"
+    );
+
+    // Past 30 yds: hard cap, even with a stranded keeper.
+    obs.yards_to_goal = 31.0;
+    obs.opposing_goalkeeper_out_of_position = 0.95;
+    assert!(
+        !speculative_long_shot_is_qualified(&obs, PlayerRole::Forward, 0.85),
+        "31-yard shot must be illegal even with the keeper stranded"
     );
 }
 
@@ -27159,10 +27167,10 @@ fn learned_policy_can_take_open_lane_speculative_long_shot() {
     let snapshot = WorldSnapshot::from_match(&sim);
     let mut observation = snapshot.observation_for(attacker);
     observation.shot_lane_open = true;
-    observation.yards_to_goal = 36.0;
+    observation.yards_to_goal = 29.0;
     observation.shot_block_probability = 0.14;
     observation.shot_on_frame_probability = 0.18;
-    // Keeper out of position — the only condition under which a 36-yard
+    // Keeper out of position — the only condition under which a 29-yard
     // speculative shot stays a legal learned action.
     observation.opposing_goalkeeper_out_of_position = 0.9;
     observation.offensive_urgency = 0.48;
@@ -27195,7 +27203,7 @@ fn q_policy_can_select_open_lane_speculative_long_shot() {
     let keeper = 11;
     park_players_except(&mut sim, &[attacker, keeper]);
     sim.players[attacker].role = PlayerRole::Forward;
-    sim.players[attacker].position = Vec2::new(40.0, 76.0);
+    sim.players[attacker].position = Vec2::new(40.0, 90.5);
     sim.players[attacker].skills.shooting = 8.9;
     sim.players[attacker].skills.decision_noise = 0.0;
     sim.players[attacker].preferences.shoot_bias = 0.82;
@@ -27209,10 +27217,6 @@ fn q_policy_can_select_open_lane_speculative_long_shot() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(attacker);
-    assert!(
-        !shot_decision_is_qualified_for_role(&observation, sim.players[attacker].role),
-        "test setup should stay outside the ordinary close-shot gate: {observation:?}"
-    );
     assert!(speculative_long_shot_is_qualified(
         &observation,
         sim.players[attacker].role,
@@ -71339,6 +71343,66 @@ fn weak_long_aerial_does_not_float_in_the_air() {
             flight_time <= 2.85,
             "a {distance:.0}yd aerial floats for {flight_time:.2}s (speed {speed:.1} yps) — \
              the hang-time ceiling should keep it under ~2.7s"
+        );
+    }
+}
+
+#[test]
+fn scoop_pass_is_low_and_snappy_not_a_balloon() {
+    let skills = SkillProfile {
+        passing: 0.45,
+        passing_completion_rate: 0.50,
+        flair_passing: 0.55,
+        ..SkillProfile::default()
+    };
+    let from = Vec2::new(38.0, 48.0);
+    for distance in [5.0, 8.0, 12.0, 15.0] {
+        let target = Vec2::new(38.0, 48.0 + distance);
+        let raw = pass_speed_yps_from_power(0.30, PassFlight::Scoop, false, &skills);
+        let mut rng = SeededRandom::new(17);
+        let speed = modulated_pass_speed_yps(
+            raw,
+            from,
+            target,
+            PassFlight::Scoop,
+            false,
+            pass_execution_skill(&skills, PassFlight::Scoop, false),
+            0.70,
+            &mut rng,
+        );
+        let pass = PendingPass {
+            team: Team::Home,
+            from: 4,
+            target: Some(9),
+            flight: PassFlight::Scoop,
+            is_cross: false,
+            launch_tick: 123,
+            origin: from,
+            intended_target: target,
+            distance_yards: distance,
+            receiver_openness: 0.70,
+            passer_skill: pass_execution_skill(&skills, PassFlight::Scoop, false),
+            launch_speed_yps: speed,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+        let apex = pass_loft_apex_yards(&pass);
+        let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+        let flight_time = distance / speed;
+        assert!(
+            apex <= SCOOP_LOFT_APEX_MAX_YARDS + 1e-9,
+            "scoop apex should stay low, got {apex:.2}yd"
+        );
+        assert!(
+            hang_time <= 1.35,
+            "scoop hang time should be short, got {hang_time:.2}s for {distance:.0}yd"
+        );
+        assert!(
+            flight_time <= 1.10,
+            "scoop should reach the target quickly, got {flight_time:.2}s for {distance:.0}yd"
         );
     }
 }

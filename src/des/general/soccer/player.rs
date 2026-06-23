@@ -3512,6 +3512,9 @@ impl PlayerAgent {
             roam_weight =
                 (roam_weight + directive.flank_overlap_run_probability * 0.18).clamp(0.10, 0.72);
         }
+        if holder_pressure_urgency >= 0.22 {
+            roam_weight = (roam_weight + holder_pressure_urgency * 0.22).clamp(0.10, 0.76);
+        }
         let special_targets = SupportSpecialTargets {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
