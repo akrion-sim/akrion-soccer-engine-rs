@@ -623,6 +623,7 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
         ("targetScale", config.target_scale),
         ("targetClip", config.target_clip),
         ("criticBaselineWeight", config.critic_baseline_weight),
+        ("mappoTeamRewardShare", config.mappo_team_reward_share),
     ] {
         if !value.is_finite() {
             return Err(format!("{name} must be finite"));
@@ -679,6 +680,11 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
     if !(0.0..=1.0).contains(&config.critic_baseline_weight) {
         return Err(
             "criticBaselineWeight must be in [0, 1] when neural learning is enabled".to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&config.mappo_team_reward_share) {
+        return Err(
+            "mappoTeamRewardShare must be in [0, 1] when neural learning is enabled".to_string(),
         );
     }
     Ok(())
@@ -5464,6 +5470,39 @@ mod tests {
             .expect_err("negative neural target scale should fail fast");
 
         assert!(err.contains("targetScale"), "{err}");
+    }
+
+    #[test]
+    fn learning_run_validator_bounds_mappo_team_reward_share() {
+        // Default (0.0) is the individual-reward objective and must validate.
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        assert_eq!(neural.mappo_team_reward_share, 0.0);
+        validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect("default mappo team-reward share should be valid");
+
+        // A fully shared team reward (1.0) is the cooperative-MARL extreme and is allowed.
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            mappo_team_reward_share: 1.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect("fully shared team reward should be valid");
+
+        // Out of [0, 1] must fail fast rather than silently clamp.
+        for bad in [-0.1, 1.5] {
+            let neural = SoccerNeuralLearningConfig {
+                enabled: true,
+                mappo_team_reward_share: bad,
+                ..SoccerNeuralLearningConfig::default()
+            };
+            let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+                .expect_err("out-of-range mappo team-reward share should fail fast");
+            assert!(err.contains("mappoTeamRewardShare"), "{err}");
+        }
     }
 
     #[test]

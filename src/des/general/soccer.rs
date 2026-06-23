@@ -12578,6 +12578,17 @@ pub struct SoccerNeuralLearningConfig {
     /// units differ from the per-tick centered reward.
     #[serde(default)]
     pub critic_baseline_weight: f64,
+    /// **MAPPO cooperative-credit share**: how much each agent's policy-gradient
+    /// reward is replaced by its *team's* per-tick mean reward, before the
+    /// existing zero-sum opponent centering. `0.0` (the default) is the fully
+    /// individual-reward objective — byte-identical to the pre-MAPPO trainer.
+    /// At `w` the per-transition reward becomes `(1-w)·rᵢ + w·r̄_team`, so a
+    /// player begins optimising the shared team return (the centralized-critic
+    /// advantage in `neural_policy_training_samples` then credits a teammate's
+    /// later goal back to the off-ball work that set it up). `1.0` is a fully
+    /// shared team reward (classic cooperative MARL). Clamped to `[0, 1]`.
+    #[serde(default)]
+    pub mappo_team_reward_share: f64,
 }
 
 impl Default for SoccerNeuralLearningConfig {
@@ -12598,6 +12609,7 @@ impl Default for SoccerNeuralLearningConfig {
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
+            mappo_team_reward_share: 0.0,
         }
     }
 }
@@ -12632,6 +12644,16 @@ impl SoccerNeuralLearningConfig {
     fn sanitized_critic_baseline_weight(&self) -> f64 {
         if self.critic_baseline_weight.is_finite() {
             self.critic_baseline_weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// MAPPO team-reward share, clamped to `[0, 1]`; a non-finite value falls
+    /// back to the individual-reward objective (`0.0`).
+    fn sanitized_mappo_team_reward_share(&self) -> f64 {
+        if self.mappo_team_reward_share.is_finite() {
+            self.mappo_team_reward_share.clamp(0.0, 1.0)
         } else {
             0.0
         }
