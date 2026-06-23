@@ -22691,6 +22691,17 @@ impl WorldSnapshot {
                 } else {
                     (PassFlight::Floor, 0.18)
                 };
+                // A killer ball threads RISK into space (that race is priced into the score, not
+                // hidden), but it must never be a gross concession — the ball arriving at an
+                // opponent's feet, or forced into a tightly-marked man the passer can see. The
+                // generic ranker/selector enforce this for ordinary passes; the threaded pool is
+                // un-gated, so re-apply the same perception-gated concede veto here. A runner
+                // breaking into clear space has no opponent within the mark radius of the
+                // reception, so genuine killer balls are untouched; only a pass landing on a
+                // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                if self.pass_target_concedes_to_perceived_opponent(player_id, target_id, flight) {
+                    return None;
+                }
                 // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
                 // lane-interception-risk gate crush its completion below the floor below (which
                 // would hide the option). Risk is priced into the killer-pass score instead.
