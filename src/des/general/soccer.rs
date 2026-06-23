@@ -478,6 +478,35 @@ const OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS: f64 = 4.5;
 const OPEN_LANE_DRIBBLE_BASE_APPETITE: f64 = 0.62;
 const OPEN_LANE_DRIBBLE_MAX_APPETITE: f64 = 1.20;
 const OPEN_LANE_DRIBBLE_UPFIELD_APPETITE_BONUS: f64 = 0.40;
+// --- "Round the keeper" ---
+// Sibling of the open-passing-lane carry, but the blocked lane is the SHOT and the blocker is the
+// goalkeeper: when the carrier is in range but the keeper is covering the shot, a short quick carry
+// CLOSER to goal (and around the keeper's angle) opens a clear strike — better than blazing a long
+// shot the keeper saves. Default ON; disable with `DD_SOCCER_DISABLE_ROUND_THE_KEEPER`. Offered only
+// in its window (keeper-blocked shot + a closer spot with a clear strike), so a disabled /
+// out-of-window match is byte-identical on the deterministic on-ball path.
+// Only fires when the goal is this near-to-mid range — we are trying to get a CLOSE shot, not a
+// long one; below the min it is already point-blank (just shoot).
+const ROUND_KEEPER_MIN_GOAL_YARDS: f64 = 6.0;
+const ROUND_KEEPER_MAX_START_YARDS: f64 = 30.0;
+// The direct best-placed shot counts as keeper-BLOCKED at/above this save probability (worth
+// rounding); a candidate spot counts as a CLEAR strike at/below the lower threshold (keeper beaten).
+const ROUND_KEEPER_BLOCKED_SAVE_THRESHOLD: f64 = 0.55;
+const ROUND_KEEPER_CLEAR_SAVE_THRESHOLD: f64 = 0.34;
+// Candidate carry step sizes (yards), smallest first — the least carry that opens a clear strike is
+// chosen. Up to 8yd so the carrier can get past an onrushing keeper to a tap-in angle.
+const ROUND_KEEPER_STEP_YARDS: [f64; 6] = [2.0, 3.5, 5.0, 6.5, 7.5, 8.0];
+// A step is rejected if it would carry straight onto a defender / the keeper (needs this much space).
+const ROUND_KEEPER_MIN_SPOT_SPACE_YARDS: f64 = 1.4;
+// Sprint (vs run) when under very high pressure OR the keeper/nearest defender is closing quickly —
+// burst around them before they smother the angle.
+const ROUND_KEEPER_SPRINT_PRESSURE: f64 = 0.55;
+const ROUND_KEEPER_SPRINT_TRACK_YPS: f64 = 4.0;
+// Decision (MDP/POMDP) appetite: a strong option (it converts a low-percentage long shot into a
+// close clear strike), lifted by how blocked the current shot is and how much closer the clear spot
+// is, capped so it does not override an already-clear close shot.
+const ROUND_KEEPER_BASE_APPETITE: f64 = 0.85;
+const ROUND_KEEPER_MAX_APPETITE: f64 = 1.80;
 /// Below this tangential speed (yps) a `xavi-turn` carrier is treated as not yet wheeling, so
 /// the wheel sense is seeded from geometry rather than from its (negligible) momentum.
 const XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS: f64 = 0.5;
@@ -43575,6 +43604,12 @@ fn dd_soccer_disable_dribble_open_lane() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE").is_ok())
+}
+
+fn dd_soccer_disable_round_the_keeper() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ROUND_THE_KEEPER").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on

@@ -1072,6 +1072,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
+            | "round-the-keeper"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1623,6 +1624,7 @@ fn mpc_execution_estimate_for_action(
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
+            | "round-the-keeper"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1766,6 +1768,12 @@ fn mpc_execution_estimate_for_action(
                 // A short carry into a clear, opponent-free spot (chosen to have space) — inherently
                 // feasible; scales with control + the space at the spot, lightly damped by pressure.
                 (0.46 + dribble_skill * 0.26 + target_space_fit * 0.18 - pressure * 0.12)
+                    .clamp(0.18, 0.97)
+            }
+            "round-the-keeper" => {
+                // A short carry to a closer spot with a clear strike past the keeper — feasible;
+                // scales with control + the space at the spot, lightly damped by pressure.
+                (0.48 + dribble_skill * 0.24 + target_space_fit * 0.18 - pressure * 0.10)
                     .clamp(0.18, 0.97)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
@@ -7091,6 +7099,43 @@ impl PlayerAgent {
                 }
                 open_lane_offered = true;
             }
+            // ROUND THE KEEPER: when the goalkeeper is covering the shot, a short carry closer to
+            // goal (and around the keeper's angle) opens a clear strike — offered in that window so
+            // the carrier dribbles in for a high-percentage shot instead of blazing from distance.
+            let round_the_keeper = if self.role != PlayerRole::Goalkeeper {
+                snapshot.dribble_round_the_keeper_for(self.id)
+            } else {
+                None
+            };
+            let mut round_the_keeper_offered = false;
+            if round_the_keeper.is_some() {
+                let press = observation
+                    .perceived_pressure
+                    .max(observation.pressure_urgency)
+                    .clamp(0.0, 1.0);
+                // Worth more the closer to goal (the clear strike is the prize) and under pressure.
+                let proximity = (1.0
+                    - (observation.yards_to_goal / ROUND_KEEPER_MAX_START_YARDS).clamp(0.0, 1.0))
+                    .clamp(0.0, 1.0);
+                let appetite = (ROUND_KEEPER_BASE_APPETITE
+                    * self.preferences.dribble_bias.clamp(0.5, 1.3)
+                    * (0.6 + proximity * 0.7 + press * 0.3))
+                    .clamp(0.0, ROUND_KEEPER_MAX_APPETITE);
+                if let Some(option) = action_options
+                    .iter_mut()
+                    .find(|option| option.label == "round-the-keeper")
+                {
+                    option.legal = true;
+                    option.score = option.score.max(appetite);
+                } else {
+                    action_options.push(AgentActionOptionTrace::new(
+                        "round-the-keeper",
+                        appetite,
+                        true,
+                    ));
+                }
+                round_the_keeper_offered = true;
+            }
             let mut xavi_turn_offered = false;
             if snapshot.xavi_turn_enabled
                 && self.role != PlayerRole::Goalkeeper
@@ -7276,6 +7321,12 @@ impl PlayerAgent {
                 weighted_ops.push((
                     "open-passing-lane".to_string(),
                     action_option_score(&action_options, "open-passing-lane"),
+                ));
+            }
+            if round_the_keeper_offered {
+                weighted_ops.push((
+                    "round-the-keeper".to_string(),
+                    action_option_score(&action_options, "round-the-keeper"),
                 ));
             }
             for rank in 0..pass_targets.len() {
@@ -7521,6 +7572,36 @@ impl PlayerAgent {
                                         touch,
                                     },
                                     "open-passing-lane".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "round-the-keeper" => {
+                        order_names.push("round-the-keeper".to_string());
+                        let round_chance =
+                            action_option_score(&action_options, "round-the-keeper");
+                        if let Some((spot, sprint_flag)) = round_the_keeper {
+                            if agentic_action_commitment(
+                                round_chance,
+                                snapshot.dt_seconds,
+                                &observation,
+                                self.role,
+                            ) {
+                                // Carry closer to goal, around the keeper, to a spot with a clear
+                                // strike (then shoot once there); driven by the per-player MPC like
+                                // any dribble. Sprint per the maneuver's own decision.
+                                let kind = DribbleMoveKind::CarryForward;
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
+                                open_lane_sprint = Some(sprint_flag);
+                                chosen = Some((
+                                    SoccerAction::DribbleMove {
+                                        target: spot,
+                                        kind,
+                                        touch,
+                                    },
+                                    "round-the-keeper".to_string(),
                                 ));
                                 break;
                             }

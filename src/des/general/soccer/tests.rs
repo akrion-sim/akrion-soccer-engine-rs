@@ -1404,6 +1404,78 @@ fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
 }
 
 #[test]
+fn round_the_keeper_reads_the_save_lane_and_respects_the_range_gate() {
+    // "Round the keeper": offered when the goalkeeper is covering the shot — dribble closer + off
+    // the keeper's angle for a clear strike rather than a long shot the keeper saves. The save read
+    // must respond to the keeper's position, and the maneuver only fires in close-to-mid range.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 31_001,
+        ..Default::default()
+    });
+    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let goal_center_x = sim.config.field_width_yards * 0.5;
+    let keeper_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away keeper exists");
+    let shooter_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("home forward exists");
+    let shooter_pos = Vec2::new(goal_center_x, goal_y - 20.0);
+    {
+        let shooter = sim.players.iter_mut().find(|p| p.id == shooter_id).unwrap();
+        shooter.position = shooter_pos;
+        shooter.skills.shooting = 8.0;
+    }
+    sim.ball.holder = Some(shooter_id);
+    sim.ball.position = shooter_pos;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let shot_speed = shot_speed_yps_from_power(
+        0.85,
+        &sim.players.iter().find(|p| p.id == shooter_id).unwrap().skills,
+    );
+    let skill = ability01(8.0);
+
+    // A keeper covering the centre saves MORE of the best-placed shot than one pulled to a post
+    // (which leaves the far side open) — the read the maneuver keys on.
+    sim.players.iter_mut().find(|p| p.id == keeper_id).unwrap().position =
+        Vec2::new(goal_center_x, goal_y - 7.0);
+    let covered = WorldSnapshot::from_match(&sim);
+    let save_covered = covered
+        .best_shot_save_probability_from(Team::Home, shooter_pos, shot_speed, skill)
+        .expect("keeper present");
+    sim.players.iter_mut().find(|p| p.id == keeper_id).unwrap().position =
+        Vec2::new(goal_center_x - 12.0, goal_y - 7.0);
+    let exposed = WorldSnapshot::from_match(&sim);
+    let save_exposed = exposed
+        .best_shot_save_probability_from(Team::Home, shooter_pos, shot_speed, skill)
+        .expect("keeper present");
+    assert!((0.0..=1.0).contains(&save_covered) && (0.0..=1.0).contains(&save_exposed));
+    assert!(
+        save_covered > save_exposed,
+        "a centrally-covering keeper saves more than one pulled to a post: covered={save_covered} exposed={save_exposed}"
+    );
+
+    // Out of range (~70yd from goal) -> the maneuver is never offered (it is for close shots).
+    {
+        let shooter = sim.players.iter_mut().find(|p| p.id == shooter_id).unwrap();
+        shooter.position = Vec2::new(goal_center_x, goal_y - 70.0);
+    }
+    sim.ball.position = Vec2::new(goal_center_x, goal_y - 70.0);
+    let far = WorldSnapshot::from_match(&sim);
+    assert!(
+        far.dribble_round_the_keeper_for(shooter_id).is_none(),
+        "round-the-keeper should not fire from ~70yd out"
+    );
+}
+
+#[test]
 fn scored_shot_placement_aims_at_the_keepers_open_side() {
     // "Price the placement, don't shoot at the keeper": a scored shot aims at the
     // goal-mouth spot the keeper can least reach, not dead-centre. A keeper off to one

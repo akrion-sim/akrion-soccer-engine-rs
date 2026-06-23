@@ -33382,6 +33382,152 @@ impl WorldSnapshot {
         None
     }
 
+    /// Save probability of the BEST-placed shot (least-saveable goalmouth corner) the shooting team
+    /// could strike from `shooter_pos` against the opposing keeper. High ⇒ the keeper is covering
+    /// the goal from here; low ⇒ the goal is open. `None` when there is no opposing keeper. Pure
+    /// read; reuses the same keeper-save model as `scored_shot_placement_x`.
+    pub(crate) fn best_shot_save_probability_from(
+        &self,
+        shooting_team: Team,
+        shooter_pos: Vec2,
+        shot_speed_yps: f64,
+        shooting_skill: f64,
+    ) -> Option<f64> {
+        if !shooter_pos.x.is_finite() || !shooter_pos.y.is_finite() {
+            return None;
+        }
+        let keeper_id = self.goalkeeper_for(shooting_team.other())?;
+        let keeper = self.players.iter().find(|p| p.id == keeper_id)?;
+        let goal_y = shooting_team.goal_y(self.field_length);
+        let best_x = self.scored_shot_placement_x(
+            shooting_team,
+            shooter_pos,
+            goal_y,
+            shot_speed_yps,
+            shooting_skill.clamp(0.0, 1.0),
+        );
+        let crossing = Vec2::new(best_x, goal_y);
+        let keeper_pos = self.player_snapshot_position(keeper);
+        let keeper_vel = self.player_velocity(keeper.id).unwrap_or(keeper.velocity);
+        Some(goalkeeper_save_probability_from_traits(
+            &keeper.skills,
+            keeper_pos,
+            keeper_vel,
+            keeper.fatigue,
+            shooter_pos,
+            crossing,
+            shot_speed_yps,
+            self.goal_width,
+            0.0,
+        ))
+    }
+
+    /// "Round the keeper": when the carrier is in range but the goalkeeper is covering the shot, a
+    /// short, quick carry CLOSER to goal (and around the keeper's angle) opens a clear strike — far
+    /// better than blazing a long shot the keeper saves. Returns `(spot, sprint)`: where to carry,
+    /// and whether to SPRINT (very high pressure / a fast-closing keeper or defender) vs run.
+    /// `None` when out of range, the shot is already clear, no closer spot opens a clear strike, or
+    /// the feature is disabled (`DD_SOCCER_DISABLE_ROUND_THE_KEEPER`). Pure read of the snapshot.
+    pub(crate) fn dribble_round_the_keeper_for(&self, carrier_id: usize) -> Option<(Vec2, bool)> {
+        if dd_soccer_disable_round_the_keeper() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == carrier_id)?;
+        if me.role == PlayerRole::Goalkeeper || self.ball.holder != Some(carrier_id) {
+            return None;
+        }
+        let from = self.player_snapshot_position(me);
+        if !from.x.is_finite() || !from.y.is_finite() {
+            return None;
+        }
+        let opp = me.team.other();
+        let attack_dir = me.team.attack_dir();
+        let goal_y = me.team.goal_y(self.field_length);
+        let dist_to_goal = (goal_y - from.y).abs();
+        // Only in the near-to-mid range: this is about getting a CLOSE shot, not a long one. Below
+        // the min it is already point-blank (just shoot).
+        if !(ROUND_KEEPER_MIN_GOAL_YARDS..=ROUND_KEEPER_MAX_START_YARDS).contains(&dist_to_goal) {
+            return None;
+        }
+        let skill = ability01(me.skills.shooting);
+        let shot_speed = shot_speed_yps_from_power(shot_power_for_skill(skill), &me.skills);
+
+        // Only act when the keeper is genuinely covering the direct shot right now.
+        let save_now = self.best_shot_save_probability_from(me.team, from, shot_speed, skill)?;
+        if save_now < ROUND_KEEPER_BLOCKED_SAVE_THRESHOLD {
+            return None;
+        }
+
+        // Sprint decision: burst when under very high pressure OR the nearest opponent (typically
+        // the onrushing keeper) is closing quickly toward the carrier; else a controlled run.
+        let nearest_opp = self
+            .players
+            .iter()
+            .filter(|p| p.team == opp)
+            .map(|p| {
+                let pos = self.player_snapshot_position(p);
+                (p, pos, pos.distance(from))
+            })
+            .filter(|(_, _, d)| d.is_finite())
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let pressure = nearest_opp
+            .as_ref()
+            .map(|(_, _, d)| pressure_from_nearest_distance(*d))
+            .unwrap_or(0.0);
+        let opp_closing_yps = nearest_opp
+            .as_ref()
+            .map(|(p, pos, d)| {
+                if *d <= 1e-3 {
+                    return 0.0;
+                }
+                let toward = (from - *pos) * (1.0 / *d);
+                self.player_velocity(p.id)
+                    .unwrap_or(p.velocity)
+                    .dot(toward)
+                    .max(0.0)
+            })
+            .unwrap_or(0.0);
+        let sprint =
+            pressure >= ROUND_KEEPER_SPRINT_PRESSURE || opp_closing_yps >= ROUND_KEEPER_SPRINT_TRACK_YPS;
+
+        let goalward = Vec2::new(0.0, attack_dir);
+        let across = Vec2::new(1.0, 0.0);
+        // Search short carries — forward toward goal, and forward-and-to-a-side to come around the
+        // keeper — for the SMALLEST one that lands a spot that is closer to goal, safe, and from
+        // which the best-placed shot beats the keeper (low save). Smallest step + most-direct offset
+        // first, so the carrier takes the least dribble that earns the clear strike.
+        for &step in ROUND_KEEPER_STEP_YARDS.iter() {
+            for &(fwd_w, lat_w) in &[
+                (1.0, 0.0),
+                (0.8, 0.6),
+                (0.8, -0.6),
+                (0.55, 0.95),
+                (0.55, -0.95),
+            ] {
+                let spot = (from + goalward * (step * fwd_w) + across * (step * lat_w))
+                    .clamp_to_pitch(self.field_width, self.field_length);
+                // Must actually get closer to goal.
+                if (goal_y - spot.y).abs() >= dist_to_goal - 0.5 {
+                    continue;
+                }
+                // Don't carry straight onto the keeper / another defender.
+                if self.nearest_opponent_distance_at(me.team, spot)
+                    < ROUND_KEEPER_MIN_SPOT_SPACE_YARDS
+                {
+                    continue;
+                }
+                if let Some(save_spot) =
+                    self.best_shot_save_probability_from(me.team, spot, shot_speed, skill)
+                {
+                    if save_spot <= ROUND_KEEPER_CLEAR_SAVE_THRESHOLD {
+                        return Some((spot, sprint));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn pass_lane_control_is_unavoidable(
         &self,
         player: &PlayerSnapshot,

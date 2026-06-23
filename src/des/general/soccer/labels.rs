@@ -87,6 +87,10 @@ pub enum SoccerActionLabel {
     /// On-ball: a short carrier dribble to change the passing angle and open a
     /// currently-blocked teammate lane.
     OpenPassLane,
+    /// On-ball: a short, quick carry around the goalkeeper — closer to goal and off the
+    /// keeper's covered angle — to open a clear shot, instead of a long shot the keeper
+    /// saves. See `WorldSnapshot::dribble_round_the_keeper_for`.
+    RoundTheKeeper,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -159,6 +163,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
             SoccerActionLabel::OpenPassLane => "open-pass-lane",
+            SoccerActionLabel::RoundTheKeeper => "round-the-keeper",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -226,6 +231,7 @@ impl SoccerActionLabel {
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
             "open-pass-lane" => SoccerActionLabel::OpenPassLane,
+            "round-the-keeper" => SoccerActionLabel::RoundTheKeeper,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -335,6 +341,15 @@ impl SoccerActionLabel {
             | "dribble-to-pass"
             | "dribble_to_pass"
             | "dribbletopass" => "open-pass-lane",
+            "round-the-keeper"
+            | "round_the_keeper"
+            | "roundthekeeper"
+            | "round-the-gk"
+            | "round-keeper"
+            | "round_keeper"
+            | "rounding-the-keeper"
+            | "dribble-round-keeper"
+            | "beat-the-keeper" => "round-the-keeper",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"
