@@ -436,18 +436,33 @@ where
 
     for summary in summaries {
         sample_games = sample_games.saturating_add(1);
-        if soccer_summary_has_non_finite_learning_metrics(summary) {
-            non_finite_metric_samples = non_finite_metric_samples.saturating_add(1);
-        }
+        let mut sample_has_non_finite = soccer_summary_has_non_finite_learning_metrics(summary);
         let match_fitness = soccer_learning_run_score(summary).match_fitness;
-        match_fitness_sum += match_fitness;
-        best_match_fitness = best_match_fitness.max(match_fitness);
-        play_quality_sum += soccer_learning_match_play_quality(summary);
-        conceded_goals_sum += (summary.score_home + summary.score_away) as f64 * 0.5;
-        goal_margin_sum += (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
-        chain_net_loss_sum += (summary.stats.pass_chains_net_loss_home
+        if !match_fitness.is_finite() {
+            sample_has_non_finite = true;
+        }
+        let match_fitness = finite_promotion_gate_metric(match_fitness, SOCCER_MATCH_FITNESS_MIN);
+        let play_quality = soccer_learning_match_play_quality(summary);
+        if !play_quality.is_finite() {
+            sample_has_non_finite = true;
+        }
+        let play_quality = finite_promotion_gate_metric(play_quality, 0.0);
+        let chain_net_loss = (summary.stats.pass_chains_net_loss_home
             + summary.stats.pass_chains_net_loss_away) as f64
             * 0.5;
+        if !chain_net_loss.is_finite() {
+            sample_has_non_finite = true;
+        }
+        let chain_net_loss = finite_promotion_gate_metric(chain_net_loss, 0.0);
+        if sample_has_non_finite {
+            non_finite_metric_samples = non_finite_metric_samples.saturating_add(1);
+        }
+        match_fitness_sum += match_fitness;
+        best_match_fitness = best_match_fitness.max(match_fitness);
+        play_quality_sum += play_quality;
+        conceded_goals_sum += (summary.score_home + summary.score_away) as f64 * 0.5;
+        goal_margin_sum += (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
+        chain_net_loss_sum += chain_net_loss;
     }
 
     let denominator = sample_games.max(1) as f64;
@@ -525,6 +540,14 @@ where
         mean_goal_margin,
         mean_chain_net_loss,
         rejection_reasons,
+    }
+}
+
+fn finite_promotion_gate_metric(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
     }
 }
 
@@ -5394,6 +5417,10 @@ mod tests {
         dirty.stats.pass_chain_gain_yards_home = f64::NAN;
         let dirty_eval = evaluate_soccer_policy_promotion_gate([&strong, &dirty], strict);
         assert!(!dirty_eval.eligible);
+        assert!(dirty_eval.mean_match_fitness.is_finite());
+        assert!(dirty_eval.mean_play_quality.is_finite());
+        assert!(dirty_eval.mean_chain_net_loss.is_finite());
+        serde_json::to_value(&dirty_eval).expect("dirty gate evaluation remains JSON-safe");
         assert!(dirty_eval
             .rejection_reasons
             .iter()

@@ -80,14 +80,23 @@ fn env_flag_enabled(name: &str) -> bool {
 
 /// Whether the dense territorial pitch-value reward is enabled this process.
 pub fn pitch_value_reward_enabled() -> bool {
-    env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV)
+    #[cfg(test)]
+    {
+        env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV))
+    }
 }
 
 /// Forward progress fraction in `[0, 1]` for `team` at point `p`: 0 on the team's
 /// own goal line, 1 on the opponent goal line. Orientation-symmetric between the
 /// two teams (mirror a point and swap the team and you get the same value).
 fn forward_fraction(team: Team, p: Vec2, field_length: f64) -> f64 {
-    if field_length <= 0.0 || !field_length.is_finite() {
+    if field_length <= 0.0 || !field_length.is_finite() || !p.y.is_finite() {
         return 0.5;
     }
     let centered = (p.y - field_length * 0.5) / field_length;
@@ -102,7 +111,11 @@ pub fn expected_threat(team: Team, p: Vec2, field_width: f64, field_length: f64)
     let territorial = fwd.powf(EXPECTED_THREAT_FORWARD_EXPONENT);
     // Central-ness in [0,1]: 1 on the spine of the pitch, 0 at the touchline.
     let centrality = if field_width > 0.0 && field_width.is_finite() {
-        (1.0 - (p.x - field_width * 0.5).abs() / (field_width * 0.5)).clamp(0.0, 1.0)
+        if p.x.is_finite() {
+            (1.0 - (p.x - field_width * 0.5).abs() / (field_width * 0.5)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
     } else {
         0.5
     };
@@ -114,21 +127,37 @@ pub fn expected_threat(team: Team, p: Vec2, field_width: f64, field_length: f64)
 /// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
 /// race can never divide by ~0.
 fn player_top_speed(player: &PlayerSnapshot) -> f64 {
-    super::player_top_speed_yps(player.role, &player.skills).max(PITCH_CONTROL_MIN_TOP_SPEED_YPS)
+    let speed = super::player_top_speed_yps(player.role, &player.skills);
+    if speed.is_finite() {
+        speed.max(PITCH_CONTROL_MIN_TOP_SPEED_YPS)
+    } else {
+        PITCH_CONTROL_MIN_TOP_SPEED_YPS
+    }
 }
 
 /// Velocity-aware time (seconds) for `player` to arrive at `cell`. A player
 /// already moving toward the cell gets a momentum head start; one moving away
 /// pays for it.
 fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
+    if !cell.x.is_finite()
+        || !cell.y.is_finite()
+        || !player.position.x.is_finite()
+        || !player.position.y.is_finite()
+    {
+        return f64::INFINITY;
+    }
     let to_cell = cell - player.position;
     let dist = to_cell.len();
+    if !dist.is_finite() {
+        return f64::INFINITY;
+    }
     let vmax = player_top_speed(player);
     if dist <= 1e-6 {
         return 0.0;
     }
     let dir = Vec2::new(to_cell.x / dist, to_cell.y / dist);
     let vel_toward = player.velocity.dot(dir);
+    let vel_toward = if vel_toward.is_finite() { vel_toward } else { 0.0 };
     let head_start = vel_toward * PITCH_CONTROL_MOMENTUM_SECONDS;
     let effective_dist = (dist - head_start).max(0.0);
     effective_dist / vmax
@@ -140,6 +169,7 @@ fn team_min_arrival(players: &[PlayerSnapshot], team: Team, cell: Vec2) -> Optio
         .iter()
         .filter(|p| p.team == team)
         .map(|p| arrival_time_seconds(p, cell))
+        .filter(|t| t.is_finite())
         .fold(None, |acc: Option<f64>, t| {
             Some(acc.map_or(t, |best| best.min(t)))
         })
@@ -169,7 +199,11 @@ pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
 pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let field_width = snapshot.field_width;
     let field_length = snapshot.field_length;
-    if field_width <= 0.0 || field_length <= 0.0 {
+    if field_width <= 0.0
+        || field_length <= 0.0
+        || !field_width.is_finite()
+        || !field_length.is_finite()
+    {
         return 0.0;
     }
     let players = &snapshot.players;
@@ -211,7 +245,7 @@ pub fn pitch_value_reward_delta(before: &WorldSnapshot, after: &WorldSnapshot, t
         return 0.0;
     }
     let scale = tunables().reward.pitch_value_threat_delta_points;
-    if scale == 0.0 {
+    if scale == 0.0 || !scale.is_finite() {
         return 0.0;
     }
     let delta = territorial_advantage(after, team) - territorial_advantage(before, team);
@@ -227,6 +261,7 @@ mod tests {
 
     const W: f64 = DEFAULT_FIELD_WIDTH_YARDS;
     const L: f64 = DEFAULT_FIELD_LENGTH_YARDS;
+    static PITCH_VALUE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn expected_threat_rises_toward_opponent_goal() {
@@ -338,6 +373,7 @@ mod tests {
 
     #[test]
     fn reward_delta_respects_gate_and_rewards_advancing() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
         // Use a real 11v11 formation: pushing one attacker into the final third
         // adds forward control WITHOUT uncovering the back line (the degenerate
         // 1v1 case is intentionally not rewarded — vacating your whole half cedes
@@ -382,5 +418,22 @@ mod tests {
         let home_adv = territorial_advantage(&snap, Team::Home);
         let away_adv = territorial_advantage(&snap, Team::Away);
         assert!((home_adv + away_adv).abs() < 1e-9, "{home_adv} + {away_adv}");
+    }
+
+    #[test]
+    fn pitch_value_model_sanitizes_non_finite_inputs() {
+        let threat = expected_threat(Team::Home, Vec2::new(f64::NAN, f64::INFINITY), W, L);
+        assert!(threat.is_finite(), "expected threat should stay finite: {threat}");
+
+        let players = vec![
+            player_at(0, Team::Home, Vec2::new(f64::NAN, L * 0.5), Vec2::zero()),
+            player_at(1, Team::Away, Vec2::new(W * 0.5, f64::INFINITY), Vec2::zero()),
+        ];
+        let control = pitch_control_home(&players, Vec2::new(W * 0.5, L * 0.5));
+        assert!(control.is_finite(), "pitch control should stay finite: {control}");
+
+        let mut snap = snapshot_with(players, Vec2::new(W * 0.5, L * 0.5));
+        snap.field_width = f64::NAN;
+        assert_eq!(team_expected_threat(&snap, Team::Home), 0.0);
     }
 }
