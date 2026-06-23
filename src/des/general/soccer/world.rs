@@ -8781,13 +8781,35 @@ impl SoccerMatch {
                                 && player.team == player_team
                         })
                     });
+                    // MPC determines the keeper's play-out: when the keeper is choosing freely
+                    // (no explicit target named), MPC picks which team-mate and which technique
+                    // (a ground roll vs a lofted throw/punt) the receding-horizon rendezvous can
+                    // best DELIVER, in place of the generic ranked target. An explicitly named
+                    // target (a learned plan / human input) is still honoured, and a restart he
+                    // is taking keeps its own goal-kick rules. The execution-layer MPC then sets
+                    // the launch pace below, so the whole play-out is MPC-driven.
+                    let keeper_mpc_distribution = if self.players[player_id].role
+                        == PlayerRole::Goalkeeper
+                        && self.restart_double_touch_guard != Some(player_id)
+                        && explicit_target_id.is_none()
+                    {
+                        snapshot.goalkeeper_mpc_distribution_for(player_id)
+                    } else {
+                        None
+                    };
                     let mut target_id = explicit_target_id.or_else(|| {
-                        if flight.is_aerial() {
-                            snapshot.best_aerial_pass_target(player_id)
-                        } else {
-                            snapshot.best_pass_target(player_id)
-                        }
+                        keeper_mpc_distribution.map(|(id, _)| id).or_else(|| {
+                            if flight.is_aerial() {
+                                snapshot.best_aerial_pass_target(player_id)
+                            } else {
+                                snapshot.best_pass_target(player_id)
+                            }
+                        })
                     });
+                    let mut flight = flight;
+                    if let Some((_, mpc_flight)) = keeper_mpc_distribution {
+                        flight = mpc_flight;
+                    }
                     // Resolve the aim point. With no ranked receiver, fall back to a purposeful
                     // forward outlet — and if that outlet is aimed at a genuinely open advanced
                     // teammate, ADOPT them as the receiver so the ball is played TO someone. Only
@@ -23766,6 +23788,83 @@ impl WorldSnapshot {
         let teammate_clearly_wins = teammate_time + defer_margin < gk_time
             && teammate_time + over_opp_margin < opponent_time;
         !teammate_clearly_wins
+    }
+
+    /// MPC determines WHERE and HOW the keeper plays the ball out: among outfield team-mates
+    /// and the two delivery techniques (a ground roll vs a lofted throw/punt), pick the
+    /// (receiver, flight) the receding-horizon rendezvous can best DELIVER — the receiver wins
+    /// the meeting under bounded acceleration ahead of the nearest opponent (high MPC receipt),
+    /// the lane is physically open (a blocked ground lane is undeliverable; a loft may clear
+    /// it), and the receiver is unmarked — tie-broken toward the keeper's territorial flank
+    /// preference. Returns `None` when nothing is cleanly deliverable, so the caller falls back
+    /// to holding / clearing. The launch pace itself is then set by the execution-layer MPC
+    /// (`mpc_pass_execution`), so the whole play-out — receiver, technique and pace — is MPC.
+    pub(crate) fn goalkeeper_mpc_distribution_for(
+        &self,
+        keeper_id: usize,
+    ) -> Option<(usize, PassFlight)> {
+        let gk = self.players.iter().find(|p| p.id == keeper_id)?;
+        if gk.role != PlayerRole::Goalkeeper {
+            return None;
+        }
+        let gk_pos = self.player_snapshot_position(gk);
+        let keeper_pressure =
+            pressure_from_nearest_distance(self.nearest_opponent_distance_at(gk.team, gk_pos));
+        let mut best: Option<(f64, usize, PassFlight)> = None;
+        for receiver in self.players.iter().filter(|p| {
+            p.team == gk.team && p.id != keeper_id && p.role != PlayerRole::Goalkeeper
+        }) {
+            let target_pos = self.player_snapshot_position(receiver);
+            for &flight in &[PassFlight::Floor, PassFlight::Aerial] {
+                let is_cross = pass_would_be_cross(
+                    gk_pos,
+                    target_pos,
+                    gk.team,
+                    self.field_width,
+                    self.field_length,
+                );
+                let speed = pass_speed_yps_from_power(0.72, flight, is_cross, &gk.skills);
+                let aim = self
+                    .anticipated_pass_reception_point(keeper_id, receiver.id, flight, speed)
+                    .unwrap_or(target_pos);
+                // MPC rendezvous feasibility: can the receiver meet this delivery before the
+                // nearest opponent, under bounded acceleration?
+                let mpc = pass_mpc_receipt_estimate_for_snapshot(
+                    self, gk, gk_pos, receiver, target_pos, flight, speed, aim,
+                );
+                if mpc.probability < GK_MPC_DISTRIBUTION_MIN_RECEIPT {
+                    continue;
+                }
+                // A ground roll through a defender in the lane is not deliverable; a loft can
+                // clear that defender, so the lane gate only vetoes the ground technique.
+                let (lane_clear_now, _) =
+                    self.pass_lane_clearance(gk_pos, aim, gk.team.other(), 2.5, speed);
+                if !lane_clear_now && !flight.is_aerial() {
+                    continue;
+                }
+                let openness = pass_receiver_openness_for_snapshots_with_teammates(
+                    &self.players,
+                    gk.team,
+                    target_pos,
+                    Some(receiver.id),
+                );
+                let distribution_preference = goalkeeper_distribution_score(
+                    gk.team,
+                    gk_pos,
+                    aim,
+                    self.field_width,
+                    keeper_pressure,
+                );
+                // MPC deliverability dominates; receiver openness and the territorial flank
+                // preference only shade the choice among genuinely deliverable options.
+                let score =
+                    mpc.probability * 3.0 + openness * 1.2 + distribution_preference * 0.12;
+                if best.as_ref().map_or(true, |(best_score, _, _)| score > *best_score) {
+                    best = Some((score, receiver.id, flight));
+                }
+            }
+        }
+        best.map(|(_, receiver_id, flight)| (receiver_id, flight))
     }
 
     fn nearest_opponent_arrival_time_to(&self, team: Team, target: Vec2) -> f64 {

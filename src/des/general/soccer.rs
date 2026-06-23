@@ -2718,6 +2718,12 @@ const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
 /// box. 0.95 ⇒ it arrives in roughly ≤70% of the earliest rival's time AND the QP solver
 /// confirms it can physically get there in that window.
 const GK_LEAVE_BOX_MIN_WIN_PROBABILITY: f64 = 0.95;
+/// MPC keeper distribution: the keeper plays the ball OUT only to a team-mate the
+/// receding-horizon rendezvous can actually deliver to — the receiver's MPC receipt
+/// probability (it wins the meeting under bounded acceleration ahead of the nearest opponent)
+/// must clear this floor for the (receiver, technique) to be a candidate. Below it nothing is
+/// cleanly deliverable and the keeper holds / clears via the existing logic.
+const GK_MPC_DISTRIBUTION_MIN_RECEIPT: f64 = 0.45;
 /// The keeper EXECUTES its positioning strategy (line height / angle / sweep) via
 /// the MPC layer too, over a wider range than an outfield presser (it tracks the
 /// ball from its line), so it joins the MPC active subset whenever the ball is

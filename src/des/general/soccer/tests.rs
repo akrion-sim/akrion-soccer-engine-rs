@@ -876,6 +876,88 @@ fn goalkeeper_holds_six_yard_box_unless_clear_winner_in_penalty_area() {
 }
 
 #[test]
+fn goalkeeper_mpc_distribution_avoids_a_marked_teammate_for_a_deliverable_one() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 5_150,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("home keeper");
+    let open = 6usize;
+    let marked = 7usize;
+    let presser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away presser");
+    // Park every team-mate well up the far flank (poor, but not "marked") so the only sane
+    // play-out is to the open man; the marked man has an opponent sitting on him.
+    park_players_except(&mut sim, &[keeper, open, marked, presser]);
+    let cx = sim.config.field_width_yards * 0.5;
+    sim.players[keeper].position = Vec2::new(cx, 2.0);
+    sim.players[open].position = Vec2::new(cx - 26.0, 30.0); // wide, no opponent near
+    sim.players[marked].position = Vec2::new(cx, 30.0); // central ...
+    sim.players[presser].position = Vec2::new(cx, 30.6); // ... with an opponent on him
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = sim.players[keeper].position;
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let (target, _flight) = snap
+        .goalkeeper_mpc_distribution_for(keeper)
+        .expect("MPC should find a deliverable play-out");
+    assert_ne!(
+        target, marked,
+        "MPC must not play the ball out to a team-mate an opponent is sitting on"
+    );
+    // Whatever it chose must itself be genuinely deliverable: no opponent tight to the receiver.
+    let chosen = sim.players.iter().find(|p| p.id == target).unwrap().position;
+    let nearest_opp = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away)
+        .map(|p| p.position.distance(chosen))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        nearest_opp > 3.0,
+        "MPC chose a marked receiver (nearest opponent {nearest_opp:.1}yd)"
+    );
+}
+
+#[test]
+fn goalkeeper_cannot_handle_the_ball_outside_its_box() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    park_players_except(&mut sim, &[keeper]);
+    let cx = sim.config.field_width_yards * 0.5;
+    sim.ball.holder = Some(keeper);
+
+    // Inside his own box: a held ball is in his HANDS — unstealable handling holder.
+    sim.players[keeper].position = Vec2::new(cx, 6.0);
+    sim.ball.position = sim.players[keeper].position;
+    assert_eq!(
+        sim.keeper_handling_holder(),
+        Some(keeper),
+        "a keeper holding inside his box handles with his hands"
+    );
+
+    // Outside the 18-yard box: he CANNOT handle — the ball is a normal foot-played, stealable
+    // ball, so the MDP/POMDP must decide how he plays it with his feet (no hand-claim path).
+    sim.players[keeper].position = Vec2::new(cx, 24.0);
+    sim.ball.position = sim.players[keeper].position;
+    assert_eq!(
+        sim.keeper_handling_holder(),
+        None,
+        "a keeper outside his penalty area cannot handle the ball — feet only"
+    );
+}
+
+#[test]
 fn mpc_reselects_normal_shot_when_execution_is_poor() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
