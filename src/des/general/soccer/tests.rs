@@ -1003,6 +1003,111 @@ fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
 }
 
 #[test]
+fn scored_shot_placement_aims_at_the_keepers_open_side() {
+    // "Price the placement, don't shoot at the keeper": a scored shot aims at the
+    // goal-mouth spot the keeper can least reach, not dead-centre. A keeper off to one
+    // post pushes the chosen placement to the open side, and that placement must be
+    // strictly harder to save than a central shot.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9,
+        ..Default::default()
+    });
+    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let goal_center_x = sim.config.field_width_yards * 0.5;
+    let keeper_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away keeper exists");
+    let shooter_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("home forward exists");
+    let shooter_pos = Vec2::new(goal_center_x, goal_y - 14.0);
+    {
+        let shooter = sim.players.iter_mut().find(|p| p.id == shooter_id).unwrap();
+        shooter.position = shooter_pos;
+        shooter.skills.shooting = 9.0;
+        shooter.skills.right_foot_shot_power = 9.0;
+    }
+    let shooting_skill = ability01(9.0);
+    let shot_speed = shot_speed_yps_from_power(
+        0.85,
+        &sim.players.iter().find(|p| p.id == shooter_id).unwrap().skills,
+    );
+
+    // Keeper left of centre on its line -> open side is the right post.
+    sim.players
+        .iter_mut()
+        .find(|p| p.id == keeper_id)
+        .unwrap()
+        .position = Vec2::new(goal_center_x - 3.5, goal_y);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let placed_x = snapshot.scored_shot_placement_x(
+        Team::Home,
+        shooter_pos,
+        goal_y,
+        shot_speed,
+        shooting_skill,
+    );
+    assert!(
+        placed_x > goal_center_x + 0.5,
+        "keeper left of centre should push the scored placement to the open right, got x={placed_x} vs centre {goal_center_x}"
+    );
+    let keeper = snapshot.players.iter().find(|p| p.id == keeper_id).unwrap();
+    let keeper_pos = snapshot.player_position(keeper_id).unwrap_or(keeper.position);
+    let save_at_center = goalkeeper_save_probability_from_traits(
+        &keeper.skills,
+        keeper_pos,
+        keeper.velocity,
+        keeper.fatigue,
+        shooter_pos,
+        Vec2::new(goal_center_x, goal_y),
+        shot_speed,
+        snapshot.goal_width,
+        0.0,
+    );
+    let save_at_placed = goalkeeper_save_probability_from_traits(
+        &keeper.skills,
+        keeper_pos,
+        keeper.velocity,
+        keeper.fatigue,
+        shooter_pos,
+        Vec2::new(placed_x, goal_y),
+        shot_speed,
+        snapshot.goal_width,
+        0.0,
+    );
+    assert!(
+        save_at_placed < save_at_center - 1e-6,
+        "scored placement should lower the keeper save vs centre: placed={save_at_placed} centre={save_at_center}"
+    );
+
+    // Mirror: keeper right of centre pushes the chosen placement to the left post.
+    sim.players
+        .iter_mut()
+        .find(|p| p.id == keeper_id)
+        .unwrap()
+        .position = Vec2::new(goal_center_x + 3.5, goal_y);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let placed_x_mirror = snapshot.scored_shot_placement_x(
+        Team::Home,
+        shooter_pos,
+        goal_y,
+        shot_speed,
+        shooting_skill,
+    );
+    assert!(
+        placed_x_mirror < goal_center_x - 0.5,
+        "keeper right of centre should push the scored placement to the open left, got x={placed_x_mirror}"
+    );
+}
+
+#[test]
 fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
     // Rule B: a mid/forward that lingers offside past the 3s grace is pulled back onside,
     // unless it is through on goal with the ball / being played in, the opponent last

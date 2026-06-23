@@ -9256,6 +9256,18 @@ impl SoccerMatch {
                             goal_center_x - half_goal * 0.74
                         };
                         keeper_opposite_corner * 0.68 + far_post * 0.32
+                    } else if dd_soccer_enable_scored_shot_placement() {
+                        // Price the placement: aim a non-curl shot at the goal-mouth spot
+                        // the keeper can least reach, instead of dead-centre into them.
+                        let shot_speed =
+                            shot_speed_yps_from_power(power, &self.players[player_id].skills);
+                        snapshot.scored_shot_placement_x(
+                            player_team,
+                            player_pos,
+                            goal_y,
+                            shot_speed,
+                            ability01(self.players[player_id].skills.shooting),
+                        )
                     } else {
                         goal_center_x
                     };
@@ -15812,6 +15824,24 @@ fn dd_soccer_disable_one_two_give_to_feet() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONE_TWO_GIVE_TO_FEET").is_ok())
 }
+
+/// How many goal-mouth placements [`WorldSnapshot::scored_shot_placement_x`] sweeps
+/// (the schema doc's ~9 placement buckets: both posts, both half-spaces, centre).
+const SCORED_SHOT_PLACEMENT_BUCKETS: usize = 9;
+/// Smallest safety margin inside the post a scored shot aims for (an elite finisher).
+const SCORED_SHOT_POST_MARGIN_MIN_YARDS: f64 = 0.6;
+/// Extra inside-the-post margin added as shooting skill falls (a weak finisher tucks it
+/// further inside the frame rather than threading the post and missing wide).
+const SCORED_SHOT_POST_MARGIN_SKILL_YARDS: f64 = 1.6;
+
+/// See [`WorldSnapshot::scored_shot_placement_x`]: set `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT=1`
+/// to aim non-curl shots at the keeper's least-saveable goal-mouth placement instead of the
+/// goal centre. Default off ⇒ shots keep the centred aim (byte-identical baseline / A/B).
+fn dd_soccer_enable_scored_shot_placement() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT").is_ok())
+}
 fn dd_soccer_disable_wall_pass_reward() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -17077,6 +17107,73 @@ impl WorldSnapshot {
             / (PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS * 2.0).max(1.0))
         .clamp(0.0, 1.0);
         (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
+    }
+
+    /// Score the shot **placement** as a discrete decision instead of defaulting to the
+    /// goal centre (where the keeper usually stands). Sweeps placement buckets across the
+    /// goal mouth — just inside each post — and returns the goal-line x the opposing keeper
+    /// is *least* able to save, reusing the same speed- and position-aware
+    /// [`goalkeeper_save_probability_from_traits`] the shot's own beat-keeper estimate
+    /// already trusts. A harder shot earns a more extreme corner (less keeper move-time),
+    /// and the post margin widens as shooting skill falls so a weak finisher tucks it
+    /// comfortably inside the frame rather than aiming at the post. This realises the
+    /// schema doc's shot-placement axis (§3.3) as a scored decision and aligns execution
+    /// with the open-corner aim the decision-time `shot_beat_goalkeeper_probability`
+    /// already credits. Gated by `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT` (default off ⇒
+    /// shots keep the centred aim, byte-identical baseline).
+    pub(crate) fn scored_shot_placement_x(
+        &self,
+        shooting_team: Team,
+        shooter_position: Vec2,
+        goal_y: f64,
+        shot_speed_yps: f64,
+        shooting_skill: f64,
+    ) -> f64 {
+        let goal_center_x = self.field_width * 0.5;
+        let half_width = self.goal_width * 0.5;
+        let skill = shooting_skill.clamp(0.0, 1.0);
+        // Keep the aim inside the post by a skill-scaled safety margin so a struck ball
+        // stays on frame: a 10/10 finisher threads it; a poor one tucks it well inside.
+        let post_margin = (SCORED_SHOT_POST_MARGIN_MIN_YARDS
+            + (1.0 - skill) * SCORED_SHOT_POST_MARGIN_SKILL_YARDS)
+            .clamp(
+                SCORED_SHOT_POST_MARGIN_MIN_YARDS,
+                half_width.max(SCORED_SHOT_POST_MARGIN_MIN_YARDS),
+            );
+        let inner = (half_width - post_margin).max(0.0);
+        if inner <= 1e-6 || !shot_speed_yps.is_finite() {
+            return goal_center_x;
+        }
+        let Some(keeper) = self
+            .goalkeeper_for(shooting_team.other())
+            .and_then(|id| self.players.iter().find(|p| p.id == id))
+        else {
+            return goal_center_x;
+        };
+        let keeper_position = self.player_position(keeper.id).unwrap_or(keeper.position);
+        let mut best_x = goal_center_x;
+        let mut best_save = f64::INFINITY;
+        for bucket in 0..SCORED_SHOT_PLACEMENT_BUCKETS {
+            let t = bucket as f64 / (SCORED_SHOT_PLACEMENT_BUCKETS - 1) as f64;
+            let x = goal_center_x - inner + 2.0 * inner * t;
+            let crossing = Vec2::new(x, goal_y);
+            let save = goalkeeper_save_probability_from_traits(
+                &keeper.skills,
+                keeper_position,
+                keeper.velocity,
+                keeper.fatigue,
+                shooter_position,
+                crossing,
+                shot_speed_yps,
+                self.goal_width,
+                0.0,
+            );
+            if save < best_save - 1e-9 {
+                best_save = save;
+                best_x = x;
+            }
+        }
+        best_x
     }
 
     pub(crate) fn no_target_pass_point_directly_favors_opponent(
