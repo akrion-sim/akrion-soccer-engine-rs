@@ -3295,6 +3295,12 @@ impl SoccerMatch {
         let mut features = soccer_neural_transition_features(transition);
         let mut discount = gamma.clamp(0.0, 0.999);
         let mut value = 0.0;
+        // Bound each rolled-out critic value to the critic's training-target range. The
+        // world model is fed its own prediction recursively, so an early/diverging model
+        // can drive the features off-distribution and make the critic extrapolate to a huge
+        // value that would dominate `model_bonus` and corrupt selection. Outputs already in
+        // range are untouched; this only trims pathological extrapolation.
+        let value_clip = self.config.neural_learning.sanitized_target_clip();
         for _ in 1..depth {
             let Some(predicted) = world_model.predict_next(&features) else {
                 break;
@@ -3302,6 +3308,7 @@ impl SoccerMatch {
             let Some(predicted_value) = learner.predict_value(&predicted) else {
                 break;
             };
+            let predicted_value = predicted_value.clamp(-value_clip, value_clip);
             value += discount * predicted_value * target_scale;
             features = predicted;
             discount *= gamma.clamp(0.0, 0.999);
@@ -4412,7 +4419,7 @@ impl SoccerMatch {
             }
         }
 
-        replay
+        let mut samples: Vec<SoccerPolicySample> = replay
             .iter()
             .enumerate()
             .filter_map(|(index, transition)| {
@@ -4436,7 +4443,25 @@ impl SoccerMatch {
                     old_action_probability,
                 })
             })
-            .collect()
+            .collect();
+
+        // PPO/MAPPO advantage standardization (zero-mean / unit-variance over the batch):
+        // the standard variance-reduction trick that keeps the policy-gradient step scale
+        // stable across episodes with different reward magnitudes. Opt-in (default OFF →
+        // byte-identical); a degenerate (zero-variance) batch is left untouched.
+        if dd_soccer_enable_advantage_normalization() && samples.len() >= 2 {
+            let n = samples.len() as f64;
+            let mean = samples.iter().map(|s| s.advantage).sum::<f64>() / n;
+            let variance =
+                samples.iter().map(|s| (s.advantage - mean).powi(2)).sum::<f64>() / n;
+            let std = variance.sqrt();
+            if std.is_finite() && std > 1e-8 {
+                for sample in &mut samples {
+                    sample.advantage = (sample.advantage - mean) / (std + 1e-8);
+                }
+            }
+        }
+        samples
     }
 
     fn ensure_policy_head(&mut self) {
@@ -4554,10 +4579,18 @@ impl SoccerMatch {
     ) -> Option<f64> {
         let features = soccer_neural_transition_features_with_action(base, action);
         if depth == 0 {
+            // Depth-0 is the established direct-critic path — left unbounded to stay
+            // byte-identical to the pre-look-ahead behaviour.
             return learner.predict_value(&features);
         }
         let next = self.world_model.as_ref()?.predict_next(&features)?;
-        learner.predict_value(&next)
+        // Bound the world-model-rolled critic value to the critic's training-target range so a
+        // diverging dynamics model can't drive an off-distribution critic extrapolation into
+        // action selection. In-range predictions are untouched.
+        let value_clip = self.config.neural_learning.sanitized_target_clip();
+        learner
+            .predict_value(&next)
+            .map(|value| value.clamp(-value_clip, value_clip))
     }
 
     fn apply_full_game_learning_if_ready(&mut self) {
@@ -16792,6 +16825,24 @@ pub(crate) fn dd_soccer_lookahead_depth() -> usize {
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .unwrap_or(0)
+    })
+}
+
+/// Whether to standardize (zero-mean / unit-variance) the MAPPO actor's GAE advantages
+/// across each episode's policy batch before the policy-gradient step. This is the
+/// standard PPO/MAPPO variance-reduction normalization, but it changes the effective
+/// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
+/// to opt in) — leaving the default training run byte-identical. Read once per process.
+pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1" || raw.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
     })
 }
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
