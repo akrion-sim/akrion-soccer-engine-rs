@@ -1,5 +1,8 @@
-do not git checkout to switch branches stay on main branch
-do not switch branches away from main
+WORK ONLY ON `main`. Do NOT `git checkout` another branch, do NOT create new
+branches, and do NOT create git worktrees on other branches. Stay in this one
+working tree on `main` and commit directly to it. To incorporate another branch's
+work, run `git merge <branch>` FROM main (a merge does not check the branch out).
+Branches/worktrees are forbidden even as a "safe sandbox" — keep everything on main.
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
 MPC = model predictive control
