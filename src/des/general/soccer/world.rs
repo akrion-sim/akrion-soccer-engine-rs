@@ -17989,6 +17989,74 @@ impl WorldSnapshot {
         (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
     }
 
+    /// True when a ground/low pass to `pass_point` concedes the reception to an opponent:
+    /// the nearest opponent to the reception point is on/near it and can REACH the arriving
+    /// ball. This is the ball-to-an-opponent's-feet / man-marked-receiver case that
+    /// [`Self::pass_point_directly_favors_opponent`] and
+    /// [`Self::pass_point_direct_opponent_control_risk`] both miss, because they only model
+    /// an opponent who is strictly CLOSER to the aim than the receiver and so return zero
+    /// when the receiver is himself at the aim point with a marker shadowing him.
+    ///
+    /// A defender essentially on the ball (within `AT_FEET`) is always a concession; a
+    /// marker within `MARK_RADIUS` is a hard concession only when `passer_pressure` is real,
+    /// so a brave pass to a half-open man and a contested final-third reception to an OPEN
+    /// receiver are left to the soft congestion penalty rather than hard-vetoed. The reach
+    /// check keeps a slow/distant marker, or a ball driven past too fast to be cut out, from
+    /// tripping it.
+    pub(crate) fn pass_reception_conceded_to_opponent(
+        &self,
+        team: Team,
+        _receiver_position: Vec2,
+        pass_origin: Vec2,
+        pass_point: Vec2,
+        ball_speed_yps: f64,
+        passer_pressure: f64,
+    ) -> bool {
+        let Some((opponent_id, opponent_position, opponent_distance)) =
+            self.nearest_opponent_at(team, pass_point)
+        else {
+            return false;
+        };
+        if !opponent_distance.is_finite()
+            || opponent_distance > PASS_RECEPTION_CONCEDE_MARK_RADIUS_YARDS
+        {
+            return false;
+        }
+        let at_feet = opponent_distance <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+        // A marker within reach but not glued to the ball only concedes under real passer
+        // pressure — the "forced ball into a tightly-marked man" the user reported.
+        if !at_feet && passer_pressure < IN_BEHIND_SPRINT_PRESSURE {
+            return false;
+        }
+        // Can the opponent reach the arriving ball? Reuse the lane-arrival + sprint-reach
+        // model so a slow/distant marker, or a ball driven past quickly, does not trip it.
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let lane = pass_point - pass_origin;
+        let lane_len = lane.len();
+        let ball_arrival = if lane_len < 1e-3 {
+            0.0
+        } else {
+            let dir = lane * (1.0 / lane_len);
+            let along = (opponent_position - pass_origin)
+                .dot(dir)
+                .clamp(0.0, lane_len);
+            along / speed
+        };
+        if at_feet {
+            return true;
+        }
+        let Some(opponent) = self.players.iter().find(|p| p.id == opponent_id) else {
+            return false;
+        };
+        let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window
+    }
+
     /// Score the shot **placement** as a discrete decision instead of defaulting to the
     /// goal centre (where the keeper usually stands). Sweeps placement buckets across the
     /// goal mouth — just inside each post — and returns the goal-line x the opposing keeper
@@ -22799,13 +22867,26 @@ impl WorldSnapshot {
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
                 // HARD veto (the real fix for "passing straight to the opposition"): if the aim
                 // point is clearly closer to an opponent than to the intended receiver, sink the
-                // candidate so it never wins over holding or a safe outlet.
-                let direct_opponent_aim_veto =
-                    if self.pass_point_directly_favors_opponent(me.team, position, pass_point) {
-                        PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
-                    } else {
-                        0.0
-                    };
+                // candidate so it never wins over holding or a safe outlet. The second clause
+                // closes the man-marked-receiver / ball-to-the-feet hole the aim-point test
+                // misses (an opponent level-with-or-in-front of a receiver who is himself at the
+                // aim point), so a pressured holder can't feed a tightly-marked teammate.
+                let passer_pressure_for_veto =
+                    self.attacker_pressure_on_point(me.team, me_position);
+                let direct_opponent_aim_veto = if self
+                    .pass_point_directly_favors_opponent(me.team, position, pass_point)
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        pass_point,
+                        score_nominal_speed,
+                        passer_pressure_for_veto,
+                    ) {
+                    PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
+                } else {
+                    0.0
+                };
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -23118,12 +23199,30 @@ impl WorldSnapshot {
                 ));
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
+                let aerial_passer_pressure_for_veto =
+                    self.attacker_pressure_on_point(me.team, me_position);
                 let direct_opponent_aim_veto = if self
                     .pass_point_directly_favors_opponent(me.team, position, pass_point)
                     || self.pass_point_directly_favors_opponent(
                         me.team,
                         position,
                         anticipated_position,
+                    )
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        pass_point,
+                        score_nominal_speed,
+                        aerial_passer_pressure_for_veto,
+                    )
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        anticipated_position,
+                        score_nominal_speed,
+                        aerial_passer_pressure_for_veto,
                     ) {
                     PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
                 } else {

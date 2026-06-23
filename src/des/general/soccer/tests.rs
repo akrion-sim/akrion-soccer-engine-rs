@@ -1310,6 +1310,73 @@ fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
 }
 
 #[test]
+fn pass_to_marked_man_or_opponent_feet_is_conceded() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_117,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    let open_receiver = 6;
+    park_players_except(&mut sim, &[passer, receiver, marker, open_receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 55.0);
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[open_receiver].team = Team::Home;
+    sim.players[open_receiver].role = PlayerRole::Forward;
+    sim.players[open_receiver].position = Vec2::new(58.0, 50.0); // isolated, no marker near
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+    let passer_pos = sim.players[passer].position;
+    let receiver_pos = sim.players[receiver].position;
+    let open_pos = sim.players[open_receiver].position;
+
+    // A typical man-mark (~1.8yd off the receiver, not glued to the ball).
+    sim.players[marker].position = Vec2::new(41.6, 55.8);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // Under real passer pressure, feeding the marked man is a conceded reception (hard veto).
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.8,
+        ),
+        "a pressured pass to a tightly-marked receiver should be a conceded reception"
+    );
+    // Without pressure the same pass is left to the soft congestion penalty, not hard-vetoed.
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.1,
+        ),
+        "an unpressured pass to a marked man should remain learnable, not hard-vetoed"
+    );
+    // An open teammate (no opponent inside the mark radius) is never a concession.
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, open_pos, passer_pos, open_pos, speed, 0.8,
+        ),
+        "a pass to an open teammate must not be vetoed as conceded"
+    );
+
+    // The ball played essentially to an opponent's feet is a concession even with zero
+    // passer pressure (the "team A passes straight to team B" bug).
+    sim.players[marker].position = Vec2::new(40.5, 55.4); // ~0.6yd from the reception point
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.0,
+        ),
+        "a ball played to an opponent's feet should always be a conceded reception"
+    );
+}
+
+#[test]
 fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
