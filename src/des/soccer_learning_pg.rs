@@ -25,7 +25,7 @@ use crate::des::general::tournament::{
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
-    SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
+    SoccerLearningPolicyDelta, SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
 use std::collections::HashMap;
 
@@ -123,32 +123,32 @@ target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_
 do nothing";
 const SOCCER_MOMENT_EMBEDDING_SEARCH_SQL: &str = "\
 select team, action, reward_micros, value_micros, tick, \
-(embedding <=> $1::vector) as distance \
+(embedding <=> $1::text::vector) as distance \
 from des_soccer_moment_embeddings \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
-order by embedding <=> $1::vector \
+order by embedding <=> $1::text::vector \
 limit $3";
 const SOCCER_CONFIG_MOMENT_SEARCH_SQL: &str = "\
 select team, role, action, reward_micros, nstep_return_micros, value_micros, \
-tick, features, (embedding <=> $1::vector) as distance \
+tick, features, (embedding <=> $1::text::vector) as distance \
 from des_soccer_config_moments \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
-order by embedding <=> $1::vector \
+order by embedding <=> $1::text::vector \
 limit $3";
 /// As [`SOCCER_CONFIG_MOMENT_SEARCH_SQL`] but over the **assigned-position**
 /// corpus (slot-aligned ordering). Back-compat rows without the second corpus
 /// (null `embedding_assigned`) are skipped so the cosine geometry stays defined.
 const SOCCER_CONFIG_MOMENT_SEARCH_ASSIGNED_SQL: &str = "\
 select team, role, action, reward_micros, nstep_return_micros, value_micros, \
-tick, features_assigned, (embedding_assigned <=> $1::vector) as distance \
+tick, features_assigned, (embedding_assigned <=> $1::text::vector) as distance \
 from des_soccer_config_moments \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
   and embedding_assigned is not null \
   and features_assigned is not null \
-order by embedding_assigned <=> $1::vector \
+order by embedding_assigned <=> $1::text::vector \
 limit $3";
 const SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL: &str = "\
 update des_soccer_moment_embeddings \
@@ -206,6 +206,8 @@ fn soccer_policy_search_label_uses_evolutionary_search(label: &str) -> bool {
     normalized.contains("evolution")
         || normalized.contains("genetic")
         || normalized.contains("gp")
+        || normalized.contains("mutation")
+        || normalized.contains("mutate")
         || normalized.contains("symbolicregression")
         || normalized.contains("programtree")
 }
@@ -246,6 +248,24 @@ fn soccer_policy_search_metadata_uses_evolutionary_search(metadata: &Value) -> b
             .iter()
             .any(soccer_policy_search_metadata_uses_evolutionary_search),
         _ => false,
+    }
+}
+
+fn soccer_team_from_label(label: &str) -> Result<Team, String> {
+    match label {
+        "home" => Ok(Team::Home),
+        "away" => Ok(Team::Away),
+        other => Err(format!("unknown soccer team label {other:?}")),
+    }
+}
+
+fn soccer_policy_entry_kind_from_label(
+    label: &str,
+) -> Result<SoccerLearningPolicyEntryKind, String> {
+    match label {
+        "action" => Ok(SoccerLearningPolicyEntryKind::Action),
+        "target" => Ok(SoccerLearningPolicyEntryKind::Target),
+        other => Err(format!("unknown soccer policy entry kind {other:?}")),
     }
 }
 
@@ -2170,6 +2190,97 @@ impl SoccerLearningPgStore {
         Ok(run_ids)
     }
 
+    pub fn load_recent_completed_run_policy_delta(
+        &mut self,
+        experiment_id: &str,
+        max_delta_rows: usize,
+        created_after_micros: Option<i64>,
+    ) -> Result<SoccerLearningPolicyDelta, String> {
+        if max_delta_rows == 0 {
+            return Ok(SoccerLearningPolicyDelta::default());
+        }
+        self.ensure_connected()?;
+        let limit = max_delta_rows.min(i64::MAX as usize) as i64;
+        let rows = self
+            .client
+            .query(
+                r#"
+                select
+                  d.team,
+                  d.entry_kind,
+                  d.state_hash,
+                  d.state_key,
+                  d.action,
+                  d.target_fine_cell_id,
+                  d.target_tactical_cell_id,
+                  d.target_macro_cell_id,
+                  d.target_root_cell_id,
+                  d.before_value_micros,
+                  d.after_value_micros,
+                  d.value_delta_micros,
+                  d.visit_delta,
+                  d.merge_weight_micros,
+                  d.effective_visit_micros
+                from des_soccer_learning_run_deltas d
+                join des_soccer_learning_runs r on r.id = d.run_id
+                where r.experiment_id = $1::text::uuid
+                  and r.status = 'completed'
+                  and ($3::bigint is null
+                       or r.created_at > to_timestamp(($3::double precision) / 1000000.0))
+                order by r.created_at desc, r.id desc,
+                         d.team, d.entry_kind, d.state_hash, d.action,
+                         d.target_fine_cell_id, d.target_tactical_cell_id,
+                         d.target_macro_cell_id, d.target_root_cell_id
+                limit $2
+                "#,
+                &[&experiment_id, &limit, &created_after_micros],
+            )
+            .map_err(|err| format!("load recent soccer completed-run policy deltas: {err}"))?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let team_label: String = row.get(0);
+            let entry_kind_label: String = row.get(1);
+            let stored_state_hash: String = row.get(2);
+            let state_json: Value = row.get(3);
+            let state_key: SoccerQStateKey = serde_json::from_value(state_json.clone())
+                .map_err(|err| format!("decode soccer run-delta state key: {err}"))?;
+            let before_value_micros: i64 = row.get(9);
+            let after_value_micros: i64 = row.get(10);
+            let value_delta_micros: i64 = row.get(11);
+            let merge_weight_micros: i64 = row.get(13);
+            let effective_visit_micros: i64 = row.get(14);
+            let state_hash = if stored_state_hash.trim().is_empty() {
+                state_hash(&state_json)
+            } else {
+                stored_state_hash
+            };
+            entries.push(SoccerLearningPolicyDeltaEntry {
+                team: soccer_team_from_label(&team_label)?,
+                entry_kind: soccer_policy_entry_kind_from_label(&entry_kind_label)?,
+                state_hash,
+                state_key,
+                state_json,
+                action: row.get(4),
+                target_fine_cell_id: row.get(5),
+                target_tactical_cell_id: row.get(6),
+                target_macro_cell_id: row.get(7),
+                target_root_cell_id: row.get(8),
+                before_value: soccer_learning_from_micros(before_value_micros),
+                after_value: soccer_learning_from_micros(after_value_micros),
+                value_delta: soccer_learning_from_micros(value_delta_micros),
+                before_value_micros,
+                after_value_micros,
+                value_delta_micros,
+                visit_delta: row.get::<_, i32>(12).max(0) as u32,
+                merge_weight: soccer_learning_from_micros(merge_weight_micros),
+                merge_weight_micros,
+                effective_visit_weight: soccer_learning_from_micros(effective_visit_micros),
+                effective_visit_micros,
+            });
+        }
+        Ok(SoccerLearningPolicyDelta { entries })
+    }
+
     pub fn prune_completed_runs_for_experiment(
         &mut self,
         experiment_id: &str,
@@ -3699,6 +3810,14 @@ fn ensure_soccer_learning_policy_retention_columns(
             updated_at desc
           )
           where full_entries_retained = true;
+        create index if not exists des_soccer_learning_policy_versions_active_metadata_idx
+          on des_soccer_learning_policy_versions (
+            experiment_id,
+            generation desc,
+            updated_at desc,
+            id desc
+          )
+          where status = 'active';
         "#,
     )
     .map_err(|err| format!("ensure soccer policy retention columns: {err}"))?;
@@ -3824,7 +3943,7 @@ fn moment_embedding_values_clause(rows: usize) -> String {
         let base = 3 + i * 6;
         let _ = write!(
             clause,
-            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${}::vector)",
+            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${}::text::vector)",
             base,
             base + 1,
             base + 2,
@@ -4042,7 +4161,7 @@ fn insert_config_moments_in_transaction(
     experiment_id: Option<&str>,
     moments: &[SoccerConfigMomentInsert],
 ) -> Result<(), String> {
-    // Chunked multi-row insert: 9 params per row plus the 2 shared run/experiment
+    // Chunked multi-row insert: 11 params per row plus the 2 shared run/experiment
     // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
     // 65535-parameter ceiling.
     for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
@@ -4120,7 +4239,8 @@ fn config_moment_values_clause(rows: usize) -> String {
         let base = 3 + i * 11;
         let _ = write!(
             clause,
-            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${},${},${}::vector,${},${}::vector,${})",
+            "($1::text::uuid,$2::text::uuid,${}::text,${}::bigint,${}::text,${}::text,\
+             ${}::bigint,${}::bigint,${}::bigint,${}::text::vector,${}::real[],${}::text::vector,${}::real[])",
             base,
             base + 1,
             base + 2,
@@ -5041,12 +5161,12 @@ mod tests {
         assert_eq!(moment_embedding_values_clause(0), "");
         assert_eq!(
             moment_embedding_values_clause(1),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::vector)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::text::vector)"
         );
         assert_eq!(
             moment_embedding_values_clause(2),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::vector),\
-             ($1::text::uuid,$2::text::uuid,$9,$10,$11,$12,$13,$14::vector)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::text::vector),\
+             ($1::text::uuid,$2::text::uuid,$9,$10,$11,$12,$13,$14::text::vector)"
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + MOMENT_EMBEDDING_INSERT_CHUNK_ROWS * 6;
@@ -5058,12 +5178,15 @@ mod tests {
         assert_eq!(config_moment_values_clause(0), "");
         assert_eq!(
             config_moment_values_clause(1),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13)"
+            "($1::text::uuid,$2::text::uuid,$3::text,$4::bigint,$5::text,$6::text,\
+             $7::bigint,$8::bigint,$9::bigint,$10::text::vector,$11::real[],$12::text::vector,$13::real[])"
         );
         assert_eq!(
             config_moment_values_clause(2),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13),\
-             ($1::text::uuid,$2::text::uuid,$14,$15,$16,$17,$18,$19,$20,$21::vector,$22,$23::vector,$24)"
+            "($1::text::uuid,$2::text::uuid,$3::text,$4::bigint,$5::text,$6::text,\
+             $7::bigint,$8::bigint,$9::bigint,$10::text::vector,$11::real[],$12::text::vector,$13::real[]),\
+             ($1::text::uuid,$2::text::uuid,$14::text,$15::bigint,$16::text,$17::text,\
+             $18::bigint,$19::bigint,$20::bigint,$21::text::vector,$22::real[],$23::text::vector,$24::real[])"
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 11;
@@ -5097,7 +5220,7 @@ mod tests {
                 "live vector search must exclude soft-deleted rows: {sql}"
             );
             assert!(
-                sql.contains("order by embedding <=> $1::vector"),
+                sql.contains("order by embedding <=> $1::text::vector"),
                 "ANN ordering must stay vector-distance based: {sql}"
             );
         }
@@ -5483,6 +5606,31 @@ mod tests {
         assert_eq!(
             metrics["learningProvenance"]["sourceKind"],
             json!("server-import")
+        );
+        assert_eq!(
+            metrics["learningProvenance"]["evolutionarySearch"],
+            json!(true)
+        );
+        assert_eq!(
+            metrics["learningProvenance"]["geneticProgrammingTacticalSearch"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn policy_version_metrics_detect_mutation_source_as_evolutionary_search() {
+        let metrics = soccer_policy_version_metrics(
+            "mutation",
+            0.75,
+            None,
+            Some(&SoccerTacticalLearningWeights::default()),
+            None,
+        )
+        .expect("metrics");
+
+        assert_eq!(
+            metrics["learningProvenance"]["sourceKind"],
+            json!("mutation")
         );
         assert_eq!(
             metrics["learningProvenance"]["evolutionarySearch"],

@@ -21,7 +21,8 @@ use soccer_engine::des::general::soccer::{
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
-    evolve_soccer_team_policies, soccer_evolution_options_from_search_metadata,
+    evolve_soccer_team_policies, merge_soccer_policy_deltas,
+    soccer_evolution_options_from_search_metadata,
     soccer_learning_curriculum_stage_for_completed_games, soccer_learning_run_score,
     soccer_neural_network_snapshot_fingerprint, soccer_policy_delta_entries,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_new_sim_refresh_plan,
@@ -51,6 +52,8 @@ const DEFAULT_SOCCER_POSTGRES_ASYNC_COALESCE_WAIT_MS: usize = 2;
 const DEFAULT_SOCCER_POSTGRES_TACTICAL_LEARNING_AUTHORITATIVE: bool = true;
 const DEFAULT_SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT: bool = true;
 const DEFAULT_SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM: bool = true;
+const DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_DELTA_ROWS: usize = 50_000;
+const DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT: f64 = 1.0;
 const DEFAULT_SOCCER_MAX_AUTO_PARALLEL_GAMES: usize = 10;
 const DEFAULT_SOCCER_WRITE_GAME_ARTIFACTS: bool = false;
 const DEFAULT_SOCCER_WRITE_FINAL_POLICY_ARTIFACT: bool = true;
@@ -2446,6 +2449,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM",
         DEFAULT_SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM,
     )?;
+    let pg_training_replay_delta_rows = env_usize(
+        "SOCCER_POSTGRES_TRAINING_REPLAY_DELTA_ROWS",
+        DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_DELTA_ROWS,
+    )?;
+    let pg_training_replay_prior_weight = env_f64(
+        "SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT",
+        DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT,
+    )?;
+    if pg_training_replay_prior_weight < 0.0 {
+        return Err(invalid_data(
+            "SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT must be non-negative",
+        )
+        .into());
+    }
     let pg_completed_run_async_coalesce_wait = Duration::from_millis(
         pg_completed_run_async_coalesce_wait_ms.min(u64::MAX as usize) as u64,
     );
@@ -2798,6 +2815,42 @@ fn run() -> Result<(), Box<dyn Error>> {
                 pg_base_neural_network_fingerprint = version_neural_network_fingerprint;
                 pg_base_tactical_learning_fingerprint = version_tactical_learning_fingerprint;
             }
+        }
+        if pg_training_replay_delta_rows > 0 {
+            let replay_created_after_micros = if pg_base_policy_version_updated_at_micros > 0 {
+                Some(pg_base_policy_version_updated_at_micros)
+            } else {
+                None
+            };
+            let replay_delta = store
+                .load_recent_completed_run_policy_delta(
+                    &experiment_id,
+                    pg_training_replay_delta_rows,
+                    replay_created_after_micros,
+                )
+                .map_err(invalid_data)?;
+            let replay_entries = replay_delta.entries.len();
+            if replay_entries > 0 {
+                policies = merge_soccer_policy_deltas(
+                    &policies,
+                    std::slice::from_ref(&replay_delta),
+                    pg_training_replay_prior_weight,
+                )
+                .map_err(invalid_data)?;
+                pg_base_policy_fingerprint = Some(soccer_team_q_policies_fingerprint(&policies));
+            }
+            println!(
+                "postgres_training_replay experiment={} entries={} max_delta_rows={} prior_weight={:.3} created_after_micros={}",
+                experiment_slug,
+                replay_entries,
+                pg_training_replay_delta_rows,
+                pg_training_replay_prior_weight,
+                replay_created_after_micros
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        } else {
+            println!("postgres_training_replay disabled max_delta_rows=0");
         }
         println!(
             "postgres_enabled experiment={} experiment_id={} base_policy_version={} generation={} retrieval_capture={}",
