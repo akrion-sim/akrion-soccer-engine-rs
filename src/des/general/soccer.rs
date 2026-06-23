@@ -691,7 +691,7 @@ const SHOT_MIN_SPEED_MPH: f64 = 40.0;
 const SHOT_MAX_SPEED_MPH: f64 = 70.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
-const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
+const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const CLEAN_SHOT_MUST_SHOOT_YARDS: f64 = 20.0;
 const CLEAN_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.34;
 const CLEAN_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.32;
@@ -743,10 +743,9 @@ const MAX_BALL_CURL_YPS2: f64 = 7.6;
 const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
 // Hard ceiling on how high any lofted/aerial pass arcs. A lofted ball should never balloon
 // much past ~30ft (10yd) of altitude — only the longest balls reach it, with shorter ones
-// peaking nearer ~20ft (`SHORT_LOFT_APEX_YARDS`). Loft height is purely the vertical arc:
-// it is a function of horizontal progress along the path, NOT of time, and the ball is
-// fully airborne (identical drag) for any apex above `BALL_ROLLING_ALTITUDE_YARDS + 0.18`,
-// so capping the apex does not change x/y speed or time-to-destination — it is realism only.
+// peaking nearer ~20ft (`SHORT_LOFT_APEX_YARDS`). Loft height is gravity-timed from the
+// launch tick, so a higher apex directly increases hang time and must be paired with enough
+// horizontal pace to land near the intended target.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 /// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
@@ -754,11 +753,11 @@ const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
 /// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.15;
-const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 1.45;
-const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 2.35;
-const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
-const SCOOP_MIN_SPEED_MPH: f64 = 12.0;
-const SCOOP_MAX_SPEED_MPH: f64 = 24.0;
+const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft
+const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 10.0 / 3.0; // 10ft
+const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.25;
+const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
+const SCOOP_MAX_SPEED_MPH: f64 = 36.0;
 /// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
 /// attacking area), the classic territory-winning long ball. Only balls at least this long, and
 /// only when forward (toward the opponent's goal line), earn the affinity — a long SIDEWAYS or
@@ -892,6 +891,9 @@ const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 9.5;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 12.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
+const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
+const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
+const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
 // A completed back pass KEEPS possession — it is far better than forcing a forward
 // ball into a turnover. It is only mildly discouraged (so the policy still prefers to
 // progress when it safely can), not punished, so the team learns to retain rather than
@@ -1074,7 +1076,17 @@ const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
 const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.58;
 const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.08;
-const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 6.2;
+const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 12.0;
+
+fn direct_opponent_aim_score_penalty(risk: f64) -> f64 {
+    let risk = risk.clamp(0.0, 1.0);
+    let emergency_penalty = if risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK {
+        PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * 3.0
+    } else {
+        0.0
+    };
+    PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * (risk + risk * risk) + emergency_penalty
+}
 // A BACKWARD ball (aim point this far behind the passer along the attack direction)
 // is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
 // the ball back toward the opponent. A backward pass whose receiver has an opponent
@@ -15358,12 +15370,48 @@ fn pass_direction_bucket(team: Team, origin: Vec2, target: Vec2) -> PassDirectio
     }
 }
 
-fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
+fn completed_flank_pass_reward(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    let target_flank = flank_lane_score(target, field_width).clamp(0.0, 1.0);
+    if target_flank <= 0.0 {
+        return 0.0;
+    }
+    let origin_flank = flank_lane_score(origin, field_width).clamp(0.0, 1.0);
+    let flank_gain = (target_flank - origin_flank).max(0.0);
+    let direction_fit = match pass_direction_bucket(team, origin, target) {
+        PassDirectionBucket::Forward => 1.0,
+        PassDirectionBucket::Lateral => 0.78,
+        PassDirectionBucket::Backward => 0.0,
+    };
+    if direction_fit <= 0.0 {
+        return 0.0;
+    }
+    let half_multiplier = if pass_origin_in_own_half(team, origin, field_length) {
+        COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER
+    } else {
+        1.0
+    };
+    let flank_use = (target_flank * 0.72 + flank_gain * 0.28).clamp(0.0, 1.0);
+    COMPLETED_FLANK_PASS_BONUS_POINTS * flank_use * direction_fit * half_multiplier
+}
+
+fn completed_pass_reward_for_pitch(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
     let forward_yards = ((target.y - origin.y) * team.attack_dir())
         .max(0.0)
         .clamp(0.0, COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS);
     let forward_progress_reward = forward_yards * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD;
-    match (
+    let base = match (
         pass_direction_bucket(team, origin, target),
         pass_origin_in_own_half(team, origin, field_length),
     ) {
@@ -15379,7 +15427,12 @@ fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f
         (PassDirectionBucket::Lateral, _) => 2.6,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
-    }
+    };
+    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
+}
+
+fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
+    completed_pass_reward_for_pitch(team, origin, target, DEFAULT_FIELD_WIDTH_YARDS, field_length)
 }
 
 fn cross_scoring_channel_score(
@@ -17533,8 +17586,13 @@ fn soccer_transition_reward_with_tactics(
                     let origin = before
                         .player_position(player.id)
                         .unwrap_or(before.ball.position);
-                    reward +=
-                        completed_pass_reward(player.team, origin, target, before.field_length);
+                    reward += completed_pass_reward_for_pitch(
+                        player.team,
+                        origin,
+                        target,
+                        before.field_width,
+                        before.field_length,
+                    );
                     let flight = pass_like_action_flight(action).unwrap_or(PassFlight::Floor);
                     let is_cross = matches!(
                         SoccerActionLabel::classify(action),
@@ -19056,13 +19114,19 @@ fn tactical_shape_trace(
         let flank_delta = (flank_lane_score(after_pos, field_width)
             - flank_lane_score(before_pos, field_width))
         .clamp(-1.0, 1.0);
+        let own_half_possession = pass_origin_in_own_half(team, before.ball.position, before.field_length);
+        let flank_reward_weight = weights.attack_flank_lane_weight
+            * if own_half_possession {
+                OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER
+            } else {
+                1.0
+            };
         let mut reward = width_delta * weights.attack_width_delta_weight * spacing_weight;
         reward += attack_width_score(after_width, field_width)
             * weights.attack_width_score_weight
             * spacing_weight;
-        reward += flank_delta * weights.attack_flank_lane_weight;
-        reward +=
-            flank_lane_score(after_pos, field_width) * weights.attack_flank_lane_weight * 0.18;
+        reward += flank_delta * flank_reward_weight;
+        reward += flank_lane_score(after_pos, field_width) * flank_reward_weight * 0.18;
         if let Some(TeamSpacingMode::InPossession) = spacing_mode {
             reward += spacing_delta.2.clamp(-1.0, 1.0)
                 * weights.attack_spacing_delta_weight
@@ -46817,14 +46881,14 @@ const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
 fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
     let distance_fit = ((distance_yards.max(0.0) - 4.0) / 10.0).clamp(0.0, 1.0);
-    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.35 + unit.clamp(0.0, 1.0) * 0.55)
+    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.64 + unit.clamp(0.0, 1.0) * 0.70)
         .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
 }
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot, not into a hanging balloon arc. Keep it low
-        // (roughly 4-7ft) with a little stable per-pass variation.
+        // (roughly 6-10ft) with a little stable per-pass variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
@@ -47052,7 +47116,7 @@ fn pass_speed_yps_from_power(
     // A scoop is a low, short dink over a close defender: slower than a driven aerial but
     // not a balloon. Gravity calibration below still decides the final launch speed.
     if flight.is_scoop() {
-        return mph_to_yps(SCOOP_MIN_SPEED_MPH + ability01(skills.flair_passing) * 4.0);
+        return mph_to_yps(SCOOP_MIN_SPEED_MPH + ability01(skills.flair_passing) * 6.0);
     }
     let passing = ability01(skills.passing_completion_rate);
     let crossing = ability01(skills.crossing_left.max(skills.crossing_right));
@@ -47440,16 +47504,16 @@ fn modulated_pass_speed_yps(
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
     if flight.is_scoop() {
-        // Low scoop calibration: the apex is only around head height, so it must be
-        // struck firmly enough to land near the target during that short hang time.
+        // Low scoop calibration: a 6-10ft dink still has only about 1.2-1.6s of
+        // gravity hang time, so strike it firmly enough to arrive inside that window.
         let apex_yards = scoop_loft_apex_yards(distance, 0.5);
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let land_at_target =
             (distance / hang_time.max(0.35)) * SCOOP_LAND_AT_TARGET_DRAG_COMP;
-        let pressure_firm = 1.0 + pressure * 0.08 - openness * 0.03;
+        let pressure_firm = 1.04 + pressure * 0.10 - openness * 0.02;
         let desired_speed = land_at_target * pressure_firm;
         let skill = passing_skill.clamp(0.0, 1.0);
-        let fit = (0.55 + skill * 0.30 + openness * 0.08).clamp(0.55, 0.93);
+        let fit = (0.86 + skill * 0.08 + openness * 0.04).clamp(0.84, 0.98);
         return (raw_speed_yps + (desired_speed - raw_speed_yps) * fit)
             .clamp(mph_to_yps(SCOOP_MIN_SPEED_MPH), mph_to_yps(SCOOP_MAX_SPEED_MPH));
     }

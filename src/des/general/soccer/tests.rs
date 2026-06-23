@@ -1307,6 +1307,100 @@ fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
 }
 
 #[test]
+fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_245,
+        ..Default::default()
+    });
+    let passer = 7;
+    let safer_receiver = 6;
+    let receiver = 9;
+    let opponent = 13;
+    park_players_except(&mut sim, &[passer, safer_receiver, receiver, opponent]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 58.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].skills.passing_completion_rate = 10.0;
+    sim.players[passer].skills.passing = 10.0;
+    sim.players[passer].skills.vision = 10.0;
+    sim.players[passer].skills.crossing_left = 10.0;
+    sim.players[passer].skills.crossing_right = 10.0;
+    sim.players[safer_receiver].team = Team::Home;
+    sim.players[safer_receiver].role = PlayerRole::Forward;
+    sim.players[safer_receiver].position = Vec2::new(48.0, 73.0);
+    sim.players[safer_receiver].home_position = sim.players[safer_receiver].position;
+    sim.players[safer_receiver].velocity = Vec2::new(0.0, 3.5);
+    sim.players[safer_receiver].skills.height = 10.0;
+    sim.players[safer_receiver].skills.strength = 10.0;
+    sim.players[safer_receiver].skills.first_touch = 10.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 76.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::new(0.0, 5.5);
+    sim.players[receiver].skills.height = 10.0;
+    sim.players[receiver].skills.strength = 10.0;
+    sim.players[receiver].skills.first_touch = 10.0;
+    sim.players[opponent].team = Team::Away;
+    sim.players[opponent].position = Vec2::new(70.0, 40.0);
+    sim.players[opponent].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position + Vec2::new(0.0, 0.25);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let safe_snapshot = WorldSnapshot::from_match(&sim);
+    let safe_ranked = safe_snapshot.ranked_visible_aerial_pass_targets(passer, 11);
+    let safe_receiver_rank = safe_ranked
+        .iter()
+        .position(|&id| id == receiver)
+        .expect("risky receiver should be an aerial option before the opponent owns it");
+    let safe_outlet_rank = safe_ranked
+        .iter()
+        .position(|&id| id == safer_receiver)
+        .expect("safer receiver should be an aerial option");
+    assert!(
+        safe_receiver_rank <= safe_outlet_rank,
+        "test setup should make the central aerial receiver competitive before direct-opponent risk; ranked={safe_ranked:?}"
+    );
+
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Aerial, false, &sim.players[passer].skills);
+    let led_target = safe_snapshot
+        .anticipated_pass_reception_point(passer, receiver, PassFlight::Aerial, speed)
+        .expect("test should produce an aerial led target");
+    sim.players[opponent].position = led_target + Vec2::new(1.0, 0.0);
+
+    let risky_snapshot = WorldSnapshot::from_match(&sim);
+    let direct_risk = risky_snapshot.pass_point_direct_opponent_control_risk(
+        Team::Home,
+        sim.players[receiver].position,
+        sim.players[passer].position,
+        led_target,
+        speed,
+    );
+    assert!(
+        direct_risk > 0.15,
+        "test setup should create aerial direct-opponent control risk, got {direct_risk}"
+    );
+
+    let risky_ranked = risky_snapshot.ranked_visible_aerial_pass_targets(passer, 11);
+    let safer_rank = risky_ranked
+        .iter()
+        .position(|&id| id == safer_receiver)
+        .expect("safer receiver should remain available");
+    let risky_rank = risky_ranked
+        .iter()
+        .position(|&id| id == receiver)
+        .expect("risky aerial pass should remain learnable instead of being hard-vetoed");
+    assert!(
+        safer_rank < risky_rank,
+        "aerial direct-opponent control risk should drop the risky option behind a safer outlet; risk={direct_risk:.3} ranked={risky_ranked:?}"
+    );
+}
+
+#[test]
 fn scored_shot_placement_aims_at_the_keepers_open_side() {
     // "Price the placement, don't shoot at the keeper": a scored shot aims at the
     // goal-mouth spot the keeper can least reach, not dead-centre. A keeper off to one
@@ -6125,7 +6219,88 @@ fn completed_pass_reward_prioritizes_forward_progression() {
     assert!(
             lateral > attacking_backward,
             "lateral recycle should still beat a backward release: lateral={lateral} backward={attacking_backward}"
-        );
+    );
+}
+
+#[test]
+fn completed_pass_reward_values_flank_usage_more_in_own_half() {
+    let field_width = 80.0;
+    let field_length = 120.0;
+    let own_half_center = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(40.0, 52.0),
+        field_width,
+        field_length,
+    );
+    let own_half_wide = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(8.0, 52.0),
+        field_width,
+        field_length,
+    );
+    let attacking_center = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 76.0),
+        Vec2::new(40.0, 88.0),
+        field_width,
+        field_length,
+    );
+    let attacking_wide = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 76.0),
+        Vec2::new(8.0, 88.0),
+        field_width,
+        field_length,
+    );
+    let own_lateral_center = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(44.0, 40.2),
+        field_width,
+        field_length,
+    );
+    let own_lateral_wide = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(8.0, 40.2),
+        field_width,
+        field_length,
+    );
+    let own_backward_center = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(40.0, 34.0),
+        field_width,
+        field_length,
+    );
+    let own_backward_wide = completed_pass_reward_for_pitch(
+        Team::Home,
+        Vec2::new(40.0, 40.0),
+        Vec2::new(8.0, 34.0),
+        field_width,
+        field_length,
+    );
+
+    let own_bonus = own_half_wide - own_half_center;
+    let attacking_bonus = attacking_wide - attacking_center;
+    assert!(
+        own_half_wide > own_half_center + 2.0,
+        "own-half completed passes into the flank should earn a clear extra reward: wide={own_half_wide} center={own_half_center}"
+    );
+    assert!(
+        own_bonus > attacking_bonus + 1.0,
+        "flank usage should be rewarded more from the team's own half: own_bonus={own_bonus} attacking_bonus={attacking_bonus}"
+    );
+    assert!(
+        own_lateral_wide > own_lateral_center + 1.5,
+        "own-half lateral switches to the wing should be valued: wide={own_lateral_wide} center={own_lateral_center}"
+    );
+    assert!(
+        (own_backward_wide - own_backward_center).abs() <= 1e-9,
+        "backward passes should not earn a flank bonus just for being wide: wide={own_backward_wide} center={own_backward_center}"
+    );
 }
 
 #[test]
@@ -71390,19 +71565,25 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
             learn_features: Vec::new(),
         };
         let apex = pass_loft_apex_yards(&pass);
+        let apex_feet = apex * 3.0;
         let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
         let flight_time = distance / speed;
         assert!(
-            apex <= SCOOP_LOFT_APEX_MAX_YARDS + 1e-9,
-            "scoop apex should stay low, got {apex:.2}yd"
+            (6.0 - 1e-9..=10.0 + 1e-9).contains(&apex_feet),
+            "scoop apex should stay in the 6-10ft window, got {apex_feet:.1}ft"
         );
         assert!(
-            hang_time <= 1.35,
-            "scoop hang time should be short, got {hang_time:.2}s for {distance:.0}yd"
+            hang_time <= 1.60,
+            "scoop hang time should follow 10ft gravity math, got {hang_time:.2}s for {distance:.0}yd"
         );
         assert!(
-            flight_time <= 1.10,
-            "scoop should reach the target quickly, got {flight_time:.2}s for {distance:.0}yd"
+            flight_time <= hang_time + 0.05,
+            "scoop should reach the target inside its gravity hang-time window, got {flight_time:.2}s \
+             vs {hang_time:.2}s for {distance:.0}yd"
+        );
+        assert!(
+            flight_time <= 1.35,
+            "scoop should be clipped and snappy, got {flight_time:.2}s for {distance:.0}yd"
         );
     }
 }

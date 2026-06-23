@@ -6466,10 +6466,11 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
-        let amount = completed_pass_reward(
+        let amount = completed_pass_reward_for_pitch(
             pass.team,
             pass.origin,
             pass.intended_target,
+            self.config.field_width_yards,
             self.config.field_length_yards,
         ) + completed_pass_anticipation_reward(pass)
             + completed_cross_reward(
@@ -22512,7 +22513,7 @@ impl WorldSnapshot {
                     score_nominal_speed,
                 );
                 let direct_opponent_aim_penalty =
-                    PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * direct_opponent_control_risk;
+                    direct_opponent_aim_score_penalty(direct_opponent_control_risk);
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -22711,9 +22712,9 @@ impl WorldSnapshot {
                         me_position,
                         pass_point,
                     ))
-                .then_some((p, position, pass_point))
+                .then_some((p, position, anticipated_position, pass_point))
             })
-            .map(|(p, position, pass_point)| {
+            .map(|(p, position, anticipated_position, pass_point)| {
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let dist = me_position.distance(pass_point);
                 let confidence = self
@@ -22814,9 +22815,16 @@ impl WorldSnapshot {
                     me_position,
                     pass_point,
                     score_nominal_speed,
-                );
+                )
+                .max(self.pass_point_direct_opponent_control_risk(
+                    me.team,
+                    position,
+                    me_position,
+                    anticipated_position,
+                    score_nominal_speed,
+                ));
                 let direct_opponent_aim_penalty =
-                    PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * direct_opponent_control_risk;
+                    direct_opponent_aim_score_penalty(direct_opponent_control_risk);
                 let keeper_distribution_bonus = if me.role == PlayerRole::Goalkeeper {
                     goalkeeper_distribution_score(
                         me.team,

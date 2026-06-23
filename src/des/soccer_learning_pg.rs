@@ -123,32 +123,32 @@ target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_
 do nothing";
 const SOCCER_MOMENT_EMBEDDING_SEARCH_SQL: &str = "\
 select team, action, reward_micros, value_micros, tick, \
-(embedding <=> $1::vector) as distance \
+(embedding <=> $1::text::vector) as distance \
 from des_soccer_moment_embeddings \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
-order by embedding <=> $1::vector \
+order by embedding <=> $1::text::vector \
 limit $3";
 const SOCCER_CONFIG_MOMENT_SEARCH_SQL: &str = "\
 select team, role, action, reward_micros, nstep_return_micros, value_micros, \
-tick, features, (embedding <=> $1::vector) as distance \
+tick, features, (embedding <=> $1::text::vector) as distance \
 from des_soccer_config_moments \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
-order by embedding <=> $1::vector \
+order by embedding <=> $1::text::vector \
 limit $3";
 /// As [`SOCCER_CONFIG_MOMENT_SEARCH_SQL`] but over the **assigned-position**
 /// corpus (slot-aligned ordering). Back-compat rows without the second corpus
 /// (null `embedding_assigned`) are skipped so the cosine geometry stays defined.
 const SOCCER_CONFIG_MOMENT_SEARCH_ASSIGNED_SQL: &str = "\
 select team, role, action, reward_micros, nstep_return_micros, value_micros, \
-tick, features_assigned, (embedding_assigned <=> $1::vector) as distance \
+tick, features_assigned, (embedding_assigned <=> $1::text::vector) as distance \
 from des_soccer_config_moments \
 where ($2::text is null or team = $2) \
   and deleted_at is null \
   and embedding_assigned is not null \
   and features_assigned is not null \
-order by embedding_assigned <=> $1::vector \
+order by embedding_assigned <=> $1::text::vector \
 limit $3";
 const SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL: &str = "\
 update des_soccer_moment_embeddings \
@@ -3810,6 +3810,14 @@ fn ensure_soccer_learning_policy_retention_columns(
             updated_at desc
           )
           where full_entries_retained = true;
+        create index if not exists des_soccer_learning_policy_versions_active_metadata_idx
+          on des_soccer_learning_policy_versions (
+            experiment_id,
+            generation desc,
+            updated_at desc,
+            id desc
+          )
+          where status = 'active';
         "#,
     )
     .map_err(|err| format!("ensure soccer policy retention columns: {err}"))?;
@@ -3935,7 +3943,7 @@ fn moment_embedding_values_clause(rows: usize) -> String {
         let base = 3 + i * 6;
         let _ = write!(
             clause,
-            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${}::vector)",
+            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${}::text::vector)",
             base,
             base + 1,
             base + 2,
@@ -4153,7 +4161,7 @@ fn insert_config_moments_in_transaction(
     experiment_id: Option<&str>,
     moments: &[SoccerConfigMomentInsert],
 ) -> Result<(), String> {
-    // Chunked multi-row insert: 9 params per row plus the 2 shared run/experiment
+    // Chunked multi-row insert: 11 params per row plus the 2 shared run/experiment
     // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
     // 65535-parameter ceiling.
     for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
@@ -4231,7 +4239,8 @@ fn config_moment_values_clause(rows: usize) -> String {
         let base = 3 + i * 11;
         let _ = write!(
             clause,
-            "($1::text::uuid,$2::text::uuid,${},${},${},${},${},${},${},${}::vector,${},${}::vector,${})",
+            "($1::text::uuid,$2::text::uuid,${}::text,${}::bigint,${}::text,${}::text,\
+             ${}::bigint,${}::bigint,${}::bigint,${}::text::vector,${}::real[],${}::text::vector,${}::real[])",
             base,
             base + 1,
             base + 2,
@@ -5152,12 +5161,12 @@ mod tests {
         assert_eq!(moment_embedding_values_clause(0), "");
         assert_eq!(
             moment_embedding_values_clause(1),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::vector)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::text::vector)"
         );
         assert_eq!(
             moment_embedding_values_clause(2),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::vector),\
-             ($1::text::uuid,$2::text::uuid,$9,$10,$11,$12,$13,$14::vector)"
+            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8::text::vector),\
+             ($1::text::uuid,$2::text::uuid,$9,$10,$11,$12,$13,$14::text::vector)"
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + MOMENT_EMBEDDING_INSERT_CHUNK_ROWS * 6;
@@ -5169,12 +5178,15 @@ mod tests {
         assert_eq!(config_moment_values_clause(0), "");
         assert_eq!(
             config_moment_values_clause(1),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13)"
+            "($1::text::uuid,$2::text::uuid,$3::text,$4::bigint,$5::text,$6::text,\
+             $7::bigint,$8::bigint,$9::bigint,$10::text::vector,$11::real[],$12::text::vector,$13::real[])"
         );
         assert_eq!(
             config_moment_values_clause(2),
-            "($1::text::uuid,$2::text::uuid,$3,$4,$5,$6,$7,$8,$9,$10::vector,$11,$12::vector,$13),\
-             ($1::text::uuid,$2::text::uuid,$14,$15,$16,$17,$18,$19,$20,$21::vector,$22,$23::vector,$24)"
+            "($1::text::uuid,$2::text::uuid,$3::text,$4::bigint,$5::text,$6::text,\
+             $7::bigint,$8::bigint,$9::bigint,$10::text::vector,$11::real[],$12::text::vector,$13::real[]),\
+             ($1::text::uuid,$2::text::uuid,$14::text,$15::bigint,$16::text,$17::text,\
+             $18::bigint,$19::bigint,$20::bigint,$21::text::vector,$22::real[],$23::text::vector,$24::real[])"
         );
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 11;
@@ -5208,7 +5220,7 @@ mod tests {
                 "live vector search must exclude soft-deleted rows: {sql}"
             );
             assert!(
-                sql.contains("order by embedding <=> $1::vector"),
+                sql.contains("order by embedding <=> $1::text::vector"),
                 "ANN ordering must stay vector-distance based: {sql}"
             );
         }
