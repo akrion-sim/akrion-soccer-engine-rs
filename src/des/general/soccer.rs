@@ -701,7 +701,12 @@ const SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS: f64 = 14.0;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY: f64 = 0.54;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_AERIAL_QUALITY: f64 = 0.56;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_OPENNESS: f64 = 0.50;
-const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 45.0;
+// HARD shot-distance cap: no shot is taken from beyond this (was 45 — far too speculative). This
+// is the absolute ceiling for every shot path (the forward window derives from it, the midfielder
+// window is this − 5), so a shot from >30yd never qualifies. Shots in the 20–30yd band are allowed
+// but reward-penalised (see `shot_reward_points`); inside 20yd they are rewarded, rising as they
+// get closer.
+const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 30.0;
 const SPECULATIVE_LONG_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.46;
 const SPECULATIVE_LONG_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.10;
 const SPECULATIVE_LONG_SHOT_SKILL_GATE: f64 = 0.68;
@@ -883,6 +888,16 @@ const SHOT_ON_TARGET_SCORING_SCALE_FLOOR: f64 = 0.04;
 // inside ~16yd, ~0.7 at 20yd, ~0.45 at 25yd, ~0.16 at 30yd, floored beyond.
 const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 16.0;
 const SHOT_REWARD_TAPER_PER_YARD: f64 = 0.065;
+// Shot-distance reward shaping, pivoting on 20yd (the user's "shoot closer" rule). A shot from
+// INSIDE 20yd is rewarded, rising as the shooter gets nearer goal; a shot from OUTSIDE 20yd (up to
+// the hard 30yd cap) is penalised, escalating with distance — relieved only when the keeper is
+// genuinely beatable / out of position so a real long-range chance still gets taken. Applied to
+// every `shoot` transition so the MDP/POMDP learns to work the ball into 20yd before pulling the
+// trigger.
+const SHOT_DISTANCE_REWARD_PIVOT_YARDS: f64 = 20.0;
+const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
+const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
+const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
@@ -18054,18 +18069,25 @@ fn dense_soccer_transition_reward(
             own_goal_relief,
         );
         reward += (before_obs.yards_to_goal - after_obs.yards_to_goal).clamp(-8.0, 8.0) * 0.07;
-        // Discourage low-percentage shots from range: the value is in working the
-        // ball forward, not blazing away. Penalty starts just past the ~25-yard
-        // comfortable window and escalates with distance (30 yds is a bad idea, 40
-        // is off), but it is relieved when the keeper is genuinely beatable / out of
-        // position — so the MDP/POMDP learns to take the long shot only then.
-        if action == "shoot" && before_obs.yards_to_goal > LONG_SHOT_DISCOURAGED_YARDS {
-            let over = before_obs.yards_to_goal - LONG_SHOT_DISCOURAGED_YARDS;
-            let keeper_relief = before_obs
-                .opposing_goalkeeper_out_of_position
-                .clamp(0.0, 1.0);
-            let distance_penalty = (over / 7.0).min(3.0) * 2.4;
-            reward -= distance_penalty * (1.0 - keeper_relief * 0.85);
+        // Shot-distance discipline pivoting on 20yd: reward shooting from inside 20yd (rising as
+        // the shooter nears goal) and penalise shooting from outside it (escalating with distance,
+        // up to the hard 30yd cap). The outside penalty is relieved when the keeper is genuinely
+        // beatable / out of position so a real long-range chance still gets taken. This teaches the
+        // policy to work the ball into ~20yd before pulling the trigger instead of blazing away.
+        if action == "shoot" {
+            let yards = before_obs.yards_to_goal.max(0.0);
+            if yards <= SHOT_DISTANCE_REWARD_PIVOT_YARDS {
+                reward += ((SHOT_DISTANCE_REWARD_PIVOT_YARDS - yards) * SHOT_CLOSE_REWARD_PER_YARD)
+                    .min(SHOT_DISTANCE_REWARD_MAX_POINTS);
+            } else {
+                let keeper_relief = before_obs
+                    .opposing_goalkeeper_out_of_position
+                    .clamp(0.0, 1.0);
+                let distance_penalty = ((yards - SHOT_DISTANCE_REWARD_PIVOT_YARDS)
+                    * SHOT_FAR_PENALTY_PER_YARD)
+                    .min(SHOT_DISTANCE_REWARD_MAX_POINTS);
+                reward -= distance_penalty * (1.0 - keeper_relief * 0.85);
+            }
         }
         reward += goalmouth_dribble_learning_reward(
             player, action, before_obs, &after_obs, before, after, before_pos, after_pos,
