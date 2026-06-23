@@ -687,8 +687,12 @@ const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 // Actual shots on/toward goal should leave the foot in this band. Slower contacts are
 // passes, pokes, or control touches; once an action is classified as Shoot, rendering and
 // physics should both see a real strike.
-const SHOT_MIN_SPEED_MPH: f64 = 40.0;
-const SHOT_MAX_SPEED_MPH: f64 = 60.0;
+// Shots leave the boot CLEARLY faster than any pass so they read as a strike, not a driven ball,
+// from the very first frame. The hardest ground pass is ~38mph and the hardest aerial ~50mph, so
+// the slowest shot floors at 50 (above both) and a full-power strike reaches ~70 — no overlap with
+// the pass band, which is what made weak shots "look like passes at first".
+const SHOT_MIN_SPEED_MPH: f64 = 50.0;
+const SHOT_MAX_SPEED_MPH: f64 = 72.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS + 7.0;
