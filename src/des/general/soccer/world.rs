@@ -24252,10 +24252,19 @@ impl WorldSnapshot {
             .holder
             .and_then(|holder| self.player_position(holder))
             .unwrap_or(self.ball.position);
-        // Open-space support may stretch a marginal 0-3yd beyond the second-last
-        // defender. Offside is still enforced when the pass is played; here the run
-        // exists to widen/deepen the attack and force the line to make a choice.
-        let run_y = self.open_space_support_line_y(me.team, line_y);
+        // Stage the run on the shoulder (level with the last defender, onside) until
+        // the ball is actually released, THEN break beyond. Offside is judged at the
+        // moment the ball is played: a runner who is already standing past the line is
+        // flagged, so continuously parking at line+tolerance pre-release meant the run
+        // was offside whenever a pass came. Once our ball is in flight (a targeted pass
+        // or an over-the-top), the offside for this play has already been assessed, so
+        // the runner may legally break beyond to chase it.
+        let ball_released = self.pending_pass.is_some();
+        let run_y = if dd_soccer_disable_onside_support_hold() || ball_released {
+            self.open_space_support_line_y(me.team, line_y)
+        } else {
+            line_y
+        };
         let target = Vec2::new(
             (current.x * 0.76 + holder_position.x * 0.24).clamp(4.0, self.field_width - 4.0),
             run_y,
