@@ -71,6 +71,9 @@ pub enum SoccerActionLabel {
     Nutmeg,
     FakeLeftCutRight,
     FakeRightCutLeft,
+    /// The "Xavi turn": a ~280-300° shielded pirouette that keeps the ball on the far
+    /// side of the defender and wheels the long way around to turn them.
+    XaviTurn,
     VerticalAttack,
     TurnoverBurst,
     /// On-ball: the carrier deliberately keeps the ball and *signals* teammates to
@@ -143,6 +146,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::Nutmeg => "nutmeg",
             SoccerActionLabel::FakeLeftCutRight => "fake-left-cut-right",
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
+            SoccerActionLabel::XaviTurn => "xavi-turn",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
@@ -207,6 +211,7 @@ impl SoccerActionLabel {
             "nutmeg" => SoccerActionLabel::Nutmeg,
             "fake-left-cut-right" => SoccerActionLabel::FakeLeftCutRight,
             "fake-right-cut-left" => SoccerActionLabel::FakeRightCutLeft,
+            "xavi-turn" => SoccerActionLabel::XaviTurn,
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
@@ -410,6 +415,8 @@ impl SoccerActionLabel {
             "fake_right_cut_left" | "fake-right-left" | "fake-right-cut-left-dribble" => {
                 "fake-right-cut-left"
             }
+            "xavi-turn" | "xavi_turn" | "xaviturn" | "xavi" | "la-pelopina" | "la_pelopina"
+            | "shielded-turn" | "shielded_turn" | "turn-and-shield" => "xavi-turn",
             "supportshape" | "support_shape" => "support-shape",
             "supportroam" | "support_roam" => "support-roam",
             "checktoball" | "check_to_ball" | "check-ball" | "checkrun" => "check-to-ball",
