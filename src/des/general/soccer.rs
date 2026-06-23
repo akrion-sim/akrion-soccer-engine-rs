@@ -53,6 +53,8 @@ mod labels;
 pub use labels::*;
 mod tunables;
 pub use tunables::*;
+mod pitch_value;
+pub use pitch_value::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -17788,6 +17790,14 @@ fn dense_soccer_transition_reward(
             0.20
         };
     }
+
+    // Dense territorial pitch-control x expected-threat shaping: credit the
+    // acting team for any action — including a pure off-ball run — that grows its
+    // net control of dangerous space, the signal the local event rewards above
+    // are blind to. Gated off by default (returns 0.0 before touching the grid
+    // unless `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`), so the baseline stays
+    // byte-identical. See `pitch_value`.
+    reward += pitch_value_reward_delta(before, after, player.team);
 
     reward.clamp(-4.0, 4.0)
 }
