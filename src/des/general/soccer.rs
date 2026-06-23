@@ -1189,6 +1189,18 @@ const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY: f64 = 1000.0;
 // ball driven past too fast to be cut out, from tripping it.
 const PASS_RECEPTION_CONCEDE_MARK_RADIUS_YARDS: f64 = 2.25;
 const PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS: f64 = 1.25;
+// Perception gate for the man-marked concede veto (POMDP: ~240° FOV, no rear vision,
+// confidence decaying as the head turns — see `player_position_confidence_for_point`). A
+// passer is only expected to AVOID feeding a marked man he can actually perceive; a marker
+// arriving on the blindside (low confidence) is a realistic loss, not a vetoable decision.
+// The ball-to-an-opponent's-feet case is NOT gated by this — playing it straight to the
+// opposition is a gross error regardless of where the passer is looking.
+const PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE: f64 = 0.42;
+// Inter-tick sweep horizons (in ticks) for the concede reach model: a pass may resolve in
+// 1, 2, 4, or 4+ ticks, so sample the ball's flight at these multiples of `dt` (each capped
+// at the ball's arrival time) and project each opponent forward with its own momentum. Keeps
+// the single-horizon reach as a strict superset so the static unit tests stay byte-identical.
+const PASS_CONCEDE_SWEEP_TICK_HORIZONS: [f64; 4] = [1.0, 2.0, 4.0, 8.0];
 
 fn direct_opponent_aim_score_penalty(risk: f64) -> f64 {
     let risk = risk.clamp(0.0, 1.0);
@@ -8889,7 +8901,12 @@ impl SoccerQPolicy {
             player.role,
         );
         let action = normalize_soccer_action_label(action);
-        candidates
+        // Re-ranking the candidate pool here would otherwise silently bypass the ranker's
+        // concede veto (it only DEMOTES a conceded target, never removes it — see
+        // `ranked_pass_targets_filtered_full`), which is how a learned policy could still pick a
+        // pass straight to an opponent or into a tightly-marked man. Flag each candidate and
+        // refuse to commit to a (perceived) conceded one while any clean option remains.
+        let scored: Vec<(usize, f64, bool)> = candidates
             .iter()
             .filter_map(|candidate_id| {
                 let target = snapshot.players.iter().find(|p| p.id == *candidate_id)?;
@@ -8912,13 +8929,24 @@ impl SoccerQPolicy {
                     + quality.mpc_receipt_probability * 0.52
                     + quality.stride_fit * 0.22
                     + quality.receiver_openness * 0.20;
-                Some((*candidate_id, score))
+                let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
+                    player_id,
+                    *candidate_id,
+                    flight,
+                );
+                Some((*candidate_id, score, concedes))
             })
-            .max_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then_with(|| b.0.cmp(&a.0))
-            })
-            .map(|(candidate_id, _)| candidate_id)
+            .collect();
+        let pick = |require_clean: bool| {
+            scored
+                .iter()
+                .filter(|(_, _, concedes)| !require_clean || !*concedes)
+                .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(candidate_id, _, _)| *candidate_id)
+        };
+        // Only fall back to the least-bad conceded target when EVERY candidate concedes
+        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
+        pick(true).or_else(|| pick(false))
     }
 
     fn best_action_filtered<F>(&self, state: &SoccerQStateKey, is_legal: F) -> Option<String>

@@ -1377,6 +1377,199 @@ fn pass_to_marked_man_or_opponent_feet_is_conceded() {
 }
 
 #[test]
+fn pass_concede_inter_tick_catches_closing_marker() {
+    // A short, firm ball arrives in ~1-2 ticks, so the single-horizon reach at the reception is
+    // barely a lunge — a marker ~2yd to the side sits OUTSIDE it while stationary. But a marker
+    // actively SPRINTING onto the reception covers that gap over the ball's flight, which the
+    // inter-tick sweep (1/2/4/4+ tick horizons, opponent carried by its own momentum) catches.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_119,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    park_players_except(&mut sim, &[passer, receiver, marker]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 52.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    let passer_pos = sim.players[passer].position;
+    let receiver_pos = sim.players[receiver].position;
+    let speed =
+        pass_speed_yps_from_power(0.92, PassFlight::Floor, false, &sim.players[passer].skills);
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].position = receiver_pos + Vec2::new(2.0, 0.0);
+
+    // Stationary marker just beyond the lunge reach: not (yet) a concession on this short ball.
+    sim.players[marker].velocity = Vec2::zero();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home,
+            receiver_pos,
+            passer_pos,
+            receiver_pos,
+            speed,
+            0.8,
+        ),
+        "a stationary marker beyond lunge reach should not concede a short, fast ball"
+    );
+
+    // Same marker sprinting onto the reception: the inter-tick sweep concedes it.
+    sim.players[marker].velocity = Vec2::new(-10.0, 0.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home,
+            receiver_pos,
+            passer_pos,
+            receiver_pos,
+            speed,
+            0.8,
+        ),
+        "a marker closing onto the reception over the ball flight is an inter-tick concession"
+    );
+}
+
+// Pin a marker `offset` off the anticipated reception of `passer`->`receiver`. The reception
+// model leads the point forward (skill/openness/byline dependent), and the marker's own presence
+// feeds back into that openness, so converge to the fixed point: place, recompute, repeat.
+fn place_marker_on_reception(
+    sim: &mut SoccerMatch,
+    passer: usize,
+    receiver: usize,
+    marker: usize,
+    offset: Vec2,
+) {
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+    for _ in 0..6 {
+        let snap = WorldSnapshot::from_match(sim);
+        let reception = snap
+            .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, speed)
+            .unwrap_or_else(|| sim.players[receiver].position);
+        sim.players[marker].position =
+            (reception + offset).clamp_to_pitch(sim.config.field_width_yards, sim.config.field_length_yards);
+    }
+}
+
+#[test]
+fn pass_concede_decision_respects_passer_perception() {
+    // The decision-level wrapper folds in POMDP perception (~240deg FOV, the rear unseen,
+    // confidence decaying as the head turns). A marked man the passer is LOOKING at is a
+    // vetoable concession; the same marker on the passer's blindside is a realistic loss, not a
+    // decision to forbid.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_121,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    let presser = 14;
+    park_players_except(&mut sim, &[passer, receiver, marker, presser]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 52.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[presser].team = Team::Away;
+    sim.players[presser].position = Vec2::new(40.0, 42.0); // arms the holder's pressure (~0.45+)
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    // A marker ~1.8yd off the reception: within the mark radius, not at the feet.
+    place_marker_on_reception(&mut sim, passer, receiver, marker, Vec2::new(1.8, 0.0));
+
+    // Facing the reception (toward +y): the passer perceives the marker -> conceded. (The holder
+    // facing comes from `action_facing`; FacingBucket::South is the +y unit vector here.)
+    sim.players[passer].action_facing = FacingBucket::South;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "a marked man the passer is looking straight at is a perceived concession"
+    );
+
+    // Facing away (toward -y): the marker is on the passer's blindside -> a realistic loss.
+    sim.players[passer].action_facing = FacingBucket::North;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "a marker on the passer's blindside should not be a vetoed concession"
+    );
+}
+
+#[test]
+fn learned_policy_selector_avoids_conceded_pass_target() {
+    // The learned-policy target selector re-ranks the candidate pool and would otherwise bypass
+    // the ranker's (demote-only) concede veto. It must refuse to commit a pass to a man with an
+    // opponent at his feet while a clean outlet exists.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_123,
+        ..Default::default()
+    });
+    let passer = 7;
+    let marked = 9;
+    let open = 6;
+    let marker = 13;
+    let presser = 14;
+    park_players_except(&mut sim, &[passer, marked, open, marker, presser]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2; // facing upfield, sees both
+    sim.players[marked].team = Team::Home;
+    sim.players[marked].role = PlayerRole::Forward;
+    sim.players[marked].position = Vec2::new(40.0, 52.0);
+    sim.players[marked].velocity = Vec2::zero();
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    // An open team-mate off to the side.
+    sim.players[open].team = Team::Home;
+    sim.players[open].role = PlayerRole::Forward;
+    sim.players[open].position = Vec2::new(56.0, 46.0);
+    sim.players[open].velocity = Vec2::zero();
+    sim.players[presser].team = Team::Away;
+    sim.players[presser].position = Vec2::new(40.0, 42.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    // An opponent right at the marked man's feet (unconditional concession).
+    place_marker_on_reception(&mut sim, passer, marked, marker, Vec2::new(0.4, 0.0));
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let policy = SoccerQPolicy::default();
+    let candidates = vec![marked, open];
+    let chosen = policy.best_pass_target_player_for_snapshot(
+        &snapshot,
+        passer,
+        "pass",
+        PassFlight::Floor,
+        &candidates,
+    );
+    assert_eq!(
+        chosen,
+        Some(open),
+        "the selector must not commit a pass into a man with an opponent at his feet"
+    );
+    assert!(
+        snapshot.pass_target_concedes_to_perceived_opponent(passer, marked, PassFlight::Floor),
+        "the marked man should be flagged as a perceived concession"
+    );
+    assert!(
+        !snapshot.pass_target_concedes_to_perceived_opponent(passer, open, PassFlight::Floor),
+        "the open team-mate must not be flagged as a concession"
+    );
+}
+
+#[test]
 fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

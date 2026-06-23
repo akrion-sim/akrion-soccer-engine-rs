@@ -18052,9 +18052,102 @@ impl WorldSnapshot {
             * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
             * MovementGait::Sprint.speed_multiplier())
         .max(0.85);
+        // (1) Single-horizon reach at the reception — kept as a strict superset trigger so the
+        // static (zero-velocity) concede unit tests stay byte-identical.
         let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
             .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
-        opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window
+        if opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window {
+            return true;
+        }
+        // (2) Inter-tick swept reach: the pass may resolve in 1, 2, 4, or 4+ ticks, so walk the
+        // ball along its lane at those tick horizons (each capped at arrival) and, at every
+        // sample, project THIS marker forward with his own momentum (capped to a sprint) and
+        // grow a sprint-reach disc over the reaction-adjusted elapsed time. He concedes the
+        // reception the instant that disc covers the ball — catching a marker actively closing
+        // onto the reception that the single, instantaneous snapshot above misses.
+        if lane_len < 1e-3 {
+            return false;
+        }
+        let dir = lane * (1.0 / lane_len);
+        let opponent_velocity = self
+            .player_velocity(opponent.id)
+            .unwrap_or(opponent.velocity);
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
+        for ticks in PASS_CONCEDE_SWEEP_TICK_HORIZONS {
+            let t = (ticks * dt).min(ball_arrival.max(dt));
+            let ball_pos = pass_origin + dir * (speed * t).min(lane_len);
+            // Momentum carries the marker, but never beyond what a sprint could cover in `t`.
+            let mut momentum = opponent_velocity * t;
+            let max_carry = sprint_speed * t;
+            if momentum.len() > max_carry {
+                momentum = momentum.normalized() * max_carry;
+            }
+            let carried = opponent_position + momentum;
+            let reach = INTERCEPT_LUNGE_REACH_YARDS
+                + sprint_speed * (t - PASS_LANE_INTERCEPT_REACTION_SECONDS).max(0.0);
+            if carried.distance(ball_pos) <= reach {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Decision-level concede check used when a passer COMMITS to a target (vs. the physical
+    /// [`Self::pass_reception_conceded_to_opponent`] the ranker prices for risk): it folds in
+    /// the passer's POMDP perception. A passer is only expected to AVOID feeding a marked man
+    /// he can actually perceive — a marker arriving on his blindside (low position confidence,
+    /// ~240° FOV with the rear unseen and confidence decaying as the head turns) is a realistic
+    /// loss, not a vetoable choice. The ball-played-straight-to-an-opponent's-feet case is a
+    /// gross error and is NOT perception-gated (you can always see where you are aiming).
+    pub(crate) fn pass_target_concedes_to_perceived_opponent(
+        &self,
+        passer_id: usize,
+        target_id: usize,
+        flight: PassFlight,
+    ) -> bool {
+        let Some(passer) = self.players.iter().find(|p| p.id == passer_id) else {
+            return false;
+        };
+        let Some(target) = self.players.iter().find(|p| p.id == target_id) else {
+            return false;
+        };
+        if passer.team != target.team || passer_id == target_id {
+            return false;
+        }
+        let passer_position = self.player_snapshot_position(passer);
+        let target_position = self.player_snapshot_position(target);
+        let initial_is_cross = pass_would_be_cross(
+            passer_position,
+            target_position,
+            passer.team,
+            self.field_width,
+            self.field_length,
+        );
+        let speed = pass_speed_yps_from_power(0.68, flight, initial_is_cross, &passer.skills);
+        let reception = self
+            .anticipated_pass_reception_point(passer_id, target_id, flight, speed)
+            .unwrap_or(target_position);
+        let passer_pressure = self.attacker_pressure_on_point(passer.team, passer_position);
+        if !self.pass_reception_conceded_to_opponent(
+            passer.team,
+            target_position,
+            passer_position,
+            reception,
+            speed,
+            passer_pressure,
+        ) {
+            return false;
+        }
+        // The ball to an opponent's FEET is always a concession (no perception gate). A marked
+        // man is only a vetoable concession if the passer actually perceives the marker.
+        let nearest = self.nearest_opponent_distance_at(passer.team, reception);
+        if nearest <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS {
+            return true;
+        }
+        let perceived = self
+            .player_position_confidence_for_point(passer_id, reception)
+            .unwrap_or(1.0);
+        perceived >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE
     }
 
     /// Score the shot **placement** as a discrete decision instead of defaulting to the
