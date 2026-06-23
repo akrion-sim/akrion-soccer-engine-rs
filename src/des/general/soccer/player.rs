@@ -6429,7 +6429,19 @@ impl PlayerAgent {
                         * (0.55 + press * 0.85)
                         * (0.55 + forward_blocked * 0.80))
                         .clamp(0.0, XAVI_TURN_MAX_APPETITE);
-                    action_options.push(AgentActionOptionTrace::new("xavi-turn", appetite, true));
+                    if let Some(option) = action_options
+                        .iter_mut()
+                        .find(|option| option.label == "xavi-turn")
+                    {
+                        option.legal = true;
+                        option.score = option.score.max(appetite);
+                    } else {
+                        action_options.push(AgentActionOptionTrace::new(
+                            "xavi-turn",
+                            appetite,
+                            true,
+                        ));
+                    }
                     xavi_turn_offered = true;
                 }
             }

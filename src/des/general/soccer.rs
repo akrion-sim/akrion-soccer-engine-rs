@@ -53,6 +53,8 @@ mod labels;
 pub use labels::*;
 mod tunables;
 pub use tunables::*;
+mod pitch_value;
+pub use pitch_value::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -650,6 +652,10 @@ const DRIBBLE_HEAVY_TOUCH_MIN_YARDS: f64 = 2.25;
 const CARRY_ORBIT_NORMAL_RATE_RAD_S: f64 = 7.0;
 // Special moves (cuts / fakes / nutmeg) chop the ball across the body far faster.
 const CARRY_ORBIT_SPECIAL_RATE_RAD_S: f64 = 11.0;
+// The xavi-turn sweeps the ball the long way AROUND the body on the shielded side as
+// the carrier wheels ~290°; a touch quicker than a normal carry so the ball keeps up
+// with the pirouette, but still arcs around (never chopped through, unlike a cut).
+const CARRY_ORBIT_XAVI_RATE_RAD_S: f64 = 9.0;
 // The ball stays at least this far from the carrier's feet on ordinary play, so
 // it arcs AROUND the body. Only special moves may pull it closer (passing it
 // THROUGH the player line).
@@ -1157,6 +1163,9 @@ const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
 // backward pass is preferred over a long backward one whenever both are on offer.
 const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
 // Per-yard demerit for every yard a backward pass travels beyond LONG_BACKWARD_PASS_YARDS.
+// The risk is LINEAR in how far backward (toward our own goal) the ball is played: every
+// extra yard conceded is priced the same, so the ranking strongly prefers a short reset and
+// only tolerates a long retreat when there is genuinely nothing else.
 const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 1.45;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
 // This is intentionally linear in both backward depth and traffic count, and applies to both
@@ -2481,6 +2490,19 @@ const LOOSE_BALL_POUNCE_CLOSING_YPS: f64 = 2.0;
 // an earlier intercept — it stretches/lunges this much further to reach the ball sooner and
 // beat them to it, rather than meeting it at the latest comfortable point on the roll.
 const LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS: f64 = 1.0;
+// Obstacle-aware loose-ball intercept (opt-in, gate `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT`).
+// The straight-line kinematic reach assumes a clear run to the ball. When an opponent body sits in
+// the dash corridor the chaser must skirt around it, so each candidate intercept point has its
+// required gap inflated by a bounded detour penalty before the reach test — deferring commitment on
+// balls that cannot actually be reached through traffic to the later contest-cut target instead.
+// Half-width (yards) of the corridor an opponent body must fall inside to impede the dash (~a body).
+const LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS: f64 = 1.1;
+// Max detour (yards) a single blocking body adds to the required gap, and the overall obstruction cap.
+const LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS: f64 = 1.6;
+// Dead-zone (yards) at each end of the corridor: a body within this of the chaser or the intercept
+// point is not "between" them (the latter is the contest at the ball, owned by the contest-cut). On
+// a short dash the margin is clamped to a fraction of the path so a centred body is still detected.
+const LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS: f64 = 0.5;
 // First-touch TIMING decision (trap now vs let it run). A ball at/below this speed is a clean
 // first touch; faster than this it risks a miscontrol when trapped on the move.
 const LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS: f64 = 6.0;
@@ -2661,8 +2683,19 @@ const WALL_PASS_MIN_RUN_GAIN_YARDS: f64 = 4.0;
 const WALL_PASS_GIVE_MIN_YARDS: f64 = 5.0;
 const WALL_PASS_GIVE_MAX_YARDS: f64 = 16.0;
 /// The wall must not sit deeper than this behind the carrier (negative = slightly behind
-/// is allowed — a give back to a supporting runner — but not a backward escape ball).
+/// is allowed — a give back to a supporting runner — but not a backward escape ball). This
+/// is a loose definitional floor on "what is a wall partner", NOT the backward-distance
+/// risk control: a one-two can legitimately include a short backpass, and longer/through-
+/// traffic backward legs are SOFT-penalised in the quality score (see
+/// `WALL_PASS_BACKWARD_RISK_*`), not hard-capped.
 const WALL_PASS_GIVE_MIN_FORWARD_YARDS: f64 = -5.0;
+/// Soft risk demerit (in quality units, 0..1) for the BACKWARD component of a one-two leg.
+/// A short backpass is part of the combination, but the further back a leg is played — and
+/// the more opponents sit in its corridor — the riskier it is, so quality is reduced by
+/// `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This demotes (but
+/// never vetoes) a long backward give/return, especially through traffic.
+const WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY: f64 = 0.03;
+const WALL_PASS_BACKWARD_RISK_MAX: f64 = 0.6;
 /// Corridor half-width used to test the give and return lanes are clean.
 const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
 /// The wall needs at least this much space to turn the ball around first-time.
@@ -12560,14 +12593,13 @@ pub struct SoccerMpcConfig {
     /// speed profile planned by a 2-D point-mass MPC instead of the open-loop
     /// "head straight at the target at top speed" heuristic. Direction and
     /// collision-avoidance steering stay heuristic. Off by default.
+    ///
+    /// MPC is an INDIVIDUAL-player tool only — it controls one actor's own
+    /// trajectory. There is deliberately no team/collective MPC layer: team shape
+    /// is owned by the formation LP and each player's POMDP, never a joint
+    /// multi-player optimizer.
     #[serde(default)]
     pub tier2_player_enabled: bool,
-    /// Tier-1 team tactical shape-transition MPC layered ABOVE the formation LP:
-    /// the LP picks the target shape, MPC smooths the collective transition into
-    /// it over a short horizon under per-player acceleration limits. Off by
-    /// default. (Wired in a later step; the flag is reserved here.)
-    #[serde(default)]
-    pub tier1_team_enabled: bool,
     /// Horizon length (ticks) for the per-player controller.
     #[serde(default = "default_soccer_mpc_player_horizon")]
     pub player_horizon: usize,
@@ -12758,7 +12790,6 @@ impl Default for SoccerMpcConfig {
     fn default() -> Self {
         SoccerMpcConfig {
             tier2_player_enabled: false,
-            tier1_team_enabled: false,
             player_horizon: default_soccer_mpc_player_horizon(),
             active_radius_yards: default_soccer_mpc_active_radius_yards(),
             reconcile_enabled: false,
@@ -13020,6 +13051,13 @@ pub struct MatchConfig {
     /// [`xavi_turn_enabled`].
     #[serde(default)]
     pub disable_xavi_turn: bool,
+    /// Enable obstacle-aware loose-ball intercept feasibility for THIS match, independent of the
+    /// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag (either turns it on).
+    /// Default `false` => the straight-line kinematic reach is used unchanged (byte-identical). When
+    /// on, an opponent body in the dash corridor inflates the gap a chaser must cover so it does not
+    /// commit to a ball it cannot reach through traffic. See [`loose_ball_corridor_obstruction_yards`].
+    #[serde(default)]
+    pub enable_obstacle_aware_intercept: bool,
     /// Enable the lightweight Bayesian opponent-press belief: a per-player
     /// Beta-Bernoulli posterior over how readily each opponent steps into pass
     /// lanes, which shades the analytic pass-lane interception risk into a Bayesian
@@ -13070,6 +13108,7 @@ impl Default for MatchConfig {
             disable_tick_order_shuffle: false,
             disable_slide_tackle: false,
             disable_xavi_turn: false,
+            enable_obstacle_aware_intercept: false,
             opponent_belief_enabled: false,
             max_human_players: 4,
             seed: 2026,
@@ -18277,6 +18316,14 @@ fn dense_soccer_transition_reward(
             0.20
         };
     }
+
+    // Dense territorial pitch-control x expected-threat shaping: credit the
+    // acting team for any action — including a pure off-ball run — that grows its
+    // net control of dangerous space, the signal the local event rewards above
+    // are blind to. Gated off by default (returns 0.0 before touching the grid
+    // unless `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`), so the baseline stays
+    // byte-identical. See `pitch_value`.
+    reward += pitch_value_reward_delta(before, after, player.team);
 
     reward.clamp(-4.0, 4.0)
 }
@@ -41550,6 +41597,7 @@ fn tracking_frame_to_world_snapshot(
         trace_mdp_mpc_comparison: true,
         slide_tackle_enabled: slide_tackle_enabled(config),
         xavi_turn_enabled: xavi_turn_enabled(config),
+        obstacle_aware_intercept_enabled: obstacle_aware_intercept_enabled(config),
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
@@ -42895,10 +42943,10 @@ fn dribble_beat_probability(
         DribbleMoveKind::ProtectBall => 0.46,
         DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => 1.0,
         DribbleMoveKind::Nutmeg => 0.82,
+        DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 1.05,
         // Turning a committed defender with a shielded pirouette beats them cleanly more
         // often than not — they are wrong-footed by the long way around.
         DribbleMoveKind::XaviTurn => 0.96,
-        DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 1.05,
     };
     let response_multiplier = match response {
         DefenderDribbleResponse::HoldUp => 1.0,
@@ -42935,7 +42983,7 @@ fn dribble_dispossession_kind_multiplier(kind: DribbleMoveKind) -> f64 {
         DribbleMoveKind::ProtectBall => 0.58,
         // Even more secure than a static shield: the body stays between defender and ball
         // through the whole turn. (The hard 10% ceiling is applied separately.)
-        DribbleMoveKind::XaviTurn => 0.50,
+        DribbleMoveKind::XaviTurn => 0.40,
         DribbleMoveKind::CarryForward => 0.86,
         DribbleMoveKind::CarryOutLeft | DribbleMoveKind::CarryOutRight => 0.78,
         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0.92,
@@ -43016,6 +43064,21 @@ fn dd_soccer_disable_xavi_turn() -> bool {
 /// the move is never produced and the byte-stream is identical to baseline.
 fn xavi_turn_enabled(config: &MatchConfig) -> bool {
     !dd_soccer_disable_xavi_turn() && !config.disable_xavi_turn
+}
+
+fn dd_soccer_enable_obstacle_aware_intercept() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+}
+
+/// Whether obstacle-aware loose-ball intercept feasibility is live for this match: OFF unless the
+/// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag OR the per-match config field
+/// opts in. Folded ONCE into [`WorldSnapshot::obstacle_aware_intercept_enabled`] at snapshot build
+/// so the intercept hot path reads a plain bool (deterministic + unit-testable). Default off keeps
+/// the straight-line kinematic reach byte-identical. See [`loose_ball_corridor_obstruction_yards`].
+fn obstacle_aware_intercept_enabled(config: &MatchConfig) -> bool {
+    dd_soccer_enable_obstacle_aware_intercept() || config.enable_obstacle_aware_intercept
 }
 
 /// The clean-steal ceiling for a carrier executing a body-shielding dribble move: a
@@ -43288,7 +43351,7 @@ fn carried_ball_orbit_command(
             false,
             true,
             XAVI_TURN_MAX_ORBIT_RAD,
-            CARRY_ORBIT_SPECIAL_RATE_RAD_S * 0.86,
+            CARRY_ORBIT_XAVI_RATE_RAD_S,
         ),
         // Carry-forward, plain hold: keep the ball ahead of the body.
         _ => (
@@ -43301,8 +43364,8 @@ fn carried_ball_orbit_command(
     };
     let shield_blend = match move_kind {
         Some(DribbleMoveKind::ProtectBall)
-        | Some(DribbleMoveKind::Nutmeg)
-        | Some(DribbleMoveKind::XaviTurn) => 0.0,
+        | Some(DribbleMoveKind::XaviTurn)
+        | Some(DribbleMoveKind::Nutmeg) => 0.0,
         Some(DribbleMoveKind::LeftCut)
         | Some(DribbleMoveKind::RightCut)
         | Some(DribbleMoveKind::FakeLeftCutRight)
@@ -49250,6 +49313,46 @@ fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
     }
     let backward_yards = -forward_yards;
     (backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD
+}
+
+/// Extra demerit for playing the ball BACKWARD past opponents standing in the pass
+/// corridor. Risk grows with BOTH how far backward (toward our own goal) the ball travels
+/// and how many opponents sit on the path — a long backward ball through a crowd is the
+/// worst case (territory conceded AND a likely interception/charge-down), whether the pass
+/// is aerial or grounded. Returns 0 for forward/lateral or near-square balls, and for a
+/// clear corridor (no opponents on the path). `forward_yards` is signed attacking-direction
+/// progress (negative = backward); `opponents_on_path` is the count of opponents within the
+/// lane radius (see [`WorldSnapshot::opponents_on_pass_path`]).
+/// Uses the same score-penalty scale as [`backward_pass_path_traffic_for_snapshot`].
+fn backward_pass_path_risk_penalty(forward_yards: f64, opponents_on_path: usize) -> f64 {
+    if !forward_yards.is_finite()
+        || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS
+        || opponents_on_path == 0
+    {
+        return 0.0;
+    }
+    let priced_backward_yards =
+        (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
+    priced_backward_yards
+        * opponents_on_path as f64
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD
+}
+
+/// Soft risk (in 0..1 quality units) for the BACKWARD component of a one-two leg. A short
+/// backpass is a normal part of a give-and-go, so a forward/square leg carries no risk; the
+/// further BACK the leg is played and the more opponents sit in its corridor, the higher the
+/// demerit — `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This
+/// demotes (never vetoes) a long or through-traffic backward give/return. `forward_yards` is
+/// signed attacking-direction progress for the leg (negative = backward).
+fn wall_pass_leg_backward_risk(forward_yards: f64, opponents_on_path: usize) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= 0.0 {
+        return 0.0;
+    }
+    let backward_yards = -forward_yards;
+    (backward_yards
+        * (1.0 + opponents_on_path as f64)
+        * WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY)
+        .min(WALL_PASS_BACKWARD_RISK_MAX)
 }
 
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {

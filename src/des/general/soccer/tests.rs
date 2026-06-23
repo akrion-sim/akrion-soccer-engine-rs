@@ -14037,6 +14037,81 @@ fn backward_pass_length_preference_favours_the_short_drop() {
 }
 
 #[test]
+fn long_backward_pass_penalty_grows_linearly_with_retreat() {
+    // Forward, square and short-backward (<=5yd) balls are untouched.
+    assert_eq!(long_backward_pass_penalty(6.0), 0.0);
+    assert_eq!(long_backward_pass_penalty(0.0), 0.0);
+    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
+    // Beyond the 5yd short cap the demerit rises LINEARLY (constant per-yard slope): the
+    // gap from 6->10yd back equals the gap from 10->14yd back.
+    let p6 = long_backward_pass_penalty(-6.0);
+    let p10 = long_backward_pass_penalty(-10.0);
+    let p14 = long_backward_pass_penalty(-14.0);
+    assert!(p6 > 0.0 && p10 > p6 && p14 > p10);
+    assert!(
+        ((p10 - p6) - (p14 - p10)).abs() < 1e-9,
+        "penalty must be linear in backward distance"
+    );
+    // A >10yd backward ball is heavily demoted, and the ramp keeps growing linearly.
+    assert!(p10 >= 6.0);
+    assert!(long_backward_pass_penalty(-40.0) > p14);
+    assert!(
+        (long_backward_pass_penalty(-40.0)
+            - (40.0 - LONG_BACKWARD_PASS_YARDS) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn backward_pass_path_risk_scales_with_retreat_and_opponents() {
+    // No opponents on the path, or a forward/near-square ball, carries no path risk.
+    assert_eq!(backward_pass_path_risk_penalty(-12.0, 0), 0.0);
+    assert_eq!(backward_pass_path_risk_penalty(8.0, 3), 0.0);
+    assert_eq!(backward_pass_path_risk_penalty(-0.5, 3), 0.0);
+    // The further BACK the ball is played, the higher the risk (more territory through a
+    // congested lane).
+    assert!(
+        backward_pass_path_risk_penalty(-20.0, 2) > backward_pass_path_risk_penalty(-8.0, 2)
+    );
+    // The MORE opponents sit on the path, the higher the risk for the same distance.
+    assert!(
+        backward_pass_path_risk_penalty(-12.0, 3) > backward_pass_path_risk_penalty(-12.0, 1)
+    );
+    // A 20yd backward ball through 3 players follows the same uncapped linear traffic formula.
+    let deep_traffic = backward_pass_path_risk_penalty(-20.0, 3);
+    let expected = (20.0 - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS)
+        * 3.0
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD;
+    assert!((deep_traffic - expected).abs() < 1e-9);
+    assert!(
+        backward_pass_path_risk_penalty(-40.0, 3) > deep_traffic,
+        "path traffic risk should keep growing with deeper backward passes"
+    );
+}
+
+#[test]
+fn wall_pass_leg_backward_risk_is_soft_and_traffic_weighted() {
+    // A forward or square leg carries no backward risk.
+    assert_eq!(wall_pass_leg_backward_risk(6.0, 3), 0.0);
+    assert_eq!(wall_pass_leg_backward_risk(0.0, 3), 0.0);
+    // A short backpass with a clear corridor is only a mild demerit (never a veto): it stays
+    // well under the worst-case cap so a good one-two is still committed.
+    let short_clear = wall_pass_leg_backward_risk(-3.0, 0);
+    assert!(short_clear > 0.0 && short_clear < WALL_PASS_BACKWARD_RISK_MAX);
+    // The further BACK the leg is played, the higher the risk.
+    assert!(wall_pass_leg_backward_risk(-8.0, 0) > wall_pass_leg_backward_risk(-3.0, 0));
+    // The MORE opponents sit in the corridor, the higher the risk for the same distance —
+    // backward THROUGH traffic is the dangerous case.
+    assert!(wall_pass_leg_backward_risk(-5.0, 3) > wall_pass_leg_backward_risk(-5.0, 0));
+    // It is bounded (a soft penalty, not an unbounded veto).
+    assert_eq!(
+        wall_pass_leg_backward_risk(-40.0, 5),
+        WALL_PASS_BACKWARD_RISK_MAX
+    );
+}
+
+#[test]
 fn lateral_pass_penalty_demotes_square_recycling() {
     assert_eq!(lateral_pass_penalty(0.0, false), GROUND_LATERAL_PASS_PENALTY);
     assert_eq!(lateral_pass_penalty(1.25, true), AERIAL_LATERAL_PASS_PENALTY);
@@ -52828,12 +52903,13 @@ fn xavi_turn_orbit_keeps_far_side_and_winds_the_long_way() {
         sim.ball.position
     );
     assert!((XAVI_TURN_DISPOSSESSION_PROBABILITY - 0.10).abs() < 1e-12);
+    assert_eq!(
+        xavi_turn_tackle_success_cap(DribbleMoveKind::XaviTurn),
+        Some(XAVI_TURN_TACKLE_SUCCESS_CAP)
+    );
     assert!(
-        (dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
-            * HOLD_UP_DISPOSSESSION_PROBABILITY
-            - 0.10)
-            .abs()
-            < 1e-12
+        dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
+            < dribble_dispossession_kind_multiplier(DribbleMoveKind::ProtectBall)
     );
 }
 
@@ -53055,6 +53131,34 @@ fn xavi_turn_clean_steal_is_capped_at_ten_percent() {
     );
 }
 
+#[test]
+fn xavi_turn_orbit_keeps_ball_on_far_side_and_arcs_around() {
+    // The carried-ball orbit on a xavi-turn holds the ball on the FAR side of the defender
+    // (like a shield) and arcs it AROUND the body (never through), swept a touch faster.
+    let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
+    let to_defender = Vec2::new(1.0, 0.0); // defender off to the carrier's +x
+    let (dir, _radius, allow_through, prefer_long_orbit, winding_cap, rate) =
+        carried_ball_orbit_command(
+            facing,
+            Some(DribbleMoveKind::XaviTurn),
+            1.6,
+            Some(to_defender),
+        );
+    assert!(
+        dot(dir, to_defender) < -0.5,
+        "xavi-turn orbit must keep the ball opposite the defender: dir={dir:?}"
+    );
+    assert!(!allow_through, "the ball arcs around the body, never through it");
+    assert!(prefer_long_orbit, "xavi-turn must request the long orbit");
+    assert!(
+        winding_cap >= XAVI_TURN_MAX_ORBIT_RAD - 1e-9,
+        "xavi-turn should preserve the 300-degree winding cap: {winding_cap}"
+    );
+    assert!(
+        (rate - CARRY_ORBIT_XAVI_RATE_RAD_S).abs() < 1e-9,
+        "xavi-turn uses its own sweep rate: rate={rate}"
+    );
+}
 
 #[test]
 fn xavi_turn_move_target_wheels_around_the_defender() {
