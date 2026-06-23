@@ -899,6 +899,15 @@ const SHOT_DISTANCE_REWARD_PIVOT_YARDS: f64 = 20.0;
 const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
+// FLANK / WING usage reward (#8): credit the on-ball player for working the ball in a WIDE channel
+// (toward a touchline), scaled UP when the team is in its OWN half — get it out of the congested
+// central area in front of our own goal and down the wings. Wideness 0 = central spine, 1 =
+// touchline; only the outer band (>= MIN_WIDENESS) earns it. The own-half reward is the larger one
+// and tapers to the smaller attacking-half reward by the halfway line (central play near the
+// opponent goal is fine). A modest per-tick shaping term, in line with the other dense rewards.
+const FLANK_USAGE_MIN_WIDENESS: f64 = 0.5;
+const FLANK_USAGE_OWN_HALF_REWARD: f64 = 0.6;
+const FLANK_USAGE_ATTACKING_HALF_REWARD: f64 = 0.2;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
@@ -17727,6 +17736,24 @@ fn dense_soccer_transition_reward(
         reward += overlap_relief.clamp(-1.0, 1.0) * tunables().reward.teammate_overlap_relief_reward;
         reward -= after_obs.teammate_overlap_pressure.clamp(0.0, 1.0)
             * tunables().reward.teammate_overlap_camp_penalty;
+    }
+    // FLANK / WING usage (#8): reward the on-ball player for working the ball in a wide channel,
+    // scaled UP in the team's OWN half (get it wide out of central congestion in front of our goal
+    // and down the wings). Tapers to a small reward by halfway. Modest, in-possession only.
+    if after_possession == Some(player.team)
+        && (after.ball.holder == Some(player.id) || before.ball.holder == Some(player.id))
+    {
+        let half_width = (after.field_width * 0.5).max(1.0);
+        let wideness = ((after.ball.position.x - half_width).abs() / half_width).clamp(0.0, 1.0);
+        if wideness >= FLANK_USAGE_MIN_WIDENESS {
+            let own_goal_dist =
+                ball_distance_from_own_goal(player.team, after.ball.position, after.field_length);
+            let own_half_frac =
+                (1.0 - own_goal_dist / (after.field_length * 0.5).max(1.0)).clamp(0.0, 1.0);
+            let flank_reward = FLANK_USAGE_ATTACKING_HALF_REWARD
+                + (FLANK_USAGE_OWN_HALF_REWARD - FLANK_USAGE_ATTACKING_HALF_REWARD) * own_half_frac;
+            reward += wideness * flank_reward;
+        }
     }
     // Keepers should rarely stray far from goal. Penalty ramps in past 20 yds,
     // gets steep past 25, and very steep past 30 — so the learned policy keeps the
