@@ -16764,6 +16764,18 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
 }
+/// When an off-ball forward/midfielder is holding a support position (NOT timing a
+/// sanctioned in-behind run), they should sit level with the last defender — on the
+/// shoulder, onside — rather than parking `OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS`
+/// beyond the line in a standing offside position. Parking offside meant any pass or
+/// loose ball that reached them was (correctly) flagged offside, so strikers were
+/// continually caught even though the ball never left our half. Set this env var to
+/// restore the old line+tolerance parking.
+pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
+}
 /// Tactical model-based look-ahead depth for the value blend (`neural_blended_action`):
 /// AlphaZero/MuZero-style planning that rolls the learned world model (`predict_next`)
 /// forward from each candidate action and scores the predicted state with the critic,
@@ -20696,8 +20708,8 @@ impl WorldSnapshot {
         mut target: Vec2,
     ) -> Vec2 {
         // Applies to attacking players (forwards and midfielders): when our team
-        // has the ball and they are not on a sanctioned timed in-behind run, allow
-        // only a marginal 0-3yd open-space stretch beyond the last line.
+        // has the ball and they are not on a sanctioned timed in-behind run, hold an
+        // ONSIDE support position level with the last defender (on the shoulder).
         if self.possession_team() != Some(player.team)
             || self.ball.holder == Some(player.id)
             || !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
@@ -20710,7 +20722,15 @@ impl WorldSnapshot {
         };
         let half_line = self.field_length * 0.5;
         let attack = player.team.attack_dir();
-        let cap_y = self.open_space_support_line_y(player.team, line_y);
+        // Idle supporters hold level with the line (onside). Only a sanctioned timed
+        // in-behind run (excluded above) may stretch beyond it. The legacy behaviour
+        // parked them OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS past the line — a standing
+        // offside position — so any ball that reached them was flagged.
+        let cap_y = if dd_soccer_disable_onside_support_hold() {
+            self.open_space_support_line_y(player.team, line_y)
+        } else {
+            line_y
+        };
         let beyond_line = (target.y - cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
         if in_attacking_half && beyond_line {
