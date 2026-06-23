@@ -1094,6 +1094,12 @@ const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
 const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.92;
 const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.18;
 const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 3.8;
+// HARD veto magnitude: when a candidate pass point sits clearly closer to an opponent than to the
+// intended receiver (`pass_point_directly_favors_opponent`), it is a direct giveaway — sink the
+// candidate by this much so it can never outrank holding or a safe outlet. The soft per-risk
+// penalty above is NOT enough on its own: an attractive forward option outscored it, which is how
+// the ball kept getting played straight to the opposition.
+const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY: f64 = 1000.0;
 // A BACKWARD ball (aim point this far behind the passer along the attack direction)
 // is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
 // the ball back toward the opponent. A backward pass whose receiver has an opponent

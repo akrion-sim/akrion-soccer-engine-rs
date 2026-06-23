@@ -22518,6 +22518,17 @@ impl WorldSnapshot {
                 );
                 let direct_opponent_aim_penalty =
                     PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * direct_opponent_control_risk;
+                // HARD veto (the real fix for "passing straight to the opposition"): if the aim
+                // point is clearly closer to an opponent than to the intended receiver, sink the
+                // candidate so it never wins over holding or a safe outlet. The soft risk penalty
+                // above could be outscored by an attractive forward option, so the giveaway still
+                // got played; this guarantees it does not.
+                let direct_opponent_aim_veto =
+                    if self.pass_point_directly_favors_opponent(me.team, position, pass_point) {
+                        PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
+                    } else {
+                        0.0
+                    };
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -22584,6 +22595,7 @@ impl WorldSnapshot {
                     - reception_teammate_penalty
                     - reception_congestion_penalty
                     - direct_opponent_aim_penalty
+                    - direct_opponent_aim_veto
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
