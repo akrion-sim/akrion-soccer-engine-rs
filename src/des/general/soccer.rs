@@ -2711,6 +2711,24 @@ const GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS: f64 = 0.25;
 /// ball, rushing through a covering defender who was ~99% going to win it (a real
 /// flaw: collisions / own-goals). In a contested 50/50 the keeper still commits.
 const GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS: f64 = 0.35;
+/// Strong 6-yard-box affinity: the keeper only ventures OUT of its goal area when the ball
+/// has entered its own penalty area AND BOTH a POMDP race-margin estimate and an MPC
+/// bounded-acceleration estimate put it at least this likely to reach the ball before the
+/// earliest of (the nearest attacker, its own nearest teammate). Otherwise it holds in the
+/// box. 0.95 ⇒ it arrives in roughly ≤70% of the earliest rival's time AND the QP solver
+/// confirms it can physically get there in that window.
+const GK_LEAVE_BOX_MIN_WIN_PROBABILITY: f64 = 0.95;
+/// MPC keeper distribution: the keeper plays the ball OUT only to a team-mate the
+/// receding-horizon rendezvous can actually deliver to — the receiver's MPC receipt
+/// probability (it wins the meeting under bounded acceleration ahead of the nearest opponent)
+/// must clear this floor for the (receiver, technique) to be a candidate. Below it nothing is
+/// cleanly deliverable and the keeper holds / clears via the existing logic.
+const GK_MPC_DISTRIBUTION_MIN_RECEIPT: f64 = 0.45;
+/// Small preference for rolling the ball out along the ground (a controllable, fast-arriving
+/// delivery) when that lane is clear, so the keeper only lofts it when the ground option is
+/// blocked or a loft is markedly more deliverable. Keeps the ground-vs-aerial technique choice
+/// deterministic and sensible rather than flipping on a near-tie.
+const GK_MPC_DISTRIBUTION_GROUND_TECHNIQUE_PREF: f64 = 0.35;
 /// The keeper EXECUTES its positioning strategy (line height / angle / sweep) via
 /// the MPC layer too, over a wider range than an outfield presser (it tracks the
 /// ball from its line), so it joins the MPC active subset whenever the ball is
@@ -5020,9 +5038,22 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub action_ball_speed_yps: f64,
     /// Chosen pass target's decision-time completion estimate. Zero for non-pass
-    /// actions or passes without a resolved receiver.
+    /// actions or passes without a resolved receiver. With the learnable-velocity layer
+    /// ON this is the completion at the speed the value trade-off picked (a contested lane
+    /// scored at its threading pace), so the critic sees the driven-ball option directly.
     #[serde(default)]
     pub pass_target_expected_completion: f64,
+    /// Dynamic lane-interception risk for the chosen pass AT the chosen launch speed
+    /// (0 clear … 1 a defender's body in the corridor). The MDP/POMDP transition record's
+    /// signal for "how threadable was the lane at the pace I struck it" — paired with the
+    /// resulting outcome it lets offline learning fit when a driven ball through traffic
+    /// pays vs gives the ball away. Zero for non-pass actions or passes without a receiver.
+    #[serde(default)]
+    pub pass_lane_interception_risk: f64,
+    /// MPC feasibility floor for the chosen pass: the slowest pace that clears the
+    /// corridor. Zero for non-pass actions or passes without a resolved receiver.
+    #[serde(default)]
+    pub pass_min_clearing_speed_yps: f64,
     /// MPC/QP receipt prior for the chosen pass: can the receiver meet the ball
     /// under bounded acceleration before/against the nearest opponent?
     #[serde(default)]
@@ -16151,6 +16182,12 @@ fn soccer_decision_context_for(
     let pass_target_expected_completion = pass_quality_for_action
         .map(|quality| quality.expected_completion)
         .unwrap_or(0.0);
+    let pass_lane_interception_risk = pass_quality_for_action
+        .map(|quality| quality.lane_interception_risk)
+        .unwrap_or(0.0);
+    let pass_min_clearing_speed_yps = pass_quality_for_action
+        .map(|quality| quality.min_clearing_speed_yps)
+        .unwrap_or(0.0);
     let pass_mpc_receipt_probability = pass_quality_for_action
         .map(|quality| quality.mpc_receipt_probability)
         .unwrap_or(0.0);
@@ -16370,6 +16407,8 @@ fn soccer_decision_context_for(
         target_angle_degrees,
         action_ball_speed_yps,
         pass_target_expected_completion,
+        pass_lane_interception_risk,
+        pass_min_clearing_speed_yps,
         pass_mpc_receipt_probability,
         pass_receipt_race_advantage_seconds,
         pass_receipt_qp_accel_fit,
@@ -44727,7 +44766,19 @@ struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
     stride_fit: f64,
+    /// Dynamic lane-interception risk AT the speed the velocity plan chose (0 clear … 1
+    /// blocked). With the learnable-velocity layer ON this is the risk of a ball struck at
+    /// `chosen_speed_yps`, so a lane that only a driven ball threads reads as lower risk
+    /// here than the legacy fixed-0.68 evaluation did.
     lane_interception_risk: f64,
+    /// Launch speed (yps) the value trade-off picked for this pass (see
+    /// [`pass_velocity_plan_for_snapshot`]). Equals the legacy nominal (0.68 power) speed
+    /// when the learnable layer is disabled.
+    chosen_speed_yps: f64,
+    /// MPC feasibility floor: the slowest pace that actually clears the corridor. The
+    /// execution layer firms a contested ball up to this so the struck pass matches the
+    /// decision.
+    min_clearing_speed_yps: f64,
     mpc_receipt_probability: f64,
     mpc_receipt_race_advantage_seconds: f64,
     mpc_receipt_qp_accel_fit: f64,
@@ -45170,6 +45221,183 @@ fn pass_mpc_receipt_estimate_for_snapshot(
     }
 }
 
+/// Whether the learnable pass-velocity layer is live (ON unless disabled by env). When OFF
+/// the engine falls back to the legacy single fixed-power (0.68) pass evaluation and
+/// execution speed, reproducing the prior behavior byte-for-byte. Set
+/// `DD_SOCCER_DISABLE_LEARNABLE_PASS_VELOCITY=1` to disable.
+fn dd_soccer_disable_learnable_pass_velocity() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LEARNABLE_PASS_VELOCITY").is_ok())
+}
+
+/// The power buckets the policy considers for a ground/driven pass, weakest→hardest. A
+/// weighted ball (low power) is easy to control but lingers in the lane (high interception
+/// risk); a driven ball (high power) threads a contested corridor but is harder to receive.
+/// The value trade-off in [`pass_velocity_plan_for_snapshot`] is what the MDP/POMDP value
+/// head then learns to weight per situation — the engine never *forbids* a ball through an
+/// occupied lane, it prices the speed needed to thread it.
+const PASS_VELOCITY_POWER_BUCKETS: [f64; 4] = [0.50, 0.68, 0.84, 1.0];
+/// Below this lane-interception risk a pass is treated as uncontested: the weighted-ball
+/// fast path is taken and no speed sweep runs. Small enough that any genuinely threatened
+/// lane still sweeps and can be driven.
+const PASS_VELOCITY_OPEN_LANE_RISK_EPSILON: f64 = 0.02;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PassVelocityPlan {
+    /// Launch speed (yps) the value trade-off selected for this aim point.
+    speed_yps: f64,
+    /// Equivalent power bucket that produced `speed_yps`.
+    power: f64,
+    /// Dynamic lane-interception risk AT the chosen speed (0 clear … 1 blocked).
+    lane_interception_risk: f64,
+    /// MPC feasibility: the slowest bucket speed whose lane risk falls under the
+    /// "threadable" threshold — the minimum pace that gets the ball through the corridor.
+    /// Equals the hardest bucket speed when no bucket threads it.
+    min_clearing_speed_yps: f64,
+    /// MPC receipt probability of the receiver controlling the ball at `speed_yps`.
+    mpc_receipt_probability: f64,
+}
+
+/// Sweep the candidate launch speeds for a ground pass down `from → aim_point` and choose
+/// the pace to strike it at. A weighted ball is easy to control but spends longer in the
+/// lane; a driven ball threads a contested corridor but is harder to receive. This returns
+/// the value-traded choice plus the MPC feasibility floor (the slowest pace that actually
+/// clears the corridor), so the engine PRICES the speed needed to beat a defender in the
+/// lane rather than vetoing the pass. Aerial flights keep their own gravity-fixed
+/// calibration and are evaluated at the single nominal (0.68 power) speed; the legacy path
+/// (layer disabled) does the same so OFF reproduces prior behavior exactly.
+fn pass_velocity_plan_for_snapshot(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    aim_point: Vec2,
+    flight: PassFlight,
+    is_cross: bool,
+    receiver: Option<(&PlayerSnapshot, Vec2)>,
+) -> PassVelocityPlan {
+    let nominal = pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
+    let receipt_at = |speed: f64| -> f64 {
+        receiver
+            .map(|(target, target_position)| {
+                pass_mpc_receipt_estimate_for_snapshot(
+                    snapshot,
+                    passer,
+                    passer_position,
+                    target,
+                    target_position,
+                    flight,
+                    speed,
+                    aim_point,
+                )
+                .probability
+            })
+            .unwrap_or(0.62)
+    };
+    if flight.is_aerial() || dd_soccer_disable_learnable_pass_velocity() {
+        let risk = snapshot
+            .pass_lane_interception_risk(
+                passer_position,
+                aim_point,
+                passer.team.other(),
+                2.5,
+                nominal,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk;
+        return PassVelocityPlan {
+            speed_yps: nominal,
+            power: 0.68,
+            lane_interception_risk: risk,
+            min_clearing_speed_yps: nominal,
+            mpc_receipt_probability: receipt_at(nominal),
+        };
+    }
+    // Fast path for the common wide-open pass: if even the SLOWEST (most interceptable)
+    // bucket faces a negligible lane, no faster bucket can do better (a quicker ball is only
+    // ever safer in the lane but harder to receive), so the value trade-off would pick the
+    // weighted ball anyway. Return it without sweeping — this keeps an uncontested ball
+    // identical to the full-sweep result while skipping 3 buckets × every opponent (the bulk
+    // of passes are to open targets, and this runs per candidate during ranking).
+    let slowest_speed =
+        pass_speed_yps_from_power(PASS_VELOCITY_POWER_BUCKETS[0], flight, is_cross, &passer.skills);
+    let slowest_risk = snapshot
+        .pass_lane_interception_risk(
+            passer_position,
+            aim_point,
+            passer.team.other(),
+            2.5,
+            slowest_speed,
+            PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+        )
+        .risk;
+    if slowest_risk < PASS_VELOCITY_OPEN_LANE_RISK_EPSILON {
+        return PassVelocityPlan {
+            speed_yps: slowest_speed,
+            power: PASS_VELOCITY_POWER_BUCKETS[0],
+            lane_interception_risk: slowest_risk,
+            min_clearing_speed_yps: slowest_speed,
+            mpc_receipt_probability: receipt_at(slowest_speed),
+        };
+    }
+    let hardest_speed = pass_speed_yps_from_power(
+        *PASS_VELOCITY_POWER_BUCKETS.last().unwrap(),
+        flight,
+        is_cross,
+        &passer.skills,
+    );
+    let mut min_clearing = hardest_speed;
+    let mut any_clears = false;
+    let mut best: Option<(f64, PassVelocityPlan)> = None;
+    for &power in PASS_VELOCITY_POWER_BUCKETS.iter() {
+        let speed = pass_speed_yps_from_power(power, flight, is_cross, &passer.skills);
+        let risk = snapshot
+            .pass_lane_interception_risk(
+                passer_position,
+                aim_point,
+                passer.team.other(),
+                2.5,
+                speed,
+                PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+            )
+            .risk;
+        // The slowest (first) bucket that brings the lane risk under the threadable line is
+        // the MPC feasibility floor — the minimum pace to get the ball through.
+        if !any_clears && risk < PASS_LANE_DYNAMIC_RISK_HIGH {
+            min_clearing = speed;
+            any_clears = true;
+        }
+        let receipt = receipt_at(speed);
+        // Value trade-off: thread the lane (low risk) while keeping the ball receivable
+        // (high receipt). A small overhit penalty keeps a weighted ball preferred when the
+        // lane is already open. The MDP/POMDP value head learns to reweight these from the
+        // captured chosen-speed completion + lane-risk features.
+        let overhit_penalty = (power - 0.68).max(0.0) * 0.06;
+        let score = (1.0 - risk).clamp(0.0, 1.0) * receipt - overhit_penalty;
+        if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            best = Some((
+                score,
+                PassVelocityPlan {
+                    speed_yps: speed,
+                    power,
+                    lane_interception_risk: risk,
+                    min_clearing_speed_yps: speed,
+                    mpc_receipt_probability: receipt,
+                },
+            ));
+        }
+    }
+    let mut plan = best.map(|(_, plan)| plan).unwrap_or(PassVelocityPlan {
+        speed_yps: nominal,
+        power: 0.68,
+        lane_interception_risk: 0.0,
+        min_clearing_speed_yps: nominal,
+        mpc_receipt_probability: receipt_at(nominal),
+    });
+    plan.min_clearing_speed_yps = min_clearing;
+    plan
+}
+
 fn pass_target_quality_for_snapshot(
     snapshot: &WorldSnapshot,
     passer: &PlayerSnapshot,
@@ -45255,6 +45483,23 @@ fn pass_target_quality_for_snapshot_inner(
     } else {
         initial_anticipated_target
     };
+    // Learnable pass velocity: sweep the candidate launch speeds and choose the pace to
+    // strike this ball at, given the lane to the anticipated reception point. A contested
+    // lane that only a driven ball threads is now scored at that driven speed (lower lane
+    // risk, slightly lower receipt) instead of at a fixed weighted 0.68 power — so "drive
+    // it through the gap" becomes a scoreable option the value head can learn, not a hidden
+    // lane. When the layer is disabled this returns the legacy nominal (0.68) speed and the
+    // whole estimate is byte-identical.
+    let velocity_plan = pass_velocity_plan_for_snapshot(
+        snapshot,
+        passer,
+        passer_position,
+        anticipated_target,
+        flight,
+        is_cross,
+        Some((target, target_position)),
+    );
+    let effective_pass_speed = velocity_plan.speed_yps;
     let distance = passer_position.distance(anticipated_target);
     let current_receiver_openness = pass_receiver_openness_for_snapshots_with_teammates(
         &snapshot.players,
@@ -45295,7 +45540,7 @@ fn pass_target_quality_for_snapshot_inner(
         target,
         target_position,
         flight,
-        nominal_speed,
+        effective_pass_speed,
         anticipated_target,
     );
     let position_confidence = snapshot
@@ -45340,14 +45585,14 @@ fn pass_target_quality_for_snapshot_inner(
             anticipated_target,
             passer.team.other(),
             2.5,
-            nominal_speed,
+            effective_pass_speed,
         );
         let dynamic_risk = snapshot.pass_lane_interception_risk(
             passer_position,
             anticipated_target,
             passer.team.other(),
             2.5,
-            nominal_speed,
+            effective_pass_speed,
             PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
         );
         lane_interception_risk = dynamic_risk.risk;
@@ -45414,6 +45659,8 @@ fn pass_target_quality_for_snapshot_inner(
         receiver_openness,
         stride_fit,
         lane_interception_risk,
+        chosen_speed_yps: velocity_plan.speed_yps,
+        min_clearing_speed_yps: velocity_plan.min_clearing_speed_yps,
         expected_completion: expected_completion.clamp(0.02, 0.98),
         mpc_receipt_probability: mpc_receipt.probability,
         mpc_receipt_race_advantage_seconds: mpc_receipt.race_advantage_seconds,
@@ -45508,6 +45755,53 @@ fn goalkeeper_flank_width_score(position: Vec2, field_width: f64) -> f64 {
     let center_x = field_width * 0.5;
     let half_width = center_x.max(1.0);
     ((position.x - center_x).abs() / half_width).clamp(0.0, 1.0)
+}
+
+/// POMDP race-margin estimate: the probability the keeper reaches the ball before the
+/// `earliest_rival_time` (the smaller of the nearest attacker's and nearest teammate's sprint
+/// time). 0.5 at a dead heat, rising with the keeper's fractional time lead — it reaches ~0.95
+/// when the keeper arrives in ~70% of the rival's time (the same "near-certain" margin the
+/// keeper already uses to sweep). Beating the earliest rival implies beating both, so this one
+/// scalar expresses "before an attacker AND before his own teammate".
+fn keeper_first_to_ball_probability(gk_time: f64, earliest_rival_time: f64) -> f64 {
+    if !earliest_rival_time.is_finite() {
+        return 1.0;
+    }
+    if gk_time <= 1e-6 {
+        return 1.0;
+    }
+    let lead = (earliest_rival_time - gk_time) / earliest_rival_time.max(gk_time).max(0.2);
+    (0.5 + lead * 1.55).clamp(0.0, 1.0)
+}
+
+/// MPC bounded-acceleration estimate: the probability the keeper physically reaches a point
+/// `distance` away within `budget` seconds, starting from its current closing speed
+/// `speed_toward` and ramping under its acceleration cap up to `top_speed`. Unlike the POMDP
+/// estimate (which uses the instantaneous top-speed sprint time), this models the
+/// acceleration ramp — so a keeper starting from rest is correctly judged slower to arrive —
+/// and is the second, independent confirmation the keeper must clear before leaving its box.
+fn keeper_mpc_reach_probability(
+    distance: f64,
+    speed_toward: f64,
+    top_speed: f64,
+    accel: f64,
+    budget: f64,
+) -> f64 {
+    if distance <= PLAYER_CONTROL_RADIUS_YARDS {
+        return 1.0;
+    }
+    let v0 = speed_toward.clamp(0.0, top_speed);
+    let vmax = top_speed.max(0.5);
+    let a = accel.max(0.5);
+    let time_to_vmax = ((vmax - v0) / a).max(0.0);
+    let distance_to_vmax = v0 * time_to_vmax + 0.5 * a * time_to_vmax * time_to_vmax;
+    let reach_time = if distance_to_vmax >= distance {
+        // Reaches the point while still accelerating: solve 0.5·a·t² + v0·t − d = 0.
+        (-v0 + (v0 * v0 + 2.0 * a * distance).sqrt()) / a
+    } else {
+        time_to_vmax + (distance - distance_to_vmax) / vmax
+    };
+    keeper_first_to_ball_probability(reach_time, budget)
 }
 
 fn goalkeeper_backward_emergency_release_allowed(
@@ -45914,6 +46208,18 @@ fn shot_speed_yps_from_power(power: f64, skills: &SkillProfile) -> f64 {
     mph_to_yps(mph.clamp(SHOT_MIN_SPEED_MPH, SHOT_MAX_SPEED_MPH))
 }
 
+/// Hard-driven launch-speed ceilings (mph) that `power` scales up to in
+/// [`pass_speed_yps_from_power`]; a strong, skilled striker overshoots the ceiling by
+/// [`PASS_SPEED_CEILING_OVERSHOOT_MPH`]. Sized so a genuinely driven ball is realistic — a
+/// ~40mph ground pass, a ~50mph aerial — rather than the old ~34/~46mph caps. Crucially the
+/// ground ceiling is set so the hardest power bucket clears
+/// [`PASS_FAST_BYPASS_MIN_SPEED_YPS`] (~35mph): the policy can then ELECT a ball driven hard
+/// enough to thread a set trap at DECISION time, instead of that relief only emerging from
+/// the execution-side speed modulation (which already reached ~42mph).
+const GROUND_PASS_CEILING_MPH: f64 = 38.0;
+const AERIAL_PASS_CEILING_MPH: f64 = 46.0;
+const PASS_SPEED_CEILING_OVERSHOOT_MPH: f64 = 4.0;
+
 fn pass_speed_yps_from_power(
     power: f64,
     flight: PassFlight,
@@ -45942,11 +46248,15 @@ fn pass_speed_yps_from_power(
     } else {
         3.0
     };
-    let ceiling = if flight.is_aerial() { 42.0 } else { 30.0 };
+    let ceiling = if flight.is_aerial() {
+        AERIAL_PASS_CEILING_MPH
+    } else {
+        GROUND_PASS_CEILING_MPH
+    };
     let aerial_power_bonus = if flight.is_aerial() { 5.0 } else { 0.0 };
     let mph =
         floor + power.clamp(0.0, 1.0) * (ceiling - floor) + skill_power * 4.0 + aerial_power_bonus;
-    mph_to_yps(mph.clamp(3.0, ceiling + 4.0))
+    mph_to_yps(mph.clamp(3.0, ceiling + PASS_SPEED_CEILING_OVERSHOOT_MPH))
 }
 
 const DISCRETIZED_KICK_SPEED_BUCKETS: u8 = 10;
