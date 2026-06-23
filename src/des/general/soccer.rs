@@ -1128,6 +1128,15 @@ const CALM_PASS_FOCUS_FLOOR: f64 = 0.45;
 const PASS_RECEPTION_CONGESTION_RADIUS_YARDS: f64 = 4.0;
 const PASS_RECEPTION_CONGESTION_PENALTY_PER_OPPONENT: f64 = 0.20;
 const PASS_RECEPTION_CONGESTION_FLOOR: f64 = 0.28;
+// A receiver this tightly marked is not merely "a little less open": under pressure,
+// playing into that player's feet is often the same failure mode as passing directly to
+// the opponent. Keep this below the broader congestion radius so ordinary contested
+// final-third passes still exist.
+const TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS: f64 = 3.35;
+const TIGHT_MAN_MARK_RECEIVER_HARD_RADIUS_YARDS: f64 = 2.55;
+const TIGHT_MAN_MARK_PASSER_PRESSURE: f64 = 0.58;
+const TIGHT_MAN_MARK_COMPLETION_DAMP: f64 = 0.72;
+const TIGHT_MAN_MARK_SCORE_PENALTY: f64 = 7.5;
 // A ground pass is only allowed if the nearest opponent's time to the reception point is at
 // least this fraction of the ball's time to it — i.e. the receiver/ball wins the race. Just
 // under 1.0 because the opponent-arrival estimate assumes a perfect sprint (no reaction
@@ -4244,7 +4253,7 @@ impl PassFlight {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncomingBallContext {
     #[serde(default)]
@@ -4558,6 +4567,10 @@ impl TacticalPhase {
     }
 }
 
+fn default_tactical_phase_for_carryover() -> TacticalPhase {
+    TacticalPhase::Kickoff
+}
+
 /// Extra value-head observation channels that the single-tick, ego-summarised
 /// feature set was structurally blind to: short-horizon **temporal** signals
 /// (possession duration, ball/own momentum), **relational** multi-agent structure
@@ -4713,6 +4726,13 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
+    /// Previous settled run-time-step decision/action summary for this player.
+    /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
+    /// current observation stays current-state-first, while this optional payload
+    /// carries what the player believed, chose, and what MPC reported on the prior
+    /// tick. It is intentionally not folded into the coarse Q-key here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_tick_carryover: Option<SoccerPlayerTickCarryover>,
     #[serde(default)]
     pub scheduled_index: Option<usize>,
     #[serde(default)]
@@ -5390,6 +5410,63 @@ pub struct AgentDecisionTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
     pub action: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPlayerTickCarryover {
+    pub player_id: usize,
+    pub decision_tick: u64,
+    pub observed_at_tick: u64,
+    pub age_ticks: u64,
+    pub clock_seconds: f64,
+    pub action: String,
+    #[serde(default)]
+    pub action_target: Option<AgentActionTargetTrace>,
+    #[serde(default = "default_tactical_phase_for_carryover")]
+    pub mdp_phase: TacticalPhase,
+    #[serde(default)]
+    pub mdp_ball_grid: PitchGridAddress,
+    #[serde(default)]
+    pub mdp_player_grid: PitchGridAddress,
+    #[serde(default)]
+    pub mdp_receive_facing: FacingBucket,
+    #[serde(default)]
+    pub mdp_action_facing: FacingBucket,
+    #[serde(default)]
+    pub pomdp_visible_ball: bool,
+    #[serde(default)]
+    pub pomdp_visible_teammates: usize,
+    #[serde(default)]
+    pub pomdp_visible_opponents: usize,
+    #[serde(default)]
+    pub pomdp_ball_position_confidence: f64,
+    #[serde(default)]
+    pub pomdp_teammate_position_confidence: f64,
+    #[serde(default)]
+    pub pomdp_opponent_position_confidence: f64,
+    #[serde(default)]
+    pub pomdp_perceived_pressure: f64,
+    #[serde(default)]
+    pub pomdp_decision_urgency: f64,
+    #[serde(default)]
+    pub decision_confidence: f64,
+    #[serde(default)]
+    pub mpc_guidance_present: bool,
+    #[serde(default)]
+    pub chosen_action_mpc_feasibility: f64,
+    #[serde(default)]
+    pub mpc_comparison: Option<SoccerMdpMpcComparisonTrace>,
+    #[serde(default)]
+    pub executed_position: Vec2,
+    #[serde(default)]
+    pub executed_velocity: Vec2,
+    #[serde(default)]
+    pub executed_acceleration: Vec2,
+    #[serde(default)]
+    pub has_ball_after_action: bool,
+    #[serde(default)]
+    pub same_action_ticks: u32,
 }
 
 /// The live "Pause & Analyze" ring retains only the last
@@ -27210,6 +27287,7 @@ pub struct SoccerLearningRewardContract {
     pub marl_team_reward_weight: f64,
     pub marl_intermediate_reward_weight: f64,
     pub mappo_clip_epsilon: f64,
+    pub mappo_team_reward_share: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27241,6 +27319,7 @@ pub struct SoccerLearningRuntimeContract {
     pub marl_intermediate_reward_weight: f64,
     pub mappo_enabled: bool,
     pub mappo_clip_epsilon: f64,
+    pub mappo_team_reward_share: f64,
     pub tracking_dataset_training_enabled: bool,
     pub tracking_csv_import_enabled: bool,
     pub tracking_jsonl_import_enabled: bool,
@@ -27367,6 +27446,7 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
         marl_team_reward_weight: DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT,
         marl_intermediate_reward_weight: DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT,
         mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
+        mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
     }
 }
 
@@ -27401,6 +27481,7 @@ fn soccer_learning_runtime_contract(config: &MatchConfig) -> SoccerLearningRunti
             .sanitized_marl_intermediate_reward_weight(),
         mappo_enabled: config.neural_learning.mappo_enabled() && config.neural_blend.actor_critic,
         mappo_clip_epsilon: config.neural_learning.sanitized_mappo_clip_epsilon(),
+        mappo_team_reward_share: config.neural_learning.sanitized_mappo_team_reward_share(),
         tracking_dataset_training_enabled: true,
         tracking_csv_import_enabled: true,
         tracking_jsonl_import_enabled: true,
@@ -29399,6 +29480,8 @@ pub struct SoccerLearningSnapshot {
     #[serde(default)]
     pub mappo_clip_epsilon: f64,
     #[serde(default)]
+    pub mappo_team_reward_share: f64,
+    #[serde(default)]
     pub neural_learning_target_clip: f64,
     #[serde(default)]
     pub neural_learning_snapshot_every_batches: usize,
@@ -30377,6 +30460,11 @@ impl SoccerPolicyHead {
         &self,
         state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
     ) -> Option<Vec<f64>> {
+        if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+            || self.network.output_dim != SOCCER_POLICY_ACTIONS.len()
+        {
+            return None;
+        }
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
         }
@@ -34184,6 +34272,7 @@ impl SoccerRealtimeSession {
                 && sim.config.neural_learning.mappo_enabled()
                 && sim.neural_blend.actor_critic,
             "mappoClipEpsilon": sim.config.neural_learning.sanitized_mappo_clip_epsilon(),
+            "mappoTeamRewardShare": sim.config.neural_learning.sanitized_mappo_team_reward_share(),
             "worldModelEnabled": sim.world_model.is_some(),
         });
 
@@ -42162,11 +42251,14 @@ fn tracking_frame_to_world_snapshot(
         away_recycle_urgency: 0.0,
         home_recycle_participants: Vec::new(),
         away_recycle_participants: Vec::new(),
-        // A tracking-frame reconstruction has no per-tick belief history; an empty map
-        // means the analytic pass-lane risk is used unchanged.
-        opponent_press_tendency: HashMap::new(),
-    }
-}
+          // A tracking-frame reconstruction has no per-tick belief history; an empty map
+          // means the analytic pass-lane risk is used unchanged.
+          opponent_press_tendency: HashMap::new(),
+          // Tracking-frame snapshots are paired externally, not advanced through
+          // `run_time_step`, so they intentionally carry no live tick memory.
+          player_tick_carryover: HashMap::new(),
+      }
+  }
 
 fn tracking_frame_to_world_snapshot_with_history(
     config: &MatchConfig,
@@ -47040,10 +47132,27 @@ fn pass_target_quality_for_snapshot_inner(
         + distance_fit * 0.24
         + stride_fit * 0.08
         + position_confidence * 0.10;
+    let tight_mark_distance =
+        snapshot.pass_target_tight_mark_distance(passer.team, target_position, anticipated_target);
+    let tight_mark_completion_gate = if tight_mark_distance <= TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS
+    {
+        let mark =
+            ((TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS - tight_mark_distance)
+                / TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS.max(1.0))
+                .clamp(0.0, 1.0);
+        (1.0 - mark * TIGHT_MAN_MARK_COMPLETION_DAMP).clamp(0.22, 1.0)
+    } else {
+        1.0
+    };
     let pass_precision = 0.80 + pass_skill * 0.20;
     let mpc_receipt_gate = 0.68 + mpc_receipt.probability * 0.32;
     let expected_completion =
-        target_quality * lane_clearance * pass_precision * pressure_adjustment * mpc_receipt_gate;
+        target_quality
+            * lane_clearance
+            * pass_precision
+            * pressure_adjustment
+            * mpc_receipt_gate
+            * tight_mark_completion_gate;
     PassTargetQuality {
         receiver_openness,
         stride_fit,
@@ -51314,73 +51423,81 @@ fn pressure_bucket(nearest_opponent_distance: f64) -> u8 {
 
 // `rng` is retained for signature stability; squad skills are now deterministic
 // per shirt (`SkillProfile::for_shirt`), so no randomness is drawn here.
+fn default_formation_position(config: &MatchConfig, x: f64, y: f64) -> Vec2 {
+    Vec2::new(
+        x * config.field_width_yards / DEFAULT_FIELD_WIDTH_YARDS,
+        y * config.field_length_yards / DEFAULT_FIELD_LENGTH_YARDS,
+    )
+    .clamp_to_pitch(config.field_width_yards, config.field_length_yards)
+}
+
 fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerAgent> {
     let home_layout = vec![
         (
             "Home GK".to_string(),
             PlayerRole::Goalkeeper,
             1,
-            Vec2::new(40.0, 7.0),
+            default_formation_position(config, 40.0, 7.0),
         ),
         (
             "Home LB".to_string(),
             PlayerRole::Defender,
             2,
-            Vec2::new(14.0, 24.0),
+            default_formation_position(config, 14.0, 24.0),
         ),
         (
             "Home LCB".to_string(),
             PlayerRole::Defender,
             4,
-            Vec2::new(31.0, 23.0),
+            default_formation_position(config, 31.0, 23.0),
         ),
         (
             "Home RCB".to_string(),
             PlayerRole::Defender,
             5,
-            Vec2::new(49.0, 23.0),
+            default_formation_position(config, 49.0, 23.0),
         ),
         (
             "Home RB".to_string(),
             PlayerRole::Defender,
             3,
-            Vec2::new(66.0, 24.0),
+            default_formation_position(config, 66.0, 24.0),
         ),
         (
             "Home LM".to_string(),
             PlayerRole::Midfielder,
             11,
-            Vec2::new(17.0, 57.0),
+            default_formation_position(config, 17.0, 57.0),
         ),
         (
             "Home CM1".to_string(),
             PlayerRole::Midfielder,
             6,
-            Vec2::new(33.0, 55.0),
+            default_formation_position(config, 33.0, 55.0),
         ),
         (
             "Home CM2".to_string(),
             PlayerRole::Midfielder,
             8,
-            Vec2::new(47.0, 55.0),
+            default_formation_position(config, 47.0, 55.0),
         ),
         (
             "Home RM".to_string(),
             PlayerRole::Midfielder,
             7,
-            Vec2::new(63.0, 57.0),
+            default_formation_position(config, 63.0, 57.0),
         ),
         (
             "Home ST1".to_string(),
             PlayerRole::Forward,
             9,
-            Vec2::new(31.0, 78.0),
+            default_formation_position(config, 31.0, 78.0),
         ),
         (
             "Home ST2".to_string(),
             PlayerRole::Forward,
             10,
-            Vec2::new(49.0, 78.0),
+            default_formation_position(config, 49.0, 78.0),
         ),
     ];
     let away_layout = home_layout

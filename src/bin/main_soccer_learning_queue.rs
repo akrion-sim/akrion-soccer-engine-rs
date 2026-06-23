@@ -24,7 +24,7 @@ use soccer_engine::des::general::soccer::{
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
     evolve_soccer_team_policies, run_soccer_learning_queue_with_events,
-    soccer_evolution_options_from_search_metadata,
+    soccer_evolution_options_from_search_metadata, soccer_learning_curriculum_episode_config,
     soccer_learning_curriculum_stage_for_completed_games,
     soccer_neural_network_snapshot_fingerprint,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_new_sim_refresh_plan,
@@ -1803,6 +1803,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut active_config = config.clone();
+    let mut last_queue_curriculum_stage_label = None::<String>;
     let mut queue_completed_games_seen = 0usize;
     let mut local_tactical_evolved_since_pg_refresh = false;
     let tactical_evolution_window_games = evolution_window_games;
@@ -1835,6 +1836,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     policies: starting_policies,
                     neural_network,
                 } => {
+                    *match_config = active_config.clone();
                     if pg_refresh_for_new_sims {
                         let mut pending_async_pg_batches = 0usize;
                         let mut pending_async_policy_version_batches = 0usize;
@@ -2093,6 +2095,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                             (pg_base_policy_version_id.clone(), pg_generation),
                         );
                     }
+                    let (curriculum_match_config, curriculum_episode) =
+                        soccer_learning_curriculum_episode_config(
+                            match_config,
+                            next_episode,
+                            &curriculum_config,
+                        );
+                    let curriculum_stage_label = curriculum_episode.stage.as_str();
+                    if last_queue_curriculum_stage_label.as_deref()
+                        != Some(curriculum_stage_label)
+                    {
+                        println!(
+                            "queue_curriculum_stage next_episode={} stage={} drill_players_per_team={} field_yards={:.1}x{:.1} duration_seconds={:.1} local_mpc_max_players_per_team={}",
+                            next_episode + 1,
+                            curriculum_stage_label,
+                            curriculum_episode.drill_players_per_team,
+                            curriculum_episode.field_width_yards,
+                            curriculum_episode.field_length_yards,
+                            curriculum_episode.duration_seconds,
+                            curriculum_episode.local_mpc_max_players_per_team
+                        );
+                        last_queue_curriculum_stage_label =
+                            Some(curriculum_stage_label.to_string());
+                    }
+                    *match_config = curriculum_match_config;
                     Ok(())
                 }
                 SoccerLearningQueueEvent::CompletedGame {

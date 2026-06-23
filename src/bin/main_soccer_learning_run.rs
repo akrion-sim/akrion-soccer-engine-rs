@@ -23,7 +23,7 @@ use soccer_engine::des::general::soccer::{
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
     evolve_soccer_team_policies, merge_soccer_policy_deltas,
-    soccer_evolution_options_from_search_metadata,
+    soccer_evolution_options_from_search_metadata, soccer_learning_curriculum_episode_config,
     soccer_learning_curriculum_stage_for_completed_games, soccer_learning_run_score,
     soccer_neural_network_snapshot_fingerprint, soccer_policy_delta_entries,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_new_sim_refresh_plan,
@@ -3119,11 +3119,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     while next_episode < games {
         let batch_size = parallel_games.min(games - next_episode);
         let batch_start_episode = next_episode;
+        let (_, batch_start_curriculum) = soccer_learning_curriculum_episode_config(
+            &config,
+            batch_start_episode,
+            &curriculum_config,
+        );
+        let (_, batch_end_curriculum) = soccer_learning_curriculum_episode_config(
+            &config,
+            batch_start_episode + batch_size.saturating_sub(1),
+            &curriculum_config,
+        );
         println!(
-            "starting_batch episodes={}..{} parallel_games={}",
+            "starting_batch episodes={}..{} parallel_games={} curriculum_stage={}..{} curriculum_drill_players_per_team={}..{} curriculum_duration_seconds={:.1}..{:.1}",
             batch_start_episode + 1,
             batch_start_episode + batch_size,
-            batch_size
+            batch_size,
+            batch_start_curriculum.stage.as_str(),
+            batch_end_curriculum.stage.as_str(),
+            batch_start_curriculum.drill_players_per_team,
+            batch_end_curriculum.drill_players_per_team,
+            batch_start_curriculum.duration_seconds,
+            batch_end_curriculum.duration_seconds
         );
 
         for offset in 0..batch_size {
@@ -3208,7 +3224,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             let episode_starting_policy_version_id = pg_base_policy_version_id.clone();
             let episode_starting_policy_generation = pg_generation;
-            let mut episode_config = config.clone();
+            let (mut episode_config, _) =
+                soccer_learning_curriculum_episode_config(&config, episode, &curriculum_config);
             episode_config.seed = effective_seed.wrapping_add(episode as u32);
             worker_pool.submit(SoccerLearningWorkerTask {
                 episode,
