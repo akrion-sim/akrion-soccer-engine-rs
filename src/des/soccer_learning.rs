@@ -19,7 +19,7 @@ use crate::des::general::soccer::{
     SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamQPolicies, Team,
+    SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS, DEFAULT_FIELD_WIDTH_YARDS,
 };
 use crate::des::shared::capabilities::RandomSource;
 
@@ -43,6 +43,7 @@ const SOCCER_POLICY_STATE_ACTION_COVERAGE_WEIGHT: f64 = 0.14;
 const SOCCER_POLICY_TECHNICAL_COVERAGE_WEIGHT: f64 = 0.05;
 const SOCCER_POLICY_TARGET_COVERAGE_WEIGHT: f64 = 0.07;
 const SOCCER_POLICY_DP_RESIDUAL_PENALTY_WEIGHT: f64 = 0.018;
+const SOCCER_CURRICULUM_FULL_PLAYERS_PER_TEAM: usize = 11;
 const SOCCER_POLICY_DRIBBLE_NOVELTY_ACTIONS: &[&str] = &[
     "dribble",
     "carry-forward",
@@ -524,6 +525,100 @@ pub fn maybe_apply_soccer_curriculum_for_episode(
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SoccerLearningCurriculumEpisodeSpec {
+    pub stage: SoccerLearningCurriculumStage,
+    pub drill_players_per_team: usize,
+    pub field_width_yards: f64,
+    pub field_length_yards: f64,
+    pub duration_seconds: f64,
+    pub local_mpc_max_players_per_team: usize,
+}
+
+fn soccer_learning_curriculum_stage_players_per_team(
+    stage: SoccerLearningCurriculumStage,
+) -> usize {
+    match stage {
+        SoccerLearningCurriculumStage::Locomotion => 2,
+        SoccerLearningCurriculumStage::BallSkills => 3,
+        SoccerLearningCurriculumStage::Duels => 4,
+        SoccerLearningCurriculumStage::SmallSided => 5,
+        SoccerLearningCurriculumStage::TeamShape => 8,
+        SoccerLearningCurriculumStage::FullMatch => SOCCER_CURRICULUM_FULL_PLAYERS_PER_TEAM,
+    }
+}
+
+fn soccer_learning_curriculum_stage_pitch_scale(stage: SoccerLearningCurriculumStage) -> f64 {
+    match stage {
+        SoccerLearningCurriculumStage::Locomotion => 0.45,
+        SoccerLearningCurriculumStage::BallSkills => 0.55,
+        SoccerLearningCurriculumStage::Duels => 0.65,
+        SoccerLearningCurriculumStage::SmallSided => 0.75,
+        SoccerLearningCurriculumStage::TeamShape => 0.88,
+        SoccerLearningCurriculumStage::FullMatch => 1.0,
+    }
+}
+
+fn soccer_learning_curriculum_stage_duration_cap_seconds(
+    stage: SoccerLearningCurriculumStage,
+) -> Option<f64> {
+    match stage {
+        SoccerLearningCurriculumStage::Locomotion => Some(45.0),
+        SoccerLearningCurriculumStage::BallSkills => Some(60.0),
+        SoccerLearningCurriculumStage::Duels => Some(90.0),
+        SoccerLearningCurriculumStage::SmallSided => Some(150.0),
+        SoccerLearningCurriculumStage::TeamShape => Some(240.0),
+        SoccerLearningCurriculumStage::FullMatch => None,
+    }
+}
+
+pub fn soccer_learning_curriculum_episode_config(
+    base_config: &MatchConfig,
+    completed_games: usize,
+    curriculum_config: &SoccerLearningCurriculumConfig,
+) -> (MatchConfig, SoccerLearningCurriculumEpisodeSpec) {
+    let stage =
+        soccer_learning_curriculum_stage_for_completed_games(completed_games, curriculum_config);
+    let mut episode_config = base_config.sanitized_for_runtime();
+    let players_per_team = soccer_learning_curriculum_stage_players_per_team(stage)
+        .clamp(1, SOCCER_CURRICULUM_FULL_PLAYERS_PER_TEAM);
+    let pitch_scale = soccer_learning_curriculum_stage_pitch_scale(stage);
+    let min_field_width_yards =
+        (DEFAULT_FIELD_WIDTH_YARDS * 0.25).min(episode_config.field_width_yards);
+    let min_field_length_yards =
+        (DEFAULT_FIELD_LENGTH_YARDS * 0.25).min(episode_config.field_length_yards);
+    episode_config.field_width_yards =
+        (episode_config.field_width_yards * pitch_scale).max(min_field_width_yards);
+    episode_config.field_length_yards =
+        (episode_config.field_length_yards * pitch_scale).max(min_field_length_yards);
+    if let Some(duration_cap_seconds) = soccer_learning_curriculum_stage_duration_cap_seconds(stage)
+    {
+        let capped_duration = episode_config
+            .effective_duration_seconds()
+            .min(duration_cap_seconds)
+            .max(0.0);
+        episode_config.duration_seconds = capped_duration;
+        if episode_config.half_duration_seconds > 0.0 {
+            episode_config.half_duration_seconds =
+                capped_duration / f64::from(episode_config.half_count());
+        }
+    }
+    episode_config.local_mpc_max_players_per_team = episode_config
+        .local_mpc_max_players_per_team
+        .clamp(1, players_per_team);
+    episode_config = episode_config.sanitized_for_runtime();
+    let spec = SoccerLearningCurriculumEpisodeSpec {
+        stage,
+        drill_players_per_team: players_per_team,
+        field_width_yards: episode_config.field_width_yards,
+        field_length_yards: episode_config.field_length_yards,
+        duration_seconds: episode_config.effective_duration_seconds(),
+        local_mpc_max_players_per_team: episode_config.local_mpc_max_players_per_team,
+    };
+    (episode_config, spec)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SoccerPolicyPromotionGateConfig {
     pub enabled: bool,
     pub min_sample_games: usize,
@@ -804,7 +899,7 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
         ("targetScale", config.target_scale),
         ("targetClip", config.target_clip),
         ("criticBaselineWeight", config.critic_baseline_weight),
-        // Both convergent multi-agent-RL knobs are kept: MAPPO team-reward SHARE (ours) and the
+        // All convergent multi-agent-RL knobs are validated: MAPPO team-reward SHARE (ours) and the
         // MARL team/intermediate reward weights + the MAPPO clip epsilon (theirs).
         ("mappoTeamRewardShare", config.mappo_team_reward_share),
         ("marlTeamRewardWeight", config.marl_team_reward_weight),
@@ -5668,6 +5763,97 @@ mod tests {
                 base.neural_learning.mappo_team_reward_share
             );
         }
+    }
+
+    #[test]
+    fn curriculum_episode_config_scales_training_rungs_without_compounding() {
+        let curriculum = SoccerLearningCurriculumConfig {
+            ball_skills_after_games: 2,
+            duels_after_games: 4,
+            small_sided_after_games: 6,
+            team_shape_after_games: 8,
+            full_match_after_games: 10,
+        };
+        let base = MatchConfig {
+            duration_seconds: 600.0,
+            half_duration_seconds: 300.0,
+            field_width_yards: 80.0,
+            field_length_yards: 120.0,
+            local_mpc_enabled: true,
+            local_mpc_max_players_per_team: 11,
+            ..MatchConfig::default()
+        };
+
+        let (locomotion, locomotion_spec) =
+            soccer_learning_curriculum_episode_config(&base, 0, &curriculum);
+        assert_eq!(
+            locomotion_spec.stage,
+            SoccerLearningCurriculumStage::Locomotion
+        );
+        assert_eq!(locomotion_spec.drill_players_per_team, 2);
+        assert!((locomotion.field_width_yards - 36.0).abs() < 1e-9);
+        assert!((locomotion.field_length_yards - 54.0).abs() < 1e-9);
+        assert!((locomotion.effective_duration_seconds() - 45.0).abs() < 1e-9);
+        assert!((locomotion.half_duration_seconds - 45.0).abs() < 1e-9);
+        assert_eq!(locomotion.local_mpc_max_players_per_team, 2);
+
+        let (_, ball_skills_spec) =
+            soccer_learning_curriculum_episode_config(&base, 2, &curriculum);
+        let (_, duels_spec) = soccer_learning_curriculum_episode_config(&base, 4, &curriculum);
+        let (_, small_sided_spec) =
+            soccer_learning_curriculum_episode_config(&base, 6, &curriculum);
+        let (_, team_shape_spec) = soccer_learning_curriculum_episode_config(&base, 8, &curriculum);
+        let (full_match, full_match_spec) =
+            soccer_learning_curriculum_episode_config(&base, 10, &curriculum);
+        assert_eq!(ball_skills_spec.drill_players_per_team, 3);
+        assert_eq!(duels_spec.drill_players_per_team, 4);
+        assert_eq!(small_sided_spec.drill_players_per_team, 5);
+        assert_eq!(team_shape_spec.drill_players_per_team, 8);
+        assert_eq!(full_match_spec.drill_players_per_team, 11);
+        assert_eq!(
+            full_match_spec.stage,
+            SoccerLearningCurriculumStage::FullMatch
+        );
+        assert!((full_match.field_width_yards - base.field_width_yards).abs() < 1e-9);
+        assert!((full_match.field_length_yards - base.field_length_yards).abs() < 1e-9);
+        assert!(
+            (full_match.effective_duration_seconds() - base.effective_duration_seconds()).abs()
+                < 1e-9
+        );
+        assert_eq!(base.local_mpc_max_players_per_team, 11);
+
+        let tiny_base = MatchConfig {
+            field_width_yards: 12.0,
+            field_length_yards: 18.0,
+            ..base.clone()
+        };
+        let (tiny_full_match, _) =
+            soccer_learning_curriculum_episode_config(&tiny_base, 10, &curriculum);
+        assert!((tiny_full_match.field_width_yards - 12.0).abs() < 1e-9);
+        assert!((tiny_full_match.field_length_yards - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn curriculum_episode_config_preserves_short_test_games() {
+        let curriculum = SoccerLearningCurriculumConfig::default();
+        let base = MatchConfig {
+            duration_seconds: 0.2,
+            half_duration_seconds: 0.0,
+            field_width_yards: 80.0,
+            field_length_yards: 120.0,
+            local_mpc_enabled: true,
+            local_mpc_max_players_per_team: 3,
+            ..MatchConfig::default()
+        };
+
+        let (episode_config, spec) =
+            soccer_learning_curriculum_episode_config(&base, 0, &curriculum);
+        assert_eq!(spec.stage, SoccerLearningCurriculumStage::Locomotion);
+        assert!((episode_config.effective_duration_seconds() - 0.2).abs() < 1e-9);
+        assert_eq!(episode_config.half_duration_seconds, 0.0);
+        assert_eq!(episode_config.local_mpc_max_players_per_team, 2);
+        assert!((base.field_width_yards - 80.0).abs() < 1e-9);
+        assert!((base.field_length_yards - 120.0).abs() < 1e-9);
     }
 
     #[test]

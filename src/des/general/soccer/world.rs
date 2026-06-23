@@ -14,6 +14,7 @@ const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
 const TEAMMATE_LANE_GUARD_SAME_ROLE_RADIUS_YARDS: f64 = 3.35;
@@ -361,6 +362,11 @@ pub struct SoccerMatch {
     /// never updated) when the feature is off, so pass-lane risk is byte-identical to the
     /// analytic-only path. Pure runtime state — never serialized.
     pub(crate) opponent_press_belief: HashMap<usize, OpponentPressBelief>,
+    /// Per-player cross-tick decision/action carryover. This is the explicit continuity layer
+    /// between successive [`Self::run_time_step`] calls: every POMDP observation can read the
+    /// player's previous MDP state, belief summary, chosen action, action target, and MPC
+    /// reconciliation summary without depending on transient `WorldSnapshot` instances.
+    pub(crate) player_tick_carryover: HashMap<usize, SoccerPlayerTickCarryover>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -985,6 +991,18 @@ mod tests {
         assert_eq!(learner.training_steps(), 0);
         assert!(learner.average_loss().is_none());
         assert!(sim.neural_blend_lambda_for_learner(learner) > 0.0);
+    }
+
+    #[test]
+    fn live_gameplay_uses_cooperative_mappo_team_reward_share() {
+        let config = MatchConfig::live_gameplay();
+
+        assert_eq!(
+            config.neural_learning.mappo_team_reward_share,
+            DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE
+        );
+        assert!(config.neural_learning.mappo_team_reward_share > 0.0);
+        assert_eq!(config.neural_learning.marl_algorithm, SoccerMarlAlgorithm::Mappo);
     }
 
     #[test]
@@ -1620,6 +1638,7 @@ impl SoccerMatch {
             mpc_player_controllers: HashMap::new(),
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
             opponent_press_belief: HashMap::new(),
+            player_tick_carryover: HashMap::new(),
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -2449,6 +2468,10 @@ impl SoccerMatch {
                 && self.config.neural_learning.mappo_enabled()
                 && self.neural_blend.actor_critic,
             mappo_clip_epsilon: self.config.neural_learning.sanitized_mappo_clip_epsilon(),
+            mappo_team_reward_share: self
+                .config
+                .neural_learning
+                .sanitized_mappo_team_reward_share(),
             neural_learning_target_clip: self.config.neural_learning.sanitized_target_clip(),
             neural_learning_snapshot_every_batches: self
                 .config
@@ -3361,10 +3384,10 @@ impl SoccerMatch {
         // dims are constant across candidates, so this is a pure function of state.
         let policy_log_probs: Option<Vec<f64>> = if actor_active {
             base.action = String::new();
-            let state_features = soccer_neural_transition_features(&base);
+            let state_features = self.policy_state_features(&base);
             self.policy_head
                 .as_ref()
-                .and_then(|head| head.action_distribution_for_role(&state_features, role))
+                .and_then(|head| head.action_distribution(&state_features))
                 .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect())
         } else {
             None
@@ -3372,8 +3395,9 @@ impl SoccerMatch {
 
         // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in via
         // `DD_SOCCER_LOOKAHEAD_DEPTH >= 1` AND a trained world model is present, the value blend
-        // scores each candidate by rolling the world model one step forward and evaluating the
-        // predicted state (folded into the `neural_q` closure below). Depth 0 — the default, and
+        // scores each candidate by rolling the world model one step forward (`predict_next`) and
+        // evaluating the predicted state with the critic (folded into the `neural_q` closure
+        // below), rather than scoring the current state-action directly. Depth 0 — the default, and
         // forced when no world model exists — reproduces the direct depth-0 critic value
         // byte-for-byte, so play is unchanged unless a run opts in.
         let lookahead_depth = if self.world_model.is_some() {
@@ -3438,24 +3462,19 @@ impl SoccerMatch {
         } else {
             0.0
         };
-        let neural_q = |transition: &SoccerLearningTransition| -> Option<f64> {
+        let neural_q = |label: &str| -> Option<f64> {
             let learner = learner?;
             // Look-ahead-aware critic value: depth 0 is the direct critic (byte-identical to the
             // pre-look-ahead path, since `model_based_lookahead_value` at depth 0 == predict_value
             // of the same features); depth >= 1 rolls the world model one step forward first.
-            self.model_based_lookahead_value(
-                transition,
-                &transition.action,
-                learner,
-                lookahead_depth,
-            )
-            .map(|v| v * target_scale)
+            self.model_based_lookahead_value(&base, label, learner, lookahead_depth)
+                .map(|v| v * target_scale)
         };
         let mut scored_candidates = Vec::with_capacity(legal.len());
         for candidate in legal.iter() {
             let mut transition = base.clone();
             transition.action = candidate.label.clone();
-            let neural_value = neural_q(&transition);
+            let neural_value = neural_q(&candidate.label);
             // Value contribution (0-weighted when the value blend is off/cold).
             let value_score = match blend.mode {
                 SoccerNeuralBlendMode::Off => candidate.value,
@@ -4273,20 +4292,21 @@ impl SoccerMatch {
             .collect()
     }
 
-    /// State-only feature vector for the actor: the transition's features built
-    /// with a **null action**, so the policy input is a pure function of state
-    /// (the action-family channels are constant across candidates). Same builder
-    /// as the critic, so there is no feature drift between heads.
+    /// State-only feature vector for the actor: the transition's critic features
+    /// built with a **null action**, then extended with an explicit role one-hot
+    /// so the shared policy can specialize by position without changing the
+    /// critic/value feature schema.
     fn policy_state_features(
         &self,
         transition: &SoccerLearningTransition,
-    ) -> [f64; SOCCER_NEURAL_FEATURE_DIM] {
+    ) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
         // Null action ⇒ pure state features, with no per-row clone of the (heavy)
         // transition. NOTE (wm-2): a handful of channels are still derived from
         // `decision_context` geometry that the realised action shaped, so this is
         // "state-dominant", not perfectly action-independent — adequate as the
         // policy/world-model state encoding, and identical at train and inference.
-        soccer_neural_transition_features_with_action(transition, "")
+        let state_features = soccer_neural_transition_features_with_action(transition, "");
+        soccer_policy_features_for_role(&state_features, transition.role)
     }
 
     /// Build actor-critic training samples from a replay: opponent-centered reward
@@ -4323,11 +4343,12 @@ impl SoccerMatch {
         // Per-tick team reward aggregation for centralized MARL shaping.
         let tick_rewards = soccer_marl_tick_rewards(replay);
 
-        // Per-transition reward advantage. Both convergent cooperative-MARL shapings are unified in
-        // `soccer_marl_adjusted_reward`: ours' MAPPO team-reward SHARE blends each agent's reward
-        // toward its team's per-tick mean, and theirs' centralized weighting then scales that
-        // (intermediate) signal and adds the zero-sum (own − opponent) team component. Each knob
-        // reduces to a no-op at its default, so the default path is byte-identical to before.
+        // Per-transition row: the MARL-adjusted reward (critic value in reward units), terminal
+        // flag, action index, and state features. Both convergent cooperative-MARL shapings are
+        // unified in `soccer_marl_adjusted_reward`: ours' MAPPO team-reward SHARE blends each
+        // agent's reward toward its team's per-tick mean, and theirs' centralized weighting then
+        // scales that (intermediate) signal and adds the zero-sum (own − opponent) team component.
+        // Each knob reduces to a no-op at its default, so the default path is byte-identical.
         let reward_adv: Vec<f64> = replay
             .iter()
             .map(|transition| {
@@ -4405,9 +4426,7 @@ impl SoccerMatch {
                 let old_action_probability = self
                     .policy_head
                     .as_ref()
-                    .and_then(|head| {
-                        head.action_distribution_for_role(&state_features, transition.role)
-                    })
+                    .and_then(|head| head.action_distribution(&state_features))
                     .and_then(|probs| probs.get(action_index).copied())
                     .filter(|probability| probability.is_finite() && *probability > 0.0);
                 advantage.is_finite().then(|| SoccerPolicySample {
@@ -4415,7 +4434,6 @@ impl SoccerMatch {
                     action_index,
                     advantage,
                     old_action_probability,
-                    role: transition.role,
                 })
             })
             .collect()
@@ -4423,10 +4441,7 @@ impl SoccerMatch {
 
     fn ensure_policy_head(&mut self) {
         if self.policy_head.is_none() {
-            self.policy_head = Some(SoccerPolicyHead::new_with_options(
-                self.config.seed,
-                self.neural_blend.policy_role_embedding,
-            ));
+            self.policy_head = Some(SoccerPolicyHead::new(self.config.seed));
         }
     }
 
@@ -4475,7 +4490,7 @@ impl SoccerMatch {
                     continue;
                 }
                 let input = soccer_neural_transition_features(&replay[current]);
-                let target = self.policy_state_features(&replay[next]);
+                let target = soccer_neural_transition_features_with_action(&replay[next], "");
                 if input.iter().all(|v| v.is_finite()) && target.iter().all(|v| v.is_finite()) {
                     pairs.push((input, target));
                 }
@@ -5306,6 +5321,81 @@ impl SoccerMatch {
         }
     }
 
+    /// Persist the settled per-player MDP/POMDP/MPC decision summary for the next
+    /// `run_time_step`. `WorldSnapshot`s are rebuilt many times inside one tick, so
+    /// this match-owned cache is the durable bridge: the next observation can read
+    /// what the player believed, chose, targeted, and what MPC reported last tick.
+    fn update_player_tick_carryover(&mut self) {
+        let live_player_ids = self
+            .players
+            .iter()
+            .map(|player| player.id)
+            .collect::<HashSet<_>>();
+        self.player_tick_carryover
+            .retain(|player_id, _| live_player_ids.contains(player_id));
+
+        for player in &self.players {
+            let Some(decision) = player.last_decision.as_ref() else {
+                continue;
+            };
+            let same_action_ticks = self
+                .player_tick_carryover
+                .get(&player.id)
+                .filter(|previous| {
+                    normalize_soccer_action_label(&previous.action)
+                        == normalize_soccer_action_label(&decision.action)
+                })
+                .map(|previous| previous.same_action_ticks.saturating_add(1))
+                .unwrap_or(1);
+            let decision_tick = decision.mdp_state.tick;
+            let observation = &decision.observation;
+            self.player_tick_carryover.insert(
+                player.id,
+                SoccerPlayerTickCarryover {
+                    player_id: player.id,
+                    decision_tick,
+                    observed_at_tick: self.tick,
+                    age_ticks: self.tick.saturating_sub(decision_tick),
+                    clock_seconds: self.clock_seconds,
+                    action: decision.action.clone(),
+                    action_target: decision.action_target.clone(),
+                    mdp_phase: decision.mdp_state.phase,
+                    mdp_ball_grid: decision.mdp_state.ball_grid,
+                    mdp_player_grid: decision.mdp_state.player_grid,
+                    mdp_receive_facing: decision.mdp_state.receive_facing,
+                    mdp_action_facing: decision.mdp_state.action_facing,
+                    pomdp_visible_ball: observation.visible_ball,
+                    pomdp_visible_teammates: observation.visible_teammates,
+                    pomdp_visible_opponents: observation.visible_opponents,
+                    pomdp_ball_position_confidence: finite_unit_interval(
+                        observation.ball_position_confidence,
+                    ),
+                    pomdp_teammate_position_confidence: finite_unit_interval(
+                        observation.teammate_position_confidence,
+                    ),
+                    pomdp_opponent_position_confidence: finite_unit_interval(
+                        observation.opponent_position_confidence,
+                    ),
+                    pomdp_perceived_pressure: finite_unit_interval(observation.perceived_pressure),
+                    pomdp_decision_urgency: finite_unit_interval(observation.decision_urgency),
+                    decision_confidence: finite_unit_interval(player.decision_confidence),
+                    mpc_guidance_present: decision.mdp_mpc_comparison.is_some(),
+                    chosen_action_mpc_feasibility: decision
+                        .mdp_mpc_comparison
+                        .as_ref()
+                        .map(|comparison| finite_unit_interval(comparison.mpc_execution_probability))
+                        .unwrap_or(1.0),
+                    mpc_comparison: decision.mdp_mpc_comparison.clone(),
+                    executed_position: player.position,
+                    executed_velocity: player.velocity,
+                    executed_acceleration: player.acceleration,
+                    has_ball_after_action: self.ball.holder == Some(player.id),
+                    same_action_ticks,
+                },
+            );
+        }
+    }
+
     /// Arm the no-double-touch guard for the opening kickoff, lazily, on the first
     /// tick of a real match. A freshly constructed match holds the ball on the centre
     /// spot with the home kickoff taker and no recorded ball decision; we make sure
@@ -5824,6 +5914,7 @@ impl SoccerMatch {
         // Body rotation / dizziness / rotational-and-involvement energy run every
         // tick on the final positions (independent of learning).
         self.update_player_facing_dizziness_energy();
+        self.update_player_tick_carryover();
         let next_snapshot = WorldSnapshot::from_match_for_learning(self);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
@@ -9491,6 +9582,66 @@ impl SoccerMatch {
                         flight = plan.flight;
                     }
                     let pressure = pressure_from_observation(&observation);
+                    if target_id.is_some_and(|id| {
+                        !snapshot.players.iter().any(|player| {
+                            player.id == id && player.id != player_id && player.team == player_team
+                        })
+                    }) {
+                        target_id = None;
+                        target = resolve_outlet(&mut target_id);
+                    }
+                    let mut marked_target_to_rewrite = None;
+                    if let Some(current_target_id) = target_id {
+                        if let Some(receiver) = snapshot
+                            .players
+                            .iter()
+                            .find(|player| player.id == current_target_id && player.team == player_team)
+                        {
+                            let receiver_position = snapshot
+                                .player_position(current_target_id)
+                                .unwrap_or(receiver.position);
+                            let one_two_give_to_wall = self.players[player_id]
+                                .one_two
+                                .map(|one_two| one_two.wall_partner)
+                                == Some(current_target_id);
+                            let forward = (target.y - player_pos.y) * player_team.attack_dir();
+                            if !one_two_give_to_wall
+                                && snapshot.pass_target_marked_under_pressure(
+                                    player_team,
+                                    receiver_position,
+                                    target,
+                                    pressure,
+                                    forward,
+                                )
+                            {
+                                marked_target_to_rewrite = Some(current_target_id);
+                            }
+                        } else {
+                            target_id = None;
+                            target = resolve_outlet(&mut target_id);
+                        }
+                    }
+                    if let Some(unsafe_target_id) = marked_target_to_rewrite {
+                        if let Some((replacement_id, replacement_point)) =
+                            snapshot.safe_pass_replacement_for(
+                                player_id,
+                                player_team,
+                                player_pos,
+                                flight,
+                                unsafe_target_id,
+                                pressure,
+                            )
+                        {
+                            target_id = Some(replacement_id);
+                            target = replacement_point.clamp_to_pitch(
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            );
+                        } else {
+                            target_id = None;
+                            target = resolve_outlet(&mut target_id);
+                        }
+                    }
                     let initial_is_cross = pass_would_be_cross(
                         player_pos,
                         target,
@@ -9576,6 +9727,70 @@ impl SoccerMatch {
                                     self.config.field_length_yards,
                                 );
                                 mpc_pass_speed = Some(v);
+                            }
+                        }
+                    }
+                    if let Some(current_target_id) = target_id {
+                        if let Some(receiver) = snapshot
+                            .players
+                            .iter()
+                            .find(|player| player.id == current_target_id && player.team == player_team)
+                        {
+                            let receiver_position = snapshot
+                                .player_position(current_target_id)
+                                .unwrap_or(receiver.position)
+                                .clamp_to_pitch(
+                                    self.config.field_width_yards,
+                                    self.config.field_length_yards,
+                                );
+                            let led_forward = (led_target.y - player_pos.y) * player_team.attack_dir();
+                            let led_unsafe = snapshot.pass_target_marked_under_pressure(
+                                player_team,
+                                receiver_position,
+                                led_target,
+                                pressure,
+                                led_forward,
+                            );
+                            if led_unsafe {
+                                let feet_forward =
+                                    (receiver_position.y - player_pos.y) * player_team.attack_dir();
+                                let receiver_feet_safe = !snapshot.pass_target_marked_under_pressure(
+                                    player_team,
+                                    receiver_position,
+                                    receiver_position,
+                                    pressure,
+                                    feet_forward,
+                                );
+                                if receiver_feet_safe {
+                                    led_target = receiver_position;
+                                    mpc_pass_speed = None;
+                                } else if let Some((replacement_id, replacement_point)) =
+                                    snapshot.safe_pass_replacement_for(
+                                        player_id,
+                                        player_team,
+                                        player_pos,
+                                        flight,
+                                        current_target_id,
+                                        pressure,
+                                    )
+                                {
+                                    target_id = Some(replacement_id);
+                                    target = replacement_point.clamp_to_pitch(
+                                        self.config.field_width_yards,
+                                        self.config.field_length_yards,
+                                    );
+                                    led_target = target;
+                                    mpc_pass_speed = None;
+                                } else {
+                                    let look = led_target - player_pos;
+                                    if look.len() > 1e-6 {
+                                        let face = facing_bucket_from_vector(look);
+                                        if face != FacingBucket::Unknown {
+                                            self.players[player_id].action_facing = face;
+                                        }
+                                    }
+                                    return;
+                                }
                             }
                         }
                     }
@@ -14241,6 +14456,7 @@ impl SoccerMatch {
             p.movement_gait = MovementGait::Stand;
             p.receive_facing = FacingBucket::Unknown;
             p.action_facing = default_team_facing(p.team);
+            p.last_decision = None;
             p.fatigue = (p.fatigue * (1.0 - recovery)).clamp(0.0, 1.0);
             p.record_position_history();
         }
@@ -14281,6 +14497,7 @@ impl SoccerMatch {
         self.ball.record_decision(self.tick, "kickoff", None);
         self.pending_pass = None;
         self.pending_shot = None;
+        self.player_tick_carryover.clear();
         self.defensive_delay_clocks.clear();
         self.defensive_beat_clocks.clear();
         self.defensive_clear_hold_trackers.clear();
@@ -14323,6 +14540,7 @@ impl SoccerMatch {
             p.movement_gait = MovementGait::Stand;
             p.receive_facing = FacingBucket::Unknown;
             p.action_facing = default_team_facing(p.team);
+            p.last_decision = None;
             p.record_position_history();
         }
         let kickoff = self
@@ -14361,6 +14579,7 @@ impl SoccerMatch {
         self.ball.record_decision(self.tick, "kickoff", None);
         self.pending_pass = None;
         self.pending_shot = None;
+        self.player_tick_carryover.clear();
         self.defensive_clear_hold_trackers.clear();
         self.shared_positions.sync_from_players_and_ball(
             &self.players,
@@ -16200,6 +16419,10 @@ pub struct WorldSnapshot {
     /// tick, never serialized.
     #[serde(skip)]
     pub(crate) opponent_press_tendency: HashMap<usize, f64>,
+    /// Previous run-time-step carryover copied from the match cache at snapshot build.
+    /// Empty for synthetic/tracking snapshots and before a player has made a decision.
+    #[serde(skip)]
+    pub(crate) player_tick_carryover: HashMap<usize, SoccerPlayerTickCarryover>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17321,6 +17544,7 @@ impl WorldSnapshot {
             home_recycle_participants,
             away_recycle_participants,
             opponent_press_tendency: m.opponent_press_tendency_map(),
+            player_tick_carryover: m.player_tick_carryover.clone(),
         }
     }
 
@@ -17881,6 +18105,175 @@ impl WorldSnapshot {
         self.nearest_opponent_at(team, position)
             .map(|(_, _, distance)| distance)
             .unwrap_or(f64::INFINITY)
+    }
+
+    fn pass_target_point_for(
+        &self,
+        passer_id: usize,
+        target_id: usize,
+        flight: PassFlight,
+    ) -> Option<Vec2> {
+        if flight.is_aerial() {
+            self.projected_in_behind_pass_point(passer_id, target_id)
+        } else {
+            None
+        }
+        .or_else(|| self.player_position(target_id))
+    }
+
+    pub(crate) fn pass_target_tight_mark_distance(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_point: Vec2,
+    ) -> f64 {
+        self.pass_target_tight_mark_distance_over_horizons(
+            team,
+            receiver_position,
+            pass_point,
+            PASS_TARGET_MARK_HORIZON_TICKS,
+        )
+    }
+
+    fn pass_target_tight_mark_distance_over_horizons(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_point: Vec2,
+        horizons: [f64; 5],
+    ) -> f64 {
+        let midpoint = receiver_position + (pass_point - receiver_position) * 0.5;
+        let mut nearest = f64::INFINITY;
+        for ticks in horizons {
+            let seconds = self.dt_seconds.max(0.0) * ticks;
+            nearest = nearest
+                .min(self.nearest_projected_opponent_distance_at(team, receiver_position, seconds));
+            nearest =
+                nearest.min(self.nearest_projected_opponent_distance_at(team, pass_point, seconds));
+            nearest =
+                nearest.min(self.nearest_projected_opponent_distance_at(team, midpoint, seconds));
+        }
+        nearest
+    }
+
+    fn nearest_projected_opponent_distance_at(
+        &self,
+        team: Team,
+        position: Vec2,
+        seconds: f64,
+    ) -> f64 {
+        let seconds = seconds.clamp(0.0, self.dt_seconds.max(DEFAULT_DT_SECONDS) * 8.0);
+        self.players
+            .iter()
+            .filter(|player| player.team == team.other())
+            .map(|player| {
+                let current = self.player_snapshot_position(player);
+                let velocity = self.player_velocity(player.id).unwrap_or(player.velocity);
+                let projected = (current + velocity * seconds
+                    + player.acceleration * (0.5 * seconds * seconds))
+                    .clamp_to_pitch(self.field_width, self.field_length);
+                projected.distance(position)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    pub(crate) fn pass_target_marked_under_pressure(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_point: Vec2,
+        passer_pressure: f64,
+        forward_yards: f64,
+    ) -> bool {
+        let tight_mark_distance =
+            self.pass_target_tight_mark_distance(team, receiver_position, pass_point);
+        if tight_mark_distance > TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS {
+            return false;
+        }
+        if self.pass_point_directly_favors_opponent(team, receiver_position, pass_point) {
+            return true;
+        }
+        let current_tight_mark_distance = self.pass_target_tight_mark_distance_over_horizons(
+            team,
+            receiver_position,
+            pass_point,
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        if current_tight_mark_distance <= TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS
+            && passer_pressure >= TIGHT_MAN_MARK_PASSER_PRESSURE
+        {
+            return true;
+        }
+        let in_final_third =
+            (team.goal_y(self.field_length) - pass_point.y).abs() <= self.field_length / 3.0;
+        let forward_or_square = forward_yards >= -1.25;
+        tight_mark_distance <= TIGHT_MAN_MARK_RECEIVER_HARD_RADIUS_YARDS
+            && !in_final_third
+            && forward_or_square
+    }
+
+    fn pass_target_marking_score_penalty(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_point: Vec2,
+        passer_pressure: f64,
+    ) -> f64 {
+        let tight_mark_distance =
+            self.pass_target_tight_mark_distance(team, receiver_position, pass_point);
+        if tight_mark_distance > TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS {
+            return 0.0;
+        }
+        let mark = ((TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS - tight_mark_distance)
+            / (TIGHT_MAN_MARK_RECEIVER_RADIUS_YARDS - TIGHT_MAN_MARK_RECEIVER_HARD_RADIUS_YARDS)
+                .max(0.25))
+        .clamp(0.0, 1.0);
+        let pressure =
+            (passer_pressure / TIGHT_MAN_MARK_PASSER_PRESSURE.max(1e-6)).clamp(0.0, 1.0);
+        let yards_to_goal = (team.goal_y(self.field_length) - pass_point.y).abs();
+        let final_third_relief = if yards_to_goal <= self.field_length / 3.0 {
+            FINAL_THIRD_CONGESTION_FLOOR
+        } else {
+            1.0
+        };
+        TIGHT_MAN_MARK_SCORE_PENALTY * mark * (0.45 + pressure * 0.55) * final_third_relief
+    }
+
+    fn safe_pass_replacement_for(
+        &self,
+        passer_id: usize,
+        passer_team: Team,
+        passer_position: Vec2,
+        flight: PassFlight,
+        rejected_target_id: usize,
+        passer_pressure: f64,
+    ) -> Option<(usize, Vec2)> {
+        let candidates = if flight.is_aerial() {
+            self.ranked_visible_aerial_pass_targets(passer_id, 11)
+        } else {
+            self.ranked_visible_pass_targets(passer_id, 11)
+        };
+        candidates
+            .into_iter()
+            .filter(|candidate_id| *candidate_id != rejected_target_id)
+            .filter_map(|candidate_id| {
+                let receiver = self
+                    .players
+                    .iter()
+                    .find(|player| player.id == candidate_id && player.team == passer_team)?;
+                let receiver_position = self.player_position(candidate_id).unwrap_or(receiver.position);
+                let point = self.pass_target_point_for(passer_id, candidate_id, flight)?;
+                let forward = (point.y - passer_position.y) * passer_team.attack_dir();
+                (!self.pass_target_marked_under_pressure(
+                    passer_team,
+                    receiver_position,
+                    point,
+                    passer_pressure,
+                    forward,
+                ))
+                .then_some((candidate_id, point))
+            })
+            .next()
     }
 
     pub(crate) fn pass_point_directly_favors_opponent(
@@ -20413,6 +20806,7 @@ impl WorldSnapshot {
                 look_behind_scan_seconds: 0.0,
                 look_behind_confidence_bonus: 0.0,
                 look_behind_drift_risk: 0.0,
+                previous_tick_carryover: None,
                 scheduled_index: None,
                 ball_scheduled_index: None,
                 ball_schedule_order: 0,
@@ -20560,6 +20954,15 @@ impl WorldSnapshot {
             };
         };
         let me_position = self.player_snapshot_position(me);
+        let previous_tick_carryover =
+            self.player_tick_carryover
+                .get(&player_id)
+                .cloned()
+                .map(|mut carryover| {
+                    carryover.observed_at_tick = self.tick;
+                    carryover.age_ticks = self.tick.saturating_sub(carryover.decision_tick);
+                    carryover
+                });
         let observation_started = Instant::now();
         let phase_started = Instant::now();
         let opponents = self
@@ -21391,6 +21794,7 @@ impl WorldSnapshot {
             look_behind_scan_seconds: look_behind_scan.duration_seconds,
             look_behind_confidence_bonus: look_behind_scan.confidence_bonus,
             look_behind_drift_risk: look_behind_scan.drift_risk,
+            previous_tick_carryover,
             scheduled_index,
             ball_scheduled_index,
             ball_schedule_order,
@@ -22430,9 +22834,11 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let directive = self.tactical_directive(me.team);
+        let passer_pressure =
+            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
         let no_pressure = self.no_pressure_at(me.team, me_position);
         let keeper_pressure = if me.role == PlayerRole::Goalkeeper {
-            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position))
+            passer_pressure
         } else {
             0.0
         };
@@ -22650,6 +23056,13 @@ impl WorldSnapshot {
                         } else {
                             reception_won
                         };
+                        let marked_under_pressure = self.pass_target_marked_under_pressure(
+                            me.team,
+                            position,
+                            *aim_point,
+                            passer_pressure,
+                            forward,
+                        );
                         // A defender whose CURRENT run carries it into the lane before the
                         // ball arrives will cut out an ordinary visible pass — hide that option
                         // (threaded/killer balls still consider it, with the risk priced in).
@@ -22706,6 +23119,7 @@ impl WorldSnapshot {
                         // are priced in the score/learned features below instead of hard-hidden.
                         (!visible_only || self.player_can_see_player(me.id, p.id))
                             && (!require_reception_won || race_won)
+                            && (!require_reception_won || !marked_under_pressure)
                             && !committed_cutout
                             && !backward_into_coverage
                             && !self.pass_lane_has_unavoidable_set_interceptor_at_speed(
@@ -22958,12 +23372,14 @@ impl WorldSnapshot {
                 );
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
-                // HARD veto (the real fix for "passing straight to the opposition"): if the aim
-                // point is clearly closer to an opponent than to the intended receiver, sink the
-                // candidate so it never wins over holding or a safe outlet. The second clause
-                // closes the man-marked-receiver / ball-to-the-feet hole the aim-point test
+                // candidate so it never wins over holding or a safe outlet. Both teams independently
+                // fixed the man-marked-receiver / ball-to-the-feet hole the bare aim-point test
                 // misses (an opponent level-with-or-in-front of a receiver who is himself at the
-                // aim point), so a pressured holder can't feed a tightly-marked teammate.
+                // aim point); the two fixes are complementary and BOTH apply, sharing one passer
+                // pressure read. Ours is a HARD veto (`pass_reception_conceded_to_opponent`) that
+                // sinks a clear concession — a marker glued to the ball, or a pressured ball into a
+                // tightly-marked man — and theirs is a graded SOFT `marked_receiver_penalty` that
+                // additionally demotes a marginally-marked receiver below the hard-veto bar.
                 let passer_pressure_for_veto =
                     self.attacker_pressure_on_point(me.team, me_position);
                 let direct_opponent_aim_veto = if self
@@ -22980,6 +23396,12 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let marked_receiver_penalty = self.pass_target_marking_score_penalty(
+                    me.team,
+                    position,
+                    pass_point,
+                    passer_pressure_for_veto,
+                );
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -23047,6 +23469,7 @@ impl WorldSnapshot {
                     - reception_congestion_penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
+                    - marked_receiver_penalty
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
@@ -23091,9 +23514,11 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let directive = self.tactical_directive(me.team);
+        let passer_pressure =
+            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
         let no_pressure = self.no_pressure_at(me.team, me_position);
         let keeper_pressure = if me.role == PlayerRole::Goalkeeper {
-            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position))
+            passer_pressure
         } else {
             0.0
         };
@@ -23169,8 +23594,16 @@ impl WorldSnapshot {
                 let backward_into_coverage = forward < -BACKWARD_PASS_MIN_FORWARD_YARDS
                     && self.nearest_opponent_distance_at(me.team, position)
                         <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
+                let marked_under_pressure = self.pass_target_marked_under_pressure(
+                    me.team,
+                    position,
+                    pass_point,
+                    passer_pressure,
+                    forward,
+                );
                 (aerial_strikeable
                     && !backward_into_coverage
+                    && !marked_under_pressure
                     && (!visible_only || self.player_can_see_player(me.id, p.id))
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
                     && !self.final_third_forward_pass_to_nobody(
@@ -23321,6 +23754,12 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let marked_receiver_penalty = self.pass_target_marking_score_penalty(
+                    me.team,
+                    position,
+                    pass_point,
+                    passer_pressure,
+                );
                 let keeper_distribution_bonus = if me.role == PlayerRole::Goalkeeper {
                     goalkeeper_distribution_score(
                         me.team,
@@ -23376,6 +23815,7 @@ impl WorldSnapshot {
                     - lateral_penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
+                    - marked_receiver_penalty
                     - reception_teammate_penalty;
                 (p.id, score)
             })

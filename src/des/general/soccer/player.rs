@@ -26,6 +26,7 @@ const WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT: f64 = 0.42;
 const WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT: f64 = 0.20;
 const WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING: f64 = 0.18;
 const OPEN_PASS_LANE_ACTION_LABEL: &str = "open-pass-lane";
+const ROUND_GOALKEEPER_ACTION_LABEL: &str = "round-goalkeeper";
 const OPEN_PASS_LANE_MIN_DRIBBLE_YARDS: f64 = 1.0;
 const OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS: f64 = 4.0;
 const OPEN_PASS_LANE_MAX_DRIBBLE_YARDS: f64 = 8.0;
@@ -46,6 +47,15 @@ const OPEN_PASS_LANE_TRACKING_REF_SPEED_YPS: f64 = 7.0;
 const OPEN_PASS_LANE_SPRINT_PRESSURE: f64 = 0.62;
 const OPEN_PASS_LANE_SPRINT_TRACKING: f64 = 0.42;
 const OPEN_PASS_LANE_SPRINT_CLOSE_OPPONENT_YARDS: f64 = 3.6;
+const ROUND_GOALKEEPER_MIN_YARDS_TO_GOAL: f64 = 5.5;
+const ROUND_GOALKEEPER_MAX_YARDS_TO_GOAL: f64 = 26.0;
+const ROUND_GOALKEEPER_MIN_DRIBBLE_YARDS: f64 = 1.2;
+const ROUND_GOALKEEPER_MAX_DRIBBLE_YARDS: f64 = OPEN_PASS_LANE_MAX_DRIBBLE_YARDS;
+const ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS: f64 = 4.8;
+const ROUND_GOALKEEPER_MIN_KEEPER_CLEARANCE_YARDS: f64 = 2.15;
+const ROUND_GOALKEEPER_MIN_PATH_KEEPER_GAP_YARDS: f64 = 1.05;
+const ROUND_GOALKEEPER_MIN_CANDIDATE_OPPONENT_SPACE: f64 = 1.15;
+const ROUND_GOALKEEPER_LONG_SHOT_YARDS: f64 = 20.0;
 
 #[derive(Clone, Copy, Debug)]
 struct OpenPassLaneSituation {
@@ -71,6 +81,15 @@ struct OpenPassLaneDribblePlan {
     kind: DribbleMoveKind,
     touch: DribbleTouchDecision,
     score: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoundGoalkeeperDribblePlan {
+    target: Vec2,
+    kind: DribbleMoveKind,
+    touch: DribbleTouchDecision,
+    score: f64,
+    sprint: bool,
 }
 
 fn open_pass_lane_touch_for_target(
@@ -104,6 +123,20 @@ fn open_pass_lane_kind_for_target(team: Team, origin: Vec2, target: Vec2) -> Dri
     let delta = target - origin;
     let forward = delta.y * team.attack_dir();
     if forward > delta.x.abs() * 1.25 {
+        return DribbleMoveKind::CarryForward;
+    }
+    let left_x_sign = -team.attack_dir();
+    if delta.x.signum() == left_x_sign.signum() {
+        DribbleMoveKind::LeftCut
+    } else {
+        DribbleMoveKind::RightCut
+    }
+}
+
+fn round_goalkeeper_kind_for_target(team: Team, origin: Vec2, target: Vec2) -> DribbleMoveKind {
+    let delta = target - origin;
+    let forward = delta.y * team.attack_dir();
+    if forward > delta.x.abs() * 0.95 {
         return DribbleMoveKind::CarryForward;
     }
     let left_x_sign = -team.attack_dir();
@@ -1064,6 +1097,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "first-time-header"
             | "dribble"
             | "open-pass-lane"
+            | "round-goalkeeper"
             | "carry-forward"
             | "carry-out-left"
             | "carry-out-right"
@@ -1621,6 +1655,7 @@ fn mpc_execution_estimate_for_action(
             | "left-cut"
             | "right-cut"
             | "open-pass-lane"
+            | "round-goalkeeper"
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
@@ -1770,9 +1805,10 @@ fn mpc_execution_estimate_for_action(
                 (0.46 + dribble_skill * 0.26 + target_space_fit * 0.18 - pressure * 0.12)
                     .clamp(0.18, 0.97)
             }
-            "round-the-keeper" => {
+            "round-goalkeeper" => {
                 // A short carry to a closer spot with a clear strike past the keeper — feasible;
-                // scales with control + the space at the spot, lightly damped by pressure.
+                // scales with control + the space at the spot, lightly damped by pressure. (Ours'
+                // tuned estimate, folded onto the unified round-goalkeeper label during the merge.)
                 (0.48 + dribble_skill * 0.24 + target_space_fit * 0.18 - pressure * 0.10)
                     .clamp(0.18, 0.97)
             }
@@ -2586,6 +2622,229 @@ impl PlayerAgent {
                         kind,
                         touch,
                         score,
+                    };
+                    if best.is_none_or(|best| plan.score > best.score) {
+                        best = Some(plan);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn round_goalkeeper_dribble_plan_for(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<RoundGoalkeeperDribblePlan> {
+        if !observation.has_ball || self.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let current = snapshot
+            .player_position(self.id)
+            .unwrap_or(self.position)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let Some(me_snapshot) = snapshot.players.iter().find(|player| player.id == self.id) else {
+            return None;
+        };
+        let attack_dir = self.team.attack_dir();
+        if (current.y - snapshot.field_length * 0.5) * attack_dir < -2.0 {
+            return None;
+        }
+        let goal_y = self.team.goal_y(snapshot.field_length);
+        let yards_to_goal = (goal_y - current.y).abs();
+        if !(ROUND_GOALKEEPER_MIN_YARDS_TO_GOAL..=ROUND_GOALKEEPER_MAX_YARDS_TO_GOAL)
+            .contains(&yards_to_goal)
+        {
+            return None;
+        }
+        if observation.forward_dribble_space_yards < 0.75
+            && observation.nearest_opponent_distance < 2.4
+        {
+            return None;
+        }
+
+        let goal_center = Vec2::new(snapshot.field_width * 0.5, goal_y);
+        let keeper = snapshot
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == self.team.other() && player.role == PlayerRole::Goalkeeper
+            })
+            .min_by(|a, b| {
+                snapshot
+                    .player_snapshot_position(a)
+                    .distance(goal_center)
+                    .total_cmp(&snapshot.player_snapshot_position(b).distance(goal_center))
+            })?;
+        let keeper_position = snapshot
+            .player_snapshot_position(keeper)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let keeper_depth = (goal_y - keeper_position.y).abs();
+        let direct_keeper_gap = segment_distance_to_point(current, goal_center, keeper_position);
+        let keeper_blocks_line = (1.0 - direct_keeper_gap / 4.5).clamp(0.0, 1.0);
+        let shot_block = observation.shot_block_probability.clamp(0.0, 1.0);
+        let keeper_beat_problem =
+            ((0.30 - observation.shot_beat_goalkeeper_probability) / 0.30).clamp(0.0, 1.0);
+        let long_shot_need = ((yards_to_goal - 17.0)
+            / (ROUND_GOALKEEPER_MAX_YARDS_TO_GOAL - 17.0).max(1.0))
+        .clamp(0.0, 1.0);
+        let direct_shot_problem = shot_block.max(keeper_blocks_line).max(keeper_beat_problem);
+        let direct_shot_clean = observation.shot_lane_open
+            && shot_block <= 0.22
+            && observation.shot_beat_goalkeeper_probability >= 0.30
+            && yards_to_goal <= ROUND_GOALKEEPER_LONG_SHOT_YARDS;
+        if direct_shot_clean && direct_shot_problem < 0.30 {
+            return None;
+        }
+
+        let direct_window = snapshot
+            .shooting_window_score_at(me_snapshot, current)
+            .clamp(0.0, 1.0);
+        let side_preference = if (current.x - keeper_position.x).abs() <= 0.75 {
+            if self.id % 2 == 0 { -1.0 } else { 1.0 }
+        } else {
+            (current.x - keeper_position.x).signum()
+        };
+        let sides = [side_preference, -side_preference];
+        let lateral_offsets = [2.8, 3.8, 5.0, 6.2];
+        let depth_candidates = [
+            (yards_to_goal - 3.6).max(ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS),
+            (yards_to_goal - 5.6).max(ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS),
+            (yards_to_goal - 7.2).max(ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS),
+            (keeper_depth + 2.0).max(ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS),
+            (keeper_depth - 1.4).max(ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS),
+        ];
+
+        let mut best: Option<RoundGoalkeeperDribblePlan> = None;
+        for side in sides {
+            for lateral_offset in lateral_offsets {
+                let target_x = (keeper_position.x + side * lateral_offset)
+                    .clamp(1.5, snapshot.field_width - 1.5);
+                for target_depth in depth_candidates {
+                    if target_depth >= yards_to_goal - 0.9 {
+                        continue;
+                    }
+                    let candidate = Vec2::new(target_x, goal_y - attack_dir * target_depth)
+                        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                    let actual_distance = current.distance(candidate);
+                    if !(ROUND_GOALKEEPER_MIN_DRIBBLE_YARDS
+                        ..=ROUND_GOALKEEPER_MAX_DRIBBLE_YARDS + 1e-6)
+                        .contains(&actual_distance)
+                    {
+                        continue;
+                    }
+                    let goalward_gain = (candidate.y - current.y) * attack_dir;
+                    if goalward_gain < 1.0 {
+                        continue;
+                    }
+                    let target_yards_to_goal = (goal_y - candidate.y).abs();
+                    if target_yards_to_goal < ROUND_GOALKEEPER_MIN_TARGET_DEPTH_YARDS
+                        || target_yards_to_goal >= yards_to_goal - 0.75
+                    {
+                        continue;
+                    }
+                    let keeper_clearance = candidate.distance(keeper_position);
+                    if keeper_clearance < ROUND_GOALKEEPER_MIN_KEEPER_CLEARANCE_YARDS {
+                        continue;
+                    }
+                    let path_keeper_gap =
+                        segment_distance_to_point(current, candidate, keeper_position);
+                    if path_keeper_gap < ROUND_GOALKEEPER_MIN_PATH_KEEPER_GAP_YARDS {
+                        continue;
+                    }
+                    let opponent_space = snapshot.nearest_opponent_distance_at(self.team, candidate);
+                    if opponent_space < ROUND_GOALKEEPER_MIN_CANDIDATE_OPPONENT_SPACE {
+                        continue;
+                    }
+                    let occupancy =
+                        snapshot.candidate_occupancy_at(self.team, candidate, Some(self.id));
+                    let teammate_penalty = occupancy.teammate_occupied_space_penalty(0.0);
+                    if teammate_penalty >= 0.76 {
+                        continue;
+                    }
+
+                    let candidate_window = snapshot
+                        .shooting_window_score_at(me_snapshot, candidate)
+                        .clamp(0.0, 1.0);
+                    let window_gain = candidate_window - direct_window;
+                    let candidate_keeper_gap =
+                        segment_distance_to_point(candidate, goal_center, keeper_position);
+                    let keeper_gap_gain =
+                        ((candidate_keeper_gap - direct_keeper_gap) / 4.5).clamp(-1.0, 1.0);
+                    let angle_gain = ((snapshot.goal_angle_degrees(candidate, self.team)
+                        - observation.opponent_goal_angle_degrees)
+                        / 30.0)
+                        .clamp(-1.0, 1.0);
+                    let material_improvement = window_gain >= 0.035
+                        || keeper_gap_gain >= 0.18
+                        || (long_shot_need >= 0.48 && goalward_gain >= 3.0);
+                    if !material_improvement {
+                        continue;
+                    }
+
+                    let distance_fit =
+                        (1.0 - (actual_distance - 4.8).abs() / 4.8).clamp(0.38, 1.0);
+                    let depth_gain = (goalward_gain / ROUND_GOALKEEPER_MAX_DRIBBLE_YARDS)
+                        .clamp(0.0, 1.0);
+                    let space_fit = (opponent_space / 7.0).clamp(0.0, 1.0);
+                    let skill_fit = (ability01(self.skills.dribbling) * 0.64
+                        + ability01(self.skills.first_touch) * 0.20
+                        + ability01(self.skills.acceleration) * 0.16)
+                        .clamp(0.0, 1.0);
+                    let round_keeper_fit =
+                        (1.0 - (target_yards_to_goal - keeper_depth).abs() / 8.0)
+                            .clamp(0.0, 1.0);
+                    let lane_clear_bonus =
+                        if snapshot.clear_line(candidate, goal_center, self.team.other(), 1.35) {
+                            0.06
+                        } else {
+                            0.0
+                        };
+                    let mut score = (0.14
+                        + long_shot_need * 0.22
+                        + direct_shot_problem * 0.20
+                        + window_gain.max(0.0) * 0.58
+                        + keeper_gap_gain.max(0.0) * 0.25
+                        + angle_gain.max(0.0) * 0.10
+                        + depth_gain * 0.16
+                        + space_fit * 0.06
+                        + skill_fit * 0.10
+                        + round_keeper_fit * 0.05
+                        + lane_clear_bonus
+                        + observation.offensive_urgency.clamp(0.0, 1.0) * 0.06
+                        - teammate_penalty * 0.18
+                        - (actual_distance - 6.0).max(0.0) * 0.018)
+                        * distance_fit;
+                    if yards_to_goal >= ROUND_GOALKEEPER_LONG_SHOT_YARDS
+                        && window_gain >= 0.02
+                    {
+                        score = score.max(0.88 + long_shot_need * 0.08);
+                    }
+                    if goal_attack_shot_blocks_alternatives(observation, self.role)
+                        && shot_block >= 0.42
+                        && window_gain >= 0.06
+                    {
+                        score = score.max(0.985);
+                    }
+                    let score = score.clamp(0.0, 0.995);
+                    if score <= 0.0 {
+                        continue;
+                    }
+                    let Some(touch) = open_pass_lane_touch_for_target(self.team, current, candidate)
+                    else {
+                        continue;
+                    };
+                    let kind = round_goalkeeper_kind_for_target(self.team, current, candidate);
+                    let sprint = observation.perceived_pressure >= 0.30
+                        || observation.forward_dribble_space_yards >= 3.0
+                        || long_shot_need >= 0.50;
+                    let plan = RoundGoalkeeperDribblePlan {
+                        target: candidate,
+                        kind,
+                        touch,
+                        score,
+                        sprint,
                     };
                     if best.is_none_or(|best| plan.score > best.score) {
                         best = Some(plan);
@@ -6929,6 +7188,15 @@ impl PlayerAgent {
                     true,
                 ));
             }
+            let round_goalkeeper_plan =
+                self.round_goalkeeper_dribble_plan_for(snapshot, &observation);
+            if let Some(plan) = round_goalkeeper_plan {
+                action_options.push(AgentActionOptionTrace::new(
+                    ROUND_GOALKEEPER_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
             let killer_pass_preempt_chance = if snapshot
                 .killer_pass_target_for(self.id, &pass_targets)
                 .is_some()
@@ -7099,43 +7367,9 @@ impl PlayerAgent {
                 }
                 open_lane_offered = true;
             }
-            // ROUND THE KEEPER: when the goalkeeper is covering the shot, a short carry closer to
-            // goal (and around the keeper's angle) opens a clear strike — offered in that window so
-            // the carrier dribbles in for a high-percentage shot instead of blazing from distance.
-            let round_the_keeper = if self.role != PlayerRole::Goalkeeper {
-                snapshot.dribble_round_the_keeper_for(self.id)
-            } else {
-                None
-            };
-            let mut round_the_keeper_offered = false;
-            if round_the_keeper.is_some() {
-                let press = observation
-                    .perceived_pressure
-                    .max(observation.pressure_urgency)
-                    .clamp(0.0, 1.0);
-                // Worth more the closer to goal (the clear strike is the prize) and under pressure.
-                let proximity = (1.0
-                    - (observation.yards_to_goal / ROUND_KEEPER_MAX_START_YARDS).clamp(0.0, 1.0))
-                    .clamp(0.0, 1.0);
-                let appetite = (ROUND_KEEPER_BASE_APPETITE
-                    * self.preferences.dribble_bias.clamp(0.5, 1.3)
-                    * (0.6 + proximity * 0.7 + press * 0.3))
-                    .clamp(0.0, ROUND_KEEPER_MAX_APPETITE);
-                if let Some(option) = action_options
-                    .iter_mut()
-                    .find(|option| option.label == "round-the-keeper")
-                {
-                    option.legal = true;
-                    option.score = option.score.max(appetite);
-                } else {
-                    action_options.push(AgentActionOptionTrace::new(
-                        "round-the-keeper",
-                        appetite,
-                        true,
-                    ));
-                }
-                round_the_keeper_offered = true;
-            }
+            // ROUND THE KEEPER is generated above as `round_goalkeeper_plan` (the unified,
+            // plan-based implementation); ours' separate `dribble_round_the_keeper_for` generator
+            // was folded into it during the merge to avoid offering the same carry twice.
             let mut xavi_turn_offered = false;
             if snapshot.xavi_turn_enabled
                 && self.role != PlayerRole::Goalkeeper
@@ -7311,6 +7545,12 @@ impl PlayerAgent {
                     action_option_score(&action_options, OPEN_PASS_LANE_ACTION_LABEL),
                 ));
             }
+            if round_goalkeeper_plan.is_some() {
+                weighted_ops.push((
+                    ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
+                    action_option_score(&action_options, ROUND_GOALKEEPER_ACTION_LABEL),
+                ));
+            }
             if xavi_turn_offered {
                 weighted_ops.push((
                     "xavi-turn".to_string(),
@@ -7321,12 +7561,6 @@ impl PlayerAgent {
                 weighted_ops.push((
                     "open-passing-lane".to_string(),
                     action_option_score(&action_options, "open-passing-lane"),
-                ));
-            }
-            if round_the_keeper_offered {
-                weighted_ops.push((
-                    "round-the-keeper".to_string(),
-                    action_option_score(&action_options, "round-the-keeper"),
                 ));
             }
             for rank in 0..pass_targets.len() {
@@ -7347,6 +7581,7 @@ impl PlayerAgent {
             // Set by the open-passing-lane arm to its precise sprint decision (very high pressure /
             // a fast-tracking opponent), overriding the generic carry sprint rule below.
             let mut open_lane_sprint: Option<bool> = None;
+            let mut round_goalkeeper_sprint: Option<bool> = None;
             for op in ops {
                 match op.as_str() {
                     "shoot" => {
@@ -7572,36 +7807,6 @@ impl PlayerAgent {
                                         touch,
                                     },
                                     "open-passing-lane".to_string(),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    "round-the-keeper" => {
-                        order_names.push("round-the-keeper".to_string());
-                        let round_chance =
-                            action_option_score(&action_options, "round-the-keeper");
-                        if let Some((spot, sprint_flag)) = round_the_keeper {
-                            if agentic_action_commitment(
-                                round_chance,
-                                snapshot.dt_seconds,
-                                &observation,
-                                self.role,
-                            ) {
-                                // Carry closer to goal, around the keeper, to a spot with a clear
-                                // strike (then shoot once there); driven by the per-player MPC like
-                                // any dribble. Sprint per the maneuver's own decision.
-                                let kind = DribbleMoveKind::CarryForward;
-                                let touch = snapshot
-                                    .deterministic_dribble_touch_decision_for(self.id, kind);
-                                open_lane_sprint = Some(sprint_flag);
-                                chosen = Some((
-                                    SoccerAction::DribbleMove {
-                                        target: spot,
-                                        kind,
-                                        touch,
-                                    },
-                                    "round-the-keeper".to_string(),
                                 ));
                                 break;
                             }
@@ -8057,6 +8262,30 @@ impl PlayerAgent {
                                         touch: plan.touch,
                                     },
                                     OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "round-goalkeeper" => {
+                        order_names.push(ROUND_GOALKEEPER_ACTION_LABEL.to_string());
+                        if let Some(plan) = round_goalkeeper_plan {
+                            let chance =
+                                action_option_score(&action_options, ROUND_GOALKEEPER_ACTION_LABEL);
+                            if agentic_action_commitment(
+                                chance,
+                                snapshot.dt_seconds,
+                                &observation,
+                                self.role,
+                            ) {
+                                round_goalkeeper_sprint = Some(plan.sprint);
+                                chosen = Some((
+                                    SoccerAction::DribbleMove {
+                                        target: plan.target,
+                                        kind: plan.kind,
+                                        touch: plan.touch,
+                                    },
+                                    ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
                                 ));
                                 break;
                             }
@@ -8527,6 +8756,16 @@ impl PlayerAgent {
                                     OPEN_PASS_LANE_ACTION_LABEL.to_string(),
                                 )
                             }),
+                            "round-goalkeeper" => round_goalkeeper_plan.map(|plan| {
+                                (
+                                    SoccerAction::DribbleMove {
+                                        target: plan.target,
+                                        kind: plan.kind,
+                                        touch: plan.touch,
+                                    },
+                                    ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
+                                )
+                            }),
                             "dribble" => {
                                 let kind = self.agentic_fallback_dribble_kind(
                                     snapshot,
@@ -8646,27 +8885,35 @@ impl PlayerAgent {
                 action = fallback_action;
                 action_label = fallback_label;
             }
-            // Both convergent open-lane carries decide sprint vs run on their own terms; every
-            // other carry uses the generic rule. Ours ("open-passing-lane") sets `open_lane_sprint`
-            // in its arm (very high pressure / fast-tracking opponent → burst, else a controlled
-            // run); theirs ("open-pass-lane") decides via `open_pass_lane_sprint_for_action`. When
-            // our arm fired, its explicit decision wins; otherwise fall to theirs (its open-pass-
-            // lane decision, or the generic carry rule for any other dribble).
-            let sprint = open_lane_sprint.unwrap_or_else(|| {
-                matches!(action, SoccerAction::DribbleMove { .. })
-                    && (open_pass_lane_sprint_for_action(
-                        snapshot,
-                        self,
-                        &observation,
-                        &action_label,
-                        &action,
-                    ) || (action_label != OPEN_PASS_LANE_ACTION_LABEL
-                        && (self.role == PlayerRole::Forward
-                            || observation.forward_dribble_space_yards > 3.0
-                            || observation.perceived_pressure > 0.35
-                            || observation.decision_urgency > 0.46
-                            || observation.offensive_urgency > 0.34)))
-            });
+            // Each special carry decides sprint-vs-run on its own terms; every other carry uses
+            // the generic role/urgency rule. This unifies both convergent open-lane features:
+            // ours ("open-passing-lane") sets `open_lane_sprint` in its arm (very high pressure /
+            // fast-tracking opponent → burst, else a controlled run to conserve energy), and
+            // theirs ("open-pass-lane", `OPEN_PASS_LANE_ACTION_LABEL`) decides via
+            // `open_pass_lane_sprint_for_action`. The round-goalkeeper carry keeps its own
+            // plan-specific burst decision (pressure/space decides glide-around vs explode-past).
+            let is_dribble_action = matches!(action, SoccerAction::DribbleMove { .. });
+            let sprint = if !is_dribble_action {
+                false
+            } else if let Some(open_lane_sprint) = open_lane_sprint {
+                open_lane_sprint
+            } else if let Some(round_goalkeeper_sprint) = round_goalkeeper_sprint {
+                round_goalkeeper_sprint
+            } else if action_label == OPEN_PASS_LANE_ACTION_LABEL {
+                open_pass_lane_sprint_for_action(
+                    snapshot,
+                    self,
+                    &observation,
+                    &action_label,
+                    &action,
+                )
+            } else {
+                self.role == PlayerRole::Forward
+                    || observation.forward_dribble_space_yards > 3.0
+                    || observation.perceived_pressure > 0.35
+                    || observation.decision_urgency > 0.46
+                    || observation.offensive_urgency > 0.34
+            };
             self.last_decision = Some(self.decision_trace(
                 snapshot,
                 mdp_state,
@@ -9613,6 +9860,18 @@ impl PlayerAgent {
                     "hold-up-flank".to_string(),
                 ))
             }
+            "round-goalkeeper" if observation.has_ball => self
+                .round_goalkeeper_dribble_plan_for(snapshot, observation)
+                .map(|round_plan| {
+                    (
+                        SoccerAction::DribbleMove {
+                            target: round_plan.target,
+                            kind: round_plan.kind,
+                            touch: round_plan.touch,
+                        },
+                        ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
+                    )
+                }),
             "open-pass-lane" if observation.has_ball => {
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
                 let mut lane_targets = Vec::with_capacity(visible_targets.len() + 1);

@@ -89,8 +89,9 @@ pub enum SoccerActionLabel {
     OpenPassLane,
     /// On-ball: a short, quick carry around the goalkeeper — closer to goal and off the
     /// keeper's covered angle — to open a clear shot, instead of a long shot the keeper
-    /// saves. See `WorldSnapshot::dribble_round_the_keeper_for`.
-    RoundTheKeeper,
+    /// saves. Unifies the two convergent "round the keeper" carries onto one label /
+    /// implementation (`round_goalkeeper_plan` + `RoundGoalkeeperDribblePlan`).
+    RoundGoalkeeper,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -163,7 +164,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
             SoccerActionLabel::OpenPassLane => "open-pass-lane",
-            SoccerActionLabel::RoundTheKeeper => "round-the-keeper",
+            SoccerActionLabel::RoundGoalkeeper => "round-goalkeeper",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -231,7 +232,7 @@ impl SoccerActionLabel {
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
             "open-pass-lane" => SoccerActionLabel::OpenPassLane,
-            "round-the-keeper" => SoccerActionLabel::RoundTheKeeper,
+            "round-goalkeeper" => SoccerActionLabel::RoundGoalkeeper,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -341,7 +342,22 @@ impl SoccerActionLabel {
             | "dribble-to-pass"
             | "dribble_to_pass"
             | "dribbletopass" => "open-pass-lane",
-            "round-the-keeper"
+            // Unified vocabulary: both teams' alias spellings (ours "round-the-keeper" et al.
+            // and theirs "round-goalkeeper" et al.) normalize to the single canonical label so
+            // any persisted/external label from either side still resolves.
+            "round-goalkeeper"
+            | "round_goalkeeper"
+            | "roundgoalkeeper"
+            | "round-the-goalkeeper"
+            | "round_the_goalkeeper"
+            | "roundthegoalkeeper"
+            | "round-gk"
+            | "round_gk"
+            | "beat-keeper"
+            | "beat_keeper"
+            | "dribble-around-keeper"
+            | "dribble_around_keeper"
+            | "round-the-keeper"
             | "round_the_keeper"
             | "roundthekeeper"
             | "round-the-gk"
@@ -349,7 +365,7 @@ impl SoccerActionLabel {
             | "round_keeper"
             | "rounding-the-keeper"
             | "dribble-round-keeper"
-            | "beat-the-keeper" => "round-the-keeper",
+            | "beat-the-keeper" => "round-goalkeeper",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"
