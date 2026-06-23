@@ -3241,6 +3241,173 @@ fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
 }
 
 #[test]
+fn long_backward_pass_penalty_grows_linearly_past_short_reset() {
+    let ten_back = long_backward_pass_penalty(-10.0);
+    let twenty_back = long_backward_pass_penalty(-20.0);
+
+    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
+    assert!(
+        ten_back > 7.0,
+        "10yd backward must be a real penalty: {ten_back}"
+    );
+    assert!(
+        (twenty_back - ten_back * 3.0).abs() < 1e-12,
+        "penalty should be linear in yards beyond 5: 10yd={ten_back} 20yd={twenty_back}"
+    );
+}
+
+#[test]
+fn backward_pass_path_traffic_prices_floor_and_aerial_retreats() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_212,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let receiver = 7usize;
+    let opponents = [12usize, 13usize, 14usize];
+    park_players_except(
+        &mut sim,
+        &[passer, receiver, opponents[0], opponents[1], opponents[2]],
+    );
+
+    let passer_pos = Vec2::new(40.0, 75.0);
+    let receiver_pos = Vec2::new(40.0, 45.0);
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = passer_pos;
+    sim.players[passer].home_position = passer_pos;
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].skills.passing_completion_rate = 8.8;
+    sim.players[passer].skills.passing = 8.8;
+    sim.players[passer].skills.vision = 9.0;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = receiver_pos;
+    sim.players[receiver].home_position = receiver_pos;
+    sim.players[receiver].velocity = Vec2::zero();
+    for opponent in opponents {
+        sim.players[opponent].velocity = Vec2::zero();
+        sim.players[opponent].acceleration = Vec2::zero();
+    }
+    sim.ball.holder = Some(passer);
+    sim.ball.position = passer_pos;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let clean_snapshot = WorldSnapshot::from_match(&sim);
+    let clean_passer = clean_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == passer)
+        .expect("passer");
+    let clean_receiver = clean_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == receiver)
+        .expect("receiver");
+    let clean_floor = pass_target_quality_for_snapshot(
+        &clean_snapshot,
+        clean_passer,
+        passer_pos,
+        clean_receiver,
+        receiver_pos,
+        PassFlight::Floor,
+    );
+    let clean_aerial = pass_target_quality_for_snapshot(
+        &clean_snapshot,
+        clean_passer,
+        passer_pos,
+        clean_receiver,
+        receiver_pos,
+        PassFlight::Aerial,
+    );
+    assert_eq!(clean_floor.backward_path_opponent_count, 0);
+    assert_eq!(clean_aerial.backward_path_opponent_count, 0);
+
+    sim.players[12].position = Vec2::new(39.0, 68.0);
+    sim.players[13].position = Vec2::new(41.0, 61.0);
+    sim.players[14].position = Vec2::new(40.0, 54.0);
+    let crowded_snapshot = WorldSnapshot::from_match(&sim);
+    let crowded_passer = crowded_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == passer)
+        .expect("passer");
+    let crowded_receiver = crowded_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == receiver)
+        .expect("receiver");
+    let traffic = backward_pass_path_traffic_for_snapshot(
+        &crowded_snapshot,
+        crowded_passer,
+        passer_pos,
+        receiver_pos,
+    );
+    let expected_scaled = opponents.len() as f64
+        * ((passer_pos.y - receiver_pos.y) - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS);
+    assert_eq!(traffic.opponent_count, 3);
+    assert!(
+        (traffic.risk
+            - expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
+            .abs()
+            < 1e-12,
+        "traffic risk should be count * backward depth"
+    );
+    assert!(
+        (traffic.score_penalty
+            - expected_scaled
+                * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD)
+            .abs()
+            < 1e-12,
+        "traffic score penalty should be count * backward depth"
+    );
+
+    let crowded_floor = pass_target_quality_for_snapshot(
+        &crowded_snapshot,
+        crowded_passer,
+        passer_pos,
+        crowded_receiver,
+        receiver_pos,
+        PassFlight::Floor,
+    );
+    let crowded_aerial = pass_target_quality_for_snapshot(
+        &crowded_snapshot,
+        crowded_passer,
+        passer_pos,
+        crowded_receiver,
+        receiver_pos,
+        PassFlight::Aerial,
+    );
+
+    assert_eq!(crowded_floor.backward_path_opponent_count, 3);
+    assert_eq!(crowded_aerial.backward_path_opponent_count, 3);
+    assert!(
+        crowded_floor.backward_path_traffic_penalty > clean_floor.backward_path_traffic_penalty,
+        "floor backward traffic should add score penalty"
+    );
+    assert!(
+        crowded_aerial.backward_path_traffic_penalty > clean_aerial.backward_path_traffic_penalty,
+        "aerial backward traffic should add score penalty"
+    );
+    assert!(
+        crowded_floor.lane_interception_risk > clean_floor.lane_interception_risk + 0.70,
+        "floor backward lane risk should rise with three opponents on the path"
+    );
+    assert!(
+        crowded_aerial.lane_interception_risk > clean_aerial.lane_interception_risk + 0.70,
+        "aerial backward lane risk should rise with three opponents on the path"
+    );
+    assert!(
+        crowded_floor.expected_completion < clean_floor.expected_completion * 0.60,
+        "floor completion should be gated by backward path traffic"
+    );
+    assert!(
+        crowded_aerial.expected_completion < clean_aerial.expected_completion * 0.60,
+        "aerial completion should be gated by backward path traffic"
+    );
+}
+
+#[test]
 fn half_open_forward_target_stays_visible_and_beats_backward_recycle() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -4639,6 +4806,57 @@ fn action_option_tick_probabilities_are_event_gates_not_normalized_shares() {
     for option in options {
         assert!((0.0..=1.0).contains(&option.tick_probability));
     }
+}
+
+#[test]
+fn option_learning_context_sanitizes_non_finite_trace_values() {
+    let options = vec![
+        AgentActionOptionTrace {
+            label: "pass".to_string(),
+            score: f64::NAN,
+            probability: f64::NAN,
+            tick_probability: f64::NAN,
+            legal: true,
+        },
+        AgentActionOptionTrace {
+            label: "shoot".to_string(),
+            score: f64::INFINITY,
+            probability: f64::INFINITY,
+            tick_probability: f64::NEG_INFINITY,
+            legal: true,
+        },
+        AgentActionOptionTrace {
+            label: "hold".to_string(),
+            score: -4.0,
+            probability: 0.40,
+            tick_probability: 0.45,
+            legal: false,
+        },
+    ];
+
+    let context = soccer_action_option_learning_context("pass", &options);
+    assert_eq!(context.action_option_count, 3);
+    assert_eq!(context.legal_action_option_count, 2);
+    assert_eq!(context.chosen_action_probability, 0.0);
+    assert_eq!(context.chosen_action_score, 0.0);
+    assert_eq!(context.best_legal_action_score, 0.0);
+    assert!(context.action_score_margin.is_finite());
+    assert!(context.action_option_entropy.is_finite());
+
+    let feasibility = soccer_action_mpc_feasibility_from_context(
+        "pass",
+        f64::NAN,
+        f64::INFINITY,
+        0.75,
+        0.75,
+        0.75,
+        0.75,
+    );
+    let control_cost =
+        soccer_action_control_cost_from_context("pass", f64::NAN, f64::INFINITY, f64::NAN, f64::NAN);
+    assert_eq!(feasibility, 0.0);
+    assert!(control_cost.is_finite());
+    assert!((0.0..=1.0).contains(&control_cost));
 }
 
 #[test]
@@ -7277,6 +7495,146 @@ fn goalkeeper_handling_holds_for_open_outlet_then_distributes() {
 }
 
 #[test]
+fn goalkeeper_brain_surveys_in_hands_when_outlet_is_marked() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 94,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let mate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let presser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    for p in sim.players.iter_mut().filter(|p| p.team == Team::Away) {
+        p.position = Vec2::new(width * 0.5, 95.0);
+    }
+    for p in sim
+        .players
+        .iter_mut()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper && p.id != mate)
+    {
+        p.position = Vec2::new(width * 0.5, 4.0 + p.id as f64 * 0.05);
+    }
+
+    let box_pos = Vec2::new(width * 0.5, 6.0);
+    let mate_pos = Vec2::new(width * 0.5, 24.0);
+    sim.players[keeper].position = box_pos;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[mate].position = mate_pos;
+    sim.players[presser].position = mate_pos + Vec2::new(1.0, 0.5);
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = box_pos;
+    sim.clock_seconds = 40.0;
+    sim.update_keeper_handling();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(snapshot.keeper_handling_held_seconds(keeper), Some(0.0));
+    assert!(
+        !snapshot.keeper_handling_release_is_intelligent(keeper, Some(mate), mate_pos),
+        "fixture outlet must be marked so the keeper brain should keep surveying"
+    );
+    let mut keeper_player = sim.players[keeper].clone();
+    let intent = keeper_player.run_time_step(&snapshot, None, None, &mut SeededRandom::new(94_001));
+    assert!(
+        matches!(intent.action, SoccerAction::MoveTo(target) if target.distance(box_pos) < 1e-9),
+        "keeper in hands should survey/hold, got {:?}",
+        intent.action
+    );
+    let trace = keeper_player.last_decision.as_ref().expect("keeper decision trace");
+    assert_eq!(trace.action, "keeper-survey-hands");
+    assert!(
+        trace.operation_order.iter().any(|op| op == "pomdp-survey"),
+        "the hold should be a keeper POMDP survey choice, not a silent world veto"
+    );
+}
+
+#[test]
+fn goalkeeper_in_hands_under_pressure_surveys_instead_of_targetless_clearance() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 96,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let presser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    let box_pos = Vec2::new(width * 0.5, 6.0);
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home && p.role != PlayerRole::Goalkeeper {
+            p.position = Vec2::new(width * 0.5, 3.0 + p.id as f64 * 0.04);
+            p.velocity = Vec2::zero();
+        } else if p.team == Team::Away {
+            p.position = Vec2::new(width * 0.8, 96.0 + p.id as f64 * 0.04);
+            p.velocity = Vec2::zero();
+        }
+    }
+    sim.players[keeper].position = box_pos;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[presser].position = box_pos + Vec2::new(1.0, 0.0);
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = box_pos;
+    sim.clock_seconds = 60.0;
+    sim.update_keeper_handling();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(snapshot.keeper_handling_held_seconds(keeper), Some(0.0));
+    assert!(
+        snapshot
+            .goalkeeper_mpc_play_out_plan(keeper, None)
+            .is_some_and(|plan| plan.target_player.is_none()),
+        "fixture should leave only a targetless keeper play-out fallback"
+    );
+    assert!(
+        snapshot.observation_for(keeper).nearest_opponent_distance
+            <= GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS,
+        "fixture should put the keeper under pressure"
+    );
+    let mut keeper_player = sim.players[keeper].clone();
+    let intent = keeper_player.run_time_step(&snapshot, None, None, &mut SeededRandom::new(96_001));
+    assert!(
+        matches!(intent.action, SoccerAction::MoveTo(target) if target.distance(box_pos) < 1e-9),
+        "keeper holding legally should survey, not targetless clear under pressure: {:?}",
+        intent.action
+    );
+    let trace = keeper_player.last_decision.as_ref().expect("keeper decision trace");
+    assert_eq!(trace.action, "keeper-survey-hands");
+    assert!(
+        !trace
+            .operation_order
+            .iter()
+            .any(|op| op == "handling-clock-expired"),
+        "this is a handling-window survey, not a clock-expired release"
+    );
+}
+
+#[test]
 fn goalkeeper_forced_clearance_lofts_and_avoids_the_central_presser() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         dt_seconds: 0.1,
@@ -7354,6 +7712,244 @@ fn goalkeeper_handling_tucks_ball_in_hands_without_dribble_orbit() {
     assert_eq!(
         sim.ball.altitude_yards, 0.0,
         "a tucked ball in hands sits on the floor at his body"
+    );
+}
+
+#[test]
+fn goalkeeper_outside_box_loose_ball_control_is_foot_only() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 91,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    let outside_box = Vec2::new(width * 0.5, 22.0);
+    assert!(
+        !sim.point_in_own_penalty_area(Team::Home, outside_box),
+        "fixture must put the keeper outside his own penalty area"
+    );
+    sim.players[keeper].position = outside_box;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.ball.holder = None;
+    sim.ball.position = outside_box;
+    sim.ball.velocity = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(!snapshot.goalkeeper_can_use_hands_at(Team::Home, outside_box));
+    let mut keeper_player = sim.players[keeper].clone();
+    let intent = keeper_player.run_time_step(&snapshot, None, None, &mut SeededRandom::new(91_001));
+    assert!(
+        matches!(intent.action, SoccerAction::ControlTouch { .. }),
+        "a keeper outside the box should first control a loose ball with feet/body, got {:?}",
+        intent.action
+    );
+    let trace = keeper_player.last_decision.as_ref().expect("keeper decision trace");
+    assert_eq!(trace.action, "keeper-foot-control-outside-box");
+    assert!(
+        trace
+            .operation_order
+            .iter()
+            .any(|op| op == "pomdp-foot-control"),
+        "outside-box keeper touch should be represented as a POMDP foot-control choice"
+    );
+}
+
+#[test]
+fn goalkeeper_mpc_play_out_plan_selects_safe_distribution() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 92,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let mate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    let keeper_pos = Vec2::new(width * 0.5, 22.0);
+    let mate_pos = Vec2::new(width * 0.22, 39.0);
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home && p.role != PlayerRole::Goalkeeper && p.id != mate {
+            p.position = Vec2::new(width * 0.5, 8.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        } else if p.team == Team::Away {
+            p.position = Vec2::new(width * 0.78, 96.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        }
+    }
+    sim.players[keeper].position = keeper_pos;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[mate].position = mate_pos;
+    sim.players[mate].velocity = Vec2::new(0.0, 1.0);
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = keeper_pos;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let plan = snapshot
+        .goalkeeper_mpc_play_out_plan(keeper, Some(mate))
+        .expect("keeper should have an MPC play-out plan");
+    assert_eq!(
+        plan.target_player,
+        Some(mate),
+        "the explicitly preferred open teammate should win the keeper play-out plan"
+    );
+    assert!(
+        matches!(plan.flight, PassFlight::Floor | PassFlight::Aerial),
+        "keeper MPC should choose the play-out flight, got {:?}",
+        plan.flight
+    );
+    if plan.flight == PassFlight::Floor {
+        assert!(
+            plan.launch_speed_yps.is_some_and(|speed| speed.is_finite() && speed > 0.0),
+            "floor keeper distribution should carry an MPC launch speed"
+        );
+    }
+    assert!(plan.score.is_finite());
+}
+
+#[test]
+fn goalkeeper_possession_outside_box_plays_mpc_pass_without_hands() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 93,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let mate = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    let keeper_pos = Vec2::new(width * 0.5, 22.0);
+    let mate_pos = Vec2::new(width * 0.25, 40.0);
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home && p.role != PlayerRole::Goalkeeper && p.id != mate {
+            p.position = Vec2::new(width * 0.48, 9.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        } else if p.team == Team::Away {
+            p.position = Vec2::new(width * 0.80, 98.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        }
+    }
+    sim.players[keeper].position = keeper_pos;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[mate].position = mate_pos;
+    sim.players[mate].velocity = Vec2::new(0.0, 1.0);
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = keeper_pos;
+    assert_eq!(sim.keeper_handling_holder(), None);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut keeper_player = sim.players[keeper].clone();
+    let intent = keeper_player.run_time_step(&snapshot, None, None, &mut SeededRandom::new(93_001));
+    let trace = keeper_player.last_decision.as_ref().expect("keeper decision trace");
+    assert!(
+        trace
+            .operation_order
+            .iter()
+            .any(|op| op == "outside-box-no-hands"),
+        "keeper possession outside the box must be explicitly no-hands"
+    );
+    assert!(
+        trace.action.starts_with("keeper-mpc-"),
+        "keeper outside-box possession should use a POMDP/MPC play-out action, got {}",
+        trace.action
+    );
+    let chosen_flight = match intent.action {
+        SoccerAction::Pass {
+            target_player,
+            flight,
+            ..
+        } => {
+            assert_eq!(target_player, Some(mate));
+            flight
+        }
+        other => panic!("expected keeper MPC pass outside box, got {:?}", other),
+    };
+    sim.apply_player_intent(intent);
+    let pending = sim.pending_pass.as_ref().expect("keeper should release a pass");
+    assert_eq!(pending.from, keeper);
+    assert_eq!(pending.target, Some(mate));
+    assert_eq!(pending.flight, chosen_flight);
+    assert!(pending.launch_speed_yps.is_finite() && pending.launch_speed_yps > 0.0);
+    assert_eq!(sim.keeper_handling_holder(), None);
+}
+
+#[test]
+fn goalkeeper_outside_box_without_pressure_controls_instead_of_targetless_clearance() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 95,
+        ..Default::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .unwrap()
+        .id;
+    let width = sim.config.field_width_yards;
+    let keeper_pos = Vec2::new(width * 0.5, 22.0);
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home && p.role != PlayerRole::Goalkeeper {
+            p.position = Vec2::new(width * 0.5, 5.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        } else if p.team == Team::Away {
+            p.position = Vec2::new(width * 0.5, 96.0 + p.id as f64 * 0.05);
+            p.velocity = Vec2::zero();
+        }
+    }
+    sim.players[keeper].position = keeper_pos;
+    sim.players[keeper].action_facing = FacingBucket::South;
+    sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.ball.holder = Some(keeper);
+    sim.ball.position = keeper_pos;
+    assert_eq!(sim.keeper_handling_holder(), None);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.goalkeeper_mpc_play_out_plan(keeper, None).is_some_and(|plan| plan.target_player.is_none()),
+        "fixture should leave only a targetless keeper play-out fallback"
+    );
+    let mut keeper_player = sim.players[keeper].clone();
+    let intent = keeper_player.run_time_step(&snapshot, None, None, &mut SeededRandom::new(95_001));
+    assert!(
+        matches!(intent.action, SoccerAction::ControlTouch { .. }),
+        "unpressured keeper outside the box should control with feet, got {:?}",
+        intent.action
+    );
+    let trace = keeper_player.last_decision.as_ref().expect("keeper decision trace");
+    assert_eq!(trace.action, "keeper-foot-control-outside-box");
+    assert!(
+        trace
+            .operation_order
+            .iter()
+            .any(|op| op == "outside-box-no-hands"),
+        "outside-box possession must keep the no-hands decision trace"
     );
 }
 
@@ -13120,9 +13716,27 @@ fn ball_in_behind_back_line_triggers_keeper_and_two_defender_recovery() {
     );
 
     let (t_gk, _) = snap.ball_in_behind_recovery_adjusted_target(gk, sim.players[gk].position);
+    let line_target = snap.goalkeeper_ball_goal_tracking_target(Team::Home);
     assert!(
-        t_gk.y > sim.players[gk].position.y + 1.0,
-        "keeper sweeps off its line toward the ball: {t_gk:?}"
+        t_gk.distance(line_target) < 1e-9,
+        "keeper should hold the six-yard line unless both POMDP and MPC say he is 95% first: \
+         target={t_gk:?} line={line_target:?}"
+    );
+
+    sim.players[attacker].position = Vec2::new(70.0, 80.0);
+    sim.players[attacker].velocity = Vec2::zero();
+    sim.players[attacker].acceleration = Vec2::zero();
+    for &d in home_def.iter().take(4) {
+        sim.players[d].position.y = 62.0;
+    }
+    let clear_snap = WorldSnapshot::from_match(&sim);
+    let clear_line_target = clear_snap.goalkeeper_ball_goal_tracking_target(Team::Home);
+    let (clear_t_gk, _) =
+        clear_snap.ball_in_behind_recovery_adjusted_target(gk, sim.players[gk].position);
+    assert!(
+        clear_t_gk.y > clear_line_target.y + 1.0,
+        "keeper may leave the six when the ball is in the 18 and he is clearly first: \
+         target={clear_t_gk:?} line={clear_line_target:?}"
     );
 
     let (t_far, _) = snap.ball_in_behind_recovery_adjusted_target(far, sim.players[far].position);
@@ -31294,6 +31908,7 @@ fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() 
     );
     assert_eq!(config.neural_learning.max_batches_per_tick, 1);
     assert!(config.adversarial_embedding_exploitation_enabled);
+    assert!(config.opponent_belief_enabled);
     // Synergy must be ACTIVE in real games, not just trained-and-ignored: the
     // neural value/actor blend into MDP/POMDP action selection, and the trained
     // critic couples back to the LP formation solver.
@@ -40279,16 +40894,23 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named decision/action feature indices live in the base block; the whole-field "moment
     // of all 22 + ball" block appends after it, then the Kalman perception-belief block, the
-    // Bayesian opponent-press belief block, and the learned-MPC replan tail.
+    // Bayesian opponent-press belief block, the learned-MPC replan tail, and finally the
+    // option-control / human-intent learning tail.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER, 8);
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM,
         SOCCER_NEURAL_BASE_FEATURE_DIM
             + SOCCER_NEURAL_FIELD_MOTION_DIM
             + SOCCER_NEURAL_BELIEF_FEATURE_DIM
             + SOCCER_NEURAL_OPP_BELIEF_DIM
             + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
+            + SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM
+            + SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM
     );
     // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
@@ -40350,6 +40972,26 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(
         SOCCER_NEURAL_FEATURE_BELIEF_POSITION_UNCERTAINTY,
         belief_start + 3
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_OPTION_LEGAL_FRACTION,
+        SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_OPTION_CHOSEN_PROBABILITY,
+        SOCCER_NEURAL_FEATURE_OPTION_LEGAL_FRACTION + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_OPTION_CONTROL_COST,
+        SOCCER_NEURAL_FEATURE_OPTION_MPC_FEASIBILITY + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_DISTANCE,
+        SOCCER_NEURAL_FEATURE_OPTION_TOTAL_COUNT + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE + 1,
+        SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -46403,12 +47045,58 @@ fn goalkeeper_loose_ball_recovery_holds_ball_goal_line_until_collection_window()
     );
 
     assert!(
+        snapshot.point_in_own_six_yard_box(Team::Home, line_target),
+        "ordinary keeper line target should remain inside the six-yard box: {line_target:?}"
+    );
+    assert!(
             recovery_target.distance(line_target) < 1e-9,
             "keeper should track the ball-goal line instead of charging at a loose ball from distance: recovery={recovery_target:?} line={line_target:?}"
         );
     assert!(
         segment_distance_to_point(goal, snapshot.ball.position, recovery_target) < 1e-9,
         "keeper recovery target should remain directly between ball and goal: {recovery_target:?}"
+    );
+}
+
+#[test]
+fn goalkeeper_six_yard_gate_rejects_off_pitch_and_mirrors_away_box() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let home_keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    park_players_except(&mut sim, &[home_keeper]);
+    sim.players[home_keeper].position = Vec2::new(width * 0.5, 1.0);
+    sim.ball.holder = None;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let behind_home_goal = Vec2::new(width * 0.5, -0.5);
+    sim.ball.position = behind_home_goal;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.point_in_own_six_yard_box(Team::Home, behind_home_goal),
+        "behind-goal coordinates must not count as inside the home six-yard box"
+    );
+    assert!(
+        !snapshot.goalkeeper_should_commit_to_loose_ball(home_keeper, behind_home_goal),
+        "keeper must not leave/claim for an off-pitch target behind its own goal line"
+    );
+
+    let away_keeper = sim.goalkeeper_for(Team::Away).expect("away keeper");
+    park_players_except(&mut sim, &[away_keeper]);
+    sim.players[away_keeper].position = Vec2::new(width * 0.5, length - 1.0);
+    sim.ball.position = Vec2::new(width * 0.18, length - 35.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let away_line_target = snapshot.goalkeeper_ball_goal_tracking_target(Team::Away);
+    assert!(
+        snapshot.point_in_own_six_yard_box(Team::Away, away_line_target),
+        "ordinary away keeper line target should remain inside its mirrored six: {away_line_target:?}"
+    );
+    let behind_away_goal = Vec2::new(width * 0.5, length + 0.5);
+    assert!(
+        !snapshot.point_in_own_six_yard_box(Team::Away, behind_away_goal),
+        "behind-goal coordinates must not count as inside the away six-yard box"
     );
 }
 
@@ -46430,11 +47118,17 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         .id;
     let width = sim.config.field_width_yards;
     let length = sim.config.field_length_yards;
-    let target = Vec2::new(width * 0.5, 8.0); // a loose ball inside the home box
+    let target = Vec2::new(width * 0.5, 6.8); // just outside the six, inside the home 18
     assert!(sim.point_in_own_penalty_area(Team::Home, target));
     park_players_except(&mut sim, &[keeper, defender, threat]);
     sim.players[keeper].position = Vec2::new(width * 0.5, 1.0); // deep on his line
+    sim.players[keeper].skills.goalkeeping = 10.0;
+    sim.players[keeper].skills.acceleration = 10.0;
+    sim.players[keeper].skills.top_speed = 10.0;
+    sim.players[keeper].skills.stamina = 10.0;
+    sim.players[keeper].fatigue = 0.0;
     sim.players[threat].position = Vec2::new(width - 6.0, length - 5.0);
+    sim.ball.position = target;
     sim.ball.last_touch_team = Some(Team::Away);
 
     // A covering defender is right on the ball → clearly his → keeper must NOT charge.
@@ -46445,13 +47139,58 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         "keeper must defer to a defender clearly winning the in-box loose ball"
     );
 
-    // Pull the defender away → keeper is the favourite → it still commits (its box).
+    // Pull the defender away → keeper is 95% first by both the POMDP race and MPC reach model,
+    // so it may leave the six to claim the ball inside the 18.
     sim.players[defender].position = Vec2::new(width * 0.5, length - 5.0);
     let snapshot = WorldSnapshot::from_match(&sim);
+    let (pomdp, mpc) = snapshot
+        .goalkeeper_leave_six_yard_box_confidences(keeper, target)
+        .expect("keeper confidence");
+    assert!(
+        pomdp >= GOALKEEPER_LEAVE_SIX_YARD_MIN_CONFIDENCE
+            && mpc >= GOALKEEPER_LEAVE_SIX_YARD_MIN_CONFIDENCE,
+        "keeper should only leave six when both models are >=95%: pomdp={pomdp} mpc={mpc}"
+    );
     assert!(
         snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
-        "keeper must commit to the in-box loose ball when no teammate is winning it"
+        "keeper may commit outside the six only when POMDP and MPC both clear the 95% race gate"
     );
+
+    for player in sim
+        .players
+        .iter_mut()
+        .filter(|player| player.team == Team::Home && player.id != keeper)
+    {
+        player.position = Vec2::new(6.0 + (player.id % 4) as f64, length - 5.0);
+        player.velocity = Vec2::zero();
+        player.acceleration = Vec2::zero();
+    }
+    let deep_target =
+        Vec2::new(width * 0.5, GOALKEEPER_LEAVE_SIX_YARD_OWN_BOX_DEPTH_YARDS - 2.5);
+    sim.ball.position = deep_target;
+    sim.players[threat].position = Vec2::new(width - 6.0, length - 5.0);
+    sim.players[defender].position = Vec2::new(width * 0.5, length - 5.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let (pomdp, mpc) = snapshot
+        .goalkeeper_leave_six_yard_box_confidences(keeper, deep_target)
+        .expect("deep keeper confidence");
+    assert!(
+        pomdp >= GOALKEEPER_LEAVE_SIX_YARD_MIN_CONFIDENCE
+            && mpc >= GOALKEEPER_LEAVE_SIX_YARD_MIN_CONFIDENCE,
+        "3s MPC horizon should still allow a clearly first keeper claim deeper in the 18: pomdp={pomdp} mpc={mpc}"
+    );
+    assert!(
+        snapshot.goalkeeper_should_commit_to_loose_ball(keeper, deep_target),
+        "keeper may claim deeper in the 18 only when both models keep the 95% first-arrival confidence"
+    );
+
+    sim.ball.position = Vec2::new(width * 0.5, 22.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper must not leave the six before the ball itself has entered the 18"
+    );
+    sim.ball.position = target;
 
     // If the loose ball was touched last by his own team, the keeper cannot use
     // hands. With an opponent near, the old automatic in-box claim must not fire.
@@ -46463,12 +47202,13 @@ fn goalkeeper_defers_in_box_loose_ball_to_a_clearly_winning_teammate() {
         "keeper must not get an automatic hand-claim path after an own-team touch"
     );
 
-    // The same geometry is claimable when the opponent touched it last.
+    // The same geometry is still not claimable when an opponent is close enough that the
+    // keeper is no longer 95% first, even if the opponent touched it last.
     sim.ball.last_touch_team = Some(Team::Away);
     let snapshot = WorldSnapshot::from_match(&sim);
     assert!(
-        snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
-        "keeper may claim the same in-box loose ball when the opponent touched it last"
+        !snapshot.goalkeeper_should_commit_to_loose_ball(keeper, target),
+        "keeper must not leave the six into an attacker-contested loose ball"
     );
 }
 
@@ -46814,7 +47554,7 @@ fn goalkeeper_defensive_shape_tracks_direct_ball_goal_line() {
         );
 
     sim.players[keeper].position = Vec2::new(40.0, 7.0);
-    sim.players[threat].position = Vec2::new(41.0, 9.0);
+    sim.players[threat].position = Vec2::new(40.5, 7.5);
     sim.ball.holder = Some(threat);
     sim.ball.position = sim.players[threat].position;
     let close_setup_snapshot = WorldSnapshot::from_match(&sim);
@@ -46917,7 +47657,7 @@ fn goalkeeper_runtime_tracks_ball_goal_line_at_least_ninety_five_percent() {
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
     let threat = 17;
     park_players_except(&mut sim, &[keeper, threat]);
-    sim.players[threat].position = Vec2::new(41.0, 9.0);
+    sim.players[threat].position = Vec2::new(40.5, 7.5);
     sim.ball.holder = Some(threat);
     sim.ball.position = sim.players[threat].position;
     sim.ball.last_touch_team = Some(Team::Away);
@@ -51596,7 +52336,7 @@ fn protect_ball_orbit_command_aims_the_ball_away_from_the_defender() {
     // protect-ball, point the ball to the FAR side of the body from the nearest defender.
     let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
     let to_defender = Vec2::new(1.0, 0.0); // defender is off to the carrier's +x
-    let (dir, _radius, _through, _rate) = carried_ball_orbit_command(
+    let (dir, _radius, _through, _long_orbit, _winding_cap, _rate) = carried_ball_orbit_command(
         facing,
         Some(DribbleMoveKind::ProtectBall),
         1.6,
@@ -51607,9 +52347,142 @@ fn protect_ball_orbit_command_aims_the_ball_away_from_the_defender() {
         "protect-ball orbit must aim the ball opposite the defender: dir={dir:?}"
     );
     // With no defender to shield from, it falls back to keeping the ball ahead of the body.
-    let (ahead, _r, _t, _rt) =
+    let (ahead, _r, _t, _long, _cap, _rt) =
         carried_ball_orbit_command(facing, Some(DribbleMoveKind::ProtectBall), f64::INFINITY, None);
     assert!(ahead.y > 0.9, "no defender → ball stays ahead of the body: {ahead:?}");
+}
+
+#[test]
+fn xavi_turn_orbit_keeps_far_side_and_winds_the_long_way() {
+    let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
+    let to_defender = Vec2::new(1.0, 0.0); // defender is off to the carrier's +x
+    let (
+        desired_dir,
+        desired_radius,
+        allow_through,
+        prefer_long_orbit,
+        winding_cap,
+        orbit_rate,
+    ) = carried_ball_orbit_command(
+        facing,
+        Some(DribbleMoveKind::XaviTurn),
+        1.6,
+        Some(to_defender),
+    );
+    assert!(
+        dot(desired_dir, to_defender) < -0.80,
+        "xavi-turn must keep the ball on the defender's far side: dir={desired_dir:?}"
+    );
+    assert!(
+        !allow_through,
+        "xavi-turn should go around the body/defender, not through the body line"
+    );
+    assert!(prefer_long_orbit, "xavi-turn must request the long orbit");
+    assert!(
+        winding_cap >= XAVI_TURN_MAX_ORBIT_RAD - 1e-9,
+        "xavi-turn should allow the 300-degree cap, got {winding_cap}"
+    );
+    assert!(
+        desired_radius >= CARRY_TIGHT_RADIUS_YARDS,
+        "xavi-turn should remain close-control, got {desired_radius}"
+    );
+
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier_pos = Vec2::new(40.0, 60.0);
+    sim.ball.position = carrier_pos + Vec2::new(0.0, 1.0);
+    sim.ball.reset_carry_orbit();
+    let mut rng = SeededRandom::new(29);
+    for step in 0..40u64 {
+        sim.ball.position = sim.ball.advance_carried_ball_orbit(
+            step + 1,
+            carrier_pos,
+            desired_dir,
+            desired_radius,
+            allow_through,
+            prefer_long_orbit,
+            winding_cap,
+            orbit_rate,
+            1.0 / 30.0,
+            sim.config.field_width_yards,
+            sim.config.field_length_yards,
+            &mut rng,
+        );
+    }
+    let swept = sim.ball.carry_orbit_swept_rad.abs();
+    assert!(
+        swept >= XAVI_TURN_MIN_ORBIT_RAD - 0.03 && swept <= XAVI_TURN_MAX_ORBIT_RAD + 1e-9,
+        "xavi-turn should sweep 280-300 degrees, swept {swept}"
+    );
+    assert!(
+        dot(sim.ball.position - carrier_pos, to_defender) < -0.10,
+        "xavi-turn should finish with the ball on the defender's far side: ball={:?}",
+        sim.ball.position
+    );
+    assert!((XAVI_TURN_DISPOSSESSION_PROBABILITY - 0.10).abs() < 1e-12);
+    assert!(
+        (dribble_dispossession_kind_multiplier(DribbleMoveKind::XaviTurn)
+            * HOLD_UP_DISPOSSESSION_PROBABILITY
+            - 0.10)
+            .abs()
+            < 1e-12
+    );
+}
+
+#[test]
+fn xavi_turn_orbit_command_keeps_far_side_for_common_defender_bearings() {
+    let facings = [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        -std::f64::consts::FRAC_PI_2,
+    ];
+    for facing in facings {
+        for defender_degrees in [0.0_f64, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
+            let defender_angle = defender_degrees.to_radians();
+            let to_defender = Vec2::new(defender_angle.cos(), defender_angle.sin());
+            let (desired_dir, _radius, allow_through, prefer_long_orbit, winding_cap, _rate) =
+                carried_ball_orbit_command(
+                    facing,
+                    Some(DribbleMoveKind::XaviTurn),
+                    1.6,
+                    Some(to_defender),
+                );
+            assert!(
+                dot(desired_dir, to_defender) <= -0.35,
+                "xavi-turn must keep the ball on the far side for facing={facing}, \
+                 defender_degrees={defender_degrees}: dir={desired_dir:?}"
+            );
+            assert!(!allow_through, "xavi-turn cannot cut through the body line");
+            assert!(prefer_long_orbit, "xavi-turn must request a long orbit");
+            assert!(
+                winding_cap >= XAVI_TURN_MAX_ORBIT_RAD - 1e-9,
+                "xavi-turn must preserve the 300-degree winding cap"
+            );
+        }
+    }
+}
+
+#[test]
+fn xavi_turn_orbit_command_sanitizes_non_finite_facing() {
+    let (desired_dir, desired_radius, allow_through, prefer_long_orbit, winding_cap, orbit_rate) =
+        carried_ball_orbit_command(
+            f64::NAN,
+            Some(DribbleMoveKind::XaviTurn),
+            f64::INFINITY,
+            Some(Vec2::new(f64::NAN, 1.0)),
+        );
+    assert!(
+        desired_dir.x.is_finite() && desired_dir.y.is_finite(),
+        "xavi-turn orbit direction must stay finite: {desired_dir:?}"
+    );
+    assert!(desired_radius.is_finite(), "radius must stay finite");
+    assert!(orbit_rate.is_finite(), "orbit rate must stay finite");
+    assert!(!allow_through, "xavi-turn cannot cut through the body line");
+    assert!(prefer_long_orbit, "xavi-turn must still request a long orbit");
+    assert!(
+        winding_cap >= XAVI_TURN_MAX_ORBIT_RAD - 1e-9,
+        "xavi-turn must preserve the 300-degree winding cap"
+    );
 }
 
 #[test]
@@ -51619,23 +52492,25 @@ fn pressured_carry_and_feint_orbits_keep_ball_away_from_defender() {
     // the chosen action is not the explicit protect-ball label.
     let facing = std::f64::consts::FRAC_PI_2; // carrier faces +y
     let to_defender = Vec2::new(1.0, 0.0); // defender is tight on the carrier's +x side
-    let (carry_dir, _carry_radius, _carry_through, _carry_rate) = carried_ball_orbit_command(
-        facing,
-        Some(DribbleMoveKind::CarryForward),
-        1.6,
-        Some(to_defender),
-    );
+    let (carry_dir, _carry_radius, _carry_through, _carry_long, _carry_cap, _carry_rate) =
+        carried_ball_orbit_command(
+            facing,
+            Some(DribbleMoveKind::CarryForward),
+            1.6,
+            Some(to_defender),
+        );
     assert!(
         dot(carry_dir, to_defender) < -0.35,
         "pressured carry should keep the ball on the far side of the body: dir={carry_dir:?}"
     );
 
-    let (feint_dir, _feint_radius, _feint_through, _feint_rate) = carried_ball_orbit_command(
-        facing,
-        Some(DribbleMoveKind::FakeLeftCutRight),
-        1.6,
-        Some(to_defender),
-    );
+    let (feint_dir, _feint_radius, _feint_through, _feint_long, _feint_cap, _feint_rate) =
+        carried_ball_orbit_command(
+            facing,
+            Some(DribbleMoveKind::FakeLeftCutRight),
+            1.6,
+            Some(to_defender),
+        );
     assert!(
         dot(feint_dir, to_defender) < -0.20,
         "pressured feint should still shield the ball from the defender: dir={feint_dir:?}"
@@ -51663,7 +52538,14 @@ fn protect_ball_orbit_settles_into_a_body_shield() {
     );
 
     let to_defender = sim.players[defender].position - carrier_pos;
-    let (desired_dir, desired_radius, allow_through, orbit_rate) = carried_ball_orbit_command(
+    let (
+        desired_dir,
+        desired_radius,
+        allow_through,
+        prefer_long_orbit,
+        winding_cap,
+        orbit_rate,
+    ) = carried_ball_orbit_command(
         sim.players[carrier].facing_yaw,
         Some(DribbleMoveKind::ProtectBall),
         to_defender.len(),
@@ -51677,6 +52559,8 @@ fn protect_ball_orbit_settles_into_a_body_shield() {
             desired_dir,
             desired_radius,
             allow_through,
+            prefer_long_orbit,
+            winding_cap,
             orbit_rate,
             sim.config.dt_seconds,
             sim.config.field_width_yards,
@@ -54715,13 +55599,13 @@ fn carried_ball_orbit_holds_close_control_and_tightens_near_opponents() {
     // The carried ball rests within close-control distance (≈0.25–1.0 yd) of the
     // carrier's feet, tighter the nearer an opponent is.
     let facing = std::f64::consts::FRAC_PI_2; // faces +y
-    let (_dir, loose_radius, _through, _rate) =
+    let (_dir, loose_radius, _through, _long, _cap, _rate) =
         carried_ball_orbit_command(facing, None, f64::INFINITY, None);
     assert!(
         (0.95..=1.05).contains(&loose_radius),
         "loose control radius should be ≈1yd in open space, got {loose_radius}"
     );
-    let (_dir, tight_radius, _through, _rate) =
+    let (_dir, tight_radius, _through, _long, _cap, _rate) =
         carried_ball_orbit_command(facing, None, 0.8, None);
     assert!(
         (0.25..0.45).contains(&tight_radius),
@@ -54759,6 +55643,8 @@ fn carried_ball_orbits_around_the_body_and_never_through_on_a_normal_carry() {
             Vec2::new(0.0, 1.0), // resting spot: in front of the body
             0.9,
             false, // ordinary carry: must arc around, not through
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
             CARRY_ORBIT_NORMAL_RATE_RAD_S,
             1.0 / 30.0,
             sim.config.field_width_yards,
@@ -54805,6 +55691,8 @@ fn a_special_move_may_bring_the_ball_through_the_body_line() {
             Vec2::new(0.0, 1.0),
             0.2, // a special move can draw it right in through the body
             true,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
             CARRY_ORBIT_SPECIAL_RATE_RAD_S,
             1.0 / 30.0,
             sim.config.field_width_yards,
@@ -54848,6 +55736,8 @@ fn carried_ball_winding_is_capped_near_270_degrees_per_possession() {
         dir0,
         0.9,
         false,
+        false,
+        CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
         CARRY_ORBIT_NORMAL_RATE_RAD_S,
         1.0 / 30.0,
         sim.config.field_width_yards,
@@ -54865,6 +55755,8 @@ fn carried_ball_winding_is_capped_near_270_degrees_per_possession() {
             dir,
             0.9,
             false,
+            false,
+            CARRY_ORBIT_POSSESSION_SOFT_CAP_RAD,
             CARRY_ORBIT_NORMAL_RATE_RAD_S,
             1.0 / 30.0,
             sim.config.field_width_yards,

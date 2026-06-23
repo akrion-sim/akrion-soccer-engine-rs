@@ -12,25 +12,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
-    SoccerConfigMomentInsert, SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend,
-    SoccerPassLearningMetrics, SoccerPassOutcomeSample,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
+    MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerMomentWindow,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
 };
 use soccer_engine::des::soccer_learning::{
-    evolve_soccer_tactical_learning_weights_from_genomes, evolve_soccer_team_policies,
-    soccer_evolution_options_from_search_metadata, soccer_learning_run_score,
+    evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
+    evolve_soccer_team_policies, soccer_evolution_options_from_search_metadata,
+    soccer_learning_curriculum_stage_for_completed_games, soccer_learning_run_score,
     soccer_neural_network_snapshot_fingerprint, soccer_policy_delta_entries,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_new_sim_refresh_plan,
     soccer_postgres_policy_refresh_decision,
     soccer_should_flush_postgres_policy_versions_for_new_sim,
     soccer_should_refresh_postgres_for_new_sim, soccer_tactical_learning_weights_fingerprint,
     soccer_team_q_policies_fingerprint, validate_soccer_evolution_options_for_learning_run,
-    validate_soccer_neural_learning_config_for_learning_run, SoccerEvolutionOptions,
-    SoccerLearningCompletedGame, SoccerPostgresPolicyRefreshCheck,
-    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE,
+    validate_soccer_learning_curriculum_config_for_learning_run,
+    validate_soccer_neural_learning_config_for_learning_run,
+    validate_soccer_policy_promotion_gate_config_for_learning_run, SoccerEvolutionOptions,
+    SoccerLearningCompletedGame, SoccerLearningCurriculumConfig, SoccerPolicyPromotionGateConfig,
+    SoccerPolicyPromotionGateEvaluation, SoccerPostgresPolicyRefreshCheck,
+    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
 };
 use soccer_engine::des::soccer_learning_pg::{
     soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
@@ -55,6 +59,7 @@ const DEFAULT_SOCCER_PRINT_COMPLETED_GAMES: bool = false;
 const DEFAULT_SOCCER_EVOLUTION_ENABLED: bool = true;
 const DEFAULT_SOCCER_EVOLUTION_INTERVAL_GAMES: usize = 10;
 const DEFAULT_SOCCER_EVOLUTION_ELITE_GAMES: usize = 4;
+const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
 
@@ -170,6 +175,27 @@ fn default_evolution_window_games(
     evolution_elite_games: usize,
 ) -> usize {
     evolution_interval_games.max(evolution_elite_games).max(1)
+}
+
+fn policy_version_status_for_promotion_gate(
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+) -> &'static str {
+    if evaluation.eligible {
+        SOCCER_POLICY_STATUS_ACTIVE
+    } else {
+        SOCCER_POLICY_STATUS_ARCHIVED
+    }
+}
+
+fn policy_promotion_search_metadata(
+    curriculum_stage: &'static str,
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "curriculumStage": curriculum_stage,
+        "gate": evaluation,
+        "status": policy_version_status_for_promotion_gate(evaluation)
+    })
 }
 
 fn default_disk_learning_artifacts_enabled(postgres_configured: bool) -> bool {
@@ -291,6 +317,95 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             default.lp_coupling_enabled,
         )?,
     })
+}
+
+fn apply_env_mpc_config(
+    config: &mut MatchConfig,
+    defaults: &MatchConfig,
+) -> Result<(), Box<dyn Error>> {
+    let mpc_override_configured = env_value("SOCCER_LEARNING_MPC_ENABLED").is_some()
+        || env_value("SOCCER_MPC_ENABLED").is_some();
+    let tier2_player_enabled = env_bool_alias(
+        "SOCCER_LEARNING_MPC_ENABLED",
+        "SOCCER_MPC_ENABLED",
+        defaults.mpc.tier2_player_enabled,
+    )?;
+    let execution_stack_default = if mpc_override_configured {
+        tier2_player_enabled
+    } else {
+        defaults.mpc.field_aware_enabled
+    };
+
+    config.mpc.tier2_player_enabled = tier2_player_enabled;
+    config.mpc.field_aware_enabled = env_bool_alias(
+        "SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED",
+        "SOCCER_MPC_FIELD_AWARE_ENABLED",
+        execution_stack_default,
+    )?;
+    config.mpc.reconcile_enabled = env_bool_alias(
+        "SOCCER_LEARNING_MPC_RECONCILE_ENABLED",
+        "SOCCER_MPC_RECONCILE_ENABLED",
+        if mpc_override_configured {
+            tier2_player_enabled
+        } else {
+            defaults.mpc.reconcile_enabled
+        },
+    )?;
+    config.mpc.latent_objective_enabled = env_bool_alias(
+        "SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED",
+        "SOCCER_MPC_LATENT_OBJECTIVE_ENABLED",
+        if mpc_override_configured {
+            tier2_player_enabled
+        } else {
+            defaults.mpc.latent_objective_enabled
+        },
+    )?;
+    if !config.mpc.tier2_player_enabled
+        && (config.mpc.field_aware_enabled
+            || config.mpc.reconcile_enabled
+            || config.mpc.latent_objective_enabled)
+    {
+        return Err(invalid_data(
+            "SOCCER_MPC_ENABLED must be true before enabling field-aware, reconcile, or latent MPC",
+        )
+        .into());
+    }
+
+    config.mpc.player_horizon = env_usize_alias(
+        "SOCCER_LEARNING_MPC_PLAYER_HORIZON",
+        "SOCCER_MPC_PLAYER_HORIZON",
+        defaults.mpc.player_horizon,
+    )?;
+    if config.mpc.player_horizon == 0 {
+        return Err(invalid_data("SOCCER_MPC_PLAYER_HORIZON must be greater than 0").into());
+    }
+    config.mpc.active_radius_yards = env_f64_alias(
+        "SOCCER_LEARNING_MPC_ACTIVE_RADIUS",
+        "SOCCER_MPC_ACTIVE_RADIUS",
+        defaults.mpc.active_radius_yards,
+    )?;
+    if config.mpc.active_radius_yards <= 0.0 {
+        return Err(invalid_data("SOCCER_MPC_ACTIVE_RADIUS must be greater than 0").into());
+    }
+
+    config.local_mpc_enabled = env_bool_alias(
+        "SOCCER_LEARNING_LOCAL_MPC_ENABLED",
+        "SOCCER_LOCAL_MPC",
+        defaults.local_mpc_enabled,
+    )?;
+    config.local_mpc_max_players_per_team = env_usize_alias(
+        "SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+        "SOCCER_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+        defaults.local_mpc_max_players_per_team,
+    )?
+    .min(SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT);
+    if config.local_mpc_max_players_per_team == 0
+        || (mpc_override_configured && !tier2_player_enabled)
+    {
+        config.local_mpc_enabled = false;
+    }
+
+    Ok(())
 }
 
 fn q_entry_order(a: &SoccerQEntry, b: &SoccerQEntry) -> std::cmp::Ordering {
@@ -905,6 +1020,7 @@ struct CompletedGame {
 
 #[derive(Clone, Debug)]
 struct EvolutionSearchSample {
+    summary: MatchSummary,
     policies: SoccerTeamQPolicies,
     tactical_summary: SoccerTacticalLearningSummary,
     starting_tactical_learning: SoccerTacticalLearningWeights,
@@ -914,6 +1030,7 @@ struct EvolutionSearchSample {
 impl EvolutionSearchSample {
     fn from_completed_game(game: &CompletedGame) -> Self {
         Self {
+            summary: game.episode_summary.summary.clone(),
             policies: game.policies.clone(),
             tactical_summary: game.artifact.tactical_summary.clone(),
             starting_tactical_learning: game.starting_tactical_learning.clone(),
@@ -976,6 +1093,9 @@ fn run_evolution_search_metadata(
     options: SoccerEvolutionOptions,
     previous_tactical_learning: &SoccerTacticalLearningWeights,
     evolved_tactical_learning: &SoccerTacticalLearningWeights,
+    curriculum_stage: &'static str,
+    promotion_evaluation: &SoccerPolicyPromotionGateEvaluation,
+    candidate_promoted: bool,
 ) -> serde_json::Value {
     let tactical = serde_json::json!({
         "algorithm": "evolutionary-genetic-programming-tactical-search",
@@ -1001,7 +1121,10 @@ fn run_evolution_search_metadata(
         "windowGames": window_games,
         "sampleCount": sample_count,
         "bestFitness": best_fitness,
+        "curriculumStage": curriculum_stage,
+        "candidatePromoted": candidate_promoted,
         "options": options,
+        "promotion": policy_promotion_search_metadata(curriculum_stage, promotion_evaluation),
         "tactical": tactical
     })
 }
@@ -2380,6 +2503,82 @@ fn run() -> Result<(), Box<dyn Error>> {
         )? as u64,
     };
     validate_soccer_evolution_options_for_learning_run(&evolution_options).map_err(invalid_data)?;
+    let default_curriculum = SoccerLearningCurriculumConfig::default();
+    let curriculum_config = SoccerLearningCurriculumConfig {
+        ball_skills_after_games: env_usize_alias(
+            "SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES",
+            "SOCCER_CURRICULUM_BALL_SKILLS_AFTER_GAMES",
+            default_curriculum.ball_skills_after_games,
+        )?,
+        duels_after_games: env_usize_alias(
+            "SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES",
+            "SOCCER_CURRICULUM_DUELS_AFTER_GAMES",
+            default_curriculum.duels_after_games,
+        )?,
+        small_sided_after_games: env_usize_alias(
+            "SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES",
+            "SOCCER_CURRICULUM_SMALL_SIDED_AFTER_GAMES",
+            default_curriculum.small_sided_after_games,
+        )?,
+        team_shape_after_games: env_usize_alias(
+            "SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES",
+            "SOCCER_CURRICULUM_TEAM_SHAPE_AFTER_GAMES",
+            default_curriculum.team_shape_after_games,
+        )?,
+        full_match_after_games: env_usize_alias(
+            "SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES",
+            "SOCCER_CURRICULUM_FULL_MATCH_AFTER_GAMES",
+            default_curriculum.full_match_after_games,
+        )?,
+    };
+    validate_soccer_learning_curriculum_config_for_learning_run(&curriculum_config)
+        .map_err(invalid_data)?;
+    let default_promotion_gate = SoccerPolicyPromotionGateConfig::default();
+    let policy_promotion_gate = SoccerPolicyPromotionGateConfig {
+        enabled: env_bool_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_GATE_ENABLED",
+            "SOCCER_POLICY_PROMOTION_GATE_ENABLED",
+            default_promotion_gate.enabled,
+        )?,
+        min_sample_games: env_usize_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MIN_SAMPLE_GAMES",
+            "SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES",
+            default_promotion_gate.min_sample_games,
+        )?
+        .max(1),
+        min_mean_match_fitness: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MIN_MEAN_MATCH_FITNESS",
+            "SOCCER_POLICY_PROMOTION_MIN_MEAN_MATCH_FITNESS",
+            default_promotion_gate.min_mean_match_fitness,
+        )?,
+        min_best_match_fitness: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MIN_BEST_MATCH_FITNESS",
+            "SOCCER_POLICY_PROMOTION_MIN_BEST_MATCH_FITNESS",
+            default_promotion_gate.min_best_match_fitness,
+        )?,
+        min_mean_play_quality: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MIN_MEAN_PLAY_QUALITY",
+            "SOCCER_POLICY_PROMOTION_MIN_MEAN_PLAY_QUALITY",
+            default_promotion_gate.min_mean_play_quality,
+        )?,
+        max_mean_conceded_goals: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MAX_MEAN_CONCEDED_GOALS",
+            "SOCCER_POLICY_PROMOTION_MAX_MEAN_CONCEDED_GOALS",
+            default_promotion_gate.max_mean_conceded_goals,
+        )?,
+        max_mean_goal_margin: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MAX_MEAN_GOAL_MARGIN",
+            "SOCCER_POLICY_PROMOTION_MAX_MEAN_GOAL_MARGIN",
+            default_promotion_gate.max_mean_goal_margin,
+        )?,
+        max_mean_chain_net_loss: env_f64_alias(
+            "SOCCER_BATCH_POLICY_PROMOTION_MAX_MEAN_CHAIN_NET_LOSS",
+            "SOCCER_POLICY_PROMOTION_MAX_MEAN_CHAIN_NET_LOSS",
+            default_promotion_gate.max_mean_chain_net_loss,
+        )?,
+    };
+    validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
+        .map_err(invalid_data)?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -2450,6 +2649,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_FORMATION_LP_ENABLED",
         default_config.formation_lp_enabled,
     )?;
+    let opponent_belief_enabled = env_bool_alias(
+        "SOCCER_OPPONENT_BELIEF_ENABLED",
+        "SOCCER_OPPONENT_BELIEF",
+        true,
+    )?;
     let mut config = MatchConfig {
         dt_seconds,
         duration_seconds: minutes * 60.0,
@@ -2466,10 +2670,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_learning: neural_learning.clone(),
         adversarial_embedding_exploitation_enabled,
         adversarial_embedding_memory_limit,
+        opponent_belief_enabled,
         max_human_players: 0,
         seed: effective_seed,
-        ..default_config
+        ..default_config.clone()
     };
+    apply_env_mpc_config(&mut config, &default_config)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
         env_value("SOCCER_RUN_DIR").unwrap_or_else(|| format!("out/soccer-learning-runs/{run_id}")),
@@ -2708,6 +2914,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         evolution_options.seed
     );
     println!(
+        "curriculum ball_skills_after_games={} duels_after_games={} small_sided_after_games={} team_shape_after_games={} full_match_after_games={}",
+        curriculum_config.ball_skills_after_games,
+        curriculum_config.duels_after_games,
+        curriculum_config.small_sided_after_games,
+        curriculum_config.team_shape_after_games,
+        curriculum_config.full_match_after_games
+    );
+    println!(
+        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4}",
+        policy_promotion_gate.enabled,
+        policy_promotion_gate.min_sample_games,
+        policy_promotion_gate.min_mean_match_fitness,
+        policy_promotion_gate.min_best_match_fitness,
+        policy_promotion_gate.min_mean_play_quality,
+        policy_promotion_gate.max_mean_conceded_goals,
+        policy_promotion_gate.max_mean_goal_margin,
+        policy_promotion_gate.max_mean_chain_net_loss
+    );
+    println!(
         "postgres_resumed_neural_network={}",
         initial_neural_network.is_some()
     );
@@ -2939,6 +3164,33 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let should_write_policy_version = pg_policy_version_interval_games <= 1
                     || completed_episode >= games
                     || completed_episode % pg_policy_version_interval_games == 0;
+                let curriculum_stage = soccer_learning_curriculum_stage_for_completed_games(
+                    completed_episode,
+                    &curriculum_config,
+                );
+                let curriculum_stage_label = curriculum_stage.as_str();
+                let policy_promotion_evaluation = evaluate_soccer_policy_promotion_gate(
+                    [&game.episode_summary.summary],
+                    policy_promotion_gate,
+                );
+                let policy_version_status =
+                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                if should_write_policy_version
+                    && policy_version_status != SOCCER_POLICY_STATUS_ACTIVE
+                {
+                    println!(
+                        "policy_promotion_blocked completed_games={} curriculum_stage={} status={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} mean_goal_margin={:.4} reasons={}",
+                        completed_episode,
+                        curriculum_stage_label,
+                        policy_version_status,
+                        policy_promotion_evaluation.sample_games,
+                        policy_promotion_evaluation.mean_match_fitness,
+                        policy_promotion_evaluation.best_match_fitness,
+                        policy_promotion_evaluation.mean_play_quality,
+                        policy_promotion_evaluation.mean_goal_margin,
+                        policy_promotion_evaluation.rejection_reasons.join("|")
+                    );
+                }
                 let output_policy_version_id = if should_write_policy_version {
                     let next_generation = pg_generation
                         .max(game.starting_policy_generation)
@@ -2955,27 +3207,36 @@ fn run() -> Result<(), Box<dyn Error>> {
                         generation: next_generation,
                         version_label,
                         source_kind: SOCCER_POLICY_SOURCE_MERGE,
-                        status: "active",
+                        status: policy_version_status,
                         config: config.clone(),
                         home_options: options.clone(),
                         away_options: options.clone(),
                         policies: policies.clone(),
                         fitness: completed_learning_game.score.match_fitness,
                         neural_network: latest_neural_network.clone(),
-                        search_metadata: None,
+                        search_metadata: policy_promotion_gate.enabled.then(|| {
+                            serde_json::json!({
+                                "promotion": policy_promotion_search_metadata(
+                                    curriculum_stage_label,
+                                    &policy_promotion_evaluation,
+                                )
+                            })
+                        }),
                     });
-                    pg_base_policy_version_id = Some(output_policy_version_id.clone());
-                    pg_last_policy_version_id = Some(output_policy_version_id.clone());
-                    pg_generation = next_generation;
-                    pg_base_policy_version_updated_at_micros = 0;
-                    pg_base_policy_fingerprint =
-                        Some(soccer_team_q_policies_fingerprint(&policies));
-                    pg_base_neural_network_fingerprint = latest_neural_network
-                        .as_ref()
-                        .map(soccer_neural_network_snapshot_fingerprint);
-                    pg_base_tactical_learning_fingerprint = Some(
-                        soccer_tactical_learning_weights_fingerprint(&config.tactical_learning),
-                    );
+                    if policy_version_status == SOCCER_POLICY_STATUS_ACTIVE {
+                        pg_base_policy_version_id = Some(output_policy_version_id.clone());
+                        pg_last_policy_version_id = Some(output_policy_version_id.clone());
+                        pg_generation = next_generation;
+                        pg_base_policy_version_updated_at_micros = 0;
+                        pg_base_policy_fingerprint =
+                            Some(soccer_team_q_policies_fingerprint(&policies));
+                        pg_base_neural_network_fingerprint = latest_neural_network
+                            .as_ref()
+                            .map(soccer_neural_network_snapshot_fingerprint);
+                        pg_base_tactical_learning_fingerprint = Some(
+                            soccer_tactical_learning_weights_fingerprint(&config.tactical_learning),
+                        );
+                    }
                     Some(output_policy_version_id)
                 } else {
                     pg_last_policy_version_id.clone()
@@ -3102,44 +3363,74 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .seed
                 .wrapping_add(completed_after_batch as u64)
                 .wrapping_add((shard_index as u64) << 32);
-            policies = evolve_soccer_team_policies(&parents, batch_evolution_options)
+            let policy_promotion_evaluation = evaluate_soccer_policy_promotion_gate(
+                evolution_search_samples
+                    .iter()
+                    .map(|sample| &sample.summary),
+                policy_promotion_gate,
+            );
+            let candidate_promoted = policy_promotion_evaluation.eligible;
+            let curriculum_stage = soccer_learning_curriculum_stage_for_completed_games(
+                completed_after_batch,
+                &curriculum_config,
+            );
+            let curriculum_stage_label = curriculum_stage.as_str();
+            let evolved_policies = evolve_soccer_team_policies(&parents, batch_evolution_options)
                 .map_err(invalid_data)?;
             let previous_tactical_learning = tactical_learning.clone();
-            tactical_learning = evolve_soccer_tactical_learning_weights_from_genomes(
+            let evolved_tactical_learning = evolve_soccer_tactical_learning_weights_from_genomes(
                 &tactical_learning,
                 &tactical_parents,
                 batch_evolution_options,
             );
-            validate_tactical_learning_weights(&tactical_learning)?;
-            config.tactical_learning = tactical_learning.clone();
-            local_tactical_evolved_since_pg_refresh = true;
-            println!(
-                "policy_evolved games_completed={} sample_window_games={} samples={} elite_games={} best_fitness={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} exploration_rate={:.4} exploration_scale={:.4} population_size={}",
-                completed_after_batch,
-                evolution_window_games,
-                evolution_search_samples.len(),
-                elite_count,
-                best_fitness,
-                batch_evolution_options.mutation_rate,
-                batch_evolution_options.mutation_scale,
-                batch_evolution_options.crossover_rate,
-                batch_evolution_options.exploration_rate,
-                batch_evolution_options.exploration_scale,
-                batch_evolution_options.population_size
-            );
-            println!(
-                "tactical_weights_evolved games_completed={} sample_window_games={} samples={} population_size={} attack_width_delta={:.3}->{:.3} attack_flank_lane={:.3}->{:.3} defense_contract_delta={:.3}->{:.3}",
-                completed_after_batch,
-                evolution_window_games,
-                evolution_search_samples.len(),
-                batch_evolution_options.population_size,
-                previous_tactical_learning.attack_width_delta_weight,
-                tactical_learning.attack_width_delta_weight,
-                previous_tactical_learning.attack_flank_lane_weight,
-                tactical_learning.attack_flank_lane_weight,
-                previous_tactical_learning.defense_contract_delta_weight,
-                tactical_learning.defense_contract_delta_weight
-            );
+            validate_tactical_learning_weights(&evolved_tactical_learning)?;
+            let mut evolved_config = config.clone();
+            evolved_config.tactical_learning = evolved_tactical_learning.clone();
+            if candidate_promoted {
+                policies = evolved_policies.clone();
+                tactical_learning = evolved_tactical_learning.clone();
+                config.tactical_learning = tactical_learning.clone();
+                local_tactical_evolved_since_pg_refresh = true;
+                println!(
+                    "policy_evolved games_completed={} curriculum_stage={} sample_window_games={} samples={} elite_games={} best_fitness={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} exploration_rate={:.4} exploration_scale={:.4} population_size={}",
+                    completed_after_batch,
+                    curriculum_stage_label,
+                    evolution_window_games,
+                    evolution_search_samples.len(),
+                    elite_count,
+                    best_fitness,
+                    batch_evolution_options.mutation_rate,
+                    batch_evolution_options.mutation_scale,
+                    batch_evolution_options.crossover_rate,
+                    batch_evolution_options.exploration_rate,
+                    batch_evolution_options.exploration_scale,
+                    batch_evolution_options.population_size
+                );
+                println!(
+                    "tactical_weights_evolved games_completed={} sample_window_games={} samples={} population_size={} attack_width_delta={:.3}->{:.3} attack_flank_lane={:.3}->{:.3} defense_contract_delta={:.3}->{:.3}",
+                    completed_after_batch,
+                    evolution_window_games,
+                    evolution_search_samples.len(),
+                    batch_evolution_options.population_size,
+                    previous_tactical_learning.attack_width_delta_weight,
+                    tactical_learning.attack_width_delta_weight,
+                    previous_tactical_learning.attack_flank_lane_weight,
+                    tactical_learning.attack_flank_lane_weight,
+                    previous_tactical_learning.defense_contract_delta_weight,
+                    tactical_learning.defense_contract_delta_weight
+                );
+            } else {
+                println!(
+                    "policy_evolution_held games_completed={} curriculum_stage={} sample_window_games={} samples={} elite_games={} best_fitness={:.4} reasons={}",
+                    completed_after_batch,
+                    curriculum_stage_label,
+                    evolution_window_games,
+                    evolution_search_samples.len(),
+                    elite_count,
+                    best_fitness,
+                    policy_promotion_evaluation.rejection_reasons.join("|")
+                );
+            }
             let _ = std::io::stdout().flush();
 
             if pg_experiment_id.is_some() {
@@ -3153,17 +3444,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                         completed_after_batch.saturating_sub(1),
                     )
                 );
+                let policy_version_status =
+                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
                 pg_policy_version_buffer.push(PendingPostgresPolicyVersion {
                     id: output_policy_version_id.clone(),
                     parent_policy_version_id: pg_base_policy_version_id.clone(),
                     generation: next_generation,
                     version_label,
                     source_kind: SOCCER_POLICY_SOURCE_EVOLUTION,
-                    status: "active",
-                    config: config.clone(),
+                    status: policy_version_status,
+                    config: evolved_config,
                     home_options: options.clone(),
                     away_options: options.clone(),
-                    policies: policies.clone(),
+                    policies: evolved_policies.clone(),
                     fitness: best_fitness,
                     neural_network: latest_neural_network.clone(),
                     search_metadata: Some(run_evolution_search_metadata(
@@ -3174,20 +3467,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                         best_fitness,
                         batch_evolution_options,
                         &previous_tactical_learning,
-                        &tactical_learning,
+                        &evolved_tactical_learning,
+                        curriculum_stage_label,
+                        &policy_promotion_evaluation,
+                        candidate_promoted,
                     )),
                 });
-                pg_base_policy_version_id = Some(output_policy_version_id.clone());
-                pg_last_policy_version_id = Some(output_policy_version_id);
-                pg_generation = next_generation;
-                pg_base_policy_version_updated_at_micros = 0;
-                pg_base_policy_fingerprint = Some(soccer_team_q_policies_fingerprint(&policies));
-                pg_base_neural_network_fingerprint = latest_neural_network
-                    .as_ref()
-                    .map(soccer_neural_network_snapshot_fingerprint);
-                pg_base_tactical_learning_fingerprint = Some(
-                    soccer_tactical_learning_weights_fingerprint(&config.tactical_learning),
-                );
+                if policy_version_status == SOCCER_POLICY_STATUS_ACTIVE {
+                    pg_base_policy_version_id = Some(output_policy_version_id.clone());
+                    pg_last_policy_version_id = Some(output_policy_version_id);
+                    pg_generation = next_generation;
+                    pg_base_policy_version_updated_at_micros = 0;
+                    pg_base_policy_fingerprint =
+                        Some(soccer_team_q_policies_fingerprint(&policies));
+                    pg_base_neural_network_fingerprint = latest_neural_network
+                        .as_ref()
+                        .map(soccer_neural_network_snapshot_fingerprint);
+                    pg_base_tactical_learning_fingerprint = Some(
+                        soccer_tactical_learning_weights_fingerprint(&config.tactical_learning),
+                    );
+                }
             }
         }
 
@@ -3548,6 +3847,30 @@ mod tests {
         .collect()
     }
 
+    fn clear_mpc_env() -> Vec<EnvVarGuard> {
+        [
+            "SOCCER_LEARNING_MPC_ENABLED",
+            "SOCCER_MPC_ENABLED",
+            "SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED",
+            "SOCCER_MPC_FIELD_AWARE_ENABLED",
+            "SOCCER_LEARNING_MPC_RECONCILE_ENABLED",
+            "SOCCER_MPC_RECONCILE_ENABLED",
+            "SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED",
+            "SOCCER_MPC_LATENT_OBJECTIVE_ENABLED",
+            "SOCCER_LEARNING_MPC_PLAYER_HORIZON",
+            "SOCCER_MPC_PLAYER_HORIZON",
+            "SOCCER_LEARNING_MPC_ACTIVE_RADIUS",
+            "SOCCER_MPC_ACTIVE_RADIUS",
+            "SOCCER_LEARNING_LOCAL_MPC_ENABLED",
+            "SOCCER_LOCAL_MPC",
+            "SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+            "SOCCER_LOCAL_MPC_MAX_PLAYERS_PER_TEAM",
+        ]
+        .into_iter()
+        .map(EnvVarGuard::clear)
+        .collect()
+    }
+
     const CONTINUOUS_DEPLOYMENT_YAML: &str =
         include_str!("../../k8s/soccer-learning-rds-continuous.deployment.yaml");
 
@@ -3569,6 +3892,64 @@ mod tests {
             CONTINUOUS_DEPLOYMENT_YAML.contains(snippet),
             "continuous deployment manifest missing snippet: {snippet}"
         );
+    }
+
+    #[test]
+    fn learning_run_mpc_env_enables_execution_stack() {
+        let _lock = SOCCER_RUN_PG_ENV_LOCK.lock().expect("env lock poisoned");
+        let _guards = clear_mpc_env();
+        std::env::set_var("SOCCER_MPC_ENABLED", "1");
+        std::env::set_var("SOCCER_MPC_PLAYER_HORIZON", "12");
+        std::env::set_var("SOCCER_MPC_ACTIVE_RADIUS", "18");
+        std::env::set_var("SOCCER_LOCAL_MPC", "1");
+        std::env::set_var("SOCCER_LOCAL_MPC_MAX_PLAYERS_PER_TEAM", "99");
+
+        let defaults = MatchConfig::default();
+        let mut config = defaults.clone();
+        apply_env_mpc_config(&mut config, &defaults).expect("valid mpc env config");
+
+        assert!(config.mpc.tier2_player_enabled);
+        assert!(config.mpc.field_aware_enabled);
+        assert!(config.mpc.reconcile_enabled);
+        assert!(config.mpc.latent_objective_enabled);
+        assert_eq!(config.mpc.player_horizon, 12);
+        assert_eq!(config.mpc.active_radius_yards, 18.0);
+        assert!(config.local_mpc_enabled);
+        assert_eq!(config.local_mpc_max_players_per_team, 11);
+    }
+
+    #[test]
+    fn learning_run_mpc_env_rejects_dependent_stack_without_tier2() {
+        let _lock = SOCCER_RUN_PG_ENV_LOCK.lock().expect("env lock poisoned");
+        let _guards = clear_mpc_env();
+        std::env::set_var("SOCCER_MPC_FIELD_AWARE_ENABLED", "1");
+
+        let defaults = MatchConfig::default();
+        let mut config = defaults.clone();
+        let err = apply_env_mpc_config(&mut config, &defaults)
+            .expect_err("dependent MPC features require tier2 MPC");
+
+        assert!(err.to_string().contains("SOCCER_MPC_ENABLED"));
+    }
+
+    #[test]
+    fn learning_run_mpc_master_off_disables_local_mpc() {
+        let _lock = SOCCER_RUN_PG_ENV_LOCK.lock().expect("env lock poisoned");
+        let _guards = clear_mpc_env();
+        std::env::set_var("SOCCER_MPC_ENABLED", "0");
+        std::env::set_var("SOCCER_LOCAL_MPC", "1");
+        std::env::set_var("SOCCER_LOCAL_MPC_MAX_PLAYERS_PER_TEAM", "3");
+
+        let defaults = MatchConfig::default();
+        let mut config = defaults.clone();
+        apply_env_mpc_config(&mut config, &defaults).expect("valid mpc env config");
+
+        assert!(!config.mpc.tier2_player_enabled);
+        assert!(!config.mpc.field_aware_enabled);
+        assert!(!config.mpc.reconcile_enabled);
+        assert!(!config.mpc.latent_objective_enabled);
+        assert!(!config.local_mpc_enabled);
+        assert_eq!(config.local_mpc_max_players_per_team, 3);
     }
 
     #[test]
@@ -4032,8 +4413,32 @@ mod tests {
         evolved.attack_flank_lane_weight = 1.85;
         evolved.defense_contract_delta_weight = 0.70;
 
-        let metadata =
-            run_evolution_search_metadata(40, 4, 16, 12, 2.75, options, &previous, &evolved);
+        let promotion_evaluation = SoccerPolicyPromotionGateEvaluation {
+            enabled: true,
+            eligible: true,
+            sample_games: 12,
+            min_sample_games: 8,
+            mean_match_fitness: 0.65,
+            best_match_fitness: 2.75,
+            mean_play_quality: 1.4,
+            mean_conceded_goals: 1.2,
+            mean_goal_margin: 2.0,
+            mean_chain_net_loss: 3.5,
+            rejection_reasons: Vec::new(),
+        };
+        let metadata = run_evolution_search_metadata(
+            40,
+            4,
+            16,
+            12,
+            2.75,
+            options,
+            &previous,
+            &evolved,
+            "duels",
+            &promotion_evaluation,
+            true,
+        );
 
         assert_eq!(metadata["algorithm"], "evolutionary-genetic-programming");
         assert_eq!(
@@ -4041,6 +4446,13 @@ mod tests {
             "evolutionary-genetic-programming-tactical-search"
         );
         assert_eq!(metadata["completedGames"].as_u64(), Some(40));
+        assert_eq!(metadata["curriculumStage"], "duels");
+        assert_eq!(metadata["candidatePromoted"], true);
+        assert_eq!(metadata["promotion"]["status"], "active");
+        assert_eq!(
+            metadata["promotion"]["gate"]["sampleGames"].as_u64(),
+            Some(12)
+        );
         assert_eq!(metadata["tactical"]["sampleCount"].as_u64(), Some(12));
         assert_eq!(
             metadata["tactical"]["previousTacticalLearning"]["attackFlankLaneWeight"].as_f64(),

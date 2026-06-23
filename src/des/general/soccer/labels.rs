@@ -69,6 +69,7 @@ pub enum SoccerActionLabel {
     LeftCut,
     RightCut,
     Nutmeg,
+    XaviTurn,
     FakeLeftCutRight,
     FakeRightCutLeft,
     VerticalAttack,
@@ -141,6 +142,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::LeftCut => "left-cut",
             SoccerActionLabel::RightCut => "right-cut",
             SoccerActionLabel::Nutmeg => "nutmeg",
+            SoccerActionLabel::XaviTurn => "xavi-turn",
             SoccerActionLabel::FakeLeftCutRight => "fake-left-cut-right",
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
@@ -205,6 +207,7 @@ impl SoccerActionLabel {
             "left-cut" => SoccerActionLabel::LeftCut,
             "right-cut" => SoccerActionLabel::RightCut,
             "nutmeg" => SoccerActionLabel::Nutmeg,
+            "xavi-turn" => SoccerActionLabel::XaviTurn,
             "fake-left-cut-right" => SoccerActionLabel::FakeLeftCutRight,
             "fake-right-cut-left" => SoccerActionLabel::FakeRightCutLeft,
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
@@ -404,6 +407,11 @@ impl SoccerActionLabel {
             "leftcut" | "left_cut" | "left-cut-dribble" | "cut-left" => "left-cut",
             "rightcut" | "right_cut" | "right-cut-dribble" | "cut-right" => "right-cut",
             "nut-meg" | "nut_meg" | "meg" => "nutmeg",
+            "xavi"
+            | "xaviturn"
+            | "xavi_turn"
+            | "xavi-turn-dribble"
+            | "xavi_turn_dribble" => "xavi-turn",
             "fake_left_cut_right" | "fake-left-right" | "fake-left-cut-right-dribble" => {
                 "fake-left-cut-right"
             }
@@ -563,6 +571,7 @@ mod tests {
             "hold",
             "defend",
             "space",
+            "xavi-turn",
         ] {
             let label = SoccerActionLabel::from_label(canonical);
             assert_eq!(label.as_str(), canonical, "round-trip for {canonical}");
@@ -575,6 +584,7 @@ mod tests {
         assert_eq!(SoccerActionLabel::from_label("hoof").as_str(), "clearance");
         assert_eq!(SoccerActionLabel::from_label("move").as_str(), "space");
         assert_eq!(SoccerActionLabel::from_label("through-pass").as_str(), "killer-pass");
+        assert_eq!(SoccerActionLabel::from_label("xavi_turn").as_str(), "xavi-turn");
     }
 
     #[test]

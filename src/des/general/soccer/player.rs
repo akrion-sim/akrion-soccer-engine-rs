@@ -770,6 +770,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "left-cut"
             | "right-cut"
             | "nutmeg"
+            | "xavi-turn"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1318,6 +1319,7 @@ fn mpc_execution_estimate_for_action(
             | "left-cut"
             | "right-cut"
             | "nutmeg"
+            | "xavi-turn"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1418,6 +1420,10 @@ fn mpc_execution_estimate_for_action(
             "carry-out-right" | "right-cut" => right_prob,
             "side-step" | "fake-left-cut-right" | "fake-right-cut-left" => {
                 left_prob.max(right_prob)
+            }
+            "xavi-turn" => {
+                (0.28 + dribble_skill * 0.32 + pressure * 0.26 + target_space_fit * 0.12)
+                    .clamp(0.12, 0.96)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
             _ => direct_prob.max(if left_prob > right_prob {
@@ -2478,6 +2484,22 @@ impl PlayerAgent {
                 observation.nearest_opponent_distance,
             ))
             .clamp(0.0, 1.0);
+        let xavi_turn_legal = observation.nearest_opponent_distance <= 5.0
+            && technical_escape_pressure >= 0.32
+            && !goalmouth_carry_forced
+            && !goal_attack_shot_blocks_alternatives
+            && self.role != PlayerRole::Goalkeeper;
+        let xavi_turn_score = (dribble_score
+            * (0.20
+                + technical_escape_pressure * 0.62
+                + pressure_rising * 0.42
+                + steal_escape_urgency * 0.50
+                + goal_side_shield * 0.26
+                + pressured_no_outlet_shield * 0.22)
+            * (0.70 + dribbling * 0.30 + ability01(self.skills.first_touch) * 0.20)
+            * calm_pass_focus
+            * keeper_carry_under_pressure_damp)
+            .clamp(0.01, (0.74 + steal_escape_urgency * 0.30).clamp(0.74, 1.06));
         let cut_legal = observation.nearest_opponent_distance <= 4.8
             && technical_escape_pressure >= 0.30
             && !goalmouth_carry_forced
@@ -2564,6 +2586,7 @@ impl PlayerAgent {
                 carry_out_right_legal,
             ),
             AgentActionOptionTrace::new("protect-ball", protect_ball_score, protect_ball_legal),
+            AgentActionOptionTrace::new("xavi-turn", xavi_turn_score, xavi_turn_legal),
             AgentActionOptionTrace::new("side-step", side_step_score, side_step_legal),
             AgentActionOptionTrace::new("left-cut", left_cut_score, left_cut_legal),
             AgentActionOptionTrace::new("right-cut", right_cut_score, right_cut_legal),
@@ -3221,6 +3244,7 @@ impl PlayerAgent {
                 "carry-out-left",
                 "carry-out-right",
                 "protect-ball",
+                "xavi-turn",
                 "side-step",
                 "fake-left-cut-right",
                 "fake-right-cut-left",
@@ -4578,12 +4602,19 @@ impl PlayerAgent {
             + forward_blocked * 0.22
             + (1.0 - left_room_fit.max(right_room_fit)) * 0.18
             - forward_space_fit * 0.12;
+        let xavi_turn_score = 0.30
+            + pressure * 0.34
+            + forward_blocked * 0.26
+            + closing_fit * 0.22
+            + no_outlet_fit * 0.10
+            - forward_space_fit * 0.08;
 
         let mut best = (DribbleMoveKind::CarryForward, carry_forward_score);
         for candidate in [
             (DribbleMoveKind::CarryOutLeft, carry_left_score),
             (DribbleMoveKind::CarryOutRight, carry_right_score),
             (DribbleMoveKind::ProtectBall, protect_score),
+            (DribbleMoveKind::XaviTurn, xavi_turn_score),
         ] {
             if candidate.1 > best.1 {
                 best = candidate;
@@ -5175,15 +5206,32 @@ impl PlayerAgent {
                 if snapshot.ball.holder.is_none() {
                     let target = self.control_touch_target_for_goal_context(snapshot, &observation);
                     let action = SoccerAction::ControlTouch { target };
+                    let keeper_outside_box = self.role == PlayerRole::Goalkeeper
+                        && !snapshot.goalkeeper_can_use_hands_at(self.team, self.position);
+                    let (operation_order, action_label) = if keeper_outside_box {
+                        (
+                            vec![
+                                "keeper-outside-box".to_string(),
+                                "pomdp-foot-control".to_string(),
+                                "ball-at-feet-reflex".to_string(),
+                            ],
+                            "keeper-foot-control-outside-box",
+                        )
+                    } else {
+                        (
+                            vec!["ball-at-feet-reflex".to_string()],
+                            "control-ball-at-feet",
+                        )
+                    };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
                         mdp_state,
                         observation,
                         belief,
-                        vec!["ball-at-feet-reflex".to_string()],
-                        single_action_option("control-ball-at-feet"),
+                        operation_order,
+                        single_action_option(action_label),
                         &action,
-                        "control-ball-at-feet",
+                        action_label,
                     ));
                     return PlayerIntent {
                         player_id: self.id,
@@ -5294,6 +5342,118 @@ impl PlayerAgent {
         }
 
         if has_ball {
+            if self.role == PlayerRole::Goalkeeper {
+                let can_use_hands_here =
+                    snapshot.goalkeeper_can_use_hands_at(self.team, self.position);
+                let handling_held_seconds = snapshot.keeper_handling_held_seconds(self.id);
+                let handling_hold_window =
+                    handling_held_seconds.is_some_and(|held| held < GK_HANDLING_HOLD_LIMIT_SECONDS);
+                let handling_clock_expired =
+                    handling_held_seconds.is_some_and(|held| held >= GK_HANDLING_HOLD_LIMIT_SECONDS);
+                let under_urgent_pressure = observation.nearest_opponent_distance.is_finite()
+                    && observation.nearest_opponent_distance
+                        <= GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS;
+                if let Some(plan) = snapshot.goalkeeper_mpc_play_out_plan(self.id, None) {
+                    let action = if let Some(target_player) = plan.target_player {
+                        SoccerAction::Pass {
+                            target_player: Some(target_player),
+                            power: plan.power,
+                            flight: plan.flight,
+                        }
+                    } else {
+                        SoccerAction::Clearance {
+                            target: plan.target,
+                            power: plan.power,
+                        }
+                    };
+                    let release_intelligent = snapshot.keeper_handling_release_is_intelligent(
+                        self.id,
+                        plan.target_player,
+                        plan.target,
+                    );
+                    let outside_box_release = !can_use_hands_here
+                        && (plan.target_player.is_some() || under_urgent_pressure);
+                    let in_box_pass_release = can_use_hands_here
+                        && plan.target_player.is_some()
+                        && (!handling_hold_window || release_intelligent);
+                    let pressured_in_box_clearance = can_use_hands_here
+                        && plan.target_player.is_none()
+                        && handling_clock_expired
+                        && release_intelligent;
+                    if outside_box_release || in_box_pass_release || pressured_in_box_clearance {
+                        let mut operation_order = vec![
+                            "keeper-play-out".to_string(),
+                            "pomdp-release-choice".to_string(),
+                            "mpc-execution-plan".to_string(),
+                        ];
+                        if outside_box_release {
+                            operation_order.push("outside-box-no-hands".to_string());
+                        }
+                        if can_use_hands_here && handling_clock_expired {
+                            operation_order.push("handling-clock-expired".to_string());
+                        }
+                        self.last_decision = Some(self.decision_trace(
+                            snapshot,
+                            mdp_state.clone(),
+                            observation.clone(),
+                            belief.clone(),
+                            operation_order,
+                            single_action_option(plan.label),
+                            &action,
+                            plan.label,
+                        ));
+                        return PlayerIntent {
+                            player_id: self.id,
+                            action,
+                            sprint: false,
+                        };
+                    }
+                }
+                if can_use_hands_here {
+                    let action = SoccerAction::MoveTo(self.position);
+                    self.last_decision = Some(self.decision_trace(
+                        snapshot,
+                        mdp_state.clone(),
+                        observation.clone(),
+                        belief.clone(),
+                        vec![
+                            "keeper-play-out".to_string(),
+                            "pomdp-survey".to_string(),
+                            "hands-allowed".to_string(),
+                        ],
+                        single_action_option("keeper-survey-hands"),
+                        &action,
+                        "keeper-survey-hands",
+                    ));
+                    return PlayerIntent {
+                        player_id: self.id,
+                        action,
+                        sprint: false,
+                    };
+                }
+                let target = self.control_touch_target_for_goal_context(snapshot, &observation);
+                let action = SoccerAction::ControlTouch { target };
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state.clone(),
+                    observation.clone(),
+                    belief.clone(),
+                    vec![
+                        "keeper-play-out".to_string(),
+                        "pomdp-foot-control".to_string(),
+                        "outside-box-no-hands".to_string(),
+                    ],
+                    single_action_option("keeper-foot-control-outside-box"),
+                    &action,
+                    "keeper-foot-control-outside-box",
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint: false,
+                };
+            }
+
             // WALL RETURN (the "two" of a one-two): return the lay-off before
             // generic first-touch logic turns the combination into an ordinary pass.
             if let Some(runner) = snapshot.wall_return_pass_target_for(self.id) {
@@ -6262,6 +6422,10 @@ impl PlayerAgent {
                     action_option_score(&action_options, "protect-ball"),
                 ),
                 (
+                    "xavi-turn".to_string(),
+                    action_option_score(&action_options, "xavi-turn"),
+                ),
+                (
                     "side-step".to_string(),
                     action_option_score(&action_options, "side-step"),
                 ),
@@ -6456,11 +6620,16 @@ impl PlayerAgent {
                             break;
                         }
                     }
-                    "carry-forward" | "carry-out-left" | "carry-out-right" | "protect-ball" => {
+                    "carry-forward"
+                    | "carry-out-left"
+                    | "carry-out-right"
+                    | "protect-ball"
+                    | "xavi-turn" => {
                         let kind = match op.as_str() {
                             "carry-forward" => DribbleMoveKind::CarryForward,
                             "carry-out-left" => DribbleMoveKind::CarryOutLeft,
                             "carry-out-right" => DribbleMoveKind::CarryOutRight,
+                            "xavi-turn" => DribbleMoveKind::XaviTurn,
                             _ => DribbleMoveKind::ProtectBall,
                         };
                         let kind = goal_approach_dribble_kind(kind, &observation, self.role);
@@ -6576,6 +6745,7 @@ impl PlayerAgent {
                                     DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                                     DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
                                     DribbleMoveKind::Nutmeg => 0,
+                                    DribbleMoveKind::XaviTurn => 10,
                                     DribbleMoveKind::FakeLeftCutRight
                                     | DribbleMoveKind::FakeRightCutLeft => 0,
                                 };
@@ -7107,6 +7277,7 @@ impl PlayerAgent {
                         DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                         DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
                         DribbleMoveKind::Nutmeg => 0,
+                        DribbleMoveKind::XaviTurn => 10,
                         DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0,
                     };
                     (
@@ -7430,11 +7601,12 @@ impl PlayerAgent {
                                 ))
                             }
                             "carry-forward" | "carry-out-left" | "carry-out-right"
-                            | "protect-ball" => {
+                            | "protect-ball" | "xavi-turn" => {
                                 let kind = match label {
                                     "carry-forward" => DribbleMoveKind::CarryForward,
                                     "carry-out-left" => DribbleMoveKind::CarryOutLeft,
                                     "carry-out-right" => DribbleMoveKind::CarryOutRight,
+                                    "xavi-turn" => DribbleMoveKind::XaviTurn,
                                     _ => DribbleMoveKind::ProtectBall,
                                 };
                                 let kind =
@@ -8464,6 +8636,7 @@ impl PlayerAgent {
                     DribbleMoveKind::CarryOutLeft | DribbleMoveKind::LeftCut => 9,
                     DribbleMoveKind::CarryOutRight | DribbleMoveKind::RightCut => 3,
                     DribbleMoveKind::Nutmeg => 0,
+                    DribbleMoveKind::XaviTurn => 10,
                     DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => 0,
                 };
                 Some((
@@ -8482,6 +8655,7 @@ impl PlayerAgent {
             | "carry-out-left"
             | "carry-out-right"
             | "protect-ball"
+            | "xavi-turn"
             | "left-cut"
             | "right-cut"
             | "nutmeg"
@@ -8500,6 +8674,7 @@ impl PlayerAgent {
                     "carry-out-left" => DribbleMoveKind::CarryOutLeft,
                     "carry-out-right" => DribbleMoveKind::CarryOutRight,
                     "protect-ball" => DribbleMoveKind::ProtectBall,
+                    "xavi-turn" => DribbleMoveKind::XaviTurn,
                     "left-cut" => DribbleMoveKind::LeftCut,
                     "right-cut" => DribbleMoveKind::RightCut,
                     "nutmeg" => DribbleMoveKind::Nutmeg,
@@ -9062,6 +9237,7 @@ pub enum DribbleMoveKind {
     LeftCut,
     RightCut,
     Nutmeg,
+    XaviTurn,
     FakeLeftCutRight,
     FakeRightCutLeft,
 }
@@ -9110,6 +9286,7 @@ impl DribbleMoveKind {
             DribbleMoveKind::LeftCut => "left-cut",
             DribbleMoveKind::RightCut => "right-cut",
             DribbleMoveKind::Nutmeg => "nutmeg",
+            DribbleMoveKind::XaviTurn => "xavi-turn",
             DribbleMoveKind::FakeLeftCutRight => "fake-left-cut-right",
             DribbleMoveKind::FakeRightCutLeft => "fake-right-cut-left",
         }
@@ -9127,6 +9304,7 @@ impl DribbleMoveKind {
             DribbleMoveKind::ProtectBall => DRIBBLE_BEAT_REWARD_POINTS * 0.42,
             DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut => DRIBBLE_BEAT_REWARD_POINTS,
             DribbleMoveKind::Nutmeg => NUTMEG_BEAT_REWARD_POINTS,
+            DribbleMoveKind::XaviTurn => DRIBBLE_BEAT_REWARD_POINTS * 0.88,
             DribbleMoveKind::FakeLeftCutRight | DribbleMoveKind::FakeRightCutLeft => {
                 DRIBBLE_BEAT_REWARD_POINTS * 1.08
             }
