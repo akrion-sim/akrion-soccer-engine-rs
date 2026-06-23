@@ -7146,8 +7146,11 @@ impl SoccerMatch {
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
-    /// Distance scale for a shot reward: full inside ~20 yds, reduced for every yard
-    /// beyond (so strikers aren\'t taught to fire from too far out).
+    /// Distance scale for a shot-on-target's CHAIN reward: it backprops credit to the build-up
+    /// chain only for a genuine chance FROM WITHIN ~20yd (the user's "reward shooting closer"
+    /// rule). Full inside `SHOT_FULL_REWARD_DISTANCE_YARDS`, then linearly to ZERO at the 20yd
+    /// pivot, and none beyond — so an on-target effort from distance no longer reward-credits the
+    /// attacking chain (it is also reward-penalised at decision time; see the shot-distance shaping).
     pub(crate) fn shot_reward_distance_scale(&self, shooting_team: Team, shooter: usize) -> f64 {
         self.players
             .iter()
@@ -7161,9 +7164,9 @@ impl SoccerMatch {
                 };
                 let goal = Vec2::new(self.config.field_width_yards * 0.5, goal_y);
                 let dist = p.position.distance(goal);
-                (1.0 - (dist - SHOT_FULL_REWARD_DISTANCE_YARDS).max(0.0)
-                    * SHOT_REWARD_TAPER_PER_YARD)
-                    .clamp(SHOT_ON_TARGET_SCORING_SCALE_FLOOR, 1.0)
+                let taper_span =
+                    (SHOT_DISTANCE_REWARD_PIVOT_YARDS - SHOT_FULL_REWARD_DISTANCE_YARDS).max(1.0);
+                (1.0 - (dist - SHOT_FULL_REWARD_DISTANCE_YARDS).max(0.0) / taper_span).clamp(0.0, 1.0)
             })
             .unwrap_or(1.0)
     }
@@ -22514,6 +22517,15 @@ impl WorldSnapshot {
                 );
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
+                // HARD veto (the real fix for "passing straight to the opposition"): if the aim
+                // point is clearly closer to an opponent than to the intended receiver, sink the
+                // candidate so it never wins over holding or a safe outlet.
+                let direct_opponent_aim_veto =
+                    if self.pass_point_directly_favors_opponent(me.team, position, pass_point) {
+                        PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
+                    } else {
+                        0.0
+                    };
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
                 // demote it. Allowed when the receiver is clearly less pressured (an escape).
@@ -22580,6 +22592,7 @@ impl WorldSnapshot {
                     - reception_teammate_penalty
                     - reception_congestion_penalty
                     - direct_opponent_aim_penalty
+                    - direct_opponent_aim_veto
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
@@ -22825,6 +22838,17 @@ impl WorldSnapshot {
                 ));
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
+                let direct_opponent_aim_veto = if self
+                    .pass_point_directly_favors_opponent(me.team, position, pass_point)
+                    || self.pass_point_directly_favors_opponent(
+                        me.team,
+                        position,
+                        anticipated_position,
+                    ) {
+                    PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
+                } else {
+                    0.0
+                };
                 let keeper_distribution_bonus = if me.role == PlayerRole::Goalkeeper {
                     goalkeeper_distribution_score(
                         me.team,
@@ -22879,6 +22903,7 @@ impl WorldSnapshot {
                     - pass_quality.backward_path_traffic_penalty
                     - lateral_penalty
                     - direct_opponent_aim_penalty
+                    - direct_opponent_aim_veto
                     - reception_teammate_penalty;
                 (p.id, score)
             })

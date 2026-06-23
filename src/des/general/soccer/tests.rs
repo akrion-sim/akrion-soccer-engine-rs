@@ -2510,11 +2510,14 @@ fn far_shots_earn_much_less_on_target_reward() {
         "shot in range scales to 1.0, got {close}"
     );
     assert!(
-        mid < 0.5,
-        "a 25yd shot is now well under half reward, got {mid}"
+        mid <= 1e-9,
+        "a 25yd shot should not backprop on-target chain reward, got {mid}"
     );
-    assert!(far < 0.2, "a 30yd shot is heavily discounted, got {far}");
-    assert!(far < mid && mid < close);
+    assert!(
+        far <= 1e-9,
+        "a 30yd shot should not backprop on-target chain reward, got {far}"
+    );
+    assert!(mid < close && far < close);
 }
 
 #[test]
@@ -34194,6 +34197,17 @@ fn shot_on_target_reward_assigns_scaled_chain_credit() {
     sim.possession_chain.clear();
     sim.possession_chain.push_back(5);
     sim.possession_chain.push_back(7);
+    let attack_dir = Team::Home.attack_dir();
+    let goal_y = if attack_dir > 0.0 {
+        sim.config.field_length_yards
+    } else {
+        0.0
+    };
+    let shooter_idx = sim.players.iter().position(|p| p.id == 9).unwrap();
+    sim.players[shooter_idx].position = Vec2::new(
+        sim.config.field_width_yards * 0.5,
+        goal_y - attack_dir * 12.0,
+    );
 
     sim.record_shot_on_target_rewards(Team::Home, 9);
 

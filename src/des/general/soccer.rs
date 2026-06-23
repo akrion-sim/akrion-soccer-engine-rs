@@ -687,8 +687,12 @@ const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 // Actual shots on/toward goal should leave the foot in this band. Slower contacts are
 // passes, pokes, or control touches; once an action is classified as Shoot, rendering and
 // physics should both see a real strike.
-const SHOT_MIN_SPEED_MPH: f64 = 40.0;
-const SHOT_MAX_SPEED_MPH: f64 = 70.0;
+// Shots leave the boot CLEARLY faster than any pass so they read as a strike, not a driven ball,
+// from the very first frame. The hardest ground pass is ~38mph and the hardest aerial ~50mph, so
+// the slowest shot floors at 50 (above both) and a full-power strike reaches ~70 — no overlap with
+// the pass band, which is what made weak shots "look like passes at first".
+const SHOT_MIN_SPEED_MPH: f64 = 50.0;
+const SHOT_MAX_SPEED_MPH: f64 = 72.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
@@ -701,6 +705,11 @@ const SUPPORT_RELAX_FORCED_SHOT_NEARBY_YARDS: f64 = 14.0;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_FLOOR_QUALITY: f64 = 0.54;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_AERIAL_QUALITY: f64 = 0.56;
 const SUPPORT_RELAX_FORCED_SHOT_MIN_OPENNESS: f64 = 0.50;
+// HARD shot-distance cap: no shot is taken from beyond this (was 45 — far too speculative). This
+// is the absolute ceiling for every shot path (the forward window derives from it, the midfielder
+// window is this − 5), so a shot from >30yd never qualifies. Shots in the 20–30yd band are allowed
+// but reward-penalised (see `shot_reward_points`); inside 20yd they are rewarded, rising as they
+// get closer.
 const SPECULATIVE_LONG_SHOT_MAX_YARDS: f64 = 30.0;
 const SPECULATIVE_LONG_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.46;
 const SPECULATIVE_LONG_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.10;
@@ -753,6 +762,8 @@ const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
 /// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.15;
+// Scoops are delicate short chips over a close defender. They must clear a standing/lunging
+// block early in the path, but stay within the requested 6-10ft window and land on the receiver.
 const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft
 const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 10.0 / 3.0; // 10ft
 const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.25;
@@ -872,13 +883,19 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 40.0;
-// Floor on the distance scoring-scale so a long shot on frame still earns a sliver.
-const SHOT_ON_TARGET_SCORING_SCALE_FLOOR: f64 = 0.04;
-// Shot-on-frame reward is full inside 20yd, then reduced per yard beyond. Shots past
-// 30yd are illegal, so the taper mainly teaches that the edge-of-box chance is much
-// more valuable than a speculative 25-30yd effort.
-const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 20.0;
-const SHOT_REWARD_TAPER_PER_YARD: f64 = 0.085;
+// A shot-on-target's chain reward is full inside this distance, then tapers to zero
+// at the 20yd pivot below: the chain is credited only for a real close-range chance.
+const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 16.0;
+// Shot-distance reward shaping, pivoting on 20yd (the user's "shoot closer" rule). A shot from
+// INSIDE 20yd is rewarded, rising as the shooter gets nearer goal; a shot from OUTSIDE 20yd (up to
+// the hard 30yd cap) is penalised, escalating with distance — relieved only when the keeper is
+// genuinely beatable / out of position so a real long-range chance still gets taken. Applied to
+// every `shoot` transition so the MDP/POMDP learns to work the ball into 20yd before pulling the
+// trigger.
+const SHOT_DISTANCE_REWARD_PIVOT_YARDS: f64 = 20.0;
+const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
+const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
+const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
@@ -1077,6 +1094,10 @@ const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
 const PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK: f64 = 0.58;
 const PASS_DIRECT_OPPONENT_AIM_NOISE_CORRECTION_MARGIN: f64 = 0.08;
 const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 12.0;
+// HARD veto magnitude: when a candidate pass point sits clearly closer to an opponent than to the
+// intended receiver (`pass_point_directly_favors_opponent`), it is a direct giveaway — sink the
+// candidate by this much so it can never outrank holding or a safe outlet.
+const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY: f64 = 1000.0;
 
 fn direct_opponent_aim_score_penalty(risk: f64) -> f64 {
     let risk = risk.clamp(0.0, 1.0);
@@ -18109,18 +18130,25 @@ fn dense_soccer_transition_reward(
             own_goal_relief,
         );
         reward += (before_obs.yards_to_goal - after_obs.yards_to_goal).clamp(-8.0, 8.0) * 0.07;
-        // Discourage low-percentage shots from range: the value is in working the
-        // ball forward, not blazing away. Penalty starts just past the ~25-yard
-        // comfortable window and escalates with distance (30 yds is a bad idea, 40
-        // is off), but it is relieved when the keeper is genuinely beatable / out of
-        // position — so the MDP/POMDP learns to take the long shot only then.
-        if action == "shoot" && before_obs.yards_to_goal > LONG_SHOT_DISCOURAGED_YARDS {
-            let over = before_obs.yards_to_goal - LONG_SHOT_DISCOURAGED_YARDS;
-            let keeper_relief = before_obs
-                .opposing_goalkeeper_out_of_position
-                .clamp(0.0, 1.0);
-            let distance_penalty = (over / 7.0).min(3.0) * 2.4;
-            reward -= distance_penalty * (1.0 - keeper_relief * 0.85);
+        // Shot-distance discipline pivoting on 20yd: reward shooting from inside 20yd (rising as
+        // the shooter nears goal) and penalise shooting from outside it (escalating with distance,
+        // up to the hard 30yd cap). The outside penalty is relieved when the keeper is genuinely
+        // beatable / out of position so a real long-range chance still gets taken. This teaches the
+        // policy to work the ball into ~20yd before pulling the trigger instead of blazing away.
+        if action == "shoot" {
+            let yards = before_obs.yards_to_goal.max(0.0);
+            if yards <= SHOT_DISTANCE_REWARD_PIVOT_YARDS {
+                reward += ((SHOT_DISTANCE_REWARD_PIVOT_YARDS - yards) * SHOT_CLOSE_REWARD_PER_YARD)
+                    .min(SHOT_DISTANCE_REWARD_MAX_POINTS);
+            } else {
+                let keeper_relief = before_obs
+                    .opposing_goalkeeper_out_of_position
+                    .clamp(0.0, 1.0);
+                let distance_penalty = ((yards - SHOT_DISTANCE_REWARD_PIVOT_YARDS)
+                    * SHOT_FAR_PENALTY_PER_YARD)
+                    .min(SHOT_DISTANCE_REWARD_MAX_POINTS);
+                reward -= distance_penalty * (1.0 - keeper_relief * 0.85);
+            }
         }
         reward += goalmouth_dribble_learning_reward(
             player, action, before_obs, &after_obs, before, after, before_pos, after_pos,
@@ -46887,8 +46915,8 @@ fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
-        // A scoop pops over a close foot, not into a hanging balloon arc. Keep it low
-        // (roughly 6-10ft) with a little stable per-pass variation.
+        // A scoop pops over a close foot and drops onto the receiver, not into a
+        // hanging balloon arc. Keep it low (roughly 6-10ft) with stable variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
@@ -47504,8 +47532,8 @@ fn modulated_pass_speed_yps(
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
     if flight.is_scoop() {
-        // Low scoop calibration: a 6-10ft dink still has only about 1.2-1.6s of
-        // gravity hang time, so strike it firmly enough to arrive inside that window.
+        // A scoop must land on the receiver. The modest 6-10ft apex gives only about
+        // 1.2-1.6s of gravity hang time, so pace it from distance / hang-time.
         let apex_yards = scoop_loft_apex_yards(distance, 0.5);
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let land_at_target =
