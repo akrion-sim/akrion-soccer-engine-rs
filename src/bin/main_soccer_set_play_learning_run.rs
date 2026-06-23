@@ -9,7 +9,7 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     train_soccer_set_play_restarts_with_events, MatchConfig, SoccerNeuralBlendConfig,
     SoccerMarlAlgorithm, SoccerNeuralBlendMode, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig,
+    SoccerNeuralLearningConfig, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
     SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerSetPlayRestartKind,
     SoccerSetPlayTrainingEvent, SoccerSetPlayTrainingRequest, SoccerTeamQPolicies, Team, Vec2,
 };
@@ -339,6 +339,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         mappo_clip_epsilon: env_parse(
             "SOCCER_MAPPO_CLIP_EPSILON",
             SoccerNeuralLearningConfig::default().mappo_clip_epsilon,
+        )?,
+        mappo_team_reward_share: env_parse(
+            "SOCCER_MAPPO_TEAM_REWARD_SHARE",
+            DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
         )?,
     };
     validate_soccer_neural_learning_config_for_learning_run(&config.neural_learning)

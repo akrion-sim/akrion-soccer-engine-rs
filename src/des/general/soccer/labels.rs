@@ -74,6 +74,10 @@ pub enum SoccerActionLabel {
     /// The "Xavi turn": a ~280-300° shielded pirouette that keeps the ball on the far
     /// side of the defender and wheels the long way around to turn them.
     XaviTurn,
+    /// A short, quick (sprinting) 1-4yd carry to shift a blocked passing lane off the
+    /// opponent in it and open the pass to a teammate. See
+    /// `WorldSnapshot::dribble_to_open_passing_lane_for`.
+    OpenPassingLane,
     VerticalAttack,
     TurnoverBurst,
     /// On-ball: the carrier deliberately keeps the ball and *signals* teammates to
@@ -83,6 +87,8 @@ pub enum SoccerActionLabel {
     /// On-ball: a short carrier dribble to change the passing angle and open a
     /// currently-blocked teammate lane.
     OpenPassLane,
+    /// On-ball: dribble around the goalkeeper to open a closer shooting lane.
+    RoundGoalkeeper,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -148,12 +154,14 @@ impl SoccerActionLabel {
             SoccerActionLabel::RightCut => "right-cut",
             SoccerActionLabel::Nutmeg => "nutmeg",
             SoccerActionLabel::XaviTurn => "xavi-turn",
+            SoccerActionLabel::OpenPassingLane => "open-passing-lane",
             SoccerActionLabel::FakeLeftCutRight => "fake-left-cut-right",
             SoccerActionLabel::FakeRightCutLeft => "fake-right-cut-left",
             SoccerActionLabel::VerticalAttack => "vertical-attack",
             SoccerActionLabel::TurnoverBurst => "turnover-burst",
             SoccerActionLabel::WaitForSupport => "wait-for-support",
             SoccerActionLabel::OpenPassLane => "open-pass-lane",
+            SoccerActionLabel::RoundGoalkeeper => "round-goalkeeper",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -216,10 +224,12 @@ impl SoccerActionLabel {
             "fake-left-cut-right" => SoccerActionLabel::FakeLeftCutRight,
             "fake-right-cut-left" => SoccerActionLabel::FakeRightCutLeft,
             "xavi-turn" => SoccerActionLabel::XaviTurn,
+            "open-passing-lane" => SoccerActionLabel::OpenPassingLane,
             "vertical-attack" => SoccerActionLabel::VerticalAttack,
             "turnover-burst" => SoccerActionLabel::TurnoverBurst,
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
             "open-pass-lane" => SoccerActionLabel::OpenPassLane,
+            "round-goalkeeper" => SoccerActionLabel::RoundGoalkeeper,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -329,6 +339,18 @@ impl SoccerActionLabel {
             | "dribble-to-pass"
             | "dribble_to_pass"
             | "dribbletopass" => "open-pass-lane",
+            "round-goalkeeper"
+            | "round_goalkeeper"
+            | "roundgoalkeeper"
+            | "round-the-goalkeeper"
+            | "round_the_goalkeeper"
+            | "roundthegoalkeeper"
+            | "round-gk"
+            | "round_gk"
+            | "beat-keeper"
+            | "beat_keeper"
+            | "dribble-around-keeper"
+            | "dribble_around_keeper" => "round-goalkeeper",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"
@@ -434,6 +456,13 @@ impl SoccerActionLabel {
             | "shielded-turn"
             | "shielded_turn"
             | "turn-and-shield" => "xavi-turn",
+            "open_passing_lane"
+            | "open-lane"
+            | "open_lane"
+            | "open-passing-lane-dribble"
+            | "create-passing-lane"
+            | "create-passing-angle"
+            | "dribble-open-lane" => "open-passing-lane",
             "fake_left_cut_right" | "fake-left-right" | "fake-left-cut-right-dribble" => {
                 "fake-left-cut-right"
             }

@@ -19,7 +19,7 @@ use soccer_engine::des::general::soccer::{
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics,
     SoccerQPolicyOptions, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
-    SoccerTeamQPolicies,
+    SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -282,6 +282,7 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
         enabled: true,
         backend: SoccerNeuralLearningBackend::Threaded,
         max_pending_batches: 128,
+        mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
         ..SoccerNeuralLearningConfig::default()
     };
     Ok(SoccerNeuralLearningConfig {
@@ -364,6 +365,10 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             default.marl_intermediate_reward_weight,
         )?,
         mappo_clip_epsilon: env_f64("SOCCER_MAPPO_CLIP_EPSILON", default.mappo_clip_epsilon)?,
+        mappo_team_reward_share: env_f64(
+            "SOCCER_MAPPO_TEAM_REWARD_SHARE",
+            default.mappo_team_reward_share,
+        )?,
     })
 }
 

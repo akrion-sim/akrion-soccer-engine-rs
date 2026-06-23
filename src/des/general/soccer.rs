@@ -447,6 +447,37 @@ const XAVI_TURN_MIN_OWN_GOAL_YARDS: f64 = 30.0;
 /// static-shield floor.
 const XAVI_TURN_BASE_APPETITE: f64 = 0.95;
 const XAVI_TURN_MAX_APPETITE: f64 = 2.60;
+// --- "Dribble to open a passing lane" ---
+// When the carrier wants a specific teammate but the DIRECT lane is blocked by an opponent, a
+// short, quick (sprinting) sideways carry of 1-4yd can shift the lane off the blocker and open the
+// pass. These tune the search + the decision appetite. Default ON; disable with
+// `DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE`. Offered only in its window (a valuable blocked lane that a
+// short step opens), so a disabled / out-of-window match is byte-identical (the on-ball path is
+// deterministic, so a conditionally-pushed option draws no RNG).
+const OPEN_LANE_DRIBBLE_TARGET_CANDIDATES: usize = 4;
+const OPEN_LANE_DRIBBLE_MIN_PASS_YARDS: f64 = 6.0;
+const OPEN_LANE_DRIBBLE_MAX_PASS_YARDS: f64 = 42.0;
+// Corridor half-width: an opponent within this of the lane segment blocks it (and after the step
+// the new lane must have NO opponent within it to count as opened).
+const OPEN_LANE_DRIBBLE_CORRIDOR_YARDS: f64 = 1.8;
+// Candidate step sizes (yards), smallest first — the least carry that opens the lane is chosen.
+// 1-8yd: a yard or two is usually enough to shift the angle off a tight blocker, but a wider step
+// is allowed when the blocker sits deeper in the lane and needs more displacement.
+const OPEN_LANE_DRIBBLE_STEP_YARDS: [f64; 6] = [1.5, 3.0, 4.5, 6.0, 7.0, 8.0];
+// A step is rejected if it would dribble straight onto another opponent (must have this much space).
+const OPEN_LANE_DRIBBLE_MIN_SPOT_SPACE_YARDS: f64 = 1.6;
+// Sprint (vs a controlled run) when the carrier is under very high pressure, OR when the nearest
+// opponent is tracking quickly toward it (closing speed ≥ this) — then burst to make the angle
+// before the lane re-closes / to exceed the tracker's pace. Otherwise run (conserve energy).
+const OPEN_LANE_DRIBBLE_SPRINT_PRESSURE: f64 = 0.60;
+const OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS: f64 = 4.5;
+// Decision (MDP/POMDP) appetite: a solid option (it keeps the ball AND creates a pass), lifted by
+// pressure and by how PROGRESSIVE the opened pass is (an upfield receiver is worth more than a
+// backward one), but capped so it never overrides an already-clear direct pass — which outranks it,
+// since this is only offered when the good targets are BLOCKED.
+const OPEN_LANE_DRIBBLE_BASE_APPETITE: f64 = 0.62;
+const OPEN_LANE_DRIBBLE_MAX_APPETITE: f64 = 1.20;
+const OPEN_LANE_DRIBBLE_UPFIELD_APPETITE_BONUS: f64 = 0.40;
 /// Below this tangential speed (yps) a `xavi-turn` carrier is treated as not yet wheeling, so
 /// the wheel sense is seeded from geometry rather than from its (negligible) momentum.
 const XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS: f64 = 0.5;
@@ -3399,6 +3430,10 @@ const DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 16;
 const DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT: f64 = 0.35;
 const DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT: f64 = 1.0;
 const DEFAULT_SOCCER_MAPPO_CLIP_EPSILON: f64 = 0.20;
+/// Cooperative MAPPO credit share used by live/training presets. The raw
+/// `SoccerNeuralLearningConfig::default()` stays at `0.0` so deterministic
+/// base simulations do not silently change reward semantics.
+pub const DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE: f64 = 0.25;
 /// Global L2 gradient-norm ceiling for the value-head SGD step. Targets are
 /// already bounded to ±`target_clip` (default 3.0) and the learning rate to
 /// ≤ 0.25, so a healthy gradient stays well under this; the clamp only engages
@@ -3421,6 +3456,9 @@ const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// Neural **policy head** (actor) hyperparameters. The actor learns `π(family|s)`
 /// by advantage policy-gradient from the critic; stable baseline values live here,
 /// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
+const SOCCER_POLICY_ROLE_EMBEDDING_DIM: usize = 4;
+const SOCCER_POLICY_FEATURE_DIM: usize =
+    SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Entropy bonus — keeps the actor from collapsing onto one family too early.
@@ -9503,9 +9541,14 @@ pub(crate) fn soccer_marl_adjusted_reward(
     let Some(tick_reward) = tick_rewards.get(&transition.tick).copied() else {
         return intermediate;
     };
-    let team_component =
-        tick_reward.average_for(transition.team) - tick_reward.average_for(transition.team.other());
-    intermediate + team_component * config.sanitized_marl_team_reward_weight()
+    let own_average = tick_reward.average_for(transition.team);
+    let opponent_average = tick_reward.average_for(transition.team.other());
+    let shared_reward = {
+        let share = config.sanitized_mappo_team_reward_share();
+        (1.0 - share) * intermediate + share * own_average
+    };
+    let team_component = own_average - opponent_average;
+    shared_reward + team_component * config.sanitized_marl_team_reward_weight()
 }
 
 fn soccer_full_game_replay_transitions(
@@ -9742,7 +9785,9 @@ fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
         LeftCut | SideStep | Dribble | HoldUpFlank | OpenPassLane => Some(DribbleMoveKind::LeftCut),
-        CarryForward | VerticalAttack | TurnoverBurst => Some(DribbleMoveKind::CarryForward),
+        CarryForward | VerticalAttack | TurnoverBurst | RoundGoalkeeper => {
+            Some(DribbleMoveKind::CarryForward)
+        }
         ProtectBall => Some(DribbleMoveKind::ProtectBall),
         XaviTurn => Some(DribbleMoveKind::XaviTurn),
         RightCut => Some(DribbleMoveKind::RightCut),
@@ -12735,6 +12780,12 @@ pub struct SoccerNeuralLearningConfig {
     /// PPO clip epsilon for MAPPO actor updates.
     #[serde(default = "default_soccer_mappo_clip_epsilon")]
     pub mappo_clip_epsilon: f64,
+    /// MAPPO cooperative-credit share: how much the individual dense reward is
+    /// blended toward the team's per-tick mean before the team-vs-opponent
+    /// component is added. `0.0` keeps the individual reward; `1.0` is a fully
+    /// shared team reward.
+    #[serde(default)]
+    pub mappo_team_reward_share: f64,
 }
 
 impl Default for SoccerNeuralLearningConfig {
@@ -12759,6 +12810,7 @@ impl Default for SoccerNeuralLearningConfig {
             marl_team_reward_weight: DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT,
             marl_intermediate_reward_weight: DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT,
             mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
+            mappo_team_reward_share: 0.0,
         }
     }
 }
@@ -12828,6 +12880,16 @@ impl SoccerNeuralLearningConfig {
 
     fn mappo_enabled(&self) -> bool {
         self.enabled && self.marl_algorithm == SoccerMarlAlgorithm::Mappo
+    }
+
+    /// MAPPO team-reward share, clamped to `[0, 1]`; a non-finite value falls
+    /// back to the individual-reward objective (`0.0`).
+    fn sanitized_mappo_team_reward_share(&self) -> f64 {
+        if self.mappo_team_reward_share.is_finite() {
+            self.mappo_team_reward_share.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     fn sanitized_target_scale(&self) -> f64 {
@@ -13453,6 +13515,7 @@ impl MatchConfig {
                 lp_coupling_enabled: true,
                 marl_algorithm: SoccerMarlAlgorithm::Mappo,
                 mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
+                mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
                 ..SoccerNeuralLearningConfig::default()
             },
             neural_blend: SoccerNeuralBlendConfig {
@@ -30264,21 +30327,22 @@ impl Drop for SoccerNeuralLearningWorker {
     }
 }
 
-/// One actor-critic training example for the policy head: the state features
-/// (built with a null action so the input is a pure function of state), the
-/// taken action's family index, and its GAE advantage from the critic.
+/// One actor-critic training example for the policy head: state features
+/// (built with a null action so the input is a pure function of state) plus an
+/// explicit role one-hot tail, the taken action's family index, and its GAE
+/// advantage from the critic.
 #[derive(Clone)]
 struct SoccerPolicySample {
-    state_features: [f64; SOCCER_NEURAL_FEATURE_DIM],
+    state_features: [f64; SOCCER_POLICY_FEATURE_DIM],
     action_index: usize,
     advantage: f64,
     old_action_probability: Option<f64>,
 }
 
-/// The neural **actor**: `π(family | s)` over [`SOCCER_POLICY_ACTIONS`], trained
-/// by advantage policy-gradient (the critic supplies the advantage). Inline-only
-/// (no worker thread): policy updates happen once per episode over the replay,
-/// so they don't need the value head's streaming/threaded machinery.
+/// The neural **actor**: `π(family | s, role)` over [`SOCCER_POLICY_ACTIONS`],
+/// trained by advantage policy-gradient (the critic supplies the advantage).
+/// Inline-only (no worker thread): policy updates happen once per episode over
+/// the replay, so they don't need the value head's streaming/threaded machinery.
 pub(crate) struct SoccerPolicyHead {
     network: FeedForwardNetwork,
     training_steps: usize,
@@ -30290,7 +30354,7 @@ impl SoccerPolicyHead {
         let mut rng = mulberry32(seed ^ 0x9E37_79B9);
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
-                input_dim: SOCCER_NEURAL_FEATURE_DIM,
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
                 hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
                 output_dim: SOCCER_POLICY_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
@@ -30311,7 +30375,7 @@ impl SoccerPolicyHead {
     /// (non-finite / mis-dimensioned) input so a degenerate actor stays out of play.
     fn action_distribution(
         &self,
-        state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
     ) -> Option<Vec<f64>> {
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
@@ -31313,6 +31377,29 @@ fn soccer_neural_role_feature(role: PlayerRole) -> f64 {
     }
 }
 
+fn soccer_policy_role_embedding(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EMBEDDING_DIM] {
+    let mut embedding = [0.0; SOCCER_POLICY_ROLE_EMBEDDING_DIM];
+    let index = match role {
+        PlayerRole::Goalkeeper => 0,
+        PlayerRole::Defender => 1,
+        PlayerRole::Midfielder => 2,
+        PlayerRole::Forward => 3,
+    };
+    embedding[index] = 1.0;
+    embedding
+}
+
+fn soccer_policy_features_for_role(
+    state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+    role: PlayerRole,
+) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
+    let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
+    features[..SOCCER_NEURAL_FEATURE_DIM].copy_from_slice(state_features);
+    let role_embedding = soccer_policy_role_embedding(role);
+    features[SOCCER_NEURAL_FEATURE_DIM..].copy_from_slice(&role_embedding);
+    features
+}
+
 fn soccer_neural_phase_feature(phase: TacticalPhase) -> f64 {
     match phase {
         TacticalPhase::Kickoff => 0.0,
@@ -31356,10 +31443,10 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
         Some(
             Shoot | Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
                 | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
-                | OpenPassLane | Pass | KillerPass | AerialPass | WallPass | CornerFlagCross
-                | SurprisePass | FlickOn | VerticalAttack | TurnoverBurst | SwitchPlay
-                | RecycleReset | FlankLowCross | FlankHighCross | RouteOne | FirstTimeShot
-                | FirstTimeHeader | FirstTimePass | Clearance
+                | OpenPassLane | RoundGoalkeeper | Pass | KillerPass | AerialPass | WallPass
+                | CornerFlagCross | SurprisePass | FlickOn | VerticalAttack | TurnoverBurst
+                | SwitchPlay | RecycleReset | FlankLowCross | FlankHighCross | RouteOne
+                | FirstTimeShot | FirstTimeHeader | FirstTimePass | Clearance
         )
     );
     let defense = matches!(
@@ -31420,6 +31507,7 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "fake-left-cut-right",
     "fake-right-cut-left",
     "xavi-turn",
+    "round-goalkeeper",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
@@ -31435,6 +31523,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         Space => "space",
         ControlTouch => "control-touch",
         Dribble | OpenPassLane => "dribble",
+        RoundGoalkeeper => "round-goalkeeper",
         CarryForward => "carry-forward",
         CarryOutLeft => "carry-out-left",
         CarryOutRight => "carry-out-right",
@@ -43505,6 +43594,12 @@ fn dd_soccer_disable_xavi_turn() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_XAVI_TURN").is_ok())
 }
 
+fn dd_soccer_disable_dribble_open_lane() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE").is_ok())
+}
+
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on
 /// unless the process-wide `DD_SOCCER_DISABLE_XAVI_TURN` env flag or the per-match config
 /// field disables it. Mirrored onto [`WorldSnapshot::xavi_turn_enabled`] so the decision
@@ -50158,6 +50253,16 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "control-touch" => observation.has_ball && observation.first_touch_available,
         "dribble" | "carry-forward" | "open-pass-lane" => observation.has_ball,
+        "round-goalkeeper" => {
+            observation.has_ball
+                && player.role != PlayerRole::Goalkeeper
+                && (6.0..=26.0).contains(&observation.yards_to_goal)
+                && observation.forward_dribble_space_yards >= 0.75
+                && snapshot
+                    .players
+                    .iter()
+                    .any(|p| p.team != player.team && p.role == PlayerRole::Goalkeeper)
+        }
         "vertical-attack" => {
             observation.has_ball
                 || (!observation.has_ball

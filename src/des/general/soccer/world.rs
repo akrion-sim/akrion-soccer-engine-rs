@@ -988,6 +988,18 @@ mod tests {
     }
 
     #[test]
+    fn live_gameplay_uses_cooperative_mappo_team_reward_share() {
+        let config = MatchConfig::live_gameplay();
+
+        assert_eq!(
+            config.neural_learning.mappo_team_reward_share,
+            DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE
+        );
+        assert!(config.neural_learning.mappo_team_reward_share > 0.0);
+        assert_eq!(config.neural_learning.marl_algorithm, SoccerMarlAlgorithm::Mappo);
+    }
+
+    #[test]
     fn policy_head_keeps_technical_dribble_families_distinct() {
         let dribble = soccer_policy_action_index("dribble").expect("dribble policy family");
         for label in [
@@ -3361,7 +3373,7 @@ impl SoccerMatch {
         // dims are constant across candidates, so this is a pure function of state.
         let policy_log_probs: Option<Vec<f64>> = if actor_active {
             base.action = String::new();
-            let state_features = soccer_neural_transition_features(&base);
+            let state_features = self.policy_state_features(&base);
             self.policy_head
                 .as_ref()
                 .and_then(|head| head.action_distribution(&state_features))
@@ -3370,6 +3382,18 @@ impl SoccerMatch {
             None
         };
 
+        // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in
+        // via `DD_SOCCER_LOOKAHEAD_DEPTH >= 1` AND a trained world model is present,
+        // score each candidate by rolling the world model forward (`predict_next`)
+        // and evaluating the predicted state with the critic, rather than scoring the
+        // current state-action directly. Depth 0 — the default, and the forced value
+        // when no world model exists — reproduces the direct depth-0 critic value
+        // byte-for-byte, so play is unchanged unless a run opts in.
+        let lookahead_depth = if self.world_model.is_some() {
+            dd_soccer_lookahead_depth()
+        } else {
+            0
+        };
         let policy_bonus = |label: &str| -> f64 {
             match &policy_log_probs {
                 Some(log_probs) => soccer_policy_action_index(label)
@@ -3427,16 +3451,16 @@ impl SoccerMatch {
         } else {
             0.0
         };
-        let neural_q = |transition: &SoccerLearningTransition| -> Option<f64> {
+        let neural_q = |label: &str| -> Option<f64> {
             let learner = learner?;
-            let features = soccer_neural_transition_features(transition);
-            learner.predict_value(&features).map(|v| v * target_scale)
+            self.model_based_lookahead_value(&base, label, learner, lookahead_depth)
+                .map(|v| v * target_scale)
         };
         let mut scored_candidates = Vec::with_capacity(legal.len());
         for candidate in legal.iter() {
             let mut transition = base.clone();
             transition.action = candidate.label.clone();
-            let neural_value = neural_q(&transition);
+            let neural_value = neural_q(&candidate.label);
             // Value contribution (0-weighted when the value blend is off/cold).
             let value_score = match blend.mode {
                 SoccerNeuralBlendMode::Off => candidate.value,
@@ -4254,20 +4278,21 @@ impl SoccerMatch {
             .collect()
     }
 
-    /// State-only feature vector for the actor: the transition's features built
-    /// with a **null action**, so the policy input is a pure function of state
-    /// (the action-family channels are constant across candidates). Same builder
-    /// as the critic, so there is no feature drift between heads.
+    /// State-only feature vector for the actor: the transition's critic features
+    /// built with a **null action**, then extended with an explicit role one-hot
+    /// so the shared policy can specialize by position without changing the
+    /// critic/value feature schema.
     fn policy_state_features(
         &self,
         transition: &SoccerLearningTransition,
-    ) -> [f64; SOCCER_NEURAL_FEATURE_DIM] {
+    ) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
         // Null action ⇒ pure state features, with no per-row clone of the (heavy)
         // transition. NOTE (wm-2): a handful of channels are still derived from
         // `decision_context` geometry that the realised action shaped, so this is
         // "state-dominant", not perfectly action-independent — adequate as the
         // policy/world-model state encoding, and identical at train and inference.
-        soccer_neural_transition_features_with_action(transition, "")
+        let state_features = soccer_neural_transition_features_with_action(transition, "");
+        soccer_policy_features_for_role(&state_features, transition.role)
     }
 
     /// Build actor-critic training samples from a replay: opponent-centered reward
@@ -4447,7 +4472,7 @@ impl SoccerMatch {
                     continue;
                 }
                 let input = soccer_neural_transition_features(&replay[current]);
-                let target = self.policy_state_features(&replay[next]);
+                let target = soccer_neural_transition_features_with_action(&replay[next], "");
                 if input.iter().all(|v| v.is_finite()) && target.iter().all(|v| v.is_finite()) {
                     pairs.push((input, target));
                 }
@@ -4477,6 +4502,44 @@ impl SoccerMatch {
         learner
             .predict_value(&predicted_next)
             .map(|value| value * target_scale)
+    }
+
+    /// Model-based look-ahead value of a candidate `action` at decision time
+    /// (AlphaZero/MuZero-style planning): roll the learned world model forward from
+    /// the current state + this candidate action and score the predicted state with
+    /// the critic. This is the decision-DRIVING generalization of
+    /// [`Self::model_based_value`] — but unlike that diagnostic, which scored a
+    /// NULL-action next state (the MBV-PARITY-01 approximation), this builds the
+    /// step's features with the candidate's OWN action channels, so the critic sees
+    /// an in-distribution input and the look-ahead can legitimately steer selection.
+    ///
+    /// The rollout is cheap because `predict_next`/`predict_value` are single MLP
+    /// forward passes over the learned dynamics + value heads — NOT a physics
+    /// re-simulation — so this stays affordable on the live decision path.
+    ///
+    /// - `depth == 0` → the depth-0 critic value of `(s, action)`, byte-for-byte the
+    ///   same as the non-look-ahead path (`predict_value(features(s, a))`).
+    /// - `depth >= 1` → predict the next state via the world model and score THAT
+    ///   with the critic (a one-step rollout; multi-step latent branching over
+    ///   follow-up action families is a follow-up commit).
+    ///
+    /// Returns RAW critic units (the caller applies `target_scale`). `None` when no
+    /// critic value is available, no world model exists for a `depth >= 1` request,
+    /// or a forward pass is degenerate — so the caller falls back to the depth-0
+    /// value and play degrades gracefully rather than feeding garbage into selection.
+    fn model_based_lookahead_value(
+        &self,
+        base: &SoccerLearningTransition,
+        action: &str,
+        learner: &SoccerNeuralLearner,
+        depth: usize,
+    ) -> Option<f64> {
+        let features = soccer_neural_transition_features_with_action(base, action);
+        if depth == 0 {
+            return learner.predict_value(&features);
+        }
+        let next = self.world_model.as_ref()?.predict_next(&features)?;
+        learner.predict_value(&next)
     }
 
     fn apply_full_game_learning_if_ready(&mut self) {
@@ -16474,6 +16537,24 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
+}
+/// Tactical model-based look-ahead depth for the value blend (`neural_blended_action`):
+/// AlphaZero/MuZero-style planning that rolls the learned world model (`predict_next`)
+/// forward from each candidate action and scores the predicted state with the critic,
+/// instead of scoring the current state-action directly. `0` (the default, env unset)
+/// = OFF: every candidate is scored at depth-0 exactly as before, so play is
+/// byte-identical. `>= 1` rolls the world model forward one step per candidate (and
+/// requires a trained dynamics model — `neural_blend.world_model`; the caller forces
+/// depth-0 when none is present). Read once per process (no per-tick env syscall).
+pub(crate) fn dd_soccer_lookahead_depth() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LOOKAHEAD_DEPTH")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
 }
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
 // goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
@@ -33194,6 +33275,114 @@ impl WorldSnapshot {
                 let position = self.player_snapshot_position(p);
                 segment_distance_to_point(from, to, position) > radius
             })
+    }
+
+    /// "Dribble to open a passing lane": the carrier has an ideal receiver (usually upfield,
+    /// sometimes back) but the DIRECT lane is blocked by an opponent. A short (1-8yd) carry to one
+    /// side shifts the lane off the blocker and opens the pass. Returns `(spot, receiver, sprint)`:
+    /// where to carry the ball, who it opens a lane to, and whether to SPRINT (very high pressure or
+    /// an opponent tracking quickly) vs run. `None` when no valuable lane is blocked, no short step
+    /// opens one, or the feature is disabled (`DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE`) — so the
+    /// carrier's decision is unchanged otherwise. Pure read of the snapshot (no RNG); the chosen
+    /// carry is executed through the per-player MPC like any other dribble.
+    pub(crate) fn dribble_to_open_passing_lane_for(
+        &self,
+        carrier_id: usize,
+    ) -> Option<(Vec2, usize, bool)> {
+        if dd_soccer_disable_dribble_open_lane() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == carrier_id)?;
+        if me.role == PlayerRole::Goalkeeper || self.ball.holder != Some(carrier_id) {
+            return None;
+        }
+        let from = self.player_snapshot_position(me);
+        if !from.x.is_finite() || !from.y.is_finite() {
+            return None;
+        }
+        let opp = me.team.other();
+        let attack_dir = me.team.attack_dir();
+        let goalward = Vec2::new(0.0, attack_dir);
+
+        // Sprint decision: burst when under very high pressure, OR when the nearest opponent is
+        // tracking quickly toward the carrier (close the angle before it re-shuts / exceed their
+        // pace). Otherwise a controlled run. Computed once for the carrier.
+        let nearest_opp = self
+            .players
+            .iter()
+            .filter(|p| p.team == opp)
+            .map(|p| {
+                let pos = self.player_snapshot_position(p);
+                (p, pos, pos.distance(from))
+            })
+            .filter(|(_, _, d)| d.is_finite())
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let pressure = nearest_opp
+            .as_ref()
+            .map(|(_, _, d)| pressure_from_nearest_distance(*d))
+            .unwrap_or(0.0);
+        let opp_closing_yps = nearest_opp
+            .as_ref()
+            .map(|(p, pos, d)| {
+                if *d <= 1e-3 {
+                    return 0.0;
+                }
+                let toward = (from - *pos) * (1.0 / *d);
+                self.player_velocity(p.id)
+                    .unwrap_or(p.velocity)
+                    .dot(toward)
+                    .max(0.0)
+            })
+            .unwrap_or(0.0);
+        let sprint = pressure >= OPEN_LANE_DRIBBLE_SPRINT_PRESSURE
+            || opp_closing_yps >= OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS;
+
+        for receiver_id in
+            self.ranked_visible_pass_targets(carrier_id, OPEN_LANE_DRIBBLE_TARGET_CANDIDATES)
+        {
+            let Some(receiver) = self
+                .players
+                .iter()
+                .find(|p| p.id == receiver_id && p.team == me.team)
+            else {
+                continue;
+            };
+            if receiver.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let to = self.player_snapshot_position(receiver);
+            let lane = to - from;
+            let lane_len = lane.len();
+            if !(OPEN_LANE_DRIBBLE_MIN_PASS_YARDS..=OPEN_LANE_DRIBBLE_MAX_PASS_YARDS)
+                .contains(&lane_len)
+            {
+                continue;
+            }
+            // Only act when the DIRECT lane is genuinely blocked right now (else just pass it).
+            if self.clear_line(from, to, opp, OPEN_LANE_DRIBBLE_CORRIDOR_YARDS) {
+                continue;
+            }
+            let dir = lane * (1.0 / lane_len);
+            let perp = Vec2::new(-dir.y, dir.x);
+            // Smallest step (with a slight goalward bias so it is a productive carry, not a pure
+            // sideways shuffle) that moves the blocker out of the corridor and clears the new lane.
+            for &step in OPEN_LANE_DRIBBLE_STEP_YARDS.iter() {
+                for &sign in &[1.0_f64, -1.0] {
+                    let spot = (from + perp * (sign * step) + goalward * (step * 0.3))
+                        .clamp_to_pitch(self.field_width, self.field_length);
+                    // Don't carry straight onto another opponent.
+                    if self.nearest_opponent_distance_at(me.team, spot)
+                        < OPEN_LANE_DRIBBLE_MIN_SPOT_SPACE_YARDS
+                    {
+                        continue;
+                    }
+                    if self.clear_line(spot, to, opp, OPEN_LANE_DRIBBLE_CORRIDOR_YARDS) {
+                        return Some((spot, receiver_id, sprint));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn pass_lane_control_is_unavoidable(
