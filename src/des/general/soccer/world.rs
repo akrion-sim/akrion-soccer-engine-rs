@@ -29649,6 +29649,26 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // SHORT-OUTLET "show for the ball" (#3): reward a candidate that gives the carrier a
+                // clean, comfortably-passable outlet in ANY direction (square / short-back too,
+                // unlike the forward-only ball_arrival_bonus) so a teammate always shows for a pass
+                // instead of the carrier being forced to play it to nobody. Range-gated so it nudges
+                // the nearest teammate to show without dragging wide players in (collapsing width).
+                let short_outlet_bonus = if possession
+                    && self.ball.holder != Some(player_id)
+                    && me.role != PlayerRole::Goalkeeper
+                {
+                    let ball_to_p = self.ball.position.distance(p);
+                    if (SHORT_OUTLET_SHOW_MIN_YARDS..=SHORT_OUTLET_SHOW_MAX_YARDS).contains(&ball_to_p)
+                        && self.clear_line(self.ball.position, p, me.team.other(), 2.0)
+                    {
+                        SHORT_OUTLET_SHOW_BONUS
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let movement_relief =
                     self.positional_shape_exception_relief_for_player_target(me, p);
                 let lane_position_penalty =
@@ -29720,6 +29740,7 @@ impl WorldSnapshot {
                     + wingback_flank_opening_bonus
                     + dynamic_lane_fit_bonus
                     + ball_arrival_bonus
+                    + short_outlet_bonus
                     - offside_penalty
                     - lane_position_penalty
                     - teammate_occupation_penalty

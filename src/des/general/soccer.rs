@@ -908,6 +908,14 @@ const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 const FLANK_USAGE_MIN_WIDENESS: f64 = 0.5;
 const FLANK_USAGE_OWN_HALF_REWARD: f64 = 0.6;
 const FLANK_USAGE_ATTACKING_HALF_REWARD: f64 = 0.2;
+// SHORT-OUTLET "show for the ball" (#3): an off-ball teammate's open-space target is rewarded for
+// offering a clean, comfortably-passable outlet to the carrier in ANY direction (square/short-back
+// too — not just forward) within this range band, so there is always someone to pass to instead of
+// the carrier being forced to play the ball to nobody. Range-gated so it nudges the nearest
+// teammate to show without dragging wide players into the ball (which would collapse the width).
+const SHORT_OUTLET_SHOW_MIN_YARDS: f64 = 7.0;
+const SHORT_OUTLET_SHOW_MAX_YARDS: f64 = 22.0;
+const SHORT_OUTLET_SHOW_BONUS: f64 = 1.4;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
