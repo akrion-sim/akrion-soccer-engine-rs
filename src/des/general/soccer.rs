@@ -2467,6 +2467,30 @@ const LOOSE_BALL_POUNCE_CLOSING_YPS: f64 = 2.0;
 // an earlier intercept — it stretches/lunges this much further to reach the ball sooner and
 // beat them to it, rather than meeting it at the latest comfortable point on the roll.
 const LOOSE_BALL_CONTESTED_LUNGE_BONUS_YARDS: f64 = 1.0;
+// Obstacle-aware loose-ball intercept (opt-in: `MatchConfig::enable_obstacle_aware_intercept` OR env
+// `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT`). The straight-line kinematic reach assumes a clear run
+// to the ball. When an opponent body will be in the dash corridor — predicted forward from its
+// position, velocity AND acceleration, time-aligned to when the chaser passes each point — the chaser
+// must skirt it, so each candidate intercept has its required gap inflated by a bounded detour before
+// the reach test, deferring commitment on balls that cannot be reached through traffic. The chosen
+// candidate is then confirmed by a single individual point-mass MPC plan around the predicted movers.
+// Half-width (yards) of the corridor an opponent body must come within to impede the dash (~a body).
+const LOOSE_BALL_INTERCEPT_CORRIDOR_RADIUS_YARDS: f64 = 1.1;
+// Max detour (yards) a single blocking body adds to the required gap, and the overall obstruction cap.
+const LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS: f64 = 1.6;
+// Dead-zone (yards) at each end of the corridor: a body within this of the chaser or the intercept
+// point is not "between" them (the latter is the contest at the ball, owned by the contest-cut). On a
+// short dash the margin is clamped to a fraction of the path so a centred body is still detected.
+const LOOSE_BALL_INTERCEPT_CORRIDOR_END_MARGIN_YARDS: f64 = 0.5;
+// Samples along the dash for the swept closest-approach between the chaser and each predicted mover.
+const LOOSE_BALL_INTERCEPT_CORRIDOR_SAMPLES: usize = 12;
+// The MPC commit confirmation accepts an intercept whose planned (obstacle-avoiding) arrival is within
+// this slack of the kinematic deadline; beyond it the avoidance path is too slow, so the chaser marches
+// on to a later point rather than committing to a ball it cannot actually reach in time through traffic.
+const LOOSE_BALL_INTERCEPT_MPC_ARRIVAL_TOLERANCE_SECONDS: f64 = 0.12;
+// Max number of candidate intercepts per search that get the (heavier) MPC commit confirmation, so a
+// fully-blocked dash cannot run the solver once per 0.05s step; past it the swept estimate decides.
+const LOOSE_BALL_INTERCEPT_MPC_CONFIRM_BUDGET: usize = 4;
 // First-touch TIMING decision (trap now vs let it run). A ball at/below this speed is a clean
 // first touch; faster than this it risks a miscontrol when trapped on the move.
 const LOOSE_BALL_CLEAN_CONTROL_SPEED_YPS: f64 = 6.0;
@@ -12358,14 +12382,13 @@ pub struct SoccerMpcConfig {
     /// speed profile planned by a 2-D point-mass MPC instead of the open-loop
     /// "head straight at the target at top speed" heuristic. Direction and
     /// collision-avoidance steering stay heuristic. Off by default.
+    ///
+    /// MPC is an INDIVIDUAL-player tool only — it controls one actor's own
+    /// trajectory. There is deliberately no team/collective MPC layer: team shape
+    /// is owned by the formation LP and each player's POMDP, never a joint
+    /// multi-player optimizer.
     #[serde(default)]
     pub tier2_player_enabled: bool,
-    /// Tier-1 team tactical shape-transition MPC layered ABOVE the formation LP:
-    /// the LP picks the target shape, MPC smooths the collective transition into
-    /// it over a short horizon under per-player acceleration limits. Off by
-    /// default. (Wired in a later step; the flag is reserved here.)
-    #[serde(default)]
-    pub tier1_team_enabled: bool,
     /// Horizon length (ticks) for the per-player controller.
     #[serde(default = "default_soccer_mpc_player_horizon")]
     pub player_horizon: usize,
@@ -12556,7 +12579,6 @@ impl Default for SoccerMpcConfig {
     fn default() -> Self {
         SoccerMpcConfig {
             tier2_player_enabled: false,
-            tier1_team_enabled: false,
             player_horizon: default_soccer_mpc_player_horizon(),
             active_radius_yards: default_soccer_mpc_active_radius_yards(),
             reconcile_enabled: false,
@@ -12818,6 +12840,14 @@ pub struct MatchConfig {
     /// [`xavi_turn_enabled`].
     #[serde(default)]
     pub disable_xavi_turn: bool,
+    /// Enable obstacle-aware loose-ball intercept feasibility for THIS match, independent of the
+    /// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag (either turns it on).
+    /// Default `false` => the straight-line kinematic reach is used unchanged (byte-identical). When
+    /// on, opponent bodies predicted (position + velocity + acceleration) into the dash corridor
+    /// inflate the gap a chaser must cover, and the chosen intercept is MPC-confirmed reachable in
+    /// time. See [`obstacle_aware_intercept_enabled`] and [`loose_ball_corridor_obstruction_yards`].
+    #[serde(default)]
+    pub enable_obstacle_aware_intercept: bool,
     /// Enable the lightweight Bayesian opponent-press belief: a per-player
     /// Beta-Bernoulli posterior over how readily each opponent steps into pass
     /// lanes, which shades the analytic pass-lane interception risk into a Bayesian
@@ -12868,6 +12898,7 @@ impl Default for MatchConfig {
             disable_tick_order_shuffle: false,
             disable_slide_tackle: false,
             disable_xavi_turn: false,
+            enable_obstacle_aware_intercept: false,
             opponent_belief_enabled: false,
             max_human_players: 4,
             seed: 2026,
@@ -41133,6 +41164,7 @@ fn tracking_frame_to_world_snapshot(
         trace_mdp_mpc_comparison: true,
         slide_tackle_enabled: slide_tackle_enabled(config),
         xavi_turn_enabled: xavi_turn_enabled(config),
+        obstacle_aware_intercept_enabled: obstacle_aware_intercept_enabled(config),
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
@@ -42587,6 +42619,21 @@ fn dd_soccer_disable_xavi_turn() -> bool {
 /// the move is never produced and the byte-stream is identical to baseline.
 fn xavi_turn_enabled(config: &MatchConfig) -> bool {
     !dd_soccer_disable_xavi_turn() && !config.disable_xavi_turn
+}
+
+fn dd_soccer_enable_obstacle_aware_intercept() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+}
+
+/// Whether obstacle-aware loose-ball intercept feasibility is live for this match: OFF unless the
+/// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag OR the per-match config field
+/// opts in. Folded ONCE into [`WorldSnapshot::obstacle_aware_intercept_enabled`] at snapshot build
+/// so the intercept hot path reads a plain bool (deterministic + unit-testable). Default off keeps
+/// the straight-line kinematic reach byte-identical. See [`loose_ball_corridor_obstruction_yards`].
+fn obstacle_aware_intercept_enabled(config: &MatchConfig) -> bool {
+    dd_soccer_enable_obstacle_aware_intercept() || config.enable_obstacle_aware_intercept
 }
 
 /// The clean-steal ceiling for a carrier executing a body-shielding dribble move: a
