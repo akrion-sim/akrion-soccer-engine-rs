@@ -3163,11 +3163,22 @@ impl SoccerMatch {
             None
         };
 
-        let mut neural_q = |label: &str| -> Option<f64> {
+        // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in
+        // via `DD_SOCCER_LOOKAHEAD_DEPTH >= 1` AND a trained world model is present,
+        // score each candidate by rolling the world model forward (`predict_next`)
+        // and evaluating the predicted state with the critic, rather than scoring the
+        // current state-action directly. Depth 0 — the default, and the forced value
+        // when no world model exists — reproduces the direct depth-0 critic value
+        // byte-for-byte, so play is unchanged unless a run opts in.
+        let lookahead_depth = if self.world_model.is_some() {
+            dd_soccer_lookahead_depth()
+        } else {
+            0
+        };
+        let neural_q = |label: &str| -> Option<f64> {
             let learner = learner?;
-            base.action = label.to_string();
-            let features = soccer_neural_transition_features(&base);
-            learner.predict_value(&features).map(|v| v * target_scale)
+            self.model_based_lookahead_value(&base, label, learner, lookahead_depth)
+                .map(|v| v * target_scale)
         };
         let policy_bonus = |label: &str| -> f64 {
             match &policy_log_probs {
@@ -4104,6 +4115,15 @@ impl SoccerMatch {
             }
         }
 
+        // MAPPO cooperative-credit share: blend each agent's individual reward
+        // toward its team's per-tick mean before the zero-sum opponent centering.
+        // `0.0` (default) keeps the fully individual reward — byte-identical to the
+        // pre-MAPPO objective.
+        let team_reward_share = self
+            .config
+            .neural_learning
+            .sanitized_mappo_team_reward_share();
+
         // Per-transition row: opponent-centered reward, critic value (in reward
         // units), terminal flag, action index, and state features.
         let opponent_centered_reward = |transition: &SoccerLearningTransition| -> f64 {
@@ -4121,11 +4141,15 @@ impl SoccerMatch {
             } else {
                 away_sum / f64::from(away_count)
             };
-            let opponent_avg = match transition.team {
-                Team::Home => away_avg,
-                Team::Away => home_avg,
+            let (own_avg, opponent_avg) = match transition.team {
+                Team::Home => (home_avg, away_avg),
+                Team::Away => (away_avg, home_avg),
             };
-            finite_metric(transition.reward) - opponent_avg
+            // (1-w)·rᵢ + w·r̄_team — the shared-return convex blend. At w=0 this is
+            // exactly the individual reward, so the result is unchanged.
+            let individual = finite_metric(transition.reward);
+            let shared = (1.0 - team_reward_share) * individual + team_reward_share * own_avg;
+            shared - opponent_avg
         };
 
         let reward_adv: Vec<f64> = replay.iter().map(opponent_centered_reward).collect();
@@ -4286,6 +4310,44 @@ impl SoccerMatch {
         learner
             .predict_value(&predicted_next)
             .map(|value| value * target_scale)
+    }
+
+    /// Model-based look-ahead value of a candidate `action` at decision time
+    /// (AlphaZero/MuZero-style planning): roll the learned world model forward from
+    /// the current state + this candidate action and score the predicted state with
+    /// the critic. This is the decision-DRIVING generalization of
+    /// [`Self::model_based_value`] — but unlike that diagnostic, which scored a
+    /// NULL-action next state (the MBV-PARITY-01 approximation), this builds the
+    /// step's features with the candidate's OWN action channels, so the critic sees
+    /// an in-distribution input and the look-ahead can legitimately steer selection.
+    ///
+    /// The rollout is cheap because `predict_next`/`predict_value` are single MLP
+    /// forward passes over the learned dynamics + value heads — NOT a physics
+    /// re-simulation — so this stays affordable on the live decision path.
+    ///
+    /// - `depth == 0` → the depth-0 critic value of `(s, action)`, byte-for-byte the
+    ///   same as the non-look-ahead path (`predict_value(features(s, a))`).
+    /// - `depth >= 1` → predict the next state via the world model and score THAT
+    ///   with the critic (a one-step rollout; multi-step latent branching over
+    ///   follow-up action families is a follow-up commit).
+    ///
+    /// Returns RAW critic units (the caller applies `target_scale`). `None` when no
+    /// critic value is available, no world model exists for a `depth >= 1` request,
+    /// or a forward pass is degenerate — so the caller falls back to the depth-0
+    /// value and play degrades gracefully rather than feeding garbage into selection.
+    fn model_based_lookahead_value(
+        &self,
+        base: &SoccerLearningTransition,
+        action: &str,
+        learner: &SoccerNeuralLearner,
+        depth: usize,
+    ) -> Option<f64> {
+        let features = soccer_neural_transition_features_with_action(base, action);
+        if depth == 0 {
+            return learner.predict_value(&features);
+        }
+        let next = self.world_model.as_ref()?.predict_next(&features)?;
+        learner.predict_value(&next)
     }
 
     fn apply_full_game_learning_if_ready(&mut self) {
@@ -16278,6 +16340,24 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
+}
+/// Tactical model-based look-ahead depth for the value blend (`neural_blended_action`):
+/// AlphaZero/MuZero-style planning that rolls the learned world model (`predict_next`)
+/// forward from each candidate action and scores the predicted state with the critic,
+/// instead of scoring the current state-action directly. `0` (the default, env unset)
+/// = OFF: every candidate is scored at depth-0 exactly as before, so play is
+/// byte-identical. `>= 1` rolls the world model forward one step per candidate (and
+/// requires a trained dynamics model — `neural_blend.world_model`; the caller forces
+/// depth-0 when none is present). Read once per process (no per-tick env syscall).
+pub(crate) fn dd_soccer_lookahead_depth() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LOOKAHEAD_DEPTH")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
 }
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
 // goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
