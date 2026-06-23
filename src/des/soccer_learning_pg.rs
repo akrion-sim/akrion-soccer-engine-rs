@@ -206,6 +206,8 @@ fn soccer_policy_search_label_uses_evolutionary_search(label: &str) -> bool {
     normalized.contains("evolution")
         || normalized.contains("genetic")
         || normalized.contains("gp")
+        || normalized.contains("mutation")
+        || normalized.contains("mutate")
         || normalized.contains("symbolicregression")
         || normalized.contains("programtree")
 }
@@ -5483,6 +5485,31 @@ mod tests {
         assert_eq!(
             metrics["learningProvenance"]["sourceKind"],
             json!("server-import")
+        );
+        assert_eq!(
+            metrics["learningProvenance"]["evolutionarySearch"],
+            json!(true)
+        );
+        assert_eq!(
+            metrics["learningProvenance"]["geneticProgrammingTacticalSearch"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn policy_version_metrics_detect_mutation_source_as_evolutionary_search() {
+        let metrics = soccer_policy_version_metrics(
+            "mutation",
+            0.75,
+            None,
+            Some(&SoccerTacticalLearningWeights::default()),
+            None,
+        )
+        .expect("metrics");
+
+        assert_eq!(
+            metrics["learningProvenance"]["sourceKind"],
+            json!("mutation")
         );
         assert_eq!(
             metrics["learningProvenance"]["evolutionarySearch"],
