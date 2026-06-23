@@ -623,7 +623,15 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
         ("targetScale", config.target_scale),
         ("targetClip", config.target_clip),
         ("criticBaselineWeight", config.critic_baseline_weight),
+        // Both convergent multi-agent-RL knobs are kept: MAPPO team-reward SHARE (ours) and the
+        // MARL team/intermediate reward weights + the MAPPO clip epsilon (theirs).
         ("mappoTeamRewardShare", config.mappo_team_reward_share),
+        ("marlTeamRewardWeight", config.marl_team_reward_weight),
+        (
+            "marlIntermediateRewardWeight",
+            config.marl_intermediate_reward_weight,
+        ),
+        ("mappoClipEpsilon", config.mappo_clip_epsilon),
     ] {
         if !value.is_finite() {
             return Err(format!("{name} must be finite"));
@@ -682,9 +690,27 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
             "criticBaselineWeight must be in [0, 1] when neural learning is enabled".to_string(),
         );
     }
+    // Keep both convergent MARL/MAPPO validations (ours: team-reward share; theirs: team +
+    // intermediate reward weights and the MAPPO clip epsilon).
     if !(0.0..=1.0).contains(&config.mappo_team_reward_share) {
         return Err(
             "mappoTeamRewardShare must be in [0, 1] when neural learning is enabled".to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&config.marl_team_reward_weight) {
+        return Err(
+            "marlTeamRewardWeight must be in [0, 1] when neural learning is enabled".to_string(),
+        );
+    }
+    if !(0.0..=2.0).contains(&config.marl_intermediate_reward_weight) {
+        return Err(
+            "marlIntermediateRewardWeight must be in [0, 2] when neural learning is enabled"
+                .to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&config.mappo_clip_epsilon) || config.mappo_clip_epsilon <= 0.0 {
+        return Err(
+            "mappoClipEpsilon must be in (0, 1] when neural learning is enabled".to_string(),
         );
     }
     Ok(())
@@ -5470,6 +5496,26 @@ mod tests {
             .expect_err("negative neural target scale should fail fast");
 
         assert!(err.contains("targetScale"), "{err}");
+
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            marl_team_reward_weight: 1.25,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("out-of-range MARL team reward weight should fail fast");
+
+        assert!(err.contains("marlTeamRewardWeight"), "{err}");
+
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            mappo_clip_epsilon: 0.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("zero MAPPO clip epsilon should fail fast");
+
+        assert!(err.contains("mappoClipEpsilon"), "{err}");
     }
 
     #[test]

@@ -15,10 +15,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
-    MatchConfig, MatchSummary, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics, SoccerQPolicyOptions,
-    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
-    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
+    MatchConfig, MatchSummary, SoccerMarlAlgorithm, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics,
+    SoccerQPolicyOptions, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
+    SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
+    SoccerTeamQPolicies,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -258,6 +259,24 @@ fn env_neural_learning_backend(
     }
 }
 
+fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorithm, Box<dyn Error>> {
+    let Some(value) =
+        env_value("SOCCER_MARL_ALGORITHM").or_else(|| env_value("SOCCER_NEURAL_MARL_ALGORITHM"))
+    else {
+        return Ok(default);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" => Ok(SoccerMarlAlgorithm::Off),
+        "independent" | "independent-actor-critic" | "independent_actor_critic"
+        | "independentactorcritic" => Ok(SoccerMarlAlgorithm::IndependentActorCritic),
+        "mappo" | "ppo" => Ok(SoccerMarlAlgorithm::Mappo),
+        _ => Err(invalid_data(format!(
+            "SOCCER_MARL_ALGORITHM must be off, independentActorCritic, or mappo, got {value:?}"
+        ))
+        .into()),
+    }
+}
+
 fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Error>> {
     let default = SoccerNeuralLearningConfig {
         enabled: true,
@@ -335,6 +354,16 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             "SOCCER_NEURAL_LP_COUPLING_ENABLED",
             default.lp_coupling_enabled,
         )?,
+        marl_algorithm: env_marl_algorithm(default.marl_algorithm)?,
+        marl_team_reward_weight: env_f64(
+            "SOCCER_MARL_TEAM_REWARD_WEIGHT",
+            default.marl_team_reward_weight,
+        )?,
+        marl_intermediate_reward_weight: env_f64(
+            "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT",
+            default.marl_intermediate_reward_weight,
+        )?,
+        mappo_clip_epsilon: env_f64("SOCCER_MAPPO_CLIP_EPSILON", default.mappo_clip_epsilon)?,
     })
 }
 
