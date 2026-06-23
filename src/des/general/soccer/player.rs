@@ -1072,6 +1072,12 @@ pub struct PlayerAgent {
     pub slide_recovery_seconds: f64,
 }
 
+fn soccer_pressured_contested_pass_damp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP").is_err())
+}
+
 fn mpc_reselect_candidate_label(label: &str) -> bool {
     matches!(
         label,
@@ -3830,10 +3836,23 @@ impl PlayerAgent {
             let quick_release = (1.35 - observation.perceived_time_on_ball_seconds)
                 .max(0.0)
                 .min(1.0);
-            let completion_bonus = (0.82
-                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.24
-                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.16)
-                .clamp(0.76, 1.22);
+            let completion_bonus = {
+                let base = 0.82
+                    + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.24
+                    + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.16;
+                // Under real pressure a CONTESTED pass (low expected completion) is penalised much
+                // harder so a pinned carrier shields/holds rather than forcing the ball into traffic
+                // (the "passed it straight to the other team" turnover). Calm play and a genuinely
+                // open pass are untouched (heat or contested ≈ 0).
+                let damp = if soccer_pressured_contested_pass_damp_enabled() {
+                    let heat = observation.perceived_pressure.clamp(0.0, 1.0);
+                    let contested = 1.0 - observation.expected_pass_completion.clamp(0.0, 1.0);
+                    heat * contested * PRESSURED_CONTESTED_PASS_DAMP
+                } else {
+                    0.0
+                };
+                (base - damp).clamp(0.40, 1.22)
+            };
             let pass_score = (self.preferences.pass_bias
                 * directive.pass_priority
                 * (0.70 + passing * 0.42)
