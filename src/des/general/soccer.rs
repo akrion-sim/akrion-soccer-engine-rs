@@ -53,6 +53,8 @@ mod labels;
 pub use labels::*;
 mod tunables;
 pub use tunables::*;
+mod pitch_value;
+pub use pitch_value::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -17884,6 +17886,14 @@ fn dense_soccer_transition_reward(
             0.20
         };
     }
+
+    // Dense territorial pitch-control x expected-threat shaping: credit the
+    // acting team for any action — including a pure off-ball run — that grows its
+    // net control of dangerous space, the signal the local event rewards above
+    // are blind to. Gated off by default (returns 0.0 before touching the grid
+    // unless `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`), so the baseline stays
+    // byte-identical. See `pitch_value`.
+    reward += pitch_value_reward_delta(before, after, player.team);
 
     reward.clamp(-4.0, 4.0)
 }
@@ -41124,6 +41134,7 @@ fn tracking_frame_to_world_snapshot(
         trace_mdp_mpc_comparison: true,
         slide_tackle_enabled: slide_tackle_enabled(config),
         xavi_turn_enabled: xavi_turn_enabled(config),
+        obstacle_aware_intercept_enabled: obstacle_aware_intercept_enabled(config),
         pass_anticipation_enabled: config.pass_anticipation_enabled,
         local_mpc_max_players_per_team: config.local_mpc_max_players_per_team,
         home_team_possession_seconds: if last_touch_team == Some(Team::Home) {
@@ -42578,6 +42589,21 @@ fn dd_soccer_disable_xavi_turn() -> bool {
 /// the move is never produced and the byte-stream is identical to baseline.
 fn xavi_turn_enabled(config: &MatchConfig) -> bool {
     !dd_soccer_disable_xavi_turn() && !config.disable_xavi_turn
+}
+
+fn dd_soccer_enable_obstacle_aware_intercept() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+}
+
+/// Whether obstacle-aware loose-ball intercept feasibility is live for this match: OFF unless the
+/// process-wide `DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT` env flag OR the per-match config field
+/// opts in. Folded ONCE into [`WorldSnapshot::obstacle_aware_intercept_enabled`] at snapshot build
+/// so the intercept hot path reads a plain bool (deterministic + unit-testable). Default off keeps
+/// the straight-line kinematic reach byte-identical. See [`loose_ball_corridor_obstruction_yards`].
+fn obstacle_aware_intercept_enabled(config: &MatchConfig) -> bool {
+    dd_soccer_enable_obstacle_aware_intercept() || config.enable_obstacle_aware_intercept
 }
 
 /// The clean-steal ceiling for a carrier executing a body-shielding dribble move: a

@@ -1,0 +1,130 @@
+diff --git a/src/des/general/soccer/world.rs b/src/des/general/soccer/world.rs
+index d86f778..4b7411a 100644
+--- a/src/des/general/soccer/world.rs
++++ b/src/des/general/soccer/world.rs
+@@ -660,6 +660,95 @@ mod tests {
+             "half-corridor incursion should add ~half the detour, got {half}"
+         );
+         assert!(blocked <= LOOSE_BALL_INTERCEPT_OBSTRUCTION_MAX_YARDS + 1e-9);
++
++        // Short dash: a fixed 0.5yd end-margin would empty the corridor window and silently disable
++        // the check; the clamped margin still detects a body centred on a sub-yard corridor.
++        let short = loose_ball_corridor_obstruction_yards(
++            &[Vec2::new(0.0, 0.4)],
++            Vec2::new(0.0, 0.0),
++            Vec2::new(0.0, 0.8),
++        );
++        assert!(short > 0.0, "centred body on a short corridor must still register, got {short}");
++
++        // Non-finite inputs never poison the result (NaN opponent / degenerate path -> 0).
++        assert_eq!(
++            loose_ball_corridor_obstruction_yards(&[Vec2::new(f64::NAN, 5.0)], from, to),
++            0.0
++        );
++        assert_eq!(
++            loose_ball_corridor_obstruction_yards(&[Vec2::new(0.0, 5.0)], from, Vec2::new(f64::NAN, 0.0)),
++            0.0
++        );
++    }
++
++    #[test]
++    fn obstacle_aware_intercept_gate_folds_config_into_snapshot() {
++        // The per-match config flag is folded into the snapshot bool at build (env is OR-ed in too,
++        // but is unset under test). Default off; on when the match config opts in.
++        let off = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig::default()));
++        assert!(!off.obstacle_aware_intercept_enabled);
++        let on = WorldSnapshot::from_match(&SoccerMatch::default_11v11(MatchConfig {
++            enable_obstacle_aware_intercept: true,
++            ..MatchConfig::default()
++        }));
++        assert!(on.obstacle_aware_intercept_enabled);
++    }
++
++    #[test]
++    fn obstacle_aware_intercept_defers_a_dash_through_a_wall() {
++        // A chaser behind a wall of opponents, chasing a ball rolling away. With the feature off the
++        // chaser claims it on the straight-line reach; on, the bodies in the corridor inflate the
++        // required gap so the catch is deferred further down the roll. Same positions both ways —
++        // only the snapshot gate flips — so the difference is attributable to the feature alone.
++        let mut sim = SoccerMatch::default_11v11(MatchConfig {
++            duration_seconds: 0.1,
++            seed: 7,
++            ..Default::default()
++        });
++        for player in sim.players.iter_mut() {
++            player.position = Vec2::new(2.0, 2.0);
++            player.velocity = Vec2::zero();
++        }
++        let chaser = sim
++            .players
++            .iter()
++            .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
++            .map(|p| p.id)
++            .unwrap();
++        sim.players[chaser].position = Vec2::new(40.0, 10.0);
++        let wall: Vec<usize> = sim
++            .players
++            .iter()
++            .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
++            .map(|p| p.id)
++            .take(3)
++            .collect();
++        for (k, &id) in wall.iter().enumerate() {
++            sim.players[id].position = Vec2::new(40.0, 11.0 + k as f64 * 0.6);
++        }
++        sim.ball.holder = None;
++        sim.pending_pass = None;
++        sim.ball.position = Vec2::new(40.0, 12.5);
++        sim.ball.velocity = Vec2::new(0.0, 3.0); // gently rolling away (+y)
++        sim.ball.altitude_yards = 0.0;
++
++        let mut snap = WorldSnapshot::from_match(&sim);
++        snap.obstacle_aware_intercept_enabled = false;
++        let target_off = snap.loose_ball_trajectory_intercept_for(chaser);
++        snap.obstacle_aware_intercept_enabled = true;
++        let target_on = snap.loose_ball_trajectory_intercept_for(chaser);
++
++        // Obstruction can only DEFER the catch, never advance it (monotone in the required gap).
++        assert!(
++            target_on.y >= target_off.y - 1e-6,
++            "obstruction must not advance the catch: off={target_off:?} on={target_on:?}"
++        );
++        // And with this wall genuinely in the corridor it defers measurably.
++        assert!(
++            target_on.y > target_off.y + 1e-2,
++            "a wall in the dash corridor should defer the catch further down the roll: \
++             off={target_off:?} on={target_on:?}"
++        );
+     }
+ 
+     #[test]
+@@ -15993,19 +16082,6 @@ fn soccer_mpc_pass_enabled() -> bool {
+     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MPC_PASS").is_ok())
+ }
+ 
+-/// Process-wide env half of the obstacle-aware loose-ball intercept gate
+-/// (`DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT`). It is OR-ed with the per-match
+-/// [`MatchConfig::enable_obstacle_aware_intercept`] and folded ONCE into
+-/// [`WorldSnapshot::obstacle_aware_intercept_enabled`] at snapshot build, so the runtime hot path
+-/// reads a plain bool (deterministic + unit-testable) rather than this cached env read per tick.
+-/// Default OFF (byte-identical) pending A/B tuning, mirroring the `DD_SOCCER_ENABLE_MPC_PASS`
+-/// precedent for execution-affecting layers. See [`loose_ball_corridor_obstruction_yards`].
+-fn soccer_obstacle_aware_intercept_enabled() -> bool {
+-    use std::sync::OnceLock;
+-    static V: OnceLock<bool> = OnceLock::new();
+-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+-}
+-
+ /// Bounded detour (yards) the worst opponent body sitting in the dash corridor from `from` toward a
+ /// candidate intercept point `to` adds to the gap a chaser must actually cover. Pure geometry: with
+ /// an empty `opponents` slice (the gate-off path) it returns 0, so the straight-line reach test is
+@@ -16501,8 +16577,7 @@ impl WorldSnapshot {
+             trace_mdp_mpc_comparison: options.trace_mdp_mpc_comparison,
+             slide_tackle_enabled: slide_tackle_enabled(&m.config),
+             xavi_turn_enabled: xavi_turn_enabled(&m.config),
+-            obstacle_aware_intercept_enabled: soccer_obstacle_aware_intercept_enabled()
+-                || m.config.enable_obstacle_aware_intercept,
++            obstacle_aware_intercept_enabled: obstacle_aware_intercept_enabled(&m.config),
+             pass_anticipation_enabled: m.config.pass_anticipation_enabled,
+             local_mpc_max_players_per_team: m.config.local_mpc_max_players_per_team,
+             home_team_possession_seconds,
