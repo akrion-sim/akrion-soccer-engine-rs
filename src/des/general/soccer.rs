@@ -885,13 +885,10 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 40.0;
-// Floor on the distance scoring-scale so a long shot on frame still earns a sliver.
-const SHOT_ON_TARGET_SCORING_SCALE_FLOOR: f64 = 0.04;
-// Shot-on-frame reward is full inside this distance, then reduced per yard beyond. Kept
-// to genuine shooting range and tapered hard so strikers stop firing from distance: full
-// inside ~16yd, ~0.7 at 20yd, ~0.45 at 25yd, ~0.16 at 30yd, floored beyond.
+// A shot-on-target's chain reward is FULL inside this distance, then tapers linearly to ZERO at the
+// 20yd pivot (`SHOT_DISTANCE_REWARD_PIVOT_YARDS`) and is none beyond — the chain is credited only
+// for a real chance from within ~20yd. See `shot_reward_distance_scale`.
 const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 16.0;
-const SHOT_REWARD_TAPER_PER_YARD: f64 = 0.065;
 // Shot-distance reward shaping, pivoting on 20yd (the user's "shoot closer" rule). A shot from
 // INSIDE 20yd is rewarded, rising as the shooter gets nearer goal; a shot from OUTSIDE 20yd (up to
 // the hard 30yd cap) is penalised, escalating with distance — relieved only when the keeper is
