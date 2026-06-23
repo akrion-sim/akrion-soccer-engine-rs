@@ -750,6 +750,13 @@ const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
 // so capping the apex does not change x/y speed or time-to-destination — it is realism only.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
+// A scoop is a delicate, SHORT chip over a close defender — it must clear a standing/lunging
+// block early in the path yet still drop ONTO the receiver, never balloon over them. A modest
+// FIXED apex (~8 ft) gives a short gravity hang time; the launch pace is then calibrated to land
+// the ball at the target within that hang (see `modulated_pass_speed_yps`). The old scoop arced
+// 9-15 ft on a fixed-slow pace that ignored distance, so a short dink sailed over a near receiver
+// and floated down well past them ("helium balloon"). Lower + deterministic + land-at-target.
+const SCOOP_LOFT_APEX_YARDS: f64 = 2.8; // ~8.4 ft
 /// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
 /// target it must be launched at ~`distance / hang_time`. In flight it loses a little pace to air
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
@@ -46784,13 +46791,12 @@ const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
-        // A scoop LOOPS high despite being short and slow — that steep loft drops it over the
-        // close defender's head. Apex UNIFORM in 9-15ft (3-5yd), seeded per-pass from the
-        // launch tick so it's stable across the flight but varies shot to shot.
-        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (pass.from as u64).wrapping_shl(17);
-        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
-        3.0 + unit * 2.0
+        // A scoop is a delicate SHORT chip over a close defender: it clears the block but must
+        // drop ONTO the receiver, so the apex is modest and FIXED (deterministic) and the launch
+        // pace is calibrated to land the ball at the target within this hang time
+        // (`modulated_pass_speed_yps`). A higher/random apex on a fixed-slow pace ballooned the
+        // ball clean over a near receiver — the "helium balloon" float.
+        SCOOP_LOFT_APEX_YARDS
     } else {
         // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
         // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
@@ -47399,10 +47405,17 @@ fn modulated_pass_speed_yps(
     receiver_openness: f64,
     _rng: &mut SeededRandom,
 ) -> f64 {
-    // A scoop keeps its slow fixed launch speed — distance-calibration would speed it back
-    // up to a normal lofted pass and defeat the purpose (a gentle dink over a close defender).
+    // A scoop must LAND ON the receiver. It is aloft for the gravity hang time set by its (modest,
+    // fixed) apex, so the only launch pace that drops it on the target is distance / hang_time. The
+    // old fixed-slow scoop ignored distance: a short chip stayed up its full hang time and floated
+    // down well past a near receiver (a "balloon"). Capped to a gentle dink band so the
+    // calibration can never speed it up into a driven loft — it stays a soft chip over the block.
     if flight.is_scoop() {
-        return raw_speed_yps;
+        let _ = raw_speed_yps;
+        let distance = from.distance(target).max(0.1);
+        let hang_time = 2.0 * (2.0 * SCOOP_LOFT_APEX_YARDS / GRAVITY_YPS2).sqrt();
+        let land_at_target = (distance / hang_time.max(0.35)) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+        return land_at_target.clamp(mph_to_yps(6.0), mph_to_yps(26.0));
     }
     let distance = from.distance(target).max(0.1);
     let openness = receiver_openness.clamp(0.0, 1.0);
