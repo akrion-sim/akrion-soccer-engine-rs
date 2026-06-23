@@ -3364,7 +3364,7 @@ impl SoccerMatch {
             let state_features = soccer_neural_transition_features(&base);
             self.policy_head
                 .as_ref()
-                .and_then(|head| head.action_distribution(&state_features))
+                .and_then(|head| head.action_distribution_for_role(&state_features, role))
                 .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect())
         } else {
             None
@@ -4405,7 +4405,9 @@ impl SoccerMatch {
                 let old_action_probability = self
                     .policy_head
                     .as_ref()
-                    .and_then(|head| head.action_distribution(&state_features))
+                    .and_then(|head| {
+                        head.action_distribution_for_role(&state_features, transition.role)
+                    })
                     .and_then(|probs| probs.get(action_index).copied())
                     .filter(|probability| probability.is_finite() && *probability > 0.0);
                 advantage.is_finite().then(|| SoccerPolicySample {
@@ -4413,6 +4415,7 @@ impl SoccerMatch {
                     action_index,
                     advantage,
                     old_action_probability,
+                    role: transition.role,
                 })
             })
             .collect()
@@ -4420,7 +4423,10 @@ impl SoccerMatch {
 
     fn ensure_policy_head(&mut self) {
         if self.policy_head.is_none() {
-            self.policy_head = Some(SoccerPolicyHead::new(self.config.seed));
+            self.policy_head = Some(SoccerPolicyHead::new_with_options(
+                self.config.seed,
+                self.neural_blend.policy_role_embedding,
+            ));
         }
     }
 

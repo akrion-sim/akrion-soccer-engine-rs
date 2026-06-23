@@ -3498,6 +3498,29 @@ const SOCCER_POLICY_GRAD_CLIP_NORM: f64 = 5.0;
 /// Decision-time weight on the actor's log-probability when it biases action
 /// selection (multiplies `ln π(family|s)` added to each candidate's blend score).
 const SOCCER_POLICY_DECISION_WEIGHT: f64 = 0.6;
+/// Width of the **role-identity one-hot** optionally appended to the actor's input
+/// (one slot per [`PlayerRole`] variant: GK / DEF / MID / FWD). With parameter
+/// sharing a single policy net serves all 11 outfield+keeper roles; the one-hot
+/// lets that shared net *specialise* per position (a centre-back and a striker
+/// should not share one averaged `π`). Gated by
+/// `SoccerNeuralBlendConfig::policy_role_embedding`; OFF by default, where the
+/// actor input is the base feature vector unchanged (byte-identical).
+const SOCCER_POLICY_ROLE_EMBED_DIM: usize = 4;
+
+/// One-hot encoding of a player's role for the actor role embedding. Index order
+/// is fixed (GK, DEF, MID, FWD) and must stay stable so a persisted/resumed actor
+/// keeps the same role columns.
+fn soccer_policy_role_one_hot(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EMBED_DIM] {
+    let mut one_hot = [0.0; SOCCER_POLICY_ROLE_EMBED_DIM];
+    let index = match role {
+        PlayerRole::Goalkeeper => 0,
+        PlayerRole::Defender => 1,
+        PlayerRole::Midfielder => 2,
+        PlayerRole::Forward => 3,
+    };
+    one_hot[index] = 1.0;
+    one_hot
+}
 /// Learned **world model** `P̂(s'|s,a)` hyperparameters. The model regresses the
 /// next state's feature vector from the current (state ⊕ action) features,
 /// enabling 1-step model-based value look-ahead (Dyna-style).
@@ -12610,6 +12633,14 @@ pub struct SoccerNeuralBlendConfig {
     /// biases action selection on top of the value blend. Off by default.
     #[serde(default)]
     pub actor_critic: bool,
+    /// Append a [`SOCCER_POLICY_ROLE_EMBED_DIM`]-wide role one-hot (GK/DEF/MID/FWD)
+    /// to the shared actor's input so one parameter-shared policy net specialises
+    /// per position. Off by default → the actor consumes the base feature vector
+    /// exactly as before, so a run that does not opt in is byte-identical. Only the
+    /// actor widens; the centralized critic and world model are untouched. Has no
+    /// effect unless `actor_critic` is also on.
+    #[serde(default)]
+    pub policy_role_embedding: bool,
     /// Train the learned **world model** `P̂(s'|s,a)` on the episode replay. Off
     /// by default. (Used for model-based value look-ahead / diagnostics; it does
     /// not alter action selection on its own.)
@@ -12687,6 +12718,7 @@ impl Default for SoccerNeuralBlendConfig {
             candidates: default_soccer_neural_blend_candidates(),
             warmup_steps: default_soccer_neural_blend_warmup_steps(),
             actor_critic: false,
+            policy_role_embedding: false,
             world_model: false,
             mcts_enabled: false,
             mcts_simulations: default_soccer_neural_mcts_simulations(),
@@ -30368,6 +30400,10 @@ struct SoccerPolicySample {
     action_index: usize,
     advantage: f64,
     old_action_probability: Option<f64>,
+    /// Acting player's role, used only when the actor's role embedding is on; the
+    /// head appends its one-hot to `state_features` at train/inference time. When
+    /// the embedding is off the role is ignored, so this is inert by default.
+    role: PlayerRole,
 }
 
 /// The neural **actor**: `π(family | s)` over [`SOCCER_POLICY_ACTIONS`], trained
@@ -30378,14 +30414,31 @@ pub(crate) struct SoccerPolicyHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// When true the network input is `SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBED_DIM`
+    /// and every train/inference call appends the acting player's role one-hot. Fixed at
+    /// construction (the input width can't change after the net is built).
+    role_embedding: bool,
 }
 
 impl SoccerPolicyHead {
     fn new(seed: u32) -> Self {
+        Self::new_with_options(seed, false)
+    }
+
+    /// Build the actor, optionally with the role embedding (a wider input). The
+    /// role-less `new` keeps the original width so existing callers/tests are
+    /// unchanged.
+    fn new_with_options(seed: u32, role_embedding: bool) -> Self {
         let mut rng = mulberry32(seed ^ 0x9E37_79B9);
+        let input_dim = SOCCER_NEURAL_FEATURE_DIM
+            + if role_embedding {
+                SOCCER_POLICY_ROLE_EMBED_DIM
+            } else {
+                0
+            };
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
-                input_dim: SOCCER_NEURAL_FEATURE_DIM,
+                input_dim,
                 hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
                 output_dim: SOCCER_POLICY_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
@@ -30399,20 +30452,55 @@ impl SoccerPolicyHead {
             network,
             training_steps: 0,
             last_loss: None,
+            role_embedding,
         }
     }
 
-    /// `π(family | s)` for a state-feature vector. Returns `None` on a malformed
-    /// (non-finite / mis-dimensioned) input so a degenerate actor stays out of play.
-    fn action_distribution(
+    /// The actor's network input: the base feature vector, with the role one-hot
+    /// appended when the embedding is on. When off this is the base vector
+    /// unchanged, so the role argument is inert.
+    fn policy_input(
         &self,
         state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+        role: PlayerRole,
+    ) -> Vec<f64> {
+        if self.role_embedding {
+            let mut input =
+                Vec::with_capacity(SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBED_DIM);
+            input.extend_from_slice(&state_features[..]);
+            input.extend_from_slice(&soccer_policy_role_one_hot(role));
+            input
+        } else {
+            state_features.to_vec()
+        }
+    }
+
+    /// `π(family | s)` for a state-feature vector, conditioned on the acting
+    /// player's role when the embedding is on. Returns `None` on a malformed
+    /// (non-finite / mis-dimensioned) input so a degenerate actor stays out of play.
+    fn action_distribution_for_role(
+        &self,
+        state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+        role: PlayerRole,
     ) -> Option<Vec<f64>> {
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
         }
-        let probs = self.network.action_probabilities(&state_features[..]);
+        let probs = self
+            .network
+            .action_probabilities(&self.policy_input(state_features, role));
         probs.iter().all(|p| p.is_finite()).then_some(probs)
+    }
+
+    /// Role-agnostic `π(family | s)` — valid for a role-less actor (the default).
+    /// A role-embedding actor must use [`Self::action_distribution_for_role`]; this
+    /// passes a neutral role so it still type-checks but is only correct when the
+    /// embedding is off.
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        self.action_distribution_for_role(state_features, PlayerRole::Midfielder)
     }
 
     fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
@@ -30422,7 +30510,9 @@ impl SoccerPolicyHead {
         if !old_prob.is_finite() || old_prob <= 1e-9 {
             return sample.advantage;
         }
-        let Some(current_probs) = self.action_distribution(&sample.state_features) else {
+        let Some(current_probs) =
+            self.action_distribution_for_role(&sample.state_features, sample.role)
+        else {
             return sample.advantage;
         };
         let Some(current_prob) = current_probs.get(sample.action_index).copied() else {
@@ -30454,8 +30544,9 @@ impl SoccerPolicyHead {
             if !advantage.is_finite() {
                 continue;
             }
+            let input = self.policy_input(&sample.state_features, sample.role);
             let result = self.network.train_policy_gradient_sample(
-                &sample.state_features[..],
+                &input,
                 sample.action_index,
                 advantage,
                 SOCCER_POLICY_ENTROPY_COEFF,
