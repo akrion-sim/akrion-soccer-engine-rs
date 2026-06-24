@@ -8410,6 +8410,48 @@ fn pass_facing_outcome_models_the_body_facing_kick_envelope() {
 }
 
 #[test]
+fn aerial_pass_requires_enough_body_power_to_release() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 8066,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 70.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].facing_yaw = 0.0; // facing east
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 90.0); // pass is north, a 90deg twist
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            power: 0.74,
+            flight: PassFlight::Aerial,
+        },
+        sprint: false,
+    });
+
+    assert_eq!(
+        sim.ball.holder,
+        Some(passer),
+        "off-balance aerial should wait and turn, not release a slow capped lob"
+    );
+    assert!(
+        sim.pending_pass.is_none(),
+        "off-balance aerial release should not create a pending pass"
+    );
+}
+
+#[test]
 fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
     // 100 points for a goal, 40 for a shot on target, distributed back through the
     // attacking chain (so an intermediate received pass that leads to a shot/goal
@@ -17153,6 +17195,9 @@ fn no_target_forward_outlet_avoids_marked_teammate_and_opponents() {
     sim.players[passer].position = Vec2::new(40.0, 40.0);
     sim.players[marked_fwd].role = PlayerRole::Forward;
     sim.players[marked_fwd].position = Vec2::new(40.0, 70.0); // 30yd ahead
+    let safe_outlet = home_ids[2];
+    sim.players[safe_outlet].role = PlayerRole::Midfielder;
+    sim.players[safe_outlet].position = Vec2::new(26.0, 56.0);
     let marker_pos = Vec2::new(40.6, 70.0);
     sim.players[marker].position = marker_pos; // right on the forward
 
@@ -17164,12 +17209,17 @@ fn no_target_forward_outlet_avoids_marked_teammate_and_opponents() {
             target.distance(marker_pos) > 4.0,
             "no-target forward outlet must avoid a marked teammate / opponent: target={target:?} marker={marker_pos:?}"
         );
-    // With the only advanced teammate tightly marked, the outlet falls back to open space —
-    // it does NOT adopt the marked man as the receiver (it stays a true ball into space).
+    // With the advanced teammate tightly marked, the outlet adopts the safer teammate instead of
+    // launching a true ball into space with no receiver.
     assert_ne!(
         receiver,
         Some(marked_fwd),
         "a marked teammate must not be adopted as the outlet receiver"
+    );
+    assert_eq!(
+        receiver,
+        Some(safe_outlet),
+        "no-target fallback should still name a teammate when one is safer"
     );
 }
 
@@ -23877,6 +23927,9 @@ fn human_input_can_choose_aerial_pass_flight() {
         sim.players[passer].velocity = Vec2::new(4.0, 0.0);
         sim.players[passer].action_facing = FacingBucket::East;
         sim.players[passer].receive_facing = FacingBucket::East;
+        // Face the pass (east, toward the target) so the body is planted to loft it — the merged
+        // aerial gate refuses a side-on lob, and the default yaw (~north) is 90° off the east pass.
+        sim.players[passer].facing_yaw = 0.0;
         sim.players[target].position = Vec2::new(63.0, 57.0);
         for home in 0..11 {
             if home != passer && home != target {
@@ -27857,6 +27910,29 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.01;
     assert!(shot_decision_is_qualified(&observation));
 
+    // Merged shot-distance discipline: shots in the 20-26yd "discouraged" band stay LEGAL but
+    // reward-penalised (the user's item-5 spec / main), so they are NOT hard-gated here. Only a
+    // genuinely speculative 26-30yd effort (origin/alex-1's keeper-dependent gate) is gated unless
+    // the keeper is clearly out of position.
+    observation.yards_to_goal = LONG_SHOT_KEEPER_DEPENDENT_YARDS + 2.0; // ~28yd, speculative band
+    observation.offensive_urgency = 0.80;
+    observation.shot_on_frame_probability =
+        tunables().shooting.shot_on_frame_min_probability + 0.04;
+    observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.04;
+    observation.opposing_goalkeeper_out_of_position = 0.0;
+    assert!(
+        !shot_decision_is_qualified(&observation),
+        "speculative 26-30yd shots stay gated when the keeper is set"
+    );
+    observation.opposing_goalkeeper_out_of_position = LONG_SHOT_GK_TOTALLY_OUT + 0.05;
+    assert!(
+        shot_decision_is_qualified(&observation),
+        "26-30yd shots reopen only when the keeper is clearly out of position"
+    );
+
+    observation.yards_to_goal = 9.0;
+    observation.offensive_urgency = 0.0;
+    observation.opposing_goalkeeper_out_of_position = 0.0;
     observation.shot_on_frame_probability = SHOT_BAILOUT_ON_FRAME_PROBABILITY + 0.01;
     observation.shot_beat_goalkeeper_probability = 0.02;
     observation.immediate_dispossession_risk = SHOT_BAILOUT_DISPOSSESSION_RISK + 0.01;
@@ -27876,7 +27952,12 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
 }
 
 #[test]
-fn striker_shot_window_extends_to_thirty_yards() {
+fn striker_shot_window_allows_thirty_yard_attempts_while_generic_shot_stays_keeper_gated() {
+    // Merged shot-distance discipline. The GENERIC speculative shot stays keeper-dependent beyond
+    // the discouraged range (origin/alex-1), but a STRIKER backs himself inside his shot window up
+    // to the hard 30yd cap: per the user's item-5 spec a 20-30yd shot is reward-PENALISED, not
+    // hard-gated on the keeper — so it stays a legal attempt for a forward even against a set
+    // keeper (the keeper being out only makes it a better idea, never a requirement).
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 1416,
@@ -27897,12 +27978,22 @@ fn striker_shot_window_extends_to_thirty_yards() {
     observation.shot_block_probability = 0.20;
     observation.shot_on_frame_probability = STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY + 0.02;
     observation.shot_beat_goalkeeper_probability = STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY + 0.02;
+    observation.opposing_goalkeeper_out_of_position = 0.0;
 
+    // Generic discretionary shot: keeper-dependent, so it stays OFF against a set keeper.
     assert!(!shot_decision_is_qualified(&observation));
+    // Striker in his window: a legal (reward-penalised) attempt even against a set keeper.
+    assert!(
+        striker_shot_window_is_qualified(&observation, PlayerRole::Forward),
+        "a striker attempts from his shot window up to 30yd (penalised, not keeper-gated)"
+    );
+    // A keeper off his line only makes it a better idea; the striker still qualifies.
+    observation.opposing_goalkeeper_out_of_position = LONG_SHOT_GK_TOTALLY_OUT + 0.05;
     assert!(striker_shot_window_is_qualified(
         &observation,
         PlayerRole::Forward
     ));
+    // The window is a striker's privilege — a midfielder gets no such latitude here.
     assert!(!striker_shot_window_is_qualified(
         &observation,
         PlayerRole::Midfielder
@@ -34920,6 +35011,60 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
         .reward_events
         .iter()
         .any(|event| event.tick == sim.tick && (event.amount - 30.0).abs() < 1e-9));
+}
+
+#[test]
+fn shot_on_target_contextualizes_recent_attacking_decisions_inside_twenty() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 1571,
+        ..Default::default()
+    });
+    sim.tick = 120;
+    let before = WorldSnapshot::from_match(&sim);
+    push_contextual_goal_credit_history(&mut sim, &before);
+    let attack_dir = Team::Home.attack_dir();
+    let goal_y = if attack_dir > 0.0 {
+        sim.config.field_length_yards
+    } else {
+        0.0
+    };
+    let shooter_idx = sim.players.iter().position(|p| p.id == 9).unwrap();
+    sim.players[shooter_idx].position = Vec2::new(
+        sim.config.field_width_yards * 0.5,
+        goal_y - attack_dir * 12.0,
+    );
+    let expected_pool =
+        SHOT_ON_TARGET_REWARD_POINTS * sim.shot_reward_distance_scale(Team::Home, 9);
+
+    sim.record_shot_on_target_rewards(Team::Home, 9);
+
+    let total = sim
+        .deferred_reward_transitions
+        .iter()
+        .filter(|transition| transition.team == Team::Home)
+        .map(|transition| transition.reward)
+        .sum::<f64>();
+    assert!((total - expected_pool).abs() < 1e-9);
+    assert_eq!(
+        sim.deferred_reward_transitions
+            .iter()
+            .filter(|transition| transition.team == Team::Home)
+            .count(),
+        3
+    );
+    assert!(sim
+        .deferred_reward_transitions
+        .iter()
+        .any(|transition| transition.action == "pass" && transition.reward > 0.0));
+    assert!(sim
+        .deferred_reward_transitions
+        .iter()
+        .any(|transition| transition.action == "shoot" && transition.reward > 0.0));
+    assert!(sim
+        .reward_events
+        .iter()
+        .any(|event| event.kind == SoccerRewardEventKind::ShotOnTarget));
 }
 
 #[test]
@@ -72864,13 +73009,39 @@ fn pass_anticipation_first_touch_flicks_onto_a_forward_runner() {
     );
 }
 
+fn resisted_airborne_distance_for_pass(pass: &PendingPass) -> (f64, f64) {
+    let mut speed = pass.launch_speed_yps.max(0.0);
+    let mut covered = 0.0;
+    let mut elapsed = 0.0;
+    let apex = pass_loft_apex_yards(pass);
+    let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+    while elapsed < hang_time - 1e-9 {
+        let dt = (hang_time - elapsed).min(DEFAULT_DT_SECONDS);
+        let altitude = pass_ball_altitude_yards(pass, elapsed + dt * 0.5);
+        let step = ball_resistance_after(
+            Vec2::new(speed, 0.0),
+            dt,
+            DEFAULT_BALL_DRAG_PER_TICK,
+            DEFAULT_BALL_AIR_RESISTANCE,
+            DEFAULT_BALL_GRASS_RESISTANCE_YPS2,
+            altitude,
+            DEFAULT_BALL_STOP_SPEED_YPS,
+        );
+        let next_speed = step.velocity.x.max(0.0);
+        covered += (speed + next_speed) * 0.5 * dt;
+        speed = next_speed;
+        elapsed += dt;
+    }
+    (covered, speed)
+}
+
 #[test]
 fn weak_long_aerial_does_not_float_in_the_air() {
     // Regression: a lofted ball is now a true gravity projectile, so it comes down at its hang
-    // time T = 2·√(2·apex/g) regardless of pace and can never float. The horizontal floor then
-    // keeps a weak ball from also landing badly short: launch speed is floored at distance / T
-    // so the ball reaches the target within the same believable airtime (~2.2s for a 20ft loft,
-    // ~2.7s for the 30ft ceiling). This guards the worst case: a low-power, low-skill long ball.
+    // time T = 2·√(2·apex/g) regardless of pace and can never float. The x-y physics must also
+    // keep carrying through that same window: launch speed is calibrated from distance / T and
+    // airborne drag is light enough that the ball does not crawl short while gravity ticks.
+    // This guards the worst case: a low-power, low-skill long ball.
     let weak = SkillProfile {
         passing: 0.15,
         passing_completion_rate: 0.15,
@@ -72893,11 +73064,36 @@ fn weak_long_aerial_does_not_float_in_the_air() {
             0.5,
             &mut rng,
         );
+        let pass = PendingPass {
+            team: Team::Home,
+            from: 4,
+            target: Some(9),
+            flight: PassFlight::Aerial,
+            is_cross: false,
+            launch_tick: 123,
+            origin: from,
+            intended_target: target,
+            distance_yards: distance,
+            receiver_openness: 0.50,
+            passer_skill: pass_execution_skill(&weak, PassFlight::Aerial, false),
+            launch_speed_yps: speed,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
         let flight_time = distance / speed;
         assert!(
             flight_time <= 2.85,
             "a {distance:.0}yd aerial floats for {flight_time:.2}s (speed {speed:.1} yps) — \
-             the hang-time ceiling should keep it under ~2.7s"
+             the gravity hang-time ceiling should keep it under ~2.7s"
+        );
+        let (covered, end_speed) = resisted_airborne_distance_for_pass(&pass);
+        assert!(
+            covered >= distance * 0.99,
+            "a {distance:.0}yd aerial should still cover the target before landing; \
+             covered {covered:.1}yd, end_speed {end_speed:.1} yps, launch {speed:.1} yps"
         );
     }
 }
@@ -72949,12 +73145,12 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
         let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
         let flight_time = distance / speed;
         assert!(
-            (6.0 - 1e-9..=10.0 + 1e-9).contains(&apex_feet),
-            "scoop apex should stay in the 6-10ft window, got {apex_feet:.1}ft"
+            (7.0 - 1e-9..=12.25 + 1e-9).contains(&apex_feet),
+            "scoop apex should stay in the 7-12ft window, got {apex_feet:.1}ft"
         );
         assert!(
-            hang_time <= 1.60,
-            "scoop hang time should follow 10ft gravity math, got {hang_time:.2}s for {distance:.0}yd"
+            hang_time <= 1.75,
+            "scoop hang time should follow 12ft gravity math, got {hang_time:.2}s for {distance:.0}yd"
         );
         assert!(
             flight_time <= hang_time + 0.05,
@@ -72964,6 +73160,12 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
         assert!(
             flight_time <= 1.35,
             "scoop should be clipped and snappy, got {flight_time:.2}s for {distance:.0}yd"
+        );
+        let (covered, end_speed) = resisted_airborne_distance_for_pass(&pass);
+        assert!(
+            covered >= distance,
+            "scoop x-y speed should carry to the receiver before gravity lands it; \
+             covered {covered:.1}yd, end_speed {end_speed:.1} yps, launch {speed:.1} yps"
         );
     }
 }

@@ -15,11 +15,12 @@ use serde_json::Value;
 
 use crate::des::general::prng::SeededRandom;
 use crate::des::general::soccer::{
-    MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
-    SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
-    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS, DEFAULT_FIELD_WIDTH_YARDS,
+    MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralBlendConfig,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry,
+    SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
+    SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
+    SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS,
+    DEFAULT_FIELD_WIDTH_YARDS,
 };
 use crate::des::shared::capabilities::RandomSource;
 
@@ -27,6 +28,11 @@ pub const SOCCER_LEARNING_FIXED_SCALE: i64 = 1_000_000;
 pub const SOCCER_POLICY_STATUS_ACTIVE: &str = "active";
 pub const SOCCER_POLICY_STATUS_ARCHIVED: &str = "archived";
 pub const SOCCER_EVOLUTION_MAX_POPULATION_SIZE: usize = 4096;
+const SOCCER_MAPPO_MIN_CLIP_EPSILON: f64 = 0.01;
+const SOCCER_NEURAL_MCTS_MAX_SIMULATIONS: usize = 32;
+const SOCCER_NEURAL_MCTS_MAX_CANDIDATES: usize = 8;
+const SOCCER_NEURAL_MCTS_MAX_DEPTH: usize = 3;
+const SOCCER_NEURAL_MCTS_MAX_EXPLORATION: f64 = 4.0;
 const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.72;
 const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 0.28;
 const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.06;
@@ -984,10 +990,52 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
                 .to_string(),
         );
     }
-    if !(0.0..=1.0).contains(&config.mappo_clip_epsilon) || config.mappo_clip_epsilon <= 0.0 {
+    if !(SOCCER_MAPPO_MIN_CLIP_EPSILON..=1.0).contains(&config.mappo_clip_epsilon) {
         return Err(
-            "mappoClipEpsilon must be in (0, 1] when neural learning is enabled".to_string(),
+            "mappoClipEpsilon must be in [0.01, 1] when neural learning is enabled".to_string(),
         );
+    }
+    Ok(())
+}
+
+pub fn validate_soccer_neural_blend_config_for_learning_run(
+    blend: &SoccerNeuralBlendConfig,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("lambda", blend.lambda),
+        ("tieEpsilon", blend.tie_epsilon),
+        ("mctsExploration", blend.mcts_exploration),
+        ("mctsModelWeight", blend.mcts_model_weight),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("{name} must be finite"));
+        }
+    }
+    if !blend.mcts_enabled {
+        return Ok(());
+    }
+    if blend.mcts_simulations == 0 || blend.mcts_simulations > SOCCER_NEURAL_MCTS_MAX_SIMULATIONS {
+        return Err(format!(
+            "mctsSimulations must be in [1, {SOCCER_NEURAL_MCTS_MAX_SIMULATIONS}] when MCTS is enabled"
+        ));
+    }
+    if !(2..=SOCCER_NEURAL_MCTS_MAX_CANDIDATES).contains(&blend.mcts_candidates) {
+        return Err(format!(
+            "mctsCandidates must be in [2, {SOCCER_NEURAL_MCTS_MAX_CANDIDATES}] when MCTS is enabled"
+        ));
+    }
+    if blend.mcts_depth == 0 || blend.mcts_depth > SOCCER_NEURAL_MCTS_MAX_DEPTH {
+        return Err(format!(
+            "mctsDepth must be in [1, {SOCCER_NEURAL_MCTS_MAX_DEPTH}] when MCTS is enabled"
+        ));
+    }
+    if !(0.0..=SOCCER_NEURAL_MCTS_MAX_EXPLORATION).contains(&blend.mcts_exploration) {
+        return Err(format!(
+            "mctsExploration must be in [0, {SOCCER_NEURAL_MCTS_MAX_EXPLORATION}] when MCTS is enabled"
+        ));
+    }
+    if !(0.0..=1.0).contains(&blend.mcts_model_weight) {
+        return Err("mctsModelWeight must be in [0, 1] when MCTS is enabled".to_string());
     }
     Ok(())
 }
@@ -4156,6 +4204,8 @@ fn run_soccer_learning_game_from_snapshot(
     neural_drain_timeout: Duration,
 ) -> Result<SoccerLearningCompletedGame, String> {
     let started = Instant::now();
+    validate_soccer_neural_learning_config_for_learning_run(&config.neural_learning)?;
+    validate_soccer_neural_blend_config_for_learning_run(&config.neural_blend)?;
     config.seed = config.seed.wrapping_add(episode as u32);
     // Progressive curriculum (off unless SOCCER_CURRICULUM_ENABLED): reshape this game's
     // pitch / length / team-reward share / formation by how many games have completed, so
@@ -4315,6 +4365,7 @@ where
     let mut config = config;
     validate_soccer_q_policy_options_for_learning_run(&config.options)?;
     validate_soccer_neural_learning_config_for_learning_run(&config.match_config.neural_learning)?;
+    validate_soccer_neural_blend_config_for_learning_run(&config.match_config.neural_blend)?;
     let parallel_games = config.parallel_games.clamp(1, 100);
     let (task_tx, task_rx) = mpsc::sync_channel::<SoccerLearningQueueTask>(parallel_games);
     let task_rx = Arc::new(Mutex::new(task_rx));
@@ -4376,6 +4427,14 @@ where
                 ) {
                     first_error = Some(format!(
                         "soccer learning queue neural config invalid for episode {next_episode}: {err}"
+                    ));
+                    break;
+                }
+                if let Err(err) = validate_soccer_neural_blend_config_for_learning_run(
+                    &config.match_config.neural_blend,
+                ) {
+                    first_error = Some(format!(
+                        "soccer learning queue neural blend config invalid for episode {next_episode}: {err}"
                     ));
                     break;
                 }
@@ -5138,8 +5197,8 @@ fn build_policies_from_accumulators(
 mod tests {
     use super::*;
     use crate::des::general::soccer::{
-        MatchStats, PlayerRole, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
-        SoccerNeuralLearningConfig, TacticalPhase,
+        MatchStats, PlayerRole, SoccerNeuralBlendConfig, SoccerNeuralLayerSnapshot,
+        SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, TacticalPhase,
     };
 
     fn league_policies_with_alpha(alpha: f64) -> SoccerTeamQPolicies {
@@ -5944,6 +6003,8 @@ mod tests {
 
         validate_soccer_neural_learning_config_for_learning_run(&neural)
             .expect("default enabled neural learning config should be valid");
+        validate_soccer_neural_blend_config_for_learning_run(&SoccerNeuralBlendConfig::default())
+            .expect("default neural blend config should be valid");
         validate_soccer_evolution_options_for_learning_run(&SoccerEvolutionOptions::default())
             .expect("default evolution options should be valid");
         validate_soccer_q_policy_options_for_learning_run(&SoccerQPolicyOptions::default())
@@ -5992,6 +6053,73 @@ mod tests {
             .expect_err("zero MAPPO clip epsilon should fail fast");
 
         assert!(err.contains("mappoClipEpsilon"), "{err}");
+
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            mappo_clip_epsilon: 0.005,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("sub-minimum MAPPO clip epsilon should fail fast");
+
+        assert!(err.contains("mappoClipEpsilon"), "{err}");
+    }
+
+    #[test]
+    fn learning_run_validator_rejects_mcts_values_that_would_sanitize_silently() {
+        let valid = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        validate_soccer_neural_blend_config_for_learning_run(&valid)
+            .expect("default enabled MCTS config should be valid");
+
+        for (name, blend) in [
+            (
+                "mctsSimulations",
+                SoccerNeuralBlendConfig {
+                    mcts_enabled: true,
+                    mcts_simulations: 0,
+                    ..valid
+                },
+            ),
+            (
+                "mctsCandidates",
+                SoccerNeuralBlendConfig {
+                    mcts_enabled: true,
+                    mcts_candidates: 1,
+                    ..valid
+                },
+            ),
+            (
+                "mctsDepth",
+                SoccerNeuralBlendConfig {
+                    mcts_enabled: true,
+                    mcts_depth: 0,
+                    ..valid
+                },
+            ),
+            (
+                "mctsExploration",
+                SoccerNeuralBlendConfig {
+                    mcts_enabled: true,
+                    mcts_exploration: f64::INFINITY,
+                    ..valid
+                },
+            ),
+            (
+                "mctsModelWeight",
+                SoccerNeuralBlendConfig {
+                    mcts_enabled: true,
+                    mcts_model_weight: 1.5,
+                    ..valid
+                },
+            ),
+        ] {
+            let err = validate_soccer_neural_blend_config_for_learning_run(&blend)
+                .expect_err("invalid MCTS blend config should fail fast");
+            assert!(err.contains(name), "{name}: {err}");
+        }
     }
 
     #[test]
