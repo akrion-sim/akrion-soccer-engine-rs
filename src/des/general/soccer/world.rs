@@ -29831,6 +29831,40 @@ impl WorldSnapshot {
         return is_wide && is_attacker;
     }
 
+    /// Whether this carrier is executing the moving first phase of a byline-cross program.
+    /// Outside midfielders keep their flank assignment; any striker who has received wide may
+    /// also take it on. The carrier remains one independently planned MPC actor while teammates
+    /// enter only as obstacles/support context.
+    pub(crate) fn byline_cross_drive_active_for(&self, player_id: usize) -> bool {
+        let Some(player) = self.players.iter().find(|player| player.id == player_id) else {
+            return false;
+        };
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(player.team)
+            || !(player.role == PlayerRole::Forward || self.is_wide_midfielder(player))
+        {
+            return false;
+        }
+        let strategy = self.tactical_directive(player.team).attack_strategy;
+        if !is_byline_cross_drive_strategy(strategy) {
+            return false;
+        }
+        let current = self.player_snapshot_position(player);
+        let attack_dir = player.team.attack_dir();
+        let in_opposition_half = (current.y - self.field_length * 0.5) * attack_dir > 0.0;
+        let on_wing = flank_lane_score(current, self.field_width) >= 0.30;
+        let on_strategy_side = match strategy {
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot => current.x < self.field_width * 0.5,
+            TeamAttackStrategy::BylineCrossRightToPenaltySpot => current.x > self.field_width * 0.5,
+            _ => false,
+        };
+        let endline_depth = (player.team.goal_y(self.field_length) - current.y).abs();
+        in_opposition_half
+            && on_wing
+            && on_strategy_side
+            && endline_depth > BYLINE_CROSS_RELEASE_DEPTH_YARDS
+    }
+
     fn wingback_attacking_cover_count(&self, player: &PlayerSnapshot) -> usize {
         if self.possession_team() != Some(player.team) || !self.is_wide_defender(player) {
             return 0;
@@ -30012,8 +30046,9 @@ impl WorldSnapshot {
             })
     }
 
-    /// "Crash the box" (the [`TeamAttackStrategy::CrashTheBox`] mechanic). When a team-mate
-    /// is carrying — or has just crossed — from a WIDE area in the attacking final third near
+    /// "Crash the box" support for both the moving byline program and its final
+    /// [`TeamAttackStrategy::CrashTheBox`] release. When a team-mate is carrying — or has just
+    /// crossed — from a WIDE area in the attacking final third near
     /// the opponent's goal, the strikers and advancing attackers attack DISTINCT zones of the
     /// penalty area so the box is PACKED for the delivery rather than one lone runner. Each
     /// eligible crasher is assigned its own zone — near post, far post, penalty spot, and the
@@ -30025,10 +30060,12 @@ impl WorldSnapshot {
         if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
             return None;
         }
-        // Unified with the feature-level box-flood in `flank_cross_arrival_target_for`: the
-        // direct distinct-zone movement override only engages when the team is actually
-        // running the CrashTheBox strategy.
-        if self.tactical_directive(player.team).attack_strategy != TeamAttackStrategy::CrashTheBox {
+        // Unified with the feature-level box-flood in `flank_cross_arrival_target_for`: runners
+        // start catching up during the byline drive and stay committed through the release.
+        let attack_strategy = self.tactical_directive(player.team).attack_strategy;
+        if attack_strategy != TeamAttackStrategy::CrashTheBox
+            && !is_byline_cross_drive_strategy(attack_strategy)
+        {
             return None;
         }
         if self.possession_team() != Some(player.team)
@@ -30063,8 +30100,14 @@ impl WorldSnapshot {
         if flank_lane_score(crosser, self.field_width) < 0.55 {
             return None;
         }
-        // Crosser must be in the attacking final third (within ~22yd of the opponent goal).
-        if (goal_y - crosser.y) * dir > 22.0 || (goal_y - crosser.y) * dir < 0.0 {
+        // During a byline drive, begin the box runs early enough for trailing attackers to catch
+        // up. The final release phase keeps the tighter historical 22-yard trigger.
+        let max_crosser_depth = if is_byline_cross_drive_strategy(attack_strategy) {
+            self.field_length * 0.36
+        } else {
+            22.0
+        };
+        if (goal_y - crosser.y) * dir > max_crosser_depth || (goal_y - crosser.y) * dir < 0.0 {
             return None;
         }
         let current = self.player_snapshot_position(player);
@@ -30178,7 +30221,8 @@ impl WorldSnapshot {
         let crash_far_six = Vec2::new(center_x - source_side * 4.6, goal_y - dir * 5.8);
         let crash_penalty = Vec2::new(center_x - source_side * 0.8, goal_y - dir * 10.8);
         let current = self.player_snapshot_position(me);
-        let crashing_box = matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
+        let crashing_box = matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox)
+            || is_byline_cross_drive_strategy(directive.attack_strategy);
         let candidates: &[Vec2] = if crashing_box && me.role == PlayerRole::Forward {
             &[
                 crash_near_six,
@@ -31696,6 +31740,23 @@ impl WorldSnapshot {
             self.field_width * 0.5,
             player.team.goal_y(self.field_length),
         );
+        if self.byline_cross_drive_active_for(player.id) {
+            let strategy = self.tactical_directive(player.team).attack_strategy;
+            let corner_x = match strategy {
+                TeamAttackStrategy::BylineCrossLeftToPenaltySpot => 2.5,
+                TeamAttackStrategy::BylineCrossRightToPenaltySpot => self.field_width - 2.5,
+                _ => current.x,
+            };
+            let corner_target = Vec2::new(
+                corner_x,
+                goal.y - player.team.attack_dir() * 3.0,
+            )
+            .clamp_to_pitch(self.field_width, self.field_length);
+            let toward_corner = (corner_target - current).normalized();
+            if toward_corner.len() > 1e-6 && toward_corner.dot(straight) > 0.20 {
+                return toward_corner;
+            }
+        }
         let yards_to_goal = (goal.y - current.y).abs();
         let goal_approach_carry_yards = tunables().shooting.goal_approach_carry_yards;
         if yards_to_goal > goal_approach_carry_yards {
@@ -31774,7 +31835,12 @@ impl WorldSnapshot {
                 .unwrap_or_else(|| Vec2::new(0.0, me.team.attack_dir())),
             _ => touch.direction_for_team(me.team),
         };
-        let direction = self.attacking_dribble_goal_drive_direction(me, current, direction, kind);
+        let byline_drive_active = self.byline_cross_drive_active_for(player_id);
+        let direction = if byline_drive_active {
+            direction
+        } else {
+            self.attacking_dribble_goal_drive_direction(me, current, direction, kind)
+        };
         // Under steal pressure, keep the defender build-up cushion and let attacking
         // carriers burst away into the best nearby space instead of carrying straight
         // into the tackle.
@@ -31791,14 +31857,18 @@ impl WorldSnapshot {
                 );
                 target = target * 0.72 + through_target * 0.28;
             }
-        } else if touch.distance_yards <= DRIBBLE_TOUCH_LEAD_YARDS + 0.10 {
+        } else if !byline_drive_active
+            && touch.distance_yards <= DRIBBLE_TOUCH_LEAD_YARDS + 0.10
+        {
             target = self.shot_creation_space_for(player_id, home);
         }
 
-        if let Some(goalmouth_target) =
-            self.goalmouth_carry_target_for_touch(player_id, current, target, kind, touch)
-        {
-            target = goalmouth_target;
+        if !byline_drive_active {
+            if let Some(goalmouth_target) =
+                self.goalmouth_carry_target_for_touch(player_id, current, target, kind, touch)
+            {
+                target = goalmouth_target;
+            }
         }
 
         // Drive to the corner flag: a committed wide carrier heads for the byline corner (then
