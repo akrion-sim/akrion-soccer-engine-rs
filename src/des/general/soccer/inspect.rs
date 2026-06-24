@@ -98,7 +98,11 @@ pub struct BallInspect {
     /// Last touch: `-1` none, `0` Home, `1` Away.
     pub last_touch_team: i8,
     pub carry_orbit_wrap_unlocked: u8,
-    pub _pad: [u8; 2],
+    /// What the ball IS this frame, so a renderer can style it distinctly (a shot must
+    /// read as a fast strike from frame one, never like a pass): 0 loose/dribble,
+    /// 1 ground pass in flight, 2 lofted/aerial pass in flight, 3 SHOT in flight.
+    pub flight_kind: u8,
+    pub _pad: [u8; 1],
 }
 
 /// Compact central-brain / team-shape view (decision/brain internals).
@@ -355,7 +359,10 @@ impl BallInspect {
             holder: b.holder.map(|h| h as i32).unwrap_or(-1),
             last_touch_team: b.last_touch_team.map(|t| team_to_u8(t) as i8).unwrap_or(-1),
             carry_orbit_wrap_unlocked: u8::from(b.carry_orbit_wrap_unlocked),
-            _pad: [0; 2],
+            // `from_ball` only sees ball kinematics; `FrameInspect::capture` overwrites this
+            // from the match's pending shot/pass state (the only place that knows intent).
+            flight_kind: 0,
+            _pad: [0; 1],
         }
     }
 }
@@ -411,6 +418,18 @@ impl FrameInspect {
             score_home: sim.score_home,
             score_away: sim.score_away,
             ..FrameInspect::default()
+        };
+        // A live shot in flight outranks everything: it must render as a strike, not a pass.
+        frame.ball.flight_kind = if sim.pending_shot.is_some() {
+            3
+        } else if let Some(pass) = sim.pending_pass.as_ref() {
+            if pass.flight.is_aerial() {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
         };
         let n = sim.players.len().min(INSPECT_MAX_PLAYERS);
         for (slot, p) in frame.players[..n].iter_mut().zip(sim.players.iter()) {
