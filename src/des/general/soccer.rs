@@ -9730,12 +9730,14 @@ pub(crate) fn soccer_marl_adjusted_reward(
     };
     let own_average = tick_reward.average_for(transition.team);
     let opponent_average = tick_reward.average_for(transition.team.other());
-    let shared_reward = {
-        let share = config.sanitized_mappo_team_reward_share();
-        (1.0 - share) * intermediate + share * own_average
-    };
+    // The cooperative-credit SHARE is already folded into `intermediate` above (the
+    // `shared` blend toward `own_avg`). Re-blending `intermediate` toward `own_average` a
+    // second time would double-count the team-reward share — its effect would grow roughly
+    // quadratically in `share` — a merge artifact of stacking the two convergent shapings.
+    // "Theirs" is purely the zero-sum centralized component below, so add it to
+    // `intermediate` directly. At `share = 0` (the default) this is byte-identical.
     let team_component = own_average - opponent_average;
-    shared_reward + team_component * config.sanitized_marl_team_reward_weight()
+    intermediate + team_component * config.sanitized_marl_team_reward_weight()
 }
 
 fn soccer_full_game_replay_transitions(
