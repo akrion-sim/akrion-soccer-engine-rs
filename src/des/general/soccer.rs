@@ -2929,6 +2929,12 @@ const HOLD_FOR_SUPPORT_SUMMON_RUN_FLOOR: f64 = 0.66;
 const HOLD_FOR_SUPPORT_SUMMON_POSITION_FLOOR: f64 = 0.50;
 /// ...and the hold-your-shape option is lifted so the player settles into its slot/open lane.
 const HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE: f64 = 1.25;
+/// A wide attacker in the opposition half carries toward the corner until reaching this
+/// end-line depth, then the team changes from the byline drive to the cross-release phase.
+const BYLINE_CROSS_RELEASE_DEPTH_YARDS: f64 = 11.0;
+/// Minimum normalized distance from pitch center for the committed byline program. This is
+/// deliberately wider than the generic left/right strategy-lane split: it is for true wingers.
+const BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER: f64 = 0.52;
 /// Over-the-top run trigger: minimum cos-angle between the holder's facing and the
 /// direction to the runner for "eye contact" (≈ within 60°) — the holder is looking up
 /// at the runner before they commit to breaking the line.
@@ -15091,6 +15097,14 @@ fn flank_attack_policy_for_team(
     }
 }
 
+fn is_byline_cross_drive_strategy(strategy: TeamAttackStrategy) -> bool {
+    matches!(
+        strategy,
+        TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+            | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+    )
+}
+
 fn tactical_directive_for_team(
     team: Team,
     phase: TacticalPhase,
@@ -15360,8 +15374,8 @@ fn tactical_directive_for_team(
     // making the one-two a deliberate team strategy rather than a rarely-selected option.
     let in_final_third =
         has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length / 3.0;
-    // Deep into the attacking quarter (near the byline) — the trigger for getting to the
-    // goal-line and crossing back to the penalty spot rather than a shorter overlap cross.
+    // Deep into the attacking quarter (near the byline) — retained for narrower overlap/cutback
+    // choices. True wide attackers enter the committed byline program from the opposition half.
     let deep_in_attack =
         has_ball && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.18;
     let half_width = (field_width * 0.5).max(1.0);
@@ -15372,11 +15386,17 @@ fn tactical_directive_for_team(
     let attack_progress =
         ((ball_position.y - field_length * 0.5) * team.attack_dir() / (field_length * 0.5).max(1.0))
             .clamp(-1.0, 1.0);
-    let crash_box_context = has_ball
+    let endline_depth = (team.goal_y(field_length) - ball_position.y).abs();
+    let wide_cross_program_context = has_ball
         && flank_attack_policy.is_flank()
-        && in_final_third
-        && width_from_center >= 0.58
-        && (team.goal_y(field_length) - ball_position.y).abs() <= field_length * 0.30;
+        && attacking_phase
+        && attack_progress > 0.0
+        && width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+        && !matches!(ball_side, StrategyLane::Center);
+    let byline_drive_context =
+        wide_cross_program_context && endline_depth > BYLINE_CROSS_RELEASE_DEPTH_YARDS;
+    let crash_box_context =
+        wide_cross_program_context && endline_depth <= BYLINE_CROSS_RELEASE_DEPTH_YARDS;
     let pressure_fit = ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64
         + 2.0)
         / 5.0)
@@ -15408,6 +15428,12 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::TransitionBurstOnRegain
     } else if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
+    } else if byline_drive_context {
+        match ball_side {
+            StrategyLane::Left => TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
+            StrategyLane::Right => TeamAttackStrategy::BylineCrossRightToPenaltySpot,
+            StrategyLane::Center => unreachable!("wide byline context cannot be central"),
+        }
     } else if crash_box_context {
         TeamAttackStrategy::CrashTheBox
     } else if build_up_phase {
@@ -15704,7 +15730,9 @@ fn tactical_directive_for_team(
     } else {
         TeamAttackStrategy::HoldUpfieldUntilOpening
     };
-    if matches!(attack_strategy, TeamAttackStrategy::CrashTheBox) {
+    if matches!(attack_strategy, TeamAttackStrategy::CrashTheBox)
+        || is_byline_cross_drive_strategy(attack_strategy)
+    {
         flank_overlap_run_probability = flank_overlap_run_probability.max(0.78).clamp(0.0, 0.86);
     }
     let defense_strategy = if leading && defending {

@@ -40725,7 +40725,7 @@ fn flank_cross_policy_sends_box_runners_to_low_and_high_arrival_lanes() {
 }
 
 #[test]
-fn wide_final_third_wing_possession_selects_crash_the_box_strategy() {
+fn wide_opposition_half_possession_selects_byline_drive_before_cross_release() {
     let config = MatchConfig::default();
     let directive = tactical_directive_for_team(
         Team::Home,
@@ -40745,14 +40745,169 @@ fn wide_final_third_wing_possession_selects_crash_the_box_strategy() {
         false,
     );
 
-    assert_eq!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
+    assert_eq!(
+        directive.attack_strategy,
+        TeamAttackStrategy::BylineCrossRightToPenaltySpot
+    );
     assert!(
         directive.flank_attack_policy.is_flank(),
-        "crash the box should be tied to an active flank/cross policy: {directive:?}"
+        "the byline drive should be tied to an active flank/cross policy: {directive:?}"
     );
     assert!(
         directive.flank_overlap_run_probability >= 0.78,
-        "crash the box should lift cross support urgency: {directive:?}"
+        "the drive should summon urgent cross support before the carrier reaches the line: {directive:?}"
+    );
+}
+
+#[test]
+fn wide_byline_drive_transitions_to_crash_the_box_inside_release_depth() {
+    let config = MatchConfig::default();
+    let directive = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(
+            config.field_width_yards * 0.91,
+            config.field_length_yards - (BYLINE_CROSS_RELEASE_DEPTH_YARDS - 1.0),
+        ),
+        0,
+        config.field_width_yards,
+        config.field_length_yards,
+        DefensiveCoverProfile::default(),
+        AttackingOverloadProfile {
+            attackers: 5,
+            defenders: 4,
+            advantage: 1,
+            score: 0.70,
+        },
+        false,
+    );
+
+    assert_eq!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
+    assert!(directive.flank_attack_policy.is_flank());
+    assert!(directive.flank_overlap_run_probability >= 0.78);
+}
+
+#[test]
+fn byline_program_drives_wide_striker_toward_corner_while_teammates_catch_up() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let crosser = 9;
+    let runner = 8;
+    let origin = Vec2::new(69.0, 84.0);
+    sim.players[crosser].role = PlayerRole::Forward;
+    sim.players[crosser].position = origin;
+    sim.players[crosser].home_position = Vec2::new(40.0, 82.0);
+    sim.players[runner].role = PlayerRole::Midfielder;
+    sim.players[runner].position = Vec2::new(38.0, 78.0);
+    sim.players[runner].home_position = sim.players[runner].position;
+    sim.ball.holder = Some(crosser);
+    sim.ball.position = origin;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(18.0 + (away - 11) as f64 * 4.0, 114.0);
+    }
+
+    let mut directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        sim.config.field_width_yards,
+        sim.config.field_length_yards,
+    );
+    directive.attack_strategy = TeamAttackStrategy::BylineCrossRightToPenaltySpot;
+    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    directive.flank_overlap_run_probability = 0.80;
+    sim.central_brain.home_directive = directive;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(snapshot.byline_cross_drive_active_for(crosser));
+    let target = snapshot.dribble_move_target_for_touch(
+        crosser,
+        sim.players[crosser].home_position,
+        DribbleMoveKind::CarryForward,
+        DribbleTouchDecision::new(0, 3.2),
+    );
+    assert!(
+        target.y > origin.y + 2.0,
+        "byline program must keep making end-line progress: origin={origin:?} target={target:?}"
+    );
+    assert!(
+        target.x > origin.x,
+        "right-wing drive should bend toward the right corner flag: origin={origin:?} target={target:?}"
+    );
+
+    let arrival = snapshot
+        .crash_the_box_target_for(&snapshot.players[runner])
+        .expect("a teammate should begin its box run while the carrier is still driving");
+    assert!(
+        arrival.y > sim.players[runner].position.y + 8.0,
+        "the drive should buy time for a committed box-arrival run: {arrival:?}"
+    );
+
+    let observation = snapshot.observation_for(crosser);
+    let options = sim.players[crosser].possession_action_options(
+        &observation,
+        snapshot.tactical_directive(Team::Home),
+        1,
+        1,
+        true,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    let carry = options
+        .iter()
+        .find(|option| option.label == "carry-forward")
+        .expect("byline carrier should retain carry-forward");
+    assert!(carry.legal && carry.score >= 1.10, "options={options:?}");
+    assert!(
+        options
+            .iter()
+            .filter(|option| matches!(option.label.as_str(), "flank-low-cross" | "flank-high-cross"))
+            .all(|option| !option.legal),
+        "the carrier should drive before releasing the cross: {options:?}"
+    );
+}
+
+#[test]
+fn byline_release_phase_strongly_prefers_configured_high_cross() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let crosser = 9;
+    let position = Vec2::new(74.0, 112.0);
+    sim.players[crosser].role = PlayerRole::Forward;
+    sim.players[crosser].position = position;
+    sim.ball.holder = Some(crosser);
+    sim.ball.position = position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        sim.config.field_width_yards,
+        sim.config.field_length_yards,
+    );
+    directive.attack_strategy = TeamAttackStrategy::CrashTheBox;
+    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    directive.flank_overlap_run_probability = 0.80;
+    sim.central_brain.home_directive = directive;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(crosser);
+    let options = sim.players[crosser].possession_action_options(
+        &observation,
+        snapshot.tactical_directive(Team::Home),
+        1,
+        1,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    let high_cross = options
+        .iter()
+        .find(|option| option.label == "flank-high-cross")
+        .expect("release phase should expose the high cross");
+    assert!(high_cross.legal, "options={options:?}");
+    assert!(
+        high_cross.score >= 0.90,
+        "configured high cross should dominate at the byline release: {options:?}"
     );
 }
 

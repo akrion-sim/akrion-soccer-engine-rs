@@ -2883,6 +2883,36 @@ impl PlayerAgent {
         // In our own half, retention (shielding / safe dribbling) takes priority over
         // risky attacking dribbling — keep the ball rather than forcing it forward.
         let own_half = observation.yards_to_own_goal < observation.yards_to_goal;
+        let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
+            field_width_yards
+        } else {
+            DEFAULT_FIELD_WIDTH_YARDS
+        };
+        let lateral_position = self.position.x.clamp(0.0, field_width);
+        let left_room = if self.team == Team::Home {
+            lateral_position
+        } else {
+            field_width - lateral_position
+        };
+        let right_room = if self.team == Team::Home {
+            field_width - lateral_position
+        } else {
+            lateral_position
+        };
+        let flank_lane_fit = ((lateral_position - field_width * 0.5).abs()
+            / (field_width * 0.5).max(1.0))
+        .clamp(0.0, 1.0);
+        let outside_midfielder = self.role == PlayerRole::Midfielder
+            && (self.home_position.x < field_width * 0.30
+                || self.home_position.x > field_width * 0.70);
+        let eligible_byline_carrier = self.role == PlayerRole::Forward || outside_midfielder;
+        let byline_drive_active = eligible_byline_carrier
+            && flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+            && is_byline_cross_drive_strategy(directive.attack_strategy);
+        let byline_cross_release = eligible_byline_carrier
+            && flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+            && directive.attack_strategy == TeamAttackStrategy::CrashTheBox
+            && directive.flank_attack_policy.is_flank();
         // A ball-carrying keeper under proximate pressure should strongly prefer a
         // release, but it is no longer illegal to carry with the feet. The risk is
         // modeled as a score damp on carry/dribble options plus a lift to release
@@ -3182,7 +3212,12 @@ impl PlayerAgent {
             // half (more so when pressured) in favour of keeping the ball.
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 }
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, 1.46);
+            .clamp(0.01, 1.46)
+            .max(if byline_drive_active {
+                (1.10 + forward_space_fit * 0.18 + crossing * 0.12).clamp(1.10, 1.38)
+            } else {
+                0.0
+            });
         let vertical_attack_legal = carry_forward_legal
             && self.role != PlayerRole::Goalkeeper
             && observation.yards_to_goal < observation.yards_to_own_goal
@@ -3225,25 +3260,6 @@ impl PlayerAgent {
             * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50)
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, 0.92);
-        let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
-            field_width_yards
-        } else {
-            DEFAULT_FIELD_WIDTH_YARDS
-        };
-        let lateral_position = self.position.x.clamp(0.0, field_width);
-        let left_room = if self.team == Team::Home {
-            lateral_position
-        } else {
-            field_width - lateral_position
-        };
-        let right_room = if self.team == Team::Home {
-            field_width - lateral_position
-        } else {
-            lateral_position
-        };
-        let flank_lane_fit = ((lateral_position - field_width * 0.5).abs()
-            / (field_width * 0.5).max(1.0))
-        .clamp(0.0, 1.0);
         let flank_policy_active = directive.flank_attack_policy.is_flank();
         let flank_drive_multiplier = if flank_policy_active {
             (1.0 + (1.0 - flank_lane_fit) * 0.26 + directive.flank_overlap_run_probability * 0.20)
@@ -3647,7 +3663,8 @@ impl PlayerAgent {
         let flank_cross_legal_context =
             flank_cross_context_is_legal(observation, self.position, field_width)
                 && !goal_attack_shot_blocks_alternatives
-                && (!goalmouth_carry_forced || directive.flank_attack_policy.is_flank());
+                && (!goalmouth_carry_forced || directive.flank_attack_policy.is_flank())
+                && !byline_drive_active;
         let low_cross_score = (self.preferences.pass_bias
             * directive.pass_priority
             * (0.42 + passing * 0.24 + crossing * 0.42)
@@ -3663,7 +3680,14 @@ impl PlayerAgent {
             * hold_release_multiplier
             * pressured_release_multiplier(observation)
             * low_cross_multiplier)
-            .clamp(0.01, 0.86);
+            .clamp(0.01, 0.86)
+            .max(if byline_cross_release
+                && directive.flank_attack_policy.prefers_low_cross()
+            {
+                (0.90 + crossing * 0.08).clamp(0.90, 0.98)
+            } else {
+                0.0
+            });
         options.push(AgentActionOptionTrace::new(
             "flank-low-cross",
             low_cross_score,
@@ -3696,7 +3720,14 @@ impl PlayerAgent {
             * hold_release_multiplier
             * pressured_release_multiplier(observation)
             * high_cross_multiplier)
-            .clamp(0.01, 0.78);
+            .clamp(0.01, 0.78)
+            .max(if byline_cross_release
+                && directive.flank_attack_policy.prefers_high_cross()
+            {
+                (0.90 + crossing * 0.08).clamp(0.90, 0.98)
+            } else {
+                0.0
+            });
         options.push(AgentActionOptionTrace::new(
             "flank-high-cross",
             high_cross_score,
@@ -7307,6 +7338,7 @@ impl PlayerAgent {
             // this window. Never offered when something decisive is already on — it is the patient
             // "let the play set up" choice, not a substitute for a shot or a killer ball.
             let hold_for_support_option = snapshot.hold_for_support_option_for(self.id);
+            let byline_corner_drive = snapshot.byline_cross_drive_active_for(self.id);
             let mut hold_for_support_offered = false;
             if let Some(plan) = hold_for_support_option.as_ref() {
                 let decisive_on = observation.threaded_goal_pass_available
@@ -8227,10 +8259,14 @@ impl PlayerAgent {
                                 &observation,
                                 self.role,
                             ) {
-                                // Keep the ball: a controlled body-shield (reusing the protect-ball
-                                // dribble execution) while the summoned teammates get into position
-                                // — the carrier does NOT release yet.
-                                let kind = DribbleMoveKind::ProtectBall;
+                                // Keep the ball while summoned teammates get into position. A wide
+                                // attacker executing the byline program keeps MOVING toward the
+                                // corner; other carriers retain the controlled body-shield.
+                                let kind = if byline_corner_drive {
+                                    DribbleMoveKind::CarryForward
+                                } else {
+                                    DribbleMoveKind::ProtectBall
+                                };
                                 let touch = snapshot
                                     .deterministic_dribble_touch_decision_for(self.id, kind);
                                 let target = snapshot.dribble_move_target_for_touch(
