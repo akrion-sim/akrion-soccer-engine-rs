@@ -4698,7 +4698,21 @@ impl SoccerMatch {
                 .mappo_enabled()
                 .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
             if let Some(policy_head) = &mut self.policy_head {
-                policy_head.train(&policy_samples, mappo_clip_epsilon);
+                // PPO/MAPPO sample reuse: take K clipped epochs over the same frozen
+                // batch (`policy_samples` — `old_action_probability` baked in once, from
+                // the behavior policy that played the game). Epoch 1's ratio ≈ 1 (clip
+                // is a no-op); epochs 2..K compute the ratio against that frozen old-prob,
+                // so the clipped surrogate enforces the trust region. Multi-epoch only
+                // when the clip is active — re-iterating an unclipped batch would just
+                // overfit it. `SOCCER_MAPPO_EPOCHS=1` ⇒ prior single-pass behavior.
+                let epochs = if mappo_clip_epsilon.is_some() {
+                    soccer_mappo_epochs()
+                } else {
+                    1
+                };
+                for _ in 0..epochs {
+                    policy_head.train(&policy_samples, mappo_clip_epsilon);
+                }
             }
         }
         if !world_model_pairs.is_empty() {
@@ -16960,6 +16974,28 @@ pub(crate) fn dd_soccer_lookahead_depth() -> usize {
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .unwrap_or(0)
+    })
+}
+
+/// Number of PPO/MAPPO optimization epochs the actor takes over each game's frozen
+/// policy batch. The actor trains once per full game (`apply_full_game_learning_if_ready`)
+/// on the whole-game replay, with `old_action_probability` captured from the behavior
+/// policy that played the game — so this is canonical PPO: collect a trajectory under
+/// π_old, then take K clipped epochs against that frozen reference. Epoch 1 has ratio ≈ 1
+/// (the clip is a no-op), so the clipped surrogate only *bites* from epoch 2 onward — which
+/// is exactly why a single epoch left the MAPPO clip inert. Default 4; `1` reproduces the
+/// prior single-pass behavior byte-for-byte. Clamped to [1, 30]; read once per process.
+/// Only applied when the MAPPO clip is active (otherwise re-iterating an unclipped batch
+/// would just overfit it), so non-MAPPO runs stay single-pass.
+pub(crate) fn soccer_mappo_epochs() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_MAPPO_EPOCHS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 30)
     })
 }
 
