@@ -6459,37 +6459,30 @@ impl PlayerAgent {
             // WALL RETURN (the "two" of a one-two): return the lay-off before
             // generic first-touch logic turns the combination into an ordinary pass.
             if let Some(runner) = snapshot.wall_return_pass_target_for(self.id) {
-                let return_reliability = (0.70
-                    + ability01(self.skills.first_touch) * 0.20
-                    + ability01(self.skills.passing) * 0.10)
-                    .clamp(0.0, 0.97);
-                if agentic_action_commitment(
-                    return_reliability,
-                    snapshot.dt_seconds,
-                    &observation,
-                    self.role,
-                ) {
-                    let action = SoccerAction::Pass {
-                        target_player: Some(runner),
-                        power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
-                        flight: PassFlight::Floor,
-                    };
-                    self.last_decision = Some(self.decision_trace(
-                        snapshot,
-                        mdp_state.clone(),
-                        observation.clone(),
-                        belief.clone(),
-                        vec!["wall-return".to_string()],
-                        single_action_option("wall-return"),
-                        &action,
-                        "wall-return",
-                    ));
-                    return PlayerIntent {
-                        player_id: self.id,
-                        action,
-                        sprint: false,
-                    };
-                }
+                // `wall_return_pass_target_for` has already checked the live commitment,
+                // offside, and both the led and feet lanes. Once that coordinated pattern is
+                // legal, do not roll another appetite check: deferring for generic first-touch
+                // logic was turning most chosen wall passes into unrelated possessions.
+                let action = SoccerAction::Pass {
+                    target_player: Some(runner),
+                    power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
+                    flight: PassFlight::Floor,
+                };
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state.clone(),
+                    observation.clone(),
+                    belief.clone(),
+                    vec!["wall-return".to_string()],
+                    single_action_option("wall-return"),
+                    &action,
+                    "wall-return",
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint: false,
+                };
             }
 
             // Named one-two / give-and-go strategies commit to the wall pass before

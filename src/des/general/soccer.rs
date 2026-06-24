@@ -2891,10 +2891,10 @@ const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
 /// The wall needs at least this much space to turn the ball around first-time.
 const WALL_PASS_PARTNER_MIN_SPACE_YARDS: f64 = 2.0;
 /// A one-two commitment lapses this many seconds after the give if the return never comes.
-/// Longer than a single touch so the runner genuinely COMMITS to the give-and-go (bursts
-/// past his man and holds the line of the run waiting for the return) rather than abandoning
-/// it the instant the wall doesn't return it first-time.
-const WALL_PASS_RUN_TTL_SECONDS: f64 = 2.4;
+/// The window covers the give travelling to the wall, the wall's first touch, and the led
+/// return travelling back to the runner. A shorter window expired too many combinations while
+/// the ball was still moving, so the apparent wall pass rarely completed as a give-and-go.
+const WALL_PASS_RUN_TTL_SECONDS: f64 = 3.6;
 /// Base appetite to attempt an available wall pass (scaled by quality, pressure, skill,
 /// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare — the
 /// one-two is a primary attacking route, so when a clean combination is on it is taken often.
@@ -15103,7 +15103,9 @@ fn flank_attack_policy_for_team(
         + phase_bonus
         + if own_half_possession { 0.06 } else { 0.0 })
     .clamp(0.10, 0.74);
-    if flank_score < 0.45 {
+    // Activate from a central attacking platform too: waiting until the ball was already wide
+    // made flank play self-defeating (the policy that creates width required width first).
+    if flank_score < 0.40 {
         return FlankAttackPolicy::None;
     }
 

@@ -10879,6 +10879,18 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         high_overload,
         false,
     );
+    let central = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(DEFAULT_FIELD_WIDTH_YARDS * 0.5, 76.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        low_overload,
+        false,
+    );
     let no_possession = tactical_directive_for_team(
         Team::Home,
         TacticalPhase::HomeAttack,
@@ -10899,6 +10911,10 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
     assert_eq!(
         high.flank_attack_policy,
         FlankAttackPolicy::PlayDownFlankHighCross
+    );
+    assert!(
+        central.flank_attack_policy.is_flank(),
+        "central attacking possession should activate the policy that creates width"
     );
     assert!(low.flank_overlap_run_probability + 1e-9 >= FLANK_OVERLAP_MIN_OPTION_SHARE);
     assert!(high.flank_overlap_run_probability + 1e-9 >= FLANK_OVERLAP_MIN_OPTION_SHARE);
@@ -35147,6 +35163,18 @@ fn nested_sub_maneuver_pairs_inside_team_shape() {
     let wide =
         select_nested_sub_maneuver(TeamAttackStrategy::PatientPossessionProbe, w * 0.1, w, true);
     assert_eq!(wide, Some(TeamAttackStrategy::WingOverlapLeftCross));
+    let left_half_space =
+        select_nested_sub_maneuver(TeamAttackStrategy::PatientPossessionProbe, w * 0.3, w, true);
+    assert_eq!(
+        left_half_space,
+        Some(TeamAttackStrategy::OneTwoLeftRelease)
+    );
+    let right_half_space =
+        select_nested_sub_maneuver(TeamAttackStrategy::PatientPossessionProbe, w * 0.7, w, true);
+    assert_eq!(
+        right_half_space,
+        Some(TeamAttackStrategy::OneTwoRightRelease)
+    );
     // A Pair primary won't nest another Pair (same layer = exclusive); none out of possession.
     assert_eq!(
         select_nested_sub_maneuver(TeamAttackStrategy::GiveAndGoCentral, w * 0.5, w, true),
@@ -73224,6 +73252,33 @@ fn wall_partner_returns_first_time_to_committed_runner() {
         snapshot.wall_return_pass_target_for(wall),
         Some(runner),
         "the wall should return the ball first-time to the committed runner"
+    );
+
+    // Once the live return lane is legal, the wall must execute it rather than roll a second
+    // probabilistic appetite check and fall into generic first-touch/pass selection.
+    sim.players[wall].skills.first_touch = 1.0;
+    sim.players[wall].skills.passing = 1.0;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut wall_agent = sim.players[wall].clone();
+    let intent = wall_agent.run_time_step(&snapshot, None, None, &mut mulberry32(58_404));
+    assert!(
+        matches!(
+            intent.action,
+            SoccerAction::Pass {
+                target_player: Some(target),
+                flight: PassFlight::Floor,
+                ..
+            } if target == runner
+        ),
+        "a bound wall should execute the return even with low technique: {:?}",
+        intent.action
+    );
+    assert_eq!(
+        wall_agent
+            .last_decision
+            .as_ref()
+            .map(|decision| decision.action.as_str()),
+        Some("wall-return")
     );
 }
 

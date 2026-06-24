@@ -5032,10 +5032,17 @@ pub(crate) fn select_nested_sub_maneuver(
         return None;
     }
     let center = width * 0.5;
-    let sub = if ball_x < center - width * 0.12 {
+    // Reserve overlaps for a ball that is genuinely on the wing. In the half-spaces, use a
+    // directional one-two so the nearby pair combines toward the flank instead of asking an
+    // overlap runner to materialize before the attack has actually reached the outside lane.
+    let sub = if ball_x < center - width * 0.22 {
         WingOverlapLeftCross
-    } else if ball_x > center + width * 0.12 {
+    } else if ball_x < center - width * 0.08 {
+        OneTwoLeftRelease
+    } else if ball_x > center + width * 0.22 {
         WingOverlapRightCross
+    } else if ball_x > center + width * 0.08 {
+        OneTwoRightRelease
     } else {
         GiveAndGoCentral
     };
