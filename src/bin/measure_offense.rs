@@ -6,9 +6,16 @@
 
 use std::collections::BTreeMap;
 
-use soccer_engine::des::general::soccer::{MatchConfig, SoccerMatch};
+use soccer_engine::des::general::soccer::{
+    enable_deterministic_formation_lp, MatchConfig, SoccerMatch,
+};
 
 fn main() {
+    // Reproducible A/B: route the formation LP through the deterministic simplex so the same
+    // seed yields byte-identical matches (the default Clarabel solver is per-process
+    // nondeterministic). This is a headless harness, so the deterministic solve's latency
+    // is irrelevant.
+    enable_deterministic_formation_lp();
     let args: Vec<String> = std::env::args().collect();
     let ticks: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30_000);
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
