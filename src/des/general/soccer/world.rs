@@ -10064,69 +10064,53 @@ impl SoccerMatch {
                                 aimed_target
                             };
                         }
-                        // Aim noise can still pull the ball onto a marker SHADOWING the receiver at
-                        // the same range — a case the closer-than-receiver risk model above scores
-                        // at zero, so it slips through. The hard, shadow-aware concede check catches
-                        // it: if the noisy release concedes the reception but the receiver's own feet
-                        // (or the led point) do NOT, snap back to that safe point rather than feeding
-                        // the marker. Only fires when the noise itself created the concede, so a pass
-                        // deliberately aimed at a clean point is untouched.
-                        if snapshot.pass_reception_conceded_to_opponent(
-                            player_team,
-                            receiver_position,
-                            player_pos,
-                            aimed_target,
-                            speed,
-                            pressure,
-                        ) {
-                            let receiver_safe = !snapshot.pass_reception_conceded_to_opponent(
+                        // Aim noise and a marker shadowing the receiver at the same range can still
+                        // turn a selected pass into a gift. The distance-only risk model misses the
+                        // latter because the receiver is also at the aim point, so combine it with
+                        // the shadow-aware reception check. Re-aim to safe teammate feet or a safe
+                        // lead point before considering whether the release must be aborted.
+                        let favours_opponent = |point: Vec2| {
+                            snapshot.pass_point_direct_opponent_control_risk(
                                 player_team,
                                 receiver_position,
                                 player_pos,
-                                receiver_position,
+                                point,
                                 speed,
-                                pressure,
-                            );
-                            let led_safe = !snapshot.pass_reception_conceded_to_opponent(
+                            ) >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
+                                || snapshot.pass_point_directly_favors_opponent(
+                                    player_team,
+                                    receiver_position,
+                                    point,
+                                )
+                        };
+                        let concedes = |point: Vec2| {
+                            snapshot.pass_reception_conceded_to_opponent(
                                 player_team,
                                 receiver_position,
                                 player_pos,
-                                led_target,
+                                point,
                                 speed,
                                 pressure,
-                            );
-                            if receiver_safe {
-                                aimed_target = receiver_position;
-                            } else if led_safe {
-                                aimed_target = led_target;
-                            }
-                        }
-
-                        // The shadow-aware correction gets first chance to recover a playable
-                        // release. If every corrected line still hands control to an opponent,
-                        // keep possession and face the intended run instead of forcing the pass.
-                        let final_risk = snapshot.pass_point_direct_opponent_control_risk(
-                            player_team,
-                            receiver_position,
-                            player_pos,
-                            aimed_target,
-                            speed,
-                        );
-                        if final_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
-                            || snapshot.pass_point_directly_favors_opponent(
-                                player_team,
-                                receiver_position,
-                                aimed_target,
                             )
-                        {
-                            let look = led_target - player_pos;
-                            if look.len() > 1e-6 {
-                                let face = facing_bucket_from_vector(look);
-                                if face != FacingBucket::Unknown {
-                                    self.players[player_id].action_facing = face;
+                        };
+                        let unsafe_release = |point: Vec2| concedes(point) || favours_opponent(point);
+                        if unsafe_release(aimed_target) {
+                            if !unsafe_release(receiver_position) {
+                                aimed_target = receiver_position;
+                            } else if !unsafe_release(led_target) {
+                                aimed_target = led_target;
+                            } else if favours_opponent(aimed_target) {
+                                // Every correction remains a strong turnover risk. Keep possession
+                                // and face the intended run instead of forcing the ball to an opponent.
+                                let look = led_target - player_pos;
+                                if look.len() > 1e-6 {
+                                    let face = facing_bucket_from_vector(look);
+                                    if face != FacingBucket::Unknown {
+                                        self.players[player_id].action_facing = face;
+                                    }
                                 }
+                                return;
                             }
-                            return;
                         }
                     }
                     let pass_curl_probability = pass_curl_probability_for_player(

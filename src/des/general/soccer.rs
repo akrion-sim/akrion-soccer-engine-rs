@@ -808,10 +808,10 @@ const SHOT_SCREEN_IDEAL_MAX_YARDS: f64 = 3.0;
 const BALL_CURL_DECAY_PER_SECOND: f64 = 1.10;
 const MAX_BALL_CURL_YPS2: f64 = 7.6;
 const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
-// Hard ceiling on how high any lofted/aerial pass arcs. Height is not the hang-time bug: the
-// x-y speed must stay alive while gravity brings the ball down. Short lofts peak around ~20ft
-// and only the longest balls approach ~30ft. The shared distance curve keeps launch calibration
-// and rendered altitude in agreement without using a flatter arc to mask excessive in-flight drag.
+// The apex fixes the gravity-timed flight duration, while horizontal launch speed and in-flight
+// drag determine whether the ball keeps moving toward the receiver during that window. Keep the
+// intended 15-30ft regular loft shape and fix balloon-like motion through the x-y pace calibration,
+// rather than flattening the arc to hide excessive horizontal deceleration.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 const LOFT_APEX_PER_YARD: f64 = 0.074;
@@ -825,7 +825,8 @@ const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
 // block early in the path, but stay in a clipped 7-12ft window and land on the receiver.
 const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 7.0 / 3.0; // ~7ft
 const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 4.0; // ~12ft
-const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.18;
+// A little extra launch compensation preserves x-y pace across the scoop's gravity window.
+const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.20;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
 const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
 /// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
@@ -44597,7 +44598,36 @@ fn goal_attack_window_score_for_role(
         .clamp(0.0, 1.0)
 }
 
+/// HARD distance gate for a shot, merging the two shot-discipline philosophies. Both agree the
+/// 30yd ceiling (`SPECULATIVE_LONG_SHOT_MAX_YARDS`) is absolute. Inside it:
+/// - up to the keeper-dependent range (`LONG_SHOT_KEEPER_DEPENDENT_YARDS`, ~26yd) the shot stays
+///   LEGAL — the user's item-5 spec is to PENALISE shots beyond ~20yd, not forbid them (the
+///   discouragement, and its relief when the keeper is out of position, live in the decision-time
+///   reward shaping), so a clear ~22-26yd effort is still a legal option;
+/// - a genuinely speculative 26-30yd effort (origin/alex-1's MARL gate) is legal only with the
+///   keeper clearly out of position.
 fn long_shot_distance_is_allowed(observation: &SoccerPomdpObservation) -> bool {
+    let distance = observation.yards_to_goal;
+    if distance <= LONG_SHOT_KEEPER_DEPENDENT_YARDS {
+        return true;
+    }
+    if distance > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+        return false;
+    }
+    observation
+        .opposing_goalkeeper_out_of_position
+        .clamp(0.0, 1.0)
+        >= LONG_SHOT_GK_TOTALLY_OUT
+}
+
+/// Keeper-dependent discipline for whether the AI should VOLUNTEER a speculative long shot (vs the
+/// basic legality in `long_shot_distance_is_allowed`). This is the stricter of the two and is NOT
+/// about legality: a ~20-30yd shot stays legal (so a forced/human shot is never blocked), but the
+/// long-shot heuristic only offers one when the keeper is sufficiently off his line — beyond the
+/// `LONG_SHOT_KEEPER_DEPENDENT_YARDS` (~26yd) range that means CLEARLY stranded
+/// (`LONG_SHOT_GK_TOTALLY_OUT`), and in the ~20-26yd band merely off position
+/// (`LONG_SHOT_GK_OUT_OF_POSITION`). Nothing inside ~20yd is gated; nothing beyond 30yd qualifies.
+fn speculative_long_shot_keeper_gate(observation: &SoccerPomdpObservation) -> bool {
     let distance = observation.yards_to_goal;
     if distance <= LONG_SHOT_DISCOURAGED_YARDS {
         return true;
@@ -44641,7 +44671,12 @@ fn shot_decision_is_qualified_for_role(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> bool {
-    if !long_shot_distance_is_allowed(observation) {
+    // Hard 30yd ceiling only (item-5: >30yd is never a shot). The keeper-dependent 26-30yd
+    // discipline is NOT applied as a blanket role gate — that would also forbid a STRIKER from
+    // attempting inside his shot window (legal but reward-penalised), which main / item-5 allow.
+    // Each branch below carries its own discipline: the generic `shot_decision_is_qualified` stays
+    // keeper-dependent, while `striker_shot_window_is_qualified` lets a forward shoot up to 30yd.
+    if observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
         return false;
     }
     shot_decision_is_qualified(observation)
@@ -44707,9 +44742,11 @@ fn speculative_long_shot_is_qualified(
     if !(TEAMMATE_MUST_SHOOT_YARDS..=SPECULATIVE_LONG_SHOT_MAX_YARDS).contains(&distance) {
         return false;
     }
-    // Distance discipline: 20+ yds is discouraged, 26-30 yds only opens up when
-    // the keeper is stranded, and >30 yds is blocked by the range guard above.
-    if !long_shot_distance_is_allowed(observation) {
+    // Distance discipline: 20+ yds is discouraged and keeper-dependent (20-26 yds needs the
+    // keeper off position, 26-30 yds needs him stranded), and >30 yds is blocked by the range
+    // guard above. This is the AI's "should I volunteer a speculative long shot" gate, stricter
+    // than the basic `long_shot_distance_is_allowed` legality (a forced/human shot stays legal).
+    if !speculative_long_shot_keeper_gate(observation) {
         return false;
     }
     if observation.shot_block_probability.clamp(0.0, 1.0)
@@ -44967,8 +45004,10 @@ fn striker_shot_window_is_qualified(
         .shooting
         .striker_shot_window_yards
         .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
+    // A striker may attempt anywhere inside his shot window up to the hard 30yd cap (already folded
+    // into `striker_window_yards`); the 20-30yd range is legal but reward-penalised (item-5), not
+    // keeper-gated like a generic speculative shot — a striker backs himself.
     observation.yards_to_goal <= striker_window_yards
-        && long_shot_distance_is_allowed(observation)
         && observation.shot_lane_open
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY

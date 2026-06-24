@@ -23927,6 +23927,9 @@ fn human_input_can_choose_aerial_pass_flight() {
         sim.players[passer].velocity = Vec2::new(4.0, 0.0);
         sim.players[passer].action_facing = FacingBucket::East;
         sim.players[passer].receive_facing = FacingBucket::East;
+        // Face the pass (east, toward the target) so the body is planted to loft it — the merged
+        // aerial gate refuses a side-on lob, and the default yaw (~north) is 90° off the east pass.
+        sim.players[passer].facing_yaw = 0.0;
         sim.players[target].position = Vec2::new(63.0, 57.0);
         for home in 0..11 {
             if home != passer && home != target {
@@ -27907,7 +27910,11 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     observation.shot_beat_goalkeeper_probability = SHOT_KEEPER_BEAT_MIN_PROBABILITY + 0.01;
     assert!(shot_decision_is_qualified(&observation));
 
-    observation.yards_to_goal = LONG_SHOT_DISCOURAGED_YARDS + 4.0;
+    // Merged shot-distance discipline: shots in the 20-26yd "discouraged" band stay LEGAL but
+    // reward-penalised (the user's item-5 spec / main), so they are NOT hard-gated here. Only a
+    // genuinely speculative 26-30yd effort (origin/alex-1's keeper-dependent gate) is gated unless
+    // the keeper is clearly out of position.
+    observation.yards_to_goal = LONG_SHOT_KEEPER_DEPENDENT_YARDS + 2.0; // ~28yd, speculative band
     observation.offensive_urgency = 0.80;
     observation.shot_on_frame_probability =
         tunables().shooting.shot_on_frame_min_probability + 0.04;
@@ -27915,12 +27922,12 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
     observation.opposing_goalkeeper_out_of_position = 0.0;
     assert!(
         !shot_decision_is_qualified(&observation),
-        "20+ yard shots should stay gated when the keeper is set"
+        "speculative 26-30yd shots stay gated when the keeper is set"
     );
-    observation.opposing_goalkeeper_out_of_position = LONG_SHOT_GK_OUT_OF_POSITION + 0.05;
+    observation.opposing_goalkeeper_out_of_position = LONG_SHOT_GK_TOTALLY_OUT + 0.05;
     assert!(
         shot_decision_is_qualified(&observation),
-        "20-26 yard shots reopen only when the keeper is out of position"
+        "26-30yd shots reopen only when the keeper is clearly out of position"
     );
 
     observation.yards_to_goal = 9.0;
@@ -27945,7 +27952,12 @@ fn shot_decision_gate_requires_quality_or_near_goal_pressure_bailout() {
 }
 
 #[test]
-fn striker_shot_window_requires_keeper_out_beyond_twenty_yards() {
+fn striker_shot_window_allows_thirty_yard_attempts_while_generic_shot_stays_keeper_gated() {
+    // Merged shot-distance discipline. The GENERIC speculative shot stays keeper-dependent beyond
+    // the discouraged range (origin/alex-1), but a STRIKER backs himself inside his shot window up
+    // to the hard 30yd cap: per the user's item-5 spec a 20-30yd shot is reward-PENALISED, not
+    // hard-gated on the keeper — so it stays a legal attempt for a forward even against a set
+    // keeper (the keeper being out only makes it a better idea, never a requirement).
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 1416,
@@ -27968,16 +27980,20 @@ fn striker_shot_window_requires_keeper_out_beyond_twenty_yards() {
     observation.shot_beat_goalkeeper_probability = STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY + 0.02;
     observation.opposing_goalkeeper_out_of_position = 0.0;
 
+    // Generic discretionary shot: keeper-dependent, so it stays OFF against a set keeper.
     assert!(!shot_decision_is_qualified(&observation));
+    // Striker in his window: a legal (reward-penalised) attempt even against a set keeper.
     assert!(
-        !striker_shot_window_is_qualified(&observation, PlayerRole::Forward),
-        "a 20+ yard striker shot should not qualify against a set keeper"
+        striker_shot_window_is_qualified(&observation, PlayerRole::Forward),
+        "a striker attempts from his shot window up to 30yd (penalised, not keeper-gated)"
     );
+    // A keeper off his line only makes it a better idea; the striker still qualifies.
     observation.opposing_goalkeeper_out_of_position = LONG_SHOT_GK_TOTALLY_OUT + 0.05;
     assert!(striker_shot_window_is_qualified(
         &observation,
         PlayerRole::Forward
     ));
+    // The window is a striker's privilege — a midfielder gets no such latitude here.
     assert!(!striker_shot_window_is_qualified(
         &observation,
         PlayerRole::Midfielder
@@ -50426,10 +50442,8 @@ fn aerial_pending_pass_skips_grass_resistance_on_launch_tick() {
     aerial.integrate_ball();
 
     // The aerial ball is airborne on the launch tick and so skips most grass rolling
-    // resistance — it must retain clearly more speed than the grounded pass. The margin is
-    // modest because the lofted arc is deliberately flatter now (less early-flight altitude
-    // ⇒ a touch more grass contact on the very first tick), but the airborne ball still
-    // loses well under half the grass speed the floor ball does.
+    // resistance. Its x-y pace must remain clearly above the grounded pass even while the
+    // gravity-timed loft follows the intended arc.
     assert!(
         aerial.ball.velocity.len() > floor.ball.velocity.len() + 0.04,
         "aerial pass should retain more speed on grass: aerial={} floor={}",
