@@ -17016,6 +17016,7 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
             .unwrap_or(false)
     })
 }
+
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
 // goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
 // up rather than turning and chasing their own goal under a ball that is going the other
