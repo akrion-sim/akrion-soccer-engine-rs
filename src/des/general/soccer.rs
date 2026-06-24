@@ -3192,6 +3192,12 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // LP problem rebuilds at full 15Hz.
 const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
 const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
+/// Iteration cap for the deterministic Bland's-rule simplex that solves the formation
+/// LP (see `SoccerFormationLpBrain::solve_exact_formation_lp`). Generous enough that the
+/// ~521-var/750-constraint problem reaches optimality on a normal tick yet bounded so a
+/// pathological tableau still terminates within the realtime budget. The solve is
+/// deterministic at any cap (Bland's rule), so this only trades solution quality vs time.
+pub(crate) const SOCCER_FORMATION_LP_SIMPLEX_MAX_ITER: usize = 1500;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.

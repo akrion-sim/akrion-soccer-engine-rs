@@ -1783,8 +1783,27 @@ impl SoccerFormationLpBrain {
         // optimality directly. The formation only needs an optimal *point* (player
         // positions), not a vertex, so we skip the IPM->simplex crossover/polish
         // entirely — that polish was the ~400ms bottleneck for a vertex we never use.
-        // The circuit breaker in `solve_tick` still guards realtime.
-        solve_lp_clarabel(&self.problem)
+        // Solver determinism: Clarabel's interior-point path is per-process
+        // nondeterministic on this degenerate LP (identical input → different iterate
+        // AND different terminal status across processes), which was the SOLE source of
+        // match-level nondeterminism — it cascaded chaotically into wildly different
+        // scorelines from the same seed and injected noise into self-play rewards. The
+        // internal Bland's-rule simplex is deterministic by construction and, measured
+        // head-to-head on this 521-var/750-constraint problem, is no slower than Clarabel
+        // (the stale "~400ms" note referred to the dropped IPM→simplex crossover, not the
+        // direct dense simplex). So the formation LP runs on the deterministic simplex by
+        // default; set `FORMATION_LP_USE_CLARABEL=1` to fall back to Clarabel.
+        if std::env::var("FORMATION_LP_USE_CLARABEL").is_ok() {
+            return solve_lp_clarabel(&self.problem);
+        }
+        crate::des::general::lp::solve_lp_internal(
+            &self.problem,
+            &crate::des::general::lp::InternalSimplexOptions {
+                max_iter: Some(SOCCER_FORMATION_LP_SIMPLEX_MAX_ITER),
+                tol: None,
+                basis_start: None,
+            },
+        )
     }
 
     fn solve_tick(&mut self, snapshot: &WorldSnapshot, directive: &TeamTacticalDirective) {
