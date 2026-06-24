@@ -1460,6 +1460,266 @@ fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
 }
 
 #[test]
+fn pass_to_marked_man_or_opponent_feet_is_conceded() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_117,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    let open_receiver = 6;
+    park_players_except(&mut sim, &[passer, receiver, marker, open_receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 55.0);
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[open_receiver].team = Team::Home;
+    sim.players[open_receiver].role = PlayerRole::Forward;
+    sim.players[open_receiver].position = Vec2::new(58.0, 50.0); // isolated, no marker near
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+    let passer_pos = sim.players[passer].position;
+    let receiver_pos = sim.players[receiver].position;
+    let open_pos = sim.players[open_receiver].position;
+
+    // A typical man-mark (~1.8yd off the receiver, not glued to the ball).
+    sim.players[marker].position = Vec2::new(41.6, 55.8);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // Under real passer pressure, feeding the marked man is a conceded reception (hard veto).
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.8,
+        ),
+        "a pressured pass to a tightly-marked receiver should be a conceded reception"
+    );
+    // Without pressure the same pass is left to the soft congestion penalty, not hard-vetoed.
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.1,
+        ),
+        "an unpressured pass to a marked man should remain learnable, not hard-vetoed"
+    );
+    // An open teammate (no opponent inside the mark radius) is never a concession.
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, open_pos, passer_pos, open_pos, speed, 0.8,
+        ),
+        "a pass to an open teammate must not be vetoed as conceded"
+    );
+
+    // The ball played essentially to an opponent's feet is a concession even with zero
+    // passer pressure (the "team A passes straight to team B" bug).
+    sim.players[marker].position = Vec2::new(40.5, 55.4); // ~0.6yd from the reception point
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home, receiver_pos, passer_pos, receiver_pos, speed, 0.0,
+        ),
+        "a ball played to an opponent's feet should always be a conceded reception"
+    );
+}
+
+#[test]
+fn pass_concede_inter_tick_catches_closing_marker() {
+    // A short, firm ball arrives in ~1-2 ticks, so the single-horizon reach at the reception is
+    // barely a lunge — a marker ~2yd to the side sits OUTSIDE it while stationary. But a marker
+    // actively SPRINTING onto the reception covers that gap over the ball's flight, which the
+    // inter-tick sweep (1/2/4/4+ tick horizons, opponent carried by its own momentum) catches.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_119,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    park_players_except(&mut sim, &[passer, receiver, marker]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 52.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    let passer_pos = sim.players[passer].position;
+    let receiver_pos = sim.players[receiver].position;
+    let speed =
+        pass_speed_yps_from_power(0.92, PassFlight::Floor, false, &sim.players[passer].skills);
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].position = receiver_pos + Vec2::new(2.0, 0.0);
+
+    // Stationary marker just beyond the lunge reach: not (yet) a concession on this short ball.
+    sim.players[marker].velocity = Vec2::zero();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.pass_reception_conceded_to_opponent(
+            Team::Home,
+            receiver_pos,
+            passer_pos,
+            receiver_pos,
+            speed,
+            0.8,
+        ),
+        "a stationary marker beyond lunge reach should not concede a short, fast ball"
+    );
+
+    // Same marker sprinting onto the reception: the inter-tick sweep concedes it.
+    sim.players[marker].velocity = Vec2::new(-10.0, 0.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_reception_conceded_to_opponent(
+            Team::Home,
+            receiver_pos,
+            passer_pos,
+            receiver_pos,
+            speed,
+            0.8,
+        ),
+        "a marker closing onto the reception over the ball flight is an inter-tick concession"
+    );
+}
+
+// Pin a marker `offset` off the anticipated reception of `passer`->`receiver`. The reception
+// model leads the point forward (skill/openness/byline dependent), and the marker's own presence
+// feeds back into that openness, so converge to the fixed point: place, recompute, repeat.
+fn place_marker_on_reception(
+    sim: &mut SoccerMatch,
+    passer: usize,
+    receiver: usize,
+    marker: usize,
+    offset: Vec2,
+) {
+    let speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &sim.players[passer].skills);
+    for _ in 0..6 {
+        let snap = WorldSnapshot::from_match(sim);
+        let reception = snap
+            .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, speed)
+            .unwrap_or_else(|| sim.players[receiver].position);
+        sim.players[marker].position =
+            (reception + offset).clamp_to_pitch(sim.config.field_width_yards, sim.config.field_length_yards);
+    }
+}
+
+#[test]
+fn pass_concede_decision_respects_passer_perception() {
+    // The decision-level wrapper folds in POMDP perception (~240deg FOV, the rear unseen,
+    // confidence decaying as the head turns). A marked man the passer is LOOKING at is a
+    // vetoable concession; the same marker on the passer's blindside is a realistic loss, not a
+    // decision to forbid.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_121,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    let marker = 13;
+    let presser = 14;
+    park_players_except(&mut sim, &[passer, receiver, marker, presser]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 52.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[presser].team = Team::Away;
+    sim.players[presser].position = Vec2::new(40.0, 42.0); // arms the holder's pressure (~0.45+)
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    // A marker ~1.8yd off the reception: within the mark radius, not at the feet.
+    place_marker_on_reception(&mut sim, passer, receiver, marker, Vec2::new(1.8, 0.0));
+
+    // Facing the reception (toward +y): the passer perceives the marker -> conceded. (The holder
+    // facing comes from `action_facing`; FacingBucket::South is the +y unit vector here.)
+    sim.players[passer].action_facing = FacingBucket::South;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "a marked man the passer is looking straight at is a perceived concession"
+    );
+
+    // Facing away (toward -y): the marker is on the passer's blindside -> a realistic loss.
+    sim.players[passer].action_facing = FacingBucket::North;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "a marker on the passer's blindside should not be a vetoed concession"
+    );
+}
+
+#[test]
+fn learned_policy_selector_avoids_conceded_pass_target() {
+    // The learned-policy target selector re-ranks the candidate pool and would otherwise bypass
+    // the ranker's (demote-only) concede veto. It must refuse to commit a pass to a man with an
+    // opponent at his feet while a clean outlet exists.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_123,
+        ..Default::default()
+    });
+    let passer = 7;
+    let marked = 9;
+    let open = 6;
+    let marker = 13;
+    let presser = 14;
+    park_players_except(&mut sim, &[passer, marked, open, marker, presser]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 40.0);
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2; // facing upfield, sees both
+    sim.players[marked].team = Team::Home;
+    sim.players[marked].role = PlayerRole::Forward;
+    sim.players[marked].position = Vec2::new(40.0, 52.0);
+    sim.players[marked].velocity = Vec2::zero();
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    // An open team-mate off to the side.
+    sim.players[open].team = Team::Home;
+    sim.players[open].role = PlayerRole::Forward;
+    sim.players[open].position = Vec2::new(56.0, 46.0);
+    sim.players[open].velocity = Vec2::zero();
+    sim.players[presser].team = Team::Away;
+    sim.players[presser].position = Vec2::new(40.0, 42.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    // An opponent right at the marked man's feet (unconditional concession).
+    place_marker_on_reception(&mut sim, passer, marked, marker, Vec2::new(0.4, 0.0));
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let policy = SoccerQPolicy::default();
+    let candidates = vec![marked, open];
+    let chosen = policy.best_pass_target_player_for_snapshot(
+        &snapshot,
+        passer,
+        "pass",
+        PassFlight::Floor,
+        &candidates,
+    );
+    assert_eq!(
+        chosen,
+        Some(open),
+        "the selector must not commit a pass into a man with an opponent at his feet"
+    );
+    assert!(
+        snapshot.pass_target_concedes_to_perceived_opponent(passer, marked, PassFlight::Floor),
+        "the marked man should be flagged as a perceived concession"
+    );
+    assert!(
+        !snapshot.pass_target_concedes_to_perceived_opponent(passer, open, PassFlight::Floor),
+        "the open team-mate must not be flagged as a concession"
+    );
+}
+
+#[test]
 fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -1550,6 +1810,78 @@ fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
     assert!(
         safer_rank < risky_rank,
         "aerial direct-opponent control risk should drop the risky option behind a safer outlet; risk={direct_risk:.3} ranked={risky_ranked:?}"
+    );
+}
+
+#[test]
+fn round_the_keeper_reads_the_save_lane_and_respects_the_range_gate() {
+    // "Round the keeper": offered when the goalkeeper is covering the shot — dribble closer + off
+    // the keeper's angle for a clear strike rather than a long shot the keeper saves. The save read
+    // must respond to the keeper's position, and the maneuver only fires in close-to-mid range.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 31_001,
+        ..Default::default()
+    });
+    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let goal_center_x = sim.config.field_width_yards * 0.5;
+    let keeper_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away keeper exists");
+    let shooter_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("home forward exists");
+    let shooter_pos = Vec2::new(goal_center_x, goal_y - 20.0);
+    {
+        let shooter = sim.players.iter_mut().find(|p| p.id == shooter_id).unwrap();
+        shooter.position = shooter_pos;
+        shooter.skills.shooting = 8.0;
+    }
+    sim.ball.holder = Some(shooter_id);
+    sim.ball.position = shooter_pos;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let shot_speed = shot_speed_yps_from_power(
+        0.85,
+        &sim.players.iter().find(|p| p.id == shooter_id).unwrap().skills,
+    );
+    let skill = ability01(8.0);
+
+    // A keeper covering the centre saves MORE of the best-placed shot than one pulled to a post
+    // (which leaves the far side open) — the read the maneuver keys on.
+    sim.players.iter_mut().find(|p| p.id == keeper_id).unwrap().position =
+        Vec2::new(goal_center_x, goal_y - 7.0);
+    let covered = WorldSnapshot::from_match(&sim);
+    let save_covered = covered
+        .best_shot_save_probability_from(Team::Home, shooter_pos, shot_speed, skill)
+        .expect("keeper present");
+    sim.players.iter_mut().find(|p| p.id == keeper_id).unwrap().position =
+        Vec2::new(goal_center_x - 12.0, goal_y - 7.0);
+    let exposed = WorldSnapshot::from_match(&sim);
+    let save_exposed = exposed
+        .best_shot_save_probability_from(Team::Home, shooter_pos, shot_speed, skill)
+        .expect("keeper present");
+    assert!((0.0..=1.0).contains(&save_covered) && (0.0..=1.0).contains(&save_exposed));
+    assert!(
+        save_covered > save_exposed,
+        "a centrally-covering keeper saves more than one pulled to a post: covered={save_covered} exposed={save_exposed}"
+    );
+
+    // Out of range (~70yd from goal) -> the maneuver is never offered (it is for close shots).
+    {
+        let shooter = sim.players.iter_mut().find(|p| p.id == shooter_id).unwrap();
+        shooter.position = Vec2::new(goal_center_x, goal_y - 70.0);
+    }
+    sim.ball.position = Vec2::new(goal_center_x, goal_y - 70.0);
+    let far = WorldSnapshot::from_match(&sim);
+    assert!(
+        far.dribble_round_the_keeper_for(shooter_id).is_none(),
+        "round-the-keeper should not fire from ~70yd out"
     );
 }
 
@@ -28569,6 +28901,53 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
     assert!(
         (negative + 1.6).abs() < 1e-9,
         "negative MAPPO advantage must clip low ratios: {negative}"
+    );
+}
+
+#[test]
+fn role_embedding_lets_one_shared_actor_specialise_per_position() {
+    // The same underlying state, reinforced for a Forward and penalised for a Defender, must
+    // pull `π(shoot)` in opposite directions across the two role-conditioned inputs — only
+    // possible if the shared net conditions on the role one-hot baked into the policy features
+    // by `soccer_policy_features_for_role`.
+    let mut head = SoccerPolicyHead::new(31);
+    let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
+    critic_state[0] = 0.4;
+    critic_state[7] = -0.2;
+    let forward_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward);
+    let defender_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Defender);
+    let shoot = soccer_policy_action_index("shoot").expect("shoot policy action");
+
+    let samples: Vec<SoccerPolicySample> = (0..60)
+        .flat_map(|_| {
+            [
+                SoccerPolicySample {
+                    state_features: forward_state,
+                    action_index: shoot,
+                    advantage: 1.0,
+                    old_action_probability: None,
+                },
+                SoccerPolicySample {
+                    state_features: defender_state,
+                    action_index: shoot,
+                    advantage: -1.0,
+                    old_action_probability: None,
+                },
+            ]
+        })
+        .collect();
+    head.train(&samples, None);
+
+    let forward_shoot = head
+        .action_distribution(&forward_state)
+        .expect("finite forward dist")[shoot];
+    let defender_shoot = head
+        .action_distribution(&defender_state)
+        .expect("finite defender dist")[shoot];
+    assert!(
+        forward_shoot > defender_shoot,
+        "role embedding should specialise the shared actor: forward π(shoot)={forward_shoot} \
+         should exceed defender π(shoot)={defender_shoot}"
     );
 }
 

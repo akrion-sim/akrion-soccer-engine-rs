@@ -479,6 +479,30 @@ const OPEN_LANE_DRIBBLE_SPRINT_TRACK_YPS: f64 = 4.5;
 const OPEN_LANE_DRIBBLE_BASE_APPETITE: f64 = 0.62;
 const OPEN_LANE_DRIBBLE_MAX_APPETITE: f64 = 1.20;
 const OPEN_LANE_DRIBBLE_UPFIELD_APPETITE_BONUS: f64 = 0.40;
+// --- "Round the keeper" ---
+// Sibling of the open-passing-lane carry, but the blocked lane is the SHOT and the blocker is the
+// goalkeeper: when the carrier is in range but the keeper is covering the shot, a short quick carry
+// CLOSER to goal (and around the keeper's angle) opens a clear strike — better than blazing a long
+// shot the keeper saves. Default ON; disable with `DD_SOCCER_DISABLE_ROUND_THE_KEEPER`. Offered only
+// in its window (keeper-blocked shot + a closer spot with a clear strike), so a disabled /
+// out-of-window match is byte-identical on the deterministic on-ball path.
+// Only fires when the goal is this near-to-mid range — we are trying to get a CLOSE shot, not a
+// long one; below the min it is already point-blank (just shoot).
+const ROUND_KEEPER_MIN_GOAL_YARDS: f64 = 6.0;
+const ROUND_KEEPER_MAX_START_YARDS: f64 = 30.0;
+// The direct best-placed shot counts as keeper-BLOCKED at/above this save probability (worth
+// rounding); a candidate spot counts as a CLEAR strike at/below the lower threshold (keeper beaten).
+const ROUND_KEEPER_BLOCKED_SAVE_THRESHOLD: f64 = 0.55;
+const ROUND_KEEPER_CLEAR_SAVE_THRESHOLD: f64 = 0.34;
+// Candidate carry step sizes (yards), smallest first — the least carry that opens a clear strike is
+// chosen. Up to 8yd so the carrier can get past an onrushing keeper to a tap-in angle.
+const ROUND_KEEPER_STEP_YARDS: [f64; 6] = [2.0, 3.5, 5.0, 6.5, 7.5, 8.0];
+// A step is rejected if it would carry straight onto a defender / the keeper (needs this much space).
+const ROUND_KEEPER_MIN_SPOT_SPACE_YARDS: f64 = 1.4;
+// Sprint (vs run) when under very high pressure OR the keeper/nearest defender is closing quickly —
+// burst around them before they smother the angle.
+const ROUND_KEEPER_SPRINT_PRESSURE: f64 = 0.55;
+const ROUND_KEEPER_SPRINT_TRACK_YPS: f64 = 4.0;
 /// Below this tangential speed (yps) a `xavi-turn` carrier is treated as not yet wheeling, so
 /// the wheel sense is seeded from geometry rather than from its (negligible) momentum.
 const XAVI_TURN_WHEEL_MOMENTUM_EPS_YPS: f64 = 0.5;
@@ -1153,6 +1177,32 @@ const PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY: f64 = 12.0;
 // intended receiver (`pass_point_directly_favors_opponent`), it is a direct giveaway — sink the
 // candidate by this much so it can never outrank holding or a safe outlet.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY: f64 = 1000.0;
+// "Reception conceded to an opponent" hard veto. The aim-point veto above only fires when
+// an opponent is strictly CLOSER to the aim than the intended receiver, so it misses two
+// real giveaways: (a) the ball played near an opponent's FEET (the receiver is marginally
+// closer, so the aim-point test stays silent), and (b) the ball played to a teammate who
+// is tightly MAN-MARKED — the marker doesn't beat the receiver to the ball, he dispossesses
+// the instant it arrives. Both are turnovers. A defender within `AT_FEET` of the reception
+// point that can physically REACH the arriving ball is always a concession (case a); a
+// marker within `MARK_RADIUS` is a concession only when the passer is genuinely pressured
+// (case b) — which leaves a brave pass to a half-open man, and a contested final-third
+// reception to an OPEN receiver, to the soft congestion penalty rather than hard-vetoing
+// them. The reach check (lane-arrival + sprint reach) keeps a slow/distant marker, or a
+// ball driven past too fast to be cut out, from tripping it.
+const PASS_RECEPTION_CONCEDE_MARK_RADIUS_YARDS: f64 = 2.25;
+const PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS: f64 = 1.25;
+// Perception gate for the man-marked concede veto (POMDP: ~240° FOV, no rear vision,
+// confidence decaying as the head turns — see `player_position_confidence_for_point`). A
+// passer is only expected to AVOID feeding a marked man he can actually perceive; a marker
+// arriving on the blindside (low confidence) is a realistic loss, not a vetoable decision.
+// The ball-to-an-opponent's-feet case is NOT gated by this — playing it straight to the
+// opposition is a gross error regardless of where the passer is looking.
+const PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE: f64 = 0.42;
+// Inter-tick sweep horizons (in ticks) for the concede reach model: a pass may resolve in
+// 1, 2, 4, or 4+ ticks, so sample the ball's flight at these multiples of `dt` (each capped
+// at the ball's arrival time) and project each opponent forward with its own momentum. Keeps
+// the single-horizon reach as a strict superset so the static unit tests stay byte-identical.
+const PASS_CONCEDE_SWEEP_TICK_HORIZONS: [f64; 4] = [1.0, 2.0, 4.0, 8.0];
 
 fn direct_opponent_aim_score_penalty(risk: f64) -> f64 {
     let risk = risk.clamp(0.0, 1.0);
@@ -1163,6 +1213,11 @@ fn direct_opponent_aim_score_penalty(risk: f64) -> f64 {
     };
     PASS_DIRECT_OPPONENT_AIM_SCORE_PENALTY * (risk + risk * risk) + emergency_penalty
 }
+// Pass-vs-hold under pressure: a pinned carrier's CONTESTED pass (low expected completion) has its
+// pass score damped by `heat * (1 - completion) * this` so it loses to shield/hold/dribble rather
+// than being forced into traffic (the turnover the user hates). Calm play and a genuinely open pass
+// are untouched (heat or contested ≈ 0). Gated `DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP`.
+const PRESSURED_CONTESTED_PASS_DAMP: f64 = 0.40;
 // A BACKWARD ball (aim point this far behind the passer along the attack direction)
 // is only safe to a CLEARLY OPEN teammate — recycling backwards into coverage hands
 // the ball back toward the opponent. A backward pass whose receiver has an opponent
@@ -8909,7 +8964,12 @@ impl SoccerQPolicy {
             player.role,
         );
         let action = normalize_soccer_action_label(action);
-        candidates
+        // Re-ranking the candidate pool here would otherwise silently bypass the ranker's
+        // concede veto (it only DEMOTES a conceded target, never removes it — see
+        // `ranked_pass_targets_filtered_full`), which is how a learned policy could still pick a
+        // pass straight to an opponent or into a tightly-marked man. Flag each candidate and
+        // refuse to commit to a (perceived) conceded one while any clean option remains.
+        let scored: Vec<(usize, f64, bool)> = candidates
             .iter()
             .filter_map(|candidate_id| {
                 let target = snapshot.players.iter().find(|p| p.id == *candidate_id)?;
@@ -8932,13 +8992,24 @@ impl SoccerQPolicy {
                     + quality.mpc_receipt_probability * 0.52
                     + quality.stride_fit * 0.22
                     + quality.receiver_openness * 0.20;
-                Some((*candidate_id, score))
+                let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
+                    player_id,
+                    *candidate_id,
+                    flight,
+                );
+                Some((*candidate_id, score, concedes))
             })
-            .max_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then_with(|| b.0.cmp(&a.0))
-            })
-            .map(|(candidate_id, _)| candidate_id)
+            .collect();
+        let pick = |require_clean: bool| {
+            scored
+                .iter()
+                .filter(|(_, _, concedes)| !require_clean || !*concedes)
+                .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(candidate_id, _, _)| *candidate_id)
+        };
+        // Only fall back to the least-bad conceded target when EVERY candidate concedes
+        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
+        pick(true).or_else(|| pick(false))
     }
 
     fn best_action_filtered<F>(&self, state: &SoccerQStateKey, is_legal: F) -> Option<String>
@@ -9613,11 +9684,20 @@ pub(crate) fn soccer_marl_adjusted_reward(
     if !config.marl_enabled() {
         return reward;
     }
-    let intermediate = reward * config.sanitized_marl_intermediate_reward_weight();
+    let tick_reward = tick_rewards.get(&transition.tick).copied();
+    // MAPPO cooperative-credit SHARE (ours): blend the agent's individual reward toward its team's
+    // per-tick mean BEFORE the centralized weighting, so off-ball work that sets up a teammate's
+    // later goal is credited. `share = 0` (the default) leaves the reward fully individual, so the
+    // `intermediate` line below reduces to the prior `reward * intermediate_weight` byte-for-byte.
+    let own_avg = tick_reward.map_or(0.0, |tr| tr.average_for(transition.team));
+    let share = config.sanitized_mappo_team_reward_share();
+    let shared = (1.0 - share) * reward + share * own_avg;
+    let intermediate = shared * config.sanitized_marl_intermediate_reward_weight();
     if config.marl_algorithm != SoccerMarlAlgorithm::Mappo {
         return intermediate;
     }
-    let Some(tick_reward) = tick_rewards.get(&transition.tick).copied() else {
+    // Centralized zero-sum team component (theirs): own team's tick mean minus the opponent's.
+    let Some(tick_reward) = tick_reward else {
         return intermediate;
     };
     let own_average = tick_reward.average_for(transition.team);
@@ -12845,6 +12925,21 @@ pub struct SoccerNeuralLearningConfig {
     /// units differ from the per-tick centered reward.
     #[serde(default)]
     pub critic_baseline_weight: f64,
+    /// **MAPPO cooperative-credit share**: how much each agent's policy-gradient
+    /// reward is replaced by its *team's* per-tick mean reward, before the
+    /// existing zero-sum opponent centering. `0.0` (the default) is the fully
+    /// individual-reward objective — byte-identical to the pre-MAPPO trainer.
+    /// At `w` the per-transition reward becomes `(1-w)·rᵢ + w·r̄_team`, so a
+    /// player begins optimising the shared team return (the centralized-critic
+    /// advantage in `neural_policy_training_samples` then credits a teammate's
+    /// later goal back to the off-ball work that set it up). `1.0` is a fully
+    /// shared team reward (classic cooperative MARL). Clamped to `[0, 1]`.
+    ///
+    /// Complements the `marl_*` fields below: this share folds the team mean into
+    /// the per-transition reward at capture time, while the `marl_*` weights shape
+    /// the centralized critic/advantage during the MAPPO update.
+    #[serde(default)]
+    pub mappo_team_reward_share: f64,
     /// Multi-agent learning mode. MAPPO keeps one decentralized actor per player
     /// decision while shaping the critic/advantage with centralized team rewards.
     #[serde(default)]
@@ -12859,12 +12954,6 @@ pub struct SoccerNeuralLearningConfig {
     /// PPO clip epsilon for MAPPO actor updates.
     #[serde(default = "default_soccer_mappo_clip_epsilon")]
     pub mappo_clip_epsilon: f64,
-    /// MAPPO cooperative-credit share: how much the individual dense reward is
-    /// blended toward the team's per-tick mean before the team-vs-opponent
-    /// component is added. `0.0` keeps the individual reward; `1.0` is a fully
-    /// shared team reward.
-    #[serde(default)]
-    pub mappo_team_reward_share: f64,
 }
 
 impl Default for SoccerNeuralLearningConfig {
@@ -12885,11 +12974,11 @@ impl Default for SoccerNeuralLearningConfig {
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
+            mappo_team_reward_share: 0.0,
             marl_algorithm: SoccerMarlAlgorithm::Mappo,
             marl_team_reward_weight: DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT,
             marl_intermediate_reward_weight: DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT,
             mappo_clip_epsilon: DEFAULT_SOCCER_MAPPO_CLIP_EPSILON,
-            mappo_team_reward_share: 0.0,
         }
     }
 }
@@ -12929,6 +13018,16 @@ impl SoccerNeuralLearningConfig {
         }
     }
 
+    /// MAPPO team-reward share, clamped to `[0, 1]`; a non-finite value falls
+    /// back to the individual-reward objective (`0.0`).
+    fn sanitized_mappo_team_reward_share(&self) -> f64 {
+        if self.mappo_team_reward_share.is_finite() {
+            self.mappo_team_reward_share.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     fn sanitized_marl_team_reward_weight(&self) -> f64 {
         if self.marl_team_reward_weight.is_finite() {
             self.marl_team_reward_weight.clamp(0.0, 1.0)
@@ -12959,16 +13058,6 @@ impl SoccerNeuralLearningConfig {
 
     fn mappo_enabled(&self) -> bool {
         self.enabled && self.marl_algorithm == SoccerMarlAlgorithm::Mappo
-    }
-
-    /// MAPPO team-reward share, clamped to `[0, 1]`; a non-finite value falls
-    /// back to the individual-reward objective (`0.0`).
-    fn sanitized_mappo_team_reward_share(&self) -> f64 {
-        if self.mappo_team_reward_share.is_finite() {
-            self.mappo_team_reward_share.clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
     }
 
     fn sanitized_target_scale(&self) -> f64 {
@@ -43692,6 +43781,12 @@ fn dd_soccer_disable_dribble_open_lane() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_OPEN_LANE").is_ok())
+}
+
+fn dd_soccer_disable_round_the_keeper() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ROUND_THE_KEEPER").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on

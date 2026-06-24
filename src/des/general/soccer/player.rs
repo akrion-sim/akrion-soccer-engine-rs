@@ -1072,6 +1072,12 @@ pub struct PlayerAgent {
     pub slide_recovery_seconds: f64,
 }
 
+fn soccer_pressured_contested_pass_damp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP").is_err())
+}
+
 fn mpc_reselect_candidate_label(label: &str) -> bool {
     matches!(
         label,
@@ -1106,6 +1112,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
+            | "round-the-keeper"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1658,6 +1665,7 @@ fn mpc_execution_estimate_for_action(
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
+            | "round-the-keeper"
             | "fake-left-cut-right"
             | "fake-right-cut-left"
             | "protect-ball"
@@ -1801,6 +1809,13 @@ fn mpc_execution_estimate_for_action(
                 // A short carry into a clear, opponent-free spot (chosen to have space) — inherently
                 // feasible; scales with control + the space at the spot, lightly damped by pressure.
                 (0.46 + dribble_skill * 0.26 + target_space_fit * 0.18 - pressure * 0.12)
+                    .clamp(0.18, 0.97)
+            }
+            "round-goalkeeper" => {
+                // A short carry to a closer spot with a clear strike past the keeper — feasible;
+                // scales with control + the space at the spot, lightly damped by pressure. (Ours'
+                // tuned estimate, folded onto the unified round-goalkeeper label during the merge.)
+                (0.48 + dribble_skill * 0.24 + target_space_fit * 0.18 - pressure * 0.10)
                     .clamp(0.18, 0.97)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
@@ -3821,10 +3836,23 @@ impl PlayerAgent {
             let quick_release = (1.35 - observation.perceived_time_on_ball_seconds)
                 .max(0.0)
                 .min(1.0);
-            let completion_bonus = (0.82
-                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.24
-                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.16)
-                .clamp(0.76, 1.22);
+            let completion_bonus = {
+                let base = 0.82
+                    + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.24
+                    + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.16;
+                // Under real pressure a CONTESTED pass (low expected completion) is penalised much
+                // harder so a pinned carrier shields/holds rather than forcing the ball into traffic
+                // (the "passed it straight to the other team" turnover). Calm play and a genuinely
+                // open pass are untouched (heat or contested ≈ 0).
+                let damp = if soccer_pressured_contested_pass_damp_enabled() {
+                    let heat = observation.perceived_pressure.clamp(0.0, 1.0);
+                    let contested = 1.0 - observation.expected_pass_completion.clamp(0.0, 1.0);
+                    heat * contested * PRESSURED_CONTESTED_PASS_DAMP
+                } else {
+                    0.0
+                };
+                (base - damp).clamp(0.40, 1.22)
+            };
             let pass_score = (self.preferences.pass_bias
                 * directive.pass_priority
                 * (0.70 + passing * 0.42)
@@ -7358,6 +7386,9 @@ impl PlayerAgent {
                 }
                 open_lane_offered = true;
             }
+            // ROUND THE KEEPER is generated above as `round_goalkeeper_plan` (the unified,
+            // plan-based implementation); ours' separate `dribble_round_the_keeper_for` generator
+            // was folded into it during the merge to avoid offering the same carry twice.
             let mut xavi_turn_offered = false;
             if snapshot.xavi_turn_enabled
                 && self.role != PlayerRole::Goalkeeper
@@ -8873,12 +8904,13 @@ impl PlayerAgent {
                 action = fallback_action;
                 action_label = fallback_label;
             }
-            // The open-passing-lane carry uses its OWN sprint decision (very high pressure or a
-            // fast-tracking opponent -> burst, else a controlled run to conserve energy).
-            // The round-goalkeeper carry also keeps its plan-specific burst decision, because
-            // pressure/space determines whether to glide around the keeper or explode past him.
-            // The open-pass-lane carry uses its pressure/tracking sprint helper; every
-            // other dribble uses the generic role/urgency rule.
+            // Each special carry decides sprint-vs-run on its own terms; every other carry uses
+            // the generic role/urgency rule. This unifies both convergent open-lane features:
+            // ours ("open-passing-lane") sets `open_lane_sprint` in its arm (very high pressure /
+            // fast-tracking opponent → burst, else a controlled run to conserve energy), and
+            // theirs ("open-pass-lane", `OPEN_PASS_LANE_ACTION_LABEL`) decides via
+            // `open_pass_lane_sprint_for_action`. The round-goalkeeper carry keeps its own
+            // plan-specific burst decision (pressure/space decides glide-around vs explode-past).
             let is_dribble_action = matches!(action, SoccerAction::DribbleMove { .. });
             let sprint = if !is_dribble_action {
                 false

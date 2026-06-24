@@ -87,7 +87,10 @@ pub enum SoccerActionLabel {
     /// On-ball: a short carrier dribble to change the passing angle and open a
     /// currently-blocked teammate lane.
     OpenPassLane,
-    /// On-ball: dribble around the goalkeeper to open a closer shooting lane.
+    /// On-ball: a short, quick carry around the goalkeeper — closer to goal and off the
+    /// keeper's covered angle — to open a clear shot, instead of a long shot the keeper
+    /// saves. Unifies the two convergent "round the keeper" carries onto one label /
+    /// implementation (`round_goalkeeper_plan` + `RoundGoalkeeperDribblePlan`).
     RoundGoalkeeper,
     // --- off-ball: support / movement ---
     Space,
@@ -339,6 +342,9 @@ impl SoccerActionLabel {
             | "dribble-to-pass"
             | "dribble_to_pass"
             | "dribbletopass" => "open-pass-lane",
+            // Unified vocabulary: both teams' alias spellings (ours "round-the-keeper" et al.
+            // and theirs "round-goalkeeper" et al.) normalize to the single canonical label so
+            // any persisted/external label from either side still resolves.
             "round-goalkeeper"
             | "round_goalkeeper"
             | "roundgoalkeeper"
@@ -350,7 +356,16 @@ impl SoccerActionLabel {
             | "beat-keeper"
             | "beat_keeper"
             | "dribble-around-keeper"
-            | "dribble_around_keeper" => "round-goalkeeper",
+            | "dribble_around_keeper"
+            | "round-the-keeper"
+            | "round_the_keeper"
+            | "roundthekeeper"
+            | "round-the-gk"
+            | "round-keeper"
+            | "round_keeper"
+            | "rounding-the-keeper"
+            | "dribble-round-keeper"
+            | "beat-the-keeper" => "round-goalkeeper",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"

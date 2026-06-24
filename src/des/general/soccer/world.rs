@@ -3427,12 +3427,12 @@ impl SoccerMatch {
             None
         };
 
-        // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in
-        // via `DD_SOCCER_LOOKAHEAD_DEPTH >= 1` AND a trained world model is present,
-        // score each candidate by rolling the world model forward (`predict_next`)
-        // and evaluating the predicted state with the critic, rather than scoring the
-        // current state-action directly. Depth 0 — the default, and the forced value
-        // when no world model exists — reproduces the direct depth-0 critic value
+        // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in via
+        // `DD_SOCCER_LOOKAHEAD_DEPTH >= 1` AND a trained world model is present, the value blend
+        // scores each candidate by rolling the world model one step forward (`predict_next`) and
+        // evaluating the predicted state with the critic (folded into the `neural_q` closure
+        // below), rather than scoring the current state-action directly. Depth 0 — the default, and
+        // forced when no world model exists — reproduces the direct depth-0 critic value
         // byte-for-byte, so play is unchanged unless a run opts in.
         let lookahead_depth = if self.world_model.is_some() {
             dd_soccer_lookahead_depth()
@@ -3498,6 +3498,9 @@ impl SoccerMatch {
         };
         let neural_q = |label: &str| -> Option<f64> {
             let learner = learner?;
+            // Look-ahead-aware critic value: depth 0 is the direct critic (byte-identical to the
+            // pre-look-ahead path, since `model_based_lookahead_value` at depth 0 == predict_value
+            // of the same features); depth >= 1 rolls the world model one step forward first.
             self.model_based_lookahead_value(&base, label, learner, lookahead_depth)
                 .map(|v| v * target_scale)
         };
@@ -4374,8 +4377,12 @@ impl SoccerMatch {
         // Per-tick team reward aggregation for centralized MARL shaping.
         let tick_rewards = soccer_marl_tick_rewards(replay);
 
-        // Per-transition row: MARL-adjusted reward, critic value (in reward
-        // units), terminal flag, action index, and state features.
+        // Per-transition row: the MARL-adjusted reward (critic value in reward units), terminal
+        // flag, action index, and state features. Both convergent cooperative-MARL shapings are
+        // unified in `soccer_marl_adjusted_reward`: ours' MAPPO team-reward SHARE blends each
+        // agent's reward toward its team's per-tick mean, and theirs' centralized weighting then
+        // scales that (intermediate) signal and adds the zero-sum (own − opponent) team component.
+        // Each knob reduces to a no-op at its default, so the default path is byte-identical.
         let reward_adv: Vec<f64> = replay
             .iter()
             .map(|transition| {
@@ -16853,6 +16860,18 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
 }
+/// When an off-ball forward/midfielder is holding a support position (NOT timing a
+/// sanctioned in-behind run), they should sit level with the last defender — on the
+/// shoulder, onside — rather than parking `OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS`
+/// beyond the line in a standing offside position. Parking offside meant any pass or
+/// loose ball that reached them was (correctly) flagged offside, so strikers were
+/// continually caught even though the ball never left our half. Set this env var to
+/// restore the old line+tolerance parking.
+pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
+}
 /// Tactical model-based look-ahead depth for the value blend (`neural_blended_action`):
 /// AlphaZero/MuZero-style planning that rolls the learned world model (`predict_next`)
 /// forward from each candidate action and scores the predicted state with the critic,
@@ -18486,6 +18505,167 @@ impl WorldSnapshot {
             / (PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS * 2.0).max(1.0))
         .clamp(0.0, 1.0);
         (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
+    }
+
+    /// True when a ground/low pass to `pass_point` concedes the reception to an opponent:
+    /// the nearest opponent to the reception point is on/near it and can REACH the arriving
+    /// ball. This is the ball-to-an-opponent's-feet / man-marked-receiver case that
+    /// [`Self::pass_point_directly_favors_opponent`] and
+    /// [`Self::pass_point_direct_opponent_control_risk`] both miss, because they only model
+    /// an opponent who is strictly CLOSER to the aim than the receiver and so return zero
+    /// when the receiver is himself at the aim point with a marker shadowing him.
+    ///
+    /// A defender essentially on the ball (within `AT_FEET`) is always a concession; a
+    /// marker within `MARK_RADIUS` is a hard concession only when `passer_pressure` is real,
+    /// so a brave pass to a half-open man and a contested final-third reception to an OPEN
+    /// receiver are left to the soft congestion penalty rather than hard-vetoed. The reach
+    /// check keeps a slow/distant marker, or a ball driven past too fast to be cut out, from
+    /// tripping it.
+    pub(crate) fn pass_reception_conceded_to_opponent(
+        &self,
+        team: Team,
+        _receiver_position: Vec2,
+        pass_origin: Vec2,
+        pass_point: Vec2,
+        ball_speed_yps: f64,
+        passer_pressure: f64,
+    ) -> bool {
+        let Some((opponent_id, opponent_position, opponent_distance)) =
+            self.nearest_opponent_at(team, pass_point)
+        else {
+            return false;
+        };
+        if !opponent_distance.is_finite()
+            || opponent_distance > PASS_RECEPTION_CONCEDE_MARK_RADIUS_YARDS
+        {
+            return false;
+        }
+        let at_feet = opponent_distance <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+        // A marker within reach but not glued to the ball only concedes under real passer
+        // pressure — the "forced ball into a tightly-marked man" the user reported.
+        if !at_feet && passer_pressure < IN_BEHIND_SPRINT_PRESSURE {
+            return false;
+        }
+        // Can the opponent reach the arriving ball? Reuse the lane-arrival + sprint-reach
+        // model so a slow/distant marker, or a ball driven past quickly, does not trip it.
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let lane = pass_point - pass_origin;
+        let lane_len = lane.len();
+        let ball_arrival = if lane_len < 1e-3 {
+            0.0
+        } else {
+            let dir = lane * (1.0 / lane_len);
+            let along = (opponent_position - pass_origin)
+                .dot(dir)
+                .clamp(0.0, lane_len);
+            along / speed
+        };
+        if at_feet {
+            return true;
+        }
+        let Some(opponent) = self.players.iter().find(|p| p.id == opponent_id) else {
+            return false;
+        };
+        let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        // (1) Single-horizon reach at the reception — kept as a strict superset trigger so the
+        // static (zero-velocity) concede unit tests stay byte-identical.
+        let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        if opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window {
+            return true;
+        }
+        // (2) Inter-tick swept reach: the pass may resolve in 1, 2, 4, or 4+ ticks, so walk the
+        // ball along its lane at those tick horizons (each capped at arrival) and, at every
+        // sample, project THIS marker forward with his own momentum (capped to a sprint) and
+        // grow a sprint-reach disc over the reaction-adjusted elapsed time. He concedes the
+        // reception the instant that disc covers the ball — catching a marker actively closing
+        // onto the reception that the single, instantaneous snapshot above misses.
+        if lane_len < 1e-3 {
+            return false;
+        }
+        let dir = lane * (1.0 / lane_len);
+        let opponent_velocity = self
+            .player_velocity(opponent.id)
+            .unwrap_or(opponent.velocity);
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
+        for ticks in PASS_CONCEDE_SWEEP_TICK_HORIZONS {
+            let t = (ticks * dt).min(ball_arrival.max(dt));
+            let ball_pos = pass_origin + dir * (speed * t).min(lane_len);
+            // Momentum carries the marker, but never beyond what a sprint could cover in `t`.
+            let mut momentum = opponent_velocity * t;
+            let max_carry = sprint_speed * t;
+            if momentum.len() > max_carry {
+                momentum = momentum.normalized() * max_carry;
+            }
+            let carried = opponent_position + momentum;
+            let reach = INTERCEPT_LUNGE_REACH_YARDS
+                + sprint_speed * (t - PASS_LANE_INTERCEPT_REACTION_SECONDS).max(0.0);
+            if carried.distance(ball_pos) <= reach {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Decision-level concede check used when a passer COMMITS to a target (vs. the physical
+    /// [`Self::pass_reception_conceded_to_opponent`] the ranker prices for risk): it folds in
+    /// the passer's POMDP perception. A passer is only expected to AVOID feeding a marked man
+    /// he can actually perceive — a marker arriving on his blindside (low position confidence,
+    /// ~240° FOV with the rear unseen and confidence decaying as the head turns) is a realistic
+    /// loss, not a vetoable choice. The ball-played-straight-to-an-opponent's-feet case is a
+    /// gross error and is NOT perception-gated (you can always see where you are aiming).
+    pub(crate) fn pass_target_concedes_to_perceived_opponent(
+        &self,
+        passer_id: usize,
+        target_id: usize,
+        flight: PassFlight,
+    ) -> bool {
+        let Some(passer) = self.players.iter().find(|p| p.id == passer_id) else {
+            return false;
+        };
+        let Some(target) = self.players.iter().find(|p| p.id == target_id) else {
+            return false;
+        };
+        if passer.team != target.team || passer_id == target_id {
+            return false;
+        }
+        let passer_position = self.player_snapshot_position(passer);
+        let target_position = self.player_snapshot_position(target);
+        let initial_is_cross = pass_would_be_cross(
+            passer_position,
+            target_position,
+            passer.team,
+            self.field_width,
+            self.field_length,
+        );
+        let speed = pass_speed_yps_from_power(0.68, flight, initial_is_cross, &passer.skills);
+        let reception = self
+            .anticipated_pass_reception_point(passer_id, target_id, flight, speed)
+            .unwrap_or(target_position);
+        let passer_pressure = self.attacker_pressure_on_point(passer.team, passer_position);
+        if !self.pass_reception_conceded_to_opponent(
+            passer.team,
+            target_position,
+            passer_position,
+            reception,
+            speed,
+            passer_pressure,
+        ) {
+            return false;
+        }
+        // The ball to an opponent's FEET is always a concession (no perception gate). A marked
+        // man is only a vetoable concession if the passer actually perceives the marker.
+        let nearest = self.nearest_opponent_distance_at(passer.team, reception);
+        if nearest <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS {
+            return true;
+        }
+        let perceived = self
+            .player_position_confidence_for_point(passer_id, reception)
+            .unwrap_or(1.0);
+        perceived >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE
     }
 
     /// Score the shot **placement** as a discrete decision instead of defaulting to the
@@ -20641,8 +20821,8 @@ impl WorldSnapshot {
         mut target: Vec2,
     ) -> Vec2 {
         // Applies to attacking players (forwards and midfielders): when our team
-        // has the ball and they are not on a sanctioned timed in-behind run, allow
-        // only a marginal 0-3yd open-space stretch beyond the last line.
+        // has the ball and they are not on a sanctioned timed in-behind run, hold an
+        // ONSIDE support position level with the last defender (on the shoulder).
         if self.possession_team() != Some(player.team)
             || self.ball.holder == Some(player.id)
             || !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
@@ -20655,7 +20835,15 @@ impl WorldSnapshot {
         };
         let half_line = self.field_length * 0.5;
         let attack = player.team.attack_dir();
-        let cap_y = self.open_space_support_line_y(player.team, line_y);
+        // Idle supporters hold level with the line (onside). Only a sanctioned timed
+        // in-behind run (excluded above) may stretch beyond it. The legacy behaviour
+        // parked them OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS past the line — a standing
+        // offside position — so any ball that reached them was flagged.
+        let cap_y = if dd_soccer_disable_onside_support_hold() {
+            self.open_space_support_line_y(player.team, line_y)
+        } else {
+            line_y
+        };
         let beyond_line = (target.y - cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
         if in_attacking_half && beyond_line {
@@ -22697,6 +22885,17 @@ impl WorldSnapshot {
                 } else {
                     (PassFlight::Floor, 0.18)
                 };
+                // A killer ball threads RISK into space (that race is priced into the score, not
+                // hidden), but it must never be a gross concession — the ball arriving at an
+                // opponent's feet, or forced into a tightly-marked man the passer can see. The
+                // generic ranker/selector enforce this for ordinary passes; the threaded pool is
+                // un-gated, so re-apply the same perception-gated concede veto here. A runner
+                // breaking into clear space has no opponent within the mark radius of the
+                // reception, so genuine killer balls are untouched; only a pass landing on a
+                // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                if self.pass_target_concedes_to_perceived_opponent(player_id, target_id, flight) {
+                    return None;
+                }
                 // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
                 // lane-interception-risk gate crush its completion below the floor below (which
                 // would hide the option). Risk is priced into the killer-pass score instead.
@@ -23378,20 +23577,35 @@ impl WorldSnapshot {
                 );
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
-                // HARD veto (the real fix for "passing straight to the opposition"): if the aim
-                // point is clearly closer to an opponent than to the intended receiver, sink the
-                // candidate so it never wins over holding or a safe outlet.
-                let direct_opponent_aim_veto =
-                    if self.pass_point_directly_favors_opponent(me.team, position, pass_point) {
-                        PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
-                    } else {
-                        0.0
-                    };
+                // candidate so it never wins over holding or a safe outlet. Both teams independently
+                // fixed the man-marked-receiver / ball-to-the-feet hole the bare aim-point test
+                // misses (an opponent level-with-or-in-front of a receiver who is himself at the
+                // aim point); the two fixes are complementary and BOTH apply, sharing one passer
+                // pressure read. Ours is a HARD veto (`pass_reception_conceded_to_opponent`) that
+                // sinks a clear concession — a marker glued to the ball, or a pressured ball into a
+                // tightly-marked man — and theirs is a graded SOFT `marked_receiver_penalty` that
+                // additionally demotes a marginally-marked receiver below the hard-veto bar.
+                let passer_pressure_for_veto =
+                    self.attacker_pressure_on_point(me.team, me_position);
+                let direct_opponent_aim_veto = if self
+                    .pass_point_directly_favors_opponent(me.team, position, pass_point)
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        pass_point,
+                        score_nominal_speed,
+                        passer_pressure_for_veto,
+                    ) {
+                    PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
+                } else {
+                    0.0
+                };
                 let marked_receiver_penalty = self.pass_target_marking_score_penalty(
                     me.team,
                     position,
                     pass_point,
-                    passer_pressure,
+                    passer_pressure_for_veto,
                 );
                 // Pointless short ball: under low pressure, a sub-4yd pass to a teammate who
                 // is no more open than the holder neither escapes pressure nor progresses —
@@ -23716,12 +23930,30 @@ impl WorldSnapshot {
                 ));
                 let direct_opponent_aim_penalty =
                     direct_opponent_aim_score_penalty(direct_opponent_control_risk);
+                let aerial_passer_pressure_for_veto =
+                    self.attacker_pressure_on_point(me.team, me_position);
                 let direct_opponent_aim_veto = if self
                     .pass_point_directly_favors_opponent(me.team, position, pass_point)
                     || self.pass_point_directly_favors_opponent(
                         me.team,
                         position,
                         anticipated_position,
+                    )
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        pass_point,
+                        score_nominal_speed,
+                        aerial_passer_pressure_for_veto,
+                    )
+                    || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        anticipated_position,
+                        score_nominal_speed,
+                        aerial_passer_pressure_for_veto,
                     ) {
                     PASS_DIRECT_OPPONENT_AIM_HARD_VETO_PENALTY
                 } else {
@@ -24194,10 +24426,19 @@ impl WorldSnapshot {
             .holder
             .and_then(|holder| self.player_position(holder))
             .unwrap_or(self.ball.position);
-        // Open-space support may stretch a marginal 0-3yd beyond the second-last
-        // defender. Offside is still enforced when the pass is played; here the run
-        // exists to widen/deepen the attack and force the line to make a choice.
-        let run_y = self.open_space_support_line_y(me.team, line_y);
+        // Stage the run on the shoulder (level with the last defender, onside) until
+        // the ball is actually released, THEN break beyond. Offside is judged at the
+        // moment the ball is played: a runner who is already standing past the line is
+        // flagged, so continuously parking at line+tolerance pre-release meant the run
+        // was offside whenever a pass came. Once our ball is in flight (a targeted pass
+        // or an over-the-top), the offside for this play has already been assessed, so
+        // the runner may legally break beyond to chase it.
+        let ball_released = self.pending_pass.is_some();
+        let run_y = if dd_soccer_disable_onside_support_hold() || ball_released {
+            self.open_space_support_line_y(me.team, line_y)
+        } else {
+            line_y
+        };
         let target = Vec2::new(
             (current.x * 0.76 + holder_position.x * 0.24).clamp(4.0, self.field_width - 4.0),
             run_y,
@@ -33986,6 +34227,152 @@ impl WorldSnapshot {
                     }
                     if self.clear_line(spot, to, opp, OPEN_LANE_DRIBBLE_CORRIDOR_YARDS) {
                         return Some((spot, receiver_id, sprint));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save probability of the BEST-placed shot (least-saveable goalmouth corner) the shooting team
+    /// could strike from `shooter_pos` against the opposing keeper. High ⇒ the keeper is covering
+    /// the goal from here; low ⇒ the goal is open. `None` when there is no opposing keeper. Pure
+    /// read; reuses the same keeper-save model as `scored_shot_placement_x`.
+    pub(crate) fn best_shot_save_probability_from(
+        &self,
+        shooting_team: Team,
+        shooter_pos: Vec2,
+        shot_speed_yps: f64,
+        shooting_skill: f64,
+    ) -> Option<f64> {
+        if !shooter_pos.x.is_finite() || !shooter_pos.y.is_finite() {
+            return None;
+        }
+        let keeper_id = self.goalkeeper_for(shooting_team.other())?;
+        let keeper = self.players.iter().find(|p| p.id == keeper_id)?;
+        let goal_y = shooting_team.goal_y(self.field_length);
+        let best_x = self.scored_shot_placement_x(
+            shooting_team,
+            shooter_pos,
+            goal_y,
+            shot_speed_yps,
+            shooting_skill.clamp(0.0, 1.0),
+        );
+        let crossing = Vec2::new(best_x, goal_y);
+        let keeper_pos = self.player_snapshot_position(keeper);
+        let keeper_vel = self.player_velocity(keeper.id).unwrap_or(keeper.velocity);
+        Some(goalkeeper_save_probability_from_traits(
+            &keeper.skills,
+            keeper_pos,
+            keeper_vel,
+            keeper.fatigue,
+            shooter_pos,
+            crossing,
+            shot_speed_yps,
+            self.goal_width,
+            0.0,
+        ))
+    }
+
+    /// "Round the keeper": when the carrier is in range but the goalkeeper is covering the shot, a
+    /// short, quick carry CLOSER to goal (and around the keeper's angle) opens a clear strike — far
+    /// better than blazing a long shot the keeper saves. Returns `(spot, sprint)`: where to carry,
+    /// and whether to SPRINT (very high pressure / a fast-closing keeper or defender) vs run.
+    /// `None` when out of range, the shot is already clear, no closer spot opens a clear strike, or
+    /// the feature is disabled (`DD_SOCCER_DISABLE_ROUND_THE_KEEPER`). Pure read of the snapshot.
+    pub(crate) fn dribble_round_the_keeper_for(&self, carrier_id: usize) -> Option<(Vec2, bool)> {
+        if dd_soccer_disable_round_the_keeper() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == carrier_id)?;
+        if me.role == PlayerRole::Goalkeeper || self.ball.holder != Some(carrier_id) {
+            return None;
+        }
+        let from = self.player_snapshot_position(me);
+        if !from.x.is_finite() || !from.y.is_finite() {
+            return None;
+        }
+        let opp = me.team.other();
+        let attack_dir = me.team.attack_dir();
+        let goal_y = me.team.goal_y(self.field_length);
+        let dist_to_goal = (goal_y - from.y).abs();
+        // Only in the near-to-mid range: this is about getting a CLOSE shot, not a long one. Below
+        // the min it is already point-blank (just shoot).
+        if !(ROUND_KEEPER_MIN_GOAL_YARDS..=ROUND_KEEPER_MAX_START_YARDS).contains(&dist_to_goal) {
+            return None;
+        }
+        let skill = ability01(me.skills.shooting);
+        let shot_speed = shot_speed_yps_from_power(shot_power_for_skill(skill), &me.skills);
+
+        // Only act when the keeper is genuinely covering the direct shot right now.
+        let save_now = self.best_shot_save_probability_from(me.team, from, shot_speed, skill)?;
+        if save_now < ROUND_KEEPER_BLOCKED_SAVE_THRESHOLD {
+            return None;
+        }
+
+        // Sprint decision: burst when under very high pressure OR the nearest opponent (typically
+        // the onrushing keeper) is closing quickly toward the carrier; else a controlled run.
+        let nearest_opp = self
+            .players
+            .iter()
+            .filter(|p| p.team == opp)
+            .map(|p| {
+                let pos = self.player_snapshot_position(p);
+                (p, pos, pos.distance(from))
+            })
+            .filter(|(_, _, d)| d.is_finite())
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        let pressure = nearest_opp
+            .as_ref()
+            .map(|(_, _, d)| pressure_from_nearest_distance(*d))
+            .unwrap_or(0.0);
+        let opp_closing_yps = nearest_opp
+            .as_ref()
+            .map(|(p, pos, d)| {
+                if *d <= 1e-3 {
+                    return 0.0;
+                }
+                let toward = (from - *pos) * (1.0 / *d);
+                self.player_velocity(p.id)
+                    .unwrap_or(p.velocity)
+                    .dot(toward)
+                    .max(0.0)
+            })
+            .unwrap_or(0.0);
+        let sprint =
+            pressure >= ROUND_KEEPER_SPRINT_PRESSURE || opp_closing_yps >= ROUND_KEEPER_SPRINT_TRACK_YPS;
+
+        let goalward = Vec2::new(0.0, attack_dir);
+        let across = Vec2::new(1.0, 0.0);
+        // Search short carries — forward toward goal, and forward-and-to-a-side to come around the
+        // keeper — for the SMALLEST one that lands a spot that is closer to goal, safe, and from
+        // which the best-placed shot beats the keeper (low save). Smallest step + most-direct offset
+        // first, so the carrier takes the least dribble that earns the clear strike.
+        for &step in ROUND_KEEPER_STEP_YARDS.iter() {
+            for &(fwd_w, lat_w) in &[
+                (1.0, 0.0),
+                (0.8, 0.6),
+                (0.8, -0.6),
+                (0.55, 0.95),
+                (0.55, -0.95),
+            ] {
+                let spot = (from + goalward * (step * fwd_w) + across * (step * lat_w))
+                    .clamp_to_pitch(self.field_width, self.field_length);
+                // Must actually get closer to goal.
+                if (goal_y - spot.y).abs() >= dist_to_goal - 0.5 {
+                    continue;
+                }
+                // Don't carry straight onto the keeper / another defender.
+                if self.nearest_opponent_distance_at(me.team, spot)
+                    < ROUND_KEEPER_MIN_SPOT_SPACE_YARDS
+                {
+                    continue;
+                }
+                if let Some(save_spot) =
+                    self.best_shot_save_probability_from(me.team, spot, shot_speed, skill)
+                {
+                    if save_spot <= ROUND_KEEPER_CLEAR_SAVE_THRESHOLD {
+                        return Some((spot, sprint));
                     }
                 }
             }
