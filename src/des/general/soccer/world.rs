@@ -4347,7 +4347,25 @@ impl SoccerMatch {
         // "state-dominant", not perfectly action-independent — adequate as the
         // policy/world-model state encoding, and identical at train and inference.
         let state_features = soccer_neural_transition_features_with_action(transition, "");
-        soccer_policy_features_for_role(&state_features, transition.role)
+        // Exact assigned position from the player's static formation anchor — gated so the
+        // block is all-zero (role-only actor) unless the assigned-position embedding is on.
+        let assigned = if dd_soccer_enable_assigned_position_embedding() {
+            self.players
+                .iter()
+                .find(|player| player.id == transition.player_id)
+                .map(|player| {
+                    soccer_assigned_position_for(
+                        transition.role,
+                        player.home_position,
+                        self.config.field_width_yards,
+                        self.config.field_length_yards,
+                        transition.team,
+                    )
+                })
+        } else {
+            None
+        };
+        soccer_policy_features_for_role(&state_features, transition.role, assigned)
     }
 
     /// Build actor-critic training samples from a replay: opponent-centered reward

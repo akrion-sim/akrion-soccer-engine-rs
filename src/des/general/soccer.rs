@@ -3557,8 +3557,17 @@ const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// by advantage policy-gradient from the critic; stable baseline values live here,
 /// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
 const SOCCER_POLICY_ROLE_EMBEDDING_DIM: usize = 4;
-const SOCCER_POLICY_FEATURE_DIM: usize =
-    SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
+/// Exact-position one-hot appended after the broad role one-hot so the shared actor can
+/// specialize per assigned slot (GK / LB / LCB / RCB / RB / DM / CM / AM / LW / RW / ST)
+/// rather than treating all four defenders — or both wide forwards — identically. Always
+/// present in the feature schema; populated only when
+/// `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING` is set (else all-zero ⇒ a clean A/B
+/// against the role-only actor within the same network dimensions). See
+/// [`SoccerAssignedPosition`] and [`soccer_assigned_position_for`].
+const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = 11;
+const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
+    + SOCCER_POLICY_ROLE_EMBEDDING_DIM
+    + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Entropy bonus — keeps the actor from collapsing onto one family too early.
@@ -31732,14 +31741,118 @@ fn soccer_policy_role_embedding(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EM
     embedding
 }
 
+/// Exact assigned position, refining the broad [`PlayerRole`] into the conventional 11 slots.
+/// Ordering is the one-hot index used in the policy feature block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerAssignedPosition {
+    Goalkeeper,
+    LeftBack,
+    LeftCentreBack,
+    RightCentreBack,
+    RightBack,
+    DefensiveMidfield,
+    CentreMidfield,
+    AttackingMidfield,
+    LeftWing,
+    RightWing,
+    Striker,
+}
+
+impl SoccerAssignedPosition {
+    fn one_hot_index(self) -> usize {
+        match self {
+            SoccerAssignedPosition::Goalkeeper => 0,
+            SoccerAssignedPosition::LeftBack => 1,
+            SoccerAssignedPosition::LeftCentreBack => 2,
+            SoccerAssignedPosition::RightCentreBack => 3,
+            SoccerAssignedPosition::RightBack => 4,
+            SoccerAssignedPosition::DefensiveMidfield => 5,
+            SoccerAssignedPosition::CentreMidfield => 6,
+            SoccerAssignedPosition::AttackingMidfield => 7,
+            SoccerAssignedPosition::LeftWing => 8,
+            SoccerAssignedPosition::RightWing => 9,
+            SoccerAssignedPosition::Striker => 10,
+        }
+    }
+}
+
+/// Derive the exact assigned position from the player's broad role and its **formation
+/// anchor** (`home_position`, static for the match), team-relative so "left"/"deep" mean the
+/// same thing for both sides. Defenders split L→R into LB/LCB/RCB/RB by lateral quartile;
+/// midfielders split by depth into DM/CM/AM; forwards split L→R into LW/ST/RW. Deterministic,
+/// so the decision-time and training-time feature vectors agree.
+pub(crate) fn soccer_assigned_position_for(
+    role: PlayerRole,
+    home_position: Vec2,
+    field_width_yards: f64,
+    field_length_yards: f64,
+    team: Team,
+) -> SoccerAssignedPosition {
+    // Team-relative lateral fraction (0 = own left touchline, 1 = own right) and forward
+    // depth fraction (0 = own goal line, 1 = opponent goal line).
+    let width = field_width_yards.max(1.0);
+    let length = field_length_yards.max(1.0);
+    let lateral = (home_position.x / width).clamp(0.0, 1.0);
+    let lateral = if team == Team::Home { lateral } else { 1.0 - lateral };
+    let depth = (home_position.y / length).clamp(0.0, 1.0);
+    let depth = if team == Team::Home { depth } else { 1.0 - depth };
+    match role {
+        PlayerRole::Goalkeeper => SoccerAssignedPosition::Goalkeeper,
+        PlayerRole::Defender => {
+            if lateral < 0.25 {
+                SoccerAssignedPosition::LeftBack
+            } else if lateral < 0.5 {
+                SoccerAssignedPosition::LeftCentreBack
+            } else if lateral < 0.75 {
+                SoccerAssignedPosition::RightCentreBack
+            } else {
+                SoccerAssignedPosition::RightBack
+            }
+        }
+        PlayerRole::Midfielder => {
+            if depth < 0.42 {
+                SoccerAssignedPosition::DefensiveMidfield
+            } else if depth < 0.62 {
+                SoccerAssignedPosition::CentreMidfield
+            } else {
+                SoccerAssignedPosition::AttackingMidfield
+            }
+        }
+        PlayerRole::Forward => {
+            if lateral < 0.33 {
+                SoccerAssignedPosition::LeftWing
+            } else if lateral < 0.67 {
+                SoccerAssignedPosition::Striker
+            } else {
+                SoccerAssignedPosition::RightWing
+            }
+        }
+    }
+}
+
+fn soccer_policy_assigned_position_embedding(
+    assigned: Option<SoccerAssignedPosition>,
+) -> [f64; SOCCER_POLICY_ASSIGNED_POSITION_DIM] {
+    let mut embedding = [0.0; SOCCER_POLICY_ASSIGNED_POSITION_DIM];
+    // `None` (gate off) ⇒ all-zero block: the actor sees only the broad role one-hot.
+    if let Some(position) = assigned {
+        embedding[position.one_hot_index()] = 1.0;
+    }
+    embedding
+}
+
 fn soccer_policy_features_for_role(
     state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
     role: PlayerRole,
+    assigned: Option<SoccerAssignedPosition>,
 ) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
     let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
     features[..SOCCER_NEURAL_FEATURE_DIM].copy_from_slice(state_features);
     let role_embedding = soccer_policy_role_embedding(role);
-    features[SOCCER_NEURAL_FEATURE_DIM..].copy_from_slice(&role_embedding);
+    let role_end = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
+    features[SOCCER_NEURAL_FEATURE_DIM..role_end].copy_from_slice(&role_embedding);
+    let assigned_embedding = soccer_policy_assigned_position_embedding(assigned);
+    features[role_end..].copy_from_slice(&assigned_embedding);
     features
 }
 
@@ -43933,6 +44046,16 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
+/// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off ⇒
+/// the block stays all-zero and the actor sees only the broad role one-hot, so the policy
+/// network has identical dimensions either way (a clean A/B for positional specialization).
+fn dd_soccer_enable_assigned_position_embedding() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING").is_ok())
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {

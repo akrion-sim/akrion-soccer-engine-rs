@@ -28827,38 +28827,105 @@ fn policy_features_append_explicit_role_embedding() {
     state[0] = 0.25;
     state[SOCCER_NEURAL_FEATURE_DIM - 1] = -0.5;
 
-    let keeper = soccer_policy_features_for_role(&state, PlayerRole::Goalkeeper);
-    let defender = soccer_policy_features_for_role(&state, PlayerRole::Defender);
-    let midfielder = soccer_policy_features_for_role(&state, PlayerRole::Midfielder);
-    let forward = soccer_policy_features_for_role(&state, PlayerRole::Forward);
+    let keeper = soccer_policy_features_for_role(&state, PlayerRole::Goalkeeper, None);
+    let defender = soccer_policy_features_for_role(&state, PlayerRole::Defender, None);
+    let midfielder = soccer_policy_features_for_role(&state, PlayerRole::Midfielder, None);
+    let forward = soccer_policy_features_for_role(&state, PlayerRole::Forward, None);
 
     assert_eq!(&keeper[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
     assert_eq!(&defender[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
     assert_eq!(&midfielder[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
     assert_eq!(&forward[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
+    // Role one-hot occupies the first block; the assigned-position block (gate off ⇒ `None`)
+    // stays all-zero.
+    let role_end = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
     assert_eq!(
-        &keeper[SOCCER_NEURAL_FEATURE_DIM..],
+        &keeper[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [1.0, 0.0, 0.0, 0.0].as_slice()
     );
     assert_eq!(
-        &defender[SOCCER_NEURAL_FEATURE_DIM..],
+        &defender[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 1.0, 0.0, 0.0].as_slice()
     );
     assert_eq!(
-        &midfielder[SOCCER_NEURAL_FEATURE_DIM..],
+        &midfielder[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 0.0, 1.0, 0.0].as_slice()
     );
     assert_eq!(
-        &forward[SOCCER_NEURAL_FEATURE_DIM..],
+        &forward[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 0.0, 0.0, 1.0].as_slice()
     );
+    assert_eq!(
+        &keeper[role_end..],
+        [0.0; SOCCER_POLICY_ASSIGNED_POSITION_DIM].as_slice()
+    );
+
+    // Gate-on path: the assigned-position one-hot lights up the exact slot.
+    let lcb = soccer_policy_features_for_role(
+        &state,
+        PlayerRole::Defender,
+        Some(SoccerAssignedPosition::LeftCentreBack),
+    );
+    assert_eq!(&lcb[SOCCER_NEURAL_FEATURE_DIM..role_end], [0.0, 1.0, 0.0, 0.0].as_slice());
+    let mut expected_assigned = [0.0; SOCCER_POLICY_ASSIGNED_POSITION_DIM];
+    expected_assigned[2] = 1.0;
+    assert_eq!(&lcb[role_end..], expected_assigned.as_slice());
+}
+
+#[test]
+fn assigned_position_derivation_splits_roles_by_anchor() {
+    let width = 80.0;
+    let length = 120.0;
+    // Home defenders split L→R across the back four by lateral quartile.
+    let lb = soccer_assigned_position_for(
+        PlayerRole::Defender,
+        Vec2::new(width * 0.1, 12.0),
+        width,
+        length,
+        Team::Home,
+    );
+    let rb = soccer_assigned_position_for(
+        PlayerRole::Defender,
+        Vec2::new(width * 0.9, 12.0),
+        width,
+        length,
+        Team::Home,
+    );
+    assert_eq!(lb, SoccerAssignedPosition::LeftBack);
+    assert_eq!(rb, SoccerAssignedPosition::RightBack);
+    // Midfielders split by forward depth.
+    let dm = soccer_assigned_position_for(
+        PlayerRole::Midfielder,
+        Vec2::new(width * 0.5, length * 0.3),
+        width,
+        length,
+        Team::Home,
+    );
+    let am = soccer_assigned_position_for(
+        PlayerRole::Midfielder,
+        Vec2::new(width * 0.5, length * 0.75),
+        width,
+        length,
+        Team::Home,
+    );
+    assert_eq!(dm, SoccerAssignedPosition::DefensiveMidfield);
+    assert_eq!(am, SoccerAssignedPosition::AttackingMidfield);
+    // Team-relativity: the Away left winger sits on the opposite absolute touchline.
+    let away_lw = soccer_assigned_position_for(
+        PlayerRole::Forward,
+        Vec2::new(width * 0.9, length * 0.2),
+        width,
+        length,
+        Team::Away,
+    );
+    assert_eq!(away_lw, SoccerAssignedPosition::LeftWing);
 }
 
 #[test]
 fn policy_head_fails_closed_on_malformed_actor_features() {
     let mut head = SoccerPolicyHead::new(11);
     let critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
-    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward);
+    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward, None);
     assert!(
         head.action_distribution(&state).is_some(),
         "fresh policy head should produce an action distribution"
@@ -28886,7 +28953,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.5;
     critic_state[5] = -0.3;
-    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder);
+    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
     let reinforced = 4usize; // "pass"
     let penalised = 11usize; // "shoot"
     let before = head.action_distribution(&state).expect("finite dist");
@@ -28933,7 +29000,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.25;
     critic_state[8] = 0.75;
-    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder);
+    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
     let action_index = soccer_policy_action_index("pass").expect("pass policy action");
     let current_probability = head.action_distribution(&state).expect("finite dist")[action_index];
 
@@ -28972,8 +29039,8 @@ fn role_embedding_lets_one_shared_actor_specialise_per_position() {
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.4;
     critic_state[7] = -0.2;
-    let forward_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward);
-    let defender_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Defender);
+    let forward_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward, None);
+    let defender_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Defender, None);
     let shoot = soccer_policy_action_index("shoot").expect("shoot policy action");
 
     let samples: Vec<SoccerPolicySample> = (0..60)
@@ -29086,7 +29153,7 @@ fn actor_critic_trains_the_policy_head_over_a_full_match() {
     assert!(head.training_steps > 0, "policy head should have trained");
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.3;
-    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder);
+    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
     let dist = head
         .action_distribution(&state)
         .expect("finite action distribution");
