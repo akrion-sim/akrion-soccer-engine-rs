@@ -10147,6 +10147,8 @@ impl SoccerMatch {
                             } else if !unsafe_release(led_target) {
                                 aimed_target = led_target;
                             } else if favours_opponent(aimed_target) {
+                                // Every correction remains a strong turnover risk. Keep possession
+                                // and face the intended run instead of forcing the ball to an opponent.
                                 let look = led_target - player_pos;
                                 if look.len() > 1e-6 {
                                     let face = facing_bucket_from_vector(look);

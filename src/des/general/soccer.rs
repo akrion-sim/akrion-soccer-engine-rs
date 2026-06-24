@@ -47756,7 +47756,7 @@ fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot and drops onto the receiver, not into a
-        // hanging balloon arc. Keep it in the clipped 6-9ft band with stable variation.
+        // hanging balloon arc. Keep it in the requested 7-12ft band with stable variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;

@@ -50472,10 +50472,8 @@ fn aerial_pending_pass_skips_grass_resistance_on_launch_tick() {
     aerial.integrate_ball();
 
     // The aerial ball is airborne on the launch tick and so skips most grass rolling
-    // resistance — it must retain clearly more speed than the grounded pass. The margin is
-    // modest because the lofted arc is deliberately flatter now (less early-flight altitude
-    // ⇒ a touch more grass contact on the very first tick), but the airborne ball still
-    // loses well under half the grass speed the floor ball does.
+    // resistance. Its x-y pace must remain clearly above the grounded pass even while the
+    // gravity-timed loft follows the intended arc.
     assert!(
         aerial.ball.velocity.len() > floor.ball.velocity.len() + 0.04,
         "aerial pass should retain more speed on grass: aerial={} floor={}",
