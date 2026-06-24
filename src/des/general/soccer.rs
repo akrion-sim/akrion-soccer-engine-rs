@@ -14466,6 +14466,10 @@ pub(crate) enum SoccerRewardEventKind {
     TwoForwardPasses,
     ThreePassForwardNetGain,
     ShotOnTarget,
+    /// A goalkeeper stopped a shot (save/parry/claim/smother). Positive credit scaled by
+    /// the danger of the effort denied (an xG-prevented proxy) — the keeper's direct
+    /// learning signal, complementing the retrospective concede penalty.
+    KeeperSave,
     Goal,
     MatchResult,
 }
@@ -14479,6 +14483,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::KeeperSave
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::MatchResult
         )

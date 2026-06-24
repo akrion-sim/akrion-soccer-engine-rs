@@ -7590,6 +7590,49 @@ impl SoccerMatch {
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
+    /// xG-prevented danger scale `∈ [KEEPER_SAVE_DANGER_FLOOR, 1.0]` for a shot the keeper
+    /// just denied. Maximal for close, central efforts (high scoring chance), tapering to the
+    /// floor for tame long-range / wide-angle ones. `shot_origin` is the shot's launch point;
+    /// `defending_team` owns the goal being protected.
+    fn keeper_save_danger_scale(&self, shot_origin: Vec2, defending_team: Team) -> f64 {
+        let own_goal_y = match defending_team {
+            Team::Home => 0.0,
+            Team::Away => self.config.field_length_yards,
+        };
+        let goal_center = Vec2::new(self.config.field_width_yards * 0.5, own_goal_y);
+        let dist = shot_origin.distance(goal_center);
+        // Distance term: 1.0 inside the full-danger radius, linearly to 0 at the 18-yd box.
+        let taper_span = (18.0 - KEEPER_SAVE_FULL_DANGER_DISTANCE_YARDS).max(1.0);
+        let distance_danger =
+            (1.0 - (dist - KEEPER_SAVE_FULL_DANGER_DISTANCE_YARDS).max(0.0) / taper_span).clamp(0.0, 1.0);
+        // Angle term: a central effort is more dangerous than one from a tight angle. Penalise
+        // lateral offset relative to how far out the shot is (a wide shot from deep is harmless).
+        let lateral = (shot_origin.x - goal_center.x).abs();
+        let depth = (shot_origin.y - own_goal_y).abs().max(1.0);
+        let angle_danger = (1.0 - (lateral / (depth + lateral)).clamp(0.0, 1.0) * 0.6).clamp(0.0, 1.0);
+        (distance_danger * angle_danger).clamp(0.0, 1.0) * (1.0 - KEEPER_SAVE_DANGER_FLOOR)
+            + KEEPER_SAVE_DANGER_FLOOR
+    }
+
+    /// Credit the goalkeeper for a shot-stop, scaled by xG-prevented danger and the security
+    /// of the outcome (`action_scale`: 1.0 for a clean catch/save, less for a parry/smother that
+    /// only deflected the danger). Gated by `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD` — default off
+    /// ⇒ no reward event emitted, baseline byte-identical. See [`dd_soccer_enable_keeper_save_reward`].
+    fn record_keeper_save_reward(
+        &mut self,
+        keeper_id: usize,
+        shot_origin: Vec2,
+        defending_team: Team,
+        action_scale: f64,
+    ) {
+        if !dd_soccer_enable_keeper_save_reward() {
+            return;
+        }
+        let danger = self.keeper_save_danger_scale(shot_origin, defending_team);
+        let amount = KEEPER_SAVE_REWARD_POINTS * danger * action_scale.clamp(0.0, 1.0);
+        self.record_reward_event_with_kind(keeper_id, amount, SoccerRewardEventKind::KeeperSave);
+    }
+
     /// Distance scale for a shot-on-target's CHAIN reward: it backprops credit to the build-up
     /// chain only for a genuine chance FROM WITHIN ~20yd (the user's "reward shooting closer"
     /// rule). Full inside `SHOT_FULL_REWARD_DISTANCE_YARDS`, then linearly to ZERO at the 20yd
@@ -12676,6 +12719,8 @@ impl SoccerMatch {
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
                 self.stat_save(defending_team);
+                // A secured save (the keeper holds/claims it) is the most valuable stop.
+                self.record_keeper_save_reward(keeper_id, shot.origin, defending_team, 1.0);
                 self.mark_ball_received(keeper_id);
                 let bounded_save_position = soccer_bounded_keeper_save_position(
                     &self.players,
@@ -12744,6 +12789,9 @@ impl SoccerMatch {
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
                 self.stat_save(defending_team);
+                // A parry denied the goal but conceded a live rebound — a less secure stop than
+                // a clean catch, so it earns a fraction of the full save reward.
+                self.record_keeper_save_reward(keeper_id, shot.origin, defending_team, 0.55);
                 let bounded_save_position = soccer_bounded_keeper_save_position(
                     &self.players,
                     keeper_id,
@@ -17114,6 +17162,31 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT").is_ok())
 }
+
+/// Set `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=1` to give the goalkeeper a positive
+/// learning reward for stopping a shot (save/parry/claim/smother), scaled by the danger
+/// of the effort denied — an xG-prevented proxy. Default off ⇒ the keeper keeps only the
+/// retrospective concede penalty (byte-identical baseline / A/B). See
+/// [`SoccerSimulation::record_keeper_save_reward`].
+fn dd_soccer_enable_keeper_save_reward() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+}
+
+/// Full reward points for a clean shot-stop (catch/save) of a maximally dangerous effort.
+/// A parry/smother/claim earns a fraction of this (it denied the goal but conceded a less
+/// secure outcome); see the action multipliers in [`SoccerSimulation::record_keeper_save_reward`].
+const KEEPER_SAVE_REWARD_POINTS: f64 = 0.9;
+
+/// Floor on the xG-prevented danger scale: even a tame, long-range save earns a small base
+/// so the keeper learns shot-stopping is always positive, while close/central denials earn
+/// proportionally more.
+const KEEPER_SAVE_DANGER_FLOOR: f64 = 0.2;
+
+/// Distance (yards from goal) at/inside which a denied shot counts as maximally dangerous
+/// for the keeper's reward; danger tapers from 1.0 here to the floor at the 18-yard box edge.
+const KEEPER_SAVE_FULL_DANGER_DISTANCE_YARDS: f64 = 6.0;
 fn dd_soccer_disable_wall_pass_reward() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
