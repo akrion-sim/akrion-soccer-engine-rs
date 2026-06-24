@@ -3205,6 +3205,14 @@ const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // it in optimized builds, so this is a guardrail against pathological ticks, not
 // the common case (see `formation_lp_ipm_solves_under_five_milliseconds`).
 const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 5_000;
+/// Deterministic circuit-breaker threshold: a formation-LP solve needing more than this
+/// many solver iterations is treated as "over budget" (a reproducible proxy for the
+/// wall-clock cost, used INSTEAD of elapsed time so the breaker decision is identical
+/// across processes/machines — wall-clock gating was a latent match-nondeterminism
+/// source). A solve this expensive cannot meet the realtime contract, so after
+/// `SOCCER_FORMATION_LP_TIMEOUT_CIRCUIT_LIMIT` consecutive ones the breaker trips to the
+/// fast heuristic fallback for the rest of the match.
+const SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET: usize = 300;
 const SOCCER_FORMATION_LP_MIN_ITER: usize = 800;
 const SOCCER_FORMATION_LP_ITER_RECOVER_STEP: usize = 1_500;
 // Consecutive over-budget solves before the circuit trips to the heuristic fallback.

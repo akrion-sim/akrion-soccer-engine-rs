@@ -444,26 +444,24 @@ mod team_strategy_mode_tests {
         let slots = soccer_formation_lp_slot_inputs(&snapshot, Team::Home, &directive, &weights);
         brain.update_problem_for_tick(&snapshot, &directive, &weights, &slots);
 
-        let mut best_micros = u128::MAX;
-        let mut any_optimal = false;
-        for _ in 0..3 {
-            let started = std::time::Instant::now();
-            let solution = brain.solve_exact_formation_lp();
-            let micros = started.elapsed().as_micros();
-            best_micros = best_micros.min(micros);
-            any_optimal |= solution.status == LPStatus::Optimal;
-        }
-        eprintln!("[formation-lp-ipm] best solve = {best_micros}us");
-        assert!(any_optimal, "interior-point formation LP should reach optimality");
-        // The <5ms realtime budget is an optimized-build guarantee; a debug build's
-        // unoptimized linear algebra is ~20-50x slower, so only enforce the bound
-        // when optimizations are on (the configuration that actually runs live).
-        #[cfg(not(debug_assertions))]
+        // The formation LP runs on the DETERMINISTIC internal simplex by default (Clarabel's
+        // interior-point solve is per-process nondeterministic on this degenerate problem,
+        // which used to make whole matches diverge from the same seed). The contract is now
+        // determinism + optimality, NOT a per-solve wall-clock bound: the dense simplex can
+        // exceed 5ms on a cold degenerate solve, and realtime safety is provided instead by
+        // the deterministic iteration-gated circuit breaker (-> fast heuristic fallback) and
+        // by the Clarabel fast path (FORMATION_LP_USE_CLARABEL) for latency-critical use.
+        let first = brain.solve_exact_formation_lp();
+        let second = brain.solve_exact_formation_lp();
         assert!(
-            best_micros < 5_000,
-            "IPM formation solve must be <5ms (best was {best_micros}us)"
+            first.status == LPStatus::Optimal,
+            "deterministic formation LP should reach optimality, got {}",
+            first.status.as_str()
         );
-        let _ = best_micros;
+        assert_eq!(
+            first.x, second.x,
+            "deterministic formation LP must return byte-identical solutions for the same problem"
+        );
     }
 
     #[test]
@@ -1823,6 +1821,11 @@ impl SoccerFormationLpBrain {
         self.solve_count = self.solve_count.saturating_add(1);
         self.last_solve_micros = elapsed_micros;
         self.last_solve_status = solution.status.as_str().to_string();
+        // Reproducible cost proxy for the circuit-breaker decision below. Using the solver
+        // iteration count (deterministic) instead of `elapsed_micros` (wall-clock) keeps the
+        // breaker -- and therefore whether the LP guides or the heuristic fallback runs --
+        // identical across processes, which is required for match determinism.
+        let solve_iterations = solution.iters.unwrap_or(0);
         if soccer_lp_debug_enabled() && self.solve_count <= 2 {
             let ineq = self.problem.a_ub.as_ref().map(|m| m.len()).unwrap_or(0);
             let eq = self.problem.a_eq.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -1834,32 +1837,33 @@ impl SoccerFormationLpBrain {
         // Adaptive time-budgeting + failure telemetry only apply to a real solve;
         // the heuristic fallback is intentionally suboptimal (not a failure).
         if simplex {
-            if elapsed_micros > SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS {
+            if solve_iterations > SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET {
                 self.solve_timeout_count = self.solve_timeout_count.saturating_add(1);
                 self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
                 self.adaptive_max_iter =
                     (self.adaptive_max_iter / 2).max(SOCCER_FORMATION_LP_MIN_ITER);
                 if self.consecutive_timeouts >= SOCCER_FORMATION_LP_TIMEOUT_CIRCUIT_LIMIT {
-                    // Repeatedly too slow for realtime: trip the breaker and run the
+                    // Repeatedly too expensive for realtime: trip the breaker and run the
                     // fast heuristic fallback for the rest of the match.
                     self.simplex_circuit_open = true;
                     if soccer_lp_debug_enabled() {
                         eprintln!(
-                            "[soccer-lp] {:?} circuit OPEN after {} consecutive timeouts -> heuristic fallback",
+                            "[soccer-lp] {:?} circuit OPEN after {} consecutive over-budget solves -> heuristic fallback",
                             self.team, self.consecutive_timeouts
                         );
                     }
                 }
                 if soccer_lp_debug_enabled() {
                     eprintln!(
-                        "[soccer-lp] {:?} solve {}us over budget ({}us); max_iter->{}",
+                        "[soccer-lp] {:?} solve {} iters over budget ({} iters, {}us); max_iter->{}",
                         self.team,
+                        solve_iterations,
+                        SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET,
                         elapsed_micros,
-                        SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS,
                         self.adaptive_max_iter
                     );
                 }
-            } else if elapsed_micros * 3 < SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS {
+            } else if solve_iterations * 3 < SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET {
                 self.consecutive_timeouts = 0;
                 self.adaptive_max_iter = (self.adaptive_max_iter
                     + SOCCER_FORMATION_LP_ITER_RECOVER_STEP)

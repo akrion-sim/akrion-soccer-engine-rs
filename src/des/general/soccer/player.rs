@@ -2910,16 +2910,6 @@ impl PlayerAgent {
             DEFAULT_FIELD_WIDTH_YARDS
         };
         let lateral_position = self.position.x.clamp(0.0, field_width);
-        let left_room = if self.team == Team::Home {
-            lateral_position
-        } else {
-            field_width - lateral_position
-        };
-        let right_room = if self.team == Team::Home {
-            field_width - lateral_position
-        } else {
-            lateral_position
-        };
         let flank_lane_fit = ((lateral_position - field_width * 0.5).abs()
             / (field_width * 0.5).max(1.0))
         .clamp(0.0, 1.0);
