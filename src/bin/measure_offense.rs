@@ -45,10 +45,46 @@ fn main() {
             ..MatchConfig::default()
         };
         let mut sim = SoccerMatch::default_11v11(config);
+        // Construction fingerprint: if two processes print different values here, the
+        // nondeterminism is in match construction; if identical but play diverges, it's
+        // in run_time_step.
+        let ctor_fp: f64 = sim
+            .players
+            .iter()
+            .map(|p| p.position.x * 7.0 + p.position.y * 13.0)
+            .sum();
+        eprintln!("seed {s}: ctor_fp={ctor_fp:.6}");
         let mut prev_one_two = vec![false; sim.players.len()];
 
-        for _ in 0..ticks {
+        let bisect = std::env::var("MO_BISECT").is_ok();
+        for t in 0..ticks {
             sim.run_time_step();
+            if bisect && s == 0 {
+                // Per-tick state + action fingerprint, to diff two runs and find the
+                // FIRST diverging tick (and whether it's positions or chosen actions).
+                let mut pos_h: u64 = 1469598103934665603;
+                let mut act = String::new();
+                for p in sim.players.iter() {
+                    let bits = (p.position.x.to_bits()) ^ (p.position.y.to_bits().rotate_left(17));
+                    pos_h ^= bits;
+                    pos_h = pos_h.wrapping_mul(1099511628211);
+                    act.push('|');
+                    if let Some(d) = p.last_decision.as_ref() {
+                        act.push_str(&d.action);
+                    }
+                }
+                println!("T{} pos={:016x} act={}", t + 1, pos_h, act);
+            }
+            if let Ok(dt) = std::env::var("MO_DUMP_TICK") {
+                if s == 0 && (t + 1) == dt.parse::<u64>().unwrap_or(0) {
+                    for (i, p) in sim.players.iter().enumerate() {
+                        println!(
+                            "P{i} x={:.17e} y={:.17e} vx={:.17e} vy={:.17e}",
+                            p.position.x, p.position.y, p.velocity.x, p.velocity.y
+                        );
+                    }
+                }
+            }
             for (i, p) in sim.players.iter().enumerate() {
                 total_player_ticks += 1;
                 if let Some(d) = p.last_decision.as_ref() {

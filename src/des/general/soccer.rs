@@ -9925,6 +9925,19 @@ fn normalize_soccer_action_label(action: &str) -> &str {
 // `tunables().flank_cross` (env/Postgres-overridable). See soccer/tunables.rs.
 const FLANK_OVERLAP_MIN_OPTION_SHARE: f64 = 1.0 / 3.0;
 
+/// Master switch for the "attacking ambition" bundle: more frequent wall-passes
+/// (give-and-goes), and crosses available from a touch deeper / narrower so the
+/// flanks are actually used as a delivery route, not just for runs that fizzle.
+/// ON by default; set `DD_SOCCER_DISABLE_ATTACK_AMBITION` to fall back to the
+/// tighter baseline gates (used for A/B and to revert without a redeploy). The
+/// switch only ever *widens availability* — every quality/risk/offside check that
+/// follows still applies, so a poor combination is still demoted, never forced.
+pub(crate) fn attack_ambition_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
@@ -9958,10 +9971,18 @@ fn flank_cross_context_is_legal(
     field_width_yards: f64,
 ) -> bool {
     let cfg = &tunables().flank_cross;
+    // Attacking ambition: let a wide carrier cross from a touch deeper and a touch
+    // narrower so the flanks become a real delivery route (the overlap runs were
+    // already firing; the cross at the end of them was not). The scoring still
+    // demotes a poor cross — this only opens the door.
+    let (max_yards_to_goal, min_flank_score) = if attack_ambition_enabled() {
+        ((cfg.max_yards_to_goal + 8.0).min(120.0), (cfg.min_flank_score - 0.12).max(0.0))
+    } else {
+        (cfg.max_yards_to_goal, cfg.min_flank_score)
+    };
     observation.has_ball
-        && observation.yards_to_goal <= cfg.max_yards_to_goal
-        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0)
-            >= cfg.min_flank_score
+        && observation.yards_to_goal <= max_yards_to_goal
+        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0) >= min_flank_score
 }
 
 fn is_attacking_support_action_label(action: &str) -> bool {
