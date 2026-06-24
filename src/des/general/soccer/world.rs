@@ -9958,8 +9958,16 @@ impl SoccerMatch {
                     // not outrun the receiver's control), else keep the analytic modulated speed.
                     let speed = match mpc_pass_speed {
                         Some(v) => {
-                            let blended = modulated_speed * 0.6 + v * 0.4;
-                            blended.clamp(modulated_speed * 0.85, modulated_speed * 1.25)
+                            // Lean on the MPC rendezvous speed (it times the ball to the receiver
+                            // and beats the press) and let it FIRM the ball well above the analytic
+                            // pace — the old ±25% clamp pinned it to a too-slow baseline.
+                            if pass_accuracy_calibration_enabled() {
+                                let blended = modulated_speed * 0.45 + v * 0.55;
+                                blended.clamp(modulated_speed * 0.85, modulated_speed * 1.5)
+                            } else {
+                                let blended = modulated_speed * 0.6 + v * 0.4;
+                                blended.clamp(modulated_speed * 0.85, modulated_speed * 1.25)
+                            }
                         }
                         None => modulated_speed,
                     };
@@ -32351,7 +32359,14 @@ impl WorldSnapshot {
             self.mpc_predicted_receiver_path(receiver, analytic_lead, MPC_PASS_HORIZON_STEPS, dt)?;
         let opp = passer.team.other();
         let attack_dir = passer.team.attack_dir();
-        let speeds = [base_speed * 0.9, base_speed, base_speed * 1.25];
+        // Sweep includes a genuinely FIRMER option so the MPC can drive the ball to meet a moving
+        // receiver (or beat the press) crisply, rather than being capped near the analytic pace.
+        let speeds = [
+            base_speed * 0.9,
+            base_speed,
+            base_speed * 1.25,
+            base_speed * 1.55,
+        ];
         let mut best: Option<(f64, Vec2, f64)> = None;
         for (k, &rk) in recv_path.iter().enumerate().skip(MPC_PASS_MIN_STEP) {
             let t_k = k as f64 * dt;

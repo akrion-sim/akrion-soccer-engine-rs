@@ -9975,6 +9975,36 @@ fn aerial_pass_lands_near_target_not_overshooting() {
 }
 
 #[test]
+fn crisp_ground_pass_reaches_the_receiver_promptly() {
+    // Regression for "right angle, too slow" turnovers: a struck ground pass used to dawdle in the
+    // lane (~1.0s over 15yd, ~1.4s over 25yd, ~2.1s over 40yd) — long enough for a defender to step
+    // in. The crisp-pass calibration paces it firmly so it arrives quickly, while a SHORT pass stays
+    // controllable (not a rocket) and a longer ball is genuinely driven.
+    let mut rng = mulberry32(7);
+    let raw = mph_to_yps(20.0); // a representative analytic raw speed
+    let from = Vec2::new(40.0, 30.0);
+    for (d, max_time, max_mph) in [
+        (12.0_f64, 0.95, 48.0),
+        (20.0, 1.15, 52.0),
+        (30.0, 1.45, 56.0),
+    ] {
+        let target = Vec2::new(40.0, 30.0 + d);
+        let speed =
+            modulated_pass_speed_yps(raw, from, target, PassFlight::Floor, false, 0.6, 0.5, &mut rng);
+        let time = d / speed;
+        let mph = speed / mph_to_yps(1.0);
+        assert!(
+            time <= max_time,
+            "a {d}yd ground pass should arrive crisply (<= {max_time}s), got {time:.2}s at {mph:.1}mph"
+        );
+        assert!(
+            mph <= max_mph,
+            "a {d}yd ground pass should stay controllable (<= {max_mph}mph), got {mph:.1}mph"
+        );
+    }
+}
+
+#[test]
 fn long_pass_prefers_opponent_corner_channel() {
     let sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

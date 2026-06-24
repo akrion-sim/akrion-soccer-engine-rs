@@ -48397,8 +48397,19 @@ fn modulated_pass_speed_yps(
         return (land_at_target * pressure_firm).clamp(mph_to_yps(7.0), mph_to_yps(66.0));
     }
     // Ground / cross passes only (aerials returned above with their own flight calibration).
+    // CRISP-PASS calibration (on by default): a pass arrives in roughly `base_time` seconds; the
+    // old curve grew that time too fast with distance (0.58 + d/31), so a 25yd ball took ~1.4s and a
+    // 40yd ball ~2.1s — slow enough to sit in the lane and be picked off (the "right angle, too slow"
+    // turnovers). Pace it crisper so longer balls are genuinely driven, not floated along the floor.
+    let calib = pass_accuracy_calibration_enabled();
     let base_time = if is_cross {
-        (0.68 + distance / 31.0).clamp(0.82, 2.65)
+        if calib {
+            (0.54 + distance / 44.0).clamp(0.68, 2.2)
+        } else {
+            (0.68 + distance / 31.0).clamp(0.82, 2.65)
+        }
+    } else if calib {
+        (0.46 + distance / 48.0).clamp(0.60, 2.0)
     } else {
         (0.58 + distance / 31.0).clamp(0.72, 2.55)
     };
@@ -48419,17 +48430,32 @@ fn modulated_pass_speed_yps(
         },
         if flight.is_aerial() {
             mph_to_yps(64.0)
+        } else if calib {
+            // Let a driven ground/cross ball reach a real pace (a 40yd raking pass ~32yps); the
+            // distance-aware cap below still keeps SHORT passes controllable.
+            mph_to_yps(58.0)
         } else {
             mph_to_yps(44.0)
         },
     );
     let skill = passing_skill.clamp(0.0, 1.0);
-    let fit = (0.30 + skill * 0.55 + openness * 0.10).clamp(0.28, 0.94);
+    // Lean the struck pace closer to the receiver-timed `desired_speed` (the old blend dragged it
+    // back toward the low power-based `raw_speed`, under-hitting the ball); a skilled, open passer
+    // hits it almost exactly on the timed pace.
+    let fit = if calib {
+        (0.40 + skill * 0.52 + openness * 0.12).clamp(0.34, 0.97)
+    } else {
+        (0.30 + skill * 0.55 + openness * 0.10).clamp(0.28, 0.94)
+    };
     let noise = ((1.0 - skill) * 0.08 + pressure * 0.035 - openness * 0.04).clamp(0.0, 0.16);
     let cap = if flight.is_aerial() {
         mph_to_yps(66.0)
     } else if is_cross {
-        mph_to_yps(48.0)
+        mph_to_yps(if calib { 52.0 } else { 48.0 })
+    } else if calib {
+        // Distance-aware ground cap: a short pass stays controllable (~42mph), a long driven ball
+        // is allowed real pace (~54mph) so it doesn't dawdle into an interception.
+        mph_to_yps((38.0 + distance * 0.45).clamp(42.0, 54.0))
     } else {
         mph_to_yps(42.0)
     };
