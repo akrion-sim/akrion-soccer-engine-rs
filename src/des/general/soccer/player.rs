@@ -487,6 +487,27 @@ fn directive_requests_lob_or_scoop(directive: &TeamTacticalDirective) -> bool {
             .unwrap_or(false)
 }
 
+/// Strategies that commit a wide carrier to DRIVING the byline corner and crossing — the carrier
+/// should keep driving (not slow / recycle) and then cross, while team-mates crash the box.
+fn is_byline_drive_strategy(strategy: TeamAttackStrategy) -> bool {
+    matches!(
+        strategy,
+        TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+            | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            | TeamAttackStrategy::WingOverlapLeftCross
+            | TeamAttackStrategy::WingOverlapRightCross
+            | TeamAttackStrategy::CrashTheBox
+    )
+}
+
+fn directive_requests_byline_drive(directive: &TeamTacticalDirective) -> bool {
+    is_byline_drive_strategy(directive.attack_strategy)
+        || directive
+            .pair_attack_strategy
+            .map(is_byline_drive_strategy)
+            .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillProfile {
@@ -3225,6 +3246,20 @@ impl PlayerAgent {
             * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50)
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, 0.92);
+        // Drive-to-corner commitment: once the team has committed to a byline drive (the wide
+        // carrier in the opponent half), LIFT the forward/wide carry so the carrier keeps driving
+        // the corner instead of slowing 32-38yd out — the carry itself is steered at the corner
+        // flag by `byline_corner_drive_target_for`, and hands off to the cross at the byline.
+        let byline_drive_boost = if directive_requests_byline_drive(directive)
+            && observation.yards_to_goal < observation.yards_to_own_goal
+            && matches!(self.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            1.0 + observation.offensive_urgency.clamp(0.0, 1.0) * 0.14 + 0.30
+        } else {
+            1.0
+        };
+        let carry_forward_score = (carry_forward_score * byline_drive_boost).clamp(0.01, 1.85);
+        let carry_out_score = (carry_out_score * byline_drive_boost).clamp(0.01, 1.30);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
         } else {

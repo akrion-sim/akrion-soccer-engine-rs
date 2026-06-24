@@ -795,6 +795,21 @@ const KILLER_PASS_LOFT_LANE_FIT: f64 = 0.60;
 const KILLER_PASS_LOFT_SHORT_MAX_YARDS: f64 = 10.0;
 const ATTACKING_DRIBBLE_GOAL_DRIVE_YARDS: f64 = 34.0;
 const ATTACKING_DRIBBLE_SHOOTING_POCKET_YARDS: f64 = 12.0;
+// "Drive to the corner flag and cross." A wide carrier (outside midfielder / striker) in the
+// opponent half on the flank, rather than slowing 32-38yd out or cutting infield into traffic,
+// COMMITS to driving the ball at the byline corner and crossing — a low cutback or a high ball —
+// which both gets to a far better delivery position and buys trailing team-mates time to arrive in
+// the box. Activation reaches back from the byline so the run starts from ~the edge of the final
+// third (matching the user's 32-38yd observation), not only once already deep.
+const BYLINE_DRIVE_ACTIVATION_YARDS: f64 = 42.0; // distance from the byline the drive may start
+// How wide (0 central .. 1 touchline) the carrier must be for a corner drive to make sense — a
+// central carrier drives at goal, only a genuinely WIDE one heads for the corner flag.
+const BYLINE_DRIVE_MIN_FLANK_WIDTH: f64 = 0.46;
+const BYLINE_DRIVE_CORNER_INSET_YARDS: f64 = 5.5; // corner-flag target this far in from the touchline
+const BYLINE_DRIVE_BYLINE_MARGIN_YARDS: f64 = 3.5; // ...and this far short of the end-line
+// Inside this distance of the byline the drive is "at the corner" — cross now (cutback / high ball)
+// rather than carry deeper into a dead end.
+const BYLINE_DRIVE_CROSS_TRIGGER_YARDS: f64 = 7.0;
 const STRIKER_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.72;
 const STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.12;
 const STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.06;
@@ -15375,6 +15390,16 @@ fn tactical_directive_for_team(
     let central_fit = (1.0 - width_from_center).clamp(0.0, 1.0);
     let left_lane_fit = ((field_width * 0.5 - ball_position.x) / half_width).clamp(0.0, 1.0);
     let right_lane_fit = ((ball_position.x - field_width * 0.5) / half_width).clamp(0.0, 1.0);
+    // "Drive to the corner flag and cross" zone: a WIDE carrier in the opponent half within the
+    // byline-drive activation window (reaching back ~42yd from the byline, matching the 32-38yd the
+    // carrier used to stall at). The committed team decision is to drive the corner and cross —
+    // off-ball runners crash the box for the cutback — rather than slowing / recycling. The carry
+    // itself heads for the corner via `byline_corner_drive_target_for`.
+    let byline_drive_zone = has_ball
+        && flank_attack_policy.is_flank()
+        && width_from_center >= BYLINE_DRIVE_MIN_FLANK_WIDTH
+        && (ball_position.y - field_length * 0.5) * team.attack_dir() > 0.0
+        && (team.goal_y(field_length) - ball_position.y).abs() <= BYLINE_DRIVE_ACTIVATION_YARDS;
     let attack_progress =
         ((ball_position.y - field_length * 0.5) * team.attack_dir() / (field_length * 0.5).max(1.0))
             .clamp(-1.0, 1.0);
@@ -15416,6 +15441,12 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::CounterTransitionVertical
     } else if crash_box_context {
         TeamAttackStrategy::CrashTheBox
+    } else if byline_drive_zone {
+        if ball_position.x <= field_width * 0.5 {
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+        } else {
+            TeamAttackStrategy::BylineCrossRightToPenaltySpot
+        }
     } else if build_up_phase {
         match ball_side {
             StrategyLane::Left => best_team_attack_strategy(&[

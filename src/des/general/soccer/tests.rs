@@ -55315,6 +55315,141 @@ fn carry_forward_in_goal_approach_bends_toward_goal() {
 }
 
 #[test]
+fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
+    // The committed MDP/POMDP decision: a wide carrier attacking the flank, with the team enjoying
+    // an attacking overload, commits to the byline-drive ("drive the corner and cross") strategy —
+    // a Pair-layer maneuver held for the strategy-commit window. A central carrier does not.
+    let overload = AttackingOverloadProfile {
+        attackers: 5,
+        defenders: 2,
+        advantage: 3,
+        score: 0.80,
+    };
+    // Wide and deep (~32yd from the byline): a corner-drive strategy (crash-the-box at this depth).
+    let wide_deep = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(8.0, 88.0), // wide LEFT, ~32yd from the byline
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        overload,
+        false,
+    );
+    assert!(
+        matches!(
+            wide_deep.attack_strategy,
+            TeamAttackStrategy::CrashTheBox
+                | TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+                | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+        ),
+        "a wide deep carrier should commit to a corner-drive strategy, got {:?}",
+        wide_deep.attack_strategy
+    );
+    // A wide carrier at the edge of the byline-drive band (~40yd out, before crash-the-box depth)
+    // commits to the named byline-cross Pair maneuver.
+    let wide_edge = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(8.0, 80.0), // wide LEFT, ~40yd from the byline
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        overload,
+        false,
+    );
+    assert_eq!(
+        wide_edge.attack_strategy,
+        TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
+        "a wide left carrier at the byline-drive band edge should commit to the byline drive"
+    );
+    assert_eq!(wide_edge.attack_strategy.layer(), StrategyLayer::Pair);
+    let central = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(40.0, 88.0), // dead central — drive at goal, not the corner
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        overload,
+        false,
+    );
+    assert!(
+        !matches!(
+            central.attack_strategy,
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+                | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+        ),
+        "a central carrier should NOT commit to the byline drive, got {:?}",
+        central.attack_strategy
+    );
+}
+
+#[test]
+fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy() {
+    // Execution: the drive-to-corner carry fires ONLY when the team has committed to the byline
+    // drive — otherwise a wide carrier is free to cut inside as before (so this never spuriously
+    // hijacks a carry). The handoff to the cross at the corner is also checked.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 5151,
+        ..Default::default()
+    });
+    let carrier = 7;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(8.0, 88.0); // wide LEFT, 32yd from the byline
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let committed = matches!(
+        snapshot.tactical_directive(Team::Home).attack_strategy,
+        TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+            | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            | TeamAttackStrategy::CrashTheBox
+    );
+    let drive = snapshot.byline_corner_drive_target_for(carrier);
+    // The execution gate exactly mirrors the committed decision: corner drive iff committed.
+    assert_eq!(
+        drive.is_some(),
+        committed,
+        "the corner drive must fire iff the byline-drive strategy is committed (committed={committed})"
+    );
+    if let Some(corner) = drive {
+        // When it fires, the carry heads forward-and-wide toward the left corner flag.
+        let origin = sim.players[carrier].position;
+        let target = snapshot.dribble_move_target_for(
+            carrier,
+            sim.players[carrier].home_position,
+            DribbleMoveKind::CarryForward,
+        );
+        assert!(corner.y > 110.0 && corner.x < 12.0, "corner target near the left flag: {corner:?}");
+        assert!(
+            target.x <= origin.x + 0.01 && (target.y - origin.y) > 0.2,
+            "byline drive carries forward-and-wide to the corner: origin={origin:?} target={target:?}"
+        );
+    }
+
+    // At the corner (inside the cross-trigger band) the drive always hands off to the cross.
+    sim.players[carrier].position = Vec2::new(6.0, 116.0); // 4yd from the byline
+    sim.ball.position = sim.players[carrier].position;
+    let at_corner = WorldSnapshot::from_match(&sim);
+    assert!(
+        at_corner.byline_corner_drive_target_for(carrier).is_none(),
+        "at the corner the drive yields to the (legal, scored) flank cross"
+    );
+}
+
+#[test]
 fn deep_defender_carry_bends_away_from_a_closing_opponent() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

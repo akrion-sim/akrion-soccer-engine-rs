@@ -16967,6 +16967,15 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
 }
+/// "Drive to the corner flag and cross" for a wide carrier. ON by default: a committed run at the
+/// byline corner (then a low cutback / high cross) instead of slowing 32-38yd out or cutting into
+/// central traffic. Set `DD_SOCCER_DISABLE_BYLINE_DRIVE_TO_CORNER=1` to restore the old
+/// central-pocket-only carry (A/B / parity).
+fn dd_soccer_disable_byline_drive_to_corner() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BYLINE_DRIVE_TO_CORNER").is_ok())
+}
 /// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
 /// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
 /// the carrier reliably HAS a teammate to play to — instead of being left to thump it to nobody or
@@ -31731,6 +31740,20 @@ impl WorldSnapshot {
             target = goalmouth_target;
         }
 
+        // Drive to the corner flag: a committed wide carrier heads for the byline corner (then
+        // crosses) instead of the central shooting pocket the goalmouth carry pulls toward. Wins
+        // over the central pull; the step never overshoots the corner.
+        if let Some(corner) = self.byline_corner_drive_target_for(player_id) {
+            let to_corner = corner - current;
+            if to_corner.len() > 1e-6 {
+                let step = touch
+                    .distance_yards
+                    .clamp(1.15, DRIBBLE_MAX_TOUCH_YARDS)
+                    .min(to_corner.len());
+                target = current + to_corner.normalized() * step;
+            }
+        }
+
         if me.role == PlayerRole::Defender
             && !matches!(
                 dribble_final_cut_kind(kind),
@@ -31756,6 +31779,73 @@ impl WorldSnapshot {
         }
 
         target.clamp_to_pitch(self.field_width, self.field_length)
+    }
+
+    /// "Drive to the corner flag and cross" target for a wide carrier, or `None` when it does not
+    /// apply. The committed run: an outside-midfielder / striker carrying in the opponent half on
+    /// the flank, inside the activation window of the byline, heads for the corner flag (wide of the
+    /// keeper) rather than slowing 32-38yd out or cutting infield into traffic — buying trailing
+    /// runners time to arrive before a cutback / high cross. Returns the corner-flag target the carry
+    /// drives at. Once WITHIN [`BYLINE_DRIVE_CROSS_TRIGGER_YARDS`] of the byline it returns `None`,
+    /// handing off to the (already legal + scored) flank-cross decision — i.e. cross now. The
+    /// conditions hold continuously as the carrier advances, so the run is naturally committed; the
+    /// `BylineCross` team strategy commits the off-ball box runs alongside it.
+    pub(crate) fn byline_corner_drive_target_for(&self, player_id: usize) -> Option<Vec2> {
+        if dd_soccer_disable_byline_drive_to_corner() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.ball.holder != Some(player_id) || me.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        // Drive the corner ONLY when the team has COMMITTED to the byline-drive strategy (the
+        // MDP/POMDP decision, held for `STRATEGY_COMMIT_TICKS`). Otherwise a wide carrier is free to
+        // cut inside toward goal as before — the two are deliberately different decisions.
+        if !matches!(
+            self.tactical_directive(me.team).attack_strategy,
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+                | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+                | TeamAttackStrategy::CrashTheBox
+        ) {
+            return None;
+        }
+        // Outside mid or striker — the players this programmed move is for.
+        let role_ok = matches!(me.role, PlayerRole::Forward)
+            || self.is_wide_midfielder(me)
+            || self.is_wide_attacker(me);
+        if !role_ok {
+            return None;
+        }
+        let pos = self.player_snapshot_position(me);
+        let attack_dir = me.team.attack_dir();
+        // Attacking, in the opponent half.
+        if (pos.y - self.field_length * 0.5) * attack_dir <= 0.0 {
+            return None;
+        }
+        let goal_y = me.team.goal_y(self.field_length);
+        let yards_to_byline = (goal_y - pos.y).abs();
+        // Inside the activation window but not yet AT the corner: at the corner, hand off to the
+        // cross decision (return None) rather than carrying into the dead ball behind the byline.
+        if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
+            || yards_to_byline <= BYLINE_DRIVE_CROSS_TRIGGER_YARDS
+        {
+            return None;
+        }
+        // Wide enough that the corner — not the goal — is the right destination.
+        let mid = self.field_width * 0.5;
+        let width_from_center = ((pos.x - mid).abs() / mid.max(1.0)).clamp(0.0, 1.0);
+        if width_from_center < BYLINE_DRIVE_MIN_FLANK_WIDTH {
+            return None;
+        }
+        // The corner flag on the carrier's side — wide of the central keeper, a touch short of the
+        // end-line so the carrier finishes in a clean crossing position, not running it dead.
+        let corner_x = if pos.x <= mid {
+            BYLINE_DRIVE_CORNER_INSET_YARDS
+        } else {
+            self.field_width - BYLINE_DRIVE_CORNER_INSET_YARDS
+        };
+        let corner_y = goal_y - attack_dir * BYLINE_DRIVE_BYLINE_MARGIN_YARDS;
+        Some(Vec2::new(corner_x, corner_y).clamp_to_pitch(self.field_width, self.field_length))
     }
 
     fn attacking_dribble_goal_drive_direction(
