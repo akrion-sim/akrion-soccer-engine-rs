@@ -744,8 +744,11 @@ const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 // passes, pokes, or control touches; once an action is classified as Shoot, rendering and
 // physics should both see a real strike.
 // Shots leave the boot CLEARLY faster than any pass so they read as a strike, not a driven ball,
-// from the very first frame. The hardest ground pass is ~38mph and the hardest aerial ~50mph, so
-// the slowest shot floors above that at 54mph and a full-power strike reaches ~70mph.
+// from the very first frame. The hardest ground pass is ~38mph and a normal aerial ~46-50mph, so
+// the slowest shot floors at 54 (clear of both) and a full-power strike reaches ~72 — the FLAT
+// shot band sits above the (flat) pass band, which is what made weak shots "look like passes at
+// first". A long LOFTED pass can legitimately match a shot's speed, but it is high in the air and
+// is flagged distinctly to the renderer (`BallInspect::flight_kind`), so it never reads as a shot.
 const SHOT_MIN_SPEED_MPH: f64 = 54.0;
 const SHOT_MAX_SPEED_MPH: f64 = 72.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
@@ -807,9 +810,12 @@ const MAX_BALL_CURL_YPS2: f64 = 7.6;
 const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
 // Hard ceiling on how high any lofted/aerial pass arcs. Height is not the hang-time bug: the
 // x-y speed must stay alive while gravity brings the ball down. Short lofts peak around ~20ft
-// and only the longest balls approach ~30ft.
+// and only the longest balls approach ~30ft. The shared distance curve keeps launch calibration
+// and rendered altitude in agreement without using a flatter arc to mask excessive in-flight drag.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
+const LOFT_APEX_PER_YARD: f64 = 0.074;
+const LOFT_APEX_MIN_YARDS: f64 = 5.0; // ~15 ft for an unusually short clipped aerial
 /// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
 /// target it must be launched at ~`distance / hang_time`. In flight it loses a little pace to air
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
@@ -29491,6 +29497,89 @@ impl SoccerPassCompletionHead {
     pub(crate) fn training_steps(&self) -> usize {
         self.training_steps
     }
+
+    /// Mean prediction accuracy over `samples` at a 0.5 decision threshold — a quick read on
+    /// whether the head has actually learned the corpus (used by the training report).
+    pub(crate) fn accuracy(&self, samples: &[SoccerPassOutcomeSample]) -> f64 {
+        let mut correct = 0usize;
+        let mut scored = 0usize;
+        for sample in samples {
+            if let Some(p) = self.predict(&sample.features) {
+                scored += 1;
+                if (p >= 0.5) == sample.completed {
+                    correct += 1;
+                }
+            }
+        }
+        if scored == 0 {
+            0.0
+        } else {
+            correct as f64 / scored as f64
+        }
+    }
+}
+
+/// Outcome of training the learned pass-completion head on a corpus loaded from Postgres
+/// (`SoccerStore::load_pass_outcome_samples`). Logged by the learning runner so an operator can
+/// see the persisted training data is actually being loaded and learned from.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPassCompletionTrainingReport {
+    /// Samples loaded from Postgres and trained on.
+    pub samples: usize,
+    /// SGD steps actually applied across all epochs.
+    pub training_steps: usize,
+    /// Number of epochs run over the corpus.
+    pub epochs: usize,
+    /// Mean loss of the final epoch.
+    pub final_loss: f64,
+    /// Post-training accuracy over the corpus (0.5 threshold).
+    pub accuracy: f64,
+}
+
+/// Load-and-train entry for the learned pass-completion model: given a corpus of
+/// [`SoccerPassOutcomeSample`]s (in practice loaded from Postgres by the cluster learner — see
+/// [`SoccerPassOutcomeSample`] and `SoccerStore::load_pass_outcome_samples`), build a fresh
+/// [`SoccerPassCompletionHead`] and run `epochs` SGD passes over it. Returns the trained head
+/// plus a [`SoccerPassCompletionTrainingReport`], or `None` if no usable samples were supplied
+/// (so the runner can skip cleanly rather than persist an untrained net).
+pub(crate) fn train_soccer_pass_completion_head(
+    samples: &[SoccerPassOutcomeSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<(SoccerPassCompletionHead, SoccerPassCompletionTrainingReport)> {
+    let usable = samples
+        .iter()
+        .filter(|s| s.features.len() == SOCCER_PASS_COMPLETION_FEATURE_DIM)
+        .count();
+    if usable == 0 || epochs == 0 {
+        return None;
+    }
+    let mut head = SoccerPassCompletionHead::new(seed);
+    let mut final_loss = 0.0;
+    for _ in 0..epochs {
+        final_loss = head.train(samples, learning_rate);
+    }
+    let report = SoccerPassCompletionTrainingReport {
+        samples: usable,
+        training_steps: head.training_steps(),
+        epochs,
+        final_loss,
+        accuracy: head.accuracy(samples),
+    };
+    Some((head, report))
+}
+
+/// Public wrapper that returns ONLY the training report (the head type is engine-internal). The
+/// learning runner uses this to load the Postgres pass-outcome corpus and verify it trains.
+pub fn report_soccer_pass_completion_training(
+    samples: &[SoccerPassOutcomeSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<SoccerPassCompletionTrainingReport> {
+    train_soccer_pass_completion_head(samples, seed, epochs, learning_rate).map(|(_, report)| report)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -47576,6 +47665,16 @@ fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
         .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
 }
 
+/// Apex (peak height, yards) of a lofted NON-scoop pass as a function of its horizontal distance.
+/// This is the single source of truth for the loft arc — the launch-speed calibration and the
+/// horizontal-speed floor both reference it so they stay consistent. Short lofts peak around ~20ft
+/// at 15yd and the apex grows gently to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the longest
+/// balls. Height remains gravity-timed; retaining realistic x-y speed in flight prevents ballooning.
+fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
+    (SHORT_LOFT_APEX_YARDS + (distance_yards.max(0.0) - 15.0) * LOFT_APEX_PER_YARD)
+        .clamp(LOFT_APEX_MIN_YARDS, MAX_LOFT_APEX_YARDS)
+}
+
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot and drops onto the receiver, not into a
@@ -47585,11 +47684,7 @@ fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         scoop_loft_apex_yards(pass.distance_yards, unit)
     } else {
-        // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
-        // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
-        // longest balls. The x-y calibration below keeps them moving while gravity acts.
-        (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + pass.distance_yards.max(0.0) * 0.074)
-            .clamp(5.0, MAX_LOFT_APEX_YARDS)
+        lofted_pass_apex_yards(pass.distance_yards)
     }
 }
 
@@ -48217,8 +48312,7 @@ fn modulated_pass_speed_yps(
         // the receiver, landing 2-3x too far. The only launch speed that LANDS the ball at the
         // target is distance / T (plus a touch for in-flight drag): short/lateral lofts are struck
         // softly, only genuine goal-to-goal balls get real pace.
-        let apex_yards = (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + distance * 0.074)
-            .clamp(5.0, MAX_LOFT_APEX_YARDS);
+        let apex_yards = lofted_pass_apex_yards(distance);
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let land_at_target = (distance / hang_time.max(0.35)) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
         // A ball into pressure is struck a touch firmer so it beats the press; an open receiver gets
@@ -48273,8 +48367,7 @@ fn modulated_pass_speed_yps(
         // be driven; short chips stay gentle (a 15yd chip's floor is only ~14mph). Mirrors the
         // apex formula in `pass_loft_apex_yards` (sans the per-pass scoop seed; scoops returned
         // above).
-        let apex_yards = (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + distance.max(0.0) * 0.074)
-            .clamp(5.0, MAX_LOFT_APEX_YARDS);
+        let apex_yards = lofted_pass_apex_yards(distance);
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let reach_target_floor = distance / hang_time.max(0.35);
         let lively_floor = mph_to_yps(13.0);

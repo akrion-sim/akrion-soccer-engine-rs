@@ -13,7 +13,8 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    report_soccer_pass_completion_training, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
@@ -2885,6 +2886,46 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         } else {
             println!("postgres_training_replay disabled max_delta_rows=0");
+        }
+        // Load the persisted pass-completion training corpus (`des_soccer_pass_outcome_samples`)
+        // back from Postgres and train the learned pass-completion head on it — the accumulated
+        // cross-game experience, not just the current run's samples. Opt-in via sample limit > 0
+        // (0 = skip); never fatal — a DB hiccup must not sink a learning run.
+        let pass_corpus_limit = env_usize("SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT", 0)?;
+        if pass_corpus_limit > 0 {
+            let epochs = env_usize("SOCCER_PG_PASS_COMPLETION_EPOCHS", 8)?;
+            let learning_rate = env_f64("SOCCER_PG_PASS_COMPLETION_LR", 0.05)?;
+            match store.load_pass_outcome_samples(&experiment_id, pass_corpus_limit as i64) {
+                Ok(samples) => {
+                    match report_soccer_pass_completion_training(
+                        &samples,
+                        seed,
+                        epochs,
+                        learning_rate,
+                    ) {
+                        Some(report) => println!(
+                            "postgres_pass_completion_training experiment={} loaded={} trained_steps={} epochs={} final_loss={:.5} accuracy={:.3}",
+                            experiment_slug,
+                            report.samples,
+                            report.training_steps,
+                            report.epochs,
+                            report.final_loss,
+                            report.accuracy
+                        ),
+                        None => println!(
+                            "postgres_pass_completion_training experiment={} loaded={} (no usable samples to train)",
+                            experiment_slug,
+                            samples.len()
+                        ),
+                    }
+                }
+                Err(err) => println!(
+                    "postgres_pass_completion_training experiment={} load_error={}",
+                    experiment_slug, err
+                ),
+            }
+        } else {
+            println!("postgres_pass_completion_training disabled sample_limit=0");
         }
         println!(
             "postgres_enabled experiment={} experiment_id={} base_policy_version={} generation={} retrieval_capture={}",

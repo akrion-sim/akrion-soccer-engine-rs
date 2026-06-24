@@ -10064,6 +10064,47 @@ impl SoccerMatch {
                                 aimed_target
                             };
                         }
+                        // Aim noise can still pull the ball onto a marker SHADOWING the receiver at
+                        // the same range — a case the closer-than-receiver risk model above scores
+                        // at zero, so it slips through. The hard, shadow-aware concede check catches
+                        // it: if the noisy release concedes the reception but the receiver's own feet
+                        // (or the led point) do NOT, snap back to that safe point rather than feeding
+                        // the marker. Only fires when the noise itself created the concede, so a pass
+                        // deliberately aimed at a clean point is untouched.
+                        if snapshot.pass_reception_conceded_to_opponent(
+                            player_team,
+                            receiver_position,
+                            player_pos,
+                            aimed_target,
+                            speed,
+                            pressure,
+                        ) {
+                            let receiver_safe = !snapshot.pass_reception_conceded_to_opponent(
+                                player_team,
+                                receiver_position,
+                                player_pos,
+                                receiver_position,
+                                speed,
+                                pressure,
+                            );
+                            let led_safe = !snapshot.pass_reception_conceded_to_opponent(
+                                player_team,
+                                receiver_position,
+                                player_pos,
+                                led_target,
+                                speed,
+                                pressure,
+                            );
+                            if receiver_safe {
+                                aimed_target = receiver_position;
+                            } else if led_safe {
+                                aimed_target = led_target;
+                            }
+                        }
+
+                        // The shadow-aware correction gets first chance to recover a playable
+                        // release. If every corrected line still hands control to an opponent,
+                        // keep possession and face the intended run instead of forcing the pass.
                         let final_risk = snapshot.pass_point_direct_opponent_control_risk(
                             player_team,
                             receiver_position,
@@ -16937,6 +16978,17 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
+/// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
+/// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
+/// the carrier reliably HAS a teammate to play to — instead of being left to thump it to nobody or
+/// force it into a marked man. The raw most-open-space term otherwise drags runners away from the
+/// ball into space the carrier cannot reach. Set `DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST=1` to
+/// restore the unboosted `SHORT_OUTLET_SHOW_BONUS` (A/B / parity).
+fn dd_soccer_disable_show_for_ball_boost() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST").is_ok())
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
@@ -30816,7 +30868,15 @@ impl WorldSnapshot {
                     if (SHORT_OUTLET_SHOW_MIN_YARDS..=SHORT_OUTLET_SHOW_MAX_YARDS).contains(&ball_to_p)
                         && self.clear_line(self.ball.position, p, me.team.other(), 2.0)
                     {
-                        SHORT_OUTLET_SHOW_BONUS
+                        if dd_soccer_disable_show_for_ball_boost() {
+                            SHORT_OUTLET_SHOW_BONUS
+                        } else {
+                            // A clean nearby outlet is worth markedly more than raw open space the
+                            // carrier can't reach, so a teammate reliably shows for the pass; reward
+                            // a FORWARD outlet most so the run also advances the play.
+                            let forward_show = (forward_from_ball / 16.0).clamp(0.0, 1.0);
+                            SHORT_OUTLET_SHOW_BONUS * (2.3 + forward_show * 1.6)
+                        }
                     } else {
                         0.0
                     }
