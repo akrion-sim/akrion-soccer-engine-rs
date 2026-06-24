@@ -50373,25 +50373,25 @@ fn lofted_pass_apex_is_capped_near_thirty_feet_and_scales_with_distance() {
     let short = apex_for(15.0);
     let long = apex_for(60.0);
     let extreme = apex_for(120.0);
-    // Shorter lofted passes peak low — around ~9ft (SHORT_LOFT_APEX_YARDS) at 15yd — so they
-    // drop onto the receiver promptly instead of ballooning.
+    // Normal short lofts keep a realistic ~20ft arc. Horizontal speed retention, not flattening
+    // the trajectory, prevents the ball from crawling while gravity brings it down.
     assert!(
-        (short - SHORT_LOFT_APEX_YARDS).abs() < 1.2,
-        "short lofted pass should peak near ~9ft: got {short} yd"
+        (short - SHORT_LOFT_APEX_YARDS).abs() < 1e-9,
+        "a 15yd lofted pass should peak near ~20ft: got {short} yd"
     );
     // Longer balls arc higher with distance...
     assert!(
         long > short,
         "longer lofted passes should arc higher: long={long} short={short}"
     );
-    // ...but NOTHING ever balloons past the ~24ft (MAX_LOFT_APEX_YARDS) ceiling.
+    // ...but nothing exceeds the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling.
     assert!(
         long <= MAX_LOFT_APEX_YARDS + 1e-9,
-        "a long lofted pass must respect the ~24ft ceiling: {long} yd"
+        "a long lofted pass must respect the ~30ft ceiling: {long} yd"
     );
     assert!(
         extreme <= MAX_LOFT_APEX_YARDS + 1e-9,
-        "no lofted pass may exceed the ~24ft ceiling: {extreme} yd > {MAX_LOFT_APEX_YARDS}"
+        "no lofted pass may exceed the ~30ft ceiling: {extreme} yd > {MAX_LOFT_APEX_YARDS}"
     );
     // A floor (non-aerial) pass has no loft at all.
     let origin = Vec2::new(40.0, 10.0);

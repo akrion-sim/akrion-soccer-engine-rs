@@ -47712,11 +47712,9 @@ fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
 
 /// Apex (peak height, yards) of a lofted NON-scoop pass as a function of its horizontal distance.
 /// This is the single source of truth for the loft arc — the launch-speed calibration and the
-/// horizontal-speed floor both reference it so they stay consistent. Short chips peak low (~9ft at
-/// 15yd) and the apex grows gently to the realistic ~24ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
-/// longest goal-to-goal balls — deliberately well under a "balloon". Because hang time is fixed at
-/// T = 2·√(2·apex/g) (see `pass_ball_altitude_yards`), this lower apex curve is exactly what makes
-/// aerial balls come down promptly instead of floating.
+/// horizontal-speed floor both reference it so they stay consistent. Short lofts peak around ~20ft
+/// at 15yd and the apex grows gently to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the longest
+/// balls. Height remains gravity-timed; retaining realistic x-y speed in flight prevents ballooning.
 fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
     (SHORT_LOFT_APEX_YARDS + (distance_yards.max(0.0) - 15.0) * LOFT_APEX_PER_YARD)
         .clamp(LOFT_APEX_MIN_YARDS, MAX_LOFT_APEX_YARDS)
