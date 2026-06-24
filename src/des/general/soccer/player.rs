@@ -3281,7 +3281,6 @@ impl PlayerAgent {
             * (1.0 + dribble_risk * (1.0 - advanced_dribbler_fit) * 0.42).clamp(1.0, 1.50)
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, 0.92);
-<<<<<<< HEAD
         // Drive-to-corner commitment: once the team has committed to a byline drive (the wide
         // carrier in the opponent half), LIFT the forward/wide carry so the carrier keeps driving
         // the corner instead of slowing 32-38yd out — the carry itself is steered at the corner
@@ -3315,8 +3314,6 @@ impl PlayerAgent {
         let flank_lane_fit = ((lateral_position - field_width * 0.5).abs()
             / (field_width * 0.5).max(1.0))
         .clamp(0.0, 1.0);
-=======
->>>>>>> origin/alex-1
         let flank_policy_active = directive.flank_attack_policy.is_flank();
         let flank_drive_multiplier = if flank_policy_active {
             (1.0 + (1.0 - flank_lane_fit) * 0.26 + directive.flank_overlap_run_probability * 0.20)
