@@ -74,9 +74,10 @@ pub const DEFAULT_FIELD_WIDTH_YARDS: f64 = 80.0;
 pub const DEFAULT_GOAL_WIDTH_YARDS: f64 = 8.0;
 pub const DEFAULT_BALL_DRAG_PER_TICK: f64 = 0.028;
 pub const DEFAULT_BALL_AIR_RESISTANCE: f64 = 0.0085;
-// Fraction of linear + air drag relieved for a fully airborne ball, so long
-// aerial passes carry their pace through the final third instead of dying late.
-const AERIAL_FLIGHT_DRAG_RELIEF: f64 = 0.45;
+// Fraction of the ground-style linear + quadratic drag relieved for a fully airborne ball.
+// Airborne x-y speed should be close to ballistic free flight; the old partial relief still bled
+// so much speed that long lofts crawled horizontally while the gravity timer kept running.
+const AERIAL_FLIGHT_DRAG_RELIEF: f64 = 0.88;
 pub const DEFAULT_BALL_GRASS_RESISTANCE_YPS2: f64 = 0.96;
 pub const DEFAULT_BALL_STOP_SPEED_YPS: f64 = 0.55;
 pub const DEFAULT_PLAYER_VISION_SKILL: f64 = 7.6;
@@ -720,9 +721,8 @@ const DEAD_SHOT_LOOSE_BALL_SPEED_YPS: f64 = 5.0;
 // physics should both see a real strike.
 // Shots leave the boot CLEARLY faster than any pass so they read as a strike, not a driven ball,
 // from the very first frame. The hardest ground pass is ~38mph and the hardest aerial ~50mph, so
-// the slowest shot floors at 50 (above both) and a full-power strike reaches ~70 — no overlap with
-// the pass band, which is what made weak shots "look like passes at first".
-const SHOT_MIN_SPEED_MPH: f64 = 50.0;
+// the slowest shot floors above that at 54mph and a full-power strike reaches ~70mph.
+const SHOT_MIN_SPEED_MPH: f64 = 54.0;
 const SHOT_MAX_SPEED_MPH: f64 = 72.0;
 const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
@@ -781,25 +781,23 @@ const SHOT_SCREEN_IDEAL_MAX_YARDS: f64 = 3.0;
 const BALL_CURL_DECAY_PER_SECOND: f64 = 1.10;
 const MAX_BALL_CURL_YPS2: f64 = 7.6;
 const BALL_ROLLING_ALTITUDE_YARDS: f64 = 0.06;
-// Hard ceiling on how high any lofted/aerial pass arcs. A lofted ball should never balloon
-// much past ~30ft (10yd) of altitude — only the longest balls reach it, with shorter ones
-// peaking nearer ~20ft (`SHORT_LOFT_APEX_YARDS`). Loft height is gravity-timed from the
-// launch tick, so a higher apex directly increases hang time and must be paired with enough
-// horizontal pace to land near the intended target.
+// Hard ceiling on how high any lofted/aerial pass arcs. Height is not the hang-time bug: the
+// x-y speed must stay alive while gravity brings the ball down. Short lofts peak around ~20ft
+// and only the longest balls approach ~30ft.
 const MAX_LOFT_APEX_YARDS: f64 = 10.0; // ~30 ft
 const SHORT_LOFT_APEX_YARDS: f64 = 6.667; // ~20 ft (short lofted passes)
 /// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
 /// target it must be launched at ~`distance / hang_time`. In flight it loses a little pace to air
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
 /// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
-const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.15;
+const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
 // Scoops are delicate short chips over a close defender. They must clear a standing/lunging
-// block early in the path, but stay within the requested 6-10ft window and land on the receiver.
-const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft
-const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 10.0 / 3.0; // 10ft
-const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.25;
+// block early in the path, but stay in a clipped 7-12ft window and land on the receiver.
+const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 7.0 / 3.0; // ~7ft
+const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 4.0; // ~12ft
+const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.18;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
-const SCOOP_MAX_SPEED_MPH: f64 = 36.0;
+const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
 /// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
 /// attacking area), the classic territory-winning long ball. Only balls at least this long, and
 /// only when forward (toward the opponent's goal line), earn the affinity — a long SIDEWAYS or
@@ -1205,16 +1203,16 @@ const RECEPTION_BYLINE_MARGIN_YARDS: f64 = 1.5;
 // When a pass has no resolved short target, look for an OPEN advanced teammate (striker /
 // midfielder) this far ahead and play a purposeful forward ball there instead of a fixed
 // blind hoof. Sweet-spot ~30yd.
-const PASS_FORWARD_OUTLET_MIN_YARDS: f64 = 18.0;
+const PASS_FORWARD_OUTLET_MIN_YARDS: f64 = 10.0;
 const PASS_FORWARD_OUTLET_MAX_YARDS: f64 = 42.0;
-const PASS_FORWARD_OUTLET_BAND_CENTER_YARDS: f64 = 30.0;
+const PASS_FORWARD_OUTLET_BAND_CENTER_YARDS: f64 = 24.0;
 // Keep the aim point comfortably inside the pitch so the long ball isn't over-hit out of
 // play (touchline / byline margins, robust to launch scatter).
 const PASS_FORWARD_OUTLET_TOUCHLINE_MARGIN_YARDS: f64 = 5.0;
 const PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS: f64 = 7.0;
 // A no-target forward ball is only played to a teammate who is genuinely open (nearest opponent
 // far) and down a reasonably clear lane — never straight to a marked man / into a blocked lane.
-const FORWARD_OUTLET_MIN_RECEIVER_OPENNESS: f64 = 0.45;
+const FORWARD_OUTLET_MIN_RECEIVER_OPENNESS: f64 = 0.38;
 const FORWARD_OUTLET_LANE_HALF_WIDTH_YARDS: f64 = 2.0;
 // A pass with NO resolved receiver ("to nobody in particular") is only a legitimate ball into
 // space — a deliberate forward delivery for runners to chase — never a square/short giveaway.
@@ -2383,6 +2381,10 @@ const PASS_FACING_PERP_ACCURACY: f64 = 0.45;
 const PASS_FACING_BACKHEEL_ACCURACY: f64 = 0.55;
 const PASS_PERP_MAX_MPH: f64 = 10.0;
 const PASS_BACKHEEL_MAX_MPH: f64 = 20.0;
+// A floor/backheel can be poked from an awkward body shape, but an aerial/scoop needs enough body
+// behind it to carry through the air. Below this, hold the ball and turn instead of releasing a
+// capped slow lob that appears to hang while gravity keeps ticking.
+const AERIAL_PASS_MIN_LAUNCH_POWER_FACTOR: f64 = 0.62;
 // When in possession and attacking, the back line pushes up this far to fill the
 // space behind midfield (soft-capped at halfway+5).
 const ATTACKING_DEFENDER_PUSH_UP_YARDS: f64 = 8.0;
@@ -2751,7 +2753,7 @@ const UNCONTESTED_CARRIER_SPACE_YARDS: f64 = 6.0;
 /// up to this many yards ahead of his current position (capped onside) so he actively
 /// pushes up with the free carrier instead of standing still. A bigger push gets more
 /// teammates genuinely sprinting forward to support an unpressured carrier on the attack.
-const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 10.0;
+const UNCONTESTED_SUPPORT_PUSH_YARDS: f64 = 13.0;
 /// If the holder has at most this many outfield teammates ahead, they are the front line
 /// (furthest/second-furthest forward) and off-ball attackers should sprint to supply runs.
 const FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD: usize = 1;
@@ -2852,15 +2854,15 @@ const HOLD_FOR_SUPPORT_TTL_SECONDS: f64 = 2.6;
 /// Base appetite to elect the wait (scaled by plan quality, patience, and calmness). It
 /// competes with the recycle/carry/shield options that are all that remain when no forward
 /// outlet is on, so it is a genuine choice rather than a rare one.
-const HOLD_FOR_SUPPORT_BASE_APPETITE: f64 = 0.34;
+const HOLD_FOR_SUPPORT_BASE_APPETITE: f64 = 0.42;
 /// ...but capped so a calm carrier still mixes in the safe alternatives rather than freezing
 /// on the ball every tick.
-const HOLD_FOR_SUPPORT_MAX_APPETITE: f64 = 0.60;
+const HOLD_FOR_SUPPORT_MAX_APPETITE: f64 = 0.72;
 /// At most this many teammates are signalled at once (the best-placed candidates).
-const HOLD_FOR_SUPPORT_MAX_SUMMONED: usize = 3;
+const HOLD_FOR_SUPPORT_MAX_SUMMONED: usize = 4;
 /// When summoned to push forward, the advanced-run option is floored to this probability in
 /// the teammate's own off-ball decision (a POMDP boost — they choose to run, not a world push).
-const HOLD_FOR_SUPPORT_SUMMON_RUN_FLOOR: f64 = 0.55;
+const HOLD_FOR_SUPPORT_SUMMON_RUN_FLOOR: f64 = 0.66;
 /// When summoned to take up position, the check-into-the-lane option is floored to this.
 const HOLD_FOR_SUPPORT_SUMMON_POSITION_FLOOR: f64 = 0.50;
 /// ...and the hold-your-shape option is lifted so the player settles into its slot/open lane.
@@ -10194,9 +10196,9 @@ fn untargeted_long_ball_altitude_yards(
     }
     let carry_speed = flight.launch_speed_yps.max(current_speed_yps);
     // Hoofed long balls were ballooning (the old 4.5..14.0yd / 13..42ft clamp). A typical
-    // long hoof now arcs ~22-26ft, hard-capped at the shared ~30ft (`MAX_LOFT_APEX_YARDS`)
-    // ceiling so it can never balloon past a lofted pass. Flatter/driven keeps the ground
-    // game quick; the cap is vertical realism only (x/y pace is independent of loft).
+    // long hoof now stays under the shared ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling so it can
+    // never balloon past a lofted pass. Flatter/driven keeps the ground game quick; the cap
+    // is vertical realism only (x/y pace is independent of loft).
     let apex = (3.15 + flight.distance_yards.max(0.0) * 0.062 + carry_speed * 0.037)
         .clamp(3.7, MAX_LOFT_APEX_YARDS);
     (std::f64::consts::PI * progress).sin().max(0.0) * apex
@@ -44363,12 +44365,16 @@ fn goal_attack_window_score_for_role(
         PlayerRole::Midfielder => TEAMMATE_MUST_SHOOT_YARDS + 6.0,
         PlayerRole::Defender => TEAMMATE_MUST_SHOOT_YARDS + 3.0,
         PlayerRole::Goalkeeper => return 0.0,
-    };
+    }
+    .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
     if yards_to_goal > window_yards {
         return 0.0;
     }
 
     let mut distance_fit = ((window_yards - yards_to_goal) / window_yards).clamp(0.0, 1.0);
+    if yards_to_goal > LONG_SHOT_DISCOURAGED_YARDS {
+        distance_fit *= 0.45;
+    }
     if role == PlayerRole::Forward
         && yards_to_goal
             <= tunables()
@@ -44407,8 +44413,29 @@ fn goal_attack_window_score_for_role(
         .clamp(0.0, 1.0)
 }
 
+fn long_shot_distance_is_allowed(observation: &SoccerPomdpObservation) -> bool {
+    let distance = observation.yards_to_goal;
+    if distance <= LONG_SHOT_DISCOURAGED_YARDS {
+        return true;
+    }
+    if distance > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+        return false;
+    }
+    let keeper_out = observation
+        .opposing_goalkeeper_out_of_position
+        .clamp(0.0, 1.0);
+    if distance > LONG_SHOT_KEEPER_DEPENDENT_YARDS {
+        keeper_out >= LONG_SHOT_GK_TOTALLY_OUT
+    } else {
+        keeper_out >= LONG_SHOT_GK_OUT_OF_POSITION
+    }
+}
+
 fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
     if !observation.shot_lane_open || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+        return false;
+    }
+    if !long_shot_distance_is_allowed(observation) {
         return false;
     }
     let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
@@ -44430,7 +44457,7 @@ fn shot_decision_is_qualified_for_role(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> bool {
-    if observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+    if !long_shot_distance_is_allowed(observation) {
         return false;
     }
     shot_decision_is_qualified(observation)
@@ -44446,7 +44473,7 @@ fn attacking_goal_pressure_shot_is_qualified(
 ) -> bool {
     if role == PlayerRole::Goalkeeper
         || !observation.shot_lane_open
-        || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS
+        || !long_shot_distance_is_allowed(observation)
     {
         return false;
     }
@@ -44498,14 +44525,7 @@ fn speculative_long_shot_is_qualified(
     }
     // Distance discipline: 20+ yds is discouraged, 26-30 yds only opens up when
     // the keeper is stranded, and >30 yds is blocked by the range guard above.
-    let keeper_out = observation
-        .opposing_goalkeeper_out_of_position
-        .clamp(0.0, 1.0);
-    if distance > LONG_SHOT_KEEPER_DEPENDENT_YARDS {
-        if keeper_out < LONG_SHOT_GK_TOTALLY_OUT {
-            return false;
-        }
-    } else if distance > LONG_SHOT_DISCOURAGED_YARDS && keeper_out < LONG_SHOT_GK_OUT_OF_POSITION {
+    if !long_shot_distance_is_allowed(observation) {
         return false;
     }
     if observation.shot_block_probability.clamp(0.0, 1.0)
@@ -44577,7 +44597,7 @@ fn contested_final_third_shot_is_qualified(
     shooting_skill: f64,
 ) -> bool {
     if role == PlayerRole::Goalkeeper
-        || observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS
+        || !long_shot_distance_is_allowed(observation)
         || observation.yards_to_goal < TEAMMATE_MUST_SHOOT_YARDS
         || observation.opponent_goal_angle_degrees < 10.0
     {
@@ -44649,7 +44669,10 @@ fn goal_proximity_shot_pressure_score(
     role: PlayerRole,
     shooting_skill: f64,
 ) -> f64 {
-    if role == PlayerRole::Goalkeeper || !observation.shot_lane_open {
+    if role == PlayerRole::Goalkeeper
+        || !observation.shot_lane_open
+        || !long_shot_distance_is_allowed(observation)
+    {
         return 0.0;
     }
     let window_yards = match role {
@@ -44761,6 +44784,7 @@ fn striker_shot_window_is_qualified(
         .striker_shot_window_yards
         .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
     observation.yards_to_goal <= striker_window_yards
+        && long_shot_distance_is_allowed(observation)
         && observation.shot_lane_open
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
@@ -47453,14 +47477,14 @@ const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
 fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
     let distance_fit = ((distance_yards.max(0.0) - 4.0) / 10.0).clamp(0.0, 1.0);
-    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.64 + unit.clamp(0.0, 1.0) * 0.70)
+    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.84 + unit.clamp(0.0, 1.0) * 0.82)
         .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
 }
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot and drops onto the receiver, not into a
-        // hanging balloon arc. Keep it low (roughly 6-10ft) with stable variation.
+        // hanging balloon arc. Keep it in the requested 7-12ft band with stable variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
@@ -47468,8 +47492,7 @@ fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     } else {
         // A real lofted pass: shorter ones peak around ~20ft (`SHORT_LOFT_APEX_YARDS`) and
         // they scale up with distance to the ~30ft (`MAX_LOFT_APEX_YARDS`) ceiling for the
-        // longest balls — never higher. Slope is set so a ~15yd loft ≈ 20ft and a ~60yd
-        // loft ≈ 30ft.
+        // longest balls. The x-y calibration below keeps them moving while gravity acts.
         (SHORT_LOFT_APEX_YARDS - 15.0 * 0.074 + pass.distance_yards.max(0.0) * 0.074)
             .clamp(5.0, MAX_LOFT_APEX_YARDS)
     }
@@ -48076,8 +48099,8 @@ fn modulated_pass_speed_yps(
     let openness = receiver_openness.clamp(0.0, 1.0);
     let pressure = 1.0 - openness;
     if flight.is_scoop() {
-        // A scoop must land on the receiver. The modest 6-10ft apex gives only about
-        // 1.2-1.6s of gravity hang time, so pace it from distance / hang-time.
+        // A scoop must land on the receiver. The requested 7-12ft apex gives roughly
+        // 1.3-1.7s of gravity hang time, so pace it from distance / hang-time.
         let apex_yards = scoop_loft_apex_yards(distance, 0.5);
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let land_at_target =

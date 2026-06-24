@@ -23,7 +23,7 @@ use soccer_engine::des::general::soccer::{
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
-    evolve_soccer_team_policies, run_soccer_learning_queue_with_events,
+    evolve_soccer_team_policies, merge_soccer_policy_deltas, run_soccer_learning_queue_with_events,
     soccer_evolution_options_from_search_metadata, soccer_learning_curriculum_episode_config,
     soccer_learning_curriculum_stage_for_completed_games,
     soccer_neural_network_snapshot_fingerprint,
@@ -54,6 +54,8 @@ const DEFAULT_SOCCER_QUEUE_POSTGRES_ASYNC_COALESCE_WAIT_MS: usize = 2;
 const DEFAULT_SOCCER_QUEUE_POSTGRES_TACTICAL_LEARNING_AUTHORITATIVE: bool = true;
 const DEFAULT_SOCCER_QUEUE_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT: bool = true;
 const DEFAULT_SOCCER_QUEUE_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM: bool = true;
+const DEFAULT_SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_DELTA_ROWS: usize = 50_000;
+const DEFAULT_SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT: f64 = 1.0;
 const DEFAULT_SOCCER_QUEUE_NEURAL_DRAIN_TIMEOUT_MS: usize = 2;
 const DEFAULT_SOCCER_QUEUE_EVOLUTION_ENABLED: bool = true;
 const DEFAULT_SOCCER_QUEUE_EVOLUTION_ELITE_GAMES: usize = 4;
@@ -1410,6 +1412,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM",
         DEFAULT_SOCCER_QUEUE_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM,
     )?;
+    let pg_training_replay_delta_rows = env_usize_alias(
+        "SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_DELTA_ROWS",
+        "SOCCER_POSTGRES_TRAINING_REPLAY_DELTA_ROWS",
+        DEFAULT_SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_DELTA_ROWS,
+    )?;
+    let pg_training_replay_prior_weight = env_f64_alias(
+        "SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT",
+        "SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT",
+        DEFAULT_SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT,
+    )?;
+    if pg_training_replay_prior_weight < 0.0 {
+        return Err(invalid_data(
+            "SOCCER_QUEUE_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT must be non-negative",
+        )
+        .into());
+    }
     let pg_policy_version_interval_games = pg_policy_version_interval_games.max(1);
     let pg_completed_run_batch_games = pg_completed_run_batch_games.max(1);
     let pg_completed_run_async_queue_batches = pg_completed_run_async_queue_batches.max(1);
@@ -1727,6 +1745,43 @@ fn run() -> Result<(), Box<dyn Error>> {
                 pg_base_tactical_learning_fingerprint = version_tactical_learning_fingerprint;
             }
         }
+        if pg_training_replay_delta_rows > 0 {
+            let replay_created_after_micros = if pg_base_policy_version_updated_at_micros > 0 {
+                Some(pg_base_policy_version_updated_at_micros)
+            } else {
+                None
+            };
+            let replay_delta = store
+                .load_recent_completed_run_policy_delta(
+                    &experiment_id,
+                    pg_training_replay_delta_rows,
+                    replay_created_after_micros,
+                )
+                .map_err(invalid_data)?;
+            let replay_entries = replay_delta.entries.len();
+            if replay_entries > 0 {
+                initial_policies = merge_soccer_policy_deltas(
+                    &initial_policies,
+                    std::slice::from_ref(&replay_delta),
+                    pg_training_replay_prior_weight,
+                )
+                .map_err(invalid_data)?;
+                pg_base_policy_fingerprint =
+                    Some(soccer_team_q_policies_fingerprint(&initial_policies));
+            }
+            println!(
+                "postgres_training_replay_queue experiment={} entries={} max_delta_rows={} prior_weight={:.3} created_after_micros={}",
+                experiment_slug,
+                replay_entries,
+                pg_training_replay_delta_rows,
+                pg_training_replay_prior_weight,
+                replay_created_after_micros
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        } else {
+            println!("postgres_training_replay_queue disabled max_delta_rows=0");
+        }
         pg_experiment_id = Some(experiment_id);
     }
     let mut pg_completed_writer = if pg_store.is_some() {
@@ -1740,7 +1795,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     println!(
-        "soccer_learning_queue_start run_id={} games={} parallel_games={} minutes={:.1} dt={:.3}s ticks_per_game={} seed={} neural_enabled={} neural_backend={:?} neural_snapshot_every_batches={} neural_drain_timeout_ms={} postgres_required={} pg_policy_version_interval_games={} pg_completed_run_batch_games={} pg_completed_run_retention_games={} pg_completed_async={} pg_completed_async_queue_batches={} pg_completed_async_coalesce_batches={} pg_completed_async_coalesce_wait_ms={} pg_tactical_learning_authoritative={} pg_refresh_with_resume_artifact={} pg_flush_policy_versions_before_new_sim={}",
+        "soccer_learning_queue_start run_id={} games={} parallel_games={} minutes={:.1} dt={:.3}s ticks_per_game={} seed={} neural_enabled={} neural_backend={:?} neural_snapshot_every_batches={} neural_drain_timeout_ms={} postgres_required={} pg_policy_version_interval_games={} pg_completed_run_batch_games={} pg_completed_run_retention_games={} pg_completed_async={} pg_completed_async_queue_batches={} pg_completed_async_coalesce_batches={} pg_completed_async_coalesce_wait_ms={} pg_tactical_learning_authoritative={} pg_refresh_with_resume_artifact={} pg_flush_policy_versions_before_new_sim={} pg_training_replay_delta_rows={} pg_training_replay_prior_weight={:.3}",
         run_id,
         games,
         parallel_games,
@@ -1763,6 +1818,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         pg_tactical_learning_authoritative,
         pg_refresh_with_resume_artifact,
         pg_flush_policy_versions_before_new_sim,
+        pg_training_replay_delta_rows,
+        pg_training_replay_prior_weight,
     );
     println!(
         "queue_evolution enabled={} interval_games={} window_games={} elite_games={} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} exploration_rate={:.4} exploration_scale={:.4} elite_weight_floor={:.4} population_size={} seed={}",

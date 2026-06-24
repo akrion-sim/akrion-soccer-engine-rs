@@ -1057,6 +1057,35 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_ignores_non_finite_priors() {
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 4,
+            mcts_candidates: 2,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                score: 0.5,
+                prior: f64::INFINITY,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                score: 0.5,
+                prior: 0.8,
+                q_visits: 1,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates).as_deref(),
+            Some("pass")
+        );
+    }
+
+    #[test]
     fn retrieved_action_priors_use_matching_whole_field_moment_shapes() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
         let frame = tracking_frame_from_match(&sim);
@@ -3204,7 +3233,12 @@ impl SoccerMatch {
         let mut prior_sum = 0.0;
         for (index, candidate) in candidates.iter().enumerate() {
             let rank_floor = 0.05 / (index as f64 + 1.0);
-            let raw = candidate.prior.max(0.0) + rank_floor;
+            let candidate_prior = if candidate.prior.is_finite() {
+                candidate.prior.max(0.0)
+            } else {
+                0.0
+            };
+            let raw = candidate_prior + rank_floor;
             raw_priors.push(raw);
             prior_sum += raw;
         }
@@ -7479,6 +7513,16 @@ impl SoccerMatch {
                 < 1e-9
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
+        let contextual_pool = SHOT_ON_TARGET_REWARD_POINTS * scale;
+        if self.record_contextual_attacking_rewards(
+            shooting_team,
+            Some(shooter),
+            contextual_pool,
+            SoccerRewardEventKind::ShotOnTarget,
+        ) {
+            self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
+            return;
+        }
         let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
             .iter()
             .map(|w| w * scale)
@@ -7640,16 +7684,17 @@ impl SoccerMatch {
         candidates
     }
 
-    fn record_contextual_goal_rewards(
+    fn record_contextual_attacking_rewards(
         &mut self,
-        scoring_team: Team,
+        attacking_team: Team,
         shooter: Option<usize>,
-        goal_reward_pool: f64,
+        reward_pool: f64,
+        kind: SoccerRewardEventKind,
     ) -> bool {
-        if goal_reward_pool <= 1e-9 || !goal_reward_pool.is_finite() {
+        if reward_pool <= 1e-9 || !reward_pool.is_finite() {
             return false;
         }
-        let candidates = self.contextual_goal_credit_candidates(scoring_team, shooter);
+        let candidates = self.contextual_goal_credit_candidates(attacking_team, shooter);
         if candidates.len() < GOAL_CONTEXT_CREDIT_MIN_PLAYERS {
             return false;
         }
@@ -7662,7 +7707,7 @@ impl SoccerMatch {
         }
 
         for candidate in candidates {
-            let amount = goal_reward_pool * candidate.score / total_score;
+            let amount = reward_pool * candidate.score / total_score;
             if !amount.is_finite() || amount <= 1e-9 {
                 continue;
             }
@@ -7674,12 +7719,26 @@ impl SoccerMatch {
                     transition.tick,
                     transition.player_id,
                     amount,
-                    SoccerRewardEventKind::Goal,
+                    kind,
                 );
             }
             self.deferred_reward_transitions.push(transition);
         }
         true
+    }
+
+    fn record_contextual_goal_rewards(
+        &mut self,
+        scoring_team: Team,
+        shooter: Option<usize>,
+        goal_reward_pool: f64,
+    ) -> bool {
+        self.record_contextual_attacking_rewards(
+            scoring_team,
+            shooter,
+            goal_reward_pool,
+            SoccerRewardEventKind::Goal,
+        )
     }
 
     fn previous_touch_team_for_goal(&self) -> Option<Team> {
@@ -9787,13 +9846,11 @@ impl SoccerMatch {
                             }
                         }
                     }
-                    // A ball with no resolved receiver ("to nobody in particular") is only a
-                    // legitimate delivery into space when it is genuinely FORWARD and LONG —
-                    // within ~70° of the line to the opponent's goal and more than ~25yd. A
-                    // shorter/lateral/backward ball, or a fallback point the opponent visibly owns,
-                    // is a giveaway, so the carrier keeps possession (turning to face the intended
-                    // line) and re-decides next tick rather than launching it nowhere. Restart takers
-                    // are exempt — the restart rules govern their release.
+                    // A ball with no resolved receiver ("to nobody in particular") is not an
+                    // open-play pass anymore. The outlet resolver above first tries to adopt a real
+                    // teammate; if that fails, the carrier keeps possession, faces the intended lane,
+                    // and lets support movement create an option. Restart takers may still release
+                    // an explicit long forward ball, but only through the old safety gate.
                     let no_target_release_is_legal = pass_to_nobody_is_legal(
                         player_pos,
                         led_target,
@@ -9806,8 +9863,8 @@ impl SoccerMatch {
                         led_target,
                     );
                     if target_id.is_none()
-                        && self.restart_double_touch_guard != Some(player_id)
-                        && !no_target_release_is_legal
+                        && (self.restart_double_touch_guard != Some(player_id)
+                            || !no_target_release_is_legal)
                     {
                         let look = led_target - player_pos;
                         if look.len() > 1e-6 {
@@ -9846,6 +9903,21 @@ impl SoccerMatch {
                         // can't play it from this body shape. Turn to face it (so a later
                         // decision can pass it) and keep possession rather than releasing an
                         // impossible reverse-strike.
+                        if intended_dir.len() > 1e-6 {
+                            let face = facing_bucket_from_vector(intended_dir);
+                            if face != FacingBucket::Unknown {
+                                self.players[player_id].action_facing = face;
+                            }
+                        }
+                        return;
+                    }
+                    if flight.is_aerial()
+                        && facing_outcome.power_factor < AERIAL_PASS_MIN_LAUNCH_POWER_FACTOR
+                    {
+                        // A loft needs a planted body shape. If the carrier is too side-on /
+                        // twisted, releasing now turns a calibrated aerial into a weak capped
+                        // lob that crawls in x-y while the gravity timer keeps ticking. Face up
+                        // and re-decide next tick instead.
                         if intended_dir.len() > 1e-6 {
                             let face = facing_bucket_from_vector(intended_dir);
                             if face != FacingBucket::Unknown {
@@ -9985,6 +10057,29 @@ impl SoccerMatch {
                                 aimed_target
                             };
                         }
+                        let final_risk = snapshot.pass_point_direct_opponent_control_risk(
+                            player_team,
+                            receiver_position,
+                            player_pos,
+                            aimed_target,
+                            speed,
+                        );
+                        if final_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK
+                            || snapshot.pass_point_directly_favors_opponent(
+                                player_team,
+                                receiver_position,
+                                aimed_target,
+                            )
+                        {
+                            let look = led_target - player_pos;
+                            if look.len() > 1e-6 {
+                                let face = facing_bucket_from_vector(look);
+                                if face != FacingBucket::Unknown {
+                                    self.players[player_id].action_facing = face;
+                                }
+                            }
+                            return;
+                        }
                     }
                     let pass_curl_probability = pass_curl_probability_for_player(
                         &self.players[player_id].skills,
@@ -10034,7 +10129,7 @@ impl SoccerMatch {
                     }
                     self.ball.holder = None;
                     self.ball.position = player_pos;
-                    {
+                    let actual_launch_speed_yps = {
                         // Kick power vs body momentum: driving the ball against your
                         // own motion (e.g. back-pedalling toward your own goal, then
                         // trying to blast it upfield) loses power — you can't plant and
@@ -10049,7 +10144,8 @@ impl SoccerMatch {
                             launch_speed = launch_speed.min(cap);
                         }
                         self.ball.velocity = kd * launch_speed;
-                    }
+                        launch_speed
+                    };
                     self.ball.curl_acceleration = release.curl_acceleration;
                     self.ball.altitude_yards = release.altitude_yards;
                     self.ball.last_touch_team = Some(player_team);
@@ -10085,7 +10181,7 @@ impl SoccerMatch {
                         distance_yards: distance,
                         receiver_openness,
                         passer_skill: pass_skill,
-                        launch_speed_yps: speed,
+                        launch_speed_yps: actual_launch_speed_yps,
                         receiver_position_at_launch,
                         receiver_velocity_at_launch,
                         offside,
@@ -18250,6 +18346,7 @@ impl WorldSnapshot {
             .into_iter()
             .filter(|candidate_id| *candidate_id != rejected_target_id)
             .filter_map(|candidate_id| {
+                let passer = self.players.iter().find(|player| player.id == passer_id)?;
                 let receiver = self
                     .players
                     .iter()
@@ -18257,13 +18354,29 @@ impl WorldSnapshot {
                 let receiver_position = self.player_position(candidate_id).unwrap_or(receiver.position);
                 let point = self.pass_target_point_for(passer_id, candidate_id, flight)?;
                 let forward = (point.y - passer_position.y) * passer_team.attack_dir();
+                let is_cross = pass_would_be_cross(
+                    passer_position,
+                    point,
+                    passer_team,
+                    self.field_width,
+                    self.field_length,
+                );
+                let nominal_speed =
+                    pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
+                let direct_risk = self.pass_point_direct_opponent_control_risk(
+                    passer_team,
+                    receiver_position,
+                    passer_position,
+                    point,
+                    nominal_speed,
+                );
                 (!self.pass_target_marked_under_pressure(
                     passer_team,
                     receiver_position,
                     point,
                     passer_pressure,
                     forward,
-                ))
+                ) && direct_risk < PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK)
                 .then_some((candidate_id, point))
             })
             .next()
@@ -22021,7 +22134,68 @@ impl WorldSnapshot {
             .map(|(id, position, _)| (id, position));
         // No open advanced teammate: aim at the most OPEN forward channel (away from the nearest
         // opponent), never blindly straight ahead into traffic.
-        let (target, receiver) = match best {
+        let fallback = || {
+            self.players
+                .iter()
+                .filter(|player| {
+                    player.team == team
+                        && player.id != passer_id
+                        && player.role != PlayerRole::Goalkeeper
+                })
+                .filter_map(|player| {
+                    let position = self.player_snapshot_position(player);
+                    let distance = passer_pos.distance(position);
+                    if !(4.0..=70.0).contains(&distance) {
+                        return None;
+                    }
+                    let forward = (position.y - passer_pos.y) * attack_dir;
+                    let lane_clear = self.clear_line(
+                        passer_pos,
+                        position,
+                        team.other(),
+                        FORWARD_OUTLET_LANE_HALF_WIDTH_YARDS,
+                    );
+                    let openness = pass_receiver_openness_for_snapshots(&self.players, team, position);
+                    let direct_risk = self.pass_point_direct_opponent_control_risk(
+                        team,
+                        position,
+                        passer_pos,
+                        position,
+                        mph_to_yps(22.0),
+                    );
+                    if direct_risk >= PASS_DIRECT_OPPONENT_AIM_RELEASE_CORRECTION_RISK {
+                        return None;
+                    }
+                    if self.pass_target_marked_under_pressure(
+                        team,
+                        position,
+                        position,
+                        0.55,
+                        forward,
+                    ) && openness < FORWARD_OUTLET_MIN_RECEIVER_OPENNESS
+                    {
+                        return None;
+                    }
+                    let forward_fit = ((forward + 8.0) / 32.0).clamp(0.0, 1.0);
+                    let range_fit = (1.0 - (distance - 18.0).abs() / 30.0).clamp(0.0, 1.0);
+                    let lane_fit = if lane_clear { 1.0 } else { 0.18 };
+                    let role_bonus = match player.role {
+                        PlayerRole::Forward => 0.20,
+                        PlayerRole::Midfielder => 0.14,
+                        PlayerRole::Defender => 0.04,
+                        PlayerRole::Goalkeeper => 0.0,
+                    };
+                    let score = openness * 0.40
+                        + lane_fit * 0.24
+                        + forward_fit * 0.18
+                        + range_fit * 0.12
+                        + role_bonus;
+                    Some((player.id, position, score))
+                })
+                .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, position, _)| (id, position))
+        };
+        let (target, receiver) = match best.or_else(fallback) {
             Some((id, position)) => (position, Some(id)),
             None => (self.open_forward_channel_point(passer_pos, team), None),
         };
