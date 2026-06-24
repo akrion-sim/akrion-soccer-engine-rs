@@ -3585,6 +3585,10 @@ const SOCCER_POLICY_GRAD_CLIP_NORM: f64 = 5.0;
 /// Decision-time weight on the actor's log-probability when it biases action
 /// selection (multiplies `ln π(family|s)` added to each candidate's blend score).
 const SOCCER_POLICY_DECISION_WEIGHT: f64 = 0.6;
+/// Decision-time weight on a **specialist skill head's** log-probability (pass/dribble/shot),
+/// added on top of the joint actor's family log-prob for candidates in that skill group. Kept
+/// below the joint weight so the specialists refine — rather than override — the shared actor.
+const SOCCER_SKILL_POLICY_DECISION_WEIGHT: f64 = 0.4;
 /// Learned **world model** `P̂(s'|s,a)` hyperparameters. The model regresses the
 /// next state's feature vector from the current (state ⊕ action) features,
 /// enabling 1-step model-based value look-ahead (Dyna-style).
@@ -30795,6 +30799,252 @@ impl SoccerPolicyHead {
     }
 }
 
+/// Technical skill groups the specialist actor heads cover. Each maps to a disjoint subset of
+/// [`SOCCER_POLICY_ACTIONS`] (the passing, dribbling, and shooting families respectively).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerSkillGroup {
+    Pass,
+    Dribble,
+    Shot,
+}
+
+const SOCCER_SKILL_PASS_FAMILIES: &[&str] = &[
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "flank-low-cross",
+    "flank-high-cross",
+    "switch-play",
+    "wall-pass",
+    "corner-flag-cross",
+    "surprise-pass",
+    "scoop-pass",
+    "first-time-pass",
+];
+const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
+    "dribble",
+    "carry-forward",
+    "carry-out-left",
+    "carry-out-right",
+    "protect-ball",
+    "side-step",
+    "left-cut",
+    "right-cut",
+    "nutmeg",
+    "fake-left-cut-right",
+    "fake-right-cut-left",
+    "xavi-turn",
+    "round-goalkeeper",
+];
+const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &["shoot", "first-time-shot"];
+
+impl SoccerSkillGroup {
+    const ALL: [SoccerSkillGroup; 3] = [
+        SoccerSkillGroup::Pass,
+        SoccerSkillGroup::Dribble,
+        SoccerSkillGroup::Shot,
+    ];
+
+    fn families(self) -> &'static [&'static str] {
+        match self {
+            SoccerSkillGroup::Pass => SOCCER_SKILL_PASS_FAMILIES,
+            SoccerSkillGroup::Dribble => SOCCER_SKILL_DRIBBLE_FAMILIES,
+            SoccerSkillGroup::Shot => SOCCER_SKILL_SHOT_FAMILIES,
+        }
+    }
+}
+
+/// Resolve a joint-actor family index (into [`SOCCER_POLICY_ACTIONS`]) to its specialist skill
+/// group and the head-local action index within that group, or `None` for families outside the
+/// three technical skills (hold/space/tackle/press/…), which only the joint actor covers.
+fn soccer_policy_skill_group_for_action_index(
+    action_index: usize,
+) -> Option<(SoccerSkillGroup, usize)> {
+    let label = *SOCCER_POLICY_ACTIONS.get(action_index)?;
+    for group in SoccerSkillGroup::ALL {
+        if let Some(local) = group.families().iter().position(|&family| family == label) {
+            return Some((group, local));
+        }
+    }
+    None
+}
+
+/// One specialist policy head: an independent softmax actor over a single skill group's action
+/// families, sharing the actor's engineered feature representation as its input.
+pub(crate) struct SoccerSkillPolicyHead {
+    network: FeedForwardNetwork,
+    group: SoccerSkillGroup,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerSkillPolicyHead {
+    fn new(seed: u32, group: SoccerSkillGroup) -> Self {
+        let salt = match group {
+            SoccerSkillGroup::Pass => 0x1234_5678,
+            SoccerSkillGroup::Dribble => 0x2345_6789,
+            SoccerSkillGroup::Shot => 0x3456_789A,
+        };
+        let mut rng = mulberry32(seed ^ salt);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                output_dim: group.families().len(),
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerSkillPolicyHead {
+            network,
+            group,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    /// `π(sub-action | s)` over just this skill's families, or `None` on a malformed input.
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+            || self.network.output_dim != self.group.families().len()
+        {
+            return None;
+        }
+        if state_features.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let probs = self.network.action_probabilities(&state_features[..]);
+        probs.iter().all(|p| p.is_finite()).then(|| probs.to_vec())
+    }
+
+    /// One advantage policy-gradient pass over a balanced subsample of this skill's samples.
+    /// `bucket` carries the head-local action index alongside each sample. No MAPPO clip: the
+    /// specialists had no behavior-policy old-prob at play time, so plain PG is the correct update.
+    fn train(&mut self, bucket: &[(&SoccerPolicySample, usize)], balanced_n: usize) {
+        if bucket.is_empty() || balanced_n == 0 {
+            return;
+        }
+        // Stride a balanced subsample of `balanced_n` across the bucket so every head trains on an
+        // equal number of samples (no skill dominates the others' separate losses).
+        let stride = (bucket.len() / balanced_n).max(1);
+        let mut loss_sum = 0.0;
+        let mut applied = 0usize;
+        let mut taken = 0usize;
+        let mut i = 0usize;
+        while i < bucket.len() && taken < balanced_n {
+            let (sample, local) = bucket[i];
+            if sample.advantage.is_finite() && local < self.network.output_dim {
+                let result = self.network.train_policy_gradient_sample(
+                    &sample.state_features[..],
+                    local,
+                    sample.advantage,
+                    SOCCER_POLICY_ENTROPY_COEFF,
+                    SOCCER_POLICY_LEARNING_RATE,
+                    SOCCER_POLICY_GRAD_CLIP_NORM,
+                );
+                if result.applied && result.loss.is_finite() {
+                    loss_sum += result.loss;
+                    applied += 1;
+                }
+            }
+            taken += 1;
+            i += stride;
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+    }
+}
+
+/// Per-decision cache of each specialist head's log-probabilities, so a candidate's skill bonus is
+/// a single lookup. Built once from the (shared) state features at decision time.
+pub(crate) struct SoccerSkillLogProbs {
+    pass: Option<Vec<f64>>,
+    dribble: Option<Vec<f64>>,
+    shot: Option<Vec<f64>>,
+}
+
+impl SoccerSkillLogProbs {
+    fn group(&self, group: SoccerSkillGroup) -> Option<&Vec<f64>> {
+        match group {
+            SoccerSkillGroup::Pass => self.pass.as_ref(),
+            SoccerSkillGroup::Dribble => self.dribble.as_ref(),
+            SoccerSkillGroup::Shot => self.shot.as_ref(),
+        }
+    }
+
+    /// Log-probability the relevant specialist head assigns to a joint-actor family index, or
+    /// `None` if the family isn't a technical skill (or the head is cold/degenerate).
+    fn log_prob_for_action_index(&self, action_index: usize) -> Option<f64> {
+        let (group, local) = soccer_policy_skill_group_for_action_index(action_index)?;
+        let prob = self.group(group)?.get(local).copied()?;
+        Some(prob.max(1e-8).ln())
+    }
+}
+
+/// The bundle of independent specialist actors (pass / dribble / shot) over the shared actor
+/// feature representation. Trained on balanced per-skill batches with separate losses so each
+/// technical decision can be learned without one skill's gradients washing out another's.
+pub(crate) struct SoccerSkillPolicyHeads {
+    pass: SoccerSkillPolicyHead,
+    dribble: SoccerSkillPolicyHead,
+    shot: SoccerSkillPolicyHead,
+}
+
+impl SoccerSkillPolicyHeads {
+    fn new(seed: u32) -> Self {
+        SoccerSkillPolicyHeads {
+            pass: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Pass),
+            dribble: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Dribble),
+            shot: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Shot),
+        }
+    }
+
+    fn log_probs(&self, state_features: &[f64; SOCCER_POLICY_FEATURE_DIM]) -> SoccerSkillLogProbs {
+        SoccerSkillLogProbs {
+            pass: self.pass.action_distribution(state_features),
+            dribble: self.dribble.action_distribution(state_features),
+            shot: self.shot.action_distribution(state_features),
+        }
+    }
+
+    /// Bucket the actor's policy samples by skill group (with head-local action indices), balance
+    /// the bucket sizes to the smallest non-empty group, and train each specialist on its own loss.
+    fn train(&mut self, samples: &[SoccerPolicySample]) {
+        let mut pass = Vec::new();
+        let mut dribble = Vec::new();
+        let mut shot = Vec::new();
+        for sample in samples {
+            if let Some((group, local)) =
+                soccer_policy_skill_group_for_action_index(sample.action_index)
+            {
+                match group {
+                    SoccerSkillGroup::Pass => pass.push((sample, local)),
+                    SoccerSkillGroup::Dribble => dribble.push((sample, local)),
+                    SoccerSkillGroup::Shot => shot.push((sample, local)),
+                }
+            }
+        }
+        let balanced_n = [pass.len(), dribble.len(), shot.len()]
+            .into_iter()
+            .filter(|&count| count > 0)
+            .min()
+            .unwrap_or(0);
+        if balanced_n == 0 {
+            return;
+        }
+        self.pass.train(&pass, balanced_n);
+        self.dribble.train(&dribble, balanced_n);
+        self.shot.train(&shot, balanced_n);
+    }
+}
+
 /// A learned 1-step **world model** `P̂(s' | s, a)` over the value-head feature
 /// space: an MLP mapping the current `(state ⊕ action)` feature vector to the
 /// *next* state's feature vector. Model-free RL is purely reactive; a transition
@@ -44056,6 +44306,16 @@ fn dd_soccer_enable_assigned_position_embedding() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS=1` to train independent pass/dribble/shot specialist
+/// actors ([`SoccerSkillPolicyHeads`]) alongside the joint actor and let their log-probabilities
+/// refine technical action selection. Default off ⇒ the heads are never constructed/trained and
+/// add nothing to decisions (byte-identical baseline / A/B).
+fn dd_soccer_enable_skill_policy_heads() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS").is_ok())
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {

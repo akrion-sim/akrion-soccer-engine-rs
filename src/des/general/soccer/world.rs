@@ -198,6 +198,10 @@ pub struct SoccerMatch {
     /// from the critic (the value head). Present only when the run opts into
     /// actor-critic (`neural_blend.actor_critic` + neural learning enabled).
     pub(crate) policy_head: Option<SoccerPolicyHead>,
+    /// Independent pass/dribble/shot specialist actors over the shared actor features. Present
+    /// only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
+    /// log-probabilities refine technical action selection on top of the joint actor.
+    pub(crate) skill_policy_heads: Option<SoccerSkillPolicyHeads>,
     /// The learned **world model** `P̂(s'|s,a)` over the feature space, trained on
     /// consecutive transitions. Present only when `neural_blend.world_model` is on.
     pub(crate) world_model: Option<SoccerWorldModel>,
@@ -1596,6 +1600,7 @@ impl SoccerMatch {
             goal_celebration_kickoff_team: None,
             neural_blend: config.neural_blend,
             policy_head: None,
+            skill_policy_heads: None,
             world_model: None,
             human_inputs: SharedHumanInputs::new(),
             latched_human_inputs: HashMap::new(),
@@ -3423,15 +3428,28 @@ impl SoccerMatch {
         // Actor: π(family|s). Computed once from state features (null action), then
         // added as a log-probability bonus to each candidate's family. The action
         // dims are constant across candidates, so this is a pure function of state.
-        let policy_log_probs: Option<Vec<f64>> = if actor_active {
+        let (policy_log_probs, skill_log_probs): (
+            Option<Vec<f64>>,
+            Option<SoccerSkillLogProbs>,
+        ) = if actor_active {
             base.action = String::new();
             let state_features = self.policy_state_features(&base);
-            self.policy_head
+            let joint = self
+                .policy_head
                 .as_ref()
                 .and_then(|head| head.action_distribution(&state_features))
-                .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect())
+                .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect());
+            // Specialist skill log-probs (pass/dribble/shot) over the same shared features.
+            let skill = if dd_soccer_enable_skill_policy_heads() {
+                self.skill_policy_heads
+                    .as_ref()
+                    .map(|heads| heads.log_probs(&state_features))
+            } else {
+                None
+            };
+            (joint, skill)
         } else {
-            None
+            (None, None)
         };
 
         // Tactical look-ahead (AlphaZero/MuZero-style planning): when a run opts in via
@@ -3447,13 +3465,22 @@ impl SoccerMatch {
             0
         };
         let policy_bonus = |label: &str| -> f64 {
-            match &policy_log_probs {
-                Some(log_probs) => soccer_policy_action_index(label)
-                    .and_then(|index| log_probs.get(index))
+            let action_index = soccer_policy_action_index(label);
+            let mut bonus = match (&policy_log_probs, action_index) {
+                (Some(log_probs), Some(index)) => log_probs
+                    .get(index)
                     .map(|&log_p| SOCCER_POLICY_DECISION_WEIGHT * log_p)
                     .unwrap_or(0.0),
-                None => 0.0,
+                _ => 0.0,
+            };
+            // Specialist head refinement: add the pass/dribble/shot head's own log-prob for
+            // technical families, below the joint weight so it tunes rather than overrides.
+            if let (Some(skill), Some(index)) = (&skill_log_probs, action_index) {
+                if let Some(skill_log_p) = skill.log_prob_for_action_index(index) {
+                    bonus += SOCCER_SKILL_POLICY_DECISION_WEIGHT * skill_log_p;
+                }
             }
+            bonus
         };
         let retrieval_bonus = |label: &str| -> f64 {
             retrieval_priors
@@ -4522,6 +4549,12 @@ impl SoccerMatch {
         }
     }
 
+    fn ensure_skill_policy_heads(&mut self) {
+        if self.skill_policy_heads.is_none() {
+            self.skill_policy_heads = Some(SoccerSkillPolicyHeads::new(self.config.seed));
+        }
+    }
+
     fn ensure_world_model(&mut self) {
         if self.world_model.is_none() {
             self.world_model = Some(SoccerWorldModel::new(self.config.seed));
@@ -4730,6 +4763,14 @@ impl SoccerMatch {
                 };
                 for _ in 0..epochs {
                     policy_head.train(&policy_samples, mappo_clip_epsilon);
+                }
+            }
+            // Specialist pass/dribble/shot heads: trained on the same frozen batch but bucketed
+            // by skill with balanced sizes and separate (unclipped) losses. Gated, default off.
+            if dd_soccer_enable_skill_policy_heads() {
+                self.ensure_skill_policy_heads();
+                if let Some(skill_heads) = &mut self.skill_policy_heads {
+                    skill_heads.train(&policy_samples);
                 }
             }
         }

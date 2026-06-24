@@ -28922,6 +28922,70 @@ fn assigned_position_derivation_splits_roles_by_anchor() {
 }
 
 #[test]
+fn skill_group_partitions_technical_families() {
+    // Each technical family resolves to its group with a valid head-local index.
+    let pass_idx = soccer_policy_action_index("killer-pass").expect("killer-pass family");
+    let (group, local) =
+        soccer_policy_skill_group_for_action_index(pass_idx).expect("killer-pass is a skill");
+    assert_eq!(group, SoccerSkillGroup::Pass);
+    assert!(local < SOCCER_SKILL_PASS_FAMILIES.len());
+
+    let dribble_idx = soccer_policy_action_index("nutmeg").expect("nutmeg family");
+    assert_eq!(
+        soccer_policy_skill_group_for_action_index(dribble_idx).map(|(g, _)| g),
+        Some(SoccerSkillGroup::Dribble)
+    );
+    let shot_idx = soccer_policy_action_index("shoot").expect("shoot family");
+    assert_eq!(
+        soccer_policy_skill_group_for_action_index(shot_idx).map(|(g, _)| g),
+        Some(SoccerSkillGroup::Shot)
+    );
+    // Non-technical families (hold/tackle/press) are joint-actor only.
+    let tackle_idx = soccer_policy_action_index("tackle").expect("tackle family");
+    assert_eq!(soccer_policy_skill_group_for_action_index(tackle_idx), None);
+}
+
+#[test]
+fn skill_policy_heads_train_and_score_their_group() {
+    let mut heads = SoccerSkillPolicyHeads::new(7);
+    let state = soccer_policy_features_for_role(
+        &[0.1f64; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Forward,
+        None,
+    );
+    let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
+    // A batch with at least one sample per group so the balanced trainer fires every head.
+    let sample = |label: &str, advantage: f64| SoccerPolicySample {
+        state_features: state,
+        action_index: soccer_policy_action_index(label).expect("family"),
+        advantage,
+        old_action_probability: None,
+    };
+    let samples = vec![
+        sample("pass", 1.0),
+        sample("dribble", 1.0),
+        sample("shoot", 1.5),
+    ];
+    let before = heads.log_probs(&state);
+    let before_shoot = before
+        .log_prob_for_action_index(shoot_idx)
+        .expect("shot head distribution");
+    heads.train(&samples);
+    let after = heads.log_probs(&state);
+    let after_shoot = after
+        .log_prob_for_action_index(shoot_idx)
+        .expect("shot head distribution");
+    // A positive-advantage shot sample should raise that action's log-prob in the shot head.
+    assert!(
+        after_shoot > before_shoot,
+        "shot specialist should reinforce a rewarded shot: {before_shoot} -> {after_shoot}"
+    );
+    // The shot head only covers its two families, so a pass family has no shot-head entry.
+    let pass_idx = soccer_policy_action_index("pass").expect("pass family");
+    assert!(after.log_prob_for_action_index(pass_idx).is_some());
+}
+
+#[test]
 fn policy_head_fails_closed_on_malformed_actor_features() {
     let mut head = SoccerPolicyHead::new(11);
     let critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
