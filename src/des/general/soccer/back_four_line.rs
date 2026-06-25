@@ -304,6 +304,26 @@ pub struct LineDepthSample {
     pub reward: f64,
 }
 
+/// An open line-depth decision awaiting its windowed reward. Recorded at the
+/// decision tick with the team's territorial advantage then; resolved
+/// `LINE_DEPTH_REWARD_WINDOW_TICKS` later by differencing the territorial advantage
+/// into a [`LineDepthSample`]'s reward.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingLineDepthDecision {
+    pub team: Team,
+    pub inputs: BackFourLineInputs,
+    pub action_gap_fraction: f64,
+    pub decision_territorial: f64,
+    pub due_tick: u64,
+}
+
+/// How often (ticks) a line-depth RL decision is sampled while a line model is on.
+pub const LINE_DEPTH_SAMPLE_INTERVAL_TICKS: u64 = 15;
+/// Window (ticks) over which a sampled decision's territorial reward is measured.
+pub const LINE_DEPTH_REWARD_WINDOW_TICKS: u64 = 45;
+/// Cap on the rolling RL sample buffer (drained by the learner).
+pub const LINE_DEPTH_SAMPLE_CAP: usize = 4096;
+
 /// Learned regression head for the line-centre gap fraction: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, sigmoid) mirroring [`SoccerPassCompletionHead`]. The live
 /// net is not serde; like the other learned heads it round-trips through the
@@ -449,6 +469,67 @@ impl BackFourLineHead {
     pub fn last_loss(&self) -> Option<f64> {
         self.last_loss
     }
+}
+
+/// Outcome of training a line-depth head on a drained RL corpus, logged by the
+/// learning runner so an operator can see the corpus is loaded and learned from.
+/// Mirrors `SoccerPassCompletionTrainingReport`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineDepthTrainingReport {
+    /// Usable samples trained on.
+    pub samples: usize,
+    /// SGD steps actually applied across all epochs.
+    pub training_steps: usize,
+    /// Epochs run over the corpus.
+    pub epochs: usize,
+    /// Mean (weighted) loss of the final epoch.
+    pub final_loss: f64,
+}
+
+/// Load-and-train entry for a line-depth head: given a drained RL corpus (in
+/// practice the cluster learner's `drain_line_depth_samples`, later resumed from
+/// Postgres), build a fresh [`BackFourLineHead`] and run `epochs`
+/// reward-weighted-regression passes. `None` if no usable samples (so the runner
+/// skips cleanly rather than persist an untrained net). Mirrors
+/// `train_soccer_pass_completion_head`.
+pub fn train_line_depth_head(
+    samples: &[LineDepthSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<(BackFourLineHead, LineDepthTrainingReport)> {
+    let usable = samples
+        .iter()
+        .filter(|s| s.reward.is_finite() && s.action_gap_fraction.is_finite())
+        .count();
+    if usable == 0 || epochs == 0 {
+        return None;
+    }
+    let mut head = BackFourLineHead::new(seed);
+    let mut final_loss = 0.0;
+    for _ in 0..epochs {
+        final_loss = head.train_reward_weighted(samples, learning_rate);
+    }
+    let report = LineDepthTrainingReport {
+        samples: usable,
+        training_steps: head.training_steps(),
+        epochs,
+        final_loss,
+    };
+    Some((head, report))
+}
+
+/// Public wrapper returning ONLY the report (the head type is engine-internal). The
+/// learning runner uses this to train the drained line-depth corpus and log that it
+/// learns. Mirrors `report_soccer_pass_completion_training`.
+pub fn report_line_depth_training(
+    samples: &[LineDepthSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<LineDepthTrainingReport> {
+    train_line_depth_head(samples, seed, epochs, learning_rate).map(|(_, report)| report)
 }
 
 impl WorldSnapshot {
@@ -629,6 +710,73 @@ impl WorldSnapshot {
         let inputs = self.build_line_depth_inputs(me.team, PlayerRole::Midfielder)?;
         let frac = analytic_midfield_gap_fraction(&inputs);
         frac.is_finite().then(|| frac.clamp(0.0, 1.0))
+    }
+}
+
+impl SoccerMatch {
+    /// Gated per-tick RL sample collection for the line-depth heads (Gap 5), driven
+    /// off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
+    /// byte-identical) unless a line-depth model is enabled, so the default learner
+    /// is unaffected. When on: resolves decisions whose reward window has elapsed
+    /// (reward = the defending team's territorial-advantage change over the window —
+    /// higher means the chosen line depth kept the opponent out), and samples a fresh
+    /// back-four decision every [`LINE_DEPTH_SAMPLE_INTERVAL_TICKS`]. Drained by the
+    /// learner via [`Self::drain_line_depth_samples`].
+    pub(crate) fn collect_line_depth_rl_samples(&mut self, snapshot: &WorldSnapshot) {
+        if !back_four_line_model_enabled() && !midfield_line_model_enabled() {
+            return;
+        }
+        let tick = self.tick;
+        // Resolve decisions whose reward window has elapsed.
+        let mut i = 0;
+        while i < self.pending_line_depth.len() {
+            if self.pending_line_depth[i].due_tick <= tick {
+                let decision = self.pending_line_depth.swap_remove(i);
+                let now_territorial = territorial_advantage(snapshot, decision.team);
+                if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    self.line_depth_samples.push(LineDepthSample {
+                        inputs: decision.inputs,
+                        action_gap_fraction: decision.action_gap_fraction,
+                        reward: now_territorial - decision.decision_territorial,
+                    });
+                    if self.line_depth_samples.len() > LINE_DEPTH_SAMPLE_CAP {
+                        let overflow = self.line_depth_samples.len() - LINE_DEPTH_SAMPLE_CAP;
+                        self.line_depth_samples.drain(0..overflow);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // Sample a fresh decision on cadence. The back four is the offside-setting
+        // line and the primary line-depth decision; its features also describe the
+        // state the midfield model reads, so one sample per team suffices for now.
+        if tick % LINE_DEPTH_SAMPLE_INTERVAL_TICKS == 0 {
+            for team in [Team::Home, Team::Away] {
+                let Some(inputs) = snapshot.build_line_depth_inputs(team, PlayerRole::Defender)
+                else {
+                    continue;
+                };
+                let action = analytic_line_centre_gap_fraction(&inputs);
+                let territorial = territorial_advantage(snapshot, team);
+                if action.is_finite() && territorial.is_finite() {
+                    self.pending_line_depth.push(PendingLineDepthDecision {
+                        team,
+                        inputs,
+                        action_gap_fraction: action,
+                        decision_territorial: territorial,
+                        due_tick: tick + LINE_DEPTH_REWARD_WINDOW_TICKS,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain the collected line-depth RL samples for the cluster learner (train the
+    /// head + persist), mirroring [`Self::drain_pass_outcome_samples`]. `pub` so the
+    /// learner binary (a separate crate) can drain it.
+    pub fn drain_line_depth_samples(&mut self) -> Vec<LineDepthSample> {
+        std::mem::take(&mut self.line_depth_samples)
     }
 }
 
@@ -814,6 +962,23 @@ mod back_four_line_tests {
             after > before && after > 0.5,
             "RWR should move the head toward the high-reward deep action: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn train_line_depth_head_entry_skips_empty_and_trains_valid() {
+        assert!(train_line_depth_head(&[], 1, 4, 0.02).is_none());
+        let samples: Vec<LineDepthSample> = (0..16)
+            .map(|i| LineDepthSample {
+                inputs: baseline_inputs(),
+                action_gap_fraction: if i % 2 == 0 { 0.8 } else { 0.2 },
+                reward: if i % 2 == 0 { 1.0 } else { -1.0 },
+            })
+            .collect();
+        let (_, report) =
+            train_line_depth_head(&samples, 1, 4, 0.02).expect("trains a usable corpus");
+        assert_eq!(report.samples, 16);
+        assert_eq!(report.epochs, 4);
+        assert!(report.training_steps > 0 && report.final_loss.is_finite());
     }
 
     #[test]
