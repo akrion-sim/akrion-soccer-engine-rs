@@ -30007,14 +30007,14 @@ pub struct SoccerPassOutcomeSample {
 /// the learned replacement for the analytic completion estimate and the hand-scored MPC pass
 /// weights — trained on [`SoccerPassOutcomeSample`]s, conditioned on the 22+ball config.
 #[derive(Clone, Debug)]
-pub(crate) struct SoccerPassCompletionHead {
+pub struct SoccerPassCompletionHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
 }
 
 impl SoccerPassCompletionHead {
-    pub(crate) fn new(seed: u32) -> Self {
+    pub fn new(seed: u32) -> Self {
         let mut rng = mulberry32(seed ^ 0x5F37_2C1B);
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
@@ -30049,7 +30049,7 @@ impl SoccerPassCompletionHead {
 
     /// One SGD epoch over `samples` (binary cross-entropy via the clipped MSE step on a sigmoid
     /// output is adequate here). Returns the mean step loss.
-    pub(crate) fn train(&mut self, samples: &[SoccerPassOutcomeSample], learning_rate: f64) -> f64 {
+    pub fn train(&mut self, samples: &[SoccerPassOutcomeSample], learning_rate: f64) -> f64 {
         let mut total = 0.0;
         let mut applied = 0usize;
         for sample in samples {
@@ -30074,7 +30074,7 @@ impl SoccerPassCompletionHead {
         mean
     }
 
-    pub(crate) fn training_steps(&self) -> usize {
+    pub fn training_steps(&self) -> usize {
         self.training_steps
     }
 
@@ -30096,6 +30096,51 @@ impl SoccerPassCompletionHead {
         } else {
             correct as f64 / scored as f64
         }
+    }
+}
+
+/// Minimum SGD steps a [`SoccerPassCompletionHead`] must have taken before the live pass-quality
+/// assessor will blend its prediction into `expected_completion`. Below this the head is still
+/// noisy, so the analytic estimate stands alone (mirrors [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`]).
+pub const PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS: usize = 200;
+
+/// Weight given to the learned head's P(complete) when blended with the analytic completion
+/// estimate (the rest stays analytic). Conservative: the head nudges, it does not replace.
+const PASS_COMPLETION_HEAD_BLEND_WEIGHT: f64 = 0.5;
+
+/// Env flag enabling live consumption of the learned pass-completion head in
+/// `pass_target_quality_for_snapshot`. Off ⇒ the analytic completion estimate stands alone
+/// (byte-identical to the pre-wiring behaviour). Read once per process.
+pub fn learned_pass_completion_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"))
+    }
+}
+
+fn soccer_env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let v = raw.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+impl SoccerMatch {
+    /// Install the trained pass-completion head for live consumption. The learner carries +
+    /// trains it across games (seeded from the Postgres corpus) and re-installs it each game;
+    /// wrapped in `Arc` so every per-tick snapshot shares it cheaply. Consumed in
+    /// `pass_target_quality_for_snapshot` once it clears
+    /// [`PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS`] and the gate is on.
+    pub fn set_pass_completion_head(&mut self, head: SoccerPassCompletionHead) {
+        self.pass_completion_head = Some(std::sync::Arc::new(head));
     }
 }
 
@@ -30123,7 +30168,7 @@ pub struct SoccerPassCompletionTrainingReport {
 /// [`SoccerPassCompletionHead`] and run `epochs` SGD passes over it. Returns the trained head
 /// plus a [`SoccerPassCompletionTrainingReport`], or `None` if no usable samples were supplied
 /// (so the runner can skip cleanly rather than persist an untrained net).
-pub(crate) fn train_soccer_pass_completion_head(
+pub fn train_soccer_pass_completion_head(
     samples: &[SoccerPassOutcomeSample],
     seed: u32,
     epochs: usize,
@@ -44095,6 +44140,7 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        pass_completion_head: None,
         loose_ball_commit_head: None,
         loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
@@ -49193,13 +49239,43 @@ fn pass_target_quality_for_snapshot_inner(
     };
     let pass_precision = 0.80 + pass_skill * 0.20;
     let mpc_receipt_gate = 0.68 + mpc_receipt.probability * 0.32;
-    let expected_completion =
+    let mut expected_completion =
         target_quality
             * lane_clearance
             * pass_precision
             * pressure_adjustment
             * mpc_receipt_gate
             * tight_mark_completion_gate;
+    // Learned pass-completion head (#4): blend the trained P(complete) into the analytic
+    // estimate when the gate is on and the carried head has trained enough. The head is
+    // conditioned on the 22+ball config along this pass's lane, so it captures completion
+    // signal the multiplicative analytic proxy misses. Off / untrained ⇒ analytic stands
+    // alone (parity). Same feature builder as the training-capture site, with passer
+    // pressure derived from the nearest opponent (the snapshot analogue of the POMDP
+    // `perceived_pressure` used at launch).
+    if learned_pass_completion_enabled() {
+        if let Some(head) = snapshot.pass_completion_head.as_ref() {
+            if head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS {
+                let passer_pressure = pressure_from_nearest_distance(
+                    snapshot.nearest_opponent_distance_at(passer.team, passer_position),
+                );
+                let features = snapshot.pass_completion_learn_features(
+                    passer.team,
+                    passer_position,
+                    anticipated_target,
+                    distance,
+                    passer_pressure,
+                    receiver_openness,
+                    flight,
+                );
+                if let Some(learned) = head.predict(&features) {
+                    expected_completion = expected_completion
+                        * (1.0 - PASS_COMPLETION_HEAD_BLEND_WEIGHT)
+                        + learned.clamp(0.0, 1.0) * PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+                }
+            }
+        }
+    }
     PassTargetQuality {
         receiver_openness,
         stride_fit,

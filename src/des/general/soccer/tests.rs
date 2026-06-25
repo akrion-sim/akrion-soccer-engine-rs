@@ -75025,6 +75025,33 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
 }
 
 #[test]
+fn pass_completion_head_installs_on_match_and_propagates_to_snapshot() {
+    // #4 wiring: the learner installs the carried pass-completion head on the match via
+    // `set_pass_completion_head`, and every per-tick `WorldSnapshot` shares it (Arc clone) so
+    // `pass_target_quality_for_snapshot` can consume it live. Default = none (parity).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 7,
+        ..MatchConfig::default()
+    });
+    // Consumption is opt-in: the gate must default OFF so the wiring is byte-identical until
+    // an operator flips DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION.
+    assert!(
+        !learned_pass_completion_enabled(),
+        "learned pass-completion consumption must be off by default (parity)"
+    );
+    // No head installed ⇒ the snapshot carries none (analytic estimate stands alone).
+    let before = WorldSnapshot::from_match(&sim);
+    assert!(before.pass_completion_head.is_none());
+    // Install a trained head; the snapshot must now share it.
+    sim.set_pass_completion_head(SoccerPassCompletionHead::new(3));
+    let after = WorldSnapshot::from_match(&sim);
+    assert!(
+        after.pass_completion_head.is_some(),
+        "installed head must propagate into the per-tick snapshot"
+    );
+}
+
+#[test]
 fn pass_outcome_samples_are_captured_during_play() {
     // Phase 1 (the learning substrate): resolved passes must emit labelled training samples whose
     // features are the 22+ball config embedding + pass features captured at launch.
