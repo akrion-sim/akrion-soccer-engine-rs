@@ -3505,6 +3505,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 episode_summaries.len(),
                 manifest_games.len()
             );
+            eprintln!(
+                "soccer_learning_signal_capture episode={} pass_outcome_samples={} defender_line_depth_rows={} midfield_line_depth_rows={} back_four_gate={} midfield_gate={} pitch_value_gate={}",
+                game.episode_summary.episode,
+                game.pass_outcome_samples.len(),
+                game.artifact
+                    .tactical_summary
+                    .defender_line_depth_training_rows,
+                game.artifact
+                    .tactical_summary
+                    .midfield_line_depth_training_rows,
+                env_value("DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL").unwrap_or_else(|| "0".to_string()),
+                env_value("DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL").unwrap_or_else(|| "0".to_string()),
+                env_value("DD_SOCCER_ENABLE_PITCH_VALUE_REWARD").unwrap_or_else(|| "0".to_string())
+            );
             if let Some(episode_log) = episode_log.as_mut() {
                 if episode_log_flush_interval_games > 0
                     && episode_summaries.len() % episode_log_flush_interval_games == 0

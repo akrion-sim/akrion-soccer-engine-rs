@@ -6520,6 +6520,10 @@ pub struct SoccerTacticalLearningSummary {
     #[serde(default)]
     pub mean_role_line_cohesion_delta: f64,
     #[serde(default)]
+    pub defender_line_depth_training_rows: usize,
+    #[serde(default)]
+    pub midfield_line_depth_training_rows: usize,
+    #[serde(default)]
     pub mean_positional_shape_exception_relief: f64,
     #[serde(default)]
     pub mean_positional_shape_reward: f64,
@@ -6754,6 +6758,12 @@ impl SoccerTacticalLearningSummary {
             other.mean_role_line_cohesion_delta,
             other.shape_transitions,
         );
+        self.defender_line_depth_training_rows = self
+            .defender_line_depth_training_rows
+            .saturating_add(other.defender_line_depth_training_rows);
+        self.midfield_line_depth_training_rows = self
+            .midfield_line_depth_training_rows
+            .saturating_add(other.midfield_line_depth_training_rows);
         self.mean_positional_shape_exception_relief = weighted_mean(
             self.mean_positional_shape_exception_relief,
             shape_count,
@@ -6842,6 +6852,7 @@ impl SoccerTacticalLearningSummary {
         if trace.attack_shape {
             self.shape_transitions = self.shape_transitions.saturating_add(1);
             self.attack_transitions = self.attack_transitions.saturating_add(1);
+            self.record_line_depth_training_row(transition);
             record_running_mean(
                 &mut self.mean_attack_team_width_yards,
                 self.attack_transitions,
@@ -6882,6 +6893,7 @@ impl SoccerTacticalLearningSummary {
         } else if trace.defense_shape {
             self.shape_transitions = self.shape_transitions.saturating_add(1);
             self.defense_transitions = self.defense_transitions.saturating_add(1);
+            self.record_line_depth_training_row(transition);
             record_running_mean(
                 &mut self.mean_defense_team_width_yards,
                 self.defense_transitions,
@@ -6961,6 +6973,28 @@ impl SoccerTacticalLearningSummary {
 
         if self.shape_transitions > 0 {
             self.mean_tactical_reward = self.total_tactical_reward / self.shape_transitions as f64;
+        }
+    }
+
+    fn record_line_depth_training_row(&mut self, transition: &SoccerLearningTransition) {
+        let trace = &transition.tactical_trace;
+        let usable = trace.before_role_line_deviation_yards.is_finite()
+            && trace.after_role_line_deviation_yards.is_finite()
+            && trace.before_role_line_cohesion_score.is_finite()
+            && trace.after_role_line_cohesion_score.is_finite();
+        if !usable {
+            return;
+        }
+        match transition.role {
+            PlayerRole::Defender => {
+                self.defender_line_depth_training_rows =
+                    self.defender_line_depth_training_rows.saturating_add(1);
+            }
+            PlayerRole::Midfielder => {
+                self.midfield_line_depth_training_rows =
+                    self.midfield_line_depth_training_rows.saturating_add(1);
+            }
+            PlayerRole::Goalkeeper | PlayerRole::Forward => {}
         }
     }
 

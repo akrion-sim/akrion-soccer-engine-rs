@@ -2142,6 +2142,9 @@ impl SoccerLearningPgStore {
         }
         self.ensure_connected()?;
         let has_config_moments = runs.iter().any(|run| !run.game.config_moments.is_empty());
+        let has_pass_outcome_samples = runs
+            .iter()
+            .any(|run| !run.game.pass_outcome_samples.is_empty());
         if has_config_moments {
             for run in runs {
                 validate_config_moments(&run.game.config_moments)?;
@@ -2154,6 +2157,9 @@ impl SoccerLearningPgStore {
             .map_err(|err| format!("begin soccer run batch transaction: {err}"))?;
         if has_config_moments {
             ensure_soccer_config_moment_tables(&mut tx)?;
+        }
+        if has_pass_outcome_samples {
+            ensure_soccer_pass_outcome_tables(&mut tx)?;
         }
         let mut run_ids = Vec::with_capacity(runs.len());
         for chunk in runs.chunks(SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE) {
@@ -2172,6 +2178,18 @@ impl SoccerLearningPgStore {
                             Some(run_id.as_str()),
                             Some(experiment_id),
                             &run.game.config_moments,
+                        )?;
+                    }
+                }
+            }
+            if has_pass_outcome_samples {
+                for (run_id, run) in chunk_run_ids.iter().zip(chunk.iter()) {
+                    if !run.game.pass_outcome_samples.is_empty() {
+                        insert_pass_outcome_samples_in_transaction(
+                            &mut tx,
+                            Some(run_id.as_str()),
+                            Some(experiment_id),
+                            &run.game.pass_outcome_samples,
                         )?;
                     }
                 }
@@ -5894,6 +5912,10 @@ mod tests {
         assert!(
             SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE * SOCCER_POLICY_TARGET_ENTRY_PARAMETER_COUNT
                 <= POSTGRES_MAX_QUERY_PARAMETERS
+        );
+        assert!(
+            2 + PASS_OUTCOME_INSERT_CHUNK_ROWS * 3 <= POSTGRES_MAX_QUERY_PARAMETERS,
+            "pass-outcome sidecar inserts share run_id/experiment_id and add 3 params per sample"
         );
     }
 

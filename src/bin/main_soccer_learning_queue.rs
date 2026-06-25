@@ -2233,6 +2233,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                     merged_policies,
                 } => {
                     queue_completed_games_seen = queue_completed_games_seen.saturating_add(1);
+                    println!(
+                        "soccer_learning_queue_signal_capture episode={} completed_games={} pass_outcome_samples={} defender_line_depth_rows={} midfield_line_depth_rows={} back_four_gate={} midfield_gate={} pitch_value_gate={}",
+                        game.episode,
+                        queue_completed_games_seen,
+                        game.pass_outcome_samples.len(),
+                        game.tactical_summary.defender_line_depth_training_rows,
+                        game.tactical_summary.midfield_line_depth_training_rows,
+                        env_value("DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL")
+                            .unwrap_or_else(|| "0".to_string()),
+                        env_value("DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL")
+                            .unwrap_or_else(|| "0".to_string()),
+                        env_value("DD_SOCCER_ENABLE_PITCH_VALUE_REWARD")
+                            .unwrap_or_else(|| "0".to_string())
+                    );
                     let game_fitness = game.score.match_fitness;
                     let game_tactical_weights = game.starting_tactical_learning.clone();
                     tactical_evolution_samples.push_back(TacticalEvolutionSample {

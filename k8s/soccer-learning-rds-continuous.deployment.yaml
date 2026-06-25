@@ -47,13 +47,33 @@ spec:
               export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
               run_prefix="${SOCCER_RUN_ID_PREFIX:-codex-soccer-learning-continuous}"
-              source_repo="${SOCCER_SOURCE_REPO:-https://github.com/ORESoftware/discrete-event-system.rs.git}"
-              source_ref="${SOCCER_SOURCE_REF:-main}"
-              work_base="/tmp/${run_prefix}-src"
-              work="${work_base}"
+              source_repo="${SOCCER_SOURCE_REPO:-https://github.com/ORESoftware/soccer-sim-game-engine.rs.git}"
+              engine_repo="${SOCCER_ENGINE_SOURCE_REPO:-https://github.com/ORESoftware/discrete-event-system.rs.git}"
+              source_ref="${SOCCER_SOURCE_REF:-learning}"
+              engine_ref="${SOCCER_ENGINE_SOURCE_REF:-main}"
+              base="/tmp/${run_prefix}-src"
+              if [ -d "${base}/.git" ]; then
+                base="${base}-$(date -u +%Y%m%dT%H%M%SZ)"
+              fi
+              soccer="${base}/soccer-sim-game-engine.rs"
+              engine="${base}/discrete-event-system.rs"
               target="/tmp/${run_prefix}-target"
               ready_file="/tmp/${run_prefix}-ready-${HOSTNAME:-pod}"
               export CARGO_TARGET_DIR="${target}"
+
+              sync_ref() {
+                repo="$1"; ref="$2"; dir="$3"
+                if [ -d "${dir}/.git" ]; then
+                  echo "source_checkout_mode=fetch dir=${dir} ref=${ref}"
+                  git -C "${dir}" fetch --depth 1 origin "${ref}"
+                  git -C "${dir}" switch --detach FETCH_HEAD
+                else
+                  echo "source_checkout_mode=clone dir=${dir} ref=${ref}"
+                  git clone --depth 1 --filter=blob:none --no-checkout "${repo}" "${dir}"
+                  git -C "${dir}" fetch --depth 1 origin "${ref}"
+                  git -C "${dir}" switch --detach FETCH_HEAD
+                fi
+              }
 
               require_value() {
                 name="$1"
@@ -89,23 +109,17 @@ spec:
               echo "flush_before_new_sim=${SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM}"
               echo "refresh_with_resume=${SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT}"
               echo "source_ref=${source_ref}"
+              echo "engine_ref=${engine_ref}"
 
-              if [ -d "${work}/.git" ]; then
-                echo "source_checkout_mode=fetch work=${work}"
-                git -C "${work}" fetch --depth 1 origin "${source_ref}"
-                git -C "${work}" checkout --force FETCH_HEAD
-              else
-                if [ -e "${work}" ]; then
-                  work="${work_base}-$(date -u +%Y%m%dT%H%M%SZ)"
-                  echo "source_checkout_mode=clone-after-existing-path work=${work}"
-                else
-                  echo "source_checkout_mode=clone work=${work}"
-                fi
-                git clone --depth 1 --branch "${source_ref}" "${source_repo}" "${work}"
-              fi
-              cd "${work}"
+              mkdir -p "${base}"
+              sync_ref "${engine_repo}" "${engine_ref}" "${engine}"
+              sync_ref "${source_repo}" "${source_ref}" "${soccer}"
+
+              cd "${soccer}"
               actual_commit="$(git rev-parse HEAD)"
+              engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
+              echo "engine_commit_actual=${engine_commit}"
               export SOCCER_SOURCE_COMMIT="${actual_commit}"
 
               /usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_learning_run
@@ -144,8 +158,12 @@ spec:
             - name: RUST_BACKTRACE
               value: "1"
             - name: SOCCER_SOURCE_REPO
-              value: https://github.com/ORESoftware/discrete-event-system.rs.git
+              value: https://github.com/ORESoftware/soccer-sim-game-engine.rs.git
             - name: SOCCER_SOURCE_REF
+              value: learning
+            - name: SOCCER_ENGINE_SOURCE_REPO
+              value: https://github.com/ORESoftware/discrete-event-system.rs.git
+            - name: SOCCER_ENGINE_SOURCE_REF
               value: main
             - name: SOCCER_DATABASE_URL
               valueFrom:
@@ -272,6 +290,18 @@ spec:
               value: /dev/null
             - name: SOCCER_LEARNED_PARAMS_PATH
               value: /dev/null
+            - name: DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL
+              value: "true"
+            - name: DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL
+              value: "true"
+            - name: DD_SOCCER_ENABLE_PITCH_VALUE_REWARD
+              value: "true"
+            - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
+              value: "50000"
+            - name: SOCCER_PG_PASS_COMPLETION_EPOCHS
+              value: "8"
+            - name: SOCCER_PG_PASS_COMPLETION_LR
+              value: "0.05"
           # Memory limit MUST stay below the node RAM (~123Gi) so a leaking learner
           # OOM-kills the POD (it restarts + resumes from Postgres) instead of OOMing
           # the whole NODE (which wedges it: load 240, API server down). The learner
