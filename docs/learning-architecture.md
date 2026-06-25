@@ -153,8 +153,11 @@ flowchart LR
 - **Dashed = dormant / gated (capacity built, not yet learning):**
   - **Pass-completion head** — trained on the corpus but **not consumed live**
     (the analytic estimate still drives passes).
-  - **Line-depth heads** (back four + midfield) — merged but **gated off** and with
-    **no training corpus wired yet** (this is the "Gap 5" work that turns them on).
+  - **Line-depth head** (back four) — now wired **end-to-end** (collect RL samples →
+    territorial reward → reward-weighted train → live consumption once trained), but
+    **gated off** (`DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL`) and carried **in-memory**
+    in the learner (resets on pod restart; cross-restart Postgres persistence is the
+    remaining durability step). The midfield line keeps the analytic seed.
   - **Pitch-control × xT reward** — implemented, **gated off** by default.
   - **PUCT re-ranker** — present, off by default.
 - **Not learning:** Hetzner runs tournaments + serving but **no neural learner**;
