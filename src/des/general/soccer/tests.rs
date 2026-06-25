@@ -44441,6 +44441,7 @@ fn formation_stagger_layers_and_spreads_the_shape() {
             120.0,
             DEFAULT_DT_SECONDS,
             Vec2::new(40.0, 50.0),
+            None,
         );
     }
     let mean = |role: PlayerRole| {
@@ -44511,7 +44512,7 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 58.0)),
     ];
     let before: Vec<Vec2> = slots.iter().map(|s| s.anchor).collect();
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     for (slot, was) in slots.iter().zip(before) {
         assert!(
             (slot.anchor - was).len() < 1e-9,
@@ -44554,7 +44555,7 @@ fn back_four_holds_lateral_band_and_order() {
         def(70.0, 70.0),
     ];
     for _ in 0..500 {
-        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     }
     let xs: Vec<f64> = slots.iter().map(|s| s.anchor.x).collect();
     for w in 1..xs.len() {
@@ -44607,7 +44608,7 @@ fn formation_stagger_pulls_overstretched_layers_back_toward_band() {
     let mid_before = mean(&slots, PlayerRole::Midfielder);
     let fwd_before = mean(&slots, PlayerRole::Forward);
 
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
 
     let mid_after = mean(&slots, PlayerRole::Midfielder);
     let fwd_after = mean(&slots, PlayerRole::Forward);

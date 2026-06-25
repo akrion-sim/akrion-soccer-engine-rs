@@ -4220,6 +4220,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
             length,
             dt,
             snapshot.ball.position,
+            snapshot.team_attack_spacing_target_min(team),
         );
     }
     slots
@@ -4239,6 +4240,11 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     length: f64,
     dt_seconds: f64,
     ball: Vec2,
+    // Learnable attacking-spacing floor (yards): when `Some`, the in-possession
+    // attacking lines (midfield + forwards) spread to at least this learned, context-
+    // dependent gap on a fixed ~2s grace horizon, instead of the fixed
+    // `MIDLINE_LATERAL_MIN_YARDS`. `None` ⇒ the existing fixed floors (byte-identical).
+    attack_spacing_min: Option<f64>,
 ) {
     let attack_dir = team.attack_dir();
     let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(0.0);
@@ -4345,13 +4351,40 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         BACKLINE_LATERAL_MAX_YARDS,
         lateral_correction(grace_for(slots, PlayerRole::Defender)),
     );
+    // Attacking lines (midfield + forwards). When the learnable attacking-spacing model
+    // is on and the team is in possession, spread these lines to at least the learned,
+    // context-dependent floor on a fixed ~2s grace (the user's "5-8yd, ~2s grace");
+    // otherwise keep the fixed `MIDLINE_LATERAL_MIN_YARDS` floor on the ball-proximity
+    // grace, and leave the forward line untouched (byte-identical). The back four is
+    // deliberately excluded — its width is structural, not an attacking spacing choice.
+    let (mid_min, attack_grace, spread_forwards) = match attack_spacing_min {
+        Some(min) => (
+            min.max(MIDLINE_LATERAL_MIN_YARDS * 0.5),
+            ATTACK_SPACING_REGROUP_GRACE_SECONDS,
+            true,
+        ),
+        None => (
+            MIDLINE_LATERAL_MIN_YARDS,
+            grace_for(slots, PlayerRole::Midfielder),
+            false,
+        ),
+    };
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Midfielder,
-        MIDLINE_LATERAL_MIN_YARDS,
+        mid_min,
         f64::INFINITY,
-        lateral_correction(grace_for(slots, PlayerRole::Midfielder)),
+        lateral_correction(attack_grace),
     );
+    if spread_forwards {
+        soccer_formation_lp_spread_line_x(
+            slots,
+            PlayerRole::Forward,
+            mid_min,
+            f64::INFINITY,
+            lateral_correction(attack_grace),
+        );
+    }
 
     for s in slots.iter_mut().filter(|s| s.active) {
         s.anchor = s.anchor.clamp_to_pitch(width, length);

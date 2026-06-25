@@ -78,6 +78,9 @@ pub const ATTACK_SPACING_ABS_MAX_YARDS: f64 = 11.0;
 /// before the spacing correction is at full strength — the user's "~2 second grace".
 /// Consumed by the formation-LP lateral-spread horizon when the model is on.
 pub const ATTACK_SPACING_REGROUP_GRACE_SECONDS: f64 = 2.0;
+/// Radius (yards) within which teammates count toward the local-crowding density
+/// feature ("are players occupying the same space"). Matches the support band scale.
+pub const ATTACK_SPACING_LOCAL_DENSITY_RADIUS_YARDS: f64 = 12.0;
 
 /// How often (ticks) an attacking-spacing decision is sampled for RL while the model is on.
 pub const ATTACK_SPACING_SAMPLE_INTERVAL_TICKS: u64 = 15;
@@ -441,6 +444,83 @@ pub fn train_attack_spacing_head(
         final_loss,
     };
     Some((head, report))
+}
+
+/// Train a fresh attacking-spacing head over a drained RL corpus and emit a log-ready
+/// report, mirroring `report_line_depth_training`. Returns the report (default/zeroed
+/// when the corpus is empty/unusable) so the learner binary can log a line unconditionally.
+pub fn report_attack_spacing_training(
+    samples: &[AttackSpacingSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> AttackSpacingTrainingReport {
+    train_attack_spacing_head(samples, seed, epochs, learning_rate)
+        .map(|(_, report)| report)
+        .unwrap_or_default()
+}
+
+impl SoccerMatch {
+    /// Gated per-tick RL sample collection for the learnable attacking-spacing target,
+    /// driven off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
+    /// byte-identical) unless the spacing model is enabled, so the default learner is
+    /// unaffected. When on: resolves decisions whose reward window has elapsed (reward =
+    /// the attacking team's territorial-advantage change over the window — higher means
+    /// the spacing held improved our control of valuable space) and samples a fresh
+    /// decision for the team in possession every
+    /// [`ATTACK_SPACING_SAMPLE_INTERVAL_TICKS`]. Drained by the learner via
+    /// [`Self::drain_attack_spacing_samples`].
+    pub(crate) fn collect_attack_spacing_rl_samples(&mut self, snapshot: &WorldSnapshot) {
+        if !attack_spacing_model_enabled() {
+            return;
+        }
+        let tick = self.tick;
+        // Resolve decisions whose reward window has elapsed.
+        let mut i = 0;
+        while i < self.pending_attack_spacing.len() {
+            if self.pending_attack_spacing[i].due_tick <= tick {
+                let decision = self.pending_attack_spacing.swap_remove(i);
+                let now_territorial = territorial_advantage(snapshot, decision.team);
+                if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    self.attack_spacing_samples.push(AttackSpacingSample {
+                        context: decision.context,
+                        held_spacing_yards: decision.held_spacing_yards,
+                        reward: now_territorial - decision.decision_territorial,
+                    });
+                    if self.attack_spacing_samples.len() > ATTACK_SPACING_SAMPLE_CAP {
+                        let overflow =
+                            self.attack_spacing_samples.len() - ATTACK_SPACING_SAMPLE_CAP;
+                        self.attack_spacing_samples.drain(0..overflow);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // Sample a fresh decision for the team in possession — spacing is an attacking choice.
+        if tick % ATTACK_SPACING_SAMPLE_INTERVAL_TICKS == 0 {
+            if let Some(team) = snapshot.possession_team() {
+                if let Some((context, held)) = snapshot.attack_spacing_team_context(team) {
+                    let territorial = territorial_advantage(snapshot, team);
+                    if held.is_finite() && territorial.is_finite() {
+                        self.pending_attack_spacing.push(PendingAttackSpacingDecision {
+                            team,
+                            context,
+                            held_spacing_yards: held,
+                            decision_territorial: territorial,
+                            due_tick: tick + ATTACK_SPACING_REWARD_WINDOW_TICKS,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain the collected attacking-spacing RL samples for the cluster learner (train
+    /// the head + persist). `pub` so the learner binary (a separate crate) can drain it.
+    pub fn drain_attack_spacing_samples(&mut self) -> Vec<AttackSpacingSample> {
+        std::mem::take(&mut self.attack_spacing_samples)
+    }
 }
 
 #[cfg(test)]
