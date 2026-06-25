@@ -17290,6 +17290,37 @@ const RUNAROUND_KNOCK_MAX_SPEED_YPS: f64 = 14.0;
 /// reach (~2.3yd) that it isn't re-grabbed the same tick, so it actually travels past the defender.
 const RUNAROUND_KNOCK_NUDGE_YARDS: f64 = 2.7;
 
+// "Outside mid attack defender" take-on tunables (see `is_outside_mid_attack_strategy`). When a
+// wide midfielder/winger carries at a full-back who is ISOLATED — no covering team-mate of the
+// defender within `OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS` — back them to take the man on much more
+// readily: lift the run-around appetite (quality), and relax the static-start preconditions so a
+// wide man who has just received can still attack the isolated defender. This is the learnable
+// MDP/POMDP appetite the user asked for (reward = beating the isolated man → flank penetration /
+// xT into the cross zone); the run-around itself is the existing per-player MPC trajectory, and the
+// "no cover within 10yd" is the interception-feasibility (IP) budget that makes the take-on "on".
+/// A defender counts as ISOLATED for the take-on when no OTHER opponent is within this radius of
+/// them — i.e. there is no second defender behind/beside the immediate man to cover the beat.
+const OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS: f64 = 10.0;
+/// Default learnable uplift added to the run-around quality when a wide man faces an isolated
+/// defender (scaled by how isolated the man is and the carrier's pace edge). Operator/learner
+/// override via `DD_SOCCER_OMAD_TAKE_ON_UPLIFT`.
+const OUTSIDE_MID_TAKE_ON_UPLIFT_DEFAULT: f64 = 0.40;
+
+/// Learnable weight on the isolated-defender take-on appetite uplift (see
+/// [`OUTSIDE_MID_TAKE_ON_UPLIFT_DEFAULT`]).
+pub(crate) fn outside_mid_take_on_uplift() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OMAD_TAKE_ON_UPLIFT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|w| w.is_finite() && *w >= 0.0)
+            .map(|w| w.clamp(0.0, 1.0))
+            .unwrap_or(OUTSIDE_MID_TAKE_ON_UPLIFT_DEFAULT)
+    })
+}
+
 /// Quality + geometry of a viable run-around dribble (see [`RunaroundDribble`]). The carrier reads
 /// this as a gated pre-empt appetite, mirroring the wall-pass plan.
 #[derive(Clone, Copy, Debug)]
@@ -25109,9 +25140,20 @@ impl WorldSnapshot {
         let force = soccer_force_runaround();
         let attack_dir = carrier.team.attack_dir();
         let carrier_pos = self.player_snapshot_position(carrier);
+        // "Outside mid attack defender": a wide man on this play takes the isolated full-back on
+        // far more readily, so the static-start precondition is relaxed (a winger who has just
+        // received can still attack the man rather than needing to already be at speed).
+        let omad_take_on = is_outside_mid_attack_strategy(
+            self.tactical_directive(carrier.team).attack_strategy,
+        ) && self.is_wide_attacker(carrier);
         // Precondition: forward momentum (running AT the defender), not standing.
         let forward_speed = carrier.velocity.y * attack_dir;
-        if !force && forward_speed < RUNAROUND_MIN_FORWARD_SPEED_YPS {
+        let min_forward_speed = if omad_take_on {
+            RUNAROUND_MIN_FORWARD_SPEED_YPS * 0.45
+        } else {
+            RUNAROUND_MIN_FORWARD_SPEED_YPS
+        };
+        if !force && forward_speed < min_forward_speed {
             return None;
         }
         // The committed defender to beat: nearest opponent just ahead, roughly in the path.
@@ -25129,7 +25171,25 @@ impl WorldSnapshot {
         let defender = self.players.get(defender_id)?;
         let speed_advantage = (carrier.skills.top_speed - defender.skills.top_speed)
             .max(forward_speed - defender.velocity.len());
-        if !force && speed_advantage < RUNAROUND_MIN_SPEED_ADVANTAGE {
+        // Is the man being taken on ISOLATED? — no covering opponent (other than the man himself)
+        // within the cover radius (the user's "no defender within 10yd of the defender they are
+        // beating"). This is the interception-feasibility budget that makes a wide take-on safe.
+        let defender_cover_dist = self
+            .players
+            .iter()
+            .filter(|p| p.team != carrier.team && p.id != defender_id)
+            .map(|p| self.player_snapshot_position(p).distance(defender_pos))
+            .fold(f64::INFINITY, f64::min);
+        let defender_isolated =
+            omad_take_on && defender_cover_dist >= OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS;
+        // Against an isolated man the beat is safe even without a clear pace edge, so allow the
+        // take-on at any non-negative advantage; otherwise the usual pace gate holds.
+        let min_speed_advantage = if defender_isolated {
+            0.0
+        } else {
+            RUNAROUND_MIN_SPEED_ADVANTAGE
+        };
+        if !force && speed_advantage < min_speed_advantage {
             return None;
         }
         // Score each side: ball knocked past on `sign`, body runs the opposite side to re-collect.
@@ -25213,6 +25273,25 @@ impl WorldSnapshot {
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (None, None) => return None,
+        };
+        // Learnable take-on appetite uplift for the wide man against the isolated defender: the
+        // more isolated the man (cover further than the 10yd radius) and the bigger the pace edge,
+        // the more we back the carrier to beat him 1v1. Off this play `defender_isolated` is false,
+        // so the quality (and thus the carrier's appetite in player.rs) is byte-identical.
+        let quality = if defender_isolated {
+            let isolation_term = ((defender_cover_dist
+                - OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS)
+                / OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS)
+                .clamp(0.0, 1.0);
+            let speed_term =
+                (speed_advantage / RUNAROUND_SPEED_ADVANTAGE_FULL_YPS).clamp(0.0, 1.0);
+            (quality
+                + outside_mid_take_on_uplift()
+                    * (0.45 + 0.55 * isolation_term)
+                    * (0.6 + 0.4 * speed_term))
+            .clamp(0.0, 1.0)
+        } else {
+            quality
         };
         if !force && quality < RUNAROUND_MIN_QUALITY {
             return None;
@@ -30097,15 +30176,23 @@ impl WorldSnapshot {
         let in_opposition_half = (current.y - self.field_length * 0.5) * attack_dir > 0.0;
         let on_wing = flank_lane_score(current, self.field_width) >= 0.30;
         let on_strategy_side = match strategy {
-            TeamAttackStrategy::BylineCrossLeftToPenaltySpot => current.x < self.field_width * 0.5,
-            TeamAttackStrategy::BylineCrossRightToPenaltySpot => current.x > self.field_width * 0.5,
+            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+            | TeamAttackStrategy::OutsideMidAttackDefenderLeft => current.x < self.field_width * 0.5,
+            TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight => {
+                current.x > self.field_width * 0.5
+            }
             _ => false,
         };
+        // The outside-mid take-on releases its cross earlier (last ~20-30yd) than the deep byline
+        // drive — so it stops the wide carry at the deeper release depth.
+        let release_depth = if is_outside_mid_attack_strategy(strategy) {
+            outside_mid_cross_release_depth_yards()
+        } else {
+            BYLINE_CROSS_RELEASE_DEPTH_YARDS
+        };
         let endline_depth = (player.team.goal_y(self.field_length) - current.y).abs();
-        in_opposition_half
-            && on_wing
-            && on_strategy_side
-            && endline_depth > BYLINE_CROSS_RELEASE_DEPTH_YARDS
+        in_opposition_half && on_wing && on_strategy_side && endline_depth > release_depth
     }
 
     fn wingback_attacking_cover_count(&self, player: &PlayerSnapshot) -> usize {

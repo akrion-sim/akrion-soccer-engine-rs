@@ -149,10 +149,23 @@ pub enum TeamAttackStrategy {
     /// [`SoccerMatch::flank_cross_arrival_target_for`] and the spread box-arrival run in
     /// [`SoccerMatch::crash_the_box_target_for`].
     CrashTheBox,
+    /// "Outside mid attack defender" (left flank): when a wide midfielder/winger carries into the
+    /// opponent half on the left and the full-back facing them is ISOLATED (no covering defender
+    /// within ~10yd), back them to TAKE THE MAN ON — sprint-and-dribble around the isolated
+    /// defender (the existing `runaround_dribble_option_for` gets a learnable appetite uplift),
+    /// keep the ball WIDE rather than cutting in, try a give-and-go to beat the man, and whip a
+    /// cross in once inside the last 20-30yd of the byline. A wide-flank variant of the byline-
+    /// cross program ([`Self::BylineCrossLeftToPenaltySpot`]) that prizes beating the full-back
+    /// 1v1 when the cover is absent. Only proposed by the heuristic when
+    /// `DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER` is set (the learner/`SOCCER_FORCE_ATTACK_STRATEGY`
+    /// can also select it); off by default it is never the active strategy, so play is byte-identical.
+    OutsideMidAttackDefenderLeft,
+    /// Mirror of [`Self::OutsideMidAttackDefenderLeft`] down the right flank.
+    OutsideMidAttackDefenderRight,
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 40] = [
+    pub const ALL: [TeamAttackStrategy; 42] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -193,6 +206,8 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
         TeamAttackStrategy::BylineCrossRightToPenaltySpot,
         TeamAttackStrategy::CrashTheBox,
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft,
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -239,6 +254,10 @@ impl TeamAttackStrategy {
                 "byline-cross-right-to-penalty-spot"
             }
             TeamAttackStrategy::CrashTheBox => "crash-the-box",
+            TeamAttackStrategy::OutsideMidAttackDefenderLeft => "outside-mid-attack-defender-left",
+            TeamAttackStrategy::OutsideMidAttackDefenderRight => {
+                "outside-mid-attack-defender-right"
+            }
         }
     }
 
@@ -298,6 +317,11 @@ impl TeamAttackStrategy {
             // Immediate box flood around a wide final-third cross: direct, few touches —
             // pack the box and finish.
             TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.72),
+            // Outside mid attacks the isolated full-back: start AND resolve wide (keep the ball on
+            // the flank, beat the man, deliver from the corner) — a take-on-and-cross with an
+            // optional give-and-go, so a short horizon and fairly direct.
+            TeamAttackStrategy::OutsideMidAttackDefenderLeft => s(Left, Left, 3, 0.62),
+            TeamAttackStrategy::OutsideMidAttackDefenderRight => s(Right, Right, 3, 0.62),
         }
     }
 }
@@ -3415,6 +3439,15 @@ fn soccer_formation_lp_apply_strategy_profile(
                 weights.space_occupation *= 1.42;
                 weights.expected_goal *= 1.22;
             }
+            // Outside mid attacks the isolated full-back: a 1v1 take-on to beat the man wide and
+            // get a cross away — prize progression and the chance created, hold width, accept the
+            // carry risk of running at a defender.
+            OutsideMidAttackDefenderLeft | OutsideMidAttackDefenderRight => {
+                weights.progression *= 1.20;
+                weights.space_occupation *= 1.22;
+                weights.expected_goal *= 1.14;
+                weights.transition_risk *= 1.10;
+            }
             _ => {}
         }
     }
@@ -5026,6 +5059,20 @@ impl CentralBrain {
                         .flank_overlap_run_probability
                         .max(NESTED_OVERLAP_RUN_PROBABILITY);
                     directive.width_yards = (directive.width_yards * 1.06).min(width * 0.96);
+                }
+                OutsideMidAttackDefenderLeft | OutsideMidAttackDefenderRight => {
+                    // Keep the ball WIDE and back the wide man to TAKE ON the isolated full-back:
+                    // maximal width, a carry-over-pass bias (the take-on is a carry), more risk
+                    // tolerance, and a high cross once the byline is reached. The per-player
+                    // isolated-defender take-on appetite uplift lives in
+                    // `WorldSnapshot::runaround_dribble_option_for` / `outside_mid_take_on_*`.
+                    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+                    directive.flank_overlap_run_probability = directive
+                        .flank_overlap_run_probability
+                        .max(NESTED_OVERLAP_RUN_PROBABILITY);
+                    directive.width_yards = (directive.width_yards * 1.08).min(width * 0.98);
+                    directive.carry_priority = (directive.carry_priority * 1.22).clamp(0.4, 1.6);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
                 }
                 _ => {}
             }

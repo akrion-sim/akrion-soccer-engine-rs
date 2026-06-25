@@ -2972,6 +2972,11 @@ const HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE: f64 = 1.25;
 /// A wide attacker in the opposition half carries toward the corner until reaching this
 /// end-line depth, then the team changes from the byline drive to the cross-release phase.
 const BYLINE_CROSS_RELEASE_DEPTH_YARDS: f64 = 11.0;
+/// Cross-release end-line depth used by the "outside mid attack defender" play
+/// ([`dd_soccer_enable_outside_mid_attack_defender`]): the wide man whips the ball in once inside
+/// the last ~25yd of the byline (the user's "cross in the last 20-30yds") rather than driving all
+/// the way to the ~11yd byline first. Override with `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS`.
+const OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT: f64 = 25.0;
 /// Minimum normalized distance from pitch center for the committed byline program. This is
 /// deliberately wider than the generic left/right strategy-lane split: it is for true wingers.
 const BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER: f64 = 0.52;
@@ -15475,7 +15480,53 @@ fn is_byline_cross_drive_strategy(strategy: TeamAttackStrategy) -> bool {
         strategy,
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot
             | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            // "Outside mid attack defender" is a wide-flank drive-and-cross: it shares the byline
+            // carry program (keep the ball wide, drive the corner, whip a cross), adding only the
+            // isolated-defender take-on appetite on top.
+            | TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
     )
+}
+
+/// Whether `strategy` is one of the "outside mid attack defender" wide take-on plays. Pure match
+/// (no env read) so it works under `SOCCER_FORCE_ATTACK_STRATEGY` and the learner; the heuristic
+/// only ever PROPOSES these when [`dd_soccer_enable_outside_mid_attack_defender`] is set, so by
+/// default they are never the active strategy and these arms are inert.
+pub(crate) fn is_outside_mid_attack_strategy(strategy: TeamAttackStrategy) -> bool {
+    matches!(
+        strategy,
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
+    )
+}
+
+/// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
+/// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
+/// carrier driving the flank in the opponent half, and the deeper cross-release window (cross in
+/// the last ~20-30yd rather than only at the byline) applies to the wide-cross program. Unset
+/// (default) the strategy is never proposed and the release window is the original, so play is
+/// byte-identical to baseline. The learner and `SOCCER_FORCE_ATTACK_STRATEGY` can still select the
+/// strategy regardless of this flag (for training / live demos).
+pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+}
+
+/// End-line depth at which the "outside mid attack defender" play releases its cross (see
+/// [`OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT`]). Learner/operator override via
+/// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 14-34yd window).
+pub(crate) fn outside_mid_cross_release_depth_yards() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| d.clamp(14.0, 34.0))
+            .unwrap_or(OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT)
+    })
 }
 
 fn tactical_directive_for_team(
@@ -15800,10 +15851,17 @@ fn tactical_directive_for_team(
         && attack_progress > 0.0
         && width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
         && !matches!(ball_side, StrategyLane::Center);
-    let byline_drive_context =
-        wide_cross_program_context && endline_depth > BYLINE_CROSS_RELEASE_DEPTH_YARDS;
-    let crash_box_context =
-        wide_cross_program_context && endline_depth <= BYLINE_CROSS_RELEASE_DEPTH_YARDS;
+    // "Outside mid attack defender" deepens the cross-release window (cross in the last ~20-30yd
+    // rather than only at the ~11yd byline) — but ONLY when the play is enabled, so the default
+    // split is byte-identical to baseline.
+    let outside_mid_attack_enabled = dd_soccer_enable_outside_mid_attack_defender();
+    let cross_release_depth = if outside_mid_attack_enabled {
+        outside_mid_cross_release_depth_yards()
+    } else {
+        BYLINE_CROSS_RELEASE_DEPTH_YARDS
+    };
+    let byline_drive_context = wide_cross_program_context && endline_depth > cross_release_depth;
+    let crash_box_context = wide_cross_program_context && endline_depth <= cross_release_depth;
     let pressure_fit = ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64
         + 2.0)
         / 5.0)
@@ -15837,6 +15895,15 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::CounterTransitionVertical
     } else if byline_drive_context {
         match ball_side {
+            // With the play enabled, the wide drive becomes a take-the-man-on program (still drives
+            // the corner + crosses via the shared byline machinery, plus the isolated-defender
+            // take-on appetite); otherwise it is the plain byline cross drive (byte-identical).
+            StrategyLane::Left if outside_mid_attack_enabled => {
+                TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            }
+            StrategyLane::Right if outside_mid_attack_enabled => {
+                TeamAttackStrategy::OutsideMidAttackDefenderRight
+            }
             StrategyLane::Left => TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
             StrategyLane::Right => TeamAttackStrategy::BylineCrossRightToPenaltySpot,
             StrategyLane::Center => unreachable!("wide byline context cannot be central"),
