@@ -194,9 +194,9 @@ pub struct SoccerMatch {
     /// How the trained value head couples into live action selection. `Off` by
     /// default, so play is unchanged unless a run opts in via `with_neural_blend`.
     pub(crate) neural_blend: SoccerNeuralBlendConfig,
-    /// The neural **actor** `π(family|s)`, trained by advantage policy-gradient
-    /// from the critic (the value head). Present only when the run opts into
-    /// actor-critic (`neural_blend.actor_critic` + neural learning enabled).
+    /// The neural **actor set** `π(family|s, role, assigned-position)`, trained by
+    /// advantage policy-gradient from the critic (the value head). Present only when
+    /// the run opts into actor-critic (`neural_blend.actor_critic` + neural learning enabled).
     pub(crate) policy_head: Option<SoccerPolicyHead>,
     /// The learned **world model** `P̂(s'|s,a)` over the feature space, trained on
     /// consecutive transitions. Present only when `neural_blend.world_model` is on.
@@ -1756,6 +1756,13 @@ impl SoccerMatch {
             network,
             &snapshot,
         ));
+        self.policy_head = if let Some(policy_head) = snapshot.policy_head.as_deref() {
+            Some(soccer_policy_head_from_snapshot(policy_head, self.config.seed)?)
+        } else if self.neural_blend.actor_critic {
+            Some(SoccerPolicyHead::new(self.config.seed))
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -1828,6 +1835,9 @@ impl SoccerMatch {
                 // blend, keeping serve consistent with train.
                 snapshot.training_steps = learner.training_steps();
                 snapshot.average_loss = learner.average_loss();
+                if let Some(policy_head) = &self.policy_head {
+                    snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(policy_head)));
+                }
                 snapshot
             })
         })
@@ -3179,6 +3189,18 @@ impl SoccerMatch {
         mdp_state: &SoccerMdpState,
         observation: &SoccerPomdpObservation,
     ) -> SoccerLearningTransition {
+        let assigned_position_grid = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .map(|player| {
+                pitch_grid_address(
+                    player.home_position,
+                    snapshot.field_width,
+                    snapshot.field_length,
+                )
+            })
+            .unwrap_or_default();
         SoccerLearningTransition {
             tick: snapshot.tick,
             player_id,
@@ -3194,7 +3216,10 @@ impl SoccerMatch {
             },
             action: String::new(),
             action_target: None,
-            decision_context: SoccerDecisionContext::default(),
+            decision_context: SoccerDecisionContext {
+                assigned_position_grid,
+                ..Default::default()
+            },
             tactical_trace: SoccerTacticalLearningTrace::default(),
             reward: 0.0,
             next_state: mdp_state.clone(),
@@ -4347,7 +4372,11 @@ impl SoccerMatch {
         // "state-dominant", not perfectly action-independent — adequate as the
         // policy/world-model state encoding, and identical at train and inference.
         let state_features = soccer_neural_transition_features_with_action(transition, "");
-        soccer_policy_features_for_role(&state_features, transition.role)
+        soccer_policy_features_for_role_and_position(
+            &state_features,
+            transition.role,
+            transition.decision_context.assigned_position_grid,
+        )
     }
 
     /// Build actor-critic training samples from a replay: opponent-centered reward
@@ -7588,6 +7617,56 @@ impl SoccerMatch {
             SoccerRewardEventKind::ShotOnTarget,
         );
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
+    }
+
+    fn record_goalkeeper_save_reward(&mut self, shot: &PendingShot, keeper_id: usize) {
+        let Some(keeper) = self.players.iter().find(|player| player.id == keeper_id) else {
+            return;
+        };
+        if keeper.role != PlayerRole::Goalkeeper || keeper.team == shot.team {
+            return;
+        }
+
+        let attacked_goal = Vec2::new(
+            self.config.field_width_yards * 0.5,
+            shot.team.goal_y(self.config.field_length_yards),
+        );
+        let danger = (1.0
+            - shot.origin.distance(attacked_goal) / GOALKEEPER_SAVE_DANGER_REFERENCE_YARDS)
+            .clamp(0.0, 1.0);
+        let amount = GOALKEEPER_SAVE_BASE_REWARD_POINTS
+            + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger;
+        self.record_reward_event_with_kind(
+            keeper_id,
+            amount,
+            SoccerRewardEventKind::GoalkeeperSave,
+        );
+
+        if !self.config.learning_enabled {
+            return;
+        }
+        let Some(mut transition) = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .find(|transition| {
+                transition.player_id == keeper_id && transition.role == PlayerRole::Goalkeeper
+            })
+            .cloned()
+        else {
+            return;
+        };
+        transition.reward = amount;
+        transition.done = false;
+        if transition.tick != self.tick {
+            self.record_reward_event_at_with_kind(
+                transition.tick,
+                keeper_id,
+                amount,
+                SoccerRewardEventKind::GoalkeeperSave,
+            );
+        }
+        self.deferred_reward_transitions.push(transition);
     }
 
     /// Distance scale for a shot-on-target's CHAIN reward: it backprops credit to the build-up
@@ -12675,6 +12754,7 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_launcher = None;
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
+                self.record_goalkeeper_save_reward(&shot, keeper_id);
                 self.stat_save(defending_team);
                 self.mark_ball_received(keeper_id);
                 let bounded_save_position = soccer_bounded_keeper_save_position(

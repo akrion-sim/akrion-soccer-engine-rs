@@ -1463,6 +1463,53 @@ pub fn soccer_neural_network_snapshot_fingerprint(snapshot: &SoccerNeuralNetwork
             soccer_learning_fingerprint_f64(&mut hash, *value);
         }
     }
+    if let Some(policy_head) = snapshot.policy_head.as_ref() {
+        soccer_learning_fingerprint_str(&mut hash, "policyHead");
+        soccer_learning_fingerprint_mix(
+            &mut hash,
+            soccer_neural_network_snapshot_fingerprint(&policy_head.network),
+        );
+        soccer_learning_fingerprint_usize(&mut hash, policy_head.training_steps);
+        if let Some(loss) = policy_head.average_loss {
+            soccer_learning_fingerprint_f64(&mut hash, loss);
+        }
+        soccer_learning_fingerprint_usize(&mut hash, policy_head.specialist_heads.len());
+        for specialist in &policy_head.specialist_heads {
+            soccer_learning_fingerprint_str(&mut hash, &specialist.kind);
+            soccer_learning_fingerprint_mix(
+                &mut hash,
+                soccer_neural_network_snapshot_fingerprint(&specialist.network),
+            );
+            soccer_learning_fingerprint_usize(&mut hash, specialist.training_steps);
+            if let Some(loss) = specialist.average_loss {
+                soccer_learning_fingerprint_f64(&mut hash, loss);
+            }
+        }
+        soccer_learning_fingerprint_usize(&mut hash, policy_head.role_heads.len());
+        for role_head in &policy_head.role_heads {
+            soccer_learning_fingerprint_str(&mut hash, &role_head.role);
+            soccer_learning_fingerprint_mix(
+                &mut hash,
+                soccer_neural_network_snapshot_fingerprint(&role_head.network),
+            );
+            soccer_learning_fingerprint_usize(&mut hash, role_head.training_steps);
+            if let Some(loss) = role_head.average_loss {
+                soccer_learning_fingerprint_f64(&mut hash, loss);
+            }
+            soccer_learning_fingerprint_usize(&mut hash, role_head.specialist_heads.len());
+            for specialist in &role_head.specialist_heads {
+                soccer_learning_fingerprint_str(&mut hash, &specialist.kind);
+                soccer_learning_fingerprint_mix(
+                    &mut hash,
+                    soccer_neural_network_snapshot_fingerprint(&specialist.network),
+                );
+                soccer_learning_fingerprint_usize(&mut hash, specialist.training_steps);
+                if let Some(loss) = specialist.average_loss {
+                    soccer_learning_fingerprint_f64(&mut hash, loss);
+                }
+            }
+        }
+    }
     hash
 }
 

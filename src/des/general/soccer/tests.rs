@@ -92,6 +92,273 @@ fn test_pending_pass(
 }
 
 #[test]
+fn policy_features_include_assigned_position_not_just_role() {
+    let base = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+    let left = pitch_grid_address(Vec2::new(8.0, 42.0), 80.0, 120.0);
+    let center = pitch_grid_address(Vec2::new(40.0, 42.0), 80.0, 120.0);
+    let right = pitch_grid_address(Vec2::new(72.0, 42.0), 80.0, 120.0);
+    let left_features = soccer_policy_features_for_role_and_position(
+        &base,
+        PlayerRole::Defender,
+        left,
+    );
+    let center_features = soccer_policy_features_for_role_and_position(
+        &base,
+        PlayerRole::Defender,
+        center,
+    );
+    let right_features = soccer_policy_features_for_role_and_position(
+        &base,
+        PlayerRole::Defender,
+        right,
+    );
+    let position_start = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
+    assert_eq!(left_features[position_start + 1], 1.0);
+    assert_eq!(center_features[position_start + 2], 1.0);
+    assert_eq!(right_features[position_start + 3], 1.0);
+    assert_ne!(
+        &left_features[position_start..position_start + SOCCER_POLICY_POSITION_EMBEDDING_DIM],
+        &center_features[position_start..position_start + SOCCER_POLICY_POSITION_EMBEDDING_DIM]
+    );
+
+    let keeper_features = soccer_policy_features_for_role_and_position(
+        &base,
+        PlayerRole::Goalkeeper,
+        center,
+    );
+    assert_eq!(keeper_features[position_start], 1.0);
+}
+
+#[test]
+fn policy_head_trains_skill_specialists_independently() {
+    let sample = |role: PlayerRole, action: &str| -> SoccerPolicySample {
+        let state_features: [f64; SOCCER_POLICY_FEATURE_DIM] =
+            soccer_policy_features_for_role(&[0.0; SOCCER_NEURAL_FEATURE_DIM], role)
+                .try_into()
+                .expect("policy feature dim");
+        SoccerPolicySample {
+            state_features,
+            action_index: soccer_policy_action_index(action).expect("known policy action"),
+            advantage: 1.0,
+            old_action_probability: None,
+        }
+    };
+    let specialist_steps = |head: &SoccerPolicyHead, kind: SoccerPolicySpecialistKind| {
+        head.role_heads
+            .iter()
+            .flat_map(|role_head| role_head.specialist_heads.iter())
+            .filter(|specialist| specialist.kind == kind)
+            .map(|specialist| specialist.training_steps)
+            .sum::<usize>()
+    };
+    let role_specialist_steps =
+        |head: &SoccerPolicyHead, role: PlayerRole, kind: SoccerPolicySpecialistKind| {
+            head.role_head_for_role(role)
+                .expect("role policy head")
+                .specialist_heads
+                .iter()
+                .find(|specialist| specialist.kind == kind)
+                .expect("specialist head")
+                .training_steps
+        };
+
+    let mut head = SoccerPolicyHead::new(42);
+    head.train(&[sample(PlayerRole::Midfielder, "pass")], None);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Passing), 1);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Dribbling), 0);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Shooting), 0);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Goalkeeping), 0);
+    assert_eq!(
+        role_specialist_steps(
+            &head,
+            PlayerRole::Forward,
+            SoccerPolicySpecialistKind::Passing
+        ),
+        0,
+        "midfield pass training must not update the forward passing specialist"
+    );
+
+    head.train(
+        &[
+            sample(PlayerRole::Midfielder, "carry-forward"),
+            sample(PlayerRole::Forward, "shoot"),
+            sample(PlayerRole::Goalkeeper, "keeper-survey-hands"),
+        ],
+        None,
+    );
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Passing), 1);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Dribbling), 1);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Shooting), 1);
+    assert_eq!(specialist_steps(&head, SoccerPolicySpecialistKind::Goalkeeping), 1);
+    assert_eq!(
+        role_specialist_steps(
+            &head,
+            PlayerRole::Forward,
+            SoccerPolicySpecialistKind::Shooting
+        ),
+        1
+    );
+    assert_eq!(
+        role_specialist_steps(
+            &head,
+            PlayerRole::Goalkeeper,
+            SoccerPolicySpecialistKind::Goalkeeping
+        ),
+        1
+    );
+}
+
+#[test]
+fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
+    let sample = |role: PlayerRole, action: &str| -> SoccerPolicySample {
+        let state_features: [f64; SOCCER_POLICY_FEATURE_DIM] =
+            soccer_policy_features_for_role(&[0.0; SOCCER_NEURAL_FEATURE_DIM], role)
+                .try_into()
+                .expect("policy feature dim");
+        SoccerPolicySample {
+            state_features,
+            action_index: soccer_policy_action_index(action).expect("known policy action"),
+            advantage: 1.0,
+            old_action_probability: None,
+        }
+    };
+
+    let mut head = SoccerPolicyHead::new(77);
+    head.train(
+        &[
+            sample(PlayerRole::Forward, "shoot"),
+            sample(PlayerRole::Goalkeeper, "keeper-survey-hands"),
+        ],
+        None,
+    );
+
+    let snapshot = soccer_policy_head_snapshot(&head);
+    assert_eq!(
+        snapshot.role_heads.len(),
+        SOCCER_POLICY_ROLE_EMBEDDING_DIM,
+        "new actor snapshots must carry one head per role group"
+    );
+    let restored = soccer_policy_head_from_snapshot(&snapshot, 99)
+        .expect("role-head actor snapshot should restore");
+
+    let forward_head = restored
+        .role_head_for_role(PlayerRole::Forward)
+        .expect("forward role head");
+    assert_eq!(forward_head.training_steps, 1);
+    assert_eq!(
+        forward_head
+            .specialist_heads
+            .iter()
+            .find(|specialist| specialist.kind == SoccerPolicySpecialistKind::Shooting)
+            .expect("shooting specialist")
+            .training_steps,
+        1
+    );
+    let defender_head = restored
+        .role_head_for_role(PlayerRole::Defender)
+        .expect("defender role head");
+    assert_eq!(
+        defender_head.training_steps, 0,
+        "restoring a trained forward head must not smear steps onto defenders"
+    );
+    let goalkeeper_head = restored
+        .role_head_for_role(PlayerRole::Goalkeeper)
+        .expect("goalkeeper role head");
+    assert_eq!(goalkeeper_head.training_steps, 1);
+    assert_eq!(
+        goalkeeper_head
+            .specialist_heads
+            .iter()
+            .find(|specialist| specialist.kind == SoccerPolicySpecialistKind::Goalkeeping)
+            .expect("goalkeeping specialist")
+            .training_steps,
+        1
+    );
+}
+
+#[test]
+fn keeper_policy_actions_are_distinct_from_outfield_actions() {
+    assert!(soccer_policy_action_index("keeper-mpc-floor-pass").is_some());
+    assert!(soccer_policy_action_index("keeper-mpc-aerial-pass").is_some());
+    assert!(soccer_policy_action_index("keeper-mpc-clearance").is_some());
+    assert!(soccer_policy_action_index("keeper-survey-hands").is_some());
+    assert_ne!(
+        soccer_policy_action_index("keeper-mpc-clearance"),
+        soccer_policy_action_index("clearance")
+    );
+}
+
+#[test]
+fn save_outcome_credits_goalkeeper_recent_decision() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let keeper = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
+        .expect("away keeper")
+        .id;
+    let shooter = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home forward")
+        .id;
+    sim.tick = 55;
+    sim.players[keeper].position = Vec2::new(40.0, 118.0);
+    sim.players[shooter].position = Vec2::new(40.0, 104.0);
+    let before = WorldSnapshot::from_match(&sim);
+    let keeper_decision = test_decision_trace(&before, keeper, "keeper-position");
+    sim.recent_learning_history
+        .push_back(SoccerLearningTransition {
+            tick: 50,
+            player_id: keeper,
+            team: Team::Away,
+            role: PlayerRole::Goalkeeper,
+            state: before.mdp_state_for_player(keeper),
+            observation: before.observation_for(keeper),
+            belief: keeper_decision.belief.clone(),
+            action: keeper_decision.action.clone(),
+            action_target: keeper_decision.action_target.clone(),
+            decision_context: SoccerDecisionContext::default(),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.0,
+            next_state: before.mdp_state_for_player(keeper),
+            next_observation: before.observation_for(keeper),
+            done: false,
+        });
+    let event_start = sim.reward_events.len();
+
+    sim.apply_ball_outcome(BallStepOutcome::Save {
+        shot: PendingShot {
+            team: Team::Home,
+            shooter,
+            origin: sim.players[shooter].position,
+        },
+        defending_team: Team::Away,
+        keeper_id: keeper,
+        save_position: sim.players[keeper].position,
+    });
+
+    assert!(sim.reward_events[event_start..].iter().any(|event| {
+        event.player_id == keeper
+            && event.kind == SoccerRewardEventKind::GoalkeeperSave
+            && event.amount > GOALKEEPER_SAVE_BASE_REWARD_POINTS
+    }));
+    let credited = sim
+        .deferred_reward_transitions
+        .iter()
+        .rev()
+        .find(|transition| transition.player_id == keeper)
+        .expect("deferred keeper transition");
+    assert_eq!(credited.role, PlayerRole::Goalkeeper);
+    assert_eq!(credited.action, "keeper-position");
+    assert!(credited.reward > GOALKEEPER_SAVE_BASE_REWARD_POINTS);
+}
+
+#[test]
 fn default_match_config_preserves_initial_runtime_contract() {
     let config = MatchConfig::default().sanitized_for_runtime();
     assert_eq!(config.dt_seconds, DEFAULT_DT_SECONDS);
@@ -28836,20 +29103,21 @@ fn policy_features_append_explicit_role_embedding() {
     assert_eq!(&defender[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
     assert_eq!(&midfielder[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
     assert_eq!(&forward[..SOCCER_NEURAL_FEATURE_DIM], &state[..]);
+    let role_end = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
     assert_eq!(
-        &keeper[SOCCER_NEURAL_FEATURE_DIM..],
+        &keeper[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [1.0, 0.0, 0.0, 0.0].as_slice()
     );
     assert_eq!(
-        &defender[SOCCER_NEURAL_FEATURE_DIM..],
+        &defender[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 1.0, 0.0, 0.0].as_slice()
     );
     assert_eq!(
-        &midfielder[SOCCER_NEURAL_FEATURE_DIM..],
+        &midfielder[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 0.0, 1.0, 0.0].as_slice()
     );
     assert_eq!(
-        &forward[SOCCER_NEURAL_FEATURE_DIM..],
+        &forward[SOCCER_NEURAL_FEATURE_DIM..role_end],
         [0.0, 0.0, 0.0, 1.0].as_slice()
     );
 }
@@ -28864,14 +29132,22 @@ fn policy_head_fails_closed_on_malformed_actor_features() {
         "fresh policy head should produce an action distribution"
     );
 
-    head.network.input_dim = SOCCER_POLICY_FEATURE_DIM + 1;
+    head.role_head_for_role_mut(PlayerRole::Forward)
+        .expect("forward policy head")
+        .network
+        .input_dim = SOCCER_POLICY_FEATURE_DIM + 1;
     assert!(
         head.action_distribution(&state).is_none(),
         "restored actor with wrong input dim must fail closed"
     );
 
-    head.network.input_dim = SOCCER_POLICY_FEATURE_DIM;
-    head.network.output_dim = SOCCER_POLICY_ACTIONS.len() + 1;
+    {
+        let forward_head = head
+            .role_head_for_role_mut(PlayerRole::Forward)
+            .expect("forward policy head");
+        forward_head.network.input_dim = SOCCER_POLICY_FEATURE_DIM;
+        forward_head.network.output_dim = SOCCER_POLICY_ACTIONS.len() + 1;
+    }
     assert!(
         head.action_distribution(&state).is_none(),
         "restored actor with wrong output dim must fail closed"
@@ -28963,11 +29239,10 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
 }
 
 #[test]
-fn role_embedding_lets_one_shared_actor_specialise_per_position() {
-    // The same underlying state, reinforced for a Forward and penalised for a Defender, must
-    // pull `π(shoot)` in opposite directions across the two role-conditioned inputs — only
-    // possible if the shared net conditions on the role one-hot baked into the policy features
-    // by `soccer_policy_features_for_role`.
+fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
+    // The same underlying state, trained only for the forward, must not move the defender actor.
+    // Role embeddings still travel in the features, but the actual weights are now independent
+    // GK/DEF/MID/FWD heads rather than one pooled actor.
     let mut head = SoccerPolicyHead::new(31);
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.4;
@@ -28975,23 +29250,19 @@ fn role_embedding_lets_one_shared_actor_specialise_per_position() {
     let forward_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward);
     let defender_state = soccer_policy_features_for_role(&critic_state, PlayerRole::Defender);
     let shoot = soccer_policy_action_index("shoot").expect("shoot policy action");
+    let before_forward_shoot = head
+        .action_distribution(&forward_state)
+        .expect("finite forward dist")[shoot];
+    let before_defender_shoot = head
+        .action_distribution(&defender_state)
+        .expect("finite defender dist")[shoot];
 
     let samples: Vec<SoccerPolicySample> = (0..60)
-        .flat_map(|_| {
-            [
-                SoccerPolicySample {
-                    state_features: forward_state,
-                    action_index: shoot,
-                    advantage: 1.0,
-                    old_action_probability: None,
-                },
-                SoccerPolicySample {
-                    state_features: defender_state,
-                    action_index: shoot,
-                    advantage: -1.0,
-                    old_action_probability: None,
-                },
-            ]
+        .map(|_| SoccerPolicySample {
+            state_features: forward_state,
+            action_index: shoot,
+            advantage: 1.0,
+            old_action_probability: None,
         })
         .collect();
     head.train(&samples, None);
@@ -29003,9 +29274,12 @@ fn role_embedding_lets_one_shared_actor_specialise_per_position() {
         .action_distribution(&defender_state)
         .expect("finite defender dist")[shoot];
     assert!(
-        forward_shoot > defender_shoot,
-        "role embedding should specialise the shared actor: forward π(shoot)={forward_shoot} \
-         should exceed defender π(shoot)={defender_shoot}"
+        forward_shoot > before_forward_shoot,
+        "forward π(shoot) should rise: {before_forward_shoot} -> {forward_shoot}"
+    );
+    assert!(
+        (defender_shoot - before_defender_shoot).abs() < 1e-12,
+        "defender π(shoot) should stay frozen without defender samples: {before_defender_shoot} -> {defender_shoot}"
     );
 }
 

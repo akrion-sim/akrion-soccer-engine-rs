@@ -5145,6 +5145,7 @@ mod tests {
             }],
             training_steps: 0,
             average_loss: None,
+            policy_head: None,
         }
     }
 

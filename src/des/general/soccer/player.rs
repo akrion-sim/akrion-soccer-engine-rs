@@ -6032,9 +6032,10 @@ impl PlayerAgent {
         let defending_skill = ability01(self.skills.defending);
         let aggression_skill = ability01(self.skills.aggression);
         let held_restart = held_restart_action_for_snapshot(snapshot, self.id);
-        let learned_open_pass_lane_requested = learned_plan.is_some_and(|plan| {
-            normalize_soccer_action_label(&plan.action) == OPEN_PASS_LANE_ACTION_LABEL
-        });
+        let learned_action_label =
+            learned_plan.map(|plan| normalize_soccer_action_label(&plan.action));
+        let learned_open_pass_lane_requested =
+            learned_action_label == Some(OPEN_PASS_LANE_ACTION_LABEL);
 
         if let Some(input) = human_input {
             let (action, action_label) = if let Some(restart_label) = held_restart {
@@ -6382,12 +6383,38 @@ impl PlayerAgent {
                         && plan.target_player.is_none()
                         && handling_clock_expired
                         && release_intelligent;
-                    if outside_box_release || in_box_pass_release || pressured_in_box_clearance {
+                    let learned_keeper_release_requested = matches!(
+                        learned_action_label,
+                        Some(
+                            "keeper-mpc-floor-pass"
+                                | "keeper-mpc-aerial-pass"
+                                | "keeper-mpc-clearance"
+                                | "pass"
+                                | "aerial-pass"
+                                | "clearance"
+                                | "route-one"
+                                | "recycle-reset"
+                        )
+                    ) && release_intelligent;
+                    let learned_keeper_hold_requested = matches!(
+                        learned_action_label,
+                        Some("keeper-survey-hands")
+                    ) && can_use_hands_here
+                        && !handling_clock_expired;
+                    if !learned_keeper_hold_requested
+                        && (outside_box_release
+                            || in_box_pass_release
+                            || pressured_in_box_clearance
+                            || learned_keeper_release_requested)
+                    {
                         let mut operation_order = vec![
                             "keeper-play-out".to_string(),
                             "pomdp-release-choice".to_string(),
                             "mpc-execution-plan".to_string(),
                         ];
+                        if learned_keeper_release_requested {
+                            operation_order.push("learned-keeper-release".to_string());
+                        }
                         if outside_box_release {
                             operation_order.push("outside-box-no-hands".to_string());
                         }

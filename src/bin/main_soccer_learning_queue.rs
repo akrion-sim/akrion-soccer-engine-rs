@@ -1637,6 +1637,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         seed,
         ..default_config.clone()
     };
+    config.neural_blend.actor_critic = env_bool_alias(
+        "SOCCER_NEURAL_ACTOR_CRITIC",
+        "SOCCER_ACTOR_CRITIC",
+        true,
+    )?;
     apply_env_mpc_config(&mut config, &default_config)?;
     let resume_artifact =
         env_value("SOCCER_RESUME_ARTIFACT").or_else(|| env_value("SOCCER_RESUME_ARTIFACT_PATH"));

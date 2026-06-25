@@ -2727,6 +2727,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         seed: effective_seed,
         ..default_config.clone()
     };
+    config.neural_blend.actor_critic = env_bool_alias(
+        "SOCCER_NEURAL_ACTOR_CRITIC",
+        "SOCCER_ACTOR_CRITIC",
+        true,
+    )?;
     apply_env_mpc_config(&mut config, &default_config)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
@@ -4920,6 +4925,7 @@ mod tests {
             layers: Vec::new(),
             training_steps: 0,
             average_loss: None,
+            policy_head: None,
         };
 
         assert_eq!(policies.home.entries()[0].visits, 1);

@@ -1122,6 +1122,7 @@ mod tests {
             layers: vec![layer],
             training_steps: 0,
             average_loss: None,
+            policy_head: None,
         };
         refresh_snapshot_norm(&mut snapshot);
         snapshot

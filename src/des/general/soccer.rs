@@ -964,6 +964,12 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 40.0;
+/// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
+/// This trains the goalkeeper's preceding positioning/claim decision instead of only
+/// rewarding the shooter and penalising the keeper later when a goal is conceded.
+const GOALKEEPER_SAVE_BASE_REWARD_POINTS: f64 = 4.0;
+const GOALKEEPER_SAVE_DANGER_REWARD_POINTS: f64 = 8.0;
+const GOALKEEPER_SAVE_DANGER_REFERENCE_YARDS: f64 = 32.0;
 // A shot-on-target's chain reward is full inside this distance, then tapers to zero
 // at the 20yd pivot below: the chain is credited only for a real close-range chance.
 const SHOT_FULL_REWARD_DISTANCE_YARDS: f64 = 16.0;
@@ -3557,8 +3563,14 @@ const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// by advantage policy-gradient from the critic; stable baseline values live here,
 /// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
 const SOCCER_POLICY_ROLE_EMBEDDING_DIM: usize = 4;
+/// GK plus left/central/right archetypes for each outfield role line.
+/// Unlike the actor's current-position channels, this tail is built from the player's
+/// assigned/home slot and therefore survives overlaps, switches, and temporary roaming.
+const SOCCER_POLICY_POSITION_EMBEDDING_DIM: usize = 10;
 const SOCCER_POLICY_FEATURE_DIM: usize =
-    SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
+    SOCCER_NEURAL_FEATURE_DIM
+        + SOCCER_POLICY_ROLE_EMBEDDING_DIM
+        + SOCCER_POLICY_POSITION_EMBEDDING_DIM;
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Entropy bonus — keeps the actor from collapsing onto one family too early.
@@ -5315,6 +5327,10 @@ pub struct SoccerDecisionContext {
     pub tracking_confidence: f64,
     #[serde(default)]
     pub actor_position: Vec2,
+    /// Pitch grid of the player's assigned/home slot. This is intentionally distinct
+    /// from `actor_position`: a left back overlapping high remains a left back to the actor.
+    #[serde(default)]
+    pub assigned_position_grid: PitchGridAddress,
     #[serde(default)]
     pub actor_velocity: Vec2,
     #[serde(default)]
@@ -14461,6 +14477,7 @@ pub(crate) struct SoccerRewardEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SoccerRewardEventKind {
     Routine,
+    GoalkeeperSave,
     DribbleBeat,
     DefensiveDispossession,
     TwoForwardPasses,
@@ -14474,7 +14491,8 @@ impl SoccerRewardEventKind {
     fn triggers_learning(self) -> bool {
         matches!(
             self,
-            SoccerRewardEventKind::DribbleBeat
+            SoccerRewardEventKind::GoalkeeperSave
+                | SoccerRewardEventKind::DribbleBeat
                 | SoccerRewardEventKind::DefensiveDispossession
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
@@ -17083,6 +17101,15 @@ fn soccer_decision_context_for(
         .iter()
         .find(|player| player.id == player_id)
         .or_else(|| after.players.iter().find(|player| player.id == player_id));
+    let assigned_position_grid = actor_snapshot
+        .map(|actor| {
+            pitch_grid_address(
+                actor.home_position,
+                before.field_width,
+                before.field_length,
+            )
+        })
+        .unwrap_or_default();
     let (target_point, target_player) =
         soccer_decision_target_point(team, action, action_target, before, after);
     let target_player_position = target_player.and_then(|target_id| {
@@ -17349,6 +17376,7 @@ fn soccer_decision_context_for(
 
     SoccerDecisionContext {
         actor_position,
+        assigned_position_grid,
         actor_velocity,
         actor_acceleration,
         field_player_motion: soccer_field_player_motion_block(before, player_id, team),
@@ -29462,6 +29490,53 @@ pub struct SoccerNeuralNetworkSnapshot {
     pub training_steps: usize,
     #[serde(default)]
     pub average_loss: Option<f64>,
+    /// Optional policy actor carried beside the value/critic net. The critic still owns
+    /// the top-level snapshot; this sidecar preserves the shared actor and its independently
+    /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_head: Option<Box<SoccerPolicyHeadSnapshot>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPolicySpecialistHeadSnapshot {
+    pub kind: String,
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPolicyRoleHeadSnapshot {
+    pub role: String,
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
+    #[serde(default)]
+    pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPolicyHeadSnapshot {
+    /// Legacy shared actor snapshot. Newer snapshots also carry `role_heads`; this
+    /// remains populated so old loaders can still see a valid actor-shaped network.
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
+    /// Legacy shared specialist snapshots. Newer snapshots carry per-role specialists
+    /// inside `role_heads`; these are kept as a backward-compatible fallback.
+    #[serde(default)]
+    pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
+    #[serde(default)]
+    pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
 }
 
 /// Number of pass-specific scalar features appended to the 256-d config embedding for the learned
@@ -30672,19 +30747,176 @@ struct SoccerPolicySample {
     old_action_probability: Option<f64>,
 }
 
-/// The neural **actor**: `π(family | s, role)` over [`SOCCER_POLICY_ACTIONS`],
-/// trained by advantage policy-gradient (the critic supplies the advantage).
-/// Inline-only (no worker thread): policy updates happen once per episode over
-/// the replay, so they don't need the value head's streaming/threaded machinery.
-pub(crate) struct SoccerPolicyHead {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoccerPolicySpecialistKind {
+    Passing,
+    Dribbling,
+    Shooting,
+    Goalkeeping,
+}
+
+impl SoccerPolicySpecialistKind {
+    fn actions(self) -> &'static [&'static str] {
+        match self {
+            SoccerPolicySpecialistKind::Passing => SOCCER_POLICY_PASS_ACTIONS,
+            SoccerPolicySpecialistKind::Dribbling => SOCCER_POLICY_DRIBBLE_ACTIONS,
+            SoccerPolicySpecialistKind::Shooting => SOCCER_POLICY_SHOT_ACTIONS,
+            SoccerPolicySpecialistKind::Goalkeeping => SOCCER_POLICY_GOALKEEPER_ACTIONS,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SoccerPolicySpecialistKind::Passing => "passing",
+            SoccerPolicySpecialistKind::Dribbling => "dribbling",
+            SoccerPolicySpecialistKind::Shooting => "shooting",
+            SoccerPolicySpecialistKind::Goalkeeping => "goalkeeping",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "passing" => Some(SoccerPolicySpecialistKind::Passing),
+            "dribbling" => Some(SoccerPolicySpecialistKind::Dribbling),
+            "shooting" => Some(SoccerPolicySpecialistKind::Shooting),
+            "goalkeeping" | "goalkeeper" | "gk" => Some(SoccerPolicySpecialistKind::Goalkeeping),
+            _ => None,
+        }
+    }
+
+    fn applies_to_role(self, role: PlayerRole) -> bool {
+        match self {
+            SoccerPolicySpecialistKind::Goalkeeping => role == PlayerRole::Goalkeeper,
+            _ => role != PlayerRole::Goalkeeper,
+        }
+    }
+
+    fn seed_salt(self) -> u32 {
+        match self {
+            SoccerPolicySpecialistKind::Passing => 0xA511_E9B3,
+            SoccerPolicySpecialistKind::Dribbling => 0x63D8_35A7,
+            SoccerPolicySpecialistKind::Shooting => 0xC2B2_AE35,
+            SoccerPolicySpecialistKind::Goalkeeping => 0x27D4_EB2F,
+        }
+    }
+}
+
+struct SoccerPolicySpecialistHead {
+    kind: SoccerPolicySpecialistKind,
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
 }
 
-impl SoccerPolicyHead {
-    fn new(seed: u32) -> Self {
-        let mut rng = mulberry32(seed ^ 0x9E37_79B9);
+impl SoccerPolicySpecialistHead {
+    fn new(kind: SoccerPolicySpecialistKind, seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ kind.seed_salt());
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                output_dim: kind.actions().len(),
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerPolicySpecialistHead {
+            kind,
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn local_action_index(&self, global_action_index: usize) -> Option<usize> {
+        let global = SOCCER_POLICY_ACTIONS.get(global_action_index)?;
+        self.kind.actions().iter().position(|action| action == global)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoccerPolicyRoleGroup {
+    Goalkeeper,
+    Defender,
+    Midfielder,
+    Forward,
+}
+
+impl SoccerPolicyRoleGroup {
+    fn all() -> [Self; SOCCER_POLICY_ROLE_EMBEDDING_DIM] {
+        [
+            SoccerPolicyRoleGroup::Goalkeeper,
+            SoccerPolicyRoleGroup::Defender,
+            SoccerPolicyRoleGroup::Midfielder,
+            SoccerPolicyRoleGroup::Forward,
+        ]
+    }
+
+    fn from_role(role: PlayerRole) -> Self {
+        match role {
+            PlayerRole::Goalkeeper => SoccerPolicyRoleGroup::Goalkeeper,
+            PlayerRole::Defender => SoccerPolicyRoleGroup::Defender,
+            PlayerRole::Midfielder => SoccerPolicyRoleGroup::Midfielder,
+            PlayerRole::Forward => SoccerPolicyRoleGroup::Forward,
+        }
+    }
+
+    fn as_player_role(self) -> PlayerRole {
+        match self {
+            SoccerPolicyRoleGroup::Goalkeeper => PlayerRole::Goalkeeper,
+            SoccerPolicyRoleGroup::Defender => PlayerRole::Defender,
+            SoccerPolicyRoleGroup::Midfielder => PlayerRole::Midfielder,
+            SoccerPolicyRoleGroup::Forward => PlayerRole::Forward,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SoccerPolicyRoleGroup::Goalkeeper => "goalkeeper",
+            SoccerPolicyRoleGroup::Defender => "defender",
+            SoccerPolicyRoleGroup::Midfielder => "midfielder",
+            SoccerPolicyRoleGroup::Forward => "forward",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("goalkeeper") || value.eq_ignore_ascii_case("gk") {
+            Some(SoccerPolicyRoleGroup::Goalkeeper)
+        } else if value.eq_ignore_ascii_case("defender") || value.eq_ignore_ascii_case("def") {
+            Some(SoccerPolicyRoleGroup::Defender)
+        } else if value.eq_ignore_ascii_case("midfielder") || value.eq_ignore_ascii_case("mid") {
+            Some(SoccerPolicyRoleGroup::Midfielder)
+        } else if value.eq_ignore_ascii_case("forward") || value.eq_ignore_ascii_case("fwd") {
+            Some(SoccerPolicyRoleGroup::Forward)
+        } else {
+            None
+        }
+    }
+
+    fn seed_salt(self) -> u32 {
+        match self {
+            SoccerPolicyRoleGroup::Goalkeeper => 0xB529_7A4D,
+            SoccerPolicyRoleGroup::Defender => 0x68E3_1DA4,
+            SoccerPolicyRoleGroup::Midfielder => 0x1B56_C4E9,
+            SoccerPolicyRoleGroup::Forward => 0x94D0_49BB,
+        }
+    }
+}
+
+struct SoccerPolicyRoleHead {
+    role_group: SoccerPolicyRoleGroup,
+    network: FeedForwardNetwork,
+    specialist_heads: Vec<SoccerPolicySpecialistHead>,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerPolicyRoleHead {
+    fn new(role_group: SoccerPolicyRoleGroup, seed: u32) -> Self {
+        let role_seed = seed ^ role_group.seed_salt();
+        let mut rng = mulberry32(role_seed ^ 0x9E37_79B9);
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
@@ -30697,15 +30929,23 @@ impl SoccerPolicyHead {
             },
             &mut rng,
         );
-        SoccerPolicyHead {
+        SoccerPolicyRoleHead {
+            role_group,
             network,
+            specialist_heads: [
+                SoccerPolicySpecialistKind::Passing,
+                SoccerPolicySpecialistKind::Dribbling,
+                SoccerPolicySpecialistKind::Shooting,
+                SoccerPolicySpecialistKind::Goalkeeping,
+            ]
+            .into_iter()
+            .map(|kind| SoccerPolicySpecialistHead::new(kind, role_seed))
+            .collect(),
             training_steps: 0,
             last_loss: None,
         }
     }
 
-    /// `π(family | s)` for a state-feature vector. Returns `None` on a malformed
-    /// (non-finite / mis-dimensioned) input so a degenerate actor stays out of play.
     fn action_distribution(
         &self,
         state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
@@ -30718,8 +30958,46 @@ impl SoccerPolicyHead {
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
         }
-        let probs = self.network.action_probabilities(&state_features[..]);
-        probs.iter().all(|p| p.is_finite()).then_some(probs)
+        let role = self.role_group.as_player_role();
+        let mut probs = self.network.action_probabilities(&state_features[..]);
+        if probs.iter().any(|p| !p.is_finite()) {
+            return None;
+        }
+        // Each independently trained specialist redistributes probability only WITHIN its
+        // technical family; multiplying by `N` preserves that family's expected mass, while
+        // the role head remains responsible for pass-vs-dribble-vs-shot selection.
+        for specialist in self
+            .specialist_heads
+            .iter()
+            .filter(|head| head.training_steps > 0 && head.kind.applies_to_role(role))
+        {
+            if specialist.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+                || specialist.network.output_dim != specialist.kind.actions().len()
+            {
+                return None;
+            }
+            let local = specialist.network.action_probabilities(&state_features[..]);
+            if local.iter().any(|p| !p.is_finite()) {
+                return None;
+            }
+            let family_scale = specialist.kind.actions().len() as f64;
+            for (local_index, action) in specialist.kind.actions().iter().enumerate() {
+                if let Some(global_index) = SOCCER_POLICY_ACTIONS
+                    .iter()
+                    .position(|candidate| candidate == action)
+                {
+                    probs[global_index] *= local[local_index] * family_scale;
+                }
+            }
+        }
+        let sum = probs.iter().sum::<f64>();
+        if !sum.is_finite() || sum <= 1e-12 {
+            return None;
+        }
+        for probability in &mut probs {
+            *probability /= sum;
+        }
+        Some(probs)
     }
 
     fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
@@ -30749,22 +31027,34 @@ impl SoccerPolicyHead {
         sample.advantage * ppo_ratio
     }
 
-    /// One advantage policy-gradient pass over a batch of samples.
-    fn train(&mut self, samples: &[SoccerPolicySample], mappo_clip_epsilon: Option<f64>) {
+    fn train(
+        &mut self,
+        samples: &[SoccerPolicySample],
+        mappo_clip_epsilon: Option<f64>,
+    ) -> (usize, f64) {
+        let role = self.role_group.as_player_role();
+        let prepared: Vec<(&SoccerPolicySample, f64)> = samples
+            .iter()
+            .filter(|sample| {
+                SoccerPolicyRoleGroup::from_role(soccer_policy_role_from_features(
+                    &sample.state_features,
+                )) == self.role_group
+            })
+            .filter_map(|sample| {
+                let advantage = match mappo_clip_epsilon {
+                    Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon),
+                    None => sample.advantage,
+                };
+                advantage.is_finite().then_some((sample, advantage))
+            })
+            .collect();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
-        for sample in samples {
-            let advantage = match mappo_clip_epsilon {
-                Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon),
-                None => sample.advantage,
-            };
-            if !advantage.is_finite() {
-                continue;
-            }
+        for (sample, advantage) in &prepared {
             let result = self.network.train_policy_gradient_sample(
                 &sample.state_features[..],
                 sample.action_index,
-                advantage,
+                *advantage,
                 SOCCER_POLICY_ENTROPY_COEFF,
                 SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
@@ -30773,6 +31063,127 @@ impl SoccerPolicyHead {
                 loss_sum += result.loss;
                 applied += 1;
             }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+        for specialist in &mut self.specialist_heads {
+            if !specialist.kind.applies_to_role(role) {
+                continue;
+            }
+            let mut specialist_loss = 0.0;
+            let mut specialist_applied = 0usize;
+            for (sample, advantage) in &prepared {
+                let Some(local_action_index) = specialist.local_action_index(sample.action_index)
+                else {
+                    continue;
+                };
+                let result = specialist.network.train_policy_gradient_sample(
+                    &sample.state_features[..],
+                    local_action_index,
+                    *advantage,
+                    SOCCER_POLICY_ENTROPY_COEFF,
+                    SOCCER_POLICY_LEARNING_RATE,
+                    SOCCER_POLICY_GRAD_CLIP_NORM,
+                );
+                if result.applied && result.loss.is_finite() {
+                    specialist_loss += result.loss;
+                    specialist_applied += 1;
+                }
+            }
+            if specialist_applied > 0 {
+                specialist.training_steps = specialist
+                    .training_steps
+                    .saturating_add(specialist_applied);
+                specialist.last_loss = Some(specialist_loss / specialist_applied as f64);
+            }
+        }
+        (applied, loss_sum)
+    }
+}
+
+/// The neural **actor set**: independent `π(family | s, role, assigned-position)`
+/// heads for GK/DEF/MID/FWD, each with its own passing/dribbling/shooting/GK
+/// specialists. The critic still supplies the advantage, but gradients are no
+/// longer pooled across positions.
+pub(crate) struct SoccerPolicyHead {
+    role_heads: Vec<SoccerPolicyRoleHead>,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerPolicyHead {
+    fn new(seed: u32) -> Self {
+        SoccerPolicyHead {
+            role_heads: SoccerPolicyRoleGroup::all()
+                .into_iter()
+                .map(|role_group| SoccerPolicyRoleHead::new(role_group, seed))
+                .collect(),
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn role_head_for_group(&self, role_group: SoccerPolicyRoleGroup) -> Option<&SoccerPolicyRoleHead> {
+        self.role_heads
+            .iter()
+            .find(|head| head.role_group == role_group)
+    }
+
+    fn role_head_for_group_mut(
+        &mut self,
+        role_group: SoccerPolicyRoleGroup,
+    ) -> Option<&mut SoccerPolicyRoleHead> {
+        self.role_heads
+            .iter_mut()
+            .find(|head| head.role_group == role_group)
+    }
+
+    fn role_head_for_role(&self, role: PlayerRole) -> Option<&SoccerPolicyRoleHead> {
+        self.role_head_for_group(SoccerPolicyRoleGroup::from_role(role))
+    }
+
+    #[cfg(test)]
+    fn role_head_for_role_mut(&mut self, role: PlayerRole) -> Option<&mut SoccerPolicyRoleHead> {
+        self.role_head_for_group_mut(SoccerPolicyRoleGroup::from_role(role))
+    }
+
+    /// `π(family | s)` for a state-feature vector. Returns `None` on a malformed
+    /// (non-finite / mis-dimensioned) input so a degenerate actor stays out of play.
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        self.action_distribution_for_role(
+            state_features,
+            soccer_policy_role_from_features(state_features),
+        )
+    }
+
+    fn action_distribution_for_role(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+        role: PlayerRole,
+    ) -> Option<Vec<f64>> {
+        self.role_head_for_role(role)?.action_distribution(state_features)
+    }
+
+    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
+        let role = soccer_policy_role_from_features(&sample.state_features);
+        self.role_head_for_role(role)
+            .map(|head| head.clipped_mappo_advantage(sample, clip_epsilon))
+            .unwrap_or(sample.advantage)
+    }
+
+    /// One advantage policy-gradient pass over a batch of samples.
+    fn train(&mut self, samples: &[SoccerPolicySample], mappo_clip_epsilon: Option<f64>) {
+        let mut loss_sum = 0.0;
+        let mut applied = 0usize;
+        for head in &mut self.role_heads {
+            let (role_applied, role_loss_sum) = head.train(samples, mappo_clip_epsilon);
+            applied += role_applied;
+            loss_sum += role_loss_sum;
         }
         if applied > 0 {
             self.training_steps = self.training_steps.saturating_add(applied);
@@ -31488,29 +31899,35 @@ fn migrate_soccer_neural_input_weight_row(row: &[f64], legacy_input_dim: usize) 
     migrated
 }
 
-fn build_soccer_neural_network_from_snapshot(
+fn build_soccer_feed_forward_network_from_snapshot(
     snapshot: &SoccerNeuralNetworkSnapshot,
+    expected_input_dim: usize,
+    expected_output_dim: usize,
+    legacy_input_dims: &[usize],
+    label: &str,
 ) -> Result<FeedForwardNetwork, String> {
-    let migrates_legacy_input = snapshot.input_dim != SOCCER_NEURAL_FEATURE_DIM
-        && SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&snapshot.input_dim)
-        && snapshot.input_dim < SOCCER_NEURAL_FEATURE_DIM;
-    if snapshot.input_dim != SOCCER_NEURAL_FEATURE_DIM && !migrates_legacy_input {
+    let migrates_legacy_input = snapshot.input_dim != expected_input_dim
+        && legacy_input_dims.contains(&snapshot.input_dim)
+        && snapshot.input_dim < expected_input_dim;
+    if snapshot.input_dim != expected_input_dim && !migrates_legacy_input {
         return Err(format!(
-            "soccer neural snapshot input_dim {} does not match expected {}",
-            snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM
+            "{label} snapshot input_dim {} does not match expected {}",
+            snapshot.input_dim, expected_input_dim
         ));
     }
-    if snapshot.output_dim != 1 {
+    if snapshot.output_dim != expected_output_dim {
         return Err(format!(
-            "soccer neural snapshot output_dim {} does not match expected 1",
-            snapshot.output_dim
+            "{label} snapshot output_dim {} does not match expected {}",
+            snapshot.output_dim, expected_output_dim
         ));
     }
     if !snapshot.l2_norm.is_finite() || snapshot.l2_norm < 0.0 {
-        return Err("soccer neural snapshot l2_norm must be finite and non-negative".to_string());
+        return Err(format!(
+            "{label} snapshot l2_norm must be finite and non-negative"
+        ));
     }
     if snapshot.layers.is_empty() {
-        return Err("soccer neural snapshot must contain at least one layer".to_string());
+        return Err(format!("{label} snapshot must contain at least one layer"));
     }
 
     let mut expected_input_dim = snapshot.input_dim;
@@ -31519,12 +31936,12 @@ fn build_soccer_neural_network_from_snapshot(
         let output_dim = layer.biases.len();
         if output_dim == 0 {
             return Err(format!(
-                "soccer neural snapshot layer {layer_index} has no biases"
+                "{label} snapshot layer {layer_index} has no biases"
             ));
         }
         if layer.weights.len() != output_dim {
             return Err(format!(
-                "soccer neural snapshot layer {layer_index} has {} weight rows for {} biases",
+                "{label} snapshot layer {layer_index} has {} weight rows for {} biases",
                 layer.weights.len(),
                 output_dim
             ));
@@ -31532,20 +31949,20 @@ fn build_soccer_neural_network_from_snapshot(
         for (row_index, row) in layer.weights.iter().enumerate() {
             if row.len() != expected_input_dim {
                 return Err(format!(
-                    "soccer neural snapshot layer {layer_index} row {row_index} has input dim {}, expected {}",
+                    "{label} snapshot layer {layer_index} row {row_index} has input dim {}, expected {}",
                     row.len(),
                     expected_input_dim
                 ));
             }
             if row.iter().any(|value| !value.is_finite()) {
                 return Err(format!(
-                    "soccer neural snapshot layer {layer_index} row {row_index} has non-finite weights"
+                    "{label} snapshot layer {layer_index} row {row_index} has non-finite weights"
                 ));
             }
         }
         if layer.biases.iter().any(|value| !value.is_finite()) {
             return Err(format!(
-                "soccer neural snapshot layer {layer_index} has non-finite biases"
+                "{label} snapshot layer {layer_index} has non-finite biases"
             ));
         }
         let mut weights = layer.weights.clone();
@@ -31563,7 +31980,7 @@ fn build_soccer_neural_network_from_snapshot(
     }
     if expected_input_dim != snapshot.output_dim {
         return Err(format!(
-            "soccer neural snapshot final layer output dim {expected_input_dim} does not match declared {}",
+            "{label} snapshot final layer output dim {expected_input_dim} does not match declared {}",
             snapshot.output_dim
         ));
     }
@@ -31574,12 +31991,38 @@ fn build_soccer_neural_network_from_snapshot(
         && snapshot.parameter_count != network.num_parameters()
     {
         return Err(format!(
-            "soccer neural snapshot parameter_count {} does not match decoded {}",
+            "{label} snapshot parameter_count {} does not match decoded {}",
             snapshot.parameter_count,
             network.num_parameters()
         ));
     }
     Ok(network)
+}
+
+fn build_soccer_neural_network_from_snapshot(
+    snapshot: &SoccerNeuralNetworkSnapshot,
+) -> Result<FeedForwardNetwork, String> {
+    build_soccer_feed_forward_network_from_snapshot(
+        snapshot,
+        SOCCER_NEURAL_FEATURE_DIM,
+        1,
+        &SOCCER_NEURAL_LEGACY_FEATURE_DIMS,
+        "soccer neural",
+    )
+}
+
+fn build_soccer_policy_network_from_snapshot(
+    snapshot: &SoccerNeuralNetworkSnapshot,
+    output_dim: usize,
+    label: &str,
+) -> Result<FeedForwardNetwork, String> {
+    build_soccer_feed_forward_network_from_snapshot(
+        snapshot,
+        SOCCER_POLICY_FEATURE_DIM,
+        output_dim,
+        &[],
+        label,
+    )
 }
 
 fn soccer_neural_activation_label(activation: ActivationName) -> &'static str {
@@ -31610,7 +32053,163 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         // when the snapshot is exposed for persistence; the raw weight snapshot is neutral.
         training_steps: 0,
         average_loss: None,
+        policy_head: None,
     }
+}
+
+fn soccer_policy_specialist_head_snapshot(
+    specialist: &SoccerPolicySpecialistHead,
+) -> SoccerPolicySpecialistHeadSnapshot {
+    let mut network = soccer_neural_network_snapshot(&specialist.network);
+    network.training_steps = specialist.training_steps;
+    network.average_loss = specialist.last_loss;
+    SoccerPolicySpecialistHeadSnapshot {
+        kind: specialist.kind.as_str().to_string(),
+        network,
+        training_steps: specialist.training_steps,
+        average_loss: specialist.last_loss,
+    }
+}
+
+fn soccer_policy_role_head_snapshot(head: &SoccerPolicyRoleHead) -> SoccerPolicyRoleHeadSnapshot {
+    let mut network = soccer_neural_network_snapshot(&head.network);
+    network.training_steps = head.training_steps;
+    network.average_loss = head.last_loss;
+    SoccerPolicyRoleHeadSnapshot {
+        role: head.role_group.as_str().to_string(),
+        network,
+        training_steps: head.training_steps,
+        average_loss: head.last_loss,
+        specialist_heads: head
+            .specialist_heads
+            .iter()
+            .map(soccer_policy_specialist_head_snapshot)
+            .collect(),
+    }
+}
+
+fn soccer_policy_head_snapshot(head: &SoccerPolicyHead) -> SoccerPolicyHeadSnapshot {
+    let fallback = head
+        .role_heads
+        .iter()
+        .find(|role_head| role_head.role_group == SoccerPolicyRoleGroup::Midfielder)
+        .or_else(|| head.role_heads.first())
+        .expect("policy actor set has at least one role head");
+    let mut network = soccer_neural_network_snapshot(&fallback.network);
+    network.training_steps = head.training_steps;
+    network.average_loss = head.last_loss;
+    let specialist_heads = fallback
+        .specialist_heads
+        .iter()
+        .map(soccer_policy_specialist_head_snapshot)
+        .collect();
+    SoccerPolicyHeadSnapshot {
+        network,
+        training_steps: head.training_steps,
+        average_loss: head.last_loss,
+        specialist_heads,
+        role_heads: head
+            .role_heads
+            .iter()
+            .map(soccer_policy_role_head_snapshot)
+            .collect(),
+    }
+}
+
+fn restore_soccer_policy_specialists_from_snapshot(
+    specialists: &mut [SoccerPolicySpecialistHead],
+    specialist_snapshots: &[SoccerPolicySpecialistHeadSnapshot],
+) -> Result<(), String> {
+    for specialist_snapshot in specialist_snapshots {
+        let Some(kind) = SoccerPolicySpecialistKind::from_str(&specialist_snapshot.kind) else {
+            continue;
+        };
+        let network = build_soccer_policy_network_from_snapshot(
+            &specialist_snapshot.network,
+            kind.actions().len(),
+            kind.as_str(),
+        )?;
+        if let Some(specialist) = specialists
+            .iter_mut()
+            .find(|specialist| specialist.kind == kind)
+        {
+            specialist.network = network;
+            specialist.training_steps = specialist_snapshot
+                .training_steps
+                .max(specialist_snapshot.network.training_steps);
+            specialist.last_loss = specialist_snapshot
+                .average_loss
+                .or(specialist_snapshot.network.average_loss);
+        }
+    }
+    Ok(())
+}
+
+fn restore_soccer_policy_role_head_from_snapshot(
+    role_head: &mut SoccerPolicyRoleHead,
+    snapshot: &SoccerPolicyRoleHeadSnapshot,
+) -> Result<(), String> {
+    role_head.network = build_soccer_policy_network_from_snapshot(
+        &snapshot.network,
+        SOCCER_POLICY_ACTIONS.len(),
+        snapshot.role.as_str(),
+    )?;
+    role_head.training_steps = snapshot.training_steps.max(snapshot.network.training_steps);
+    role_head.last_loss = snapshot.average_loss.or(snapshot.network.average_loss);
+    restore_soccer_policy_specialists_from_snapshot(
+        &mut role_head.specialist_heads,
+        &snapshot.specialist_heads,
+    )
+}
+
+fn soccer_policy_head_from_snapshot(
+    snapshot: &SoccerPolicyHeadSnapshot,
+    seed: u32,
+) -> Result<SoccerPolicyHead, String> {
+    let mut head = SoccerPolicyHead::new(seed);
+
+    if snapshot.role_heads.is_empty() {
+        for role_head in &mut head.role_heads {
+            role_head.network = build_soccer_policy_network_from_snapshot(
+                &snapshot.network,
+                SOCCER_POLICY_ACTIONS.len(),
+                role_head.role_group.as_str(),
+            )?;
+            role_head.training_steps = snapshot.training_steps.max(snapshot.network.training_steps);
+            role_head.last_loss = snapshot.average_loss.or(snapshot.network.average_loss);
+            restore_soccer_policy_specialists_from_snapshot(
+                &mut role_head.specialist_heads,
+                &snapshot.specialist_heads,
+            )?;
+        }
+    } else {
+        for role_snapshot in &snapshot.role_heads {
+            let Some(role_group) = SoccerPolicyRoleGroup::from_str(&role_snapshot.role) else {
+                continue;
+            };
+            if let Some(role_head) = head.role_head_for_group_mut(role_group) {
+                restore_soccer_policy_role_head_from_snapshot(role_head, role_snapshot)?;
+            }
+        }
+    }
+
+    let role_training_steps = head
+        .role_heads
+        .iter()
+        .map(|role_head| role_head.training_steps)
+        .sum::<usize>();
+    head.training_steps = snapshot.training_steps.max(role_training_steps);
+    head.last_loss = snapshot.average_loss.or_else(|| {
+        let (sum, count) = head
+            .role_heads
+            .iter()
+            .filter_map(|role_head| role_head.last_loss)
+            .fold((0.0, 0usize), |(sum, count), loss| {
+                (sum + loss, count + 1)
+            });
+        (count > 0).then_some(sum / count as f64)
+    });
+    Ok(head)
 }
 
 fn soccer_neural_bool(value: bool) -> f64 {
@@ -31727,15 +32326,76 @@ fn soccer_policy_role_embedding(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EM
     embedding
 }
 
+fn soccer_policy_position_embedding(
+    role: PlayerRole,
+    assigned_grid: PitchGridAddress,
+) -> [f64; SOCCER_POLICY_POSITION_EMBEDDING_DIM] {
+    let mut embedding = [0.0; SOCCER_POLICY_POSITION_EMBEDDING_DIM];
+    let index = if role == PlayerRole::Goalkeeper {
+        0
+    } else {
+        let cell = assigned_grid.fine;
+        let lane = if cell.columns <= 1 {
+            1
+        } else {
+            let x = cell.x.min(cell.columns - 1) as f64 / (cell.columns - 1) as f64;
+            if x < 1.0 / 3.0 {
+                0
+            } else if x > 2.0 / 3.0 {
+                2
+            } else {
+                1
+            }
+        };
+        match role {
+            PlayerRole::Goalkeeper => 0,
+            PlayerRole::Defender => 1 + lane,
+            PlayerRole::Midfielder => 4 + lane,
+            PlayerRole::Forward => 7 + lane,
+        }
+    };
+    embedding[index] = 1.0;
+    embedding
+}
+
 fn soccer_policy_features_for_role(
     state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
     role: PlayerRole,
 ) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
+    soccer_policy_features_for_role_and_position(state_features, role, PitchGridAddress::default())
+}
+
+fn soccer_policy_features_for_role_and_position(
+    state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+    role: PlayerRole,
+    assigned_grid: PitchGridAddress,
+) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
     let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
     features[..SOCCER_NEURAL_FEATURE_DIM].copy_from_slice(state_features);
     let role_embedding = soccer_policy_role_embedding(role);
-    features[SOCCER_NEURAL_FEATURE_DIM..].copy_from_slice(&role_embedding);
+    let role_end = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
+    features[SOCCER_NEURAL_FEATURE_DIM..role_end].copy_from_slice(&role_embedding);
+    let position_embedding = soccer_policy_position_embedding(role, assigned_grid);
+    features[role_end..].copy_from_slice(&position_embedding);
     features
+}
+
+fn soccer_policy_role_from_features(
+    features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+) -> PlayerRole {
+    let start = SOCCER_NEURAL_FEATURE_DIM;
+    let role_index = features[start..start + SOCCER_POLICY_ROLE_EMBEDDING_DIM]
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(index, _)| index)
+        .unwrap_or(2);
+    match role_index {
+        0 => PlayerRole::Goalkeeper,
+        1 => PlayerRole::Defender,
+        2 => PlayerRole::Midfielder,
+        _ => PlayerRole::Forward,
+    }
 }
 
 fn soccer_neural_phase_feature(phase: TacticalPhase) -> f64 {
@@ -31846,6 +32506,68 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "fake-right-cut-left",
     "xavi-turn",
     "round-goalkeeper",
+    // Keeper-only families. Append-only: persisted actor output indices must remain stable.
+    "keeper-survey-hands",
+    "keeper-foot-control-outside-box",
+    "keeper-mpc-floor-pass",
+    "keeper-mpc-aerial-pass",
+    "keeper-mpc-clearance",
+    "keeper-position",
+    "keeper-save",
+];
+
+const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "flank-low-cross",
+    "flank-high-cross",
+    "clearance",
+    "route-one",
+    "switch-play",
+    "recycle-reset",
+    "wall-pass",
+    "corner-flag-cross",
+    "surprise-pass",
+    "flick-on",
+    "first-time-pass",
+    "scoop-pass",
+];
+
+const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
+    "dribble",
+    "carry-forward",
+    "carry-out-left",
+    "carry-out-right",
+    "protect-ball",
+    "side-step",
+    "left-cut",
+    "right-cut",
+    "nutmeg",
+    "fake-left-cut-right",
+    "fake-right-cut-left",
+    "xavi-turn",
+    "round-goalkeeper",
+];
+
+const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &["shoot", "first-time-shot"];
+
+const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
+    "hold",
+    "space",
+    "control-touch",
+    "pass",
+    "aerial-pass",
+    "clearance",
+    "route-one",
+    "recycle-reset",
+    "keeper-survey-hands",
+    "keeper-foot-control-outside-box",
+    "keeper-mpc-floor-pass",
+    "keeper-mpc-aerial-pass",
+    "keeper-mpc-clearance",
+    "keeper-position",
+    "keeper-save",
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
@@ -31856,6 +32578,13 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
 /// because control-first is a mutually exclusive receiving decision.
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
+    let action = normalize_soccer_action_label(action);
+    if let Some(index) = SOCCER_POLICY_ACTIONS
+        .iter()
+        .position(|candidate| *candidate == action)
+    {
+        return Some(index);
+    }
     let family = match SoccerActionLabel::classify(action)? {
         Hold => "hold",
         Space => "space",
@@ -37791,6 +38520,7 @@ where
     );
 
     let mut neural_learner: Option<SoccerNeuralLearner> = None;
+    let mut policy_head: Option<SoccerPolicyHead> = None;
     let mut initial_neural_network = request.initial_neural_network.clone();
     let mut episode_summaries = Vec::with_capacity(request.episodes);
     let mut goals = 0usize;
@@ -37812,6 +38542,7 @@ where
         policies.away.options = options.clone();
         if reset_neural_learner {
             neural_learner = None;
+            policy_head = None;
         }
 
         let restart = restarts[episode % restarts.len()];
@@ -37828,8 +38559,12 @@ where
             } else if let Some(snapshot) = initial_neural_network.take() {
                 sim.set_neural_network_snapshot(snapshot)?;
             }
+            if sim.neural_blend.actor_critic && sim.policy_head.is_none() {
+                sim.policy_head = policy_head.take();
+            }
         } else {
             sim.neural_learner = None;
+            sim.policy_head = None;
         }
         if let Some(hint) = request.vector_hint.clone() {
             sim.set_coach_set_play_hint(hint);
@@ -37878,6 +38613,7 @@ where
             .take()
             .unwrap_or_else(|| SoccerTeamQPolicies::new(options.clone()));
         neural_learner = sim.neural_learner.take();
+        policy_head = sim.policy_head.take();
         let after_policy_visits = policies.home.visit_count() + policies.away.visit_count();
         let policy_updates = after_policy_visits.saturating_sub(before_policy_visits);
         let summary = SoccerSetPlayTrainingEpisodeSummary {
@@ -40108,6 +40844,7 @@ where
     let mut episode_summaries = Vec::new();
     let mut tactical_summary = SoccerTacticalLearningSummary::default();
     let mut neural_learner: Option<SoccerNeuralLearner> = None;
+    let mut policy_head: Option<SoccerPolicyHead> = None;
     let mut initial_neural_network = initial_neural_network;
     let mut latest_neural_network = None;
     let base_seed = config.seed;
@@ -40124,8 +40861,12 @@ where
             } else if let Some(snapshot) = initial_neural_network.take() {
                 sim.set_neural_network_snapshot(snapshot)?;
             }
+            if sim.neural_blend.actor_critic && sim.policy_head.is_none() {
+                sim.policy_head = policy_head.take();
+            }
         } else {
             sim.neural_learner = None;
+            sim.policy_head = None;
         }
         let progress_interval = (total_ticks / 9).max(1);
         for tick_idx in 0..total_ticks {
@@ -40157,6 +40898,7 @@ where
             .take()
             .unwrap_or_else(|| SoccerTeamQPolicies::new(options.clone()));
         neural_learner = sim.neural_learner.take();
+        policy_head = sim.policy_head.take();
         tactical_summary.merge(&sim.tactical_summary);
         let summary = SoccerSelfPlayEpisodeSummary {
             episode,
@@ -50620,6 +51362,43 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
     let goal_attack_blocks_alternatives =
         goal_attack_shot_blocks_alternatives(&observation, player.role);
     match action {
+        "keeper-survey-hands" => {
+            player.role == PlayerRole::Goalkeeper
+                && observation.has_ball
+                && snapshot.goalkeeper_can_use_hands_at(player.team, player.position)
+        }
+        "keeper-foot-control-outside-box" => {
+            player.role == PlayerRole::Goalkeeper
+                && observation.has_ball
+                && !snapshot.goalkeeper_can_use_hands_at(player.team, player.position)
+        }
+        "keeper-mpc-floor-pass" => {
+            player.role == PlayerRole::Goalkeeper
+                && observation.has_ball
+                && snapshot
+                    .goalkeeper_mpc_play_out_plan(player_id, None)
+                    .is_some_and(|plan| {
+                        plan.target_player.is_some() && plan.flight == PassFlight::Floor
+                    })
+        }
+        "keeper-mpc-aerial-pass" => {
+            player.role == PlayerRole::Goalkeeper
+                && observation.has_ball
+                && snapshot
+                    .goalkeeper_mpc_play_out_plan(player_id, None)
+                    .is_some_and(|plan| {
+                        plan.target_player.is_some() && plan.flight != PassFlight::Floor
+                    })
+        }
+        "keeper-mpc-clearance" => {
+            player.role == PlayerRole::Goalkeeper
+                && observation.has_ball
+                && snapshot
+                    .goalkeeper_mpc_play_out_plan(player_id, None)
+                    .is_some_and(|plan| plan.target_player.is_none())
+        }
+        "keeper-position" => player.role == PlayerRole::Goalkeeper && !observation.has_ball,
+        "keeper-save" => false,
         "shoot" => {
             observation.has_ball
                 && (shot_decision_is_qualified_for_role(&observation, player.role)

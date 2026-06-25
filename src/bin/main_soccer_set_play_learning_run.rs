@@ -87,11 +87,13 @@ fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorith
 
 /// Decision-time coupling of the trained value head, from the environment. The
 /// set-piece curriculum is where it pays off: short restarts give many dense reps
-/// to warm the head before its value drives play. Off by default.
+/// to warm the head before its value drives play. The specialist actor is on by
+/// default so passing/dribbling/shooting/GK heads also get dense set-play reps.
 ///   SOCCER_NEURAL_BLEND_MODE = off | additive | tiebreak | confidence
 ///   SOCCER_NEURAL_BLEND_LAMBDA, SOCCER_NEURAL_BLEND_WARMUP_STEPS (optional)
 fn env_neural_blend() -> Result<SoccerNeuralBlendConfig, Box<dyn Error>> {
     let mut blend = SoccerNeuralBlendConfig::default();
+    blend.actor_critic = true;
     if let Some(value) = env_value("SOCCER_NEURAL_BLEND_MODE") {
         blend.mode = match value.to_ascii_lowercase().as_str() {
             "off" | "none" => SoccerNeuralBlendMode::Off,
