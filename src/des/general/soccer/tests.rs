@@ -28922,6 +28922,50 @@ fn assigned_position_derivation_splits_roles_by_anchor() {
 }
 
 #[test]
+fn keeper_action_mapping_and_commit_preference() {
+    // Distribution techniques map to short/long; coming off the line reads as a commit.
+    let long = soccer_keeper_action_index_for("clearance", false).expect("long distribution");
+    assert_eq!(SOCCER_KEEPER_ACTIONS[long], "distribute-long");
+    let short = soccer_keeper_action_index_for("pass", false).expect("short distribution");
+    assert_eq!(SOCCER_KEEPER_ACTIONS[short], "distribute-short");
+    let sweep = soccer_keeper_action_index_for("move", true).expect("keeper off line = sweep");
+    assert_eq!(SOCCER_KEEPER_ACTIONS[sweep], "sweep");
+    let set = soccer_keeper_action_index_for("move", false).expect("keeper on line = set");
+    assert_eq!(SOCCER_KEEPER_ACTIONS[set], "set");
+    assert!(soccer_keeper_action_is_commit(sweep));
+    assert!(!soccer_keeper_action_is_commit(set));
+}
+
+#[test]
+fn keeper_policy_head_learns_to_commit() {
+    let mut head = SoccerKeeperPolicyHead::new(13);
+    let state = soccer_policy_features_for_role(
+        &[0.05f64; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Goalkeeper,
+        None,
+    );
+    let sweep_idx = SOCCER_KEEPER_ACTIONS
+        .iter()
+        .position(|&a| a == "sweep")
+        .expect("sweep action");
+    let before = head.commit_preference(&state).expect("finite commit preference");
+    // Reward sweeping a few times; the keeper's commit preference should rise.
+    let samples: Vec<SoccerKeeperPolicySample> = (0..8)
+        .map(|_| SoccerKeeperPolicySample {
+            state_features: state,
+            action_index: sweep_idx,
+            advantage: 1.0,
+        })
+        .collect();
+    head.train(&samples);
+    let after = head.commit_preference(&state).expect("finite commit preference");
+    assert!(
+        after > before,
+        "rewarding sweeps should raise the keeper's commit preference: {before} -> {after}"
+    );
+}
+
+#[test]
 fn skill_group_partitions_technical_families() {
     // Each technical family resolves to its group with a valid head-local index.
     let pass_idx = soccer_policy_action_index("killer-pass").expect("killer-pass family");

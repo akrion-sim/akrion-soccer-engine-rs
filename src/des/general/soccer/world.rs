@@ -202,6 +202,10 @@ pub struct SoccerMatch {
     /// only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
     /// log-probabilities refine technical action selection on top of the joint actor.
     pub(crate) skill_policy_heads: Option<SoccerSkillPolicyHeads>,
+    /// Dedicated goalkeeper actor over the keeper action vocabulary, biasing the keeper's
+    /// come-for-the-ball decision. Present only when the actor is active AND
+    /// `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is set.
+    pub(crate) keeper_policy_head: Option<SoccerKeeperPolicyHead>,
     /// The learned **world model** `P̂(s'|s,a)` over the feature space, trained on
     /// consecutive transitions. Present only when `neural_blend.world_model` is on.
     pub(crate) world_model: Option<SoccerWorldModel>,
@@ -1601,6 +1605,7 @@ impl SoccerMatch {
             neural_blend: config.neural_blend,
             policy_head: None,
             skill_policy_heads: None,
+            keeper_policy_head: None,
             world_model: None,
             human_inputs: SharedHumanInputs::new(),
             latched_human_inputs: HashMap::new(),
@@ -4555,6 +4560,79 @@ impl SoccerMatch {
         }
     }
 
+    fn ensure_keeper_policy_head(&mut self) {
+        if self.keeper_policy_head.is_none() {
+            self.keeper_policy_head = Some(SoccerKeeperPolicyHead::new(self.config.seed));
+        }
+    }
+
+    /// The dedicated GK head's sweep-vs-set commit preference for `team`'s keeper, evaluated on the
+    /// given snapshot's features. `0.0` unless the head is built and produces a finite distribution.
+    pub(crate) fn keeper_commit_bias_for(&self, team: Team, snapshot: &WorldSnapshot) -> f64 {
+        let Some(keeper_head) = self.keeper_policy_head.as_ref() else {
+            return 0.0;
+        };
+        let Some(keeper_id) = self.goalkeeper_for(team) else {
+            return 0.0;
+        };
+        let mdp_state = snapshot.mdp_state_for_player(keeper_id);
+        let observation = snapshot.observation_for(keeper_id);
+        let transition = self.neural_decision_transition(
+            snapshot,
+            keeper_id,
+            team,
+            PlayerRole::Goalkeeper,
+            &mdp_state,
+            &observation,
+        );
+        let features = self.policy_state_features(&transition);
+        keeper_head.commit_preference(&features).unwrap_or(0.0)
+    }
+
+    /// Build one-step training samples for the dedicated goalkeeper head from a replay: each
+    /// keeper transition's realised behaviour mapped to a keeper-vocabulary action, with the
+    /// transition reward (now carrying the keeper save reward + concede penalty) as the advantage.
+    fn neural_keeper_policy_training_samples(
+        &self,
+        replay: &[SoccerLearningTransition],
+    ) -> Vec<SoccerKeeperPolicySample> {
+        replay
+            .iter()
+            .filter(|transition| transition.role == PlayerRole::Goalkeeper)
+            .filter_map(|transition| {
+                // A keeper sitting near its own goal line is holding; one well off it has come out.
+                let own_goal_y = match transition.team {
+                    Team::Home => 0.0,
+                    Team::Away => self.config.field_length_yards,
+                };
+                let keeper_left_line = self
+                    .players
+                    .iter()
+                    .find(|player| player.id == transition.player_id)
+                    .map(|player| (player.home_position.y - own_goal_y).abs() < f64::INFINITY)
+                    .unwrap_or(false)
+                    && self
+                        .players
+                        .iter()
+                        .find(|player| player.id == transition.player_id)
+                        .map(|player| (player.position.y - own_goal_y).abs() > 6.0)
+                        .unwrap_or(false);
+                let action_index =
+                    soccer_keeper_action_index_for(&transition.action, keeper_left_line)?;
+                let advantage = transition.reward;
+                if !advantage.is_finite() {
+                    return None;
+                }
+                let state_features = self.policy_state_features(transition);
+                Some(SoccerKeeperPolicySample {
+                    state_features,
+                    action_index,
+                    advantage,
+                })
+            })
+            .collect()
+    }
+
     fn ensure_world_model(&mut self) {
         if self.world_model.is_none() {
             self.world_model = Some(SoccerWorldModel::new(self.config.seed));
@@ -4732,6 +4810,15 @@ impl SoccerMatch {
             } else {
                 Vec::new()
             };
+        // Dedicated goalkeeper head samples: keeper transitions only, one-step reward as advantage.
+        let keeper_policy_samples = if self.neural_blend.actor_critic
+            && self.config.neural_learning.enabled
+            && dd_soccer_enable_keeper_policy_head()
+        {
+            self.neural_keeper_policy_training_samples(&replay)
+        } else {
+            Vec::new()
+        };
         // World model: predict-next-state pairs from the *current* features
         // (built before the value update, like the actor's advantages).
         let world_model_pairs =
@@ -4772,6 +4859,14 @@ impl SoccerMatch {
                 if let Some(skill_heads) = &mut self.skill_policy_heads {
                     skill_heads.train(&policy_samples);
                 }
+            }
+        }
+        // Dedicated goalkeeper head: trained on the keeper's own transitions (gate checked when
+        // the samples were built, so a non-empty batch already implies the gate is on).
+        if !keeper_policy_samples.is_empty() {
+            self.ensure_keeper_policy_head();
+            if let Some(keeper_head) = &mut self.keeper_policy_head {
+                keeper_head.train(&keeper_policy_samples);
             }
         }
         if !world_model_pairs.is_empty() {
@@ -16586,6 +16681,12 @@ pub struct TeammateSpacingNotice {
 #[serde(rename_all = "camelCase")]
 pub struct WorldSnapshot {
     pub tick: u64,
+    /// Dedicated GK head's sweep-vs-set commit bias per team (`[home, away]`), in `[-1, 1]`.
+    /// `0.0` unless `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is on and the head is warm; read by
+    /// [`WorldSnapshot::goalkeeper_should_commit_to_loose_ball`]. Computed on the sim side (where
+    /// the head lives) when the snapshot is built. `#[serde(default)]` keeps old snapshots loadable.
+    #[serde(default)]
+    pub(crate) keeper_commit_bias: [f64; 2],
     // Per-tick memo of pass-target rankings. A snapshot is one immutable world state, so
     // a ranking computed once stays valid for its whole lifetime; this collapses the many
     // identical ranked_*_pass_targets calls a single decision makes (visible variant alone
@@ -17246,6 +17347,11 @@ const KEEPER_SAVE_DANGER_FLOOR: f64 = 0.2;
 /// Distance (yards from goal) at/inside which a denied shot counts as maximally dangerous
 /// for the keeper's reward; danger tapers from 1.0 here to the floor at the 18-yard box edge.
 const KEEPER_SAVE_FULL_DANGER_DISTANCE_YARDS: f64 = 6.0;
+
+/// How strongly the dedicated GK head's sweep-vs-set preference shifts the keeper's
+/// come-for-the-ball margin. Bounded so a confident head nudges — but cannot dominate — the
+/// physics/genome decision (the head's preference is in `[-1, 1]`).
+const KEEPER_HEAD_COMMIT_BIAS_WEIGHT: f64 = 0.4;
 fn dd_soccer_disable_wall_pass_reward() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -17678,6 +17784,14 @@ impl WorldSnapshot {
         Self::from_match_with_options(m, WorldSnapshotOptions::FULL)
     }
 
+    /// Dedicated GK head commit bias for `team`'s keeper (`0.0` when the head is disabled/cold).
+    pub(crate) fn keeper_commit_bias(&self, team: Team) -> f64 {
+        match team {
+            Team::Home => self.keeper_commit_bias[0],
+            Team::Away => self.keeper_commit_bias[1],
+        }
+    }
+
     pub(crate) fn from_match_for_agent_decision(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::AGENT_DECISION)
     }
@@ -17869,8 +17983,9 @@ impl WorldSnapshot {
         let (away_recycle_urgency, away_recycle_participants) =
             m.recycled_possession_urgency(Team::Away);
 
-        WorldSnapshot {
+        let mut snapshot = WorldSnapshot {
             tick: m.tick,
+            keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             home_genome: m.home_genome.clone(),
@@ -17932,7 +18047,15 @@ impl WorldSnapshot {
             away_recycle_participants,
             opponent_press_tendency: m.opponent_press_tendency_map(),
             player_tick_carryover: m.player_tick_carryover.clone(),
+        };
+        // Dedicated GK head (gated): read each keeper's sweep-vs-set preference off this snapshot's
+        // features so the come-for-the-ball decision can use it. Gate-off ⇒ left at 0.0 (free).
+        if dd_soccer_enable_keeper_policy_head() {
+            snapshot.keeper_commit_bias =
+                [m.keeper_commit_bias_for(Team::Home, &snapshot),
+                 m.keeper_commit_bias_for(Team::Away, &snapshot)];
         }
+        snapshot
     }
 
     /// Recycled-possession urgency (0 = none) and the players the possession is bouncing
@@ -26200,7 +26323,15 @@ impl WorldSnapshot {
             // aggressive keeper needs the teammate to beat it by a larger margin
             // before backing off (commits more); a passive keeper defers sooner.
             // Neutral (0.5) keeps the base margins.
-            let margin_scale = 0.5 + self.genome_for(gk.team).gk_commit_aggression;
+            // The dedicated GK head's sweep-vs-set preference shifts this margin on top of the
+            // genome aggression (head prefers sweeping ⇒ wider margin ⇒ commits more). The bias is
+            // computed on the sim side (where the head lives) and threaded in via the snapshot;
+            // `keeper_commit_bias` is 0.0 unless the keeper head is enabled and warm.
+            let head_bias = self.keeper_commit_bias(gk.team);
+            let margin_scale = (0.5
+                + self.genome_for(gk.team).gk_commit_aggression
+                + KEEPER_HEAD_COMMIT_BIAS_WEIGHT * head_bias)
+                .max(0.0);
             let defer_margin = GK_BOX_DEFER_TO_TEAMMATE_MARGIN_SECONDS * margin_scale;
             let over_opp_margin = GK_BOX_TEAMMATE_OVER_OPPONENT_MARGIN_SECONDS * margin_scale;
             let teammate_clearly_wins = teammate_time + defer_margin < gk_time

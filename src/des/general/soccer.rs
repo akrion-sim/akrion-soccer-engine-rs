@@ -31045,6 +31045,156 @@ impl SoccerSkillPolicyHeads {
     }
 }
 
+/// The dedicated **goalkeeper** action vocabulary. The outfield actor's 38 families are all
+/// outfield-centric, so the keeper had no learnable decisions of its own; this gives the GK head
+/// its own keeping choices (positioning, coming for the ball, shot-stop intent, and distribution).
+const SOCCER_KEEPER_ACTIONS: &[&str] = &[
+    "set",
+    "step-out",
+    "sweep",
+    "claim-cross",
+    "catch",
+    "parry",
+    "dive-left",
+    "dive-right",
+    "dive-center",
+    "distribute-short",
+    "distribute-long",
+];
+
+/// The keeper actions that mean "come off the line / commit" (vs. holding position). Used to read
+/// the GK head's aggression as a single sweep-vs-set preference for the commit decision hook.
+fn soccer_keeper_action_is_commit(index: usize) -> bool {
+    matches!(
+        SOCCER_KEEPER_ACTIONS.get(index).copied(),
+        Some("step-out") | Some("sweep") | Some("claim-cross")
+    )
+}
+
+/// Map a goalkeeper transition's realised action label + geometry to a keeper-vocabulary index, so
+/// the dedicated GK head can be trained on the keeper's own experience. Distribution actions split
+/// short/long by technique; a keeper that has left its line reads as a commit (sweep); otherwise it
+/// is holding its set position. Save micro-actions (catch/parry/dive) are resolved in the shot
+/// physics, not the decision replay, so they are not derived here.
+fn soccer_keeper_action_index_for(action: &str, keeper_left_line: bool) -> Option<usize> {
+    let label = match SoccerActionLabel::classify(action) {
+        Some(SoccerActionLabel::AerialPass)
+        | Some(SoccerActionLabel::RouteOne)
+        | Some(SoccerActionLabel::Clearance) => "distribute-long",
+        Some(SoccerActionLabel::Pass)
+        | Some(SoccerActionLabel::FirstTimePass)
+        | Some(SoccerActionLabel::ScoopPass)
+        | Some(SoccerActionLabel::SwitchPlay) => "distribute-short",
+        _ if keeper_left_line => "sweep",
+        _ => "set",
+    };
+    SOCCER_KEEPER_ACTIONS.iter().position(|&a| a == label)
+}
+
+/// The dedicated goalkeeper actor: `π(keeper-action | s)` over [`SOCCER_KEEPER_ACTIONS`], separate
+/// from the outfield actor so keeping is learned in its own right (against the keeper save reward
+/// and concede penalty) instead of sharing the outfield policy. Same shared feature input.
+pub(crate) struct SoccerKeeperPolicyHead {
+    network: FeedForwardNetwork,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerKeeperPolicyHead {
+    fn new(seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ 0x4B1D_9E3F);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                output_dim: SOCCER_KEEPER_ACTIONS.len(),
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerKeeperPolicyHead {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+            || self.network.output_dim != SOCCER_KEEPER_ACTIONS.len()
+        {
+            return None;
+        }
+        if state_features.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let probs = self.network.action_probabilities(&state_features[..]);
+        probs.iter().all(|p| p.is_finite()).then(|| probs.to_vec())
+    }
+
+    /// Net preference `∈ [-1, 1]` for committing off the line (sweep/step/claim) over holding the
+    /// set position: `P(commit) - P(set)`. `None` on a cold/degenerate head.
+    fn commit_preference(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<f64> {
+        let dist = self.action_distribution(state_features)?;
+        let commit: f64 = dist
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| soccer_keeper_action_is_commit(*i))
+            .map(|(_, &p)| p)
+            .sum();
+        let set = SOCCER_KEEPER_ACTIONS
+            .iter()
+            .position(|&a| a == "set")
+            .and_then(|i| dist.get(i).copied())
+            .unwrap_or(0.0);
+        Some((commit - set).clamp(-1.0, 1.0))
+    }
+
+    /// One-step advantage policy-gradient pass over the keeper's own transitions. `samples` carry
+    /// the keeper-vocabulary action index and the transition reward (which now includes the keeper
+    /// save reward and concede penalty) as the advantage.
+    fn train(&mut self, samples: &[SoccerKeeperPolicySample]) {
+        let mut loss_sum = 0.0;
+        let mut applied = 0usize;
+        for sample in samples {
+            if !sample.advantage.is_finite() || sample.action_index >= self.network.output_dim {
+                continue;
+            }
+            let result = self.network.train_policy_gradient_sample(
+                &sample.state_features[..],
+                sample.action_index,
+                sample.advantage,
+                SOCCER_POLICY_ENTROPY_COEFF,
+                SOCCER_POLICY_LEARNING_RATE,
+                SOCCER_POLICY_GRAD_CLIP_NORM,
+            );
+            if result.applied && result.loss.is_finite() {
+                loss_sum += result.loss;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+    }
+}
+
+/// A single training sample for the dedicated goalkeeper head.
+struct SoccerKeeperPolicySample {
+    state_features: [f64; SOCCER_POLICY_FEATURE_DIM],
+    action_index: usize,
+    advantage: f64,
+}
+
 /// A learned 1-step **world model** `P̂(s' | s, a)` over the value-head feature
 /// space: an MLP mapping the current `(state ⊕ action)` feature vector to the
 /// *next* state's feature vector. Model-free RL is purely reactive; a transition
@@ -42736,6 +42886,7 @@ fn tracking_frame_to_world_snapshot(
     let score_diff_home = score_home as i32 - score_away as i32;
     WorldSnapshot {
         tick: frame.tick,
+        keeper_commit_bias: [0.0, 0.0],
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
@@ -44316,6 +44467,16 @@ fn dd_soccer_enable_skill_policy_heads() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD=1` to train a dedicated goalkeeper actor
+/// ([`SoccerKeeperPolicyHead`]) over the keeper action vocabulary and let it bias the keeper's
+/// come-for-the-ball (sweep vs hold) decision. Default off ⇒ the head is never built and the
+/// keeper's heuristics are unchanged (byte-identical baseline / A/B).
+fn dd_soccer_enable_keeper_policy_head() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD").is_ok())
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {
