@@ -55,6 +55,10 @@ mod tunables;
 pub use tunables::*;
 mod pitch_value;
 pub use pitch_value::*;
+// Centralized lane-discipline (12-lane grid). Qualified path only (no glob
+// re-export) — its public fns have deliberately generic names (`strength`,
+// `lane_match`) that read clearly as `lane_discipline::strength()`.
+mod lane_discipline;
 mod back_four_line;
 pub use back_four_line::*;
 mod loose_ball_commit;
@@ -4446,7 +4450,10 @@ fn vertical_lane_fit_for_role_target(
     };
     let deviation_yards =
         vertical_lane_deviation_yards(target_x, role, home_x, field_width, in_possession);
-    let affinity_score = if lane_gap == 0 {
+    let affinity_score = if lane_discipline::lane_discipline_v2_enabled() {
+        // Yard-based 12-lane re-derivation (grid-/pitch-size invariant).
+        lane_discipline::static_affinity_score(deviation_yards, commitment)
+    } else if lane_gap == 0 {
         1.0
     } else {
         (1.0 - commitment * (0.58 + lane_gap as f64 * 0.22)).clamp(0.0, 1.0)
