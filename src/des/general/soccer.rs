@@ -3244,6 +3244,12 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // LP problem rebuilds at full 15Hz.
 const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
 const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
+/// Iteration cap for the deterministic Bland's-rule simplex that solves the formation
+/// LP (see `SoccerFormationLpBrain::solve_exact_formation_lp`). Generous enough that the
+/// ~521-var/750-constraint problem reaches optimality on a normal tick yet bounded so a
+/// pathological tableau still terminates within the realtime budget. The solve is
+/// deterministic at any cap (Bland's rule), so this only trades solution quality vs time.
+pub(crate) const SOCCER_FORMATION_LP_SIMPLEX_MAX_ITER: usize = 1500;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.
@@ -3251,6 +3257,14 @@ const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // it in optimized builds, so this is a guardrail against pathological ticks, not
 // the common case (see `formation_lp_ipm_solves_under_five_milliseconds`).
 const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 5_000;
+/// Deterministic circuit-breaker threshold: a formation-LP solve needing more than this
+/// many solver iterations is treated as "over budget" (a reproducible proxy for the
+/// wall-clock cost, used INSTEAD of elapsed time so the breaker decision is identical
+/// across processes/machines — wall-clock gating was a latent match-nondeterminism
+/// source). A solve this expensive cannot meet the realtime contract, so after
+/// `SOCCER_FORMATION_LP_TIMEOUT_CIRCUIT_LIMIT` consecutive ones the breaker trips to the
+/// fast heuristic fallback for the rest of the match.
+const SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET: usize = 300;
 const SOCCER_FORMATION_LP_MIN_ITER: usize = 800;
 const SOCCER_FORMATION_LP_ITER_RECOVER_STEP: usize = 1_500;
 // Consecutive over-budget solves before the circuit trips to the heuristic fallback.
@@ -10263,6 +10277,19 @@ fn normalize_soccer_action_label(action: &str) -> &str {
 // `tunables().flank_cross` (env/Postgres-overridable). See soccer/tunables.rs.
 const FLANK_OVERLAP_MIN_OPTION_SHARE: f64 = 1.0 / 3.0;
 
+/// Master switch for the "attacking ambition" bundle: more frequent wall-passes
+/// (give-and-goes), and crosses available from a touch deeper / narrower so the
+/// flanks are actually used as a delivery route, not just for runs that fizzle.
+/// ON by default; set `DD_SOCCER_DISABLE_ATTACK_AMBITION` to fall back to the
+/// tighter baseline gates (used for A/B and to revert without a redeploy). The
+/// switch only ever *widens availability* — every quality/risk/offside check that
+/// follows still applies, so a poor combination is still demoted, never forced.
+pub(crate) fn attack_ambition_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
@@ -10296,10 +10323,18 @@ fn flank_cross_context_is_legal(
     field_width_yards: f64,
 ) -> bool {
     let cfg = &tunables().flank_cross;
+    // Attacking ambition: let a wide carrier cross from a touch deeper and a touch
+    // narrower so the flanks become a real delivery route (the overlap runs were
+    // already firing; the cross at the end of them was not). The scoring still
+    // demotes a poor cross — this only opens the door.
+    let (max_yards_to_goal, min_flank_score) = if attack_ambition_enabled() {
+        ((cfg.max_yards_to_goal + 8.0).min(120.0), (cfg.min_flank_score - 0.12).max(0.0))
+    } else {
+        (cfg.max_yards_to_goal, cfg.min_flank_score)
+    };
     observation.has_ball
-        && observation.yards_to_goal <= cfg.max_yards_to_goal
-        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0)
-            >= cfg.min_flank_score
+        && observation.yards_to_goal <= max_yards_to_goal
+        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0) >= min_flank_score
 }
 
 fn is_attacking_support_action_label(action: &str) -> bool {

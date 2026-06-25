@@ -25497,14 +25497,24 @@ impl WorldSnapshot {
         if !position_in_opponent_half(carrier.team, carrier_pos, self.field_length) {
             return None;
         }
+        // Attacking ambition: widen the trigger zone for the man-to-beat (and ease the
+        // wall's first-touch space below) so a one-two is genuinely available more often.
+        // The lay-off lane, return lane, onside and quality checks all still apply.
+        let ambition = attack_ambition_enabled();
+        let man_ahead_max = WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS + if ambition { 3.0 } else { 0.0 };
+        let man_lateral_max =
+            WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS + if ambition { 2.0 } else { 0.0 };
+        let man_range_max = WALL_PASS_MAN_TO_BEAT_RANGE_YARDS + if ambition { 3.0 } else { 0.0 };
+        let partner_min_space =
+            WALL_PASS_PARTNER_MIN_SPACE_YARDS - if ambition { 0.5 } else { 0.0 };
         // The man to beat: the nearest goalside opponent sitting in front of the carrier,
         // close enough that running a teammate's return around them actually beats someone.
         let (_, man_pos, man_dist) = self.nearest_opponent_at(carrier.team, carrier_pos)?;
         let man_ahead = (man_pos.y - carrier_pos.y) * attack_dir;
         if man_ahead < -1.0
-            || man_ahead > WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS
-            || (man_pos.x - carrier_pos.x).abs() > WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS
-            || man_dist > WALL_PASS_MAN_TO_BEAT_RANGE_YARDS
+            || man_ahead > man_ahead_max
+            || (man_pos.x - carrier_pos.x).abs() > man_lateral_max
+            || man_dist > man_range_max
         {
             return None;
         }
@@ -25571,7 +25581,7 @@ impl WorldSnapshot {
                     return None;
                 }
                 let partner_space = self.nearest_opponent_distance_at(partner.team, partner_pos);
-                if partner_space < WALL_PASS_PARTNER_MIN_SPACE_YARDS {
+                if partner_space < partner_min_space {
                     return None;
                 }
                 // The return into the run must be open from the wall's feet.

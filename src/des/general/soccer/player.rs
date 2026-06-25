@@ -7483,7 +7483,9 @@ impl PlayerAgent {
                     - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
+                let ambition_appetite = if attack_ambition_enabled() { 1.45 } else { 1.0 };
                 let raw_wall_appetite = WALL_PASS_BASE_APPETITE
+                    * ambition_appetite
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
