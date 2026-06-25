@@ -29357,16 +29357,41 @@ impl WorldSnapshot {
             gap.clamp(MID_AHEAD_OF_DEF_MIN_YARDS, MID_AHEAD_OF_DEF_MAX_YARDS);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
-        let consistency_gain = self.shape_consistency_gain_for_player_target(
-            me,
-            target,
-            MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS,
-        );
-        let adjusted_fwd = if (hard_desired_gap - gap).abs() > 1e-6 {
+        // MIDFIELD LINE MODEL (gated): the ideal separation ahead of the back four
+        // becomes a dynamic/learned depth, the line forms an ACTUAL flat line (the
+        // back-four treatment, minus the offside semantics), and it eases over the
+        // longer 5s window. Off ⇒ `ideal_gap` = the fixed constant and the 3s window,
+        // i.e. byte-identical to the legacy band.
+        let model_on = midfield_line_model_enabled();
+        let ideal_gap = match self.midfield_line_model_ideal_gap_fraction(me) {
+            Some(frac) => {
+                MID_AHEAD_OF_DEF_MIN_YARDS
+                    + frac * (MID_AHEAD_OF_DEF_MAX_YARDS - MID_AHEAD_OF_DEF_MIN_YARDS)
+            }
+            None => MID_AHEAD_OF_DEF_IDEAL_YARDS,
+        };
+        let consistency_seconds = if model_on {
+            MIDFIELD_LINE_MODEL_CONSISTENCY_SECONDS
+        } else {
+            MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS
+        };
+        let consistency_gain =
+            self.shape_consistency_gain_for_player_target(me, target, consistency_seconds);
+        let adjusted_fwd = if model_on && defending {
+            // ACTUAL FLAT LINE while defending: pull this midfielder onto the line
+            // CENTRE — the back four's average plus the dynamic ideal gap — within the
+            // level band, eased over the 5s window. Symmetric (no offside asymmetry):
+            // the midfield does not set offside, so it simply levels into a line. In
+            // possession it falls through to the looser push-on band below.
+            let mid_centre_fwd = def_avg_fwd + ideal_gap;
+            let half_band = MIDFIELD_LINE_LEVEL_BAND_YARDS * 0.5;
+            let on_line = target_fwd.clamp(mid_centre_fwd - half_band, mid_centre_fwd + half_band);
+            current_fwd + (on_line - current_fwd) * consistency_gain
+        } else if (hard_desired_gap - gap).abs() > 1e-6 {
             // LINE out of band: reconnect. Defending → to the ideal stagger; in possession
             // → just to the nearest band edge.
             let reconnect_gap = if defending {
-                MID_AHEAD_OF_DEF_IDEAL_YARDS
+                ideal_gap
             } else {
                 hard_desired_gap
             };
@@ -29382,7 +29407,7 @@ impl WorldSnapshot {
                 .sum::<f64>();
             let projected_avg_fwd = (peer_sum_fwd + target_fwd) / mids.len() as f64;
             let projected_gap = projected_avg_fwd - def_avg_fwd;
-            let delta = MID_AHEAD_OF_DEF_IDEAL_YARDS - projected_gap;
+            let delta = ideal_gap - projected_gap;
             if delta.abs() < 1e-6 {
                 return target;
             }
@@ -33389,7 +33414,29 @@ impl WorldSnapshot {
             return clamped_fwd * attack;
         }
         let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
-        let line_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
+        // The existing heuristic line centre — the retained determinant (group 8):
+        // it already folds in the directive line target, ball blend, role bias,
+        // press focus, and the legal band.
+        let heuristic_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
+        // The line CENTRE is the controlled quantity the dynamic line model sets (a
+        // function of ball/opponent/self kinematics, possession, the GK, and the
+        // offside-trap state). When the model is gated on it BLENDS its learned/
+        // analytic depth with the heuristic centre above (existing determinants are
+        // kept, not discarded) and re-clamps to the legal band; gated off it returns
+        // None and the heuristic centre stands (byte-identical). The flat ≤2yd
+        // flatten/cover machinery below is unchanged, so individual defenders still
+        // ease onto the line over the ~3s grace — the model only chooses where that
+        // flat line sits. See docs/back-four-line-model.md.
+        let line_centre_fwd = self
+            .back_four_line_model_centre_fwd(
+                me,
+                predicted_fwd,
+                deepest_fwd,
+                shallowest_fwd,
+                max_gap,
+                heuristic_centre_fwd,
+            )
+            .unwrap_or(heuristic_centre_fwd);
         let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
         // No defender may sit AHEAD of the line (toward the attackers) — that is what plays runners
         // onside — so the front edge is always capped to the line centre + half-band.
