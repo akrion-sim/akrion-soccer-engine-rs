@@ -5339,6 +5339,17 @@ pub struct SoccerPomdpObservation {
     pub first_time_pass_field_feasibility: f64,
     #[serde(default)]
     pub first_time_shot_field_feasibility: f64,
+    /// Value [0,1] of the best QUICK FORWARD ground pass — a short progressive ball (≈5–8 m)
+    /// to an OPEN, advanced teammate. Non-zero only when `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS`
+    /// is set; it floors the first-time-pass / carrier-pass option (release sooner) and is
+    /// folded into the learnable first-time-pass field feasibility. See
+    /// [`dd_soccer_enable_quick_forward_pass`].
+    #[serde(default)]
+    pub quick_forward_pass_value: f64,
+    /// Teammate id of the [`quick_forward_pass_value`] ball, when one qualifies — the
+    /// execution paths target this player and let the MPC pass path shape the pace.
+    #[serde(default)]
+    pub quick_forward_pass_target: Option<usize>,
     #[serde(default)]
     pub first_touch_shape_prior: f64,
     #[serde(default)]

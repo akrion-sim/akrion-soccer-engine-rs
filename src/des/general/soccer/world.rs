@@ -16829,6 +16829,41 @@ struct ForwardSupportContext {
     visible_forward_pass_options: usize,
     best_forward_pass_receiver_openness: f64,
     nearest_forward_teammate_distance_yards: f64,
+    /// Value [0,1] of the best QUICK FORWARD ground pass available — a short progressive
+    /// ball (≈5–8 m, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
+    /// to an OPEN, advanced teammate. Blends the receiver's openness, the in-band distance
+    /// fit and the upfield gain. Drives "knock it forward to feet and keep it moving" — the
+    /// carrier/first-toucher should release this SOONER than settling or dwelling. Only
+    /// consumed when `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS` is set (else inert).
+    best_quick_forward_open_value: f64,
+    /// The teammate id of the [`best_quick_forward_open_value`] pass, when one qualifies.
+    best_quick_forward_target: Option<usize>,
+}
+
+/// A quick, progressive GROUND pass into an advanced, open teammate is most valuable in a
+/// short band — roughly 5–8 m (≈5.5–8.7 yards). This is the "knock it forward to feet, keep
+/// the ball moving" distance: long enough to break a line, short enough to be a high-percentage
+/// one/two-touch ball. The forward-open value peaks across this band and tapers outside it.
+const QUICK_FORWARD_PASS_MIN_YARDS: f64 = 5.47; // ≈5 m
+const QUICK_FORWARD_PASS_IDEAL_YARDS: f64 = 7.10; // ≈6.5 m
+const QUICK_FORWARD_PASS_MAX_YARDS: f64 = 8.75; // ≈8 m
+/// Soft taper (yards) applied to distances outside the [min, max] band so a 4 m or 11 m
+/// forward ball still carries some value rather than dropping to a hard zero.
+const QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS: f64 = 4.0;
+
+/// In-band distance fit [0,1] for the quick forward ground-pass value: 1.0 across the
+/// ≈5–8 m sweet spot, tapering linearly to 0 over [`QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS`]
+/// on either side. A pass shorter than the band or much longer is worth progressively less.
+pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
+    if distance_yards >= QUICK_FORWARD_PASS_MIN_YARDS
+        && distance_yards <= QUICK_FORWARD_PASS_MAX_YARDS
+    {
+        return 1.0;
+    }
+    let shortfall = (QUICK_FORWARD_PASS_MIN_YARDS - distance_yards).max(0.0);
+    let overshoot = (distance_yards - QUICK_FORWARD_PASS_MAX_YARDS).max(0.0);
+    let outside = shortfall.max(overshoot);
+    (1.0 - outside / QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS).clamp(0.0, 1.0)
 }
 
 fn first_touch_shape_prior_for_snapshot(
@@ -17137,6 +17172,28 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
+}
+
+/// Quick forward ground-pass priority (OFF by default = byte-identical). When set, players
+/// place much more value on a short progressive GROUND pass (≈5–8 m) into an OPEN, advanced
+/// teammate and release it SOONER — as a first-time ball off the carry or a one-touch off
+/// the first touch — rather than settling or dwelling on the ball. The forward-open value is
+/// folded into the LEARNABLE first-time-pass field feasibility (so the neural policy adapts
+/// its weight), the option score is floored to beat a settling touch / a held carry, and the
+/// chosen pass is delivered through the existing MPC pass-execution path (the `Pass` action
+/// is rendezvous-solved + learnable-velocity shaped downstream). Addresses "players are not
+/// passing fast enough / should prioritise quick forward ground passes to open teammates."
+pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok())
+    }
 }
 
 /// The loose-ball urgency override (force the designated retriever to attack a ball
@@ -21412,6 +21469,8 @@ impl WorldSnapshot {
                 one_touch_shot_feasibility: 1.0,
                 first_time_pass_field_feasibility: 0.0,
                 first_time_shot_field_feasibility: 0.0,
+                quick_forward_pass_value: 0.0,
+                quick_forward_pass_target: None,
                 first_touch_shape_prior: 0.0,
                 skill_top_speed: 0.0,
                 skill_acceleration: 0.0,
@@ -21645,6 +21704,20 @@ impl WorldSnapshot {
         ) = support_ball_holder.unwrap_or((0.0, 0.0, 0.0));
         let forward_support_context =
             self.forward_support_context_for(player_id, &visible_pass_targets);
+        // Quick forward ground-pass priority (gated OFF = inert). Surfaces the best short
+        // progressive ball (≈5–8 m) to an open, advanced teammate so the decision paths can
+        // release it sooner and the execution can target that runner through the MPC pass path.
+        let quick_forward_pass_enabled = dd_soccer_enable_quick_forward_pass();
+        let quick_forward_pass_value = if quick_forward_pass_enabled {
+            forward_support_context.best_quick_forward_open_value
+        } else {
+            0.0
+        };
+        let quick_forward_pass_target = if quick_forward_pass_enabled {
+            forward_support_context.best_quick_forward_target
+        } else {
+            None
+        };
         let threaded_goal_pass_assessment = if has_ball {
             self.killer_pass_target_assessment_for(player_id, &visible_pass_targets)
         } else {
@@ -21956,6 +22029,15 @@ impl WorldSnapshot {
             )
         } else {
             0.0
+        };
+        // Fold the quick-forward-pass value into the LEARNABLE first-time-pass field
+        // feasibility: it feeds `first_time_pass_field_bin` in the neural state, so the policy
+        // adapts how strongly a short progressive ball biases a first-time release. Gate OFF =
+        // `quick_forward_pass_value` is 0 ⇒ byte-identical.
+        let first_time_pass_field_feasibility = if first_touch_available {
+            (first_time_pass_field_feasibility + quick_forward_pass_value * 0.22).clamp(0.0, 1.0)
+        } else {
+            first_time_pass_field_feasibility
         };
         let first_time_shot_field_feasibility = if first_touch_available {
             first_time_shot_field_feasibility_for_snapshot(
@@ -22443,6 +22525,8 @@ impl WorldSnapshot {
             one_touch_shot_feasibility,
             first_time_pass_field_feasibility,
             first_time_shot_field_feasibility,
+            quick_forward_pass_value,
+            quick_forward_pass_target,
             first_touch_shape_prior,
             skill_top_speed: me.skills.top_speed,
             skill_acceleration: me.skills.acceleration,
@@ -31635,6 +31719,8 @@ impl WorldSnapshot {
                 visible_forward_pass_options: 0,
                 best_forward_pass_receiver_openness: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
+                best_quick_forward_open_value: 0.0,
+                best_quick_forward_target: None,
             };
         };
         let current = self.player_snapshot_position(me);
@@ -31657,6 +31743,8 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut best_quick_forward_open_value = 0.0f64;
+        let mut best_quick_forward_target: Option<usize> = None;
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -31677,6 +31765,25 @@ impl WorldSnapshot {
             );
             best_forward_pass_receiver_openness =
                 best_forward_pass_receiver_openness.max(quality.receiver_openness);
+            // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
+            // advanced teammate. Reward openness × completion most, weight the in-band
+            // distance, and add a modest upfield-gain term so a more advanced open runner
+            // edges a square one. The ranked execution targets this player when the value
+            // wins (see `quick_forward_pass_target`).
+            let distance = current.distance(target_position);
+            let band_fit = quick_forward_pass_band_fit(distance);
+            if band_fit > 0.0 {
+                let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+                let openness = quality.receiver_openness.clamp(0.0, 1.0);
+                let completion = quality.expected_completion.clamp(0.0, 1.0);
+                let value = (band_fit
+                    * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
+                    .clamp(0.0, 1.0);
+                if value > best_quick_forward_open_value {
+                    best_quick_forward_open_value = value;
+                    best_quick_forward_target = Some(*target_id);
+                }
+            }
         }
 
         ForwardSupportContext {
@@ -31690,12 +31797,27 @@ impl WorldSnapshot {
             } else {
                 self.field_length
             },
+            best_quick_forward_open_value,
+            best_quick_forward_target,
         }
     }
 
     fn teammate_ahead_count_for(&self, player_id: usize) -> usize {
         self.forward_support_context_for(player_id, &[])
             .teammates_ahead
+    }
+
+    /// Test accessor: the gate-independent quick forward ground-pass value + chosen teammate
+    /// for `player_id`, computed over the ranked visible pass set (mirrors what
+    /// `observation_for` surfaces once `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS` is set).
+    #[cfg(test)]
+    pub(crate) fn quick_forward_pass_value_for(&self, player_id: usize) -> (f64, Option<usize>) {
+        let visible = self.ranked_visible_pass_targets(player_id, 11);
+        let ctx = self.forward_support_context_for(player_id, &visible);
+        (
+            ctx.best_quick_forward_open_value,
+            ctx.best_quick_forward_target,
+        )
     }
 
     pub fn striker_hold_up_flank_target_for(&self, player_id: usize) -> Option<Vec2> {

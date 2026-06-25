@@ -6949,6 +6949,98 @@ fn first_touch_observation_prices_field_shape_before_one_touch_release() {
 }
 
 #[test]
+fn quick_forward_pass_band_fit_peaks_in_five_to_eight_metre_band() {
+    // Full value across the ≈5–8 m sweet spot (5.47–8.75 yd) and at both edges.
+    assert!((quick_forward_pass_band_fit(7.0) - 1.0).abs() < 1e-9);
+    assert!((quick_forward_pass_band_fit(5.47) - 1.0).abs() < 1e-9);
+    assert!((quick_forward_pass_band_fit(8.75) - 1.0).abs() < 1e-9);
+    // Linear taper outside the band over the 4-yard falloff.
+    assert!((quick_forward_pass_band_fit(3.47) - 0.5).abs() < 1e-6); // 2 yd short
+    assert!((quick_forward_pass_band_fit(10.75) - 0.5).abs() < 1e-6); // 2 yd long
+    // Far outside the band drops to a hard zero (no value for a 1 m tap or a 13 yd ball).
+    assert_eq!(quick_forward_pass_band_fit(1.0), 0.0);
+    assert_eq!(quick_forward_pass_band_fit(13.0), 0.0);
+}
+
+#[test]
+fn quick_forward_pass_values_open_advanced_teammate_and_stays_inert_when_gated_off() {
+    let receiver = 7;
+    let outlet = 9;
+    let blocker = 13;
+    // Holder at (40,58); an open forward teammate `forward_yards` ahead (Home attacks +y).
+    let build = |forward_yards: f64, block_lane: bool| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 31_775,
+            ..Default::default()
+        });
+        let keep = if block_lane {
+            vec![receiver, outlet, blocker]
+        } else {
+            vec![receiver, outlet]
+        };
+        park_players_except(&mut sim, &keep);
+        sim.active_set_play = None;
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        sim.players[receiver].team = Team::Home;
+        sim.players[receiver].role = PlayerRole::Midfielder;
+        sim.players[receiver].position = Vec2::new(40.0, 58.0);
+        sim.players[receiver].home_position = sim.players[receiver].position;
+        sim.players[outlet].team = Team::Home;
+        sim.players[outlet].role = PlayerRole::Forward;
+        sim.players[outlet].position = Vec2::new(40.0, 58.0 + forward_yards);
+        sim.players[outlet].home_position = sim.players[outlet].position;
+        if block_lane {
+            sim.players[blocker].team = Team::Away;
+            // Shadow the outlet, tight, to crush its openness.
+            sim.players[blocker].position = Vec2::new(40.4, 58.0 + forward_yards - 0.6);
+            sim.players[blocker].home_position = sim.players[blocker].position;
+        }
+        sim.ball.holder = Some(receiver);
+        sim.ball.position = sim.players[receiver].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim
+    };
+
+    // An OPEN forward teammate ~7 yd ahead (in the 5–8 m band) is highly valued and chosen.
+    let in_band = WorldSnapshot::from_match(&build(7.0, false));
+    let (band_value, band_target) = in_band.quick_forward_pass_value_for(receiver);
+    assert!(
+        band_value > 0.30,
+        "an open advanced teammate in the 5–8 m band should carry real quick-forward value, got {band_value}"
+    );
+    assert_eq!(
+        band_target,
+        Some(outlet),
+        "the quick-forward target should be the open advanced teammate"
+    );
+
+    // The same teammate parked far upfield (~27 yd) falls outside the band ⇒ much less value.
+    let far = WorldSnapshot::from_match(&build(27.0, false));
+    let (far_value, _) = far.quick_forward_pass_value_for(receiver);
+    assert!(
+        far_value < band_value,
+        "a forward ball well outside the 5–8 m band should be worth less than the in-band one: far={far_value} band={band_value}"
+    );
+
+    // Marked tight in the band ⇒ openness collapses ⇒ value drops vs the open in-band ball.
+    let marked = WorldSnapshot::from_match(&build(7.0, true));
+    let (marked_value, _) = marked.quick_forward_pass_value_for(receiver);
+    assert!(
+        marked_value < band_value,
+        "a tightly marked in-band receiver should be valued below an open one: marked={marked_value} band={band_value}"
+    );
+
+    // Gate OFF (env unset in the test process) ⇒ the observation surfaces NOTHING (inert).
+    let observation = in_band.observation_for(receiver);
+    assert_eq!(observation.quick_forward_pass_value, 0.0);
+    assert_eq!(observation.quick_forward_pass_target, None);
+}
+
+#[test]
 fn first_touch_mpc_vetoes_unplayable_one_touch_pass_and_controls_first() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
