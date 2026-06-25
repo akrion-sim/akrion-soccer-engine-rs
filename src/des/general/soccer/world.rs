@@ -301,6 +301,14 @@ pub struct SoccerMatch {
     /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
     /// each [`WorldSnapshot`] so the retriever decision can read it.
     pub(crate) loose_ball_uncontested_since_tick: Option<u64>,
+    /// Rolling RL training corpus for the learnable attacking-spacing target: a
+    /// team-level context + the spacing held + the windowed territorial reward.
+    /// Collected only while the spacing model is enabled
+    /// (`collect_attack_spacing_rl_samples`); drained by the cluster learner. Empty +
+    /// untouched in the default (gated-off) process.
+    pub(crate) attack_spacing_samples: Vec<AttackSpacingSample>,
+    /// Open attacking-spacing decisions awaiting their windowed reward.
+    pub(crate) pending_attack_spacing: Vec<PendingAttackSpacingDecision>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
     /// only while the turnover-window penalty is enabled, so a dispossession/interception
     /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
@@ -1672,6 +1680,8 @@ impl SoccerMatch {
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
             loose_ball_uncontested_since_tick: None,
+            attack_spacing_samples: Vec::new(),
+            pending_attack_spacing: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             defensive_delay_clocks: HashMap::new(),
@@ -6067,6 +6077,9 @@ impl SoccerMatch {
         // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
         self.update_loose_ball_urgency(&next_snapshot);
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
+        // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
+        self.collect_attack_spacing_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -17028,6 +17041,18 @@ pub(crate) struct CandidateOccupancy {
     pub(crate) teammate_axis_clump_pressure: f64,
 }
 
+/// Shared field state for the learnable attacking-spacing target: the own-team centre
+/// of mass, the defending team's vector (centroid / spread / mean velocity) and the
+/// carrier's heading. Built once by [`WorldSnapshot::spacing_field_terms`].
+#[derive(Clone, Copy, Debug)]
+struct SpacingFieldTerms {
+    centroid: Vec2,
+    opp_centroid: Vec2,
+    opp_spread: f64,
+    opp_mean_vel: Vec2,
+    carrier_vel: Vec2,
+}
+
 impl CandidateOccupancy {
     pub(crate) fn teammate_occupied_space_pressure(self) -> f64 {
         teammate_occupied_space_pressure_from_distance(self.nearest_teammate_distance)
@@ -17130,6 +17155,35 @@ pub(crate) fn open_space_score_from_distances(
     teammate_crowding: f64,
 ) -> f64 {
     open_space_score_from_distances_with_axis_pressure(opponent_distance, teammate_crowding, 0.0)
+}
+
+/// Off-ball spacing-discipline score adjustment for one `open_space_for` candidate. Pure so it
+/// can be unit-tested without the (process-cached) env gate; the caller passes
+/// `current_outlet_open = false` whenever the gate is OFF, making this a no-op (returns 0.0) and
+/// `open_space_for` byte-identical. When the player ALREADY offers a clean, in-range outlet:
+///   1. most of the show-for-ball / ball-arrival proximity pull is cancelled (closing the gap
+///      to the carrier opens no new lane, so it earns ~nothing — the reward becomes marginal);
+///   2. a candidate that actively collapses inside the carrier keep-out radius (closer to the
+///      carrier than the player is now) is penalised in proportion to how far inside it sits.
+pub(crate) fn off_ball_space_discipline_adjustment(
+    current_outlet_open: bool,
+    short_outlet_bonus: f64,
+    ball_arrival_bonus: f64,
+    candidate_to_carrier_yards: f64,
+    current_to_carrier_yards: f64,
+) -> f64 {
+    if !current_outlet_open {
+        return 0.0;
+    }
+    let mut adj = -(short_outlet_bonus + ball_arrival_bonus) * OFF_BALL_MARGINAL_OUTLET_CANCEL;
+    if candidate_to_carrier_yards < OFF_BALL_CARRIER_KEEP_OUT_YARDS
+        && candidate_to_carrier_yards < current_to_carrier_yards - 1e-6
+    {
+        let intrusion = (OFF_BALL_CARRIER_KEEP_OUT_YARDS - candidate_to_carrier_yards)
+            / OFF_BALL_CARRIER_KEEP_OUT_YARDS.max(1.0);
+        adj -= intrusion * OFF_BALL_CARRIER_COLLAPSE_PENALTY;
+    }
+    adj
 }
 
 fn open_space_score_from_distances_with_axis_pressure(
@@ -17338,6 +17392,19 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST").is_ok())
+}
+/// Off-ball spacing discipline (gated, default OFF = byte-identical for clean A/B). When ON,
+/// `open_space_for` rewards off-ball teammates for *improving* the passing picture rather than
+/// merely closing on the ball: the "show for the ball" / ball-arrival proximity pulls are
+/// cancelled for a player who is ALREADY a clean, in-range outlet, and candidates that collapse
+/// inside the carrier's comfortable receiving radius are penalised (unless the carrier is
+/// pressured and genuinely needs a short option). This kills the "two off-ball players >4yd
+/// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
+/// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
+fn dd_soccer_enable_off_ball_space_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
@@ -31295,6 +31362,203 @@ impl WorldSnapshot {
         best
     }
 
+    /// Build the [`AttackSpacingContext`] for an off-ball attacker and resolve the
+    /// served target band — the learnable "how much space to keep to the nearest
+    /// teammate", a function of the team centre of mass, ball position, the defending
+    /// team's vector, and the carrier's heading. Returns `None` (so the live spacing
+    /// term keeps the fixed `ATTACK_SPACING_*` band, byte-identical) unless the
+    /// learned-spacing model is enabled (`DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET`).
+    /// `width_shortage` is passed in because `open_space_for` has already computed it.
+    /// The trained [`AttackSpacingHead`] is not yet plumbed to the snapshot (mirrors the
+    /// other learned heads), so this serves the analytic 5-8yd seed until one is promoted.
+    /// Shared field terms for the spacing context: own-team centroid (centre of mass),
+    /// the opponent's centroid / spread / mean velocity (the "defending team vector"),
+    /// and the ball carrier's velocity (its heading). `None` when the team has no
+    /// players (degenerate snapshot). Reused by the per-player and team-level spacing
+    /// targets so they read identical state.
+    fn spacing_field_terms(&self, team: Team) -> Option<SpacingFieldTerms> {
+        let ball = self.ball.position;
+        let (mut sum, mut count) = (Vec2::zero(), 0.0_f64);
+        for p in self.players.iter().filter(|p| p.team == team) {
+            sum = sum + self.player_snapshot_position(p);
+            count += 1.0;
+        }
+        if count < 1.0 {
+            return None;
+        }
+        let centroid = sum * (1.0 / count);
+        let (mut osum, mut ovel, mut ocount) = (Vec2::zero(), Vec2::zero(), 0.0_f64);
+        for p in self.players.iter().filter(|p| p.team == team.other()) {
+            osum = osum + self.player_snapshot_position(p);
+            ovel = ovel + self.player_velocity(p.id).unwrap_or(p.velocity);
+            ocount += 1.0;
+        }
+        let (opp_centroid, opp_mean_vel) = if ocount >= 1.0 {
+            (osum * (1.0 / ocount), ovel * (1.0 / ocount))
+        } else {
+            (ball, Vec2::zero())
+        };
+        let opp_spread = if ocount >= 1.0 {
+            self.players
+                .iter()
+                .filter(|p| p.team == team.other())
+                .map(|p| self.player_snapshot_position(p).distance(opp_centroid))
+                .sum::<f64>()
+                / ocount
+        } else {
+            0.0
+        };
+        let carrier_vel = self
+            .ball
+            .holder
+            .and_then(|h| {
+                self.player_velocity(h)
+                    .or_else(|| self.players.iter().find(|p| p.id == h).map(|p| p.velocity))
+            })
+            .unwrap_or(self.ball.velocity);
+        Some(SpacingFieldTerms {
+            centroid,
+            opp_centroid,
+            opp_spread,
+            opp_mean_vel,
+            carrier_vel,
+        })
+    }
+
+    pub(crate) fn attack_spacing_target_for(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+        width_shortage: f64,
+    ) -> Option<AttackSpacingTarget> {
+        if !attack_spacing_model_enabled() {
+            return None;
+        }
+        let team = me.team;
+        let dir = team.attack_dir();
+        let ball = self.ball.position;
+        let terms = self.spacing_field_terms(team)?;
+        let (centroid, opp_centroid, opp_spread, opp_mean_vel, carrier_vel) = (
+            terms.centroid,
+            terms.opp_centroid,
+            terms.opp_spread,
+            terms.opp_mean_vel,
+            terms.carrier_vel,
+        );
+        // Local fill / occupancy.
+        let nearest_teammate = self.nearest_teammate_distance_at(team, me_position, Some(me.id));
+        let local_teammate_density = self
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.id != me.id)
+            .filter(|p| {
+                self.player_snapshot_position(p).distance(me_position)
+                    <= ATTACK_SPACING_LOCAL_DENSITY_RADIUS_YARDS
+            })
+            .count() as f64;
+        let center_y = self.field_length * 0.5;
+        let ctx = AttackSpacingContext {
+            centroid_fwd_from_ball: (centroid.y - ball.y) * dir,
+            centroid_lat_from_ball: centroid.x - ball.x,
+            self_fwd_from_centroid: (me_position.y - centroid.y) * dir,
+            ball_progress: (0.5 + (ball.y - center_y) * dir / self.field_length.max(1.0))
+                .clamp(0.0, 1.0),
+            behind_ball_yards: ((ball.y - me_position.y) * dir).max(0.0),
+            def_centroid_fwd_from_ball: (opp_centroid.y - ball.y) * dir,
+            def_spread_yards: opp_spread,
+            def_mean_vel_fwd: opp_mean_vel.y * dir,
+            def_mean_vel_lat: opp_mean_vel.x,
+            carrier_vel_fwd: carrier_vel.y * dir,
+            carrier_vel_lat: carrier_vel.x,
+            local_teammate_density,
+            nearest_teammate_yards: nearest_teammate,
+            width_shortage: width_shortage.clamp(0.0, 1.0),
+        };
+        Some(resolve_attack_spacing_target(&ctx, None))
+    }
+
+    /// The team-level attacking-spacing context (the centroid is "self") plus the
+    /// representative spacing actually held now (the team's mean nearest-teammate gap,
+    /// the RL regression target). `None` on a degenerate (empty-team) snapshot. Built
+    /// unconditionally (no gate / possession check) so both the live LP floor and the RL
+    /// sampler read identical state; callers gate.
+    pub(crate) fn attack_spacing_team_context(
+        &self,
+        team: Team,
+    ) -> Option<(AttackSpacingContext, f64)> {
+        let dir = team.attack_dir();
+        let ball = self.ball.position;
+        let terms = self.spacing_field_terms(team)?;
+        // Representative current spacing + local density across the outfield team.
+        let (mut gap_sum, mut dens_sum, mut n) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.role != PlayerRole::Goalkeeper)
+        {
+            let pos = self.player_snapshot_position(p);
+            gap_sum += self.nearest_teammate_distance_at(team, pos, Some(p.id));
+            dens_sum += self
+                .players
+                .iter()
+                .filter(|q| q.team == team && q.id != p.id)
+                .filter(|q| {
+                    self.player_snapshot_position(q).distance(pos)
+                        <= ATTACK_SPACING_LOCAL_DENSITY_RADIUS_YARDS
+                })
+                .count() as f64;
+            n += 1.0;
+        }
+        let (mean_gap, mean_density) = if n >= 1.0 {
+            (gap_sum / n, dens_sum / n)
+        } else {
+            (DEFAULT_ATTACK_SPACING_IDEAL_YARDS, 1.0)
+        };
+        let directive = self.tactical_directive(team);
+        let current_width = self.team_lateral_width_yards(team);
+        let target_width = directive
+            .width_yards
+            .max(self.field_width * 0.95)
+            .min(self.field_width * 0.99);
+        let width_shortage = if target_width > 1e-6 {
+            ((target_width - current_width) / target_width).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let center_y = self.field_length * 0.5;
+        let ctx = AttackSpacingContext {
+            centroid_fwd_from_ball: (terms.centroid.y - ball.y) * dir,
+            centroid_lat_from_ball: terms.centroid.x - ball.x,
+            self_fwd_from_centroid: 0.0,
+            ball_progress: (0.5 + (ball.y - center_y) * dir / self.field_length.max(1.0))
+                .clamp(0.0, 1.0),
+            behind_ball_yards: ((ball.y - terms.centroid.y) * dir).max(0.0),
+            def_centroid_fwd_from_ball: (terms.opp_centroid.y - ball.y) * dir,
+            def_spread_yards: terms.opp_spread,
+            def_mean_vel_fwd: terms.opp_mean_vel.y * dir,
+            def_mean_vel_lat: terms.opp_mean_vel.x,
+            carrier_vel_fwd: terms.carrier_vel.y * dir,
+            carrier_vel_lat: terms.carrier_vel.x,
+            local_teammate_density: mean_density,
+            nearest_teammate_yards: mean_gap,
+            width_shortage,
+        };
+        Some((ctx, mean_gap))
+    }
+
+    /// Team-level served spacing-target MINIMUM (yards) for the formation LP's
+    /// in-possession attacking lateral spread. `None` (so the LP keeps its fixed
+    /// lateral-spread floors, byte-identical) unless the learned-spacing model is on AND
+    /// `team` is in possession. So the LP shape and the per-player off-ball ranker agree
+    /// on how wide to spread the attacking lines.
+    pub(crate) fn team_attack_spacing_target_min(&self, team: Team) -> Option<f64> {
+        if !attack_spacing_model_enabled() || self.possession_team() != Some(team) {
+            return None;
+        }
+        let (ctx, _held) = self.attack_spacing_team_context(team)?;
+        Some(resolve_attack_spacing_target(&ctx, None).min)
+    }
+
     pub fn open_space_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
@@ -31397,6 +31661,37 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Off-ball spacing discipline (gated): reward IMPROVING the passing picture, not merely
+        // closing on the ball. Computed once here so the per-candidate term is marginal vs the
+        // player's CURRENT position. OFF (default) leaves the loop below byte-identical.
+        let space_discipline = possession
+            && self.ball.holder != Some(player_id)
+            && me.role != PlayerRole::Goalkeeper
+            && dd_soccer_enable_off_ball_space_discipline();
+        let carrier_position = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .map(|h| self.player_snapshot_position(h))
+            .unwrap_or(self.ball.position);
+        // A pressured carrier genuinely wants a short option, so the discipline is suspended.
+        let carrier_pressured = space_discipline
+            && self.nearest_opponent_distance_at(me.team, carrier_position)
+                < OFF_BALL_CARRIER_PRESSURED_YARDS;
+        // Is the player ALREADY a clean, in-range outlet from where they stand? If so, closing
+        // the gap further opens no new lane, so the proximity pulls earn ~nothing.
+        let current_outlet_open = space_discipline
+            && !carrier_pressured
+            && self.ball.position.distance(me_position) <= SHORT_OUTLET_SHOW_MAX_YARDS
+            && self.clear_line(self.ball.position, me_position, me.team.other(), 2.0);
+        let current_to_carrier = carrier_position.distance(me_position);
+        // Learnable attacking-spacing target (gated): the context-dependent 5-8yd band
+        // the player should hold to its nearest teammate, a function of the team centre
+        // of mass, ball position, defending-team vector and carrier heading. `None` when
+        // the model is off ⇒ the spacing term keeps the fixed `ATTACK_SPACING_*` band
+        // (byte-identical). Resolved once here — it depends on the player/team/ball state,
+        // not the candidate point — so it is cheap.
+        let attack_spacing_target = self.attack_spacing_target_for(me, me_position, width_shortage);
         for dx in [-22.0, -13.0, -6.0, 0.0, 6.0, 13.0, 22.0] {
             for dy in [-8.0, 0.0, 7.0, 14.0, 22.0, 30.0] {
                 let raw_p = Vec2::new(
@@ -31443,8 +31738,18 @@ impl WorldSnapshot {
                 };
                 let occupancy = self.candidate_occupancy_at(me.team, p, Some(me.id));
                 let spacing_bonus = if possession {
-                    occupancy.team_spacing_score(TeamSpacingMode::InPossession)
-                        * (1.0 + self.possession_spacing_weight(me.team) * 1.5)
+                    // When the learnable spacing target is served (gate on), score this
+                    // candidate's nearest-teammate distance against the learned 5-8yd
+                    // band instead of the fixed `ATTACK_SPACING_*` one — keeping the
+                    // same axis-clump term so the shape of the term is preserved. `None`
+                    // (gate off) ⇒ the existing fixed-band score, byte-identical.
+                    let raw = match attack_spacing_target {
+                        Some(target) => (target.spacing_score(occupancy.nearest_teammate_distance)
+                            - occupancy.teammate_axis_clump_pressure * 0.55)
+                            .clamp(-1.0, 1.0),
+                        None => occupancy.team_spacing_score(TeamSpacingMode::InPossession),
+                    };
+                    raw * (1.0 + self.possession_spacing_weight(me.team) * 1.5)
                 } else {
                     0.0
                 };
@@ -31584,6 +31889,19 @@ impl WorldSnapshot {
                 };
                 let vacuum_run_bonus =
                     self.attacking_vacuum_run_bonus(me, me_position, p, occupancy, forward);
+                // Off-ball spacing discipline (gated; 0.0 when OFF). Two effects, both only when
+                // the player already offers a clean outlet (so they are NOT needed shorter):
+                //   1. cancel most of the show-for-ball / ball-arrival proximity pull, so a
+                //      candidate that merely closes the gap to the carrier earns nothing extra;
+                //   2. penalise candidates that actively collapse inside the carrier's keep-out
+                //      radius (crowding the carrier's space instead of stretching the defence).
+                let off_ball_space_discipline = off_ball_space_discipline_adjustment(
+                    current_outlet_open,
+                    short_outlet_bonus,
+                    ball_arrival_bonus,
+                    carrier_position.distance(p),
+                    current_to_carrier,
+                );
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + goal_directness_bonus
@@ -31602,6 +31920,7 @@ impl WorldSnapshot {
                     + dynamic_lane_fit_bonus
                     + ball_arrival_bonus
                     + short_outlet_bonus
+                    + off_ball_space_discipline
                     - offside_penalty
                     - lane_position_penalty
                     - teammate_occupation_penalty

@@ -44615,6 +44615,7 @@ fn formation_stagger_layers_and_spreads_the_shape() {
             120.0,
             DEFAULT_DT_SECONDS,
             Vec2::new(40.0, 50.0),
+            None,
         );
     }
     let mean = |role: PlayerRole| {
@@ -44685,7 +44686,7 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 58.0)),
     ];
     let before: Vec<Vec2> = slots.iter().map(|s| s.anchor).collect();
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     for (slot, was) in slots.iter().zip(before) {
         assert!(
             (slot.anchor - was).len() < 1e-9,
@@ -44728,7 +44729,7 @@ fn back_four_holds_lateral_band_and_order() {
         def(70.0, 70.0),
     ];
     for _ in 0..500 {
-        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     }
     let xs: Vec<f64> = slots.iter().map(|s| s.anchor.x).collect();
     for w in 1..xs.len() {
@@ -44781,7 +44782,7 @@ fn formation_stagger_pulls_overstretched_layers_back_toward_band() {
     let mid_before = mean(&slots, PlayerRole::Midfielder);
     let fwd_before = mean(&slots, PlayerRole::Forward);
 
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
 
     let mid_after = mean(&slots, PlayerRole::Midfielder);
     let fwd_after = mean(&slots, PlayerRole::Forward);
@@ -49291,6 +49292,70 @@ fn spacing_scores_reward_the_in_band_separation() {
     );
     assert!(
         defense_upper > spacing_score_from_distance(16.0, TeamSpacingMode::Defending)
+    );
+}
+
+#[test]
+fn off_ball_space_discipline_is_a_no_op_when_no_open_outlet_yet() {
+    // Gate OFF (or: player has no clean in-range outlet) => `current_outlet_open == false` =>
+    // the adjustment is exactly 0.0 for every candidate, so `open_space_for` is byte-identical.
+    for cand_to_carrier in [2.0, 5.0, 9.0, 18.0] {
+        assert_eq!(
+            off_ball_space_discipline_adjustment(false, 5.5, 1.2, cand_to_carrier, 10.0),
+            0.0,
+            "no-outlet (gate-off) state must leave the candidate score untouched"
+        );
+    }
+}
+
+#[test]
+fn off_ball_space_discipline_punishes_spiralling_into_the_carrier() {
+    // The red flag: a teammate who ALREADY offers a clean, in-range outlet (10yd from the
+    // carrier, lane open) keeps closing toward the ball to <3yd. With the discipline on, a
+    // candidate that collapses inside the carrier keep-out radius must score strictly worse
+    // than one that holds/widens — and the spiral-in candidate must be net-penalised.
+    let short_outlet_bonus = 5.5; // the show-for-ball pull the old code rewarded near the ball
+    let ball_arrival_bonus = 1.2;
+    let current_to_carrier = 10.0;
+
+    // Candidate A: spirals in to 3yd of the carrier (the bug behaviour).
+    let collapse = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        3.0,
+        current_to_carrier,
+    );
+    // Candidate B: holds a stretched 12yd, outside the keep-out radius.
+    let hold = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        12.0,
+        current_to_carrier,
+    );
+
+    assert!(
+        collapse < hold - 1e-9,
+        "collapsing into the carrier must score worse than holding width: collapse={collapse} hold={hold}"
+    );
+    assert!(
+        collapse < 0.0,
+        "the spiral-in candidate must be net-penalised, not merely neutral: {collapse}"
+    );
+    // The proximity pull that drove the spiral is largely cancelled even before the keep-out
+    // penalty (a candidate just inside the radius but not closer than now keeps only the cancel).
+    let marginal_only = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        current_to_carrier, // same distance: no active collapse, only the marginal cancel
+        current_to_carrier,
+    );
+    assert!(
+        marginal_only < 0.0 && marginal_only > collapse,
+        "holding position cancels the proximity pull but skips the collapse penalty: \
+         marginal={marginal_only} collapse={collapse}"
     );
 }
 

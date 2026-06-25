@@ -14,6 +14,7 @@ use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
     BackFourLineHead, LooseBallCommitHead, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    report_attack_spacing_training, report_line_depth_training,
     report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot,
@@ -1984,6 +1985,19 @@ fn run_game(
             head.training_steps(),
             head.training_steps() >= LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
             final_loss
+        );
+    }
+    // Learnable attacking-spacing target: train this game's reward-weighted RL corpus
+    // and log it so the spacing is demonstrably learned from. Empty + skipped unless
+    // DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET is set. Cross-game Postgres persistence +
+    // live head consumption are the remaining integration steps (as for the line head).
+    let attack_spacing_samples = sim.drain_attack_spacing_samples();
+    if !attack_spacing_samples.is_empty() {
+        let report =
+            report_attack_spacing_training(&attack_spacing_samples, episode_seed as u32, 4, 0.02);
+        eprintln!(
+            "attack_spacing_training samples={} training_steps={} epochs={} final_loss={:.5}",
+            report.samples, report.training_steps, report.epochs, report.final_loss
         );
     }
     let mut artifact = sim.team_policy_artifact();

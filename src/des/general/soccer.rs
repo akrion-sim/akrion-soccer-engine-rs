@@ -59,6 +59,10 @@ mod back_four_line;
 pub use back_four_line::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod support_scorer;
+pub use support_scorer::*;
+mod spacing_target;
+pub use spacing_target::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -1004,6 +1008,21 @@ const FLANK_USAGE_ATTACKING_HALF_REWARD: f64 = 0.2;
 const SHORT_OUTLET_SHOW_MIN_YARDS: f64 = 7.0;
 const SHORT_OUTLET_SHOW_MAX_YARDS: f64 = 22.0;
 const SHORT_OUTLET_SHOW_BONUS: f64 = 1.4;
+// Off-ball spacing discipline (see `dd_soccer_enable_off_ball_space_discipline`). All only bite
+// when that gate is ON; default OFF keeps `open_space_for` byte-identical.
+// Fraction of the show-for-ball / ball-arrival proximity pull cancelled for a player who ALREADY
+// offers a clean, in-range outlet from where they stand (so closing further earns ~nothing —
+// the reward becomes marginal: open a NEW lane, don't crowd an existing one).
+const OFF_BALL_MARGINAL_OUTLET_CANCEL: f64 = 0.85;
+// Comfortable receiving radius around the carrier: a clean outlet wants to sit at least this far
+// out (≈ the in-possession spacing floor). Candidates inside it are crowding the carrier.
+const OFF_BALL_CARRIER_KEEP_OUT_YARDS: f64 = 7.0;
+// Penalty weight for a candidate that actively collapses inside the carrier keep-out radius while
+// a clean lane already exists. Additive, so it complements (never silently overrides) the score.
+const OFF_BALL_CARRIER_COLLAPSE_PENALTY: f64 = 8.0;
+// The carrier is "pressured" (and so genuinely wants a short option) when its nearest opponent is
+// inside this radius; the keep-out / marginal-cancel are suspended in that case.
+const OFF_BALL_CARRIER_PRESSURED_YARDS: f64 = 4.5;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
