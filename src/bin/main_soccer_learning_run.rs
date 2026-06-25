@@ -13,7 +13,7 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    report_line_depth_training, report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
+    BackFourLineHead, report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
@@ -1868,6 +1868,14 @@ fn load_initial_policies(
     .into())
 }
 
+/// In-memory back-four line-depth head, carried + trained across games WITHIN a
+/// learner process (parallel_games=1), so it accumulates and the back-four line
+/// consumes it live once trained. Resets on pod restart — cross-restart Postgres
+/// persistence (round-trip via SoccerNeuralNetworkSnapshot) is the remaining
+/// durability step. Untouched unless a line-depth model is enabled.
+static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -1894,6 +1902,12 @@ fn run_game(
     for window in adversarial_moment_windows.iter() {
         sim.remember_adversarial_moment_window(window.clone());
     }
+    // Gap 5 step 3b: install the carried line-depth head so the back-four line
+    // consumes it live once trained. No-op unless a line-depth model is enabled (the
+    // head only accumulates while collection is on).
+    if let Some(head) = CARRIED_LINE_DEPTH_HEAD.lock().unwrap().as_ref() {
+        sim.set_line_depth_head(head.clone());
+    }
 
     for tick_idx in 0..total_ticks {
         sim.run_time_step();
@@ -1919,18 +1933,25 @@ fn run_game(
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
     let pass_outcome_samples = sim.drain_pass_outcome_samples();
-    // Gap 5: train the line-depth head on this game's reward-weighted RL corpus and
-    // log progress so the corpus is demonstrably learned from. Empty + skipped
-    // unless a line-depth model is enabled (DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL /
-    // _MIDFIELD_LINE_MODEL). Cross-game Postgres persistence + live head consumption
-    // are the remaining integration steps.
+    // Gap 5: train the CARRIED line-depth head on this game's reward-weighted RL
+    // corpus so it accumulates across games and the back-four line consumes it live
+    // once trained. Empty + skipped unless a line-depth model is enabled
+    // (DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL / _MIDFIELD_LINE_MODEL). Cross-restart
+    // Postgres persistence is the remaining durability step.
     let line_depth_samples = sim.drain_line_depth_samples();
-    if let Some(report) =
-        report_line_depth_training(&line_depth_samples, episode_seed as u32, 4, 0.02)
-    {
+    if !line_depth_samples.is_empty() {
+        let mut guard = CARRIED_LINE_DEPTH_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| BackFourLineHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&line_depth_samples, 0.02);
+        }
         eprintln!(
-            "line_depth_training samples={} training_steps={} epochs={} final_loss={:.5}",
-            report.samples, report.training_steps, report.epochs, report.final_loss
+            "line_depth_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            line_depth_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= soccer_engine::des::general::soccer::LINE_DEPTH_HEAD_MIN_TRAINING_STEPS,
+            final_loss
         );
     }
     let mut artifact = sim.team_policy_artifact();

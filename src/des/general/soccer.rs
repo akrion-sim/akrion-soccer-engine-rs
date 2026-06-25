@@ -44079,6 +44079,7 @@ fn tracking_frame_to_world_snapshot(
         tick: frame.tick,
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        line_depth_head: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         clock_seconds: frame.clock_seconds,

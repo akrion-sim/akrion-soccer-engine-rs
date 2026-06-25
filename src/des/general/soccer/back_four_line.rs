@@ -323,6 +323,9 @@ pub const LINE_DEPTH_SAMPLE_INTERVAL_TICKS: u64 = 15;
 pub const LINE_DEPTH_REWARD_WINDOW_TICKS: u64 = 45;
 /// Cap on the rolling RL sample buffer (drained by the learner).
 pub const LINE_DEPTH_SAMPLE_CAP: usize = 4096;
+/// Minimum training steps before a trained head is consumed live; below this the
+/// regression net is too raw, so the decision falls back to the analytic seed.
+pub const LINE_DEPTH_HEAD_MIN_TRAINING_STEPS: usize = 200;
 
 /// Learned regression head for the line-centre gap fraction: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, sigmoid) mirroring [`SoccerPassCompletionHead`]. The live
@@ -684,7 +687,15 @@ impl WorldSnapshot {
         let own_goal_fwd = self.own_goal_y_for(me.team) * me.team.attack_dir();
         inputs.heuristic_centre_fwd_from_own_goal = heuristic_centre_fwd - own_goal_fwd;
 
-        let gap_fraction = analytic_line_centre_gap_fraction(&inputs);
+        // Consume the trained head once it has learned enough; otherwise the analytic
+        // seed. The head is trained on back-four decisions (its action = this same
+        // analytic fraction), so it refines the depth the corpus showed worked.
+        let gap_fraction = self
+            .line_depth_head
+            .as_ref()
+            .filter(|head| head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(&inputs))
+            .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs));
         if !gap_fraction.is_finite() || !max_gap.is_finite() || !heuristic_centre_fwd.is_finite() {
             return None;
         }
@@ -777,6 +788,15 @@ impl SoccerMatch {
     /// learner binary (a separate crate) can drain it.
     pub fn drain_line_depth_samples(&mut self) -> Vec<LineDepthSample> {
         std::mem::take(&mut self.line_depth_samples)
+    }
+
+    /// Install the trained back-four line-depth head for live consumption. The
+    /// learner carries + trains it across games and re-installs it each game; wrapped
+    /// in `Arc` so every per-tick snapshot shares it cheaply. Consumed in
+    /// `back_four_line_model_centre_fwd` once it clears
+    /// [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`].
+    pub fn set_line_depth_head(&mut self, head: BackFourLineHead) {
+        self.line_depth_head = Some(std::sync::Arc::new(head));
     }
 }
 
