@@ -11358,12 +11358,18 @@ fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
     let missing = TeamAttackStrategy::ALL
         .iter()
         .copied()
+        // Gated strategies are NOT unconditionally rule-reachable by design: the "outside mid
+        // attack defender" play is only proposed by the rule selector when
+        // `DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER` is set (otherwise the learner /
+        // `SOCCER_FORCE_ATTACK_STRATEGY` selects it). This default run leaves the gate off, so
+        // exclude those from the "every strategy is reachable" invariant.
+        .filter(|strategy| !is_outside_mid_attack_strategy(*strategy))
         .filter(|strategy| !seen.contains(strategy))
         .map(TeamAttackStrategy::as_str)
         .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "every attacking strategy should have at least one rule-selector invocation path; missing={missing:?}"
+        "every (ungated) attacking strategy should have at least one rule-selector invocation path; missing={missing:?}"
     );
 }
 
@@ -74263,6 +74269,116 @@ fn runaround_dribble_gate_fires_on_a_pace_beat_and_is_disablable() {
         "re-collect point is beyond the carrier toward goal: {plan:?}"
     );
     assert!(plan.quality > 0.0, "positive quality: {plan:?}");
+}
+
+#[test]
+fn outside_mid_attack_defender_strategy_is_registered_and_classified() {
+    // The named "outside mid attack defender" play is a first-class catalogue entry, classified
+    // as a wide take-on AND as a byline drive-and-cross program (it reuses that machinery).
+    for s in [
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft,
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+    ] {
+        assert!(TeamAttackStrategy::ALL.contains(&s), "{s:?} must be in ALL");
+        assert!(is_outside_mid_attack_strategy(s), "{s:?} is an outside-mid play");
+        assert!(
+            is_byline_cross_drive_strategy(s),
+            "{s:?} should drive the byline and cross"
+        );
+    }
+    assert!(!is_outside_mid_attack_strategy(TeamAttackStrategy::CrashTheBox));
+    assert_eq!(
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft.as_str(),
+        "outside-mid-attack-defender-left"
+    );
+    assert_eq!(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight.as_str(),
+        "outside-mid-attack-defender-right"
+    );
+}
+
+/// A wide-right midfielder carrying at a committed full-back who has no covering team-mate near him.
+fn outside_mid_take_on_scenario(
+    strategy: TeamAttackStrategy,
+    carrier_forward_speed: f64,
+    carrier_top_speed: f64,
+) -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.central_brain.home_directive.attack_strategy = strategy;
+    let carrier = 7usize;
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].home_position = Vec2::new(68.0, 60.0); // wide right of an 80yd pitch
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(64.0, 85.0); // wide, in the opponent half (Home attacks +y)
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[carrier].velocity = Vec2::new(0.0, carrier_forward_speed);
+    sim.players[carrier].skills.top_speed = carrier_top_speed;
+    // The committed full-back, just ahead in the lane.
+    sim.players[12].position = Vec2::new(64.5, 88.0);
+    sim.players[12].velocity = Vec2::zero();
+    sim.players[12].skills.top_speed = 7.0;
+    // Every other opponent far away: the full-back is ISOLATED (nobody within 10yd of him).
+    for away in [11usize, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
+        sim.players[away].position = Vec2::new(8.0, 20.0);
+    }
+    sim
+}
+
+#[test]
+fn outside_mid_attack_defender_lifts_take_on_quality_vs_isolated_defender() {
+    // Same wide carrier + isolated full-back; only the team strategy differs. The outside-mid play
+    // should back the take-on more strongly (higher run-around quality => higher carrier appetite).
+    let mut omad = outside_mid_take_on_scenario(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+        6.0,
+        8.0,
+    );
+    let mut plain =
+        outside_mid_take_on_scenario(TeamAttackStrategy::PullWideRightThenCenter, 6.0, 8.0);
+    // A deep cover man ~15yd behind the full-back: still BEYOND the 10yd isolation radius (so the
+    // full-back is "isolated" for the take-on), but near enough the re-collect zone that the
+    // baseline run-around quality is no longer saturated — exposing the appetite uplift.
+    for sim in [&mut omad, &mut plain] {
+        sim.players[13].position = Vec2::new(64.5, 103.0);
+    }
+    let omad_q = WorldSnapshot::from_match(&omad)
+        .runaround_dribble_option_for(7)
+        .expect("a take-on is on for the outside-mid play")
+        .quality;
+    let plain_q = WorldSnapshot::from_match(&plain)
+        .runaround_dribble_option_for(7)
+        .expect("a take-on is on at baseline too here")
+        .quality;
+    assert!(
+        omad_q > plain_q + 0.05,
+        "outside-mid play must lift the isolated-defender take-on appetite: omad={omad_q} plain={plain_q}"
+    );
+}
+
+#[test]
+fn outside_mid_attack_defender_takes_on_isolated_man_with_only_modest_momentum() {
+    // Momentum below the baseline run-around threshold (4.0yps) but above the relaxed outside-mid
+    // one (1.8yps), with no top-speed edge. Baseline declines (needs more momentum); the outside-mid
+    // play backs the carrier to attack the isolated man anyway.
+    let omad = outside_mid_take_on_scenario(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+        2.5,
+        7.0,
+    );
+    let plain =
+        outside_mid_take_on_scenario(TeamAttackStrategy::PullWideRightThenCenter, 2.5, 7.0);
+    assert!(
+        WorldSnapshot::from_match(&omad)
+            .runaround_dribble_option_for(7)
+            .is_some(),
+        "outside-mid play should take the isolated man on even from modest momentum"
+    );
+    assert!(
+        WorldSnapshot::from_match(&plain)
+            .runaround_dribble_option_for(7)
+            .is_none(),
+        "baseline run-around needs full forward momentum / a pace edge"
+    );
 }
 
 #[test]

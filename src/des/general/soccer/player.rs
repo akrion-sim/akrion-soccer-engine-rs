@@ -432,6 +432,10 @@ fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
             | TeamAttackStrategy::OneTwoRightRelease
             | TeamAttackStrategy::CentralDoubleOneTwo
             | TeamAttackStrategy::BackheelDisguisedRelease
+            // The "outside mid attack defender" play wants the wide man to either take the isolated
+            // full-back on OR beat him with a give-and-go — so it requests the one-two appetite too.
+            | TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
     )
 }
 
