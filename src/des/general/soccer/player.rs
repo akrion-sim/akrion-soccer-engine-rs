@@ -2910,16 +2910,6 @@ impl PlayerAgent {
             DEFAULT_FIELD_WIDTH_YARDS
         };
         let lateral_position = self.position.x.clamp(0.0, field_width);
-        let left_room = if self.team == Team::Home {
-            lateral_position
-        } else {
-            field_width - lateral_position
-        };
-        let right_room = if self.team == Team::Home {
-            field_width - lateral_position
-        } else {
-            lateral_position
-        };
         let flank_lane_fit = ((lateral_position - field_width * 0.5).abs()
             / (field_width * 0.5).max(1.0))
         .clamp(0.0, 1.0);
@@ -2957,6 +2947,12 @@ impl PlayerAgent {
         let decision_urgency = observation.decision_urgency.clamp(0.0, 1.0);
         let goal_attack = observation.goal_attack_window_score.clamp(0.0, 1.0);
         let goal_entry_pressure = goal_entry_decisive_pressure_score(observation);
+        let shot_choice_learning =
+            tactical_learning_multiplier(directive.shot_choice_learning_weight, 0.28);
+        let goal_entry_pass_learning =
+            tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.34);
+        let pressure_release_learning =
+            tactical_learning_multiplier(directive.pressure_release_learning_weight, 0.36);
         let speculative_long_shot =
             speculative_long_shot_is_qualified(observation, self.role, shooting);
         let contested_final_third_shot =
@@ -3008,40 +3004,43 @@ impl PlayerAgent {
             * (1.0 + striker_shot_bonus * 1.35)
             * (1.0 + decisive_goal_pressure * 1.18)
             * (1.0 + final_ball_goal_decision_fit * 0.42)
+            * shot_choice_learning
             * 0.042)
             .clamp(
                 0.004,
-                0.12 + offensive_urgency * 0.30
+                (0.12
+                    + offensive_urgency * 0.30
                     + striker_shot_bonus * 0.18
                     + goal_attack * 0.22
                     + goal_proximity_shot_pressure * 0.36
                     + goal_entry_pressure * 0.20
-                    + decisive_goal_pressure * 0.30,
+                    + decisive_goal_pressure * 0.30)
+                    * shot_choice_learning.clamp(0.82, 1.24),
             )
-            .max(close_shot_attempt)
+            .max(close_shot_attempt * shot_choice_learning.clamp(0.88, 1.16))
             .max(goal_proximity_shot_pressure_floor(
                 observation,
                 self.role,
                 shooting,
-            ))
+            ) * shot_choice_learning.clamp(0.88, 1.16))
             .max(attacking_goal_pressure_shot_attempt_probability(
                 observation,
                 self.role,
                 shooting,
-            ))
+            ) * shot_choice_learning.clamp(0.88, 1.16))
             .max(speculative_long_shot_attempt_probability(
                 observation,
                 self.role,
                 shooting,
-            ))
+            ) * shot_choice_learning)
             .max(contested_final_third_shot_attempt_probability(
                 observation,
                 self.role,
                 shooting,
-            ))
-            .max(striker_shot_bonus)
+            ) * shot_choice_learning)
+            .max(striker_shot_bonus * shot_choice_learning.clamp(0.88, 1.16))
             .max(if goal_attack_shot_blocks_alternatives {
-                0.99
+                0.99 * shot_choice_learning.clamp(0.90, 1.10)
             } else {
                 0.0
             });
@@ -3050,7 +3049,11 @@ impl PlayerAgent {
         let patience_factor = low_pressure_patience_factor(observation);
         let floor_pass_quality = pass_quality_for_patience(observation, PassFlight::Floor);
         let aerial_pass_quality = pass_quality_for_patience(observation, PassFlight::Aerial);
-        let pressured_release_signal = pressure_release_signal(observation);
+        let pressured_release_signal =
+            (pressure_release_signal(observation) * pressure_release_learning).clamp(0.0, 1.0);
+        let pressured_release_multiplier = (1.0
+            + (pressured_release_multiplier(observation) - 1.0) * pressure_release_learning)
+            .clamp(1.0, 2.72);
         let open_support_fit = open_support_outlet_fit(observation);
         let pressured_good_outlet = (pressured_release_signal
             * (floor_pass_quality.max(aerial_pass_quality * 0.86) + open_support_fit * 0.18))
@@ -3669,7 +3672,7 @@ impl PlayerAgent {
             * floor_pass_patience_multiplier
             * hold_release_multiplier
             * crowded_pass_lift
-            * pressured_release_multiplier(observation))
+            * pressured_release_multiplier)
             .clamp(0.004, hold_release_score_cap);
         options.push(AgentActionOptionTrace::new(
             "recycle-reset",
@@ -3699,7 +3702,7 @@ impl PlayerAgent {
             * floor_pass_patience_multiplier
             * hold_release_multiplier
             * crowded_pass_lift
-            * pressured_release_multiplier(observation))
+            * pressured_release_multiplier)
             .clamp(0.004, 0.98 * hold_release_multiplier.clamp(1.0, 1.28));
         options.push(AgentActionOptionTrace::new(
             "switch-play",
@@ -3714,9 +3717,11 @@ impl PlayerAgent {
         ));
         let flank_cross_context =
             flank_cross_context_score(observation, self.position, field_width);
+        let committed_byline_cross_release =
+            byline_cross_release && directive.flank_attack_policy.is_flank();
         let flank_cross_legal_context =
             flank_cross_context_is_legal(observation, self.position, field_width)
-                && !goal_attack_shot_blocks_alternatives
+                && (!goal_attack_shot_blocks_alternatives || committed_byline_cross_release)
                 && (!goalmouth_carry_forced || directive.flank_attack_policy.is_flank())
                 && !byline_drive_active;
         let low_cross_score = (self.preferences.pass_bias
@@ -3732,7 +3737,7 @@ impl PlayerAgent {
             * near_goal_pass_multiplier
             * floor_pass_patience_multiplier
             * hold_release_multiplier
-            * pressured_release_multiplier(observation)
+            * pressured_release_multiplier
             * low_cross_multiplier)
             .clamp(0.01, 0.86)
             .max(if byline_cross_release
@@ -3772,7 +3777,7 @@ impl PlayerAgent {
             * aerial_pass_patience_multiplier
             * aerial_forward_runner_multiplier
             * hold_release_multiplier
-            * pressured_release_multiplier(observation)
+            * pressured_release_multiplier
             * high_cross_multiplier)
             .clamp(0.01, 0.78)
             .max(if byline_cross_release
@@ -3811,7 +3816,7 @@ impl PlayerAgent {
                 + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.18)
             * floor_pass_patience_multiplier
             * hold_release_multiplier
-            * pressured_release_multiplier(observation))
+            * pressured_release_multiplier)
         .clamp(0.01, 0.84);
         options.push(AgentActionOptionTrace::new(
             "surprise-pass",
@@ -3838,7 +3843,7 @@ impl PlayerAgent {
                 + observation.aerial_forward_runner_pass_multiplier.clamp(1.0, 1.50) * 0.10)
             * aerial_pass_patience_multiplier
             * aerial_forward_runner_multiplier
-            * pressured_release_multiplier(observation))
+            * pressured_release_multiplier)
         .clamp(0.01, 0.88);
         options.push(AgentActionOptionTrace::new(
             "flick-on",
@@ -3901,12 +3906,13 @@ impl PlayerAgent {
             * (1.0 + offensive_urgency * 0.42)
             * (1.0 + decisive_goal_pressure * 0.72)
             * (1.0 + final_ball_goal_decision_fit * 0.28)
+            * goal_entry_pass_learning
             * near_goal_pass_multiplier.max(0.72)
             * floor_pass_patience_multiplier
             * hold_release_multiplier
             * crowded_pass_lift
-            * pressured_release_multiplier(observation))
-        .clamp(0.01, 1.68);
+            * pressured_release_multiplier)
+        .clamp(0.01, 1.68 * goal_entry_pass_learning.clamp(0.86, 1.20));
         options.push(AgentActionOptionTrace::new(
             "killer-pass",
             killer_pass_score,
@@ -3949,7 +3955,7 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * low_cross_multiplier
                 * crowded_pass_lift
-                * pressured_release_multiplier(observation)
+                * pressured_release_multiplier
                 * panic_pass_damp
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
@@ -4007,7 +4013,7 @@ impl PlayerAgent {
                 * aerial_forward_runner_multiplier
                 * hold_release_multiplier
                 * high_cross_multiplier
-                * pressured_release_multiplier(observation)
+                * pressured_release_multiplier
                 * aerial_flick_strategy_multiplier
                 * rank_weight)
                 .clamp(0.004, 0.98 * hold_release_multiplier.clamp(1.0, 1.24));
@@ -6006,7 +6012,8 @@ impl PlayerAgent {
         let intent = snapshot.defensive_line_cushion_adjusted_intent(intent);
         let intent = snapshot.midfield_line_band_adjusted_intent(intent);
         let intent = snapshot.forward_line_band_adjusted_intent(intent);
-        snapshot.wingback_width_adjusted_intent(intent)
+        let intent = snapshot.wingback_width_adjusted_intent(intent);
+        snapshot.possession_wide_lane_floor_adjusted_intent(intent)
     }
 
     pub fn run_time_step_with_context(

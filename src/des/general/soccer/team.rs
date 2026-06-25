@@ -614,6 +614,10 @@ mod team_strategy_mode_tests {
     }
 }
 
+fn default_tactical_learning_preference_weight() -> f64 {
+    1.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamTacticalDirective {
@@ -637,6 +641,16 @@ pub struct TeamTacticalDirective {
     pub carry_priority: f64,
     pub shot_threshold_yards: f64,
     pub risk_tolerance: f64,
+    #[serde(default = "default_tactical_learning_preference_weight")]
+    pub shot_choice_learning_weight: f64,
+    #[serde(default = "default_tactical_learning_preference_weight")]
+    pub goal_entry_pass_learning_weight: f64,
+    #[serde(default = "default_tactical_learning_preference_weight")]
+    pub pressure_release_learning_weight: f64,
+    #[serde(default = "default_tactical_learning_preference_weight")]
+    pub pass_target_ranking_learning_weight: f64,
+    #[serde(default = "default_tactical_learning_preference_weight")]
+    pub defensive_line_press_learning_weight: f64,
     #[serde(default)]
     pub flank_attack_policy: FlankAttackPolicy,
     /// Active team-level attacking maneuver (semi-MDP option). Interruptible.
@@ -691,6 +705,11 @@ impl TeamTacticalDirective {
             carry_priority: 1.0,
             shot_threshold_yards: 20.0,
             risk_tolerance: 0.50,
+            shot_choice_learning_weight: 1.0,
+            goal_entry_pass_learning_weight: 1.0,
+            pressure_release_learning_weight: 1.0,
+            pass_target_ranking_learning_weight: 1.0,
+            defensive_line_press_learning_weight: 1.0,
             flank_attack_policy: FlankAttackPolicy::None,
             attack_strategy: TeamAttackStrategy::default(),
             pair_attack_strategy: None,
@@ -5149,6 +5168,7 @@ impl CentralBrain {
             home_cover,
             home_overload,
             just_regained_home,
+            &snapshot.tactical_learning,
         );
         self.away_directive = tactical_directive_for_team(
             Team::Away,
@@ -5161,6 +5181,7 @@ impl CentralBrain {
             away_cover,
             away_overload,
             just_regained_away,
+            &snapshot.tactical_learning,
         );
         // Commit to the freshly-selected strategy and hold it for a window so teams
         // run a maneuver out instead of flip-flopping the discrete strategy each tick.

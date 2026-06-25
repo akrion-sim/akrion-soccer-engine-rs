@@ -86,6 +86,57 @@ Ideas:
 - Compare learned policy improvement from plain self-play versus MCTS-augmented
   self-play over the same seeds and wall-clock budget.
 
+## Learned Role-Band Average-Y Models
+
+The back four and midfield four should not be fixed line-height heuristics. Each
+role band's average `y` position is a dynamic state variable that the value head,
+actor, and learned world model can learn from live match outcomes. The current
+heuristic remains a warm-start prior, but the neural nets should decide when
+holding, stepping, dropping, or temporarily breaking a band actually improves
+goals, turnovers, offside traps, pressure, outlets, and clean possession regains.
+
+State inputs now made explicit:
+
+- Ball position, velocity, and acceleration relative to the average defender
+  line and midfield band, with the whole-field motion block still carrying the
+  full ball vector.
+- Opponent player vectors through the existing 22-player motion block, plus
+  opponent center-of-mass gap, velocity, and acceleration relative to each role
+  band.
+- Each role band's own average `y`, forward velocity, and forward acceleration.
+- Goalkeeper depth relative to each average band.
+- Possession state: own possession, opponent possession, or loose/unknown.
+- Current offside-trap viability and whether the next three seconds project to a
+  viable trap for the back four.
+- Midfield current spread and whether the average midfield band projects back
+  within target tolerance over five seconds.
+
+Eventual consistency is intentional. A defender may step out, cover a runner,
+press a carrier, or have a wingback overlap for roughly three seconds without
+being treated as a failed line. The back four is still the only role group with a
+strict line requirement, and that requirement only applies to offside-trap
+viability. Midfielders get roughly five seconds to recover their average band and
+do not need to form a strict line; their spread is a learning input, not a hard
+failure gate. The model should learn the payoff of those exceptions, while
+persistent drift is still visible through target-delta, relative-motion,
+spread, and viability channels.
+
+Near-term training path:
+
+- Track feature importance and value gradients for the appended back-four line
+  and midfield-four band tails so we can see whether the critic is using the
+  aggregates or relying only on hand-coded clamps.
+- Add offline labels from successful defensive phases: average line `y`,
+  midfield-band `y`, conceded xG/goal outcomes, offside wins, line-break
+  concessions, keeper interventions, pressure recoveries, outlet availability,
+  and regained possession windows.
+- Let world-model lookahead predict how the average line/band evolves over one
+  to five seconds, but keep execution per-player: LP/IPM owns team shape and
+  each player's MPC remains single-actor only.
+- Promote any learned line-height controller only behind readiness gates for
+  finite loss, sufficient samples, and live fallback to the current defensive
+  assignment logic.
+
 ## MPC Boundary
 
 MCTS must not become team MPC. Keep the architecture division intact:

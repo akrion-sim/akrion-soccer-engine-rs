@@ -1568,6 +1568,7 @@ impl SoccerMatch {
                     resistance: BallResistanceFrame::default(),
                     holder: kickoff,
                     last_touch_team: Some(Team::Home),
+                    last_touch_player: kickoff,
                     scheduled_index: None,
                     last_decision: None,
                 },
@@ -6417,6 +6418,7 @@ impl SoccerMatch {
             .collect();
         let ball_scheduled_index = schedule_lookup.ball();
         let mut ball = self.ball.to_state();
+        ball.last_touch_player = self.last_touch_player;
         ball.scheduled_index = ball_scheduled_index;
         if let Some(decision) = ball.last_decision.as_mut() {
             if decision.scheduled_index.is_none() && ball_scheduled_index.is_some() {
@@ -15340,6 +15342,8 @@ pub struct BallState {
     pub holder: Option<usize>,
     pub last_touch_team: Option<Team>,
     #[serde(default)]
+    pub last_touch_player: Option<usize>,
+    #[serde(default)]
     pub scheduled_index: Option<usize>,
     #[serde(default)]
     pub last_decision: Option<BallDecisionTrace>,
@@ -15507,6 +15511,7 @@ impl BallAgent {
             resistance: self.resistance,
             holder: self.holder,
             last_touch_team: self.last_touch_team,
+            last_touch_player: self.holder,
             scheduled_index: None,
             last_decision: self.last_decision.clone(),
         }
@@ -16589,6 +16594,8 @@ pub struct WorldSnapshot {
     /// snapshot-side shape helpers read the configurable+learnable values, not constants.
     #[serde(default = "default_spacing_params")]
     pub spacing_params: SoccerSpacingParams,
+    #[serde(default = "default_tactical_learning_weights")]
+    pub tactical_learning: SoccerTacticalLearningWeights,
     #[serde(default = "default_ball_drag_per_tick")]
     pub ball_drag_per_tick: f64,
     #[serde(default = "default_ball_air_resistance")]
@@ -17810,6 +17817,7 @@ impl WorldSnapshot {
             })
             .unwrap_or(0.0);
         let mut ball = m.ball.to_state();
+        ball.last_touch_player = m.last_touch_player;
         ball.scheduled_index = schedule_index_lookup.ball();
 
         let (home_recycle_urgency, home_recycle_participants) =
@@ -17829,6 +17837,7 @@ impl WorldSnapshot {
             field_width: m.config.field_width_yards,
             goal_width: m.config.goal_width_yards,
             spacing_params: m.config.spacing,
+            tactical_learning: m.config.tactical_learning.clone(),
             ball_drag_per_tick: m.config.ball_drag_per_tick,
             ball_air_resistance: m.config.ball_air_resistance,
             ball_grass_resistance_yps2: m.config.ball_grass_resistance_yps2,
@@ -23044,6 +23053,9 @@ impl WorldSnapshot {
         let me_position = self.player_snapshot_position(me);
         let goal_y = me.team.goal_y(self.field_length);
         let yards_to_goal = (goal_y - me_position.y).abs();
+        let directive = self.tactical_directive(me.team);
+        let goal_entry_pass_learning =
+            tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.32);
         if yards_to_goal > KILLER_PASS_MAX_YARDS_TO_GOAL {
             return None;
         }
@@ -23166,15 +23178,15 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let score = goal_gain * 0.12
+                let score = goal_gain * 0.12 * goal_entry_pass_learning
                     + forward.min(24.0) * 0.055
-                    + window * 4.8
-                    + quality.receiver_openness * 1.7
-                    + quality.expected_completion * 1.5
-                    + quality.stride_fit * 1.25
+                    + window * 4.8 * goal_entry_pass_learning
+                    + quality.receiver_openness * 1.7 * goal_entry_pass_learning
+                    + quality.expected_completion * 1.5 * goal_entry_pass_learning
+                    + quality.stride_fit * 1.25 * goal_entry_pass_learning
                     + lane_fit * 1.3
-                    + goal_channel_fit * 1.35
-                    + range_fit * 1.2
+                    + goal_channel_fit * 1.35 * goal_entry_pass_learning
+                    + range_fit * 1.2 * goal_entry_pass_learning
                     + role_bonus
                     + runner_bonus
                     - reception_teammate_penalty * 0.72;
@@ -23266,6 +23278,10 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let directive = self.tactical_directive(me.team);
+        let pass_target_learning =
+            tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.30);
+        let goal_entry_pass_learning =
+            tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.24);
         let passer_pressure =
             pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
         let no_pressure = self.no_pressure_at(me.team, me_position);
@@ -23720,12 +23736,12 @@ impl WorldSnapshot {
                     + confidence * 0.65
                     + role_bonus
                     + short_pass_preference
-                    + expected_completion_for_score * 1.55
-                    + receiver_openness_for_score * 0.62
-                    + pass_quality.stride_fit * 1.18
+                    + expected_completion_for_score * 1.55 * pass_target_learning
+                    + receiver_openness_for_score * 0.62 * pass_target_learning
+                    + pass_quality.stride_fit * 1.18 * pass_target_learning
                     + backward_depth_adjustment
                     + (p.velocity.y * me.team.attack_dir()).max(0.0).min(5.5) * 0.12
-                    + finishing_window_bonus
+                    + finishing_window_bonus * goal_entry_pass_learning
                     + keeper_distribution_bonus;
                 let own_box_play_out_adjustment = if own_box_pressured {
                     self.own_box_play_out_pass_adjustment(
@@ -23906,11 +23922,11 @@ impl WorldSnapshot {
                     - build_up_short_pass_penalty
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                     - safe_pass_overrisk_penalty
-                    + over_the_top_invite_bonus
+                    + over_the_top_invite_bonus * goal_entry_pass_learning
                     + own_box_play_out_adjustment
-                    + forward_open_bonus
-                    + wing_overload_bonus
-                    + pass_length_bonus
+                    + forward_open_bonus * pass_target_learning
+                    + wing_overload_bonus * pass_target_learning
+                    + pass_length_bonus * pass_target_learning
                     + keeper_outlet_bonus
                     - backheel_penalty;
                 (p.id, score)
@@ -23946,6 +23962,10 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let directive = self.tactical_directive(me.team);
+        let pass_target_learning =
+            tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.24);
+        let goal_entry_pass_learning =
+            tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.28);
         let passer_pressure =
             pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
         let no_pressure = self.no_pressure_at(me.team, me_position);
@@ -24230,14 +24250,14 @@ impl WorldSnapshot {
                     + aerial_target_bonus
                     + lane_bonus
                     + cross_bonus
-                    + wide_outlet_bonus
+                    + wide_outlet_bonus * pass_target_learning
                     + corner_affinity
-                    + finishing_window_bonus
-                    + in_behind_bonus
-                    + preferred_in_behind_bonus
-                    + expected_completion_for_score * 0.85
-                    + receiver_openness_for_score * 0.38
-                    + pass_quality.stride_fit * 0.46
+                    + finishing_window_bonus * goal_entry_pass_learning
+                    + in_behind_bonus * goal_entry_pass_learning
+                    + preferred_in_behind_bonus * goal_entry_pass_learning
+                    + expected_completion_for_score * 0.85 * pass_target_learning
+                    + receiver_openness_for_score * 0.38 * pass_target_learning
+                    + pass_quality.stride_fit * 0.46 * pass_target_learning
                     + keeper_distribution_bonus
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
@@ -24605,6 +24625,18 @@ impl WorldSnapshot {
             ((position.y - line_y) * team.attack_dir() - OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS)
                 .max(0.0)
         })
+    }
+
+    fn open_space_offside_excess_yards_for_player(
+        &self,
+        player_id: usize,
+        team: Team,
+        position: Vec2,
+    ) -> f64 {
+        if !self.position_would_be_offside_for_player(player_id, team, position) {
+            return 0.0;
+        }
+        self.open_space_offside_excess_yards(team, position)
     }
 
     pub(crate) fn in_behind_run_target_for(&self, player_id: usize) -> Option<Vec2> {
@@ -28651,13 +28683,21 @@ impl WorldSnapshot {
         // (1) inside our own 20yd emergency zone, and
         // (2) the back four may not press more than 5yd into the opponent half, so
         // a high ball may leave the line more than 30yd behind by design.
-        let max_behind = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
+        let defensive_line_bias = tactical_learning_weight_bias(
+            self.tactical_directive(me.team)
+                .defensive_line_press_learning_weight,
+        );
+        let learned_max_behind =
+            (DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS - defensive_line_bias * 4.0).clamp(20.0, 34.0);
+        let max_behind = learned_max_behind.min(ball_from_own_goal);
         // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
         // 10yd off the ball); the max still applies.
         let min_behind = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
             0.0
         } else {
-            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_behind)
+            (DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS - defensive_line_bias * 2.0)
+                .clamp(6.0, 13.0)
+                .min(max_behind)
         };
         // 5yd-into-the-opponents'-half ceiling (in attack-forward coords). The halfway
         // line sits exactly field_length/2 forward of our own goal.
@@ -28665,7 +28705,8 @@ impl WorldSnapshot {
             + self.field_length * 0.5
             + tunables()
                 .defensive_shape
-                .defensive_line_max_into_opp_half_yards;
+                .defensive_line_max_into_opp_half_yards
+            + defensive_line_bias * 2.0;
         // Upper bound = nearer of "10yd behind the ball" and the opp-half ceiling; pin the
         // lower bound at/under it so a ball deep upfield can't invert the band (the
         // ceiling wins — bulletproof, never panics on lower > upper).
@@ -30960,7 +31001,7 @@ impl WorldSnapshot {
         let target_attack_width = if possession && me.role != PlayerRole::Goalkeeper {
             directive
                 .width_yards
-                .max(self.field_width * 0.92)
+                .max(self.field_width * 0.95)
                 .min(self.field_width * 0.99)
         } else {
             0.0
@@ -31003,7 +31044,8 @@ impl WorldSnapshot {
                 } else {
                     -1.2
                 };
-                let offside_excess = self.open_space_offside_excess_yards(me.team, p);
+                let offside_excess =
+                    self.open_space_offside_excess_yards_for_player(player_id, me.team, p);
                 let offside_penalty = if offside_excess > 0.0 {
                     // Scale with how far past the last-defender line, so the least
                     // badly-offside candidate is strongly preferred rather than an
@@ -31042,14 +31084,14 @@ impl WorldSnapshot {
                     } else {
                         0.0
                     };
-                    let spread_need = (0.82 + width_shortage * 1.35).clamp(0.82, 1.95);
+                    let spread_need = (0.95 + width_shortage * 1.65).clamp(0.95, 2.30);
                     // Lane affinity: holding the player's OWN home channel (and, for wide
                     // players, the touchline) has to compete with the open-space term
                     // (~0..18), while the global width fit rewards spreading the whole team.
-                    (lane_width * 1.5
-                        + home_lane_fit * 2.85
-                        + width_gain.max(0.0) * 2.10
-                        + width_fit * 0.9)
+                    (lane_width * 1.85
+                        + home_lane_fit * 3.10
+                        + width_gain.max(0.0) * 2.85
+                        + width_fit * 1.25)
                         * if correct_side { 1.0 } else { 0.28 }
                         // Don't hold width when the ball is well ahead — get forward.
                         * (1.0 - (behind_ball_yards / 28.0).clamp(0.0, 0.38))
@@ -31107,7 +31149,7 @@ impl WorldSnapshot {
                 let lane_position_penalty =
                     self.vertical_lane_penalty_for_player_target(me, p, movement_relief);
                 let dynamic_lane_fit_bonus = if possession && me.role != PlayerRole::Goalkeeper {
-                    self.dynamic_lane_affinity_for_player_target(me, p) * 0.54
+                    self.dynamic_lane_affinity_for_player_target(me, p) * 0.66
                 } else {
                     0.0
                 };
@@ -31207,6 +31249,7 @@ impl WorldSnapshot {
         // Stretch the pitch: if this is the wide player on the flank away from the ball,
         // hold its home channel instead of drifting ball-side into the bunch.
         let best = self.weak_side_width_hold_target(me, best);
+        let best = self.possession_wide_lane_floor_target(me, best);
         self.clamp_forward_onside_support(me, best)
     }
 
@@ -31256,6 +31299,65 @@ impl WorldSnapshot {
         Vec2::new(new_x, target.y).clamp_to_pitch(self.field_width, self.field_length)
     }
 
+    /// Possession width floor for wide off-ball players. Weak-side pinning handles
+    /// the far flank; this catches the ball-side and learned-target paths that can
+    /// still drift inside their assigned x-lane when the team shape is narrow.
+    fn possession_wide_lane_floor_target(&self, me: &PlayerSnapshot, target: Vec2) -> Vec2 {
+        if dd_soccer_disable_weakside_width_hold()
+            || self.active_set_play.is_some()
+            || me.role == PlayerRole::Goalkeeper
+            || self.ball.holder == Some(me.id)
+            || self.possession_team() != Some(me.team)
+            || !(self.is_wide_attacker(me) || self.is_wide_defender(me))
+        {
+            return target;
+        }
+        let mid = self.field_width * 0.5;
+        if mid <= 1.0 || !target.x.is_finite() || !target.y.is_finite() {
+            return target;
+        }
+        let home_side = (me.home_position.x - mid).signum();
+        if home_side == 0.0 {
+            return target;
+        }
+        let home_lateral = (me.home_position.x - mid).abs();
+        if home_lateral <= self.field_width * 0.16 {
+            return target;
+        }
+        let target_lateral = (target.x - mid).abs();
+        let home_collapse = ((home_lateral - target_lateral) / home_lateral.max(1.0))
+            .clamp(0.0, 1.0);
+        let target_width = self
+            .tactical_directive(me.team)
+            .width_yards
+            .max(self.field_width * 0.90)
+            .min(self.field_width * 0.99);
+        let current_width = self.team_lateral_width_yards(me.team);
+        let width_shortage = if target_width > 1e-6 {
+            ((target_width - current_width) / target_width).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let urgency = width_shortage.max(home_collapse * 0.62);
+        if urgency < POSSESSION_WIDE_LANE_FLOOR_MIN_SHORTAGE {
+            return target;
+        }
+        let ball_near_target = target.distance(self.ball.position) <= 8.0;
+        if ball_near_target && home_collapse < 0.45 {
+            return target;
+        }
+        let min_lateral = home_lateral
+            .max(self.field_width * POSSESSION_WIDE_LANE_FLOOR_MIN_FRACTION)
+            .min(mid - WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS);
+        if target_lateral >= min_lateral {
+            return target;
+        }
+        let desired_x = (mid + home_side * min_lateral).clamp(0.0, self.field_width);
+        let blend = (0.38 + urgency * 0.48).clamp(0.38, 0.86);
+        Vec2::new(target.x + (desired_x - target.x) * blend, target.y)
+            .clamp_to_pitch(self.field_width, self.field_length)
+    }
+
     /// Intent-level application of [`Self::weak_side_width_hold_target`]. The support
     /// router reaches a wide player through many branches (wide-outlet, flank-cross
     /// arrival, in-behind, check-to-ball, plain open space), so pinning width inside
@@ -31284,6 +31386,33 @@ impl WorldSnapshot {
             return intent;
         }
         let held = self.weak_side_width_hold_target(player, target);
+        if held.distance(target) > 1e-6 {
+            intent.action = SoccerAction::MoveTo(held);
+        }
+        intent
+    }
+
+    pub(crate) fn possession_wide_lane_floor_adjusted_intent(
+        &self,
+        mut intent: PlayerIntent,
+    ) -> PlayerIntent {
+        let SoccerAction::MoveTo(target) = intent.action else {
+            return intent;
+        };
+        if !target.x.is_finite() || !target.y.is_finite() || self.active_set_play.is_some() {
+            return intent;
+        }
+        let Some(player) = self.players.iter().find(|p| p.id == intent.player_id) else {
+            return intent;
+        };
+        if player.role == PlayerRole::Goalkeeper
+            || player.controller_slot.is_some()
+            || self.ball.holder == Some(player.id)
+            || self.is_live_ball_attacker_for_movement_guards(player.id)
+        {
+            return intent;
+        }
+        let held = self.possession_wide_lane_floor_target(player, target);
         if held.distance(target) > 1e-6 {
             intent.action = SoccerAction::MoveTo(held);
         }
@@ -32666,9 +32795,11 @@ impl WorldSnapshot {
         } else {
             -0.72
         };
-        let offside_penalty = if self.ball.holder != Some(player_id)
-            && self.position_would_be_offside(player.team, candidate)
-        {
+        let offside_penalty = if self.position_would_be_offside_for_player(
+            player_id,
+            player.team,
+            candidate,
+        ) {
             12.0
         } else {
             0.0
@@ -33818,7 +33949,8 @@ impl WorldSnapshot {
         let lane_penalty = self.vertical_lane_penalty_for_player_target(player, target, relief);
         let line_penalty = self.role_line_penalty_for_player_target(player, target, relief);
         let offside_penalty = if possession == Some(player.team) {
-            let excess = self.open_space_offside_excess_yards(player.team, target);
+            let excess =
+                self.open_space_offside_excess_yards_for_player(player.id, player.team, target);
             if excess > 0.0 {
                 0.45 + excess.min(12.0) * 0.35
             } else {
@@ -33837,8 +33969,9 @@ impl WorldSnapshot {
             let directive = self.tactical_directive(player.team);
             let target_width = directive
                 .width_yards
-                .max(self.field_width * 0.92)
+                .max(self.field_width * 0.95)
                 .min(self.field_width * 0.99);
+            let current_width = self.team_lateral_width_yards(player.team);
             let width_after =
                 self.team_lateral_width_yards_with_candidate(player.team, player.id, target);
             let width_fit = if target_width > 1e-6 {
@@ -33846,13 +33979,25 @@ impl WorldSnapshot {
             } else {
                 0.0
             };
+            let width_shortage = if target_width > 1e-6 {
+                ((target_width - current_width) / target_width).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let width_gain = ((width_after - current_width) / (self.field_width * 0.14).max(1.0))
+                .clamp(-0.5, 1.0);
             let half_width = (self.field_width * 0.5).max(1.0);
             let lateral_fit =
                 ((target.x - self.field_width * 0.5).abs() / half_width).clamp(0.0, 1.0);
             let home_lane_fit = (1.0
                 - (target.x - player.home_position.x).abs() / (self.field_width * 0.42).max(1.0))
             .clamp(0.0, 1.0);
-            (width_fit * 0.68 + lateral_fit * 0.52 + home_lane_fit * 0.28).clamp(0.0, 1.0)
+            ((width_fit * 0.78
+                + lateral_fit * 0.60
+                + home_lane_fit * 0.32
+                + width_gain.max(0.0) * 0.48)
+                * (1.0 + width_shortage * 0.45))
+                .clamp(0.0, 1.35)
         } else {
             0.0
         };
@@ -33874,7 +34019,7 @@ impl WorldSnapshot {
             + spacing * 0.30
             + relief * 0.12
             + dynamic_lane_fit * 0.22
-            + possession_width_score * 0.58
+            + possession_width_score * 0.72
             - teammate_penalty * 0.72
             - lane_penalty * lane_penalty_weight
             - line_penalty * line_penalty_weight
@@ -34334,6 +34479,7 @@ impl WorldSnapshot {
         let chosen = self.defensive_goal_side_target(player, chosen);
         let chosen = self.teammate_spacing_path_adjusted_target(player, chosen);
         let chosen = self.teammate_cross_through_target(player, chosen);
+        let chosen = self.possession_wide_lane_floor_target(player, chosen);
         self.defensive_goal_side_target(player, chosen)
     }
 
@@ -35206,5 +35352,45 @@ impl WorldSnapshot {
                 position.y < self.ball.position.y && position.y < defender_ys[1]
             }
         }
+    }
+
+    pub(crate) fn position_would_be_offside_for_player(
+        &self,
+        player_id: usize,
+        team: Team,
+        position: Vec2,
+    ) -> bool {
+        let legal_self_carry = self.player_has_legal_self_touch_claim(player_id, team);
+        !legal_self_carry && self.position_would_be_offside(team, position)
+    }
+
+    pub(crate) fn carrier_offside_line_break_yards(&self, player_id: usize) -> f64 {
+        let Some(player) = self.players.iter().find(|player| player.id == player_id) else {
+            return 0.0;
+        };
+        if !self.player_has_legal_self_touch_claim(player_id, player.team) {
+            return 0.0;
+        }
+        let position = self.player_snapshot_position(player);
+        let attack = player.team.attack_dir();
+        let half_line = self.field_length * 0.5;
+        if (position.y - half_line) * attack <= 0.0 {
+            return 0.0;
+        }
+        self.second_last_defender_line_for(player.team)
+            .map(|line_y| ((position.y - line_y) * attack).max(0.0))
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn player_has_legal_self_touch_claim(&self, player_id: usize, team: Team) -> bool {
+        if !self
+            .players
+            .iter()
+            .any(|player| player.id == player_id && player.team == team)
+        {
+            return false;
+        }
+        self.ball.holder == Some(player_id)
+            || (self.ball.holder.is_none() && self.ball.last_touch_player == Some(player_id))
     }
 }

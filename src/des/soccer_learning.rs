@@ -1429,6 +1429,10 @@ pub fn soccer_tactical_learning_weights_fingerprint(
     soccer_learning_fingerprint_f64(&mut hash, weights.attack_width_delta_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.attack_width_score_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.attack_flank_lane_weight);
+    soccer_learning_fingerprint_f64(&mut hash, weights.shot_choice_learning_weight);
+    soccer_learning_fingerprint_f64(&mut hash, weights.goal_entry_pass_learning_weight);
+    soccer_learning_fingerprint_f64(&mut hash, weights.pressure_release_learning_weight);
+    soccer_learning_fingerprint_f64(&mut hash, weights.pass_target_ranking_learning_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.defense_spacing_delta_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.defense_spacing_score_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.defense_contract_delta_weight);
@@ -1438,6 +1442,7 @@ pub fn soccer_tactical_learning_weights_fingerprint(
     soccer_learning_fingerprint_f64(&mut hash, weights.defense_endline_hard_penalty_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.defender_midfielder_press_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.midfielder_press_weight);
+    soccer_learning_fingerprint_f64(&mut hash, weights.defensive_line_press_learning_weight);
     soccer_learning_fingerprint_f64(&mut hash, weights.formation_lp_alignment_weight);
     hash
 }
@@ -2649,7 +2654,7 @@ fn search_soccer_tactical_genome_archetype_candidates<F>(
     let defense_ball_gap = (1.0 - weighted_summary.mean_defense_ball_gap_score).clamp(0.0, 1.0);
     let press_gap = (1.0 - weighted_summary.mean_defense_role_press_score).clamp(0.0, 1.0);
     let attack_pressure =
-        (attack_width_gap * 0.42 + attack_flank_gap * 0.42 + attack_spacing_gap * 0.16)
+        (attack_width_gap * 0.48 + attack_flank_gap * 0.40 + attack_spacing_gap * 0.12)
             .clamp(0.0, 1.0);
     let defense_pressure = (defense_contract_gap * 0.50
         + defense_spacing_gap * 0.18
@@ -2659,18 +2664,25 @@ fn search_soccer_tactical_genome_archetype_candidates<F>(
 
     if attack_pressure > 1e-12 {
         let mut flank_switch = centroid.clone();
-        flank_switch.attack_width_delta_weight += attack_width_gap * (0.16 + pressure * 0.10);
-        flank_switch.attack_flank_lane_weight += attack_flank_gap * (0.26 + pressure * 0.16);
+        flank_switch.attack_width_delta_weight += attack_width_gap * (0.22 + pressure * 0.12);
+        flank_switch.attack_width_score_weight += attack_width_gap * 0.10;
+        flank_switch.attack_flank_lane_weight += attack_flank_gap * (0.34 + pressure * 0.18);
         flank_switch.attack_spacing_delta_weight +=
             attack_spacing_gap * (0.10 + attack_pressure * 0.08);
         flank_switch.attack_spacing_score_weight += attack_spacing_gap * 0.05;
+        flank_switch.goal_entry_pass_learning_weight += attack_pressure * (0.10 + pressure * 0.05);
+        flank_switch.pass_target_ranking_learning_weight +=
+            attack_width_gap.max(attack_flank_gap) * 0.08;
         visit(clamp_soccer_tactical_learning_weights(&flank_switch));
 
         let mut support_spread = centroid.clone();
         support_spread.attack_spacing_delta_weight += attack_spacing_gap * (0.22 + pressure * 0.08);
         support_spread.attack_spacing_score_weight += attack_spacing_gap * 0.10;
-        support_spread.attack_width_delta_weight += attack_width_gap * 0.10;
-        support_spread.attack_flank_lane_weight += attack_flank_gap * 0.14;
+        support_spread.attack_width_delta_weight += attack_width_gap * 0.16;
+        support_spread.attack_width_score_weight += attack_width_gap * 0.06;
+        support_spread.attack_flank_lane_weight += attack_flank_gap * 0.20;
+        support_spread.pressure_release_learning_weight += attack_spacing_gap * 0.08;
+        support_spread.pass_target_ranking_learning_weight += attack_pressure * 0.06;
         visit(clamp_soccer_tactical_learning_weights(&support_spread));
     }
 
@@ -2692,18 +2704,24 @@ fn search_soccer_tactical_genome_archetype_candidates<F>(
             press_gap * (0.09 + defense_pressure * 0.04);
         press_contract.midfielder_press_weight += press_gap * (0.08 + defense_pressure * 0.03);
         press_contract.defense_ball_depth_score_weight += defense_ball_gap * 0.05;
+        press_contract.defensive_line_press_learning_weight +=
+            press_gap * (0.10 + defense_pressure * 0.06);
         visit(clamp_soccer_tactical_learning_weights(&press_contract));
     }
 
     if attack_pressure > 1e-12 && defense_pressure > 1e-12 {
         let mut two_phase_shape = centroid.clone();
-        two_phase_shape.attack_width_delta_weight += attack_width_gap * 0.13;
-        two_phase_shape.attack_flank_lane_weight += attack_flank_gap * (0.20 + pressure * 0.10);
+        two_phase_shape.attack_width_delta_weight += attack_width_gap * 0.18;
+        two_phase_shape.attack_width_score_weight += attack_width_gap * 0.06;
+        two_phase_shape.attack_flank_lane_weight += attack_flank_gap * (0.26 + pressure * 0.12);
         two_phase_shape.attack_spacing_delta_weight += attack_spacing_gap * 0.08;
+        two_phase_shape.goal_entry_pass_learning_weight += attack_pressure * 0.08;
+        two_phase_shape.pressure_release_learning_weight += attack_spacing_gap * 0.05;
         two_phase_shape.defense_contract_delta_weight +=
             defense_contract_gap * (0.21 + pressure * 0.11);
         two_phase_shape.defense_compactness_score_weight += defense_contract_gap * 0.14;
         two_phase_shape.defense_spacing_delta_weight += defense_spacing_gap * 0.06;
+        two_phase_shape.defensive_line_press_learning_weight += press_gap * 0.09;
         visit(clamp_soccer_tactical_learning_weights(&two_phase_shape));
     }
 }
@@ -2715,6 +2733,10 @@ enum SoccerTacticalGpGene {
     AttackWidthDelta,
     AttackWidthScore,
     AttackFlankLane,
+    ShotChoice,
+    GoalEntryPass,
+    PressureRelease,
+    PassTargetRanking,
     DefenseSpacingDelta,
     DefenseSpacingScore,
     DefenseContractDelta,
@@ -2722,6 +2744,7 @@ enum SoccerTacticalGpGene {
     DefenseBallDepthScore,
     DefenderMidfielderPress,
     MidfielderPress,
+    DefensiveLinePress,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2751,15 +2774,19 @@ struct SoccerTacticalGpInstruction {
     scale: f64,
 }
 
-const ATTACK_SOCCER_TACTICAL_GP_GENES: [SoccerTacticalGpGene; 5] = [
+const ATTACK_SOCCER_TACTICAL_GP_GENES: [SoccerTacticalGpGene; 9] = [
     SoccerTacticalGpGene::AttackSpacingDelta,
     SoccerTacticalGpGene::AttackSpacingScore,
     SoccerTacticalGpGene::AttackWidthDelta,
     SoccerTacticalGpGene::AttackWidthScore,
     SoccerTacticalGpGene::AttackFlankLane,
+    SoccerTacticalGpGene::ShotChoice,
+    SoccerTacticalGpGene::GoalEntryPass,
+    SoccerTacticalGpGene::PressureRelease,
+    SoccerTacticalGpGene::PassTargetRanking,
 ];
 
-const DEFENSE_SOCCER_TACTICAL_GP_GENES: [SoccerTacticalGpGene; 7] = [
+const DEFENSE_SOCCER_TACTICAL_GP_GENES: [SoccerTacticalGpGene; 8] = [
     SoccerTacticalGpGene::DefenseSpacingDelta,
     SoccerTacticalGpGene::DefenseSpacingScore,
     SoccerTacticalGpGene::DefenseContractDelta,
@@ -2767,6 +2794,7 @@ const DEFENSE_SOCCER_TACTICAL_GP_GENES: [SoccerTacticalGpGene; 7] = [
     SoccerTacticalGpGene::DefenseBallDepthScore,
     SoccerTacticalGpGene::DefenderMidfielderPress,
     SoccerTacticalGpGene::MidfielderPress,
+    SoccerTacticalGpGene::DefensiveLinePress,
 ];
 
 const ATTACK_SOCCER_TACTICAL_GP_SIGNALS: [SoccerTacticalGpSignal; 4] = [
@@ -3136,7 +3164,7 @@ fn search_soccer_tactical_novelty_immigrant_candidates<F>(
     let defense_ball_gap = (1.0 - weighted_summary.mean_defense_ball_gap_score).clamp(0.0, 1.0);
     let press_gap = (1.0 - weighted_summary.mean_defense_role_press_score).clamp(0.0, 1.0);
     let attack_pressure =
-        (attack_width_gap * 0.38 + attack_flank_gap * 0.46 + attack_spacing_gap * 0.16)
+        (attack_width_gap * 0.44 + attack_flank_gap * 0.44 + attack_spacing_gap * 0.12)
             .clamp(0.0, 1.0);
     let defense_pressure = (defense_contract_gap * 0.52
         + defense_spacing_gap * 0.14
@@ -3168,10 +3196,10 @@ fn search_soccer_tactical_novelty_immigrant_candidates<F>(
 
         if attack_pressure > 1e-12 {
             candidate.attack_width_delta_weight +=
-                attack_width_gap * (0.20 + pressure * 0.18) * stretch * attack_bias;
-            candidate.attack_width_score_weight += attack_width_gap * 0.05 * stretch;
+                attack_width_gap * (0.26 + pressure * 0.20) * stretch * attack_bias;
+            candidate.attack_width_score_weight += attack_width_gap * 0.09 * stretch;
             candidate.attack_flank_lane_weight +=
-                attack_flank_gap * (0.34 + pressure * 0.24) * stretch * attack_bias;
+                attack_flank_gap * (0.42 + pressure * 0.26) * stretch * attack_bias;
             candidate.attack_spacing_delta_weight +=
                 attack_spacing_gap * (0.08 + attack_pressure * 0.09) * stretch;
             candidate.attack_spacing_score_weight += attack_spacing_gap * 0.04 * stretch;
@@ -3193,7 +3221,8 @@ fn search_soccer_tactical_novelty_immigrant_candidates<F>(
         }
 
         if attack_pressure > 1e-12 && defense_pressure > 1e-12 && candidate_index % 5 == 0 {
-            candidate.attack_flank_lane_weight += attack_flank_gap * 0.16 * stretch;
+            candidate.attack_width_score_weight += attack_width_gap * 0.05 * stretch;
+            candidate.attack_flank_lane_weight += attack_flank_gap * 0.20 * stretch;
             candidate.defense_contract_delta_weight += defense_contract_gap * 0.18 * stretch;
         }
 
@@ -3357,6 +3386,10 @@ fn soccer_tactical_gp_gene_is_attack(gene: SoccerTacticalGpGene) -> bool {
             | SoccerTacticalGpGene::AttackWidthDelta
             | SoccerTacticalGpGene::AttackWidthScore
             | SoccerTacticalGpGene::AttackFlankLane
+            | SoccerTacticalGpGene::ShotChoice
+            | SoccerTacticalGpGene::GoalEntryPass
+            | SoccerTacticalGpGene::PressureRelease
+            | SoccerTacticalGpGene::PassTargetRanking
     )
 }
 
@@ -3438,6 +3471,18 @@ fn adjust_soccer_tactical_gp_gene(
         SoccerTacticalGpGene::AttackFlankLane => {
             weights.attack_flank_lane_weight += delta;
         }
+        SoccerTacticalGpGene::ShotChoice => {
+            weights.shot_choice_learning_weight += delta;
+        }
+        SoccerTacticalGpGene::GoalEntryPass => {
+            weights.goal_entry_pass_learning_weight += delta;
+        }
+        SoccerTacticalGpGene::PressureRelease => {
+            weights.pressure_release_learning_weight += delta;
+        }
+        SoccerTacticalGpGene::PassTargetRanking => {
+            weights.pass_target_ranking_learning_weight += delta;
+        }
         SoccerTacticalGpGene::DefenseSpacingDelta => {
             weights.defense_spacing_delta_weight += delta;
         }
@@ -3458,6 +3503,9 @@ fn adjust_soccer_tactical_gp_gene(
         }
         SoccerTacticalGpGene::MidfielderPress => {
             weights.midfielder_press_weight += delta;
+        }
+        SoccerTacticalGpGene::DefensiveLinePress => {
+            weights.defensive_line_press_learning_weight += delta;
         }
     }
 }
@@ -3491,7 +3539,7 @@ fn search_soccer_tactical_strategy_candidates<F>(
     let defense_ball_gap = (1.0 - weighted_summary.mean_defense_ball_gap_score).clamp(0.0, 1.0);
     let press_gap = (1.0 - weighted_summary.mean_defense_role_press_score).clamp(0.0, 1.0);
     let attack_pressure =
-        (attack_width_gap * 0.42 + attack_flank_gap * 0.43 + attack_spacing_gap * 0.15)
+        (attack_width_gap * 0.47 + attack_flank_gap * 0.41 + attack_spacing_gap * 0.12)
             .clamp(0.0, 1.0);
     let defense_pressure = (defense_contract_gap * 0.50
         + defense_spacing_gap * 0.18
@@ -3502,28 +3550,39 @@ fn search_soccer_tactical_strategy_candidates<F>(
 
     if attack_pressure > 1e-12 {
         let mut wide_flank = base.clone();
-        wide_flank.attack_width_delta_weight += attack_width_gap * 0.24 + attack_pressure * 0.10;
-        wide_flank.attack_width_score_weight += attack_width_gap * 0.07;
-        wide_flank.attack_flank_lane_weight += attack_flank_gap * 0.30 + attack_pressure * 0.12;
+        wide_flank.attack_width_delta_weight += attack_width_gap * 0.32 + attack_pressure * 0.12;
+        wide_flank.attack_width_score_weight += attack_width_gap * 0.12;
+        wide_flank.attack_flank_lane_weight += attack_flank_gap * 0.36 + attack_pressure * 0.14;
         wide_flank.attack_spacing_delta_weight += attack_spacing_gap * 0.08;
+        wide_flank.goal_entry_pass_learning_weight += attack_pressure * 0.10;
+        wide_flank.pass_target_ranking_learning_weight +=
+            attack_width_gap.max(attack_flank_gap) * 0.08;
         visit(wide_flank);
 
         let mut flank_overload = base.clone();
         flank_overload.attack_width_delta_weight +=
-            attack_width_gap * 0.30 + attack_flank_gap * 0.10;
-        flank_overload.attack_width_score_weight += attack_width_gap * 0.09;
-        flank_overload.attack_flank_lane_weight += attack_flank_gap * 0.38 + attack_pressure * 0.18;
+            attack_width_gap * 0.38 + attack_flank_gap * 0.12;
+        flank_overload.attack_width_score_weight += attack_width_gap * 0.14;
+        flank_overload.attack_flank_lane_weight += attack_flank_gap * 0.46 + attack_pressure * 0.20;
         flank_overload.attack_spacing_delta_weight +=
             attack_spacing_gap * 0.12 + attack_pressure * 0.04;
         flank_overload.attack_spacing_score_weight += attack_spacing_gap * 0.04;
+        flank_overload.shot_choice_learning_weight += attack_width_gap.max(attack_flank_gap) * 0.05;
+        flank_overload.goal_entry_pass_learning_weight += attack_pressure * 0.12;
+        flank_overload.pass_target_ranking_learning_weight +=
+            attack_width_gap.max(attack_flank_gap) * 0.10;
         visit(flank_overload);
 
         let mut spread_support = base.clone();
         spread_support.attack_spacing_delta_weight +=
             attack_spacing_gap * 0.20 + attack_pressure * 0.06;
         spread_support.attack_spacing_score_weight += attack_spacing_gap * 0.10;
-        spread_support.attack_width_delta_weight += attack_width_gap * 0.16;
-        spread_support.attack_flank_lane_weight += attack_flank_gap * 0.20;
+        spread_support.attack_width_delta_weight += attack_width_gap * 0.22;
+        spread_support.attack_width_score_weight += attack_width_gap * 0.08;
+        spread_support.attack_flank_lane_weight += attack_flank_gap * 0.26;
+        spread_support.pressure_release_learning_weight +=
+            attack_spacing_gap * 0.10 + attack_pressure * 0.04;
+        spread_support.pass_target_ranking_learning_weight += attack_pressure * 0.07;
         visit(spread_support);
     }
 
@@ -3536,6 +3595,7 @@ fn search_soccer_tactical_strategy_candidates<F>(
         compact_defense.defense_ball_depth_score_weight += defense_ball_gap * 0.06;
         compact_defense.defender_midfielder_press_weight += press_gap * 0.04;
         compact_defense.midfielder_press_weight += press_gap * 0.035;
+        compact_defense.defensive_line_press_learning_weight += press_gap * 0.06;
         visit(compact_defense);
 
         let mut deep_compact_block = base.clone();
@@ -3556,21 +3616,28 @@ fn search_soccer_tactical_strategy_candidates<F>(
             press_gap * 0.08 + defense_pressure * 0.025;
         press_contract.midfielder_press_weight += press_gap * 0.07 + defense_pressure * 0.020;
         press_contract.defense_ball_depth_score_weight += defense_ball_gap * 0.05;
+        press_contract.defensive_line_press_learning_weight +=
+            press_gap * 0.10 + defense_pressure * 0.05;
         visit(press_contract);
     }
 
     if shape_pressure > 1e-12 {
         let mut balanced_shape = base.clone();
         balanced_shape.attack_width_delta_weight +=
-            attack_width_gap * 0.22 + attack_pressure * 0.08;
-        balanced_shape.attack_width_score_weight += attack_width_gap * 0.05;
-        balanced_shape.attack_flank_lane_weight += attack_flank_gap * 0.27 + attack_pressure * 0.10;
+            attack_width_gap * 0.28 + attack_pressure * 0.10;
+        balanced_shape.attack_width_score_weight += attack_width_gap * 0.08;
+        balanced_shape.attack_flank_lane_weight += attack_flank_gap * 0.34 + attack_pressure * 0.12;
         balanced_shape.attack_spacing_delta_weight += attack_spacing_gap * 0.07 * shape_pressure;
+        balanced_shape.goal_entry_pass_learning_weight += attack_pressure * 0.08;
+        balanced_shape.pressure_release_learning_weight += attack_spacing_gap * 0.05 * shape_pressure;
+        balanced_shape.pass_target_ranking_learning_weight +=
+            attack_width_gap.max(attack_flank_gap) * 0.07;
         balanced_shape.defense_contract_delta_weight +=
             defense_contract_gap * 0.27 + defense_pressure * 0.10;
         balanced_shape.defense_compactness_score_weight += defense_contract_gap * 0.16;
         balanced_shape.defense_spacing_delta_weight += defense_spacing_gap * 0.06 * shape_pressure;
         balanced_shape.defense_ball_depth_score_weight += defense_ball_gap * 0.05 * shape_pressure;
+        balanced_shape.defensive_line_press_learning_weight += press_gap * 0.08 * shape_pressure;
         visit(balanced_shape);
     }
 }
@@ -3714,6 +3781,22 @@ fn weighted_soccer_tactical_genome_centroid(
         weighted_soccer_tactical_genome_gene(parents, options, |weights| {
             weights.attack_flank_lane_weight
         })?;
+    centroid.shot_choice_learning_weight =
+        weighted_soccer_tactical_genome_gene(parents, options, |weights| {
+            weights.shot_choice_learning_weight
+        })?;
+    centroid.goal_entry_pass_learning_weight =
+        weighted_soccer_tactical_genome_gene(parents, options, |weights| {
+            weights.goal_entry_pass_learning_weight
+        })?;
+    centroid.pressure_release_learning_weight =
+        weighted_soccer_tactical_genome_gene(parents, options, |weights| {
+            weights.pressure_release_learning_weight
+        })?;
+    centroid.pass_target_ranking_learning_weight =
+        weighted_soccer_tactical_genome_gene(parents, options, |weights| {
+            weights.pass_target_ranking_learning_weight
+        })?;
     centroid.defense_spacing_delta_weight =
         weighted_soccer_tactical_genome_gene(parents, options, |weights| {
             weights.defense_spacing_delta_weight
@@ -3749,6 +3832,10 @@ fn weighted_soccer_tactical_genome_centroid(
     centroid.midfielder_press_weight =
         weighted_soccer_tactical_genome_gene(parents, options, |weights| {
             weights.midfielder_press_weight
+        })?;
+    centroid.defensive_line_press_learning_weight =
+        weighted_soccer_tactical_genome_gene(parents, options, |weights| {
+            weights.defensive_line_press_learning_weight
         })?;
     centroid.formation_lp_alignment_weight =
         weighted_soccer_tactical_genome_gene(parents, options, |weights| {
@@ -3819,6 +3906,26 @@ fn extrapolate_soccer_tactical_learning_weights(
         target.attack_flank_lane_weight,
         scale,
     );
+    extrapolated.shot_choice_learning_weight = extrapolate_soccer_tactical_weight(
+        base.shot_choice_learning_weight,
+        target.shot_choice_learning_weight,
+        scale,
+    );
+    extrapolated.goal_entry_pass_learning_weight = extrapolate_soccer_tactical_weight(
+        base.goal_entry_pass_learning_weight,
+        target.goal_entry_pass_learning_weight,
+        scale,
+    );
+    extrapolated.pressure_release_learning_weight = extrapolate_soccer_tactical_weight(
+        base.pressure_release_learning_weight,
+        target.pressure_release_learning_weight,
+        scale,
+    );
+    extrapolated.pass_target_ranking_learning_weight = extrapolate_soccer_tactical_weight(
+        base.pass_target_ranking_learning_weight,
+        target.pass_target_ranking_learning_weight,
+        scale,
+    );
     extrapolated.defense_spacing_delta_weight = extrapolate_soccer_tactical_weight(
         base.defense_spacing_delta_weight,
         target.defense_spacing_delta_weight,
@@ -3864,6 +3971,11 @@ fn extrapolate_soccer_tactical_learning_weights(
         target.midfielder_press_weight,
         scale,
     );
+    extrapolated.defensive_line_press_learning_weight = extrapolate_soccer_tactical_weight(
+        base.defensive_line_press_learning_weight,
+        target.defensive_line_press_learning_weight,
+        scale,
+    );
     extrapolated.formation_lp_alignment_weight = extrapolate_soccer_tactical_weight(
         base.formation_lp_alignment_weight,
         target.formation_lp_alignment_weight,
@@ -3898,6 +4010,9 @@ fn evolve_soccer_tactical_learning_candidate(
     let defense_spacing_gap = (1.0 - weighted_summary.mean_defense_spacing_score).clamp(0.0, 1.0);
     let defense_ball_gap = (1.0 - weighted_summary.mean_defense_ball_gap_score).clamp(0.0, 1.0);
     let press_gap = (1.0 - weighted_summary.mean_defense_role_press_score).clamp(0.0, 1.0);
+    let attack_decision_gap = attack_width_gap
+        .max(attack_flank_gap)
+        .max(attack_spacing_gap * 0.70);
 
     evolve_weight(
         &mut evolved.attack_spacing_delta_weight,
@@ -3910,7 +4025,7 @@ fn evolve_soccer_tactical_learning_candidate(
     );
     evolve_weight(
         &mut evolved.attack_width_delta_weight,
-        attack_width_gap * 0.070,
+        attack_width_gap * 0.090,
         mutation_scale,
         exploration_rate,
         exploration_scale,
@@ -3918,13 +4033,58 @@ fn evolve_soccer_tactical_learning_candidate(
         2.2,
     );
     evolve_weight(
+        &mut evolved.attack_width_score_weight,
+        attack_width_gap * 0.045,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        1.2,
+    );
+    evolve_weight(
         &mut evolved.attack_flank_lane_weight,
-        attack_flank_gap * 0.085,
+        attack_flank_gap * 0.105,
         mutation_scale,
         exploration_rate,
         exploration_scale,
         &mut rng,
         2.2,
+    );
+    evolve_weight(
+        &mut evolved.shot_choice_learning_weight,
+        attack_decision_gap * 0.050,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        2.0,
+    );
+    evolve_weight(
+        &mut evolved.goal_entry_pass_learning_weight,
+        attack_width_gap.max(attack_flank_gap) * 0.060 + attack_spacing_gap * 0.020,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        2.0,
+    );
+    evolve_weight(
+        &mut evolved.pressure_release_learning_weight,
+        attack_spacing_gap * 0.045 + press_gap * 0.030,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        2.0,
+    );
+    evolve_weight(
+        &mut evolved.pass_target_ranking_learning_weight,
+        attack_width_gap.max(attack_flank_gap) * 0.055 + attack_spacing_gap * 0.025,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        2.0,
     );
     evolve_weight(
         &mut evolved.defense_contract_delta_weight,
@@ -3980,6 +4140,15 @@ fn evolve_soccer_tactical_learning_candidate(
         &mut rng,
         1.6,
     );
+    evolve_weight(
+        &mut evolved.defensive_line_press_learning_weight,
+        press_gap * 0.070 + defense_ball_gap * 0.025,
+        mutation_scale,
+        exploration_rate,
+        exploration_scale,
+        &mut rng,
+        2.0,
+    );
 
     evolved
 }
@@ -4034,6 +4203,38 @@ fn crossover_soccer_tactical_learning_weights(
         rng,
         2.2,
         |weights| weights.attack_flank_lane_weight,
+    );
+    crossover_tactical_weight_gene(
+        &mut child.shot_choice_learning_weight,
+        parents,
+        options,
+        rng,
+        2.0,
+        |weights| weights.shot_choice_learning_weight,
+    );
+    crossover_tactical_weight_gene(
+        &mut child.goal_entry_pass_learning_weight,
+        parents,
+        options,
+        rng,
+        2.0,
+        |weights| weights.goal_entry_pass_learning_weight,
+    );
+    crossover_tactical_weight_gene(
+        &mut child.pressure_release_learning_weight,
+        parents,
+        options,
+        rng,
+        2.0,
+        |weights| weights.pressure_release_learning_weight,
+    );
+    crossover_tactical_weight_gene(
+        &mut child.pass_target_ranking_learning_weight,
+        parents,
+        options,
+        rng,
+        2.0,
+        |weights| weights.pass_target_ranking_learning_weight,
     );
     crossover_tactical_weight_gene(
         &mut child.defense_spacing_delta_weight,
@@ -4107,6 +4308,14 @@ fn crossover_soccer_tactical_learning_weights(
         1.6,
         |weights| weights.midfielder_press_weight,
     );
+    crossover_tactical_weight_gene(
+        &mut child.defensive_line_press_learning_weight,
+        parents,
+        options,
+        rng,
+        2.0,
+        |weights| weights.defensive_line_press_learning_weight,
+    );
     child
 }
 
@@ -4179,6 +4388,14 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.attack_width_delta_weight = clamped.attack_width_delta_weight.max(0.0).min(2.2);
     clamped.attack_width_score_weight = clamped.attack_width_score_weight.max(0.0).min(1.2);
     clamped.attack_flank_lane_weight = clamped.attack_flank_lane_weight.max(0.0).min(2.2);
+    clamped.shot_choice_learning_weight =
+        clamped.shot_choice_learning_weight.max(0.0).min(2.0);
+    clamped.goal_entry_pass_learning_weight =
+        clamped.goal_entry_pass_learning_weight.max(0.0).min(2.0);
+    clamped.pressure_release_learning_weight =
+        clamped.pressure_release_learning_weight.max(0.0).min(2.0);
+    clamped.pass_target_ranking_learning_weight =
+        clamped.pass_target_ranking_learning_weight.max(0.0).min(2.0);
     clamped.defense_spacing_delta_weight = clamped.defense_spacing_delta_weight.max(0.0).min(1.8);
     clamped.defense_spacing_score_weight = clamped.defense_spacing_score_weight.max(0.0).min(1.2);
     clamped.defense_contract_delta_weight = clamped.defense_contract_delta_weight.max(0.0).min(2.4);
@@ -4197,6 +4414,8 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.defender_midfielder_press_weight =
         clamped.defender_midfielder_press_weight.max(0.0).min(1.6);
     clamped.midfielder_press_weight = clamped.midfielder_press_weight.max(0.0).min(1.6);
+    clamped.defensive_line_press_learning_weight =
+        clamped.defensive_line_press_learning_weight.max(0.0).min(2.0);
     clamped.formation_lp_alignment_weight =
         clamped.formation_lp_alignment_weight.max(-5.0).min(5.0);
     clamped
@@ -4213,12 +4432,25 @@ fn soccer_tactical_weight_search_score(
     let defense_spacing_gap = (1.0 - summary.mean_defense_spacing_score).clamp(0.0, 1.0);
     let defense_ball_gap = (1.0 - summary.mean_defense_ball_gap_score).clamp(0.0, 1.0);
     let press_gap = (1.0 - summary.mean_defense_role_press_score).clamp(0.0, 1.0);
+    let attack_decision_gap = attack_width_gap
+        .max(attack_flank_gap)
+        .max(attack_spacing_gap * 0.70);
 
     weights.attack_width_delta_weight * attack_width_gap * 1.15
         + weights.attack_width_score_weight * attack_width_gap * 0.45
         + weights.attack_flank_lane_weight * attack_flank_gap * 1.35
         + weights.attack_spacing_delta_weight * attack_spacing_gap * 0.85
         + weights.attack_spacing_score_weight * attack_spacing_gap * 0.35
+        + weights.shot_choice_learning_weight * attack_decision_gap * 0.10
+        + weights.goal_entry_pass_learning_weight
+            * attack_width_gap.max(attack_flank_gap)
+            * 0.18
+        + weights.pressure_release_learning_weight
+            * (attack_spacing_gap * 0.50 + press_gap * 0.50)
+            * 0.14
+        + weights.pass_target_ranking_learning_weight
+            * attack_width_gap.max(attack_flank_gap)
+            * 0.16
         + weights.defense_contract_delta_weight * defense_contract_gap * 1.35
         + weights.defense_compactness_score_weight * defense_contract_gap * 1.05
         + weights.defense_spacing_delta_weight * defense_spacing_gap * 0.80
@@ -4226,6 +4458,7 @@ fn soccer_tactical_weight_search_score(
         + weights.defense_ball_depth_score_weight * defense_ball_gap * 0.70
         + weights.defender_midfielder_press_weight * press_gap * 0.40
         + weights.midfielder_press_weight * press_gap * 0.35
+        + weights.defensive_line_press_learning_weight * press_gap * 0.20
 }
 
 pub fn run_soccer_learning_game(
@@ -7093,9 +7326,51 @@ mod tests {
         let evolved = evolve_soccer_tactical_learning_weights(&base, &[(&summary, 1.0)], options);
 
         assert!(evolved.attack_width_delta_weight > base.attack_width_delta_weight);
+        assert!(evolved.attack_width_score_weight > base.attack_width_score_weight);
         assert!(evolved.attack_flank_lane_weight > base.attack_flank_lane_weight);
         assert!(evolved.defense_contract_delta_weight > base.defense_contract_delta_weight);
         assert!(evolved.defense_compactness_score_weight > base.defense_compactness_score_weight);
+    }
+
+    #[test]
+    fn tactical_weight_evolution_mutates_decision_learning_weights() {
+        let base = SoccerTacticalLearningWeights::default();
+        let summary = SoccerTacticalLearningSummary {
+            mean_attack_width_score: 0.16,
+            mean_attack_flank_lane_score: 0.14,
+            mean_attack_spacing_score: 0.20,
+            mean_defense_contract_score: 0.28,
+            mean_defense_spacing_score: 0.38,
+            mean_defense_ball_gap_score: 0.32,
+            mean_defense_role_press_score: 0.18,
+            ..Default::default()
+        };
+        let options = SoccerEvolutionOptions {
+            mutation_rate: 0.0,
+            mutation_scale: 0.0,
+            crossover_rate: 0.0,
+            exploration_rate: 0.0,
+            exploration_scale: 0.0,
+            elite_weight_floor: 0.0,
+            population_size: 1,
+            seed: 31,
+        };
+
+        let evolved = evolve_soccer_tactical_learning_candidate(&base, &summary, options);
+
+        assert!(evolved.shot_choice_learning_weight > base.shot_choice_learning_weight);
+        assert!(evolved.goal_entry_pass_learning_weight > base.goal_entry_pass_learning_weight);
+        assert!(evolved.pressure_release_learning_weight > base.pressure_release_learning_weight);
+        assert!(evolved.pass_target_ranking_learning_weight > base.pass_target_ranking_learning_weight);
+        assert!(
+            evolved.defensive_line_press_learning_weight
+                > base.defensive_line_press_learning_weight
+        );
+        assert!(evolved.shot_choice_learning_weight <= 2.0);
+        assert!(evolved.goal_entry_pass_learning_weight <= 2.0);
+        assert!(evolved.pressure_release_learning_weight <= 2.0);
+        assert!(evolved.pass_target_ranking_learning_weight <= 2.0);
+        assert!(evolved.defensive_line_press_learning_weight <= 2.0);
     }
 
     #[test]
@@ -7158,6 +7433,7 @@ mod tests {
         let evolved = evolve_soccer_tactical_learning_weights(&base, &[(&summary, 1.0)], options);
 
         assert!(evolved.attack_width_delta_weight >= base.attack_width_delta_weight + 0.18);
+        assert!(evolved.attack_width_score_weight >= base.attack_width_score_weight + 0.06);
         assert!(evolved.attack_flank_lane_weight >= base.attack_flank_lane_weight + 0.24);
         assert!(evolved.defense_contract_delta_weight >= base.defense_contract_delta_weight + 0.22);
         assert!(
@@ -7188,6 +7464,9 @@ mod tests {
         assert!(candidates.iter().any(|candidate| {
             candidate.attack_flank_lane_weight >= base.attack_flank_lane_weight + 0.40
                 && candidate.attack_spacing_delta_weight > base.attack_spacing_delta_weight
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.attack_width_score_weight >= base.attack_width_score_weight + 0.08
         }));
         assert!(candidates.iter().any(|candidate| {
             candidate.defense_contract_delta_weight >= base.defense_contract_delta_weight + 0.35

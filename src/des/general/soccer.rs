@@ -2491,6 +2491,8 @@ const DEFENDER_LINE_FORWARD_BIAS_YARDS: f64 = 2.5;
 // be at least this lopsided (fraction of the half-width off-centre) before the far
 // flank is meaningfully a "weak side" worth pinning; below it both flanks are live.
 const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.10;
+const POSSESSION_WIDE_LANE_FLOOR_MIN_SHORTAGE: f64 = 0.08;
+const POSSESSION_WIDE_LANE_FLOOR_MIN_FRACTION: f64 = 0.30;
 // Defenders slide toward the ball laterally a touch more than before, and
 // wing-backs (wide defenders) slide much more — they are the ones who shuttle out
 // to the ball on their flank. Centre-backs get only a small amount: they hold
@@ -2973,8 +2975,14 @@ const OVER_THE_TOP_PASS_BONUS: f64 = 2.4;
 /// defender projects whether a sprinting attacker would be offside if the ball were
 /// played to them, and the belief threshold below which it stops trusting the trap and
 /// drops to cover (the user's "~90% confident over the next 3 seconds").
-const OFFSIDE_TRAP_HORIZON_SECONDS: f64 = 3.0;
+const BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS: f64 = 3.0;
+const OFFSIDE_TRAP_HORIZON_SECONDS: f64 = BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS;
 const OFFSIDE_TRAP_COVER_CONFIDENCE: f64 = 0.90;
+const MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_SECONDS: f64 = 5.0;
+const MIDFIELD_FOUR_BAND_IN_POSSESSION_AHEAD_BALL_YARDS: f64 = 5.0;
+const MIDFIELD_FOUR_BAND_LOOSE_BALL_BEHIND_BALL_YARDS: f64 = 6.0;
+const MIDFIELD_FOUR_BAND_OUT_OF_POSSESSION_BEHIND_BALL_YARDS: f64 = 12.0;
+const MIDFIELD_FOUR_BAND_TARGET_TOLERANCE_YARDS: f64 = 10.0;
 /// A runner must be moving goalward at least this fast to count as breaking the trap.
 const OFFSIDE_TRAP_RUNNER_MIN_SPEED_YPS: f64 = 4.0;
 /// Projected yards offside at which the defender is fully confident the trap catches the
@@ -3265,6 +3273,18 @@ const SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS: f64 = 18.0;
 const SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM: usize = 4;
 const SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM: usize = 8;
 const SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM: usize = 4;
+/// Append-only back-four line model block. The existing whole-field motion block
+/// already carries every player and the ball; this aggregate makes the dynamic
+/// average defensive-line `y` state explicit for the value, actor, and world-model
+/// heads while preserving old snapshots by zero-padding these newest channels.
+const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM: usize = 14;
+/// Append-only carrier line-break block: legal self-dribble progress beyond the
+/// second-last defender line, plus the distance to that break while carrying.
+const SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM: usize = 2;
+/// Append-only midfield-four band model block. Midfielders learn the same average
+/// `y` role-band dynamics as the back four, but without a strict offside-line
+/// constraint and with a five-second eventual-consistency horizon.
+const SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize = 14;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3275,9 +3295,16 @@ const SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM: usize = SOCCER_NEURAL_BASE_F
     + SOCCER_NEURAL_BELIEF_FEATURE_DIM
     + SOCCER_NEURAL_OPP_BELIEF_DIM
     + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
+const SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
     + SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM
     + SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM
+    + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM
+    + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
+    + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3438,6 +3465,66 @@ const SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_HAS_BALL + 1;
 const SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE: usize =
     SOCCER_NEURAL_FEATURE_HUMAN_TEAMMATE_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_LINE_Y: usize =
+    SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_TARGET_DELTA: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_LINE_Y + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_TARGET_DELTA + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_GAP: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_GAP + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_GAP: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_GAP + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_KEEPER_GAP: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_POSSESSION_STATE: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_KEEPER_GAP + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_POSSESSION_STATE + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW + 1;
+const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT + 1;
+const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW: usize =
+    SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y: usize =
+    SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_TARGET_DELTA: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_TARGET_DELTA + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_GAP: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_GAP + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_GAP: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_GAP + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_KEEPER_GAP: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_POSSESSION_STATE: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_KEEPER_GAP + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_POSSESSION_STATE + 1;
+const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3511,6 +3598,13 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     // Current base + motion + belief + opponent belief + learned-MPC tail,
     // before option-mask and human-intent features were appended.
     SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM,
+    // Current base + motion + belief + opponent belief + learned-MPC +
+    // option-control + human-intent, before the back-four line model tail.
+    SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM,
+    // Same schema with the back-four model tail, before legal carrier line-break features.
+    SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM,
+    // Same schema with carrier line-break features, before the midfield-four band tail.
+    SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -4732,6 +4826,100 @@ pub struct SoccerNeuralExtendedObservation {
     /// Opponent learned forward-intent (their value-head formation pull), in
     /// [0, 1]; 0 unless they run the neural blend.
     pub opponent_neural_intent_attack: f64,
+    // --- Back-four average-y line model (team aggregate, attack-direction frame) ---
+    /// Raw average `y` position of the team's defenders, in yards.
+    #[serde(default)]
+    pub back_four_line_y: f64,
+    /// Warm-start target delta for the average defender line, in attack-direction
+    /// yards. Positive means the current line should step up; negative means drop.
+    #[serde(default)]
+    pub back_four_line_target_delta_yards: f64,
+    /// Average defender-line velocity in the team's attacking direction, yards/sec.
+    #[serde(default)]
+    pub back_four_line_forward_velocity_yps: f64,
+    /// Average defender-line acceleration in the team's attacking direction, yards/sec^2.
+    #[serde(default)]
+    pub back_four_line_forward_acceleration_yps2: f64,
+    /// Ball offset from the average defender line in the team's attacking direction.
+    #[serde(default)]
+    pub back_four_ball_forward_gap_yards: f64,
+    /// Ball velocity minus line velocity in the team's attacking direction.
+    #[serde(default)]
+    pub back_four_ball_relative_velocity_yps: f64,
+    /// Ball acceleration minus line acceleration in the team's attacking direction.
+    #[serde(default)]
+    pub back_four_ball_relative_acceleration_yps2: f64,
+    /// Opponent center-of-mass offset from the average defender line.
+    #[serde(default)]
+    pub back_four_opponent_center_forward_gap_yards: f64,
+    /// Opponent center-of-mass velocity minus line velocity.
+    #[serde(default)]
+    pub back_four_opponent_center_relative_velocity_yps: f64,
+    /// Opponent center-of-mass acceleration minus line acceleration.
+    #[serde(default)]
+    pub back_four_opponent_center_relative_acceleration_yps2: f64,
+    /// Goalkeeper offset from the average defender line in the team's attacking direction.
+    #[serde(default)]
+    pub back_four_goalkeeper_forward_gap_yards: f64,
+    /// Possession state for this team: 1 own possession, -1 opponent possession, 0 loose/unknown.
+    #[serde(default)]
+    pub back_four_possession_state: f64,
+    /// Whether the current frame is a usable offside-trap shape.
+    #[serde(default)]
+    pub back_four_offside_trap_now: f64,
+    /// Whether the next three seconds project to a usable offside-trap shape.
+    #[serde(default)]
+    pub back_four_offside_trap_next_three_seconds: f64,
+    // --- Midfield-four average-y band model (team aggregate, attack-direction frame) ---
+    /// Raw average `y` position of the team's midfielders, in yards.
+    #[serde(default)]
+    pub midfield_four_band_y: f64,
+    /// Warm-start target delta for the average midfield band, in attack-direction
+    /// yards. Positive means the current band should step up; negative means drop.
+    #[serde(default)]
+    pub midfield_four_band_target_delta_yards: f64,
+    /// Average midfield-band velocity in the team's attacking direction, yards/sec.
+    #[serde(default)]
+    pub midfield_four_band_forward_velocity_yps: f64,
+    /// Average midfield-band acceleration in the team's attacking direction, yards/sec^2.
+    #[serde(default)]
+    pub midfield_four_band_forward_acceleration_yps2: f64,
+    /// Ball offset from the average midfield band in the team's attacking direction.
+    #[serde(default)]
+    pub midfield_four_ball_forward_gap_yards: f64,
+    /// Ball velocity minus midfield-band velocity in the team's attacking direction.
+    #[serde(default)]
+    pub midfield_four_ball_relative_velocity_yps: f64,
+    /// Ball acceleration minus midfield-band acceleration in the team's attacking direction.
+    #[serde(default)]
+    pub midfield_four_ball_relative_acceleration_yps2: f64,
+    /// Opponent center-of-mass offset from the average midfield band.
+    #[serde(default)]
+    pub midfield_four_opponent_center_forward_gap_yards: f64,
+    /// Opponent center-of-mass velocity minus midfield-band velocity.
+    #[serde(default)]
+    pub midfield_four_opponent_center_relative_velocity_yps: f64,
+    /// Opponent center-of-mass acceleration minus midfield-band acceleration.
+    #[serde(default)]
+    pub midfield_four_opponent_center_relative_acceleration_yps2: f64,
+    /// Goalkeeper offset from the average midfield band in the team's attacking direction.
+    #[serde(default)]
+    pub midfield_four_goalkeeper_forward_gap_yards: f64,
+    /// Possession state for this team: 1 own possession, -1 opponent possession, 0 loose/unknown.
+    #[serde(default)]
+    pub midfield_four_possession_state: f64,
+    /// Current midfield-band spread in raw `y` yards. This is a learning input, not a strict line gate.
+    #[serde(default)]
+    pub midfield_four_band_spread_yards: f64,
+    /// Whether the average midfield band projects back within target tolerance in five seconds.
+    #[serde(default)]
+    pub midfield_four_eventual_consistency_next_five_seconds: f64,
+    /// Legal yards the current carrier has dribbled beyond the second-last defender line.
+    #[serde(default)]
+    pub carrier_offside_line_break_yards: f64,
+    /// Distance to breaking the second-last defender line while still carrying.
+    #[serde(default)]
+    pub carrier_offside_line_break_window_yards: f64,
     // --- Dribble decision lanes (which way there is room to take the ball) ---
     /// Open-lane score to the carrier's LEFT forward sector, [0, 1] (1 = clear).
     pub dribble_left_lane_openness: f64,
@@ -12603,6 +12791,10 @@ pub struct SoccerTacticalLearningWeights {
     pub attack_width_delta_weight: f64,
     pub attack_width_score_weight: f64,
     pub attack_flank_lane_weight: f64,
+    pub shot_choice_learning_weight: f64,
+    pub goal_entry_pass_learning_weight: f64,
+    pub pressure_release_learning_weight: f64,
+    pub pass_target_ranking_learning_weight: f64,
     pub defense_spacing_delta_weight: f64,
     pub defense_spacing_score_weight: f64,
     pub defense_contract_delta_weight: f64,
@@ -12612,6 +12804,7 @@ pub struct SoccerTacticalLearningWeights {
     pub defense_endline_hard_penalty_weight: f64,
     pub defender_midfielder_press_weight: f64,
     pub midfielder_press_weight: f64,
+    pub defensive_line_press_learning_weight: f64,
     pub formation_lp_alignment_weight: f64,
 }
 
@@ -12620,9 +12813,13 @@ impl Default for SoccerTacticalLearningWeights {
         SoccerTacticalLearningWeights {
             attack_spacing_delta_weight: 0.22,
             attack_spacing_score_weight: 0.06,
-            attack_width_delta_weight: 0.52,
-            attack_width_score_weight: 0.24,
-            attack_flank_lane_weight: 0.36,
+            attack_width_delta_weight: 0.68,
+            attack_width_score_weight: 0.32,
+            attack_flank_lane_weight: 0.50,
+            shot_choice_learning_weight: 1.0,
+            goal_entry_pass_learning_weight: 1.0,
+            pressure_release_learning_weight: 1.0,
+            pass_target_ranking_learning_weight: 1.0,
             defense_spacing_delta_weight: 0.08,
             defense_spacing_score_weight: 0.04,
             defense_contract_delta_weight: 0.42,
@@ -12632,9 +12829,19 @@ impl Default for SoccerTacticalLearningWeights {
             defense_endline_hard_penalty_weight: 0.90,
             defender_midfielder_press_weight: 0.18,
             midfielder_press_weight: 0.20,
+            defensive_line_press_learning_weight: 1.0,
             formation_lp_alignment_weight: 0.16,
         }
     }
+}
+
+pub(crate) fn tactical_learning_weight_bias(weight: f64) -> f64 {
+    (weight.clamp(0.0, 2.0) - 1.0).clamp(-1.0, 1.0)
+}
+
+pub(crate) fn tactical_learning_multiplier(weight: f64, span: f64) -> f64 {
+    let span = span.max(0.0).min(1.0);
+    (1.0 + tactical_learning_weight_bias(weight) * span).clamp(1.0 - span, 1.0 + span)
 }
 
 impl SoccerTacticalLearningWeights {
@@ -12645,6 +12852,22 @@ impl SoccerTacticalLearningWeights {
             ("attackWidthDeltaWeight", self.attack_width_delta_weight),
             ("attackWidthScoreWeight", self.attack_width_score_weight),
             ("attackFlankLaneWeight", self.attack_flank_lane_weight),
+            (
+                "shotChoiceLearningWeight",
+                self.shot_choice_learning_weight,
+            ),
+            (
+                "goalEntryPassLearningWeight",
+                self.goal_entry_pass_learning_weight,
+            ),
+            (
+                "pressureReleaseLearningWeight",
+                self.pressure_release_learning_weight,
+            ),
+            (
+                "passTargetRankingLearningWeight",
+                self.pass_target_ranking_learning_weight,
+            ),
             (
                 "defenseSpacingDeltaWeight",
                 self.defense_spacing_delta_weight,
@@ -12678,6 +12901,10 @@ impl SoccerTacticalLearningWeights {
                 self.defender_midfielder_press_weight,
             ),
             ("midfielderPressWeight", self.midfielder_press_weight),
+            (
+                "defensiveLinePressLearningWeight",
+                self.defensive_line_press_learning_weight,
+            ),
             (
                 "formationLpAlignmentWeight",
                 self.formation_lp_alignment_weight,
@@ -15159,6 +15386,7 @@ fn tactical_directive_for_team(
     defensive_cover: DefensiveCoverProfile,
     attacking_overload: AttackingOverloadProfile,
     just_regained: bool,
+    tactical_learning: &SoccerTacticalLearningWeights,
 ) -> TeamTacticalDirective {
     let has_ball = possession_team == Some(team);
     let defending = possession_team == Some(team.other());
@@ -15186,18 +15414,28 @@ fn tactical_directive_for_team(
     } else {
         0.0
     };
+    let shot_choice_bias =
+        tactical_learning_weight_bias(tactical_learning.shot_choice_learning_weight);
+    let goal_entry_pass_bias =
+        tactical_learning_weight_bias(tactical_learning.goal_entry_pass_learning_weight);
+    let pass_target_bias =
+        tactical_learning_weight_bias(tactical_learning.pass_target_ranking_learning_weight);
+    let defensive_line_bias =
+        tactical_learning_weight_bias(tactical_learning.defensive_line_press_learning_weight);
     let attack_dir = team.attack_dir();
     let mut line_seed = if has_ball {
-        let holding_distance = if own_half_possession {
+        let holding_distance: f64 = if own_half_possession {
             14.0
         } else if attacking_phase {
             18.0
         } else {
             25.0
         };
+        let holding_distance = (holding_distance - defensive_line_bias * 2.5).clamp(10.5, 28.0);
         ball_position.y - attack_dir * holding_distance
     } else if defending {
-        let press_step = 8.0 + (urgency.max(0.0) * 18.0);
+        let press_step = (8.0 + (urgency.max(0.0) * 18.0) - defensive_line_bias * 3.5)
+            .clamp(4.5, 22.0);
         ball_position.y - attack_dir * press_step
     } else {
         match team {
@@ -15279,6 +15517,9 @@ fn tactical_directive_for_team(
         + if build_up_phase { 0.04 } else { 0.0 }
         + if own_half_possession { 0.11 } else { 0.0 }
         + overload_score * 0.18
+        + shot_choice_bias * 0.035
+        + goal_entry_pass_bias * 0.030
+        + defensive_line_bias * if defending { 0.055 } else { 0.020 }
         + urgency)
         .clamp(0.28, 0.92);
     let press_intensity: f64 = (if defending {
@@ -15287,7 +15528,7 @@ fn tactical_directive_for_team(
         0.54
     } else {
         0.30 + risk_tolerance * 0.12 + overload_score * 0.26
-    })
+    } + defensive_line_bias * if defending { 0.13 } else { 0.045 })
     .clamp(0.22, 1.0);
     let pass_base: f64 = if has_ball {
         if build_up_phase {
@@ -15300,7 +15541,12 @@ fn tactical_directive_for_team(
     } else {
         0.84
     };
-    let pass_priority: f64 = (pass_base + overload_score * 0.16 + if leading { 0.06 } else { 0.0 }
+    let pass_priority: f64 = (pass_base
+        + overload_score * 0.16
+        + goal_entry_pass_bias * 0.10
+        + pass_target_bias * 0.045
+        - shot_choice_bias * 0.035
+        + if leading { 0.06 } else { 0.0 }
         - if trailing && attacking_phase {
             0.04
         } else {
@@ -15320,6 +15566,9 @@ fn tactical_directive_for_team(
     } else {
         0.76
     } + urgency * 0.55
+        - goal_entry_pass_bias * 0.040
+        - pass_target_bias * 0.025
+        + shot_choice_bias * 0.025
         + overload_score * 0.22)
         .clamp(0.55, 1.35);
     let flank_attack_policy = flank_attack_policy_for_team(
@@ -15396,6 +15645,8 @@ fn tactical_directive_for_team(
     let shot_base: f64 =
         20.0 + if attacking_phase { 2.4 } else { 0.0 } + if trailing { 2.0 } else { 0.0 }
             - if leading { 1.2 } else { 0.0 }
+            + shot_choice_bias * 2.8
+            - goal_entry_pass_bias * 1.3
             + overload_score * 3.5;
     let shot_threshold_yards: f64 = shot_base.clamp(16.0, 28.0);
 
@@ -15822,6 +16073,19 @@ fn tactical_directive_for_team(
         carry_priority,
         shot_threshold_yards,
         risk_tolerance,
+        shot_choice_learning_weight: tactical_learning.shot_choice_learning_weight.clamp(0.0, 2.0),
+        goal_entry_pass_learning_weight: tactical_learning
+            .goal_entry_pass_learning_weight
+            .clamp(0.0, 2.0),
+        pressure_release_learning_weight: tactical_learning
+            .pressure_release_learning_weight
+            .clamp(0.0, 2.0),
+        pass_target_ranking_learning_weight: tactical_learning
+            .pass_target_ranking_learning_weight
+            .clamp(0.0, 2.0),
+        defensive_line_press_learning_weight: tactical_learning
+            .defensive_line_press_learning_weight
+            .clamp(0.0, 2.0),
         flank_attack_policy,
         attack_strategy,
         pair_attack_strategy: None,
@@ -19124,6 +19388,13 @@ fn goalmouth_dribble_learning_reward(
         - goalmouth_centrality(before_pos, before.field_width);
     let window_gain = after_obs.goal_attack_window_score.clamp(0.0, 1.0)
         - before_obs.goal_attack_window_score.clamp(0.0, 1.0);
+    let line_break_gain = (after_obs
+        .neural_extended
+        .carrier_offside_line_break_yards
+        - before_obs
+            .neural_extended
+            .carrier_offside_line_break_yards)
+        .clamp(-8.0, 8.0);
     let goal_approach_carry_yards = tunables().shooting.goal_approach_carry_yards;
     let approach_fit = ((goal_approach_carry_yards - before_obs.yards_to_goal)
         / (goal_approach_carry_yards - TEAMMATE_MUST_SHOOT_YARDS).max(1.0))
@@ -19141,7 +19412,8 @@ fn goalmouth_dribble_learning_reward(
             * (0.58 + approach_fit * 0.42)
             * ((goal_progress.max(0.0) / 8.0).clamp(0.0, 1.0) * 0.38
                 + centrality_gain.max(0.0).clamp(0.0, 0.70) * 0.34
-                + window_gain.max(0.0).clamp(0.0, 0.70) * 0.52)
+                + window_gain.max(0.0).clamp(0.0, 0.70) * 0.52
+                + (line_break_gain.max(0.0) / 8.0).clamp(0.0, 1.0) * 0.30)
     } else {
         -0.22 * (0.55 + approach_fit * 0.45)
     };
@@ -32631,6 +32903,358 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         .position(|&label| label == family)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BackFourLineLearningSignal {
+    line_y: f64,
+    target_delta_yards: f64,
+    line_forward_velocity_yps: f64,
+    line_forward_acceleration_yps2: f64,
+    ball_forward_gap_yards: f64,
+    ball_relative_velocity_yps: f64,
+    ball_relative_acceleration_yps2: f64,
+    opponent_center_forward_gap_yards: f64,
+    opponent_center_relative_velocity_yps: f64,
+    opponent_center_relative_acceleration_yps2: f64,
+    goalkeeper_forward_gap_yards: f64,
+    possession_state: f64,
+    offside_trap_now: f64,
+    offside_trap_next_three_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MidfieldFourBandLearningSignal {
+    band_y: f64,
+    target_delta_yards: f64,
+    band_forward_velocity_yps: f64,
+    band_forward_acceleration_yps2: f64,
+    ball_forward_gap_yards: f64,
+    ball_relative_velocity_yps: f64,
+    ball_relative_acceleration_yps2: f64,
+    opponent_center_forward_gap_yards: f64,
+    opponent_center_relative_velocity_yps: f64,
+    opponent_center_relative_acceleration_yps2: f64,
+    goalkeeper_forward_gap_yards: f64,
+    possession_state: f64,
+    band_spread_yards: f64,
+    eventual_consistency_next_five_seconds: f64,
+}
+
+fn back_four_line_learning_signal(
+    snapshot: &WorldSnapshot,
+    team: Team,
+) -> BackFourLineLearningSignal {
+    let attack_dir = team.attack_dir();
+    let field_length = snapshot.field_length.max(1.0);
+    let mut defender_y_total = 0.0;
+    let mut defender_velocity_y_total = 0.0;
+    let mut defender_acceleration_y_total = 0.0;
+    let mut defender_min_y = f64::INFINITY;
+    let mut defender_max_y = f64::NEG_INFINITY;
+    let mut projected_defender_min_y = f64::INFINITY;
+    let mut projected_defender_max_y = f64::NEG_INFINITY;
+    let mut defender_count = 0usize;
+    for defender in snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == team && player.role == PlayerRole::Defender)
+    {
+        let position = snapshot.player_snapshot_position(defender);
+        defender_y_total += position.y;
+        defender_velocity_y_total += defender.velocity.y;
+        defender_acceleration_y_total += defender.acceleration.y;
+        defender_min_y = defender_min_y.min(position.y);
+        defender_max_y = defender_max_y.max(position.y);
+        let projected_y = position.y
+            + defender.velocity.y * BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS
+            + 0.5
+                * defender.acceleration.y
+                * BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS
+                * BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS;
+        projected_defender_min_y = projected_defender_min_y.min(projected_y);
+        projected_defender_max_y = projected_defender_max_y.max(projected_y);
+        defender_count += 1;
+    }
+    if defender_count == 0 {
+        return BackFourLineLearningSignal::default();
+    }
+
+    let defender_count_f = defender_count as f64;
+    let line_y = defender_y_total / defender_count_f;
+    let line_velocity_y = defender_velocity_y_total / defender_count_f;
+    let line_acceleration_y = defender_acceleration_y_total / defender_count_f;
+    let line_forward_velocity_yps = line_velocity_y * attack_dir;
+    let line_forward_acceleration_yps2 = line_acceleration_y * attack_dir;
+    let line_spread_yards = (defender_max_y - defender_min_y).abs();
+    let projected_line_spread_yards =
+        (projected_defender_max_y - projected_defender_min_y).abs();
+
+    let mut opponent_y_total = 0.0;
+    let mut opponent_velocity_y_total = 0.0;
+    let mut opponent_acceleration_y_total = 0.0;
+    let mut opponent_count = 0usize;
+    let mut projects_runner_into_trap = false;
+    let projected_line_y = line_y
+        + line_velocity_y * OFFSIDE_TRAP_HORIZON_SECONDS
+        + 0.5 * line_acceleration_y * OFFSIDE_TRAP_HORIZON_SECONDS * OFFSIDE_TRAP_HORIZON_SECONDS;
+    let opponent_attack_dir = team.other().attack_dir();
+    for opponent in snapshot.players.iter().filter(|player| player.team == team.other()) {
+        let position = snapshot.player_snapshot_position(opponent);
+        opponent_y_total += position.y;
+        opponent_velocity_y_total += opponent.velocity.y;
+        opponent_acceleration_y_total += opponent.acceleration.y;
+        opponent_count += 1;
+        if matches!(opponent.role, PlayerRole::Forward | PlayerRole::Midfielder) {
+            let goalward_speed = (opponent.velocity.y * opponent_attack_dir).max(0.0);
+            let goalward_accel = (opponent.acceleration.y * opponent_attack_dir).max(0.0);
+            let projected_y = position.y
+                + opponent.velocity.y * OFFSIDE_TRAP_HORIZON_SECONDS
+                + 0.5
+                    * opponent.acceleration.y
+                    * OFFSIDE_TRAP_HORIZON_SECONDS
+                    * OFFSIDE_TRAP_HORIZON_SECONDS;
+            let projected_margin = (projected_y - projected_line_y) * opponent_attack_dir;
+            if goalward_speed + goalward_accel * OFFSIDE_TRAP_HORIZON_SECONDS
+                >= OFFSIDE_TRAP_RUNNER_MIN_SPEED_YPS
+                && projected_margin >= -OFFSIDE_TRAP_MAX_ONSIDE_DEPTH_YARDS
+                && projected_margin <= OFFSIDE_TRAP_ONSIDE_THREAT_MAX_YARDS
+            {
+                projects_runner_into_trap = true;
+            }
+        }
+    }
+
+    let possession = snapshot.controlled_possession_team();
+    let possession_state = match possession {
+        Some(possession_team) if possession_team == team => 1.0,
+        Some(_) => -1.0,
+        None => 0.0,
+    };
+    let offside_available = possession != Some(team) && !snapshot.offside_currently_suspended();
+    let offside_trap_now = if offside_available && line_spread_yards <= BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS {
+        1.0
+    } else {
+        0.0
+    };
+    let offside_trap_next_three_seconds = if offside_available
+        && projected_line_spread_yards <= BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS
+        && (offside_trap_now > 0.0 || projects_runner_into_trap)
+    {
+        1.0
+    } else {
+        0.0
+    };
+
+    let projected_ball_raw_y = snapshot.ball.position.y
+        + snapshot.ball.velocity.y * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS
+        + 0.5
+            * snapshot.ball.acceleration.y
+            * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS
+            * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS;
+    let projected_ball_y = snapshot.ball.position.y
+        + (projected_ball_raw_y - snapshot.ball.position.y).clamp(
+            -BALL_PREDICTION_MAX_DISPLACEMENT_YARDS,
+            BALL_PREDICTION_MAX_DISPLACEMENT_YARDS,
+        );
+    let own_goal_y = team.goal_y(field_length);
+    let ball_distance_from_own_goal = ((projected_ball_y - own_goal_y) * attack_dir).max(0.0);
+    let target_gap = if ball_distance_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
+        0.0
+    } else {
+        let raw_gap = if snapshot.offside_currently_suspended() {
+            NO_OFFSIDE_RESTART_DROP_OFF_YARDS
+        } else if possession == Some(team) {
+            DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS
+        } else if offside_trap_now > 0.0 || offside_trap_next_three_seconds > 0.0 {
+            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS
+        } else {
+            (DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS + DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS) * 0.5
+        };
+        let own_goal_room_gap = (ball_distance_from_own_goal
+            - DEFENSIVE_LINE_GOAL_SHRINK_SAFETY_YARDS)
+            .max(DEFENSIVE_LINE_GAP_FLOOR_YARDS);
+        raw_gap
+            .min(own_goal_room_gap)
+            .min(DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS)
+            .max(0.0)
+    };
+    let target_line_y = (projected_ball_y - attack_dir * target_gap).clamp(0.0, field_length);
+    let target_delta_yards = (target_line_y - line_y) * attack_dir;
+
+    let (opponent_center_y, opponent_center_velocity_y, opponent_center_acceleration_y) =
+        if opponent_count > 0 {
+            let count = opponent_count as f64;
+            (
+                opponent_y_total / count,
+                opponent_velocity_y_total / count,
+                opponent_acceleration_y_total / count,
+            )
+        } else {
+            (line_y, line_velocity_y, line_acceleration_y)
+        };
+    let goalkeeper_y = snapshot
+        .goalkeeper_for(team)
+        .and_then(|keeper_id| snapshot.players.iter().find(|player| player.id == keeper_id))
+        .map(|keeper| snapshot.player_snapshot_position(keeper).y)
+        .unwrap_or(line_y);
+
+    BackFourLineLearningSignal {
+        line_y: finite_metric(line_y),
+        target_delta_yards: finite_metric(target_delta_yards),
+        line_forward_velocity_yps: finite_metric(line_forward_velocity_yps),
+        line_forward_acceleration_yps2: finite_metric(line_forward_acceleration_yps2),
+        ball_forward_gap_yards: finite_metric((snapshot.ball.position.y - line_y) * attack_dir),
+        ball_relative_velocity_yps: finite_metric((snapshot.ball.velocity.y - line_velocity_y) * attack_dir),
+        ball_relative_acceleration_yps2: finite_metric(
+            (snapshot.ball.acceleration.y - line_acceleration_y) * attack_dir,
+        ),
+        opponent_center_forward_gap_yards: finite_metric((opponent_center_y - line_y) * attack_dir),
+        opponent_center_relative_velocity_yps: finite_metric(
+            (opponent_center_velocity_y - line_velocity_y) * attack_dir,
+        ),
+        opponent_center_relative_acceleration_yps2: finite_metric(
+            (opponent_center_acceleration_y - line_acceleration_y) * attack_dir,
+        ),
+        goalkeeper_forward_gap_yards: finite_metric((goalkeeper_y - line_y) * attack_dir),
+        possession_state,
+        offside_trap_now,
+        offside_trap_next_three_seconds,
+    }
+}
+
+fn midfield_four_band_learning_signal(
+    snapshot: &WorldSnapshot,
+    team: Team,
+) -> MidfieldFourBandLearningSignal {
+    let attack_dir = team.attack_dir();
+    let field_length = snapshot.field_length.max(1.0);
+    let mut midfielder_y_total = 0.0;
+    let mut midfielder_velocity_y_total = 0.0;
+    let mut midfielder_acceleration_y_total = 0.0;
+    let mut midfielder_min_y = f64::INFINITY;
+    let mut midfielder_max_y = f64::NEG_INFINITY;
+    let mut midfielder_count = 0usize;
+    for midfielder in snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == team && player.role == PlayerRole::Midfielder)
+    {
+        let position = snapshot.player_snapshot_position(midfielder);
+        midfielder_y_total += position.y;
+        midfielder_velocity_y_total += midfielder.velocity.y;
+        midfielder_acceleration_y_total += midfielder.acceleration.y;
+        midfielder_min_y = midfielder_min_y.min(position.y);
+        midfielder_max_y = midfielder_max_y.max(position.y);
+        midfielder_count += 1;
+    }
+    if midfielder_count == 0 {
+        return MidfieldFourBandLearningSignal::default();
+    }
+
+    let midfielder_count_f = midfielder_count as f64;
+    let band_y = midfielder_y_total / midfielder_count_f;
+    let band_velocity_y = midfielder_velocity_y_total / midfielder_count_f;
+    let band_acceleration_y = midfielder_acceleration_y_total / midfielder_count_f;
+    let band_forward_velocity_yps = band_velocity_y * attack_dir;
+    let band_forward_acceleration_yps2 = band_acceleration_y * attack_dir;
+    let band_spread_yards = (midfielder_max_y - midfielder_min_y).abs();
+
+    let mut opponent_y_total = 0.0;
+    let mut opponent_velocity_y_total = 0.0;
+    let mut opponent_acceleration_y_total = 0.0;
+    let mut opponent_count = 0usize;
+    for opponent in snapshot.players.iter().filter(|player| player.team == team.other()) {
+        let position = snapshot.player_snapshot_position(opponent);
+        opponent_y_total += position.y;
+        opponent_velocity_y_total += opponent.velocity.y;
+        opponent_acceleration_y_total += opponent.acceleration.y;
+        opponent_count += 1;
+    }
+
+    let possession = snapshot.controlled_possession_team();
+    let possession_state = match possession {
+        Some(possession_team) if possession_team == team => 1.0,
+        Some(_) => -1.0,
+        None => 0.0,
+    };
+    let projected_ball_raw_y = snapshot.ball.position.y
+        + snapshot.ball.velocity.y * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS
+        + 0.5
+            * snapshot.ball.acceleration.y
+            * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS
+            * DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS;
+    let projected_ball_y = snapshot.ball.position.y
+        + (projected_ball_raw_y - snapshot.ball.position.y).clamp(
+            -BALL_PREDICTION_MAX_DISPLACEMENT_YARDS,
+            BALL_PREDICTION_MAX_DISPLACEMENT_YARDS,
+        );
+    let target_gap = match possession {
+        Some(possession_team) if possession_team == team => {
+            -MIDFIELD_FOUR_BAND_IN_POSSESSION_AHEAD_BALL_YARDS
+        }
+        Some(_) => MIDFIELD_FOUR_BAND_OUT_OF_POSSESSION_BEHIND_BALL_YARDS,
+        None => MIDFIELD_FOUR_BAND_LOOSE_BALL_BEHIND_BALL_YARDS,
+    };
+    let target_band_y = (projected_ball_y - attack_dir * target_gap).clamp(0.0, field_length);
+    let target_delta_yards = (target_band_y - band_y) * attack_dir;
+    let projected_band_y = band_y
+        + band_velocity_y * MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_SECONDS
+        + 0.5
+            * band_acceleration_y
+            * MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_SECONDS
+            * MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_SECONDS;
+    let projected_target_delta_yards = (target_band_y - projected_band_y) * attack_dir;
+    let eventual_consistency_next_five_seconds =
+        if projected_target_delta_yards.abs() <= MIDFIELD_FOUR_BAND_TARGET_TOLERANCE_YARDS {
+            1.0
+        } else {
+            0.0
+        };
+
+    let (opponent_center_y, opponent_center_velocity_y, opponent_center_acceleration_y) =
+        if opponent_count > 0 {
+            let count = opponent_count as f64;
+            (
+                opponent_y_total / count,
+                opponent_velocity_y_total / count,
+                opponent_acceleration_y_total / count,
+            )
+        } else {
+            (band_y, band_velocity_y, band_acceleration_y)
+        };
+    let goalkeeper_y = snapshot
+        .goalkeeper_for(team)
+        .and_then(|keeper_id| snapshot.players.iter().find(|player| player.id == keeper_id))
+        .map(|keeper| snapshot.player_snapshot_position(keeper).y)
+        .unwrap_or(band_y);
+
+    MidfieldFourBandLearningSignal {
+        band_y: finite_metric(band_y),
+        target_delta_yards: finite_metric(target_delta_yards),
+        band_forward_velocity_yps: finite_metric(band_forward_velocity_yps),
+        band_forward_acceleration_yps2: finite_metric(band_forward_acceleration_yps2),
+        ball_forward_gap_yards: finite_metric((snapshot.ball.position.y - band_y) * attack_dir),
+        ball_relative_velocity_yps: finite_metric(
+            (snapshot.ball.velocity.y - band_velocity_y) * attack_dir,
+        ),
+        ball_relative_acceleration_yps2: finite_metric(
+            (snapshot.ball.acceleration.y - band_acceleration_y) * attack_dir,
+        ),
+        opponent_center_forward_gap_yards: finite_metric(
+            (opponent_center_y - band_y) * attack_dir,
+        ),
+        opponent_center_relative_velocity_yps: finite_metric(
+            (opponent_center_velocity_y - band_velocity_y) * attack_dir,
+        ),
+        opponent_center_relative_acceleration_yps2: finite_metric(
+            (opponent_center_acceleration_y - band_acceleration_y) * attack_dir,
+        ),
+        goalkeeper_forward_gap_yards: finite_metric((goalkeeper_y - band_y) * attack_dir),
+        possession_state,
+        band_spread_yards: finite_metric(band_spread_yards),
+        eventual_consistency_next_five_seconds,
+    }
+}
+
 fn soccer_neural_flank_policy_feature(policy: FlankAttackPolicy) -> f64 {
     match policy {
         FlankAttackPolicy::None => 0.0,
@@ -32776,6 +33400,17 @@ fn soccer_neural_extended_observation(
     // line sits up the pitch toward the actor's own goal (positive = high press).
     let opponent_defensive_line_offset =
         ((opponent_directive.defensive_line_y - length * 0.5) / (length * 0.5)) * attack_dir;
+    let back_four_line = back_four_line_learning_signal(snapshot, team);
+    let midfield_four_band = midfield_four_band_learning_signal(snapshot, team);
+    let carrier_offside_line_break_yards = snapshot.carrier_offside_line_break_yards(me.id);
+    let carrier_offside_line_break_window_yards = if snapshot.ball.holder == Some(me.id) {
+        snapshot
+            .second_last_defender_line_for(team)
+            .map(|line_y| ((line_y - me_position.y) * attack_dir).clamp(0.0, 18.0))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
     SoccerNeuralExtendedObservation {
         own_possession_seconds: finite_metric(own_possession_seconds),
@@ -32796,6 +33431,50 @@ fn soccer_neural_extended_observation(
         opponent_attacking_overload: finite_metric(opponent_directive.attacking_overload_score),
         opponent_neural_intent_attack: finite_metric(
             opponent_directive.neural_formation_attack_score,
+        ),
+        back_four_line_y: back_four_line.line_y,
+        back_four_line_target_delta_yards: back_four_line.target_delta_yards,
+        back_four_line_forward_velocity_yps: back_four_line.line_forward_velocity_yps,
+        back_four_line_forward_acceleration_yps2: back_four_line
+            .line_forward_acceleration_yps2,
+        back_four_ball_forward_gap_yards: back_four_line.ball_forward_gap_yards,
+        back_four_ball_relative_velocity_yps: back_four_line.ball_relative_velocity_yps,
+        back_four_ball_relative_acceleration_yps2: back_four_line
+            .ball_relative_acceleration_yps2,
+        back_four_opponent_center_forward_gap_yards: back_four_line
+            .opponent_center_forward_gap_yards,
+        back_four_opponent_center_relative_velocity_yps: back_four_line
+            .opponent_center_relative_velocity_yps,
+        back_four_opponent_center_relative_acceleration_yps2: back_four_line
+            .opponent_center_relative_acceleration_yps2,
+        back_four_goalkeeper_forward_gap_yards: back_four_line.goalkeeper_forward_gap_yards,
+        back_four_possession_state: back_four_line.possession_state,
+        back_four_offside_trap_now: back_four_line.offside_trap_now,
+        back_four_offside_trap_next_three_seconds: back_four_line
+            .offside_trap_next_three_seconds,
+        midfield_four_band_y: midfield_four_band.band_y,
+        midfield_four_band_target_delta_yards: midfield_four_band.target_delta_yards,
+        midfield_four_band_forward_velocity_yps: midfield_four_band.band_forward_velocity_yps,
+        midfield_four_band_forward_acceleration_yps2: midfield_four_band
+            .band_forward_acceleration_yps2,
+        midfield_four_ball_forward_gap_yards: midfield_four_band.ball_forward_gap_yards,
+        midfield_four_ball_relative_velocity_yps: midfield_four_band.ball_relative_velocity_yps,
+        midfield_four_ball_relative_acceleration_yps2: midfield_four_band
+            .ball_relative_acceleration_yps2,
+        midfield_four_opponent_center_forward_gap_yards: midfield_four_band
+            .opponent_center_forward_gap_yards,
+        midfield_four_opponent_center_relative_velocity_yps: midfield_four_band
+            .opponent_center_relative_velocity_yps,
+        midfield_four_opponent_center_relative_acceleration_yps2: midfield_four_band
+            .opponent_center_relative_acceleration_yps2,
+        midfield_four_goalkeeper_forward_gap_yards: midfield_four_band.goalkeeper_forward_gap_yards,
+        midfield_four_possession_state: midfield_four_band.possession_state,
+        midfield_four_band_spread_yards: midfield_four_band.band_spread_yards,
+        midfield_four_eventual_consistency_next_five_seconds: midfield_four_band
+            .eventual_consistency_next_five_seconds,
+        carrier_offside_line_break_yards: finite_metric(carrier_offside_line_break_yards),
+        carrier_offside_line_break_window_yards: finite_metric(
+            carrier_offside_line_break_window_yards,
         ),
         dribble_left_lane_openness: finite_metric(dribble_left_lane_openness),
         dribble_center_lane_openness: finite_metric(dribble_center_lane_openness),
@@ -33435,6 +34114,71 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(context.human_teammate_pressure);
     features[SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE] =
         soccer_neural_unit(context.human_support_score);
+    let line_model = &obs.neural_extended;
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LINE_Y] =
+        soccer_neural_scaled(line_model.back_four_line_y, DEFAULT_FIELD_LENGTH_YARDS);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_TARGET_DELTA] =
+        soccer_neural_scaled(line_model.back_four_line_target_delta_yards, 40.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_VELOCITY] =
+        soccer_neural_scaled(line_model.back_four_line_forward_velocity_yps, 12.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_ACCELERATION] =
+        soccer_neural_scaled(line_model.back_four_line_forward_acceleration_yps2, 12.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_GAP] =
+        soccer_neural_scaled(line_model.back_four_ball_forward_gap_yards, 60.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_VELOCITY] =
+        soccer_neural_scaled(line_model.back_four_ball_relative_velocity_yps, 24.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_BALL_REL_ACCELERATION] =
+        soccer_neural_scaled(line_model.back_four_ball_relative_acceleration_yps2, 24.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_GAP] =
+        soccer_neural_scaled(line_model.back_four_opponent_center_forward_gap_yards, 60.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_VELOCITY] =
+        soccer_neural_scaled(line_model.back_four_opponent_center_relative_velocity_yps, 24.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OPP_COM_REL_ACCELERATION] = soccer_neural_scaled(
+        line_model.back_four_opponent_center_relative_acceleration_yps2,
+        24.0,
+    );
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_KEEPER_GAP] =
+        soccer_neural_scaled(line_model.back_four_goalkeeper_forward_gap_yards, 40.0);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_POSSESSION_STATE] =
+        soccer_neural_signed_unit(line_model.back_four_possession_state);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW] =
+        soccer_neural_unit(line_model.back_four_offside_trap_now);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT] =
+        soccer_neural_unit(line_model.back_four_offside_trap_next_three_seconds);
+    features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK] =
+        soccer_neural_scaled(line_model.carrier_offside_line_break_yards, 18.0);
+    features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW] =
+        soccer_neural_scaled(line_model.carrier_offside_line_break_window_yards, 18.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y] =
+        soccer_neural_scaled(line_model.midfield_four_band_y, DEFAULT_FIELD_LENGTH_YARDS);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_TARGET_DELTA] =
+        soccer_neural_scaled(line_model.midfield_four_band_target_delta_yards, 40.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_VELOCITY] =
+        soccer_neural_scaled(line_model.midfield_four_band_forward_velocity_yps, 12.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_ACCELERATION] =
+        soccer_neural_scaled(line_model.midfield_four_band_forward_acceleration_yps2, 12.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_GAP] =
+        soccer_neural_scaled(line_model.midfield_four_ball_forward_gap_yards, 60.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_VELOCITY] =
+        soccer_neural_scaled(line_model.midfield_four_ball_relative_velocity_yps, 24.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BALL_REL_ACCELERATION] =
+        soccer_neural_scaled(line_model.midfield_four_ball_relative_acceleration_yps2, 24.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_GAP] =
+        soccer_neural_scaled(line_model.midfield_four_opponent_center_forward_gap_yards, 60.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_VELOCITY] =
+        soccer_neural_scaled(line_model.midfield_four_opponent_center_relative_velocity_yps, 24.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_OPP_COM_REL_ACCELERATION] = soccer_neural_scaled(
+        line_model.midfield_four_opponent_center_relative_acceleration_yps2,
+        24.0,
+    );
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_KEEPER_GAP] =
+        soccer_neural_scaled(line_model.midfield_four_goalkeeper_forward_gap_yards, 50.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_POSSESSION_STATE] =
+        soccer_neural_signed_unit(line_model.midfield_four_possession_state);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD] =
+        soccer_neural_scaled(line_model.midfield_four_band_spread_yards, 36.0);
+    features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT] =
+        soccer_neural_unit(line_model.midfield_four_eventual_consistency_next_five_seconds);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -43120,6 +43864,7 @@ fn tracking_frame_to_world_snapshot(
         field_width: config.field_width_yards,
         goal_width: config.goal_width_yards,
         spacing_params: config.spacing,
+        tactical_learning: config.tactical_learning.clone(),
         ball_drag_per_tick: config.ball_drag_per_tick,
         ball_air_resistance: config.ball_air_resistance,
         ball_grass_resistance_yps2: config.ball_grass_resistance_yps2,
@@ -43137,6 +43882,7 @@ fn tracking_frame_to_world_snapshot(
             resistance: BallResistanceFrame::default(),
             holder: frame.ball_holder,
             last_touch_team,
+            last_touch_player: frame.ball_holder,
             scheduled_index: None,
             last_decision: frame
                 .ball_action
@@ -43197,6 +43943,7 @@ fn tracking_frame_to_world_snapshot(
             DefensiveCoverProfile::default(),
             AttackingOverloadProfile::default(),
             false,
+            &config.tactical_learning,
         ),
         away_directive: tactical_directive_for_team(
             Team::Away,
@@ -43209,6 +43956,7 @@ fn tracking_frame_to_world_snapshot(
             DefensiveCoverProfile::default(),
             AttackingOverloadProfile::default(),
             false,
+            &config.tactical_learning,
         ),
         formation_lp_enabled: config.formation_lp_enabled,
         local_mpc_enabled: config.local_mpc_enabled,
@@ -51361,6 +52109,21 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
     }
     let goal_attack_blocks_alternatives =
         goal_attack_shot_blocks_alternatives(&observation, player.role);
+    let player_position = snapshot
+        .player_position(player_id)
+        .unwrap_or(player.position);
+    let directive = snapshot.tactical_directive(player.team);
+    let flank_lane_fit = ((player_position.x - snapshot.field_width * 0.5).abs()
+        / (snapshot.field_width * 0.5).max(1.0))
+    .clamp(0.0, 1.0);
+    let outside_midfielder = player.role == PlayerRole::Midfielder
+        && (player.home_position.x < snapshot.field_width * 0.30
+            || player.home_position.x > snapshot.field_width * 0.70);
+    let committed_byline_cross_release =
+        (player.role == PlayerRole::Forward || outside_midfielder)
+            && flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+            && directive.attack_strategy == TeamAttackStrategy::CrashTheBox
+            && directive.flank_attack_policy.is_flank();
     match action {
         "keeper-survey-hands" => {
             player.role == PlayerRole::Goalkeeper
@@ -51425,34 +52188,25 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
             observation.has_ball && snapshot.best_aerial_pass_target(player_id).is_some()
         }
         "flank-low-cross" => {
-            let player_position = snapshot
-                .player_position(player_id)
-                .unwrap_or(player.position);
             observation.has_ball
                 && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
-                && !goal_attack_blocks_alternatives
+                && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && !snapshot
                     .ranked_visible_pass_targets(player_id, 1)
                     .is_empty()
         }
         "flank-high-cross" => {
-            let player_position = snapshot
-                .player_position(player_id)
-                .unwrap_or(player.position);
             observation.has_ball
                 && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
-                && !goal_attack_blocks_alternatives
+                && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && !snapshot
                     .ranked_visible_aerial_pass_targets(player_id, 1)
                     .is_empty()
         }
         "corner-flag-cross" => {
-            let player_position = snapshot
-                .player_position(player_id)
-                .unwrap_or(player.position);
             observation.has_ball
                 && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
-                && !goal_attack_blocks_alternatives
+                && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && (!snapshot
                     .ranked_visible_pass_targets(player_id, 1)
                     .is_empty()

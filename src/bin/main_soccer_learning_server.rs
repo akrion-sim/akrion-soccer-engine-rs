@@ -673,9 +673,14 @@ fn build_payload(
     let gamma = env_f64("SOCCER_GAMMA", 0.96)?;
     let attack_spacing_delta_weight = env_f64("SOCCER_ATTACK_SPACING_DELTA_WEIGHT", 0.22)?;
     let attack_spacing_score_weight = env_f64("SOCCER_ATTACK_SPACING_SCORE_WEIGHT", 0.06)?;
-    let attack_width_delta_weight = env_f64("SOCCER_ATTACK_WIDTH_DELTA_WEIGHT", 0.52)?;
-    let attack_width_score_weight = env_f64("SOCCER_ATTACK_WIDTH_SCORE_WEIGHT", 0.14)?;
-    let attack_flank_lane_weight = env_f64("SOCCER_ATTACK_FLANK_LANE_WEIGHT", 0.28)?;
+    let attack_width_delta_weight = env_f64("SOCCER_ATTACK_WIDTH_DELTA_WEIGHT", 0.68)?;
+    let attack_width_score_weight = env_f64("SOCCER_ATTACK_WIDTH_SCORE_WEIGHT", 0.32)?;
+    let attack_flank_lane_weight = env_f64("SOCCER_ATTACK_FLANK_LANE_WEIGHT", 0.50)?;
+    let shot_choice_learning_weight = env_f64("SOCCER_SHOT_CHOICE_LEARNING_WEIGHT", 1.0)?;
+    let goal_entry_pass_learning_weight = env_f64("SOCCER_GOAL_ENTRY_PASS_LEARNING_WEIGHT", 1.0)?;
+    let pressure_release_learning_weight = env_f64("SOCCER_PRESSURE_RELEASE_LEARNING_WEIGHT", 1.0)?;
+    let pass_target_ranking_learning_weight =
+        env_f64("SOCCER_PASS_TARGET_RANKING_LEARNING_WEIGHT", 1.0)?;
     let defense_spacing_delta_weight = env_f64("SOCCER_DEFENSE_SPACING_DELTA_WEIGHT", 0.08)?;
     let defense_spacing_score_weight = env_f64("SOCCER_DEFENSE_SPACING_SCORE_WEIGHT", 0.04)?;
     let defense_contract_delta_weight = env_f64("SOCCER_DEFENSE_CONTRACT_DELTA_WEIGHT", 0.42)?;
@@ -689,6 +694,8 @@ fn build_payload(
     let defender_midfielder_press_weight =
         env_f64("SOCCER_DEFENDER_MIDFIELDER_PRESS_WEIGHT", 0.18)?;
     let midfielder_press_weight = env_f64("SOCCER_MIDFIELDER_PRESS_WEIGHT", 0.20)?;
+    let defensive_line_press_learning_weight =
+        env_f64("SOCCER_DEFENSIVE_LINE_PRESS_LEARNING_WEIGHT", 1.0)?;
     let formation_lp_alignment_weight = env_f64("SOCCER_FORMATION_LP_ALIGNMENT_WEIGHT", 0.16)?;
     let tactical_weights = [
         (
@@ -708,6 +715,22 @@ fn build_payload(
             attack_width_score_weight,
         ),
         ("SOCCER_ATTACK_FLANK_LANE_WEIGHT", attack_flank_lane_weight),
+        (
+            "SOCCER_SHOT_CHOICE_LEARNING_WEIGHT",
+            shot_choice_learning_weight,
+        ),
+        (
+            "SOCCER_GOAL_ENTRY_PASS_LEARNING_WEIGHT",
+            goal_entry_pass_learning_weight,
+        ),
+        (
+            "SOCCER_PRESSURE_RELEASE_LEARNING_WEIGHT",
+            pressure_release_learning_weight,
+        ),
+        (
+            "SOCCER_PASS_TARGET_RANKING_LEARNING_WEIGHT",
+            pass_target_ranking_learning_weight,
+        ),
         (
             "SOCCER_DEFENSE_SPACING_DELTA_WEIGHT",
             defense_spacing_delta_weight,
@@ -742,6 +765,10 @@ fn build_payload(
         ),
         ("SOCCER_MIDFIELDER_PRESS_WEIGHT", midfielder_press_weight),
         (
+            "SOCCER_DEFENSIVE_LINE_PRESS_LEARNING_WEIGHT",
+            defensive_line_press_learning_weight,
+        ),
+        (
             "SOCCER_FORMATION_LP_ALIGNMENT_WEIGHT",
             formation_lp_alignment_weight,
         ),
@@ -768,6 +795,10 @@ fn build_payload(
         attack_width_delta_weight,
         attack_width_score_weight,
         attack_flank_lane_weight,
+        shot_choice_learning_weight,
+        goal_entry_pass_learning_weight,
+        pressure_release_learning_weight,
+        pass_target_ranking_learning_weight,
         defense_spacing_delta_weight,
         defense_spacing_score_weight,
         defense_contract_delta_weight,
@@ -777,6 +808,7 @@ fn build_payload(
         defense_endline_hard_penalty_weight,
         defender_midfielder_press_weight,
         midfielder_press_weight,
+        defensive_line_press_learning_weight,
         formation_lp_alignment_weight,
     };
     let config = payload_match_config(
@@ -809,6 +841,10 @@ fn build_payload(
             "attackWidthDeltaWeight": attack_width_delta_weight,
             "attackWidthScoreWeight": attack_width_score_weight,
             "attackFlankLaneWeight": attack_flank_lane_weight,
+            "shotChoiceLearningWeight": shot_choice_learning_weight,
+            "goalEntryPassLearningWeight": goal_entry_pass_learning_weight,
+            "pressureReleaseLearningWeight": pressure_release_learning_weight,
+            "passTargetRankingLearningWeight": pass_target_ranking_learning_weight,
             "defenseSpacingDeltaWeight": defense_spacing_delta_weight,
             "defenseSpacingScoreWeight": defense_spacing_score_weight,
             "defenseContractDeltaWeight": defense_contract_delta_weight,
@@ -818,6 +854,7 @@ fn build_payload(
             "defenseEndlineHardPenaltyWeight": defense_endline_hard_penalty_weight,
             "defenderMidfielderPressWeight": defender_midfielder_press_weight,
             "midfielderPressWeight": midfielder_press_weight,
+            "defensiveLinePressLearningWeight": defensive_line_press_learning_weight,
             "formationLpAlignmentWeight": formation_lp_alignment_weight,
         },
         "artifactPath": &args.server_artifact_path,

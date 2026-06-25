@@ -486,6 +486,22 @@ fn env_tactical_learning_weights() -> Result<SoccerTacticalLearningWeights, Box<
             "SOCCER_ATTACK_FLANK_LANE_WEIGHT",
             default.attack_flank_lane_weight,
         )?,
+        shot_choice_learning_weight: env_f64(
+            "SOCCER_SHOT_CHOICE_LEARNING_WEIGHT",
+            default.shot_choice_learning_weight,
+        )?,
+        goal_entry_pass_learning_weight: env_f64(
+            "SOCCER_GOAL_ENTRY_PASS_LEARNING_WEIGHT",
+            default.goal_entry_pass_learning_weight,
+        )?,
+        pressure_release_learning_weight: env_f64(
+            "SOCCER_PRESSURE_RELEASE_LEARNING_WEIGHT",
+            default.pressure_release_learning_weight,
+        )?,
+        pass_target_ranking_learning_weight: env_f64(
+            "SOCCER_PASS_TARGET_RANKING_LEARNING_WEIGHT",
+            default.pass_target_ranking_learning_weight,
+        )?,
         defense_spacing_delta_weight: env_f64(
             "SOCCER_DEFENSE_SPACING_DELTA_WEIGHT",
             default.defense_spacing_delta_weight,
@@ -522,6 +538,10 @@ fn env_tactical_learning_weights() -> Result<SoccerTacticalLearningWeights, Box<
             "SOCCER_MIDFIELDER_PRESS_WEIGHT",
             default.midfielder_press_weight,
         )?,
+        defensive_line_press_learning_weight: env_f64(
+            "SOCCER_DEFENSIVE_LINE_PRESS_LEARNING_WEIGHT",
+            default.defensive_line_press_learning_weight,
+        )?,
         formation_lp_alignment_weight: env_f64(
             "SOCCER_FORMATION_LP_ALIGNMENT_WEIGHT",
             default.formation_lp_alignment_weight,
@@ -552,6 +572,22 @@ fn validate_tactical_learning_weights(
         (
             "SOCCER_ATTACK_FLANK_LANE_WEIGHT",
             weights.attack_flank_lane_weight,
+        ),
+        (
+            "SOCCER_SHOT_CHOICE_LEARNING_WEIGHT",
+            weights.shot_choice_learning_weight,
+        ),
+        (
+            "SOCCER_GOAL_ENTRY_PASS_LEARNING_WEIGHT",
+            weights.goal_entry_pass_learning_weight,
+        ),
+        (
+            "SOCCER_PRESSURE_RELEASE_LEARNING_WEIGHT",
+            weights.pressure_release_learning_weight,
+        ),
+        (
+            "SOCCER_PASS_TARGET_RANKING_LEARNING_WEIGHT",
+            weights.pass_target_ranking_learning_weight,
         ),
         (
             "SOCCER_DEFENSE_SPACING_DELTA_WEIGHT",
@@ -590,6 +626,10 @@ fn validate_tactical_learning_weights(
             weights.midfielder_press_weight,
         ),
         (
+            "SOCCER_DEFENSIVE_LINE_PRESS_LEARNING_WEIGHT",
+            weights.defensive_line_press_learning_weight,
+        ),
+        (
             "SOCCER_FORMATION_LP_ALIGNMENT_WEIGHT",
             weights.formation_lp_alignment_weight,
         ),
@@ -601,13 +641,17 @@ fn validate_tactical_learning_weights(
     Ok(())
 }
 
-fn tactical_learning_weight_values(weights: &SoccerTacticalLearningWeights) -> [f64; 15] {
+fn tactical_learning_weight_values(weights: &SoccerTacticalLearningWeights) -> [f64; 20] {
     [
         weights.attack_spacing_delta_weight,
         weights.attack_spacing_score_weight,
         weights.attack_width_delta_weight,
         weights.attack_width_score_weight,
         weights.attack_flank_lane_weight,
+        weights.shot_choice_learning_weight,
+        weights.goal_entry_pass_learning_weight,
+        weights.pressure_release_learning_weight,
+        weights.pass_target_ranking_learning_weight,
         weights.defense_spacing_delta_weight,
         weights.defense_spacing_score_weight,
         weights.defense_contract_delta_weight,
@@ -617,6 +661,7 @@ fn tactical_learning_weight_values(weights: &SoccerTacticalLearningWeights) -> [
         weights.defense_endline_hard_penalty_weight,
         weights.defender_midfielder_press_weight,
         weights.midfielder_press_weight,
+        weights.defensive_line_press_learning_weight,
         weights.formation_lp_alignment_weight,
     ]
 }

@@ -11133,6 +11133,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DefensiveCoverProfile::default(),
         low_overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let high = tactical_directive_for_team(
         Team::Home,
@@ -11145,6 +11146,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DefensiveCoverProfile::default(),
         high_overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let central = tactical_directive_for_team(
         Team::Home,
@@ -11157,6 +11159,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DefensiveCoverProfile::default(),
         low_overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let no_possession = tactical_directive_for_team(
         Team::Home,
@@ -11169,6 +11172,7 @@ fn tactical_directive_can_select_low_or_high_flank_cross_policy() {
         DefensiveCoverProfile::default(),
         high_overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
 
     assert_eq!(
@@ -11235,6 +11239,7 @@ fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
                                 DefensiveCoverProfile::default(),
                                 overload,
                                 false,
+                                &SoccerTacticalLearningWeights::default(),
                             );
                             seen.insert(directive.attack_strategy);
                             let regain = tactical_directive_for_team(
@@ -11248,6 +11253,7 @@ fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
                                 DefensiveCoverProfile::default(),
                                 overload,
                                 true,
+                                &SoccerTacticalLearningWeights::default(),
                             );
                             seen.insert(regain.attack_strategy);
                         }
@@ -11666,6 +11672,7 @@ fn team_brain_detects_attacking_numbers_up_and_raises_urgency() {
         DefensiveCoverProfile::default(),
         AttackingOverloadProfile::default(),
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let urgent = tactical_directive_for_team(
         Team::Home,
@@ -11678,6 +11685,7 @@ fn team_brain_detects_attacking_numbers_up_and_raises_urgency() {
         DefensiveCoverProfile::default(),
         overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let mut rng = mulberry32(909);
     sim.central_brain.run_time_step(&snapshot, &mut rng);
@@ -13101,6 +13109,7 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
         },
         AttackingOverloadProfile::default(),
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     let aggressive = tactical_directive_for_team(
         Team::Home,
@@ -13117,6 +13126,7 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
         },
         AttackingOverloadProfile::default(),
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
 
     assert_eq!(conservative.defensive_cover_target, 3);
@@ -13124,6 +13134,91 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
     assert_eq!(conservative.foremost_attacker_y, Some(33.0));
     assert!(conservative.defensive_line_y < 33.0);
     assert!(conservative.defensive_line_y < aggressive.defensive_line_y);
+}
+
+#[test]
+fn tactical_learning_weights_bias_directive_decisions_and_press() {
+    let mut conservative_learning = SoccerTacticalLearningWeights::default();
+    conservative_learning.shot_choice_learning_weight = 0.55;
+    conservative_learning.goal_entry_pass_learning_weight = 0.55;
+    conservative_learning.pressure_release_learning_weight = 0.55;
+    conservative_learning.pass_target_ranking_learning_weight = 0.55;
+    conservative_learning.defensive_line_press_learning_weight = 0.55;
+
+    let mut assertive_learning = SoccerTacticalLearningWeights::default();
+    assertive_learning.shot_choice_learning_weight = 1.55;
+    assertive_learning.goal_entry_pass_learning_weight = 1.55;
+    assertive_learning.pressure_release_learning_weight = 1.55;
+    assertive_learning.pass_target_ranking_learning_weight = 1.55;
+    assertive_learning.defensive_line_press_learning_weight = 1.55;
+
+    let overload = AttackingOverloadProfile {
+        attackers: 5,
+        defenders: 3,
+        advantage: 2,
+        score: 0.75,
+    };
+    let conservative_attack = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(18.0, 96.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        overload,
+        false,
+        &conservative_learning,
+    );
+    let assertive_attack = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::HomeAttack,
+        Some(Team::Home),
+        Vec2::new(18.0, 96.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        overload,
+        false,
+        &assertive_learning,
+    );
+
+    assert!(assertive_attack.pass_priority > conservative_attack.pass_priority);
+    assert!(assertive_attack.risk_tolerance > conservative_attack.risk_tolerance);
+    assert_eq!(assertive_attack.pressure_release_learning_weight, 1.55);
+    assert_eq!(conservative_attack.pressure_release_learning_weight, 0.55);
+
+    let conservative_defense = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::AwayAttack,
+        Some(Team::Away),
+        Vec2::new(40.0, 52.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        AttackingOverloadProfile::default(),
+        false,
+        &conservative_learning,
+    );
+    let assertive_defense = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::AwayAttack,
+        Some(Team::Away),
+        Vec2::new(40.0, 52.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile::default(),
+        AttackingOverloadProfile::default(),
+        false,
+        &assertive_learning,
+    );
+
+    assert!(assertive_defense.press_intensity > conservative_defense.press_intensity);
+    assert!(assertive_defense.defensive_line_y > conservative_defense.defensive_line_y);
 }
 
 #[test]
@@ -34903,7 +34998,12 @@ fn default_tactical_learning_rewards_flanks_and_defensive_contraction() {
 fn self_play_training_artifact_persists_tactical_learning_weights() {
     let tactical_learning = SoccerTacticalLearningWeights {
         attack_flank_lane_weight: 0.31,
+        shot_choice_learning_weight: 1.14,
+        goal_entry_pass_learning_weight: 1.21,
+        pressure_release_learning_weight: 1.08,
+        pass_target_ranking_learning_weight: 1.17,
         defense_contract_delta_weight: 0.42,
+        defensive_line_press_learning_weight: 1.19,
         formation_lp_alignment_weight: 0.27,
         ..Default::default()
     };
@@ -34925,8 +35025,28 @@ fn self_play_training_artifact_persists_tactical_learning_weights() {
         serde_json::json!(0.31)
     );
     assert_eq!(
+        value["tacticalLearning"]["shotChoiceLearningWeight"],
+        serde_json::json!(1.14)
+    );
+    assert_eq!(
+        value["tacticalLearning"]["goalEntryPassLearningWeight"],
+        serde_json::json!(1.21)
+    );
+    assert_eq!(
+        value["tacticalLearning"]["pressureReleaseLearningWeight"],
+        serde_json::json!(1.08)
+    );
+    assert_eq!(
+        value["tacticalLearning"]["passTargetRankingLearningWeight"],
+        serde_json::json!(1.17)
+    );
+    assert_eq!(
         value["config"]["tacticalLearning"]["defenseContractDeltaWeight"],
         serde_json::json!(0.42)
+    );
+    assert_eq!(
+        value["config"]["tacticalLearning"]["defensiveLinePressLearningWeight"],
+        serde_json::json!(1.19)
     );
     assert_eq!(
         value["tacticalLearning"]["formationLpAlignmentWeight"],
@@ -39888,6 +40008,80 @@ fn offside_geometry_uses_ball_second_last_defender_and_halfway_line() {
 }
 
 #[test]
+fn ball_holder_dribble_target_beyond_line_is_not_self_offside() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier = 9;
+    let carrier_pos = Vec2::new(40.0, 98.0);
+    let target = Vec2::new(40.0, 106.0);
+    sim.players[carrier].position = carrier_pos;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(8.0 + away as f64, 82.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(42.0, 96.0);
+    sim.ball.position = carrier_pos;
+    sim.ball.holder = Some(carrier);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(snapshot.position_would_be_offside(Team::Home, target));
+    assert!(!snapshot.position_would_be_offside_for_player(
+        carrier,
+        Team::Home,
+        target
+    ));
+    assert!(snapshot.pending_offside_for_pass(carrier, carrier).is_none());
+    assert!(snapshot.carrier_offside_line_break_yards(carrier) > 1.5);
+    let holder_score = snapshot.movement_target_shape_score(
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == carrier)
+            .expect("carrier snapshot"),
+        target,
+    );
+    let observation = snapshot.observation_for(carrier);
+    assert!(observation.neural_extended.carrier_offside_line_break_yards > 1.5);
+
+    sim.ball.holder = None;
+    sim.last_touch_player = Some(carrier);
+    sim.ball.position = carrier_pos;
+    let loose_self_touch = WorldSnapshot::from_match(&sim);
+    assert_eq!(loose_self_touch.ball.last_touch_player, Some(carrier));
+    assert!(loose_self_touch.player_has_legal_self_touch_claim(carrier, Team::Home));
+    assert!(!loose_self_touch.position_would_be_offside_for_player(
+        carrier,
+        Team::Home,
+        target
+    ));
+    assert!(loose_self_touch.carrier_offside_line_break_yards(carrier) > 1.5);
+
+    let teammate_holder = 8;
+    sim.players[teammate_holder].position = carrier_pos;
+    sim.ball.holder = Some(teammate_holder);
+    sim.ball.position = carrier_pos;
+    let runner_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(!runner_snapshot.player_has_legal_self_touch_claim(carrier, Team::Home));
+    assert!(runner_snapshot.position_would_be_offside_for_player(
+        carrier,
+        Team::Home,
+        target
+    ));
+    let runner_score = runner_snapshot.movement_target_shape_score(
+        runner_snapshot
+            .players
+            .iter()
+            .find(|player| player.id == carrier)
+            .expect("runner snapshot"),
+        target,
+    );
+    assert!(
+        holder_score > runner_score + 1.0,
+        "carrier should not receive an offside-shape penalty for legal self-dribble: holder={holder_score} runner={runner_score}"
+    );
+}
+
+#[test]
 fn direct_goal_kick_pass_is_exempt_from_offside() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.apply_restart(BallRestart {
@@ -41075,6 +41269,7 @@ fn wide_opposition_half_possession_selects_byline_drive_before_cross_release() {
             score: 0.70,
         },
         false,
+        &config.tactical_learning,
     );
 
     assert_eq!(
@@ -41113,6 +41308,7 @@ fn wide_byline_drive_transitions_to_crash_the_box_inside_release_depth() {
             score: 0.70,
         },
         false,
+        &config.tactical_learning,
     );
 
     assert_eq!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
@@ -41203,9 +41399,17 @@ fn byline_program_drives_wide_striker_toward_corner_while_teammates_catch_up() {
 fn byline_release_phase_strongly_prefers_configured_high_cross() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let crosser = 9;
+    let target = 8;
     let position = Vec2::new(74.0, 112.0);
     sim.players[crosser].role = PlayerRole::Forward;
     sim.players[crosser].position = position;
+    sim.players[target].role = PlayerRole::Forward;
+    sim.players[target].position = Vec2::new(42.0, 114.0);
+    sim.players[target].skills.height = 8.6;
+    sim.players[target].skills.strength = 8.4;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(12.0, 116.0 + (away - 11) as f64 * 0.2);
+    }
     sim.ball.holder = Some(crosser);
     sim.ball.position = position;
     sim.ball.velocity = Vec2::zero();
@@ -41222,6 +41426,12 @@ fn byline_release_phase_strongly_prefers_configured_high_cross() {
     sim.central_brain.home_directive = directive;
 
     let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot
+            .ranked_visible_aerial_pass_targets(crosser, 3)
+            .contains(&target),
+        "fixture must provide a real aerial cross target for learned-action legality"
+    );
     let observation = snapshot.observation_for(crosser);
     let options = sim.players[crosser].possession_action_options(
         &observation,
@@ -41240,6 +41450,10 @@ fn byline_release_phase_strongly_prefers_configured_high_cross() {
     assert!(
         high_cross.score >= 0.90,
         "configured high cross should dominate at the byline release: {options:?}"
+    );
+    assert!(
+        learned_action_label_is_legal("flank-high-cross", &snapshot, crosser),
+        "the learned actor must be allowed to choose the same committed byline high cross"
     );
 }
 
@@ -42008,9 +42222,110 @@ fn possession_support_expands_width_while_respecting_all_outfield_lanes() {
         "support targets should expand a compact possession shape across the field: compact={compact_width:.2} target={target_width:.2}"
     );
     assert!(
-        target_width > snapshot.field_width * 0.70,
+        target_width > snapshot.field_width * 0.76,
         "support targets should use most of the field width in possession: field={:.2} target={target_width:.2}",
         snapshot.field_width
+    );
+}
+
+#[test]
+fn possession_shape_score_prefers_width_restoring_home_lane_target() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for id in 1..11 {
+        sim.players[id].position = Vec2::new(39.0 + (id % 3) as f64, 53.0 + id as f64 * 0.2);
+        sim.players[id].velocity = Vec2::zero();
+    }
+    sim.players[holder].position = sim.ball.position;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(68.0, 94.0 + (away - 11) as f64 * 0.5);
+    }
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let center = snapshot.field_width * 0.5;
+    let runner = sim.players[1..11]
+        .iter()
+        .find(|player| {
+            player.id != holder
+                && player.role != PlayerRole::Goalkeeper
+                && player.home_position.x < center - snapshot.field_width * 0.18
+        })
+        .expect("left-side support runner")
+        .id;
+    let runner_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let forward_y = (sim.ball.position.y + runner_snapshot.team.attack_dir() * 10.0)
+        .clamp(0.0, snapshot.field_length);
+    let wide_home_lane = Vec2::new(runner_snapshot.home_position.x, forward_y);
+    let central_collapse = Vec2::new(center + 1.0, forward_y);
+
+    let wide_score = snapshot.movement_target_shape_score(runner_snapshot, wide_home_lane);
+    let central_score = snapshot.movement_target_shape_score(runner_snapshot, central_collapse);
+
+    assert!(
+        wide_score > central_score + 0.35,
+        "width-restoring home-lane support should beat central collapse: wide={wide_score:.3} central={central_score:.3} runner={runner}"
+    );
+}
+
+#[test]
+fn ball_side_wide_support_keeps_x_width_floor_after_shape_guards() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6usize;
+    let winger = 9usize;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(16.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    for id in 1..11 {
+        sim.players[id].position = Vec2::new(38.0 + (id % 3) as f64 * 2.0, 52.0 + id as f64);
+        sim.players[id].velocity = Vec2::zero();
+    }
+    sim.players[holder].position = sim.ball.position;
+    sim.players[winger].role = PlayerRole::Forward;
+    sim.players[winger].home_position = Vec2::new(8.0, 76.0);
+    sim.players[winger].position = Vec2::new(28.0, 66.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(70.0, 96.0 + (away - 11) as f64 * 0.4);
+    }
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let center = snapshot.field_width * 0.5;
+    let collapsing_target = Vec2::new(center, 76.0);
+    let guarded = snapshot.shape_guarded_support_point(
+        winger,
+        collapsing_target,
+        &[collapsing_target],
+        sim.players[winger].home_position,
+        false,
+    );
+    let intent = snapshot.possession_wide_lane_floor_adjusted_intent(PlayerIntent {
+        player_id: winger,
+        action: SoccerAction::MoveTo(collapsing_target),
+        sprint: false,
+    });
+    let SoccerAction::MoveTo(intent_target) = intent.action else {
+        panic!("expected MoveTo intent");
+    };
+
+    assert!(
+        guarded.x < center - snapshot.field_width * 0.24,
+        "shape guard should preserve ball-side x-axis width for a wide support runner: guarded={guarded:?} center={center}"
+    );
+    assert!(
+        intent_target.x < center - snapshot.field_width * 0.18,
+        "final intent guard should also restore x-axis width after learned/late movement targets: target={intent_target:?}"
+    );
+    assert!(
+        guarded.x < collapsing_target.x - 16.0 && intent_target.x < collapsing_target.x - 12.0,
+        "central collapse should be corrected outward: guarded={guarded:?} intent={intent_target:?} collapse={collapsing_target:?}"
     );
 }
 
@@ -43126,11 +43441,233 @@ fn observation_surfaces_nearest_teammate_and_overlap_pressure() {
 }
 
 #[test]
+fn back_four_neural_features_encode_dynamic_average_line_state() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for (offset, id) in (1usize..=4).enumerate() {
+        let step = offset as f64;
+        sim.players[id].position = Vec2::new(18.0 + step * 14.0, 30.0 + step * 0.5);
+        sim.players[id].velocity = Vec2::new(0.0, 2.5);
+        sim.players[id].acceleration = Vec2::new(0.0, 0.4);
+    }
+    let keeper = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Goalkeeper)
+        .expect("home goalkeeper")
+        .id;
+    sim.players[keeper].position = Vec2::new(40.0, 6.0);
+    let holder = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Forward)
+        .expect("away forward")
+        .id;
+    sim.players[holder].position = Vec2::new(40.0, 52.0);
+    sim.players[holder].velocity = Vec2::new(0.0, -5.0);
+    sim.players[holder].acceleration = Vec2::new(0.0, -1.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::new(0.0, -4.0);
+    sim.ball.acceleration = Vec2::new(0.0, -1.0);
+    sim.shared_positions.sync_from_players_and_ball(
+        &sim.players,
+        &sim.officials,
+        &sim.ball,
+        sim.tick,
+        sim.clock_seconds,
+    );
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(1);
+    let line = observation.neural_extended;
+
+    assert!((line.back_four_line_y - 30.75).abs() < 1e-9);
+    assert!((line.back_four_line_forward_velocity_yps - 2.5).abs() < 1e-9);
+    assert!(line.back_four_line_forward_acceleration_yps2.is_finite());
+    assert_eq!(line.back_four_possession_state, -1.0);
+    assert_eq!(line.back_four_offside_trap_now, 1.0);
+    assert_eq!(line.back_four_offside_trap_next_three_seconds, 1.0);
+    assert!(
+        line.back_four_line_target_delta_yards < 0.0,
+        "a ball projected toward the home goal should train the line to drop"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: 1,
+        team: Team::Home,
+        role: PlayerRole::Defender,
+        state: snapshot.mdp_state_for_player(1),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "defend-shape".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(1),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LINE_Y],
+        soccer_neural_scaled(line.back_four_line_y, DEFAULT_FIELD_LENGTH_YARDS)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_VELOCITY],
+        soccer_neural_scaled(line.back_four_line_forward_velocity_yps, 12.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_TARGET_DELTA],
+        soccer_neural_scaled(line.back_four_line_target_delta_yards, 40.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_ACCELERATION],
+        soccer_neural_scaled(line.back_four_line_forward_acceleration_yps2, 12.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_POSSESSION_STATE],
+        -1.0
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW],
+        1.0
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT],
+        1.0
+    );
+}
+
+#[test]
+fn back_four_offside_next_three_seconds_uses_projected_line_recovery() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let target_y = 34.0;
+    for (id, y) in [(1usize, 28.0), (2, 30.0), (3, 32.0), (4, 40.0)] {
+        sim.players[id].position = Vec2::new(24.0 + id as f64 * 8.0, y);
+        sim.players[id].velocity =
+            Vec2::new(0.0, (target_y - y) / BACK_FOUR_EVENTUAL_CONSISTENCY_SECONDS);
+        sim.players[id].acceleration = Vec2::new(0.0, 0.0);
+    }
+    let holder = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Forward)
+        .expect("away forward")
+        .id;
+    sim.players[holder].position = Vec2::new(40.0, 47.0);
+    sim.players[holder].velocity = Vec2::new(0.0, -5.0);
+    sim.players[holder].acceleration = Vec2::new(0.0, 0.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = sim.players[holder].velocity;
+    sim.ball.acceleration = Vec2::new(0.0, 0.0);
+    sim.shared_positions.sync_from_players_and_ball(
+        &sim.players,
+        &sim.officials,
+        &sim.ball,
+        sim.tick,
+        sim.clock_seconds,
+    );
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let line = snapshot.observation_for(1).neural_extended;
+    assert_eq!(line.back_four_offside_trap_now, 0.0);
+    assert_eq!(line.back_four_offside_trap_next_three_seconds, 1.0);
+}
+
+#[test]
+fn midfield_four_neural_features_encode_five_second_non_strict_band_state() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let midfielders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+        .map(|player| player.id)
+        .collect();
+    assert_eq!(midfielders.len(), 4);
+    for (&id, y) in midfielders.iter().zip([32.0, 40.0, 48.0, 56.0]) {
+        sim.players[id].position = Vec2::new(28.0 + id as f64 * 2.0, y);
+        sim.players[id].velocity = Vec2::new(0.0, -0.8);
+        sim.players[id].acceleration = Vec2::new(0.0, 0.0);
+    }
+    let holder = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Away && player.role == PlayerRole::Forward)
+        .expect("away forward")
+        .id;
+    sim.players[holder].position = Vec2::new(40.0, 60.0);
+    sim.players[holder].velocity = Vec2::new(0.0, -2.0);
+    sim.players[holder].acceleration = Vec2::new(0.0, 0.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = sim.players[holder].velocity;
+    sim.ball.acceleration = Vec2::new(0.0, 0.0);
+    sim.shared_positions.sync_from_players_and_ball(
+        &sim.players,
+        &sim.officials,
+        &sim.ball,
+        sim.tick,
+        sim.clock_seconds,
+    );
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(midfielders[0]);
+    let band = observation.neural_extended;
+
+    assert!((band.midfield_four_band_y - 44.0).abs() < 1e-9);
+    assert!((band.midfield_four_band_spread_yards - 24.0).abs() < 1e-9);
+    assert_eq!(band.midfield_four_possession_state, -1.0);
+    assert_eq!(band.midfield_four_eventual_consistency_next_five_seconds, 1.0);
+    assert!(
+        band.midfield_four_band_spread_yards > BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS,
+        "midfield consistency should not require the strict back-four offside line"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: midfielders[0],
+        team: Team::Home,
+        role: PlayerRole::Midfielder,
+        state: snapshot.mdp_state_for_player(midfielders[0]),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "support-shape".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(midfielders[0]),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y],
+        soccer_neural_scaled(band.midfield_four_band_y, DEFAULT_FIELD_LENGTH_YARDS)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD],
+        soccer_neural_scaled(band.midfield_four_band_spread_yards, 36.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT],
+        1.0
+    );
+}
+
+#[test]
 fn neural_feature_and_qstate_encode_sustained_overlap() {
     // The named decision/action feature indices live in the base block; the whole-field "moment
     // of all 22 + ball" block appends after it, then the Kalman perception-belief block, the
-    // Bayesian opponent-press belief block, the learned-MPC replan tail, and finally the
-    // option-control / human-intent learning tail.
+    // Bayesian opponent-press belief block, the learned-MPC replan tail, the
+    // option-control / human-intent learning tail, the back-four line-model tail,
+    // the legal carrier line-break tail, and the midfield-four band tail.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER, 8);
     assert_eq!(
@@ -43142,10 +43679,24 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
             + SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM,
         SOCCER_NEURAL_PRE_OPTION_CONTROL_FEATURE_DIM
             + SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM
             + SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM
+            + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
+            + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM
     );
     // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
@@ -43226,6 +43777,22 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_HUMAN_SUPPORT_SCORE + 1,
+        SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BACK_FOUR_LINE_Y,
+        SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT + 1,
+        SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW + 1,
+        SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -43242,6 +43809,15 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&248));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&251));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&330));
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM)
+    );
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -55822,6 +56398,7 @@ fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
         DefensiveCoverProfile::default(),
         overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     assert!(
         matches!(
@@ -55846,6 +56423,7 @@ fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
         DefensiveCoverProfile::default(),
         overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     assert_eq!(
         wide_edge.attack_strategy,
@@ -55864,6 +56442,7 @@ fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
         DefensiveCoverProfile::default(),
         overload,
         false,
+        &SoccerTacticalLearningWeights::default(),
     );
     assert!(
         !matches!(
