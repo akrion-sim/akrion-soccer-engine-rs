@@ -275,6 +275,10 @@ pub struct SoccerMatch {
     pub(crate) pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     /// The learned pass-completion model, when present (trained from `pass_outcome_samples`).
     pub(crate) pass_completion_head: Option<SoccerPassCompletionHead>,
+    /// The trained back-four line-depth head, when present. Set by the learner
+    /// (carried + trained across games) so the line decision consumes it live; `None`
+    /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
     /// Rolling RL training corpus for the line-depth heads (Gap 5): a state + the gap
     /// the line used + the windowed territorial reward. Collected only while a
     /// line-depth model is enabled (`collect_line_depth_rl_samples`); drained by the
@@ -1646,6 +1650,7 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             pass_outcome_samples: Vec::new(),
             pass_completion_head: None,
+            line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
@@ -16589,6 +16594,12 @@ pub struct WorldSnapshot {
     #[serde(skip)]
     pub(crate) ranked_aerial_pass_cache:
         std::cell::RefCell<std::collections::HashMap<(usize, bool), Vec<usize>>>,
+    /// The trained back-four line-depth head, carried from the match for live
+    /// consumption in `back_four_line_model_centre_fwd` (Gap 5 step 3b). `None` ⇒ the
+    /// decision uses the analytic seed (parity). Skipped by serde (an internal
+    /// decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
     /// Per-team tactical genomes (constant for the whole match). Default = neutral
     /// genome, so a genome-agnostic match is byte-identical to before; consumers
     /// read style via [`WorldSnapshot::genome_for`]. `serde(default)` keeps older
@@ -17841,6 +17852,7 @@ impl WorldSnapshot {
             tick: m.tick,
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            line_depth_head: m.line_depth_head.clone(),
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
             clock_seconds: m.clock_seconds,
