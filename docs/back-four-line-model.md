@@ -161,3 +161,56 @@ bootstrap target**. The path to "solve it optimally":
   *centre*, inside the same guards.
 - Pure / RNG-free feature build and analytic fraction ⇒ deterministic and
   testable without enabling the live seam.
+
+---
+
+# Midfield line model (same machinery, second line)
+
+The line-depth model is **generalized**: the feature struct (`BackFourLineInputs`),
+the head (`BackFourLineHead`), and the role-parameterized builder
+(`build_line_depth_inputs(team, role)`) are line-agnostic. The midfield line reuses
+all of it — only which players are "self" (`Midfielder` vs `Defender`) and the
+output mapping differ.
+
+## What's the same
+
+- The **same 26-d feature vector**, in the same attacking frame — now describing
+  the *midfield* line's own kinematics in the `line_*` slots (the builder is called
+  with `PlayerRole::Midfielder`).
+- The **same analytic-seed → head** path; `analytic_midfield_gap_fraction` is the
+  midfield seed, `BackFourLineHead` the (shared) trainable head.
+- The **same eventual-consistency contract**: the model sets a target; players ease
+  onto it. The grace is **5 seconds** for the midfield (vs ~3 s for the back four) —
+  the midfield is allowed to be looser.
+
+## What's different
+
+1. **Reference & output.** The back four's depth is a gap *behind the ball*; the
+   midfield's is a gap *ahead of the back four*. `midfield_line_model_ideal_gap_fraction`
+   returns a fraction in `[0, 1]`; the seam maps it onto the existing
+   `MID_AHEAD_OF_DEF_{MIN=5, MAX=20}` band (so `0` = compressed onto the defenders,
+   `1` = a 20 yd stagger). It replaces the fixed `MID_AHEAD_OF_DEF_IDEAL_YARDS = 10`.
+2. **No offside semantics.** The midfield does not set offside, so its flatten is
+   **symmetric** — it simply levels into a line (`MIDFIELD_LINE_LEVEL_BAND_YARDS`,
+   ±1.5 yd), with none of the back four's asymmetric "never step ahead of the line"
+   trap clamp.
+3. **It forms an actual flat line.** While defending (model on), each midfielder is
+   pulled onto the line **centre** — the back four's average plus the dynamic ideal
+   gap — within the level band. In possession it falls through to the looser
+   push-on band (the midfield stretches to support the attack).
+
+## Where it plugs in
+
+`WorldSnapshot::midfield_line_band_adjusted_target` (the midfield band chokepoint,
+analogous to `defender_line_band_average_adjusted_y`). When the model is on it (a)
+makes the ideal gap dynamic, (b) switches to the 5 s window, and (c) flattens the
+line while defending. Gate: `DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL`. **Off ⇒
+`ideal_gap` = the fixed constant, the 3 s window, and no flatten = byte-identical**
+to the legacy band.
+
+## Training signal
+
+Same as the back four — the pitch-value × xT territorial reward, conditioned on the
+midfield's own depth. The shared head can carry a line-id input later if a single
+net is preferred over one head per line; today each line trains its own head.
+

@@ -62,6 +62,10 @@ const REF_ACCEL_YPS2: f64 = 8.0;
 /// Env gate enabling the dynamic line model at the live chokepoint. Off (unset)
 /// by default so an unconfigured process stays byte-identical.
 const BACK_FOUR_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL";
+/// Env gate enabling the dynamic MIDFIELD line model (dynamic depth + an actual
+/// flat line + the 5s consistency window) at the midfield band chokepoint. Off by
+/// default ⇒ byte-identical to the existing fixed-ideal midfield band.
+const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL";
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -84,6 +88,21 @@ pub fn back_four_line_model_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_MODEL_ENABLE_ENV))
+    }
+}
+
+/// Whether the dynamic MIDFIELD line model is consulted at the midfield band
+/// chokepoint this process. Off ⇒ the existing fixed-ideal band stands (parity).
+pub fn midfield_line_model_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(MIDFIELD_LINE_MODEL_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled(MIDFIELD_LINE_MODEL_ENABLE_ENV))
     }
 }
 
@@ -237,6 +256,34 @@ pub fn analytic_line_centre_gap_fraction(inputs: &BackFourLineInputs) -> f64 {
     gap.clamp(0.0, 1.0)
 }
 
+/// Analytic, deterministic, RNG-free seed for the MIDFIELD line's depth, returned
+/// as a fraction in `[0, 1]` of the legal ideal-gap band *ahead of the back four*
+/// (`0` = compressed onto the defenders, `1` = pushed up to the maximum stagger).
+/// The midfield line is NOT an offside tool — it has no trap term; it pushes up to
+/// connect with the press and compresses to protect the block. The caller maps the
+/// fraction onto its `MID_AHEAD_OF_DEF_{MIN,MAX}` band.
+pub fn analytic_midfield_gap_fraction(inputs: &BackFourLineInputs) -> f64 {
+    let l = inputs.field_length.max(1.0);
+    // Push the midfield UP as the ball advances upfield; compress it as the ball
+    // sits deep in our half (protect the back four).
+    let ball_fwd_frac = (inputs.ball_fwd_from_own_goal / l).clamp(0.0, 1.0);
+    let mut frac = ball_fwd_frac;
+
+    // Possession: when we have it the midfield steps up to support the attack;
+    // when they have it the block tucks in a touch.
+    if inputs.we_control {
+        frac += 0.20;
+    } else if inputs.they_control {
+        frac -= 0.10;
+    }
+
+    // A ball driving at our goal pulls the whole block — midfield included — back.
+    let approach = (-inputs.ball_vel_fwd / REF_TOP_SPEED_YPS).clamp(-1.0, 1.0);
+    frac -= 0.15 * approach;
+
+    frac.clamp(0.0, 1.0)
+}
+
 /// Learned regression head for the line-centre gap fraction: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, sigmoid) mirroring [`SoccerPassCompletionHead`]. The live
 /// net is not serde; like the other learned heads it round-trips through the
@@ -323,10 +370,24 @@ impl BackFourLineHead {
 }
 
 impl WorldSnapshot {
-    /// Build the [`BackFourLineInputs`] for `team`, in that team's attacking
-    /// frame. `None` when the team has no defenders or no goalkeeper on the field
-    /// (a degenerate roster the model should not opine on). Pure / RNG-free.
+    /// Build the [`BackFourLineInputs`] for `team`'s back four. Thin wrapper over
+    /// the role-parameterized [`Self::build_line_depth_inputs`] — the same feature
+    /// machinery serves any defensive line; the back four is `Defender`.
     pub(crate) fn build_back_four_line_inputs(&self, team: Team) -> Option<BackFourLineInputs> {
+        self.build_line_depth_inputs(team, PlayerRole::Defender)
+    }
+
+    /// Build the [`BackFourLineInputs`] feature state for `team`'s line of role
+    /// `self_role` (the back four = `Defender`, the midfield line = `Midfielder`),
+    /// in that team's attacking frame. `None` when the team has no players of that
+    /// role or no goalkeeper on the field (a degenerate roster the model should not
+    /// opine on). Pure / RNG-free. The struct is line-agnostic: only the `line_*`
+    /// (self) and `heuristic_centre_*` fields differ by which line is modeled.
+    pub(crate) fn build_line_depth_inputs(
+        &self,
+        team: Team,
+        self_role: PlayerRole,
+    ) -> Option<BackFourLineInputs> {
         let attack = team.attack_dir();
         let own_goal_fwd = self.own_goal_y_for(team) * attack;
         let mid_x = self.field_width * 0.5;
@@ -335,7 +396,7 @@ impl WorldSnapshot {
         let lat = |x: f64| (x - mid_x) * attack;
         let fwd_from_goal = |y: f64| y * attack - own_goal_fwd;
 
-        // 3. The back four (self): centroid kinematics over the team's defenders.
+        // 3. This line (self): centroid kinematics over the team's `self_role`s.
         let mut def_pos = Vec2::zero();
         let mut def_vel = Vec2::zero();
         let mut def_acc = Vec2::zero();
@@ -350,7 +411,7 @@ impl WorldSnapshot {
         let mut opp_foremost_fwd_from_goal = f64::INFINITY;
         for p in &self.players {
             if p.team == team {
-                if p.role == PlayerRole::Defender {
+                if p.role == self_role {
                     def_pos = def_pos + p.position;
                     def_vel = def_vel + p.velocity;
                     def_acc = def_acc + p.acceleration;
@@ -471,6 +532,22 @@ impl WorldSnapshot {
         let centre_fwd = heuristic_centre_fwd * (1.0 - blend) + model_centre_fwd * blend;
         Some(centre_fwd.clamp(deepest_fwd.min(shallowest_fwd), shallowest_fwd))
     }
+
+    /// The MIDFIELD line model's preferred depth, as a fraction in `[0, 1]` of the
+    /// ideal-gap band ahead of the back four (`0` = compressed onto the defenders,
+    /// `1` = maximum stagger). `None` when the midfield model is gated off or the
+    /// inputs are degenerate — the caller then keeps its fixed ideal (parity). The
+    /// fraction comes from [`analytic_midfield_gap_fraction`] today; swap to a
+    /// trained [`BackFourLineHead`] once promoted. The caller maps the fraction to
+    /// yards and forms the actual flat line over the 5s consistency window.
+    pub(crate) fn midfield_line_model_ideal_gap_fraction(&self, me: &PlayerSnapshot) -> Option<f64> {
+        if !midfield_line_model_enabled() {
+            return None;
+        }
+        let inputs = self.build_line_depth_inputs(me.team, PlayerRole::Midfielder)?;
+        let frac = analytic_midfield_gap_fraction(&inputs);
+        frac.is_finite().then(|| frac.clamp(0.0, 1.0))
+    }
 }
 
 #[cfg(test)]
@@ -588,5 +665,37 @@ mod back_four_line_tests {
         }
         assert!(last.is_finite());
         assert!(head.training_steps() > 0);
+    }
+
+    #[test]
+    fn midfield_fraction_is_a_valid_gap() {
+        let f = analytic_midfield_gap_fraction(&baseline_inputs());
+        assert!((0.0..=1.0).contains(&f), "midfield fraction {f} out of [0,1]");
+    }
+
+    #[test]
+    fn midfield_pushes_up_with_a_high_ball_and_compresses_with_a_deep_one() {
+        let mut high = baseline_inputs();
+        high.ball_fwd_from_own_goal = 100.0; // ball near their goal
+        let mut deep = baseline_inputs();
+        deep.ball_fwd_from_own_goal = 20.0; // ball near our goal
+        assert!(
+            analytic_midfield_gap_fraction(&high) > analytic_midfield_gap_fraction(&deep),
+            "the midfield should push up with a high ball, compress with a deep one"
+        );
+    }
+
+    #[test]
+    fn midfield_steps_up_when_we_control() {
+        let mut ours = baseline_inputs();
+        ours.we_control = true;
+        ours.they_control = false;
+        let mut theirs = baseline_inputs();
+        theirs.we_control = false;
+        theirs.they_control = true;
+        assert!(
+            analytic_midfield_gap_fraction(&ours) > analytic_midfield_gap_fraction(&theirs),
+            "controlling the ball should push the midfield up (larger gap)"
+        );
     }
 }

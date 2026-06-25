@@ -2182,6 +2182,15 @@ const MID_AHEAD_OF_DEF_MIN_YARDS: f64 = 5.0;
 const MID_AHEAD_OF_DEF_MAX_YARDS: f64 = 20.0;
 const MID_AHEAD_OF_DEF_IDEAL_YARDS: f64 = 10.0;
 const MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
+// MIDFIELD LINE MODEL (gated `DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL`): when on, the
+// midfield forms an ACTUAL flat line (like the back four, but with no offside
+// semantics) at a dynamic/learned depth, eased over a 5-second consistency window
+// (longer than the back four's ~3s — the midfield is allowed to be looser).
+// Fore-aft level band thickness for that flat line (±half this off the centre).
+const MIDFIELD_LINE_LEVEL_BAND_YARDS: f64 = 3.0;
+// The 5-second eventual-consistency window the midfield line eases onto its target
+// over (vs `MID_AHEAD_OF_DEF_CONSISTENCY_TARGET_SECONDS` for the legacy band).
+const MIDFIELD_LINE_MODEL_CONSISTENCY_SECONDS: f64 = 5.0;
 const STRIKER_AHEAD_OF_MID_MIN_YARDS: f64 = 5.0;
 const STRIKER_AHEAD_OF_MID_MAX_YARDS: f64 = 20.0;
 // In possession the strikers are let off the leash to push forward and hold a high line —
