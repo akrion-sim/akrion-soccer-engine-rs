@@ -73678,6 +73678,39 @@ fn neural_snapshot_sidecar_round_trips_independently_of_tabular_artifact() {
     let _ = std::fs::remove_file(&sidecar_path);
 }
 
+#[test]
+fn tactical_learning_sidecar_round_trips_independently_of_tabular_artifact() {
+    let policy_path = std::env::temp_dir().join(format!(
+        "soccer-tactical-sidecar-test-{}.json",
+        std::process::id()
+    ));
+    let sidecar_path = policy_tactical_learning_disk_path(&policy_path);
+    let _ = std::fs::remove_file(&sidecar_path);
+
+    assert!(read_soccer_tactical_learning_snapshot(&policy_path)
+        .expect("missing tactical sidecar is Ok(None)")
+        .is_none());
+
+    let mut snapshot = SoccerTacticalLearningWeights::default();
+    snapshot.attack_width_delta_weight = 2.2;
+    snapshot.attack_flank_lane_weight = 2.4;
+    snapshot.defense_contract_delta_weight = 2.6;
+
+    write_soccer_tactical_learning_snapshot(&policy_path, &snapshot)
+        .expect("write tactical sidecar");
+    assert!(sidecar_path.exists());
+    assert!(!policy_path.exists());
+
+    let loaded = read_soccer_tactical_learning_snapshot(&policy_path)
+        .expect("read tactical sidecar")
+        .expect("sidecar present");
+    assert!((loaded.attack_width_delta_weight - 2.2).abs() < 1e-9);
+    assert!((loaded.attack_flank_lane_weight - 2.4).abs() < 1e-9);
+    assert!((loaded.defense_contract_delta_weight - 2.6).abs() < 1e-9);
+
+    let _ = std::fs::remove_file(&sidecar_path);
+}
+
 // --- Wall pass / one-two (give-and-go) -----------------------------------------
 
 /// Set up a Home attack in the opponent half with a beatable man in front of the

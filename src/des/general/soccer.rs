@@ -30281,6 +30281,18 @@ fn policy_neural_snapshot_disk_path(policy_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.neural.json"))
 }
 
+fn policy_tactical_learning_disk_path(policy_path: &Path) -> PathBuf {
+    let Some(parent) = policy_path.parent() else {
+        return PathBuf::from("out/soccer-live/team-policy.tactical.json");
+    };
+    let stem = policy_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("team-policy");
+    parent.join(format!("{stem}.tactical.json"))
+}
+
 fn write_soccer_neural_snapshot(
     policy_path: &Path,
     snapshot: &SoccerNeuralNetworkSnapshot,
@@ -30315,6 +30327,44 @@ fn read_soccer_neural_snapshot(
     let raw = fs::read_to_string(&path).map_err(|err| format!("read neural snapshot: {err}"))?;
     let snapshot = serde_json::from_str::<SoccerNeuralNetworkSnapshot>(&raw)
         .map_err(|err| format!("parse neural snapshot: {err}"))?;
+    Ok(Some(snapshot))
+}
+
+fn write_soccer_tactical_learning_snapshot(
+    policy_path: &Path,
+    snapshot: &SoccerTacticalLearningWeights,
+) -> Result<(), String> {
+    let path = policy_tactical_learning_disk_path(policy_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create tactical learning snapshot directory: {err}"))?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    let json = serde_json::to_string(snapshot)
+        .map_err(|err| format!("serialize tactical learning snapshot: {err}"))?;
+    if let Err(err) = fs::write(&tmp_path, json) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("write tactical learning snapshot: {err}"));
+    }
+    fs::rename(&tmp_path, &path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("commit tactical learning snapshot: {err}")
+    })
+}
+
+fn read_soccer_tactical_learning_snapshot(
+    policy_path: &Path,
+) -> Result<Option<SoccerTacticalLearningWeights>, String> {
+    let path = policy_tactical_learning_disk_path(policy_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        fs::read_to_string(&path).map_err(|err| format!("read tactical learning snapshot: {err}"))?;
+    let snapshot = serde_json::from_str::<SoccerTacticalLearningWeights>(&raw)
+        .map_err(|err| format!("parse tactical learning snapshot: {err}"))?;
     Ok(Some(snapshot))
 }
 
@@ -35471,6 +35521,12 @@ impl SoccerRealtimeSession {
                     .record_error(format!("neural snapshot autosave: {err}"));
             }
         }
+        if let Err(err) =
+            write_soccer_tactical_learning_snapshot(&path, &self.sim.config.tactical_learning)
+        {
+            self.policy_autosave
+                .record_error(format!("tactical learning snapshot autosave: {err}"));
+        }
         // Champion–challenger: also append this version to the APPEND-ONLY champion
         // log when its fitness beats the best so far (never overwritten; the load
         // picks the best entry).
@@ -36801,6 +36857,15 @@ impl SoccerLiveServer {
                 Err(err) => session
                     .policy_autosave
                     .record_error(format!("read neural snapshot: {err}")),
+            }
+            match read_soccer_tactical_learning_snapshot(&policy_path) {
+                Ok(Some(snapshot)) => {
+                    session.sim.config.tactical_learning = snapshot;
+                }
+                Ok(None) => {}
+                Err(err) => session
+                    .policy_autosave
+                    .record_error(format!("read tactical learning snapshot: {err}")),
             }
         }
         // Postgres is the source of truth when configured: load the cluster learner's latest
