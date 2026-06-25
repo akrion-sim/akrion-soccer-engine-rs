@@ -30869,6 +30869,45 @@ fn soccer_policy_skill_group_for_action_index(
     None
 }
 
+/// Which specialist the curriculum is focusing on this training round. A focused phase trains only
+/// that specialist (a focused curriculum); `Joint` trains every head together (self-play fine-tune).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerSpecialistFocus {
+    Pass,
+    Dribble,
+    Shot,
+    Goalkeeper,
+    Joint,
+}
+
+/// Training rounds spent focusing each specialist before the joint phase. Tuned short so the
+/// specialists get a dedicated warm-up, then everything fine-tunes together indefinitely.
+const SOCCER_CURRICULUM_PASS_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_DRIBBLE_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_SHOT_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_GK_ROUNDS: usize = 40;
+
+/// The specialist focus for a given (0-based) training round under the curriculum: pass → dribble
+/// → shot → goalkeeper focused phases, then `Joint` forever. When the curriculum is disabled the
+/// caller uses `Joint` from the start (every head trains every round, as before).
+fn soccer_specialist_curriculum_focus(round: usize) -> SoccerSpecialistFocus {
+    let pass_end = SOCCER_CURRICULUM_PASS_ROUNDS;
+    let dribble_end = pass_end + SOCCER_CURRICULUM_DRIBBLE_ROUNDS;
+    let shot_end = dribble_end + SOCCER_CURRICULUM_SHOT_ROUNDS;
+    let gk_end = shot_end + SOCCER_CURRICULUM_GK_ROUNDS;
+    if round < pass_end {
+        SoccerSpecialistFocus::Pass
+    } else if round < dribble_end {
+        SoccerSpecialistFocus::Dribble
+    } else if round < shot_end {
+        SoccerSpecialistFocus::Shot
+    } else if round < gk_end {
+        SoccerSpecialistFocus::Goalkeeper
+    } else {
+        SoccerSpecialistFocus::Joint
+    }
+}
+
 /// One specialist policy head: an independent softmax actor over a single skill group's action
 /// families, sharing the actor's engineered feature representation as its input.
 pub(crate) struct SoccerSkillPolicyHead {
@@ -31042,6 +31081,47 @@ impl SoccerSkillPolicyHeads {
         self.pass.train(&pass, balanced_n);
         self.dribble.train(&dribble, balanced_n);
         self.shot.train(&shot, balanced_n);
+    }
+
+    /// Curriculum-aware training: a focused phase trains only the matching specialist, leaving the
+    /// others frozen; `Joint` (and the GK phase, which trains the separate keeper head elsewhere)
+    /// trains all skill heads together. Mirrors [`Self::train`]'s balanced bucketing.
+    fn train_focused(&mut self, samples: &[SoccerPolicySample], focus: SoccerSpecialistFocus) {
+        let mut pass = Vec::new();
+        let mut dribble = Vec::new();
+        let mut shot = Vec::new();
+        for sample in samples {
+            if let Some((group, local)) =
+                soccer_policy_skill_group_for_action_index(sample.action_index)
+            {
+                match group {
+                    SoccerSkillGroup::Pass => pass.push((sample, local)),
+                    SoccerSkillGroup::Dribble => dribble.push((sample, local)),
+                    SoccerSkillGroup::Shot => shot.push((sample, local)),
+                }
+            }
+        }
+        let balanced_n = [pass.len(), dribble.len(), shot.len()]
+            .into_iter()
+            .filter(|&count| count > 0)
+            .min()
+            .unwrap_or(0);
+        if balanced_n == 0 {
+            return;
+        }
+        let train_all = matches!(
+            focus,
+            SoccerSpecialistFocus::Joint | SoccerSpecialistFocus::Goalkeeper
+        );
+        if train_all || focus == SoccerSpecialistFocus::Pass {
+            self.pass.train(&pass, balanced_n);
+        }
+        if train_all || focus == SoccerSpecialistFocus::Dribble {
+            self.dribble.train(&dribble, balanced_n);
+        }
+        if train_all || focus == SoccerSpecialistFocus::Shot {
+            self.shot.train(&shot, balanced_n);
+        }
     }
 }
 
@@ -44477,6 +44557,16 @@ fn dd_soccer_enable_keeper_policy_head() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM=1` to run the specialist heads through focused
+/// pass → dribble → shot → goalkeeper warm-up phases before the joint self-play fine-tune
+/// ([`soccer_specialist_curriculum_focus`]). Default off ⇒ every specialist trains every round
+/// from the start (the plain joint schedule).
+fn dd_soccer_enable_specialist_curriculum() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM").is_ok())
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {

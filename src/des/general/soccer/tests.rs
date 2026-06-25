@@ -28922,6 +28922,54 @@ fn assigned_position_derivation_splits_roles_by_anchor() {
 }
 
 #[test]
+fn specialist_curriculum_sequences_phases_then_joint() {
+    use SoccerSpecialistFocus::*;
+    // Phase boundaries: pass → dribble → shot → goalkeeper → joint forever.
+    assert_eq!(soccer_specialist_curriculum_focus(0), Pass);
+    assert_eq!(
+        soccer_specialist_curriculum_focus(SOCCER_CURRICULUM_PASS_ROUNDS),
+        Dribble
+    );
+    let shot_start = SOCCER_CURRICULUM_PASS_ROUNDS + SOCCER_CURRICULUM_DRIBBLE_ROUNDS;
+    assert_eq!(soccer_specialist_curriculum_focus(shot_start), Shot);
+    let gk_start = shot_start + SOCCER_CURRICULUM_SHOT_ROUNDS;
+    assert_eq!(soccer_specialist_curriculum_focus(gk_start), Goalkeeper);
+    let joint_start = gk_start + SOCCER_CURRICULUM_GK_ROUNDS;
+    assert_eq!(soccer_specialist_curriculum_focus(joint_start), Joint);
+    assert_eq!(soccer_specialist_curriculum_focus(joint_start + 10_000), Joint);
+}
+
+#[test]
+fn curriculum_focused_phase_trains_only_its_specialist() {
+    let mut heads = SoccerSkillPolicyHeads::new(21);
+    let state = soccer_policy_features_for_role(
+        &[0.07f64; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Midfielder,
+        None,
+    );
+    let sample = |label: &str| SoccerPolicySample {
+        state_features: state,
+        action_index: soccer_policy_action_index(label).expect("family"),
+        advantage: 1.0,
+        old_action_probability: None,
+    };
+    let samples = vec![sample("pass"), sample("dribble"), sample("shoot")];
+    let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
+    let dribble_idx = soccer_policy_action_index("dribble").expect("dribble family");
+    let before = heads.log_probs(&state);
+    let before_shoot = before.log_prob_for_action_index(shoot_idx).unwrap();
+    let before_dribble = before.log_prob_for_action_index(dribble_idx).unwrap();
+    // A pass-focused phase must leave the shot and dribble heads untouched.
+    heads.train_focused(&samples, SoccerSpecialistFocus::Pass);
+    let after = heads.log_probs(&state);
+    assert_eq!(after.log_prob_for_action_index(shoot_idx).unwrap(), before_shoot);
+    assert_eq!(
+        after.log_prob_for_action_index(dribble_idx).unwrap(),
+        before_dribble
+    );
+}
+
+#[test]
 fn keeper_action_mapping_and_commit_preference() {
     // Distribution techniques map to short/long; coming off the line reads as a commit.
     let long = soccer_keeper_action_index_for("clearance", false).expect("long distribution");

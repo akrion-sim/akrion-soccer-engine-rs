@@ -206,6 +206,10 @@ pub struct SoccerMatch {
     /// come-for-the-ball decision. Present only when the actor is active AND
     /// `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is set.
     pub(crate) keeper_policy_head: Option<SoccerKeeperPolicyHead>,
+    /// Specialist-curriculum training-round counter: increments each actor training pass and drives
+    /// [`soccer_specialist_curriculum_focus`] (pass → dribble → shot → GK → joint). Only consulted
+    /// when `DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM` is set.
+    pub(crate) specialist_curriculum_round: usize,
     /// The learned **world model** `P̂(s'|s,a)` over the feature space, trained on
     /// consecutive transitions. Present only when `neural_blend.world_model` is on.
     pub(crate) world_model: Option<SoccerWorldModel>,
@@ -1606,6 +1610,7 @@ impl SoccerMatch {
             policy_head: None,
             skill_policy_heads: None,
             keeper_policy_head: None,
+            specialist_curriculum_round: 0,
             world_model: None,
             human_inputs: SharedHumanInputs::new(),
             latched_human_inputs: HashMap::new(),
@@ -4566,6 +4571,16 @@ impl SoccerMatch {
         }
     }
 
+    /// The current specialist-training focus: the curriculum schedule when enabled, otherwise
+    /// `Joint` (every head trains every round).
+    fn specialist_curriculum_focus(&self) -> SoccerSpecialistFocus {
+        if dd_soccer_enable_specialist_curriculum() {
+            soccer_specialist_curriculum_focus(self.specialist_curriculum_round)
+        } else {
+            SoccerSpecialistFocus::Joint
+        }
+    }
+
     /// The dedicated GK head's sweep-vs-set commit preference for `team`'s keeper, evaluated on the
     /// given snapshot's features. `0.0` unless the head is built and produces a finite distribution.
     pub(crate) fn keeper_commit_bias_for(&self, team: Team, snapshot: &WorldSnapshot) -> f64 {
@@ -4854,20 +4869,35 @@ impl SoccerMatch {
             }
             // Specialist pass/dribble/shot heads: trained on the same frozen batch but bucketed
             // by skill with balanced sizes and separate (unclipped) losses. Gated, default off.
+            // Under the curriculum, a focused phase trains only the matching specialist.
             if dd_soccer_enable_skill_policy_heads() {
                 self.ensure_skill_policy_heads();
+                let focus = self.specialist_curriculum_focus();
                 if let Some(skill_heads) = &mut self.skill_policy_heads {
-                    skill_heads.train(&policy_samples);
+                    skill_heads.train_focused(&policy_samples, focus);
                 }
             }
         }
         // Dedicated goalkeeper head: trained on the keeper's own transitions (gate checked when
-        // the samples were built, so a non-empty batch already implies the gate is on).
+        // the samples were built, so a non-empty batch already implies the gate is on). Under the
+        // curriculum, the keeper only trains in its focused phase or the joint phase.
         if !keeper_policy_samples.is_empty() {
-            self.ensure_keeper_policy_head();
-            if let Some(keeper_head) = &mut self.keeper_policy_head {
-                keeper_head.train(&keeper_policy_samples);
+            let focus = self.specialist_curriculum_focus();
+            let keeper_phase = matches!(
+                focus,
+                SoccerSpecialistFocus::Goalkeeper | SoccerSpecialistFocus::Joint
+            );
+            if keeper_phase {
+                self.ensure_keeper_policy_head();
+                if let Some(keeper_head) = &mut self.keeper_policy_head {
+                    keeper_head.train(&keeper_policy_samples);
+                }
             }
+        }
+        // Advance the curriculum round once per actor training pass (only meaningful when the
+        // curriculum is enabled; harmless otherwise).
+        if !policy_samples.is_empty() || !keeper_policy_samples.is_empty() {
+            self.specialist_curriculum_round = self.specialist_curriculum_round.saturating_add(1);
         }
         if !world_model_pairs.is_empty() {
             self.ensure_world_model();
