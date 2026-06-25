@@ -8427,9 +8427,11 @@ fn rising_pressure_from_a_closing_defender_raises_release_signal() {
 
 #[test]
 fn dribbling_into_a_close_opponent_is_cut_outside_the_final_third_only() {
+    // A defender closing in (positive closing rate), in the opponent half (in_own_half=false).
+    let closing = 1.0;
     // Outside the final third, < 2 yds of space ahead cuts the carry score.
-    let cramped_mid = dribble_into_opponent_penalty(0.5, 80.0);
-    let open_mid = dribble_into_opponent_penalty(8.0, 80.0);
+    let cramped_mid = dribble_into_opponent_penalty(0.5, 80.0, false, closing);
+    let open_mid = dribble_into_opponent_penalty(8.0, 80.0, false, closing);
     assert!(cramped_mid < open_mid);
     assert!(
         cramped_mid <= 0.55,
@@ -8437,9 +8439,23 @@ fn dribbling_into_a_close_opponent_is_cut_outside_the_final_third_only() {
     );
     assert_eq!(open_mid, 1.0);
     // In the final attacking third the guard is lifted — risk is allowed.
-    assert_eq!(dribble_into_opponent_penalty(0.5, 20.0), 1.0);
-    // At/above the 2-yard buffer there is no penalty.
-    assert_eq!(dribble_into_opponent_penalty(2.0, 80.0), 1.0);
+    assert_eq!(dribble_into_opponent_penalty(0.5, 20.0, false, closing), 1.0);
+    // At/above the 2-yard buffer there is no penalty in the opponent half.
+    assert_eq!(dribble_into_opponent_penalty(2.0, 80.0, false, closing), 1.0);
+
+    // In our OWN half a wider 3-yard cushion is required: 2.5 yds of space is fine in the
+    // opponent half but still cut back in our own half.
+    assert_eq!(dribble_into_opponent_penalty(2.5, 80.0, false, closing), 1.0);
+    assert!(
+        dribble_into_opponent_penalty(2.5, 80.0, true, closing) < 1.0,
+        "own half demands a 3-yard cushion"
+    );
+    assert_eq!(dribble_into_opponent_penalty(3.0, 80.0, true, closing), 1.0);
+
+    // "If the opponent is moving away it's ok": a receding defender (negative closing
+    // rate) lifts the guard entirely even with little space ahead, in either half.
+    assert_eq!(dribble_into_opponent_penalty(0.5, 80.0, true, -1.0), 1.0);
+    assert_eq!(dribble_into_opponent_penalty(0.5, 80.0, false, -1.0), 1.0);
 }
 
 #[test]

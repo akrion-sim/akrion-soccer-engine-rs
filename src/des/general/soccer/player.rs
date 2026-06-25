@@ -3095,6 +3095,8 @@ impl PlayerAgent {
         let dribble_into_opponent_penalty = dribble_into_opponent_penalty(
             observation.forward_dribble_space_yards,
             observation.yards_to_goal,
+            observation.yards_to_own_goal <= observation.yards_to_goal,
+            observation.neural_extended.nearest_opponent_closing_rate_yps,
         );
         // A clearly-open teammate ahead is an outlet the carrier should USE rather than
         // keep dribbling — even with time on the ball (the "dribbles too long while a

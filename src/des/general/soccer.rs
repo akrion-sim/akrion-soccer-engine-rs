@@ -684,6 +684,15 @@ const PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS: f64 = 3.2;
 // keep at least this much open space ahead. In the final attacking third more risk is
 // allowed, so the guard is relaxed there.
 const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
+// In our OWN half a turnover is dangerous (it springs an opponent at our goal), so the
+// carrier keeps a WIDER cushion before driving forward into a defender — 3 yds of space
+// ahead rather than the universal 2.
+const DRIBBLE_OPPONENT_OWN_HALF_MIN_SPACE_YARDS: f64 = 3.0;
+// "If the opponent is moving away it's ok": an opponent ahead RECEDING at this rate or
+// faster (yds/s of separation gained) is vacating the space, so the carrier may drive
+// into it — the cushion guard is lifted. Small negative threshold so genuinely closing
+// or stationary defenders still trip the guard.
+const DRIBBLE_OPPONENT_RECEDING_YPS: f64 = -0.5;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // Critical spacing discipline: most carriers should keep 2+ yards between the
 // ball and the NEAREST defender (in any direction), not just space straight ahead.
@@ -45811,6 +45820,16 @@ fn dd_soccer_disable_round_the_keeper() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ROUND_THE_KEEPER").is_ok())
 }
 
+// ON by default: the carrier keeps a cushion ahead before driving into a defender
+// (3yd in our own half, 2yd otherwise) and is freed to drive on when the defender ahead
+// is receding. Set DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE to revert to the flat
+// 2yd guard (byte-identical to the prior behavior).
+fn dd_soccer_disable_dribble_cushion_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE").is_ok())
+}
+
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on
 /// unless the process-wide `DD_SOCCER_DISABLE_XAVI_TURN` env flag or the per-match config
 /// field disables it. Mirrored onto [`WorldSnapshot::xavi_turn_enabled`] so the decision
@@ -53525,18 +53544,45 @@ fn open_support_outlet_fit(observation: &SoccerPomdpObservation) -> f64 {
 }
 
 /// Multiplier (<=1) that discourages dribbling straight into an opponent OUTSIDE the
-/// final third: with less than ~2 yds of space ahead the carrier is running into a
-/// defender for no reason, so the carry/dribble score is cut. In the final attacking
-/// third (`yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL`) more risk pays off, so
-/// the guard is lifted entirely.
-fn dribble_into_opponent_penalty(forward_dribble_space_yards: f64, yards_to_goal: f64) -> f64 {
+/// final third: with less than the required space ahead the carrier is running into a
+/// defender for no reason, so the carry/dribble score is cut. The required cushion is
+/// 2 yds normally and 3 yds in our OWN half (where a turnover is dangerous). In the
+/// final attacking third (`yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL`) more risk
+/// pays off, and when the defender ahead is RECEDING there is nobody to run into, so in
+/// both cases the guard is lifted entirely — the carrier is freed to drive on.
+fn dribble_into_opponent_penalty(
+    forward_dribble_space_yards: f64,
+    yards_to_goal: f64,
+    in_own_half: bool,
+    nearest_opponent_closing_rate_yps: f64,
+) -> f64 {
+    if dd_soccer_disable_dribble_cushion_discipline() {
+        // Legacy flat-2yd guard (byte-identical to the prior behavior).
+        if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL
+            || forward_dribble_space_yards >= DRIBBLE_OPPONENT_MIN_SPACE_YARDS
+        {
+            return 1.0;
+        }
+        let closeness =
+            (1.0 - forward_dribble_space_yards / DRIBBLE_OPPONENT_MIN_SPACE_YARDS).clamp(0.0, 1.0);
+        return (1.0 - closeness * 0.70).clamp(0.30, 1.0);
+    }
+    // Final third: more risk pays off. Receding defender: it is vacating the space, so
+    // driving into it loses nobody — "if the opponent is moving away it's ok".
     if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL
-        || forward_dribble_space_yards >= DRIBBLE_OPPONENT_MIN_SPACE_YARDS
+        || nearest_opponent_closing_rate_yps <= DRIBBLE_OPPONENT_RECEDING_YPS
     {
         return 1.0;
     }
-    let closeness =
-        (1.0 - forward_dribble_space_yards / DRIBBLE_OPPONENT_MIN_SPACE_YARDS).clamp(0.0, 1.0);
+    let min_space = if in_own_half {
+        DRIBBLE_OPPONENT_OWN_HALF_MIN_SPACE_YARDS
+    } else {
+        DRIBBLE_OPPONENT_MIN_SPACE_YARDS
+    };
+    if forward_dribble_space_yards >= min_space {
+        return 1.0;
+    }
+    let closeness = (1.0 - forward_dribble_space_yards / min_space).clamp(0.0, 1.0);
     (1.0 - closeness * 0.70).clamp(0.30, 1.0)
 }
 
