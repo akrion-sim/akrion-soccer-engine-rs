@@ -55,6 +55,8 @@ mod tunables;
 pub use tunables::*;
 mod pitch_value;
 pub use pitch_value::*;
+mod back_four_line;
+pub use back_four_line::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the

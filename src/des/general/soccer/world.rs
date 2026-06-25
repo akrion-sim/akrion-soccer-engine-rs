@@ -33178,7 +33178,29 @@ impl WorldSnapshot {
             return clamped_fwd * attack;
         }
         let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
-        let line_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
+        // The existing heuristic line centre — the retained determinant (group 8):
+        // it already folds in the directive line target, ball blend, role bias,
+        // press focus, and the legal band.
+        let heuristic_centre_fwd = line_avg_fwd.clamp(deepest_fwd, shallowest_fwd);
+        // The line CENTRE is the controlled quantity the dynamic line model sets (a
+        // function of ball/opponent/self kinematics, possession, the GK, and the
+        // offside-trap state). When the model is gated on it BLENDS its learned/
+        // analytic depth with the heuristic centre above (existing determinants are
+        // kept, not discarded) and re-clamps to the legal band; gated off it returns
+        // None and the heuristic centre stands (byte-identical). The flat ≤2yd
+        // flatten/cover machinery below is unchanged, so individual defenders still
+        // ease onto the line over the ~3s grace — the model only chooses where that
+        // flat line sits. See docs/back-four-line-model.md.
+        let line_centre_fwd = self
+            .back_four_line_model_centre_fwd(
+                me,
+                predicted_fwd,
+                deepest_fwd,
+                shallowest_fwd,
+                max_gap,
+                heuristic_centre_fwd,
+            )
+            .unwrap_or(heuristic_centre_fwd);
         let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
         // No defender may sit AHEAD of the line (toward the attackers) — that is what plays runners
         // onside — so the front edge is always capped to the line centre + half-band.
