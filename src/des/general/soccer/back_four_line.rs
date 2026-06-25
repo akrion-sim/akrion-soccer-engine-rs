@@ -471,6 +471,67 @@ impl BackFourLineHead {
     }
 }
 
+/// Outcome of training a line-depth head on a drained RL corpus, logged by the
+/// learning runner so an operator can see the corpus is loaded and learned from.
+/// Mirrors `SoccerPassCompletionTrainingReport`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineDepthTrainingReport {
+    /// Usable samples trained on.
+    pub samples: usize,
+    /// SGD steps actually applied across all epochs.
+    pub training_steps: usize,
+    /// Epochs run over the corpus.
+    pub epochs: usize,
+    /// Mean (weighted) loss of the final epoch.
+    pub final_loss: f64,
+}
+
+/// Load-and-train entry for a line-depth head: given a drained RL corpus (in
+/// practice the cluster learner's `drain_line_depth_samples`, later resumed from
+/// Postgres), build a fresh [`BackFourLineHead`] and run `epochs`
+/// reward-weighted-regression passes. `None` if no usable samples (so the runner
+/// skips cleanly rather than persist an untrained net). Mirrors
+/// `train_soccer_pass_completion_head`.
+pub fn train_line_depth_head(
+    samples: &[LineDepthSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<(BackFourLineHead, LineDepthTrainingReport)> {
+    let usable = samples
+        .iter()
+        .filter(|s| s.reward.is_finite() && s.action_gap_fraction.is_finite())
+        .count();
+    if usable == 0 || epochs == 0 {
+        return None;
+    }
+    let mut head = BackFourLineHead::new(seed);
+    let mut final_loss = 0.0;
+    for _ in 0..epochs {
+        final_loss = head.train_reward_weighted(samples, learning_rate);
+    }
+    let report = LineDepthTrainingReport {
+        samples: usable,
+        training_steps: head.training_steps(),
+        epochs,
+        final_loss,
+    };
+    Some((head, report))
+}
+
+/// Public wrapper returning ONLY the report (the head type is engine-internal). The
+/// learning runner uses this to train the drained line-depth corpus and log that it
+/// learns. Mirrors `report_soccer_pass_completion_training`.
+pub fn report_line_depth_training(
+    samples: &[LineDepthSample],
+    seed: u32,
+    epochs: usize,
+    learning_rate: f64,
+) -> Option<LineDepthTrainingReport> {
+    train_line_depth_head(samples, seed, epochs, learning_rate).map(|(_, report)| report)
+}
+
 impl WorldSnapshot {
     /// Build the [`BackFourLineInputs`] for `team`'s back four. Thin wrapper over
     /// the role-parameterized [`Self::build_line_depth_inputs`] — the same feature
@@ -712,8 +773,9 @@ impl SoccerMatch {
     }
 
     /// Drain the collected line-depth RL samples for the cluster learner (train the
-    /// head + persist), mirroring [`Self::drain_pass_outcome_samples`].
-    pub(crate) fn drain_line_depth_samples(&mut self) -> Vec<LineDepthSample> {
+    /// head + persist), mirroring [`Self::drain_pass_outcome_samples`]. `pub` so the
+    /// learner binary (a separate crate) can drain it.
+    pub fn drain_line_depth_samples(&mut self) -> Vec<LineDepthSample> {
         std::mem::take(&mut self.line_depth_samples)
     }
 }
@@ -900,6 +962,23 @@ mod back_four_line_tests {
             after > before && after > 0.5,
             "RWR should move the head toward the high-reward deep action: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn train_line_depth_head_entry_skips_empty_and_trains_valid() {
+        assert!(train_line_depth_head(&[], 1, 4, 0.02).is_none());
+        let samples: Vec<LineDepthSample> = (0..16)
+            .map(|i| LineDepthSample {
+                inputs: baseline_inputs(),
+                action_gap_fraction: if i % 2 == 0 { 0.8 } else { 0.2 },
+                reward: if i % 2 == 0 { 1.0 } else { -1.0 },
+            })
+            .collect();
+        let (_, report) =
+            train_line_depth_head(&samples, 1, 4, 0.02).expect("trains a usable corpus");
+        assert_eq!(report.samples, 16);
+        assert_eq!(report.epochs, 4);
+        assert!(report.training_steps > 0 && report.final_loss.is_finite());
     }
 
     #[test]

@@ -13,7 +13,8 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    report_soccer_pass_completion_training, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    report_line_depth_training, report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
@@ -1918,6 +1919,20 @@ fn run_game(
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
     let pass_outcome_samples = sim.drain_pass_outcome_samples();
+    // Gap 5: train the line-depth head on this game's reward-weighted RL corpus and
+    // log progress so the corpus is demonstrably learned from. Empty + skipped
+    // unless a line-depth model is enabled (DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL /
+    // _MIDFIELD_LINE_MODEL). Cross-game Postgres persistence + live head consumption
+    // are the remaining integration steps.
+    let line_depth_samples = sim.drain_line_depth_samples();
+    if let Some(report) =
+        report_line_depth_training(&line_depth_samples, episode_seed as u32, 4, 0.02)
+    {
+        eprintln!(
+            "line_depth_training samples={} training_steps={} epochs={} final_loss={:.5}",
+            report.samples, report.training_steps, report.epochs, report.final_loss
+        );
+    }
     let mut artifact = sim.team_policy_artifact();
     let neural_network = if retain_neural_network_in_game_artifact {
         artifact.learning.neural_network.clone()
