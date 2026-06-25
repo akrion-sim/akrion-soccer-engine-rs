@@ -51,6 +51,8 @@ pub struct Tunables {
     pub shooting: ShootingTunables,
     /// Defensive line and back-four shape thresholds.
     pub defensive_shape: DefensiveShapeTunables,
+    /// Fine-grid lane/row affinity used by formation, support, and retrieval.
+    pub lane_affinity: LaneAffinityTunables,
 }
 
 impl Default for Tunables {
@@ -62,6 +64,7 @@ impl Default for Tunables {
             decision_mpc: DecisionMpcTunables::default(),
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
+            lane_affinity: LaneAffinityTunables::default(),
         }
     }
 }
@@ -271,6 +274,134 @@ impl Default for DefensiveShapeTunables {
     }
 }
 
+/// Fine-grid lane/row affinity knobs. Defaults harden the existing 12-lane /
+/// 24-row shape signal while keeping forwards soft enough to make real runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaneAffinityTunables {
+    pub goalkeeper_neutral_score: f64,
+    pub defender_lane_radius_possession: usize,
+    pub defender_lane_radius_defense: usize,
+    pub midfielder_lane_radius_possession: usize,
+    pub midfielder_lane_radius_defense: usize,
+    pub forward_lane_radius: usize,
+    pub defender_commitment_possession: f64,
+    pub defender_commitment_defense: f64,
+    pub midfielder_commitment_possession: f64,
+    pub midfielder_commitment_defense: f64,
+    pub forward_commitment_possession: f64,
+    pub forward_commitment_defense: f64,
+    pub commitment_relief_max: f64,
+    pub lane_gap_base_penalty: f64,
+    pub lane_gap_step_penalty: f64,
+    pub possession_factor: f64,
+    pub markov_relief_max: f64,
+    pub ball_speed_clamp_yps: f64,
+    pub ball_acceleration_clamp_yps2: f64,
+    pub lookahead_base_seconds: f64,
+    pub lookahead_speed_scale_yps: f64,
+    pub lookahead_acceleration_scale_yps2: f64,
+    pub lookahead_min_seconds: f64,
+    pub lookahead_max_seconds: f64,
+    pub lane_match_span_lanes: f64,
+    pub row_match_span_rows: f64,
+    pub player_predicted_lane_weight: f64,
+    pub home_predicted_lane_weight: f64,
+    pub player_current_lane_weight: f64,
+    pub target_predicted_lane_weight: f64,
+    pub target_current_lane_weight: f64,
+    pub player_predicted_row_weight: f64,
+    pub home_predicted_row_weight: f64,
+    pub target_predicted_row_weight: f64,
+    pub target_current_row_weight: f64,
+    pub flow_base_score: f64,
+    pub flow_gap_weight: f64,
+    pub flow_min_score: f64,
+    pub flow_max_score: f64,
+    pub field_teammate_space_weight: f64,
+    pub field_open_space_weight: f64,
+    pub field_open_space_normalizer_yards: f64,
+    pub forward_static_fit_weight: f64,
+    pub forward_player_ball_weight: f64,
+    pub forward_target_ball_weight: f64,
+    pub forward_row_coherence_weight: f64,
+    pub forward_flow_weight: f64,
+    pub forward_field_config_weight: f64,
+    pub role_markov_weight: f64,
+    pub role_static_fit_weight: f64,
+    pub role_player_ball_weight: f64,
+    pub role_target_ball_weight: f64,
+    pub role_row_coherence_weight: f64,
+    pub role_flow_weight: f64,
+    pub role_field_config_weight: f64,
+    pub open_space_dynamic_lane_bonus_weight: f64,
+    pub movement_shape_dynamic_lane_weight: f64,
+}
+
+impl Default for LaneAffinityTunables {
+    fn default() -> Self {
+        LaneAffinityTunables {
+            goalkeeper_neutral_score: 0.5,
+            defender_lane_radius_possession: 2,
+            defender_lane_radius_defense: 1,
+            midfielder_lane_radius_possession: 2,
+            midfielder_lane_radius_defense: 1,
+            forward_lane_radius: 3,
+            defender_commitment_possession: 0.80,
+            defender_commitment_defense: 0.92,
+            midfielder_commitment_possession: 0.80,
+            midfielder_commitment_defense: 0.90,
+            forward_commitment_possession: 0.36,
+            forward_commitment_defense: 0.40,
+            commitment_relief_max: 0.65,
+            lane_gap_base_penalty: 0.58,
+            lane_gap_step_penalty: 0.22,
+            possession_factor: 0.80,
+            markov_relief_max: 0.85,
+            ball_speed_clamp_yps: 42.0,
+            ball_acceleration_clamp_yps2: 72.0,
+            lookahead_base_seconds: 0.45,
+            lookahead_speed_scale_yps: 42.0,
+            lookahead_acceleration_scale_yps2: 96.0,
+            lookahead_min_seconds: 0.45,
+            lookahead_max_seconds: 1.35,
+            lane_match_span_lanes: 5.0,
+            row_match_span_rows: 8.0,
+            player_predicted_lane_weight: 0.48,
+            home_predicted_lane_weight: 0.34,
+            player_current_lane_weight: 0.18,
+            target_predicted_lane_weight: 0.68,
+            target_current_lane_weight: 0.32,
+            player_predicted_row_weight: 0.42,
+            home_predicted_row_weight: 0.18,
+            target_predicted_row_weight: 0.28,
+            target_current_row_weight: 0.12,
+            flow_base_score: 0.5,
+            flow_gap_weight: 0.18,
+            flow_min_score: 0.15,
+            flow_max_score: 0.85,
+            field_teammate_space_weight: 0.62,
+            field_open_space_weight: 0.38,
+            field_open_space_normalizer_yards: 18.0,
+            forward_static_fit_weight: 0.38,
+            forward_player_ball_weight: 0.18,
+            forward_target_ball_weight: 0.14,
+            forward_row_coherence_weight: 0.08,
+            forward_flow_weight: 0.06,
+            forward_field_config_weight: 0.10,
+            role_markov_weight: 0.34,
+            role_static_fit_weight: 0.30,
+            role_player_ball_weight: 0.16,
+            role_target_ball_weight: 0.08,
+            role_row_coherence_weight: 0.06,
+            role_flow_weight: 0.03,
+            role_field_config_weight: 0.03,
+            open_space_dynamic_lane_bonus_weight: 1.05,
+            movement_shape_dynamic_lane_weight: 0.36,
+        }
+    }
+}
+
 impl Tunables {
     /// Build the tunables from compile-time defaults plus the environment
     /// layers (`SOCCER_TUNABLES_JSON` then per-field `DD_SOCCER_TUNABLE__*`).
@@ -309,6 +440,7 @@ impl Tunables {
         self.decision_mpc.sanitize();
         self.shooting.sanitize();
         self.defensive_shape.sanitize();
+        self.lane_affinity.sanitize();
         self
     }
 
@@ -324,10 +456,152 @@ impl Tunables {
         self.shooting.validate_strict("shooting", &mut errors);
         self.defensive_shape
             .validate_strict("defensive_shape", &mut errors);
+        self.lane_affinity
+            .validate_strict("lane_affinity", &mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors.join("; "))
+        }
+    }
+}
+
+impl LaneAffinityTunables {
+    fn sanitize(&mut self) {
+        let default = LaneAffinityTunables::default();
+        sanitize_f64("lane_affinity.goalkeeper_neutral_score", &mut self.goalkeeper_neutral_score, default.goalkeeper_neutral_score, 0.0, 1.0, 0.25, 0.75);
+        sanitize_usize("lane_affinity.defender_lane_radius_possession", &mut self.defender_lane_radius_possession, default.defender_lane_radius_possession, 0, 6, 1, 3);
+        sanitize_usize("lane_affinity.defender_lane_radius_defense", &mut self.defender_lane_radius_defense, default.defender_lane_radius_defense, 0, 6, 1, 2);
+        sanitize_usize("lane_affinity.midfielder_lane_radius_possession", &mut self.midfielder_lane_radius_possession, default.midfielder_lane_radius_possession, 0, 6, 1, 3);
+        sanitize_usize("lane_affinity.midfielder_lane_radius_defense", &mut self.midfielder_lane_radius_defense, default.midfielder_lane_radius_defense, 0, 6, 1, 2);
+        sanitize_usize("lane_affinity.forward_lane_radius", &mut self.forward_lane_radius, default.forward_lane_radius, 0, 6, 2, 4);
+        sanitize_f64("lane_affinity.defender_commitment_possession", &mut self.defender_commitment_possession, default.defender_commitment_possession, 0.0, 1.0, 0.50, 0.95);
+        sanitize_f64("lane_affinity.defender_commitment_defense", &mut self.defender_commitment_defense, default.defender_commitment_defense, 0.0, 1.0, 0.60, 1.0);
+        sanitize_f64("lane_affinity.midfielder_commitment_possession", &mut self.midfielder_commitment_possession, default.midfielder_commitment_possession, 0.0, 1.0, 0.45, 0.95);
+        sanitize_f64("lane_affinity.midfielder_commitment_defense", &mut self.midfielder_commitment_defense, default.midfielder_commitment_defense, 0.0, 1.0, 0.55, 1.0);
+        sanitize_f64("lane_affinity.forward_commitment_possession", &mut self.forward_commitment_possession, default.forward_commitment_possession, 0.0, 1.0, 0.15, 0.65);
+        sanitize_f64("lane_affinity.forward_commitment_defense", &mut self.forward_commitment_defense, default.forward_commitment_defense, 0.0, 1.0, 0.15, 0.70);
+        sanitize_f64("lane_affinity.commitment_relief_max", &mut self.commitment_relief_max, default.commitment_relief_max, 0.0, 1.0, 0.30, 0.85);
+        sanitize_f64("lane_affinity.lane_gap_base_penalty", &mut self.lane_gap_base_penalty, default.lane_gap_base_penalty, 0.0, 2.0, 0.25, 1.0);
+        sanitize_f64("lane_affinity.lane_gap_step_penalty", &mut self.lane_gap_step_penalty, default.lane_gap_step_penalty, 0.0, 1.0, 0.05, 0.45);
+        sanitize_f64("lane_affinity.possession_factor", &mut self.possession_factor, default.possession_factor, 0.0, 1.0, 0.60, 0.90);
+        sanitize_f64("lane_affinity.markov_relief_max", &mut self.markov_relief_max, default.markov_relief_max, 0.0, 1.0, 0.40, 0.95);
+        sanitize_f64("lane_affinity.ball_speed_clamp_yps", &mut self.ball_speed_clamp_yps, default.ball_speed_clamp_yps, 1.0, 80.0, 20.0, 55.0);
+        sanitize_f64("lane_affinity.ball_acceleration_clamp_yps2", &mut self.ball_acceleration_clamp_yps2, default.ball_acceleration_clamp_yps2, 1.0, 160.0, 30.0, 110.0);
+        sanitize_f64("lane_affinity.lookahead_base_seconds", &mut self.lookahead_base_seconds, default.lookahead_base_seconds, 0.0, 5.0, 0.20, 1.25);
+        sanitize_f64("lane_affinity.lookahead_speed_scale_yps", &mut self.lookahead_speed_scale_yps, default.lookahead_speed_scale_yps, 1.0, 120.0, 20.0, 70.0);
+        sanitize_f64("lane_affinity.lookahead_acceleration_scale_yps2", &mut self.lookahead_acceleration_scale_yps2, default.lookahead_acceleration_scale_yps2, 1.0, 220.0, 40.0, 140.0);
+        sanitize_f64("lane_affinity.lookahead_min_seconds", &mut self.lookahead_min_seconds, default.lookahead_min_seconds, 0.0, 5.0, 0.20, 1.0);
+        sanitize_f64("lane_affinity.lookahead_max_seconds", &mut self.lookahead_max_seconds, default.lookahead_max_seconds, 0.0, 5.0, 0.75, 2.5);
+        sanitize_f64("lane_affinity.lane_match_span_lanes", &mut self.lane_match_span_lanes, default.lane_match_span_lanes, 1.0, 12.0, 3.0, 8.0);
+        sanitize_f64("lane_affinity.row_match_span_rows", &mut self.row_match_span_rows, default.row_match_span_rows, 1.0, 24.0, 4.0, 12.0);
+        sanitize_f64("lane_affinity.player_predicted_lane_weight", &mut self.player_predicted_lane_weight, default.player_predicted_lane_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.home_predicted_lane_weight", &mut self.home_predicted_lane_weight, default.home_predicted_lane_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.player_current_lane_weight", &mut self.player_current_lane_weight, default.player_current_lane_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.target_predicted_lane_weight", &mut self.target_predicted_lane_weight, default.target_predicted_lane_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.target_current_lane_weight", &mut self.target_current_lane_weight, default.target_current_lane_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.player_predicted_row_weight", &mut self.player_predicted_row_weight, default.player_predicted_row_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.home_predicted_row_weight", &mut self.home_predicted_row_weight, default.home_predicted_row_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.target_predicted_row_weight", &mut self.target_predicted_row_weight, default.target_predicted_row_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.target_current_row_weight", &mut self.target_current_row_weight, default.target_current_row_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.flow_base_score", &mut self.flow_base_score, default.flow_base_score, 0.0, 1.0, 0.20, 0.80);
+        sanitize_f64("lane_affinity.flow_gap_weight", &mut self.flow_gap_weight, default.flow_gap_weight, 0.0, 1.0, 0.05, 0.40);
+        sanitize_f64("lane_affinity.flow_min_score", &mut self.flow_min_score, default.flow_min_score, 0.0, 1.0, 0.0, 0.45);
+        sanitize_f64("lane_affinity.flow_max_score", &mut self.flow_max_score, default.flow_max_score, 0.0, 1.0, 0.55, 1.0);
+        sanitize_f64("lane_affinity.field_teammate_space_weight", &mut self.field_teammate_space_weight, default.field_teammate_space_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.field_open_space_weight", &mut self.field_open_space_weight, default.field_open_space_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.field_open_space_normalizer_yards", &mut self.field_open_space_normalizer_yards, default.field_open_space_normalizer_yards, 1.0, 80.0, 8.0, 35.0);
+        sanitize_f64("lane_affinity.forward_static_fit_weight", &mut self.forward_static_fit_weight, default.forward_static_fit_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.forward_player_ball_weight", &mut self.forward_player_ball_weight, default.forward_player_ball_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.forward_target_ball_weight", &mut self.forward_target_ball_weight, default.forward_target_ball_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.forward_row_coherence_weight", &mut self.forward_row_coherence_weight, default.forward_row_coherence_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.forward_flow_weight", &mut self.forward_flow_weight, default.forward_flow_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.forward_field_config_weight", &mut self.forward_field_config_weight, default.forward_field_config_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_markov_weight", &mut self.role_markov_weight, default.role_markov_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_static_fit_weight", &mut self.role_static_fit_weight, default.role_static_fit_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_player_ball_weight", &mut self.role_player_ball_weight, default.role_player_ball_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_target_ball_weight", &mut self.role_target_ball_weight, default.role_target_ball_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_row_coherence_weight", &mut self.role_row_coherence_weight, default.role_row_coherence_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_flow_weight", &mut self.role_flow_weight, default.role_flow_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.role_field_config_weight", &mut self.role_field_config_weight, default.role_field_config_weight, 0.0, 5.0, 0.0, 1.5);
+        sanitize_f64("lane_affinity.open_space_dynamic_lane_bonus_weight", &mut self.open_space_dynamic_lane_bonus_weight, default.open_space_dynamic_lane_bonus_weight, 0.0, 5.0, 0.20, 2.0);
+        sanitize_f64("lane_affinity.movement_shape_dynamic_lane_weight", &mut self.movement_shape_dynamic_lane_weight, default.movement_shape_dynamic_lane_weight, 0.0, 5.0, 0.10, 1.0);
+        if self.lookahead_min_seconds > self.lookahead_max_seconds {
+            eprintln!("soccer tunables: lane_affinity lookahead min exceeded max; swapping");
+            std::mem::swap(
+                &mut self.lookahead_min_seconds,
+                &mut self.lookahead_max_seconds,
+            );
+        }
+        if self.flow_min_score > self.flow_max_score {
+            eprintln!("soccer tunables: lane_affinity flow min exceeded max; swapping");
+            std::mem::swap(&mut self.flow_min_score, &mut self.flow_max_score);
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "goalkeeper_neutral_score", self.goalkeeper_neutral_score, 0.0, 1.0, errors);
+        validate_usize(prefix, "defender_lane_radius_possession", self.defender_lane_radius_possession, 0, 6, errors);
+        validate_usize(prefix, "defender_lane_radius_defense", self.defender_lane_radius_defense, 0, 6, errors);
+        validate_usize(prefix, "midfielder_lane_radius_possession", self.midfielder_lane_radius_possession, 0, 6, errors);
+        validate_usize(prefix, "midfielder_lane_radius_defense", self.midfielder_lane_radius_defense, 0, 6, errors);
+        validate_usize(prefix, "forward_lane_radius", self.forward_lane_radius, 0, 6, errors);
+        validate_f64(prefix, "defender_commitment_possession", self.defender_commitment_possession, 0.0, 1.0, errors);
+        validate_f64(prefix, "defender_commitment_defense", self.defender_commitment_defense, 0.0, 1.0, errors);
+        validate_f64(prefix, "midfielder_commitment_possession", self.midfielder_commitment_possession, 0.0, 1.0, errors);
+        validate_f64(prefix, "midfielder_commitment_defense", self.midfielder_commitment_defense, 0.0, 1.0, errors);
+        validate_f64(prefix, "forward_commitment_possession", self.forward_commitment_possession, 0.0, 1.0, errors);
+        validate_f64(prefix, "forward_commitment_defense", self.forward_commitment_defense, 0.0, 1.0, errors);
+        validate_f64(prefix, "commitment_relief_max", self.commitment_relief_max, 0.0, 1.0, errors);
+        validate_f64(prefix, "lane_gap_base_penalty", self.lane_gap_base_penalty, 0.0, 2.0, errors);
+        validate_f64(prefix, "lane_gap_step_penalty", self.lane_gap_step_penalty, 0.0, 1.0, errors);
+        validate_f64(prefix, "possession_factor", self.possession_factor, 0.0, 1.0, errors);
+        validate_f64(prefix, "markov_relief_max", self.markov_relief_max, 0.0, 1.0, errors);
+        validate_f64(prefix, "ball_speed_clamp_yps", self.ball_speed_clamp_yps, 1.0, 80.0, errors);
+        validate_f64(prefix, "ball_acceleration_clamp_yps2", self.ball_acceleration_clamp_yps2, 1.0, 160.0, errors);
+        validate_f64(prefix, "lookahead_base_seconds", self.lookahead_base_seconds, 0.0, 5.0, errors);
+        validate_f64(prefix, "lookahead_speed_scale_yps", self.lookahead_speed_scale_yps, 1.0, 120.0, errors);
+        validate_f64(prefix, "lookahead_acceleration_scale_yps2", self.lookahead_acceleration_scale_yps2, 1.0, 220.0, errors);
+        validate_f64(prefix, "lookahead_min_seconds", self.lookahead_min_seconds, 0.0, 5.0, errors);
+        validate_f64(prefix, "lookahead_max_seconds", self.lookahead_max_seconds, 0.0, 5.0, errors);
+        validate_f64(prefix, "lane_match_span_lanes", self.lane_match_span_lanes, 1.0, 12.0, errors);
+        validate_f64(prefix, "row_match_span_rows", self.row_match_span_rows, 1.0, 24.0, errors);
+        validate_f64(prefix, "player_predicted_lane_weight", self.player_predicted_lane_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "home_predicted_lane_weight", self.home_predicted_lane_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "player_current_lane_weight", self.player_current_lane_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "target_predicted_lane_weight", self.target_predicted_lane_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "target_current_lane_weight", self.target_current_lane_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "player_predicted_row_weight", self.player_predicted_row_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "home_predicted_row_weight", self.home_predicted_row_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "target_predicted_row_weight", self.target_predicted_row_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "target_current_row_weight", self.target_current_row_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "flow_base_score", self.flow_base_score, 0.0, 1.0, errors);
+        validate_f64(prefix, "flow_gap_weight", self.flow_gap_weight, 0.0, 1.0, errors);
+        validate_f64(prefix, "flow_min_score", self.flow_min_score, 0.0, 1.0, errors);
+        validate_f64(prefix, "flow_max_score", self.flow_max_score, 0.0, 1.0, errors);
+        validate_f64(prefix, "field_teammate_space_weight", self.field_teammate_space_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "field_open_space_weight", self.field_open_space_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "field_open_space_normalizer_yards", self.field_open_space_normalizer_yards, 1.0, 80.0, errors);
+        validate_f64(prefix, "forward_static_fit_weight", self.forward_static_fit_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "forward_player_ball_weight", self.forward_player_ball_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "forward_target_ball_weight", self.forward_target_ball_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "forward_row_coherence_weight", self.forward_row_coherence_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "forward_flow_weight", self.forward_flow_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "forward_field_config_weight", self.forward_field_config_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_markov_weight", self.role_markov_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_static_fit_weight", self.role_static_fit_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_player_ball_weight", self.role_player_ball_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_target_ball_weight", self.role_target_ball_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_row_coherence_weight", self.role_row_coherence_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_flow_weight", self.role_flow_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "role_field_config_weight", self.role_field_config_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "open_space_dynamic_lane_bonus_weight", self.open_space_dynamic_lane_bonus_weight, 0.0, 5.0, errors);
+        validate_f64(prefix, "movement_shape_dynamic_lane_weight", self.movement_shape_dynamic_lane_weight, 0.0, 5.0, errors);
+        if self.lookahead_min_seconds > self.lookahead_max_seconds {
+            errors.push(format!("{prefix}.lookahead_min_seconds > {prefix}.lookahead_max_seconds"));
+        }
+        if self.flow_min_score > self.flow_max_score {
+            errors.push(format!("{prefix}.flow_min_score > {prefix}.flow_max_score"));
         }
     }
 }
@@ -522,6 +796,47 @@ fn validate_f64(
     }
 }
 
+fn sanitize_usize(
+    path: &str,
+    value: &mut usize,
+    default: usize,
+    hard_min: usize,
+    hard_max: usize,
+    sane_min: usize,
+    sane_max: usize,
+) {
+    if *value < hard_min || *value > hard_max {
+        let before = *value;
+        *value = (*value).clamp(hard_min, hard_max);
+        eprintln!(
+            "soccer tunables: {path}={before} outside hard range [{hard_min}, {hard_max}]; clamped to {}",
+            *value
+        );
+        return;
+    }
+    if *value < sane_min || *value > sane_max {
+        eprintln!(
+            "soccer tunables: {path}={} outside sane range [{sane_min}, {sane_max}], default {default}",
+            *value
+        );
+    }
+}
+
+fn validate_usize(
+    prefix: &str,
+    field: &str,
+    value: usize,
+    hard_min: usize,
+    hard_max: usize,
+    errors: &mut Vec<String>,
+) {
+    if value < hard_min || value > hard_max {
+        errors.push(format!(
+            "{prefix}.{field}={value} outside [{hard_min}, {hard_max}]"
+        ));
+    }
+}
+
 /// Recursively merge `overlay` into `base`: objects are merged key-by-key, any
 /// other value (scalar, array) replaces wholesale. Mirrors how a config patch
 /// should behave.
@@ -659,6 +974,12 @@ mod tests {
             8.0
         );
         assert_eq!(t.defensive_shape.defensive_goal_side_min_yards, 1.5);
+        assert_eq!(t.lane_affinity.forward_lane_radius, 3);
+        assert_eq!(t.lane_affinity.defender_commitment_possession, 0.80);
+        assert_eq!(t.lane_affinity.possession_factor, 0.80);
+        assert_eq!(t.lane_affinity.row_match_span_rows, 8.0);
+        assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.05);
+        assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
     }
 
     #[test]
@@ -666,7 +987,11 @@ mod tests {
         let t = Tunables::from_overlays([json!({
             "tracking": { "moved_dt_multiplier": 1.5 },
             "decision_mpc": { "reselect_min_ball_execution_probability": 0.42 },
-            "defensive_shape": { "defensive_line_max_into_opp_half_yards": 4.0 }
+            "defensive_shape": { "defensive_line_max_into_opp_half_yards": 4.0 },
+            "lane_affinity": {
+                "possession_factor": 0.74,
+                "open_space_dynamic_lane_bonus_weight": 1.3
+            }
         })]);
         assert_eq!(t.tracking.moved_dt_multiplier, 1.5);
         assert_eq!(
@@ -678,9 +1003,12 @@ mod tests {
             t.defensive_shape.defensive_line_max_into_opp_half_yards,
             4.0
         );
+        assert_eq!(t.lane_affinity.possession_factor, 0.74);
+        assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.3);
         // Untouched fields keep their defaults.
         assert_eq!(t.tracking.tackle_recover_max_distance_yards, 3.8);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
+        assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
     }
 
     #[test]
@@ -713,12 +1041,22 @@ mod tests {
             "defensive_shape": {
                 "back_four_horizontal_min_gap_yards": 12.0,
                 "back_four_horizontal_max_gap_yards": 4.0
+            },
+            "lane_affinity": {
+                "possession_factor": 4.0,
+                "forward_lane_radius": 99,
+                "lookahead_min_seconds": 2.0,
+                "lookahead_max_seconds": 0.5
             }
         })]);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 1.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 4.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 12.0);
+        assert_eq!(t.lane_affinity.possession_factor, 1.0);
+        assert_eq!(t.lane_affinity.forward_lane_radius, 6);
+        assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
+        assert_eq!(t.lane_affinity.lookahead_max_seconds, 2.0);
     }
 
     #[test]
@@ -727,9 +1065,13 @@ mod tests {
         t.shooting.shot_on_frame_min_probability = 1.2;
         t.defensive_shape.back_four_horizontal_min_gap_yards = 9.0;
         t.defensive_shape.back_four_horizontal_max_gap_yards = 6.0;
+        t.lane_affinity.possession_factor = 1.2;
+        t.lane_affinity.forward_lane_radius = 9;
 
         let err = t.validate_strict().expect_err("config should be invalid");
         assert!(err.contains("shooting.shot_on_frame_min_probability"));
         assert!(err.contains("defensive_shape.back_four_horizontal_min_gap_yards >"));
+        assert!(err.contains("lane_affinity.possession_factor"));
+        assert!(err.contains("lane_affinity.forward_lane_radius"));
     }
 }

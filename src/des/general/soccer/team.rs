@@ -961,6 +961,7 @@ pub(crate) struct SoccerFormationLpSlotInput {
     pub(crate) speed_match_weight: f64,
     pub(crate) pair_weight: f64,
     pub(crate) alignment_weight: f64,
+    pub(crate) attacking_spacing_weight: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -2110,7 +2111,8 @@ impl SoccerFormationLpBrain {
                 + space_occupation * 0.30
                 + passing_lane_quality * 0.18
                 + defensive_compactness * role_rest_defense * 0.26
-                + progression * role_attack * 0.12;
+                + progression * role_attack * 0.12
+                + soccer_lp_unit(input.attacking_spacing_weight) * role_attack * 0.22;
             let movement_weight = 0.18 + fatigue * (0.45 + input_fatigue * 0.75);
             let acceleration_weight = 0.06 + fatigue * 0.18 + input_fatigue * 0.16;
             let dynamics_weight =
@@ -2135,6 +2137,7 @@ impl SoccerFormationLpBrain {
                     + progression * role_attack * 0.012
                     + embedding_attack * role_attack * 0.008
                     + neural_attack * role_attack * 0.008
+                    + soccer_lp_unit(input.attacking_spacing_weight) * role_attack * 0.010
                     - transition_risk * role_rest_defense * 0.006
                     - embedding_defense * role_rest_defense * 0.006
                     - neural_defense * role_rest_defense * 0.006);
@@ -2170,8 +2173,12 @@ impl SoccerFormationLpBrain {
                 let shape_relief =
                     soccer_formation_lp_pair_shape_relief(snapshot, self.team, &a, &b);
                 let base_pair_weight = soccer_lp_unit((a.pair_weight + b.pair_weight) * 0.5);
+                let attacking_spacing_pair_weight =
+                    soccer_lp_unit((a.attacking_spacing_weight + b.attacking_spacing_weight) * 0.5)
+                        * 0.14;
                 let spacing_shape_weight =
-                    same_role_spacing_weight * (1.0 - shape_relief).clamp(0.15, 1.0);
+                    (same_role_spacing_weight + attacking_spacing_pair_weight)
+                        * (1.0 - shape_relief).clamp(0.15, 1.0);
                 let line_shape_weight =
                     same_role_line_y_weight * (1.0 - shape_relief).clamp(0.15, 1.0);
                 let pair_x_weight = soccer_lp_unit(base_pair_weight + spacing_shape_weight);
@@ -4237,6 +4244,21 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
                 0.42,
                 0.08,
             );
+            let attacking_spacing_profile =
+                snapshot.attacking_support_spacing_profile_at(player, anchor);
+            let attacking_spacing_weight = if snapshot.possession_team() == Some(team)
+                && player.role != PlayerRole::Goalkeeper
+                && snapshot.ball.holder != Some(player.id)
+            {
+                soccer_lp_unit(
+                    attacking_spacing_profile.combined_score() * 0.62
+                        + attacking_spacing_profile.forward_fill * 0.38,
+                ) * (0.55
+                    + soccer_lp_unit(weights.space_occupation) * 0.28
+                    + soccer_lp_unit(weights.progression) * 0.22)
+            } else {
+                0.0
+            };
             slots.push(SoccerFormationLpSlotInput {
                 active: true,
                 player_id: player.id,
@@ -4271,6 +4293,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
                     1.6,
                     0.46,
                 ),
+                attacking_spacing_weight,
             });
         } else {
             let anchor = center;
@@ -4292,6 +4315,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
                 speed_match_weight: 0.0,
                 pair_weight: 0.0,
                 alignment_weight: 0.0,
+                attacking_spacing_weight: 0.0,
             });
         }
     }

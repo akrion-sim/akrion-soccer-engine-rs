@@ -1038,6 +1038,11 @@ const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
+const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 3.4;
+const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
+const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
+const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
+const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
 // A completed back pass KEEPS possession — it is far better than forcing a forward
 // ball into a turnover. It is only mildly discouraged (so the policy still prefers to
 // progress when it safely can), not punished, so the team learns to retain rather than
@@ -2787,6 +2792,13 @@ const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
 // ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
 // touch, they do not stand off it.
 const LOOSE_BALL_MAX_UNCONTESTED_SECONDS: f64 = 0.25;
+// Parallel loose-ball-attack tunables from the `alex-1` line of work (kept alongside
+// the urgency constants above — they drive its own shape-safe retrieval weighting and
+// its learning rewards/penalties for attacking vs. standing off an uncontested ball).
+const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 = 0.25;
+const LOOSE_BALL_SHAPE_SAFE_RETRIEVAL_WEIGHT_YARDS: f64 = 2.4;
+const LOOSE_BALL_ATTACK_CANDIDATE_REWARD: f64 = 0.20;
+const LOOSE_BALL_UNCONTESTED_HOLD_PENALTY: f64 = 0.34;
 // ---- Off-ball pass-reception belief / hand-off (anticipate the trajectory; best man receives) ----
 // When a ground pass is in flight, the receiving team predicts where it will arrive and the
 // genuinely best-placed team-mate goes to meet it. A team-mate is only treated as a live contender
@@ -3125,6 +3137,13 @@ const SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MAX_YARDS: f64 = 15.0;
 const SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_PENALTY: f64 = 0.85;
 const SUPPORT_HOLDER_CLEAR_LANE_RELIEF_REWARD: f64 = 0.18;
 const SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_SPACING_REWARD: f64 = 0.12;
+const ATTACK_SUPPORT_SPACING_MIN_YARDS: f64 = 5.0;
+const ATTACK_SUPPORT_SPACING_IDEAL_YARDS: f64 = 6.5;
+const ATTACK_SUPPORT_SPACING_MAX_YARDS: f64 = 8.0;
+const ATTACK_SUPPORT_SPACING_FAR_DECAY_YARDS: f64 = 10.0;
+const ATTACK_SUPPORT_SPACING_SHAPE_REWARD: f64 = 0.18;
+pub(crate) const OUTSIDE_MID_TAKEON_COVER_CLEAR_YARDS: f64 = 10.0;
+const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
 // gait is forced to a sprint.
@@ -3358,8 +3377,14 @@ const SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM: usize = 2;
 const SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize = 14;
 /// Append-only off-ball support spacing block. These channels teach the policy
 /// when a teammate already has a clean passing lane to the carrier and should
-/// hold/widen/advance instead of spiraling into the holder's feet.
-const SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM: usize = 3;
+/// hold/widen/advance instead of spiraling into the holder's feet, then extend
+/// that signal into the attacking 5-8yd local spacing band, plus the on-ball
+/// outside-midfielder isolation cue for taking on a lone flank defender.
+const SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM: usize = 8;
+/// Append-only loose-ball attack block. The policy learns which player should
+/// break shape to win an unpossessed ball, balancing race urgency with LP-backed
+/// shape safety.
+const SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = 3;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3380,8 +3405,10 @@ const SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize =
     + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
     + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM
+const SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM
     + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM
+    + SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3608,6 +3635,22 @@ const SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_LANE_OPEN: usize =
     SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_DISTANCE + 1;
 const SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_LANE_OPEN + 1;
+const SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_SPACING_QUALITY: usize =
+    SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_FORWARD_FILL: usize =
+    SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_SPACING_QUALITY + 1;
+const SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_DEFENSIVE_VECTOR_SPACE: usize =
+    SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_FORWARD_FILL + 1;
+const SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_HOLDER_DIRECTION_FIT: usize =
+    SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_DEFENSIVE_VECTOR_SPACE + 1;
+const SOCCER_NEURAL_FEATURE_OUTSIDE_MID_TAKEON_ISOLATION: usize =
+    SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_HOLDER_DIRECTION_FIT + 1;
+const SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_CANDIDATE: usize =
+    SOCCER_NEURAL_FEATURE_OUTSIDE_MID_TAKEON_ISOLATION + 1;
+const SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_SHAPE_SAFETY: usize =
+    SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_CANDIDATE + 1;
+const SOCCER_NEURAL_FEATURE_LOOSE_BALL_UNCONTESTED_URGENCY: usize =
+    SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_SHAPE_SAFETY + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3690,6 +3733,12 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM,
     // Same schema with midfield-four band features, before support-holder spacing.
     SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM,
+    // Same schema with support-holder spacing, before attacking-spacing channels.
+    SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM + 3,
+    // Same schema with attacking support shape, before outside-mid take-on isolation.
+    SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM + 7,
+    // Same schema with attacking-spacing channels, before loose-ball attack selection.
+    SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -4365,6 +4414,7 @@ fn role_vertical_lane_range(
     field_width: f64,
     in_possession: bool,
 ) -> (usize, usize) {
+    let lane_tunables = &tunables().lane_affinity;
     let home_lane = vertical_lane_index(home_x, field_width);
     let clamp_lane = |lane: isize| -> usize {
         lane.clamp(0, VERTICAL_LANE_COUNT.saturating_sub(1) as isize) as usize
@@ -4383,16 +4433,25 @@ fn role_vertical_lane_range(
         // still carry a lighter lane prior than the back/midfield lines, but the learned
         // and MPC shape scorers now see that prior instead of treating forwards as
         // lane-less.
-        PlayerRole::Forward => centered_band(3),
-        PlayerRole::Defender if in_possession => centered_band(2),
-        PlayerRole::Defender => centered_band(1),
-        PlayerRole::Midfielder if in_possession => centered_band(2),
-        PlayerRole::Midfielder => centered_band(1),
+        PlayerRole::Forward => centered_band(lane_tunables.forward_lane_radius as isize),
+        PlayerRole::Defender if in_possession => {
+            centered_band(lane_tunables.defender_lane_radius_possession as isize)
+        }
+        PlayerRole::Defender => {
+            centered_band(lane_tunables.defender_lane_radius_defense as isize)
+        }
+        PlayerRole::Midfielder if in_possession => {
+            centered_band(lane_tunables.midfielder_lane_radius_possession as isize)
+        }
+        PlayerRole::Midfielder => {
+            centered_band(lane_tunables.midfielder_lane_radius_defense as isize)
+        }
         PlayerRole::Goalkeeper => (home_lane, home_lane),
     }
 }
 
 fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
+    let lane_tunables = &tunables().lane_affinity;
     // Scalar pull back into the home lane (0 = free, 1 = hard), tuned to the 4-lane
     // (~20yd quarter-pitch) `VERTICAL_LANE_COUNT`. The richer, ball/field-config-aware
     // per-player lane affinity lives in `dynamic_lane_affinity_for_player_target`.
@@ -4405,16 +4464,16 @@ fn role_vertical_lane_commitment(role: PlayerRole, in_possession: bool) -> f64 {
         // tracking a mark, no outlet, covering a teammate, team urgency) — i.e. players
         // only leave their primary lane for those already-specified reasons. Drift
         // INSIDE the band is still free; this only bounds the band edge.
-        PlayerRole::Defender if in_possession => 0.76,
-        PlayerRole::Defender => 0.92,
-        PlayerRole::Midfielder if in_possession => 0.76,
-        PlayerRole::Midfielder => 0.90,
+        PlayerRole::Defender if in_possession => lane_tunables.defender_commitment_possession,
+        PlayerRole::Defender => lane_tunables.defender_commitment_defense,
+        PlayerRole::Midfielder if in_possession => lane_tunables.midfielder_commitment_possession,
+        PlayerRole::Midfielder => lane_tunables.midfielder_commitment_defense,
         // A light containment pull for forwards: enough to keep the lane clamp/penalty
         // alive against a cross-pitch drift (commitment must be > 0 to engage at all),
         // but well below the 0.65 hard-lock threshold and eroded by genuine attacking
         // runs (`offensive_high_speed_run_relief`), so striker movement stays free.
-        PlayerRole::Forward if in_possession => 0.34,
-        PlayerRole::Forward => 0.40,
+        PlayerRole::Forward if in_possession => lane_tunables.forward_commitment_possession,
+        PlayerRole::Forward => lane_tunables.forward_commitment_defense,
     }
 }
 
@@ -4445,8 +4504,10 @@ fn vertical_lane_fit_for_role_target(
     in_possession: bool,
     relief: f64,
 ) -> VerticalLaneFit {
+    let lane_tunables = &tunables().lane_affinity;
     let commitment =
-        role_vertical_lane_commitment(role, in_possession) * (1.0 - relief.clamp(0.0, 0.65));
+        role_vertical_lane_commitment(role, in_possession)
+            * (1.0 - relief.clamp(0.0, lane_tunables.commitment_relief_max));
     if commitment <= 1e-9 {
         return VerticalLaneFit {
             affinity_score: 1.0,
@@ -4468,7 +4529,11 @@ fn vertical_lane_fit_for_role_target(
     let affinity_score = if lane_gap == 0 {
         1.0
     } else {
-        (1.0 - commitment * (0.58 + lane_gap as f64 * 0.22)).clamp(0.0, 1.0)
+        (1.0
+            - commitment
+                * (lane_tunables.lane_gap_base_penalty
+                    + lane_gap as f64 * lane_tunables.lane_gap_step_penalty))
+        .clamp(0.0, 1.0)
     };
     VerticalLaneFit {
         affinity_score,
@@ -5167,6 +5232,16 @@ pub struct SoccerPomdpObservation {
     pub loose_ball_team_time_advantage_seconds: f64,
     #[serde(default)]
     pub loose_ball_player_time_to_ball_seconds: f64,
+    /// Whether this player is the elected, shape-safe loose-ball attacker.
+    #[serde(default)]
+    pub loose_ball_attack_candidate: f64,
+    /// LP/formation-backed safety for this player attacking the loose ball.
+    #[serde(default)]
+    pub loose_ball_attack_shape_safety: f64,
+    /// Urgency created when the best reachable loose-ball arrival is beyond the
+    /// quarter-second realism grace.
+    #[serde(default)]
+    pub loose_ball_uncontested_urgency: f64,
     pub ball_distance: f64,
     pub nearest_opponent_distance: f64,
     pub nearest_teammate_distance: f64,
@@ -5217,6 +5292,27 @@ pub struct SoccerPomdpObservation {
     /// several yards away into the carrier's feet.
     #[serde(default)]
     pub support_ball_holder_collapse_pressure: f64,
+    /// Local attacking spacing quality around this player/target. A high value
+    /// means the nearest teammate is in the default 5-8yd support band, after the
+    /// 2s teammate-spacing grace has had time to resolve transient crossings.
+    #[serde(default)]
+    pub attacking_support_spacing_quality: f64,
+    /// How well this off-ball player is filling forward empty space relative to
+    /// the team center of mass and the ball.
+    #[serde(default)]
+    pub attacking_support_forward_fill: f64,
+    /// How much the target lives in space relative to the defending team's current
+    /// vector/center rather than on top of the defending block.
+    #[serde(default)]
+    pub attacking_support_defensive_vector_space: f64,
+    /// Fit between the target pocket and the carrier's current facing/movement
+    /// direction, so support arrives where the ball can plausibly be played.
+    #[serde(default)]
+    pub attacking_support_holder_direction_fit: f64,
+    /// On-ball outside-midfielder take-on isolation: high when the immediate flank
+    /// defender has no covering defender within the 10yd re-collect window.
+    #[serde(default)]
+    pub outside_mid_takeon_isolation: f64,
     #[serde(default)]
     pub team_brain_mode: TeamBrainMode,
     #[serde(default)]
@@ -7294,6 +7390,12 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub loose_ball_player_time_bin: u8,
     #[serde(default)]
+    pub loose_ball_attack_candidate_bin: u8,
+    #[serde(default)]
+    pub loose_ball_attack_shape_safety_bin: u8,
+    #[serde(default)]
+    pub loose_ball_uncontested_urgency_bin: u8,
+    #[serde(default)]
     pub receive_facing: FacingBucket,
     #[serde(default)]
     pub action_facing: FacingBucket,
@@ -7466,6 +7568,21 @@ pub struct SoccerQStateKey {
     /// Collapse-pressure bucket: already-open support lane but too close to holder.
     #[serde(default)]
     pub support_ball_holder_collapse_bin: u8,
+    /// Local 5-8yd attacking support-spacing quality bucket.
+    #[serde(default)]
+    pub attacking_support_spacing_quality_bin: u8,
+    /// Forward empty-space fill bucket while attacking.
+    #[serde(default)]
+    pub attacking_support_forward_fill_bin: u8,
+    /// Space relative to the defending team vector/center while attacking.
+    #[serde(default)]
+    pub attacking_support_defensive_vector_space_bin: u8,
+    /// Fit to the ball holder's facing/movement direction while attacking.
+    #[serde(default)]
+    pub attacking_support_holder_direction_fit_bin: u8,
+    /// Outside-mid take-on isolation bucket for learned flank defender attacks.
+    #[serde(default)]
+    pub outside_mid_takeon_isolation_bin: u8,
     #[serde(default)]
     pub perceived_time_on_ball_bin: u8,
     #[serde(default)]
@@ -7609,6 +7726,18 @@ impl SoccerQStateKey {
             loose_ball_player_time_bin: distance_bucket(
                 observation.loose_ball_player_time_to_ball_seconds,
                 &[0.45, 0.90, 1.60, 2.80, 4.50],
+            ),
+            loose_ball_attack_candidate_bin: distance_bucket(
+                observation.loose_ball_attack_candidate,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            loose_ball_attack_shape_safety_bin: distance_bucket(
+                observation.loose_ball_attack_shape_safety,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            loose_ball_uncontested_urgency_bin: distance_bucket(
+                observation.loose_ball_uncontested_urgency,
+                &[0.20, 0.45, 0.70, 0.88],
             ),
             receive_facing,
             action_facing,
@@ -7887,6 +8016,26 @@ impl SoccerQStateKey {
                 observation.support_ball_holder_collapse_pressure,
                 &[0.12, 0.30, 0.55, 0.78],
             ),
+            attacking_support_spacing_quality_bin: distance_bucket(
+                observation.attacking_support_spacing_quality,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            attacking_support_forward_fill_bin: distance_bucket(
+                observation.attacking_support_forward_fill,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            attacking_support_defensive_vector_space_bin: distance_bucket(
+                observation.attacking_support_defensive_vector_space,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            attacking_support_holder_direction_fit_bin: distance_bucket(
+                observation.attacking_support_holder_direction_fit,
+                &[0.20, 0.45, 0.70, 0.88],
+            ),
+            outside_mid_takeon_isolation_bin: distance_bucket(
+                observation.outside_mid_takeon_isolation,
+                &[0.18, 0.40, 0.65, 0.82],
+            ),
             perceived_time_on_ball_bin: distance_bucket(
                 observation.perceived_time_on_ball_seconds,
                 &[0.35, 0.75, 1.3, 2.2],
@@ -8029,6 +8178,9 @@ impl SoccerQStateKey {
             && self.loose_ball_fifty_fifty == other.loose_ball_fifty_fifty
             && self.loose_ball_team_time_advantage_bin == other.loose_ball_team_time_advantage_bin
             && self.loose_ball_player_time_bin == other.loose_ball_player_time_bin
+            && self.loose_ball_attack_candidate_bin == other.loose_ball_attack_candidate_bin
+            && self.loose_ball_attack_shape_safety_bin == other.loose_ball_attack_shape_safety_bin
+            && self.loose_ball_uncontested_urgency_bin == other.loose_ball_uncontested_urgency_bin
             && self.score_diff_bucket == other.score_diff_bucket
             && self.team_brain_mode == other.team_brain_mode
             && self.team_brain_press_bin == other.team_brain_press_bin
@@ -8127,6 +8279,14 @@ impl SoccerQStateKey {
             && self.support_ball_holder_distance_bin == other.support_ball_holder_distance_bin
             && self.support_ball_holder_lane_open_bin == other.support_ball_holder_lane_open_bin
             && self.support_ball_holder_collapse_bin == other.support_ball_holder_collapse_bin
+            && self.attacking_support_spacing_quality_bin
+                == other.attacking_support_spacing_quality_bin
+            && self.attacking_support_forward_fill_bin == other.attacking_support_forward_fill_bin
+            && self.attacking_support_defensive_vector_space_bin
+                == other.attacking_support_defensive_vector_space_bin
+            && self.attacking_support_holder_direction_fit_bin
+                == other.attacking_support_holder_direction_fit_bin
+            && self.outside_mid_takeon_isolation_bin == other.outside_mid_takeon_isolation_bin
             && self.perceived_time_on_ball_bin == other.perceived_time_on_ball_bin
             && self.excessive_hold_pressure_bin == other.excessive_hold_pressure_bin
             && self.fatigue_bin == other.fatigue_bin
@@ -8169,6 +8329,9 @@ impl SoccerQStateKey {
             && self.loose_ball_fifty_fifty == other.loose_ball_fifty_fifty
             && self.loose_ball_team_time_advantage_bin == other.loose_ball_team_time_advantage_bin
             && self.loose_ball_player_time_bin == other.loose_ball_player_time_bin
+            && self.loose_ball_attack_candidate_bin == other.loose_ball_attack_candidate_bin
+            && self.loose_ball_attack_shape_safety_bin == other.loose_ball_attack_shape_safety_bin
+            && self.loose_ball_uncontested_urgency_bin == other.loose_ball_uncontested_urgency_bin
             && self.flank_cross_arrival_available == other.flank_cross_arrival_available
             && self.defensive_cross_arrival_threat_available
                 == other.defensive_cross_arrival_threat_available
@@ -10372,7 +10535,7 @@ fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
         LeftCut | SideStep | Dribble | HoldUpFlank | OpenPassLane => Some(DribbleMoveKind::LeftCut),
-        CarryForward | VerticalAttack | TurnoverBurst | RoundGoalkeeper => {
+        CarryForward | VerticalAttack | TurnoverBurst | RoundGoalkeeper | RunaroundDribble => {
             Some(DribbleMoveKind::CarryForward)
         }
         ProtectBall => Some(DribbleMoveKind::ProtectBall),
@@ -16542,6 +16705,57 @@ fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f
     completed_pass_reward_for_pitch(team, origin, target, DEFAULT_FIELD_WIDTH_YARDS, field_length)
 }
 
+fn first_time_short_forward_pass_fit(team: Team, origin: Vec2, target: Vec2) -> f64 {
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if !forward_yards.is_finite() || forward_yards <= FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS
+    {
+        return 0.0;
+    }
+    if forward_yards < FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS {
+        ((forward_yards - FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS)
+            / (FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS
+                - FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS)
+                .max(1e-6))
+        .clamp(0.0, 1.0)
+            * 0.82
+    } else if forward_yards <= FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS {
+        1.0
+    } else {
+        (1.0
+            - (forward_yards - FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS)
+                / FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS)
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn completed_first_time_forward_pass_reward_from_parts(
+    action: &str,
+    team: Team,
+    flight: PassFlight,
+    is_cross: bool,
+    origin: Vec2,
+    target: Vec2,
+    receiver_openness: f64,
+    stride_fit: f64,
+) -> f64 {
+    if action != "first-time-pass" || flight != PassFlight::Floor || is_cross {
+        return 0.0;
+    }
+    let short_forward_fit = first_time_short_forward_pass_fit(team, origin, target);
+    if short_forward_fit <= 0.0 {
+        return 0.0;
+    }
+    let forward_yards = ((target.y - origin.y) * team.attack_dir()).max(0.0);
+    let upfield_fit = (forward_yards / 14.0).clamp(0.0, 1.0);
+    let target_fit = (receiver_openness.clamp(0.0, 1.0) * 0.68
+        + stride_fit.clamp(0.0, 1.0) * 0.20
+        + upfield_fit * 0.12)
+        .clamp(0.0, 1.0);
+    COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS
+        * short_forward_fit
+        * (0.48 + target_fit * 0.52)
+}
+
 fn cross_scoring_channel_score(
     team: Team,
     origin: Vec2,
@@ -18767,6 +18981,16 @@ fn soccer_transition_reward_with_tactics(
                         receiver_openness,
                         pass_into_stride_fit_for_context(&action_context, player.team),
                     );
+                    reward += completed_first_time_forward_pass_reward_from_parts(
+                        action,
+                        player.team,
+                        flight,
+                        is_cross,
+                        origin,
+                        target,
+                        receiver_openness,
+                        pass_into_stride_fit_for_context(&action_context, player.team),
+                    );
                     if flight == PassFlight::Floor && !is_cross {
                         let target_forward_yards = (target.y - origin.y) * player.team.attack_dir();
                         let target_yards_to_goal =
@@ -18867,6 +19091,65 @@ fn clear_lane_support_spacing_fit(distance_yards: f64) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AttackSupportSpacingProfile {
+    pub spacing_quality: f64,
+    pub forward_fill: f64,
+    pub defensive_vector_space: f64,
+    pub holder_direction_fit: f64,
+}
+
+impl AttackSupportSpacingProfile {
+    pub(crate) fn combined_score(self) -> f64 {
+        (self.spacing_quality.clamp(0.0, 1.0) * 0.34
+            + self.forward_fill.clamp(0.0, 1.0) * 0.28
+            + self.defensive_vector_space.clamp(0.0, 1.0) * 0.20
+            + self.holder_direction_fit.clamp(0.0, 1.0) * 0.18)
+            .clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LooseBallAttackProfile {
+    pub attack_candidate: f64,
+    pub shape_safety: f64,
+    pub uncontested_urgency: f64,
+}
+
+pub(crate) fn attacking_support_spacing_fit(distance_yards: f64) -> f64 {
+    if !distance_yards.is_finite() || distance_yards <= 0.0 {
+        return 0.0;
+    }
+    if distance_yards < ATTACK_SUPPORT_SPACING_MIN_YARDS {
+        return (distance_yards / ATTACK_SUPPORT_SPACING_MIN_YARDS.max(1e-6)).clamp(0.0, 1.0);
+    }
+    if distance_yards <= ATTACK_SUPPORT_SPACING_IDEAL_YARDS {
+        return 1.0;
+    }
+    if distance_yards <= ATTACK_SUPPORT_SPACING_MAX_YARDS {
+        return (1.0
+            - (distance_yards - ATTACK_SUPPORT_SPACING_IDEAL_YARDS)
+                / (ATTACK_SUPPORT_SPACING_MAX_YARDS - ATTACK_SUPPORT_SPACING_IDEAL_YARDS)
+                    .max(1e-6)
+                * 0.12)
+            .clamp(0.88, 1.0);
+    }
+    (1.0
+        - (distance_yards - ATTACK_SUPPORT_SPACING_MAX_YARDS)
+            / ATTACK_SUPPORT_SPACING_FAR_DECAY_YARDS.max(1e-6))
+    .clamp(0.0, 0.88)
+}
+
+fn attacking_support_shape_fit(obs: &SoccerPomdpObservation) -> f64 {
+    AttackSupportSpacingProfile {
+        spacing_quality: obs.attacking_support_spacing_quality,
+        forward_fill: obs.attacking_support_forward_fill,
+        defensive_vector_space: obs.attacking_support_defensive_vector_space,
+        holder_direction_fit: obs.attacking_support_holder_direction_fit,
+    }
+    .combined_score()
+}
+
 fn dense_soccer_transition_reward(
     player: &PlayerAgent,
     decision: &AgentDecisionTrace,
@@ -18922,6 +19205,23 @@ fn dense_soccer_transition_reward(
         reward += (after_fit - before_fit).clamp(-1.0, 1.0)
             * before_obs.support_ball_holder_lane_open.clamp(0.0, 1.0)
             * SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_SPACING_REWARD;
+    }
+    if player.role != PlayerRole::Goalkeeper
+        && !before_obs.has_ball
+        && (before_possession == Some(player.team) || after_possession == Some(player.team))
+    {
+        let before_fit = attacking_support_shape_fit(before_obs);
+        let after_fit = attacking_support_shape_fit(&after_obs);
+        reward +=
+            (after_fit - before_fit).clamp(-1.0, 1.0) * ATTACK_SUPPORT_SPACING_SHAPE_REWARD;
+    }
+    if player.role == PlayerRole::Midfielder
+        && (before.ball.holder == Some(player.id) || after.ball.holder == Some(player.id))
+        && (before_possession == Some(player.team) || after_possession == Some(player.team))
+        && normalize_soccer_action_label(action) == "runaround-dribble"
+    {
+        reward += before_obs.outside_mid_takeon_isolation.clamp(0.0, 1.0)
+            * OUTSIDE_MID_TAKEON_ISOLATION_REWARD;
     }
     // FLANK / WING usage (#8): reward the on-ball player for working the ball in a wide channel,
     // scaled UP in the team's OWN half (get it wide out of central congestion in front of our goal
@@ -19621,8 +19921,18 @@ fn loose_ball_contest_learning_reward(
 
     if action == "recover" {
         reward += 0.12 + race_urgency * 0.20 + player_time_fit * 0.16;
+        reward += before_obs.loose_ball_attack_candidate.clamp(0.0, 1.0)
+            * before_obs.loose_ball_attack_shape_safety.clamp(0.0, 1.0)
+            * (LOOSE_BALL_ATTACK_CANDIDATE_REWARD
+                + before_obs.loose_ball_uncontested_urgency.clamp(0.0, 1.0) * 0.20);
     } else if SoccerActionLabel::classify(action) == Some(SoccerActionLabel::Hold) && (before_obs.loose_ball_fifty_fifty || time_advantage > 0.10) {
         reward -= 0.18 + race_urgency * 0.24 + player_time_fit * 0.18;
+    } else if SoccerActionLabel::classify(action) == Some(SoccerActionLabel::Hold)
+        && before_obs.loose_ball_attack_candidate >= 0.65
+        && before_obs.loose_ball_uncontested_urgency >= 0.35
+    {
+        reward -= LOOSE_BALL_UNCONTESTED_HOLD_PENALTY
+            * before_obs.loose_ball_uncontested_urgency.clamp(0.0, 1.0);
     }
 
     match after.controlled_possession_team() {
@@ -34534,6 +34844,22 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(obs.support_ball_holder_lane_open);
     features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE] =
         soccer_neural_unit(obs.support_ball_holder_collapse_pressure);
+    features[SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_SPACING_QUALITY] =
+        soccer_neural_unit(obs.attacking_support_spacing_quality);
+    features[SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_FORWARD_FILL] =
+        soccer_neural_unit(obs.attacking_support_forward_fill);
+    features[SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_DEFENSIVE_VECTOR_SPACE] =
+        soccer_neural_unit(obs.attacking_support_defensive_vector_space);
+    features[SOCCER_NEURAL_FEATURE_ATTACK_SUPPORT_HOLDER_DIRECTION_FIT] =
+        soccer_neural_unit(obs.attacking_support_holder_direction_fit);
+    features[SOCCER_NEURAL_FEATURE_OUTSIDE_MID_TAKEON_ISOLATION] =
+        soccer_neural_unit(obs.outside_mid_takeon_isolation);
+    features[SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_CANDIDATE] =
+        soccer_neural_unit(obs.loose_ball_attack_candidate);
+    features[SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_SHAPE_SAFETY] =
+        soccer_neural_unit(obs.loose_ball_attack_shape_safety);
+    features[SOCCER_NEURAL_FEATURE_LOOSE_BALL_UNCONTESTED_URGENCY] =
+        soccer_neural_unit(obs.loose_ball_uncontested_urgency);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -52613,6 +52939,9 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "control-touch" => observation.has_ball && observation.first_touch_available,
         "dribble" | "carry-forward" | "open-pass-lane" => observation.has_ball,
+        "runaround-dribble" => {
+            observation.has_ball && snapshot.runaround_dribble_option_for(player_id).is_some()
+        }
         "round-goalkeeper" => {
             observation.has_ball
                 && player.role != PlayerRole::Goalkeeper

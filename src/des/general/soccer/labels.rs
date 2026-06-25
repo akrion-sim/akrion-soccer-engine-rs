@@ -92,6 +92,9 @@ pub enum SoccerActionLabel {
     /// saves. Unifies the two convergent "round the keeper" carries onto one label /
     /// implementation (`round_goalkeeper_plan` + `RoundGoalkeeperDribblePlan`).
     RoundGoalkeeper,
+    /// On-ball: an outside/wing carrier knocks the ball past the immediate defender
+    /// and sprints around to re-collect when there is no close covering defender.
+    RunaroundDribble,
     // --- off-ball: support / movement ---
     Space,
     SupportShape,
@@ -165,6 +168,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::WaitForSupport => "wait-for-support",
             SoccerActionLabel::OpenPassLane => "open-pass-lane",
             SoccerActionLabel::RoundGoalkeeper => "round-goalkeeper",
+            SoccerActionLabel::RunaroundDribble => "runaround-dribble",
             SoccerActionLabel::Space => "space",
             SoccerActionLabel::SupportShape => "support-shape",
             SoccerActionLabel::SupportRoam => "support-roam",
@@ -233,6 +237,7 @@ impl SoccerActionLabel {
             "wait-for-support" => SoccerActionLabel::WaitForSupport,
             "open-pass-lane" => SoccerActionLabel::OpenPassLane,
             "round-goalkeeper" => SoccerActionLabel::RoundGoalkeeper,
+            "runaround-dribble" => SoccerActionLabel::RunaroundDribble,
             "space" => SoccerActionLabel::Space,
             "support-shape" => SoccerActionLabel::SupportShape,
             "support-roam" => SoccerActionLabel::SupportRoam,
@@ -366,6 +371,21 @@ impl SoccerActionLabel {
             | "rounding-the-keeper"
             | "dribble-round-keeper"
             | "beat-the-keeper" => "round-goalkeeper",
+            "runaround-dribble"
+            | "runaround_dribble"
+            | "runarounddribble"
+            | "run-around-dribble"
+            | "run_around_dribble"
+            | "runaround"
+            | "outside-mid-attack-defender"
+            | "outside_mid_attack_defender"
+            | "outsidemidattackdefender"
+            | "wing-attack-defender"
+            | "wing_attack_defender"
+            | "wingattackdefender"
+            | "attack-defender"
+            | "attack_defender"
+            | "attackdefender" => "runaround-dribble",
             "turnover-burst"
             | "turnover_burst"
             | "turnoverburst"

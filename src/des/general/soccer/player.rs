@@ -1196,6 +1196,35 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
     .clamp(0.0, 1.0)
 }
 
+const SHORT_UPFIELD_GROUND_PASS_MIN_YARDS: f64 = 5.47;
+const SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
+const SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS: f64 = 8.0;
+
+fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
+    if observation.visible_forward_pass_options == 0 {
+        return 0.0;
+    }
+    let distance = observation.nearest_forward_teammate_distance_yards;
+    if !distance.is_finite() || distance <= 0.0 {
+        return 0.0;
+    }
+    let distance_fit = if distance < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS {
+        (distance / SHORT_UPFIELD_GROUND_PASS_MIN_YARDS).clamp(0.0, 1.0) * 0.82
+    } else if distance <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
+        1.0
+    } else {
+        (1.0
+            - (distance - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
+                / SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS)
+            .clamp(0.0, 1.0)
+    };
+    let outlet_fit = (observation.best_forward_pass_receiver_openness.clamp(0.0, 1.0) * 0.38
+        + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.30
+        + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.32)
+        .clamp(0.0, 1.0);
+    (distance_fit * (0.42 + outlet_fit * 0.58)).clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Debug, Default)]
 struct MpcExecutionEstimate {
     ball_urgency: f64,
@@ -3107,6 +3136,14 @@ impl PlayerAgent {
         } else {
             0.0
         };
+        let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let short_upfield_ground_pass_multiplier = (1.0
+            + short_upfield_ground_pass_fit
+                * (0.22
+                    + decision_urgency * 0.14
+                    + pressured_release_signal * 0.18
+                    + open_forward_outlet * 0.18))
+            .clamp(1.0, 1.62);
         // Critical spacing: most carriers react once the nearest defender gets inside
         // the 2-yard floor; defenders on the ball should prefer a larger 3-4 yard buffer.
         // The response stays soft: dribbling is damped and passing lifted rather than
@@ -3193,7 +3230,8 @@ impl PlayerAgent {
             * (1.0 + offensive_urgency * 0.30 + pressure_urgency * 0.20 * advanced_dribbler_fit)
             * (1.0 - pressured_release_signal * open_support_fit * 0.18).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.30).clamp(0.62, 1.0)
-            * (1.0 - open_forward_outlet * 0.34).clamp(0.58, 1.0)
+            * (1.0 - (open_forward_outlet * 0.34 + short_upfield_ground_pass_fit * 0.18))
+                .clamp(0.44, 1.0)
             * dribble_into_opponent_penalty
             * deep_pressure_dribble_damp
             * crowded_dribble_damp)
@@ -3958,6 +3996,7 @@ impl PlayerAgent {
                 * floor_pass_patience_multiplier
                 * hold_release_multiplier
                 * low_cross_multiplier
+                * short_upfield_ground_pass_multiplier
                 * crowded_pass_lift
                 * pressured_release_multiplier
                 * panic_pass_damp
@@ -4103,6 +4142,22 @@ impl PlayerAgent {
                 + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.08)
                 .clamp(0.50, 0.78);
             ensure_min_legal_option_probability(&mut options, "pass1", spacing_release_floor);
+        }
+        if pass_target_count > 0
+            && short_upfield_ground_pass_fit >= 0.42
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let short_forward_release_floor = (0.24
+                + short_upfield_ground_pass_fit * 0.34
+                + decision_urgency * 0.08
+                + pressured_release_signal * 0.10
+                + open_forward_outlet * 0.08)
+                .clamp(0.34, 0.76);
+            ensure_min_legal_option_probability(
+                &mut options,
+                "pass1",
+                short_forward_release_floor,
+            );
         }
         if clearance_legal && hold_pressure >= 0.16 && release_pressure >= 0.42 {
             let danger_clearance_floor =
@@ -4365,6 +4420,10 @@ impl PlayerAgent {
             (0.70 + shot_field_fit * 0.32 + shape_prior * 0.08).clamp(0.44, 1.10);
         let control_field_multiplier =
             (1.0 + (1.0 - pass_field_fit.max(shot_field_fit)) * 0.18).clamp(1.0, 1.18);
+        let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let first_time_forward_pass_multiplier =
+            (1.0 + short_upfield_ground_pass_fit * (0.26 + pass_field_fit * 0.20))
+                .clamp(1.0, 1.46);
         let killer_pressure = observation
             .killer_pass_goal_pressure
             .max(killer_pass_goal_pressure_score(observation))
@@ -4411,6 +4470,7 @@ impl PlayerAgent {
                 (observation.first_time_pass_score
                     * quick_pressure_bonus
                     * pass_field_multiplier
+                    * first_time_forward_pass_multiplier
                     * 0.86
                     * pass_feasibility_gate)
                     .clamp(0.0, 0.88),
@@ -4475,6 +4535,19 @@ impl PlayerAgent {
                     first_time_floor,
                 );
                 let control_multiplier = (1.0 - dominance * 0.85).clamp(0.10, 1.0);
+                scale_legal_option_score(&mut options, control_label, control_multiplier);
+            }
+            if short_upfield_ground_pass_fit >= 0.42 && !one_touch_pass_blocked {
+                let forward_release_floor =
+                    (0.34 + short_upfield_ground_pass_fit * 0.42 + pass_field_fit * 0.10)
+                        .clamp(0.42, 0.86);
+                ensure_min_legal_option_probability(
+                    &mut options,
+                    "first-time-pass",
+                    forward_release_floor,
+                );
+                let control_multiplier =
+                    (1.0 - short_upfield_ground_pass_fit * 0.46).clamp(0.36, 1.0);
                 scale_legal_option_score(&mut options, control_label, control_multiplier);
             }
         }
@@ -5276,12 +5349,14 @@ impl PlayerAgent {
         closer_teammates: usize,
         goalkeeper_can_recover: bool,
         fifty_fifty_duel: bool,
+        must_attack: bool,
     ) -> Vec<AgentActionOptionTrace> {
         if fifty_fifty_duel {
             return single_action_option("fifty-fifty-duel");
         }
 
-        let recover_legal = closer_teammates < 2 && my_distance <= 46.0 && goalkeeper_can_recover;
+        let recover_legal =
+            (must_attack || closer_teammates < 2) && my_distance <= 46.0 && goalkeeper_can_recover;
         let distance_fit = (1.0 - my_distance / 46.0).clamp(0.0, 1.0);
         let role_fit = match self.role {
             PlayerRole::Goalkeeper => 0.42,
@@ -5292,19 +5367,23 @@ impl PlayerAgent {
         let teammate_priority = match closer_teammates {
             0 => 1.0,
             1 => 0.70,
+            _ if must_attack => 0.82,
             _ => 0.0,
         };
         let recover_score = if recover_legal {
             (0.34
                 + distance_fit * 0.46
                 + teammate_priority * 0.22
-                + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.08)
+                + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.08
+                + if must_attack { 0.36 } else { 0.0 })
                 * role_fit
         } else {
             0.0
         }
         .clamp(0.0, 1.10);
-        let hold_score = if recover_legal {
+        let hold_score = if must_attack {
+            0.02
+        } else if recover_legal {
             (0.16
                 + self.preferences.defensive_mindedness.clamp(0.0, 1.0) * 0.10
                 + (1.0 - teammate_priority) * 0.12)
@@ -6394,7 +6473,7 @@ impl PlayerAgent {
                     })
                     .count();
                 let options =
-                    self.loose_ball_action_options(my_distance, closer_teammates, true, fifty_fifty_duel);
+                    self.loose_ball_action_options(my_distance, closer_teammates, true, fifty_fifty_duel, true);
                 // The decision LABEL stays "recover" (the loose-ball recovery move), but the
                 // leading operation reflects the contest type — an explicit "fifty-fifty-duel"
                 // when both teams are right on it, else the ordinary "recover" pursuit.
@@ -7002,7 +7081,10 @@ impl PlayerAgent {
             // body the OTHER side, re-collect behind). Gated pre-empt — parity-safe when disabled,
             // fires only on a genuine pace-beat opportunity (or always under SOCCER_FORCE_RUNAROUND).
             if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
-                let appetite = (0.15 + 0.60 * plan.quality).clamp(0.05, 0.85);
+                let outside_mid_takeon = observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
+                let outside_mid_attack_defender = outside_mid_takeon >= 0.55;
+                let appetite = (0.15 + 0.60 * plan.quality + 0.24 * outside_mid_takeon)
+                    .clamp(0.05, if outside_mid_attack_defender { 0.96 } else { 0.85 });
                 if soccer_force_runaround_commit()
                     || agentic_action_commitment(
                         appetite,
@@ -7021,12 +7103,20 @@ impl PlayerAgent {
                     // The body runs to the re-collect point; the knock itself is applied in
                     // `apply_player_intent`, and the MPC routes this MoveTo around the defender.
                     let action = SoccerAction::MoveTo(plan.recollect_point);
+                    let operation_order = if outside_mid_attack_defender {
+                        vec![
+                            "outside-mid-attack-defender".to_string(),
+                            "runaround-dribble".to_string(),
+                        ]
+                    } else {
+                        vec!["runaround-dribble".to_string()]
+                    };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
                         mdp_state,
                         observation,
                         belief,
-                        vec!["runaround-dribble".to_string()],
+                        operation_order,
                         single_action_option("runaround-dribble"),
                         &action,
                         "runaround-dribble",
@@ -7370,13 +7460,28 @@ impl PlayerAgent {
                             });
                         }
                     }
-                    let sprint = open_pass_lane_sprint_for_action(
-                        snapshot,
-                        self,
-                        &observation,
-                        &action_label,
-                        &action,
-                    );
+                    if action_label == "runaround-dribble" {
+                        if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
+                            self.runaround = Some(RunaroundDribble {
+                                defender: plan.defender,
+                                launch_clock_seconds: snapshot.clock_seconds,
+                                push_target: plan.push_target,
+                                recollect_point: plan.recollect_point,
+                                knocked: false,
+                            });
+                        }
+                    }
+                    let sprint = if action_label == "runaround-dribble" {
+                        true
+                    } else {
+                        open_pass_lane_sprint_for_action(
+                            snapshot,
+                            self,
+                            &observation,
+                            &action_label,
+                            &action,
+                        )
+                    };
                     let mut decision = self.decision_trace(
                         snapshot,
                         mdp_state,
@@ -7430,6 +7535,20 @@ impl PlayerAgent {
                 action_options.push(AgentActionOptionTrace::new(
                     ROUND_GOALKEEPER_ACTION_LABEL,
                     plan.score,
+                    true,
+                ));
+            }
+            let runaround_dribble_option = snapshot.runaround_dribble_option_for(self.id).map(|plan| {
+                let outside_mid_takeon = observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
+                let appetite = (0.18 + plan.quality * 0.58 + outside_mid_takeon * 0.28)
+                    .clamp(0.05, if outside_mid_takeon >= 0.55 { 0.97 } else { 0.86 });
+                let strategy_commits = outside_mid_takeon >= 0.75 && plan.quality >= 0.60;
+                (plan, appetite, strategy_commits)
+            });
+            if let Some((_, appetite, strategy_commits)) = runaround_dribble_option {
+                action_options.push(AgentActionOptionTrace::new(
+                    "runaround-dribble",
+                    if strategy_commits { appetite.max(1.0) } else { appetite },
                     true,
                 ));
             }
@@ -7784,6 +7903,12 @@ impl PlayerAgent {
                     action_option_score(&action_options, OPEN_PASS_LANE_ACTION_LABEL),
                 ));
             }
+            if runaround_dribble_option.is_some() {
+                weighted_ops.push((
+                    "runaround-dribble".to_string(),
+                    action_option_score(&action_options, "runaround-dribble"),
+                ));
+            }
             if round_goalkeeper_plan.is_some() {
                 weighted_ops.push((
                     ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
@@ -7820,6 +7945,7 @@ impl PlayerAgent {
             // Set by the open-passing-lane arm to its precise sprint decision (very high pressure /
             // a fast-tracking opponent), overriding the generic carry sprint rule below.
             let mut open_lane_sprint: Option<bool> = None;
+            let mut runaround_sprint = false;
             let mut round_goalkeeper_sprint: Option<bool> = None;
             for op in ops {
                 match op.as_str() {
@@ -8046,6 +8172,36 @@ impl PlayerAgent {
                                         touch,
                                     },
                                     "open-passing-lane".to_string(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    "runaround-dribble" => {
+                        if observation.outside_mid_takeon_isolation >= 0.55 {
+                            order_names.push("outside-mid-attack-defender".to_string());
+                        }
+                        order_names.push("runaround-dribble".to_string());
+                        if let Some((plan, appetite, strategy_commits)) = runaround_dribble_option {
+                            if strategy_commits
+                                || agentic_action_commitment(
+                                    appetite,
+                                    snapshot.dt_seconds,
+                                    &observation,
+                                    self.role,
+                                )
+                            {
+                                self.runaround = Some(RunaroundDribble {
+                                    defender: plan.defender,
+                                    launch_clock_seconds: snapshot.clock_seconds,
+                                    push_target: plan.push_target,
+                                    recollect_point: plan.recollect_point,
+                                    knocked: false,
+                                });
+                                runaround_sprint = true;
+                                chosen = Some((
+                                    SoccerAction::MoveTo(plan.recollect_point),
+                                    "runaround-dribble".to_string(),
                                 ));
                                 break;
                             }
@@ -9147,7 +9303,9 @@ impl PlayerAgent {
             // `open_pass_lane_sprint_for_action`. The round-goalkeeper carry keeps its own
             // plan-specific burst decision (pressure/space decides glide-around vs explode-past).
             let is_dribble_action = matches!(action, SoccerAction::DribbleMove { .. });
-            let sprint = if !is_dribble_action {
+            let sprint = if runaround_sprint {
+                true
+            } else if !is_dribble_action {
                 false
             } else if let Some(open_lane_sprint) = open_lane_sprint {
                 open_lane_sprint
@@ -9479,6 +9637,7 @@ impl PlayerAgent {
                 closer_teammates,
                 goalkeeper_can_recover,
                 fifty_fifty_duel,
+                snapshot.loose_ball_attack_profile_for(self.id).attack_candidate >= 0.65,
             );
             let loose_order = agentic_action_order(
                 loose_options
@@ -9500,6 +9659,7 @@ impl PlayerAgent {
                 && snapshot.on_path_ball_intercept_target_for(self.id).is_some();
             let should_recover = lane_interceptor
                 || fifty_fifty_duel
+                || snapshot.loose_ball_attack_profile_for(self.id).attack_candidate >= 0.65
                 || action_option_score(&loose_options, "recover") > 0.0;
             if should_recover {
                 action_options = loose_options;
@@ -10128,6 +10288,14 @@ impl PlayerAgent {
                             touch: round_plan.touch,
                         },
                         ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
+                    )
+                }),
+            "runaround-dribble" if observation.has_ball => snapshot
+                .runaround_dribble_option_for(self.id)
+                .map(|runaround_plan| {
+                    (
+                        SoccerAction::MoveTo(runaround_plan.recollect_point),
+                        "runaround-dribble".to_string(),
                     )
                 }),
             "open-pass-lane" if observation.has_ball => {

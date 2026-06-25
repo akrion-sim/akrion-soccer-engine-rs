@@ -302,6 +302,35 @@
     margin-right: 4px;
   }
   .status { color: var(--muted); font-size: 12px; }
+  .player-menu {
+    position: fixed;
+    z-index: 900;
+    display: none;
+    width: min(270px, calc(100vw - 20px));
+    padding: 10px;
+    border: 1px solid #2f9b57;
+    border-radius: 8px;
+    background: #fff;
+    box-shadow: 0 10px 26px rgba(17, 32, 38, .24);
+  }
+  .player-menu.open { display: block; }
+  .player-menu-title {
+    font-weight: 800;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+  }
+  .player-menu-meta {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .player-menu select {
+    width: 100%;
+    max-width: none;
+    margin-top: 9px;
+  }
   @media (max-width: 860px) {
     header { grid-template-columns: 1fr; }
     .main {
@@ -370,7 +399,14 @@
     </div>
   </header>
   <div class="main">
-    <div class="stage"><canvas id="pitch" width="1280" height="720"></canvas></div>
+    <div class="stage">
+      <canvas id="pitch" width="1280" height="720"></canvas>
+      <div id="playerMenu" class="player-menu" role="dialog" aria-label="Player actions">
+        <div id="playerMenuTitle" class="player-menu-title"></div>
+        <div id="playerMenuMeta" class="player-menu-meta"></div>
+        <select id="playerActionSelect" aria-label="Player action"></select>
+      </div>
+    </div>
     <aside>
       <div class="row">
         <button id="run" aria-label="Run live simulation">Run</button>
@@ -822,6 +858,10 @@ const sampleTrackingJsonlButton = document.getElementById("sampleTrackingJsonl")
 const trackingFile = document.getElementById("trackingFile");
 const episodes = document.getElementById("episodes");
 const policyHistory = document.getElementById("policyHistory");
+const playerMenu = document.getElementById("playerMenu");
+const playerMenuTitle = document.getElementById("playerMenuTitle");
+const playerMenuMeta = document.getElementById("playerMenuMeta");
+const playerActionSelect = document.getElementById("playerActionSelect");
 const keys = new Set();
 let state = null;
 let running = false;
@@ -854,6 +894,7 @@ let policyAutosaveTimer = null;
 let syncingPolicyAutosave = false;
 let hoverPlayerId = null;
 let inspectedPlayerId = null;
+let playerMenuPlayerId = null;
 let lastSemanticBallAction = null;
 const LIVE_STEP_INTERVAL_MS = 100;
 // Single fallback for the simulation timestep when a frame/config somehow omits it.
@@ -2445,7 +2486,7 @@ function updateAgentStatePanel() {
   const d = p.lastDecision;
   const controlled = controlledPlayer();
   const inspected = controlled?.id === p.id ? "" : " inspect";
-  agentSelected.textContent = `${p.team} ${p.shirt} ${p.name}${inspected} / ${gaitLabel(p.movementGait)}`;
+  agentSelected.textContent = `${playerIdentityLabel(p)} · ${formationPositionLabel(p)}${inspected} / ${gaitLabel(p.movementGait)}`;
   agentMotion.textContent = agentMotionLabel(p);
   agentKinematics.textContent = playerHistoryKinematicsLabel(p);
   agentEnergy.textContent = agentEnergyLabel(p);
@@ -3263,13 +3304,27 @@ function drawGaitCue(p, pt, r) {
     ctx.stroke();
   }
 }
-function drawPlayer(p, r) {
+function drawPlayerRing(pt, radius, color, width, glow) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = glow;
+  ctx.stroke();
+  ctx.restore();
+}
+function drawPlayer(p, r, holderId = null) {
   const pt = mapPoint(p.position, r);
   const color = p.team === "Home" ? "#1f6feb" : "#d64545";
   const assigned = p.controllerSlot != null;
   const controlled = assigned && p.controllerSlot === activeSlot;
   const hovered = p.id === hoverPlayerId;
   const slotColor = assigned ? SLOT_COLORS[p.controllerSlot % SLOT_COLORS.length] : null;
+  const isHolder = holderId != null && Number(p.id) === Number(holderId);
+  if (p.role === "Goalkeeper") drawPlayerRing(pt, 14.4, "#7cff3a", 2.4, 10);
+  if (isHolder) drawPlayerRing(pt, 18.2, "#00e5ff", 3.1, 12);
   const isDuel = Array.isArray(p.lastDecision?.operationOrder)
     && p.lastDecision.operationOrder.includes("fifty-fifty-duel");
   if (isDuel) {
@@ -3400,7 +3455,7 @@ function drawField(frame, r) {
   drawSelectedVision(inspectedPlayer(), r);
   drawDecisionIntentTraces(r);
   for (const o of frame.officials || []) drawOfficial(o, r);
-  for (const p of frame.players || []) drawPlayer(p, r);
+  for (const p of frame.players || []) drawPlayer(p, r, frame.ball?.holder);
   if (frame.ball) drawBall(frame.ball, r);
   drawCoachHintMarkers(r);
   drawCoachHintDrag(r);
@@ -3597,6 +3652,7 @@ function render() {
   syncLearningControls();
   syncPolicyAutosaveControls();
   updateAgentStatePanel();
+  syncOpenPlayerMenu();
   updateRunButton();
   episodes.innerHTML = episodeHistoryHtml();
   policyHistory.innerHTML = policyHistoryHtml();
@@ -3638,8 +3694,65 @@ function assignmentKey(assignments) {
     .sort()
     .join("|");
 }
+const FORMATION_POSITION_BY_SHIRT = {
+  1: "GK",
+  2: "Left back",
+  3: "Right back",
+  4: "Left center back",
+  5: "Right center back",
+  6: "Center mid",
+  7: "Right mid",
+  8: "Center mid",
+  9: "Striker",
+  10: "Striker",
+  11: "Left mid",
+};
+const FORMATION_POSITION_BY_SUFFIX = {
+  GK: "GK",
+  LB: "Left back",
+  LCB: "Left center back",
+  RCB: "Right center back",
+  RB: "Right back",
+  LM: "Left mid",
+  CM1: "Center mid",
+  CM2: "Center mid",
+  CM: "Center mid",
+  RM: "Right mid",
+  ST1: "Striker",
+  ST2: "Striker",
+  ST: "Striker",
+};
+function humanizePositionText(raw) {
+  return String(raw || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+function playerRoleLabel(p) {
+  const role = String(p?.role || "").trim();
+  return role || "Player";
+}
+function playerShirtLabel(p) {
+  const shirt = Number(p?.shirt);
+  return Number.isFinite(shirt) ? `#${shirt}` : `P${p?.id ?? "-"}`;
+}
+function formationPositionLabel(p) {
+  const explicit = p?.formationPosition ?? p?.formation_position ?? p?.positionRole ?? p?.position_role ?? p?.formationSlot ?? p?.formation_slot;
+  if (explicit != null && String(explicit).trim() !== "") return humanizePositionText(explicit);
+  const suffix = String(p?.name || "").trim().split(/\s+/).pop().toUpperCase();
+  if (FORMATION_POSITION_BY_SUFFIX[suffix]) return FORMATION_POSITION_BY_SUFFIX[suffix];
+  const shirt = Number(p?.shirt);
+  if (FORMATION_POSITION_BY_SHIRT[shirt]) return FORMATION_POSITION_BY_SHIRT[shirt];
+  if (p?.role === "Goalkeeper") return "GK";
+  if (p?.role === "Forward") return "Striker";
+  return playerRoleLabel(p);
+}
+function playerIdentityLabel(p) {
+  return `${p?.team || "Team"} ${playerShirtLabel(p)} ${p?.name || "Player"}`;
+}
 function playerLabel(p) {
-  return `${p.team} ${p.shirt} ${p.name}`;
+  return `${playerIdentityLabel(p)} · ${formationPositionLabel(p)}`;
 }
 function applyAssignmentsToFrame(assignments) {
   if (!state?.frame?.players) return;
@@ -4652,7 +4765,111 @@ async function useSlot(slot) {
   setActiveSlot(slot);
   const claimed = playerForSlot(slot);
   if (claimed) {
-    statusEl.textContent = `slot ${slot + 1} → #${claimed.shirt} ${claimed.name} · arrow keys move, Enter = pass/shoot`;
+    statusEl.textContent = `slot ${slot + 1} -> ${playerShirtLabel(claimed)} ${claimed.name} · ${formationPositionLabel(claimed)} · arrow keys move, Enter = pass/shoot`;
+  }
+}
+
+function playerMenuOpen() {
+  return playerMenu?.classList.contains("open");
+}
+function playerMenuOption(value, label, disabled = false) {
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = label;
+  opt.disabled = disabled;
+  return opt;
+}
+function canSetPassTargetFromMenu(p) {
+  const selected = controlledPlayer();
+  return !!selected
+    && selected.id !== p.id
+    && selected.team === p.team
+    && state?.frame?.ball?.holder === selected.id;
+}
+function syncPlayerMenuContent(p) {
+  if (!p || !playerMenuTitle || !playerActionSelect) return;
+  playerMenuTitle.textContent = `${playerShirtLabel(p)} ${p.name || "Player"}`;
+  playerMenuMeta.textContent = `${p.team || "Team"} · ${formationPositionLabel(p)} · ${playerRoleLabel(p)}`;
+  playerActionSelect.innerHTML = "";
+  playerActionSelect.appendChild(playerMenuOption("", "Choose action"));
+  playerActionSelect.appendChild(playerMenuOption("inspect", "Inspect details"));
+  if (humanSlotCount() > 0) {
+    playerActionSelect.appendChild(playerMenuOption("control", `Control with slot ${activeSlot + 1}`));
+    if (canSetPassTargetFromMenu(p)) {
+      playerActionSelect.appendChild(playerMenuOption("target", "Set pass target"));
+    }
+    if (Number(selectedPlayerId(activeSlot)) === Number(p.id)) {
+      playerActionSelect.appendChild(playerMenuOption("release", `Release slot ${activeSlot + 1}`));
+    }
+  } else {
+    playerActionSelect.appendChild(playerMenuOption("control-disabled", "No controller slots", true));
+  }
+  playerActionSelect.value = "";
+}
+function placePlayerMenu(e) {
+  if (!playerMenu) return;
+  const w = 270;
+  const h = 126;
+  const left = Math.max(10, Math.min(window.innerWidth - w - 10, e.clientX + 12));
+  const top = Math.max(10, Math.min(window.innerHeight - h - 10, e.clientY + 12));
+  playerMenu.style.left = `${left}px`;
+  playerMenu.style.top = `${top}px`;
+}
+function openPlayerMenu(p, e) {
+  if (!playerMenu || !p) return;
+  playerMenuPlayerId = p.id;
+  inspectedPlayerId = p.id;
+  syncPlayerMenuContent(p);
+  placePlayerMenu(e);
+  playerMenu.classList.add("open");
+  statusEl.textContent = `${playerShirtLabel(p)} ${p.name} · ${formationPositionLabel(p)}`;
+  render();
+  playerActionSelect?.focus({preventScroll: true});
+}
+function closePlayerMenu() {
+  if (!playerMenu) return;
+  playerMenu.classList.remove("open");
+  playerMenuPlayerId = null;
+  if (document.activeElement === playerActionSelect) playerActionSelect.blur();
+}
+function syncOpenPlayerMenu() {
+  if (!playerMenuOpen()) return;
+  const p = playerById(playerMenuPlayerId);
+  if (!p) {
+    closePlayerMenu();
+    return;
+  }
+  if (document.activeElement === playerActionSelect) return;
+  syncPlayerMenuContent(p);
+}
+async function applyPlayerMenuAction(action) {
+  const p = playerById(playerMenuPlayerId);
+  if (!p || !action) return;
+  if (action === "inspect") {
+    inspectedPlayerId = p.id;
+    statusEl.textContent = `inspect ${playerShirtLabel(p)} ${p.name} · ${formationPositionLabel(p)}`;
+    closePlayerMenu();
+    render();
+    return;
+  }
+  if (action === "control") {
+    const slot = activeSlot;
+    await assignSlot(slot, p.id);
+    setActiveSlot(slot);
+    closePlayerMenu();
+    statusEl.textContent = `slot ${slot + 1} -> ${playerShirtLabel(p)} ${p.name} · ${formationPositionLabel(p)} · keyboard control on`;
+    return;
+  }
+  if (action === "target") {
+    setPassTarget(p.id);
+    closePlayerMenu();
+    return;
+  }
+  if (action === "release") {
+    const slot = activeSlot;
+    await assignSlot(slot, null);
+    closePlayerMenu();
+    statusEl.textContent = `slot ${slot + 1} released`;
   }
 }
 
@@ -4661,26 +4878,14 @@ async function handlePitchClick(e) {
   const hit = nearestPlayerAtCanvas(canvasPointFromEvent(e));
   if (!hit) return;
   const clicked = hit.player;
-  if (inspectModeEnabled() || e.shiftKey || e.altKey || e.metaKey || humanSlotCount() <= 0) {
+  if (inspectModeEnabled() || e.shiftKey || e.altKey || e.metaKey) {
     inspectedPlayerId = clicked.id;
-    statusEl.textContent = `inspect ${clicked.shirt} ${clicked.name}`;
+    closePlayerMenu();
+    statusEl.textContent = `inspect ${playerShirtLabel(clicked)} ${clicked.name} · ${formationPositionLabel(clicked)}`;
     render();
     return;
   }
-  const selected = controlledPlayer();
-  if (selected
-      && clicked.id !== selected.id
-      && clicked.team === selected.team
-      && state?.frame?.ball?.holder === selected.id
-      && setPassTarget(clicked.id)) {
-    return;
-  }
-  if (selected?.id === clicked.id) {
-    statusEl.textContent = "controller active";
-    render();
-    return;
-  }
-  await assignSlot(activeSlot, clicked.id);
+  openPlayerMenu(clicked, e);
 }
 function handlePitchHover(e) {
   if (coachDrag) return;
@@ -5471,6 +5676,7 @@ analyzeCopyButton?.addEventListener("click", () => { copyAnalyzeJson(); });
 analyzeOverlay?.addEventListener("click", e => { if (e.target === analyzeOverlay) closeAnalyze(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && analyzeOverlay?.classList.contains("open")) closeAnalyze();
+  if (e.key === "Escape" && playerMenuOpen()) closePlayerMenu();
 });
 function dtFmt(n, d) { return (typeof n === "number" && isFinite(n)) ? n.toFixed(d == null ? 2 : d) : "–"; }
 function dtMph(yps) { return (typeof yps === "number" && isFinite(yps)) ? (yps * 0.681818).toFixed(1) : "–"; }
@@ -5599,6 +5805,19 @@ trackingFile.addEventListener("change", () => {
 });
 slotPick.addEventListener("change", () => setActiveSlot(Number(slotPick.value || 0)));
 inspectModeButton.addEventListener("click", () => setInspectMode(!inspectModeEnabled()));
+playerActionSelect?.addEventListener("change", () => {
+  const action = playerActionSelect.value;
+  playerActionSelect.value = "";
+  applyPlayerMenuAction(action).catch(err => {
+    statusEl.textContent = err.message;
+    closePlayerMenu();
+  });
+});
+document.addEventListener("pointerdown", e => {
+  if (!playerMenuOpen()) return;
+  if (playerMenu.contains(e.target) || e.target === canvas) return;
+  closePlayerMenu();
+});
 canvas.addEventListener("click", e => {
   if (suppressNextPitchClick) {
     suppressNextPitchClick = false;
