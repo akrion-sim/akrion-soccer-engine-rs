@@ -21220,6 +21220,9 @@ impl WorldSnapshot {
                 nearest_teammate_id: None,
                 teammate_overlap_pressure: 0.0,
                 spacing_nudge_target: None,
+                support_ball_holder_distance_yards: 0.0,
+                support_ball_holder_lane_open: 0.0,
+                support_ball_holder_collapse_pressure: 0.0,
                 team_brain_mode: TeamBrainMode::Transition,
                 team_brain_press_intensity: 0.0,
                 team_brain_risk_tolerance: 0.0,
@@ -21497,6 +21500,36 @@ impl WorldSnapshot {
                 })
             })
             .unwrap_or(0);
+        let support_ball_holder = self.ball.holder.and_then(|holder_id| {
+            if holder_id == player_id {
+                return None;
+            }
+            let holder = self.players.iter().find(|player| player.id == holder_id)?;
+            if holder.team != me.team || !self.player_can_see_player(me.id, holder.id) {
+                return None;
+            }
+            let holder_position = self.player_snapshot_position(holder);
+            let distance = me_position.distance(holder_position);
+            let lane_open = if self.clear_line(holder_position, me_position, me.team.other(), 2.0) {
+                1.0
+            } else {
+                0.0
+            };
+            let collapse_pressure =
+                if lane_open > 0.0 && distance < SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS {
+                    ((SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS - distance)
+                        / SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS.max(1e-6))
+                    .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+            Some((distance, lane_open, collapse_pressure))
+        });
+        let (
+            support_ball_holder_distance_yards,
+            support_ball_holder_lane_open,
+            support_ball_holder_collapse_pressure,
+        ) = support_ball_holder.unwrap_or((0.0, 0.0, 0.0));
         let forward_support_context =
             self.forward_support_context_for(player_id, &visible_pass_targets);
         let threaded_goal_pass_assessment = if has_ball {
@@ -22212,6 +22245,9 @@ impl WorldSnapshot {
             nearest_teammate_id,
             teammate_overlap_pressure,
             spacing_nudge_target,
+            support_ball_holder_distance_yards,
+            support_ball_holder_lane_open,
+            support_ball_holder_collapse_pressure,
             team_brain_mode,
             team_brain_press_intensity: team_directive.press_intensity,
             team_brain_risk_tolerance: team_directive.risk_tolerance,

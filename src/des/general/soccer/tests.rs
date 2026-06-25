@@ -48232,6 +48232,214 @@ fn support_operation_order_can_prioritize_check_to_ball() {
 }
 
 #[test]
+fn off_ball_support_observation_flags_clear_lane_holder_collapse() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let support = 8;
+    park_players_except(&mut sim, &[holder, support]);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[support].position = Vec2::new(46.0, 60.0);
+    sim.players[support].home_position = sim.players[support].position;
+
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(68.0, 104.0 + (away - 11) as f64 * 0.4);
+    }
+
+    let open_snapshot = WorldSnapshot::from_match(&sim);
+    let open_obs = open_snapshot.observation_for(support);
+    let open_key = SoccerQStateKey::from_parts(
+        &open_snapshot.mdp_state_for_player(support),
+        &open_obs,
+        Team::Home,
+        open_snapshot.players[support].role,
+    );
+
+    assert!(
+        open_obs.support_ball_holder_distance_yards > 5.5
+            && open_obs.support_ball_holder_distance_yards < 6.5,
+        "support observation should preserve open-lane holder distance: {open_obs:?}"
+    );
+    assert!(
+        open_obs.support_ball_holder_lane_open > 0.9,
+        "six-yard support lane should be open: {open_obs:?}"
+    );
+    assert_eq!(open_obs.support_ball_holder_collapse_pressure, 0.0);
+    assert!(
+        open_key.support_ball_holder_lane_open_bin > 0,
+        "Q-state should expose the open holder-support lane: {open_key:?}"
+    );
+
+    sim.players[support].position = Vec2::new(42.4, 60.0);
+    let collapsed_snapshot = WorldSnapshot::from_match(&sim);
+    let collapsed_obs = collapsed_snapshot.observation_for(support);
+    let collapsed_decision = test_decision_trace(&collapsed_snapshot, support, "support-shape");
+    let collapsed_transition = SoccerLearningTransition {
+        tick: collapsed_snapshot.tick,
+        player_id: support,
+        team: Team::Home,
+        role: collapsed_snapshot.players[support].role,
+        state: collapsed_decision.mdp_state,
+        observation: collapsed_obs.clone(),
+        belief: collapsed_decision.belief,
+        action: collapsed_decision.action,
+        action_target: collapsed_decision.action_target,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: collapsed_snapshot.mdp_state_for_player(support),
+        next_observation: collapsed_obs.clone(),
+        done: false,
+    };
+    let collapsed_features = soccer_neural_transition_features(&collapsed_transition);
+
+    assert!(
+        collapsed_obs.support_ball_holder_distance_yards < SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS,
+        "supporter should now be inside the collapse band: {collapsed_obs:?}"
+    );
+    assert!(
+        collapsed_obs.support_ball_holder_collapse_pressure > 0.1,
+        "POMDP observation should flag spiraling into an already open holder lane: {collapsed_obs:?}"
+    );
+    assert!(
+        collapsed_features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE] > 0.1,
+        "neural features should learn from the open-lane collapse pressure: {:?}",
+        collapsed_features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE]
+    );
+}
+
+#[test]
+fn clear_lane_holder_spacing_reward_prefers_not_collapsing_to_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let support = 8;
+    park_players_except(&mut sim, &[holder, support]);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[support].position = Vec2::new(46.0, 60.0);
+    sim.players[support].home_position = sim.players[support].position;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(68.0, 104.0 + (away - 11) as f64 * 0.4);
+    }
+
+    let before = WorldSnapshot::from_match(&sim);
+    let decision = test_decision_trace(&before, support, "support-shape");
+
+    let mut held_after = before.clone();
+    held_after.tick += 1;
+    held_after.clock_seconds += held_after.dt_seconds;
+    if let Some(player) = held_after
+        .players
+        .iter_mut()
+        .find(|player| player.id == support)
+    {
+        player.position = Vec2::new(48.0, 60.0);
+    }
+    held_after.shared_positions = SharedPlayerPositionSnapshot::from_player_snapshots(
+        &held_after.players,
+        held_after.tick,
+        held_after.clock_seconds,
+    );
+    let held_reward = dense_soccer_transition_reward(
+        &sim.players[support],
+        &decision,
+        &before,
+        &held_after,
+        "support-shape",
+        &SoccerTacticalLearningWeights::default(),
+    );
+
+    let mut collapsed_after = before.clone();
+    collapsed_after.tick += 1;
+    collapsed_after.clock_seconds += collapsed_after.dt_seconds;
+    if let Some(player) = collapsed_after
+        .players
+        .iter_mut()
+        .find(|player| player.id == support)
+    {
+        player.position = Vec2::new(41.5, 60.0);
+    }
+    collapsed_after.shared_positions = SharedPlayerPositionSnapshot::from_player_snapshots(
+        &collapsed_after.players,
+        collapsed_after.tick,
+        collapsed_after.clock_seconds,
+    );
+    let collapsed_reward = dense_soccer_transition_reward(
+        &sim.players[support],
+        &decision,
+        &before,
+        &collapsed_after,
+        "support-shape",
+        &SoccerTacticalLearningWeights::default(),
+    );
+
+    assert!(
+        held_reward > collapsed_reward + 0.20,
+        "learning reward should prefer holding useful open-lane spacing over spiraling inside three yards: held={held_reward:.3} collapsed={collapsed_reward:.3}"
+    );
+}
+
+#[test]
+fn clear_open_holder_lane_deprioritizes_check_to_ball_support() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let support = 8;
+    park_players_except(&mut sim, &[holder, support]);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[support].position = Vec2::new(50.0, 60.0);
+    sim.players[support].home_position = sim.players[support].position;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(68.0, 104.0 + (away - 11) as f64 * 0.4);
+    }
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let obs = snapshot.observation_for(support);
+    assert!(
+        obs.support_ball_holder_lane_open > 0.9
+            && obs.support_ball_holder_distance_yards > SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS,
+        "test setup should expose an open support lane far enough to hold: {obs:?}"
+    );
+
+    let options = sim.players[support].support_action_options(&snapshot);
+    let option_probability = |label: &str| {
+        options
+            .iter()
+            .find(|option| option.label == label)
+            .map(|option| option.probability)
+            .unwrap_or(0.0)
+    };
+    let check_probability = option_probability("check-to-ball");
+    let hold_family_probability = [
+        "support-shape",
+        "wide-outlet",
+        "exploit-space-run",
+        "run-in-behind",
+    ]
+    .into_iter()
+    .map(option_probability)
+    .sum::<f64>();
+
+    assert!(
+        hold_family_probability >= 0.30,
+        "open lane should keep useful support-space options alive: options={options:?}"
+    );
+    assert!(
+        check_probability < hold_family_probability,
+        "open holder lane should not teach the support player to spiral into the ball: check={check_probability:.3} hold_family={hold_family_probability:.3}; options={options:?}"
+    );
+}
+
+#[test]
 fn learned_support_policy_can_choose_wide_outlet() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;

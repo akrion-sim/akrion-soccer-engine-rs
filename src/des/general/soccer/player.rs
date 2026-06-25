@@ -4523,6 +4523,31 @@ impl PlayerAgent {
         };
         let current = snapshot.player_position(self.id).unwrap_or(self.position);
         let open = snapshot.open_space_for(self.id, self.home_position);
+        let clear_lane_holder_context = snapshot.ball.holder.and_then(|holder_id| {
+            if holder_id == self.id {
+                return None;
+            }
+            let holder = snapshot.players.iter().find(|player| player.id == holder_id)?;
+            if holder.team != self.team || !snapshot.player_can_see_player(self.id, holder.id) {
+                return None;
+            }
+            let holder_position = snapshot.player_snapshot_position(holder);
+            let distance = current.distance(holder_position);
+            let lane_open = snapshot.clear_line(holder_position, current, self.team.other(), 2.0);
+            (lane_open && distance > SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS)
+                .then_some(distance)
+        });
+        let clear_lane_support_hold_signal = clear_lane_holder_context
+            .map(|distance| {
+                let distance_fit = ((distance - SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS)
+                    / 10.0)
+                    .clamp(0.0, 1.0);
+                let pressure_relief =
+                    (1.0 - holder_pressure_urgency / PRESSURED_SUPPORT_SPRINT_URGENCY.max(1e-6))
+                        .clamp(0.0, 1.0);
+                distance_fit * pressure_relief
+            })
+            .unwrap_or(0.0);
         let guarded_special_target = |target: Vec2| {
             snapshot.shape_guarded_support_point(
                 self.id,
@@ -4582,7 +4607,8 @@ impl PlayerAgent {
                     target,
                     0.42 + ball_gain.min(8.0) * 0.030
                         + shape_support_urgency * 2.6
-                        + holder_pressure_urgency * 0.58,
+                        + holder_pressure_urgency * 0.58
+                        - clear_lane_support_hold_signal * 1.05,
                 ),
                 true,
             ));
@@ -4828,6 +4854,48 @@ impl PlayerAgent {
                 scale_legal_option_score(&mut options, "support-shape", support_shape_multiplier);
                 scale_legal_option_score(&mut options, "support-roam", support_roam_multiplier);
             }
+        }
+        if clear_lane_support_hold_signal > 0.0 {
+            scale_legal_option_score(
+                &mut options,
+                "check-to-ball",
+                (1.0 - clear_lane_support_hold_signal * 0.78).clamp(0.18, 1.0),
+            );
+            scale_legal_option_score(
+                &mut options,
+                "support-shape",
+                1.0 + clear_lane_support_hold_signal * 0.38,
+            );
+            scale_legal_option_score(
+                &mut options,
+                "support-roam",
+                1.0 + clear_lane_support_hold_signal * 0.12,
+            );
+            scale_legal_option_score(
+                &mut options,
+                "wide-outlet",
+                1.0 + clear_lane_support_hold_signal * 0.42,
+            );
+            scale_legal_option_score(
+                &mut options,
+                "exploit-space-run",
+                1.0 + clear_lane_support_hold_signal * 0.24,
+            );
+            scale_legal_option_score(
+                &mut options,
+                "run-in-behind",
+                1.0 + clear_lane_support_hold_signal * 0.18,
+            );
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &[
+                    "support-shape",
+                    "wide-outlet",
+                    "exploit-space-run",
+                    "run-in-behind",
+                ],
+                (0.30 + clear_lane_support_hold_signal * 0.28).clamp(0.30, 0.62),
+            );
         }
         if holder_pressure_urgency >= PRESSURED_SUPPORT_SPRINT_URGENCY {
             if options

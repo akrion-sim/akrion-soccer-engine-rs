@@ -3079,6 +3079,13 @@ const GK_BACKPASS_OUTLET_BONUS: f64 = 3.2;
 // get inside this radius (outside the 18yd box) — never, not even briefly. Matches the existing
 // near-radius so the two systems agree.
 const CARRIER_UNPRESSURED_HARD_STANDOFF_YARDS: f64 = TEAMMATE_SPACING_NEAR_RADIUS_YARDS;
+const SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS: f64 = 4.0;
+const SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS: f64 = 3.0;
+const SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MIN_YARDS: f64 = 6.0;
+const SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MAX_YARDS: f64 = 15.0;
+const SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_PENALTY: f64 = 0.85;
+const SUPPORT_HOLDER_CLEAR_LANE_RELIEF_REWARD: f64 = 0.18;
+const SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_SPACING_REWARD: f64 = 0.12;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
 // gait is forced to a sprint.
@@ -3296,6 +3303,10 @@ const SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM: usize = 2;
 /// `y` role-band dynamics as the back four, but without a strict offside-line
 /// constraint and with a five-second eventual-consistency horizon.
 const SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize = 14;
+/// Append-only off-ball support spacing block. These channels teach the policy
+/// when a teammate already has a clean passing lane to the carrier and should
+/// hold/widen/advance instead of spiraling into the holder's feet.
+const SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM: usize = 3;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3314,8 +3325,10 @@ const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM: usize = SOCCER_NEURAL_PR
 const SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM
     + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
+const SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
     + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM
+    + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3536,6 +3549,12 @@ const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD: usize =
     SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_POSSESSION_STATE + 1;
 const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT: usize =
     SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_SPREAD + 1;
+const SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT + 1;
+const SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_LANE_OPEN: usize =
+    SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_DISTANCE + 1;
+const SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_LANE_OPEN + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3616,6 +3635,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM,
     // Same schema with carrier line-break features, before the midfield-four band tail.
     SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM,
+    // Same schema with midfield-four band features, before support-holder spacing.
+    SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5129,6 +5150,20 @@ pub struct SoccerPomdpObservation {
     /// its own slot). None in the common case.
     #[serde(default)]
     pub spacing_nudge_target: Option<Vec2>,
+    /// Distance to a same-team ball holder, if this player is off the ball while
+    /// its team has controlled possession. Zero when no teammate holds the ball.
+    #[serde(default)]
+    pub support_ball_holder_distance_yards: f64,
+    /// Whether the direct passing lane between this off-ball player and the
+    /// teammate holder is already open. A high value means "hold the pocket";
+    /// sprinting closer is redundant unless pressure demands it.
+    #[serde(default)]
+    pub support_ball_holder_lane_open: f64,
+    /// Pressure created by being too close to a teammate holder despite an already
+    /// open lane. This is the learnable red flag for support runs collapsing from
+    /// several yards away into the carrier's feet.
+    #[serde(default)]
+    pub support_ball_holder_collapse_pressure: f64,
     #[serde(default)]
     pub team_brain_mode: TeamBrainMode,
     #[serde(default)]
@@ -7358,6 +7393,15 @@ pub struct SoccerQStateKey {
     /// its thresholds are advisory seeds.
     #[serde(default)]
     pub teammate_overlap_pressure_bin: u8,
+    /// Distance bucket to the same-team ball holder for off-ball support decisions.
+    #[serde(default)]
+    pub support_ball_holder_distance_bin: u8,
+    /// Open-lane bucket between this off-ball player and the same-team holder.
+    #[serde(default)]
+    pub support_ball_holder_lane_open_bin: u8,
+    /// Collapse-pressure bucket: already-open support lane but too close to holder.
+    #[serde(default)]
+    pub support_ball_holder_collapse_bin: u8,
     #[serde(default)]
     pub perceived_time_on_ball_bin: u8,
     #[serde(default)]
@@ -7768,6 +7812,17 @@ impl SoccerQStateKey {
                 observation.teammate_overlap_pressure,
                 &[0.15, 0.40, 0.65, 0.85],
             ),
+            support_ball_holder_distance_bin: distance_bucket(
+                observation.support_ball_holder_distance_yards,
+                &[3.0, 5.0, 8.0, 13.0, 21.0],
+            ),
+            support_ball_holder_lane_open_bin: confidence_bucket(
+                observation.support_ball_holder_lane_open,
+            ),
+            support_ball_holder_collapse_bin: distance_bucket(
+                observation.support_ball_holder_collapse_pressure,
+                &[0.12, 0.30, 0.55, 0.78],
+            ),
             perceived_time_on_ball_bin: distance_bucket(
                 observation.perceived_time_on_ball_seconds,
                 &[0.35, 0.75, 1.3, 2.2],
@@ -8005,6 +8060,9 @@ impl SoccerQStateKey {
             && self.positional_shape_exception_relief_bin
                 == other.positional_shape_exception_relief_bin
             && self.teammate_overlap_pressure_bin == other.teammate_overlap_pressure_bin
+            && self.support_ball_holder_distance_bin == other.support_ball_holder_distance_bin
+            && self.support_ball_holder_lane_open_bin == other.support_ball_holder_lane_open_bin
+            && self.support_ball_holder_collapse_bin == other.support_ball_holder_collapse_bin
             && self.perceived_time_on_ball_bin == other.perceived_time_on_ball_bin
             && self.excessive_hold_pressure_bin == other.excessive_hold_pressure_bin
             && self.fatigue_bin == other.fatigue_bin
@@ -18641,6 +18699,27 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
     reward
 }
 
+fn clear_lane_support_spacing_fit(distance_yards: f64) -> f64 {
+    if !distance_yards.is_finite() || distance_yards <= 0.0 {
+        return 0.0;
+    }
+    if distance_yards < SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS {
+        return 0.0;
+    }
+    if distance_yards < SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MIN_YARDS {
+        return ((distance_yards - SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS)
+            / (SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MIN_YARDS
+                - SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_YARDS)
+                .max(1e-6))
+        .clamp(0.0, 1.0);
+    }
+    if distance_yards <= SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MAX_YARDS {
+        return 1.0;
+    }
+    (1.0 - (distance_yards - SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_MAX_YARDS) / 18.0)
+        .clamp(0.0, 1.0)
+}
+
 fn dense_soccer_transition_reward(
     player: &PlayerAgent,
     decision: &AgentDecisionTrace,
@@ -18672,6 +18751,30 @@ fn dense_soccer_transition_reward(
         reward += overlap_relief.clamp(-1.0, 1.0) * tunables().reward.teammate_overlap_relief_reward;
         reward -= after_obs.teammate_overlap_pressure.clamp(0.0, 1.0)
             * tunables().reward.teammate_overlap_camp_penalty;
+    }
+    // Off-ball support spacing: when a teammate already has the ball and the
+    // direct passing lane is open, collapsing from a useful pocket into the
+    // holder's feet is a decision-quality failure, not useful support.
+    if player.role != PlayerRole::Goalkeeper
+        && !before_obs.has_ball
+        && before_possession == Some(player.team)
+        && before_obs.support_ball_holder_lane_open >= 0.65
+    {
+        let started_in_pocket = before_obs.support_ball_holder_distance_yards
+            > SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS;
+        if started_in_pocket && after_obs.support_ball_holder_collapse_pressure > 0.0 {
+            reward -= after_obs.support_ball_holder_collapse_pressure.clamp(0.0, 1.0)
+                * SUPPORT_HOLDER_CLEAR_LANE_COLLAPSE_PENALTY;
+        }
+        let collapse_relief = before_obs.support_ball_holder_collapse_pressure
+            - after_obs.support_ball_holder_collapse_pressure;
+        reward += collapse_relief.clamp(-1.0, 1.0) * SUPPORT_HOLDER_CLEAR_LANE_RELIEF_REWARD;
+        let before_fit =
+            clear_lane_support_spacing_fit(before_obs.support_ball_holder_distance_yards);
+        let after_fit = clear_lane_support_spacing_fit(after_obs.support_ball_holder_distance_yards);
+        reward += (after_fit - before_fit).clamp(-1.0, 1.0)
+            * before_obs.support_ball_holder_lane_open.clamp(0.0, 1.0)
+            * SUPPORT_HOLDER_CLEAR_LANE_HEALTHY_SPACING_REWARD;
     }
     // FLANK / WING usage (#8): reward the on-ball player for working the ball in a wide channel,
     // scaled UP in the team's OWN half (get it wide out of central congestion in front of our goal
@@ -34274,6 +34377,16 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(line_model.midfield_four_band_spread_yards, 36.0);
     features[SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT] =
         soccer_neural_unit(line_model.midfield_four_eventual_consistency_next_five_seconds);
+    features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_DISTANCE] =
+        if obs.support_ball_holder_distance_yards > 0.0 {
+            1.0 - soccer_neural_scaled(obs.support_ball_holder_distance_yards, 30.0)
+        } else {
+            0.0
+        };
+    features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_LANE_OPEN] =
+        soccer_neural_unit(obs.support_ball_holder_lane_open);
+    features[SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_COLLAPSE_PRESSURE] =
+        soccer_neural_unit(obs.support_ball_holder_collapse_pressure);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
