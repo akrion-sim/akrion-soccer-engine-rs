@@ -13,7 +13,9 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    BackFourLineHead, report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
+    BackFourLineHead, LooseBallCommitHead, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    report_attack_spacing_training, report_line_depth_training,
+    report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
@@ -1876,6 +1878,13 @@ fn load_initial_policies(
 static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory loose-ball commit head (which player attacks a loose ball), carried +
+/// trained across games WITHIN a learner process, mirroring `CARRIED_LINE_DEPTH_HEAD`.
+/// Resets on pod restart; untouched unless the commit model is enabled
+/// (DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL).
+static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHead>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -1907,6 +1916,11 @@ fn run_game(
     // head only accumulates while collection is on).
     if let Some(head) = CARRIED_LINE_DEPTH_HEAD.lock().unwrap().as_ref() {
         sim.set_line_depth_head(head.clone());
+    }
+    // Install the carried loose-ball commit head so the retriever election consumes it
+    // live once trained. No-op unless the commit model is enabled.
+    if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
+        sim.set_loose_ball_commit_head(head.clone());
     }
 
     for tick_idx in 0..total_ticks {
@@ -1952,6 +1966,38 @@ fn run_game(
             head.training_steps(),
             head.training_steps() >= soccer_engine::des::general::soccer::LINE_DEPTH_HEAD_MIN_TRAINING_STEPS,
             final_loss
+        );
+    }
+    // Train the CARRIED loose-ball commit head on this game's reward-weighted RL
+    // corpus (which player attacking the loose ball won/kept possession without
+    // breaking shape). Empty + skipped unless the commit model is enabled.
+    let loose_ball_commit_samples = sim.drain_loose_ball_commit_samples();
+    if !loose_ball_commit_samples.is_empty() {
+        let mut guard = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| LooseBallCommitHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&loose_ball_commit_samples, 0.02);
+        }
+        eprintln!(
+            "loose_ball_commit_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            loose_ball_commit_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Learnable attacking-spacing target: train this game's reward-weighted RL corpus
+    // and log it so the spacing is demonstrably learned from. Empty + skipped unless
+    // DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET is set. Cross-game Postgres persistence +
+    // live head consumption are the remaining integration steps (as for the line head).
+    let attack_spacing_samples = sim.drain_attack_spacing_samples();
+    if !attack_spacing_samples.is_empty() {
+        let report =
+            report_attack_spacing_training(&attack_spacing_samples, episode_seed as u32, 4, 0.02);
+        eprintln!(
+            "attack_spacing_training samples={} training_steps={} epochs={} final_loss={:.5}",
+            report.samples, report.training_steps, report.epochs, report.final_loss
         );
     }
     let mut artifact = sim.team_policy_artifact();

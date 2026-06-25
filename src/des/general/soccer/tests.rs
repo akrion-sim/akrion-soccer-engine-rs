@@ -7195,6 +7195,98 @@ fn completed_first_time_ground_pass_learns_short_upfield_open_bonus() {
 }
 
 #[test]
+fn quick_forward_pass_band_fit_peaks_in_five_to_eight_metre_band() {
+    // Full value across the ≈5–8 m sweet spot (5.47–8.75 yd) and at both edges.
+    assert!((quick_forward_pass_band_fit(7.0) - 1.0).abs() < 1e-9);
+    assert!((quick_forward_pass_band_fit(5.47) - 1.0).abs() < 1e-9);
+    assert!((quick_forward_pass_band_fit(8.75) - 1.0).abs() < 1e-9);
+    // Linear taper outside the band over the 4-yard falloff.
+    assert!((quick_forward_pass_band_fit(3.47) - 0.5).abs() < 1e-6); // 2 yd short
+    assert!((quick_forward_pass_band_fit(10.75) - 0.5).abs() < 1e-6); // 2 yd long
+    // Far outside the band drops to a hard zero (no value for a 1 m tap or a 13 yd ball).
+    assert_eq!(quick_forward_pass_band_fit(1.0), 0.0);
+    assert_eq!(quick_forward_pass_band_fit(13.0), 0.0);
+}
+
+#[test]
+fn quick_forward_pass_values_open_advanced_teammate_and_stays_inert_when_gated_off() {
+    let receiver = 7;
+    let outlet = 9;
+    let blocker = 13;
+    // Holder at (40,58); an open forward teammate `forward_yards` ahead (Home attacks +y).
+    let build = |forward_yards: f64, block_lane: bool| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 31_775,
+            ..Default::default()
+        });
+        let keep = if block_lane {
+            vec![receiver, outlet, blocker]
+        } else {
+            vec![receiver, outlet]
+        };
+        park_players_except(&mut sim, &keep);
+        sim.active_set_play = None;
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        sim.players[receiver].team = Team::Home;
+        sim.players[receiver].role = PlayerRole::Midfielder;
+        sim.players[receiver].position = Vec2::new(40.0, 58.0);
+        sim.players[receiver].home_position = sim.players[receiver].position;
+        sim.players[outlet].team = Team::Home;
+        sim.players[outlet].role = PlayerRole::Forward;
+        sim.players[outlet].position = Vec2::new(40.0, 58.0 + forward_yards);
+        sim.players[outlet].home_position = sim.players[outlet].position;
+        if block_lane {
+            sim.players[blocker].team = Team::Away;
+            // Shadow the outlet, tight, to crush its openness.
+            sim.players[blocker].position = Vec2::new(40.4, 58.0 + forward_yards - 0.6);
+            sim.players[blocker].home_position = sim.players[blocker].position;
+        }
+        sim.ball.holder = Some(receiver);
+        sim.ball.position = sim.players[receiver].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim
+    };
+
+    // An OPEN forward teammate ~7 yd ahead (in the 5–8 m band) is highly valued and chosen.
+    let in_band = WorldSnapshot::from_match(&build(7.0, false));
+    let (band_value, band_target) = in_band.quick_forward_pass_value_for(receiver);
+    assert!(
+        band_value > 0.30,
+        "an open advanced teammate in the 5–8 m band should carry real quick-forward value, got {band_value}"
+    );
+    assert_eq!(
+        band_target,
+        Some(outlet),
+        "the quick-forward target should be the open advanced teammate"
+    );
+
+    // The same teammate parked far upfield (~27 yd) falls outside the band ⇒ much less value.
+    let far = WorldSnapshot::from_match(&build(27.0, false));
+    let (far_value, _) = far.quick_forward_pass_value_for(receiver);
+    assert!(
+        far_value < band_value,
+        "a forward ball well outside the 5–8 m band should be worth less than the in-band one: far={far_value} band={band_value}"
+    );
+
+    // Marked tight in the band ⇒ openness collapses ⇒ value drops vs the open in-band ball.
+    let marked = WorldSnapshot::from_match(&build(7.0, true));
+    let (marked_value, _) = marked.quick_forward_pass_value_for(receiver);
+    assert!(
+        marked_value < band_value,
+        "a tightly marked in-band receiver should be valued below an open one: marked={marked_value} band={band_value}"
+    );
+
+    // Gate OFF (env unset in the test process) ⇒ the observation surfaces NOTHING (inert).
+    let observation = in_band.observation_for(receiver);
+    assert_eq!(observation.quick_forward_pass_value, 0.0);
+    assert_eq!(observation.quick_forward_pass_target, None);
+}
+
+#[test]
 fn first_touch_mpc_vetoes_unplayable_one_touch_pass_and_controls_first() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -11512,12 +11604,18 @@ fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
     let missing = TeamAttackStrategy::ALL
         .iter()
         .copied()
+        // Gated strategies are NOT unconditionally rule-reachable by design: the "outside mid
+        // attack defender" play is only proposed by the rule selector when
+        // `DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER` is set (otherwise the learner /
+        // `SOCCER_FORCE_ATTACK_STRATEGY` selects it). This default run leaves the gate off, so
+        // exclude those from the "every strategy is reachable" invariant.
+        .filter(|strategy| !is_outside_mid_attack_strategy(*strategy))
         .filter(|strategy| !seen.contains(strategy))
         .map(TeamAttackStrategy::as_str)
         .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "every attacking strategy should have at least one rule-selector invocation path; missing={missing:?}"
+        "every (ungated) attacking strategy should have at least one rule-selector invocation path; missing={missing:?}"
     );
 }
 
@@ -16257,6 +16355,82 @@ fn shape_safe_loose_ball_attacker_goes_before_quarter_second_dead_zone() {
         }
         other => panic!("shape-safe loose-ball attacker should recover, got {other:?}"),
     }
+}
+
+#[test]
+fn loose_ball_uncontested_too_long_forces_the_retriever_to_attack_now() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51,
+        ..Default::default()
+    });
+    // Park everyone well away from a fast, grounded loose ball so nothing contests it.
+    for player in sim.players.iter_mut() {
+        player.position = Vec2::new(2.0, 2.0);
+        player.velocity = Vec2::zero();
+    }
+    let chaser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+        .map(|p| p.id)
+        .unwrap();
+    sim.players[chaser].position = Vec2::new(40.0, 30.0);
+    sim.players[chaser].home_position = Vec2::new(40.0, 30.0);
+    sim.players[chaser].skills.first_touch = 0.1; // poor touch ⇒ would prefer to let it run
+    sim.ball.holder = None;
+    sim.pending_pass = None;
+    sim.ball.position = Vec2::new(40.0, 44.0);
+    sim.ball.velocity = Vec2::new(0.0, 9.0); // quick ball — clean reception is "later"
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    // The uncontested clock: nobody is near or closing on the ball, so an update sets it.
+    let snap0 = WorldSnapshot::from_match(&sim);
+    sim.update_loose_ball_urgency(&snap0);
+    assert!(
+        sim.loose_ball_uncontested_since_tick.is_some(),
+        "an unchallenged loose ball must start the uncontested clock"
+    );
+
+    // Not yet past the ¼s threshold ⇒ no urgency.
+    let snap_fresh = WorldSnapshot::from_match(&sim);
+    assert!(!snap_fresh.loose_ball_urgency_active());
+
+    // Advance time past ¼s with the ball still uncontested ⇒ urgency fires.
+    sim.tick = sim
+        .loose_ball_uncontested_since_tick
+        .unwrap()
+        .saturating_add(8);
+    let snap_late = WorldSnapshot::from_match(&sim);
+    assert!(
+        snap_late.loose_ball_urgency_active(),
+        "a loose ball uncontested for >¼s must raise urgency"
+    );
+    // Under urgency the retriever attacks NOW (traps at the earliest reachable point)
+    // instead of waiting for a cleaner, slower reception.
+    assert!(
+        snap_late.loose_ball_control_plan_for(chaser).1,
+        "urgency must force the retriever to trap the ball now"
+    );
+
+    // The disable gate restores the prior behavior (no urgency override).
+    std::env::set_var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY", "1");
+    let disabled = !snap_late.loose_ball_urgency_active();
+    std::env::remove_var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY");
+    assert!(
+        disabled,
+        "DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY must turn the urgency override off"
+    );
+
+    // A teammate right on the ball means it IS contested ⇒ the clock clears.
+    sim.players[chaser].position = sim.ball.position;
+    let snap_contested = WorldSnapshot::from_match(&sim);
+    sim.update_loose_ball_urgency(&snap_contested);
+    assert!(
+        sim.loose_ball_uncontested_since_tick.is_none(),
+        "a ball being challenged at close quarters is contested — the clock clears"
+    );
 }
 
 #[test]
@@ -44889,6 +45063,7 @@ fn formation_stagger_layers_and_spreads_the_shape() {
             120.0,
             DEFAULT_DT_SECONDS,
             Vec2::new(40.0, 50.0),
+            None,
         );
     }
     let mean = |role: PlayerRole| {
@@ -44960,7 +45135,7 @@ fn formation_stagger_leaves_a_compliant_shape_untouched() {
         lp_slot(PlayerRole::Forward, 40.0, Vec2::new(40.0, 58.0)),
     ];
     let before: Vec<Vec2> = slots.iter().map(|s| s.anchor).collect();
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     for (slot, was) in slots.iter().zip(before) {
         assert!(
             (slot.anchor - was).len() < 1e-9,
@@ -45004,7 +45179,7 @@ fn back_four_holds_lateral_band_and_order() {
         def(70.0, 70.0),
     ];
     for _ in 0..500 {
-        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+        soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
     }
     let xs: Vec<f64> = slots.iter().map(|s| s.anchor.x).collect();
     for w in 1..xs.len() {
@@ -45058,7 +45233,7 @@ fn formation_stagger_pulls_overstretched_layers_back_toward_band() {
     let mid_before = mean(&slots, PlayerRole::Midfielder);
     let fwd_before = mean(&slots, PlayerRole::Forward);
 
-    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0));
+    soccer_formation_lp_stagger_role_layers(&mut slots, Team::Home, 80.0, 120.0, DEFAULT_DT_SECONDS, Vec2::new(40.0, 50.0), None);
 
     let mid_after = mean(&slots, PlayerRole::Midfielder);
     let fwd_after = mean(&slots, PlayerRole::Forward);
@@ -49662,6 +49837,70 @@ fn spacing_scores_reward_the_in_band_separation() {
     );
     assert!(
         defense_upper > spacing_score_from_distance(16.0, TeamSpacingMode::Defending)
+    );
+}
+
+#[test]
+fn off_ball_space_discipline_is_a_no_op_when_no_open_outlet_yet() {
+    // Gate OFF (or: player has no clean in-range outlet) => `current_outlet_open == false` =>
+    // the adjustment is exactly 0.0 for every candidate, so `open_space_for` is byte-identical.
+    for cand_to_carrier in [2.0, 5.0, 9.0, 18.0] {
+        assert_eq!(
+            off_ball_space_discipline_adjustment(false, 5.5, 1.2, cand_to_carrier, 10.0),
+            0.0,
+            "no-outlet (gate-off) state must leave the candidate score untouched"
+        );
+    }
+}
+
+#[test]
+fn off_ball_space_discipline_punishes_spiralling_into_the_carrier() {
+    // The red flag: a teammate who ALREADY offers a clean, in-range outlet (10yd from the
+    // carrier, lane open) keeps closing toward the ball to <3yd. With the discipline on, a
+    // candidate that collapses inside the carrier keep-out radius must score strictly worse
+    // than one that holds/widens — and the spiral-in candidate must be net-penalised.
+    let short_outlet_bonus = 5.5; // the show-for-ball pull the old code rewarded near the ball
+    let ball_arrival_bonus = 1.2;
+    let current_to_carrier = 10.0;
+
+    // Candidate A: spirals in to 3yd of the carrier (the bug behaviour).
+    let collapse = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        3.0,
+        current_to_carrier,
+    );
+    // Candidate B: holds a stretched 12yd, outside the keep-out radius.
+    let hold = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        12.0,
+        current_to_carrier,
+    );
+
+    assert!(
+        collapse < hold - 1e-9,
+        "collapsing into the carrier must score worse than holding width: collapse={collapse} hold={hold}"
+    );
+    assert!(
+        collapse < 0.0,
+        "the spiral-in candidate must be net-penalised, not merely neutral: {collapse}"
+    );
+    // The proximity pull that drove the spiral is largely cancelled even before the keep-out
+    // penalty (a candidate just inside the radius but not closer than now keeps only the cancel).
+    let marginal_only = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        current_to_carrier, // same distance: no active collapse, only the marginal cancel
+        current_to_carrier,
+    );
+    assert!(
+        marginal_only < 0.0 && marginal_only > collapse,
+        "holding position cancels the proximity pull but skips the collapse penalty: \
+         marginal={marginal_only} collapse={collapse}"
     );
 }
 
@@ -74770,6 +75009,116 @@ fn outside_mid_takeon_isolation_collapses_when_cover_is_within_ten_yards() {
     assert!(
         covered.runaround_dribble_option_for(7).is_none(),
         "cover near the re-collect zone should block the runaround option"
+    );
+}
+
+#[test]
+fn outside_mid_attack_defender_strategy_is_registered_and_classified() {
+    // The named "outside mid attack defender" play is a first-class catalogue entry, classified
+    // as a wide take-on AND as a byline drive-and-cross program (it reuses that machinery).
+    for s in [
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft,
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+    ] {
+        assert!(TeamAttackStrategy::ALL.contains(&s), "{s:?} must be in ALL");
+        assert!(is_outside_mid_attack_strategy(s), "{s:?} is an outside-mid play");
+        assert!(
+            is_byline_cross_drive_strategy(s),
+            "{s:?} should drive the byline and cross"
+        );
+    }
+    assert!(!is_outside_mid_attack_strategy(TeamAttackStrategy::CrashTheBox));
+    assert_eq!(
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft.as_str(),
+        "outside-mid-attack-defender-left"
+    );
+    assert_eq!(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight.as_str(),
+        "outside-mid-attack-defender-right"
+    );
+}
+
+/// A wide-right midfielder carrying at a committed full-back who has no covering team-mate near him.
+fn outside_mid_take_on_scenario(
+    strategy: TeamAttackStrategy,
+    carrier_forward_speed: f64,
+    carrier_top_speed: f64,
+) -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.central_brain.home_directive.attack_strategy = strategy;
+    let carrier = 7usize;
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].home_position = Vec2::new(68.0, 60.0); // wide right of an 80yd pitch
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = Vec2::new(64.0, 85.0); // wide, in the opponent half (Home attacks +y)
+    sim.players[carrier].position = sim.ball.position;
+    sim.players[carrier].velocity = Vec2::new(0.0, carrier_forward_speed);
+    sim.players[carrier].skills.top_speed = carrier_top_speed;
+    // The committed full-back, just ahead in the lane.
+    sim.players[12].position = Vec2::new(64.5, 88.0);
+    sim.players[12].velocity = Vec2::zero();
+    sim.players[12].skills.top_speed = 7.0;
+    // Every other opponent far away: the full-back is ISOLATED (nobody within 10yd of him).
+    for away in [11usize, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
+        sim.players[away].position = Vec2::new(8.0, 20.0);
+    }
+    sim
+}
+
+#[test]
+fn outside_mid_attack_defender_lifts_take_on_quality_vs_isolated_defender() {
+    // Same wide carrier + isolated full-back; only the team strategy differs. The outside-mid play
+    // should back the take-on more strongly (higher run-around quality => higher carrier appetite).
+    let mut omad = outside_mid_take_on_scenario(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+        6.0,
+        8.0,
+    );
+    let mut plain =
+        outside_mid_take_on_scenario(TeamAttackStrategy::PullWideRightThenCenter, 6.0, 8.0);
+    // A deep cover man ~15yd behind the full-back: still BEYOND the 10yd isolation radius (so the
+    // full-back is "isolated" for the take-on), but near enough the re-collect zone that the
+    // baseline run-around quality is no longer saturated — exposing the appetite uplift.
+    for sim in [&mut omad, &mut plain] {
+        sim.players[13].position = Vec2::new(64.5, 103.0);
+    }
+    let omad_q = WorldSnapshot::from_match(&omad)
+        .runaround_dribble_option_for(7)
+        .expect("a take-on is on for the outside-mid play")
+        .quality;
+    let plain_q = WorldSnapshot::from_match(&plain)
+        .runaround_dribble_option_for(7)
+        .expect("a take-on is on at baseline too here")
+        .quality;
+    assert!(
+        omad_q > plain_q + 0.05,
+        "outside-mid play must lift the isolated-defender take-on appetite: omad={omad_q} plain={plain_q}"
+    );
+}
+
+#[test]
+fn outside_mid_attack_defender_takes_on_isolated_man_with_only_modest_momentum() {
+    // Momentum below the baseline run-around threshold (4.0yps) but above the relaxed outside-mid
+    // one (1.8yps), with no top-speed edge. Baseline declines (needs more momentum); the outside-mid
+    // play backs the carrier to attack the isolated man anyway.
+    let omad = outside_mid_take_on_scenario(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+        2.5,
+        7.0,
+    );
+    let plain =
+        outside_mid_take_on_scenario(TeamAttackStrategy::PullWideRightThenCenter, 2.5, 7.0);
+    assert!(
+        WorldSnapshot::from_match(&omad)
+            .runaround_dribble_option_for(7)
+            .is_some(),
+        "outside-mid play should take the isolated man on even from modest momentum"
+    );
+    assert!(
+        WorldSnapshot::from_match(&plain)
+            .runaround_dribble_option_for(7)
+            .is_none(),
+        "baseline run-around needs full forward momentum / a pace edge"
     );
 }
 

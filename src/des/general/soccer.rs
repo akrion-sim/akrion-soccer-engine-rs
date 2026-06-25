@@ -57,6 +57,12 @@ mod pitch_value;
 pub use pitch_value::*;
 mod back_four_line;
 pub use back_four_line::*;
+mod loose_ball_commit;
+pub use loose_ball_commit::*;
+mod support_scorer;
+pub use support_scorer::*;
+mod spacing_target;
+pub use spacing_target::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -1002,6 +1008,21 @@ const FLANK_USAGE_ATTACKING_HALF_REWARD: f64 = 0.2;
 const SHORT_OUTLET_SHOW_MIN_YARDS: f64 = 7.0;
 const SHORT_OUTLET_SHOW_MAX_YARDS: f64 = 22.0;
 const SHORT_OUTLET_SHOW_BONUS: f64 = 1.4;
+// Off-ball spacing discipline (see `dd_soccer_enable_off_ball_space_discipline`). All only bite
+// when that gate is ON; default OFF keeps `open_space_for` byte-identical.
+// Fraction of the show-for-ball / ball-arrival proximity pull cancelled for a player who ALREADY
+// offers a clean, in-range outlet from where they stand (so closing further earns ~nothing —
+// the reward becomes marginal: open a NEW lane, don't crowd an existing one).
+const OFF_BALL_MARGINAL_OUTLET_CANCEL: f64 = 0.85;
+// Comfortable receiving radius around the carrier: a clean outlet wants to sit at least this far
+// out (≈ the in-possession spacing floor). Candidates inside it are crowding the carrier.
+const OFF_BALL_CARRIER_KEEP_OUT_YARDS: f64 = 7.0;
+// Penalty weight for a candidate that actively collapses inside the carrier keep-out radius while
+// a clean lane already exists. Additive, so it complements (never silently overrides) the score.
+const OFF_BALL_CARRIER_COLLAPSE_PENALTY: f64 = 8.0;
+// The carrier is "pressured" (and so genuinely wants a short option) when its nearest opponent is
+// inside this radius; the keep-out / marginal-cancel are suspended in that case.
+const OFF_BALL_CARRIER_PRESSURED_YARDS: f64 = 4.5;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
@@ -2758,7 +2779,21 @@ const RESTART_HOOF_POWER: f64 = 0.85;
 // speed. Otherwise ONE defender claims it and the others peel off goalside into space.
 const LOOSE_BALL_SHIELD_PRESSURE_RADIUS_YARDS: f64 = 4.0;
 const LOOSE_BALL_SHIELD_CLOSING_YPS: f64 = 3.0;
-const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 = 0.25;
+// ---- Loose-ball urgency: no unpossessed ball sits uncontested for too long ----
+// A loose ball is "contested" this tick if any outfielder is within this radius of
+// it (challenging at close quarters) OR is closing on it from within the approach
+// radius at/above the approach speed (genuinely running it down). When neither holds,
+// the uncontested clock runs; once it exceeds `LOOSE_BALL_MAX_UNCONTESTED_SECONDS`
+// the designated retriever is forced to attack the ball NOW (trap it, no let-it-run),
+// so a ball never lingers unchallenged the way it does not in real soccer.
+const LOOSE_BALL_URGENCY_CONTEST_RADIUS_YARDS: f64 = 2.25;
+const LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS: f64 = 7.0;
+const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
+// ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
+// touch, they do not stand off it.
+const LOOSE_BALL_MAX_UNCONTESTED_SECONDS: f64 = 0.25;
+const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 =
+    LOOSE_BALL_MAX_UNCONTESTED_SECONDS;
 const LOOSE_BALL_SHAPE_SAFE_RETRIEVAL_WEIGHT_YARDS: f64 = 2.4;
 const LOOSE_BALL_ATTACK_CANDIDATE_REWARD: f64 = 0.20;
 const LOOSE_BALL_UNCONTESTED_HOLD_PENALTY: f64 = 0.34;
@@ -2981,6 +3016,11 @@ const HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE: f64 = 1.25;
 /// A wide attacker in the opposition half carries toward the corner until reaching this
 /// end-line depth, then the team changes from the byline drive to the cross-release phase.
 const BYLINE_CROSS_RELEASE_DEPTH_YARDS: f64 = 11.0;
+/// Cross-release end-line depth used by the "outside mid attack defender" play
+/// ([`dd_soccer_enable_outside_mid_attack_defender`]): the wide man whips the ball in once inside
+/// the last ~25yd of the byline (the user's "cross in the last 20-30yds") rather than driving all
+/// the way to the ~11yd byline first. Override with `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS`.
+const OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT: f64 = 25.0;
 /// Minimum normalized distance from pitch center for the committed byline program. This is
 /// deliberately wider than the generic left/right strategy-lane split: it is for true wingers.
 const BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER: f64 = 0.52;
@@ -3240,6 +3280,12 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // LP problem rebuilds at full 15Hz.
 const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
 const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
+/// Iteration cap for the deterministic Bland's-rule simplex that solves the formation
+/// LP (see `SoccerFormationLpBrain::solve_exact_formation_lp`). Generous enough that the
+/// ~521-var/750-constraint problem reaches optimality on a normal tick yet bounded so a
+/// pathological tableau still terminates within the realtime budget. The solve is
+/// deterministic at any cap (Bland's rule), so this only trades solution quality vs time.
+pub(crate) const SOCCER_FORMATION_LP_SIMPLEX_MAX_ITER: usize = 1500;
 const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // Per-solve wall-clock budget; over it the iteration cap halves (down to MIN) so
 // the next solve bails within time, recovering toward the max when solves are fast.
@@ -3247,6 +3293,14 @@ const SOCCER_FORMATION_LP_INTERNAL_SIMPLEX_MAX_ITER: usize = 12_000;
 // it in optimized builds, so this is a guardrail against pathological ticks, not
 // the common case (see `formation_lp_ipm_solves_under_five_milliseconds`).
 const SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS: u128 = 5_000;
+/// Deterministic circuit-breaker threshold: a formation-LP solve needing more than this
+/// many solver iterations is treated as "over budget" (a reproducible proxy for the
+/// wall-clock cost, used INSTEAD of elapsed time so the breaker decision is identical
+/// across processes/machines — wall-clock gating was a latent match-nondeterminism
+/// source). A solve this expensive cannot meet the realtime contract, so after
+/// `SOCCER_FORMATION_LP_TIMEOUT_CIRCUIT_LIMIT` consecutive ones the breaker trips to the
+/// fast heuristic fallback for the rest of the match.
+const SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET: usize = 300;
 const SOCCER_FORMATION_LP_MIN_ITER: usize = 800;
 const SOCCER_FORMATION_LP_ITER_RECOVER_STEP: usize = 1_500;
 // Consecutive over-budget solves before the circuit trips to the heuristic fallback.
@@ -5417,6 +5471,17 @@ pub struct SoccerPomdpObservation {
     pub first_time_pass_field_feasibility: f64,
     #[serde(default)]
     pub first_time_shot_field_feasibility: f64,
+    /// Value [0,1] of the best QUICK FORWARD ground pass — a short progressive ball (≈5–8 m)
+    /// to an OPEN, advanced teammate. Non-zero only when `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS`
+    /// is set; it floors the first-time-pass / carrier-pass option (release sooner) and is
+    /// folded into the learnable first-time-pass field feasibility. See
+    /// [`dd_soccer_enable_quick_forward_pass`].
+    #[serde(default)]
+    pub quick_forward_pass_value: f64,
+    /// Teammate id of the [`quick_forward_pass_value`] ball, when one qualifies — the
+    /// execution paths target this player and let the MPC pass path shape the pace.
+    #[serde(default)]
+    pub quick_forward_pass_target: Option<usize>,
     #[serde(default)]
     pub first_touch_shape_prior: f64,
     #[serde(default)]
@@ -10392,6 +10457,19 @@ fn normalize_soccer_action_label(action: &str) -> &str {
 // `tunables().flank_cross` (env/Postgres-overridable). See soccer/tunables.rs.
 const FLANK_OVERLAP_MIN_OPTION_SHARE: f64 = 1.0 / 3.0;
 
+/// Master switch for the "attacking ambition" bundle: more frequent wall-passes
+/// (give-and-goes), and crosses available from a touch deeper / narrower so the
+/// flanks are actually used as a delivery route, not just for runs that fizzle.
+/// ON by default; set `DD_SOCCER_DISABLE_ATTACK_AMBITION` to fall back to the
+/// tighter baseline gates (used for A/B and to revert without a redeploy). The
+/// switch only ever *widens availability* — every quality/risk/offside check that
+/// follows still applies, so a poor combination is still demoted, never forced.
+pub(crate) fn attack_ambition_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
@@ -10425,10 +10503,18 @@ fn flank_cross_context_is_legal(
     field_width_yards: f64,
 ) -> bool {
     let cfg = &tunables().flank_cross;
+    // Attacking ambition: let a wide carrier cross from a touch deeper and a touch
+    // narrower so the flanks become a real delivery route (the overlap runs were
+    // already firing; the cross at the end of them was not). The scoring still
+    // demotes a poor cross — this only opens the door.
+    let (max_yards_to_goal, min_flank_score) = if attack_ambition_enabled() {
+        ((cfg.max_yards_to_goal + 8.0).min(120.0), (cfg.min_flank_score - 0.12).max(0.0))
+    } else {
+        (cfg.max_yards_to_goal, cfg.min_flank_score)
+    };
     observation.has_ball
-        && observation.yards_to_goal <= cfg.max_yards_to_goal
-        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0)
-            >= cfg.min_flank_score
+        && observation.yards_to_goal <= max_yards_to_goal
+        && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0) >= min_flank_score
 }
 
 fn is_attacking_support_action_label(action: &str) -> bool {
@@ -15635,7 +15721,53 @@ fn is_byline_cross_drive_strategy(strategy: TeamAttackStrategy) -> bool {
         strategy,
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot
             | TeamAttackStrategy::BylineCrossRightToPenaltySpot
+            // "Outside mid attack defender" is a wide-flank drive-and-cross: it shares the byline
+            // carry program (keep the ball wide, drive the corner, whip a cross), adding only the
+            // isolated-defender take-on appetite on top.
+            | TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
     )
+}
+
+/// Whether `strategy` is one of the "outside mid attack defender" wide take-on plays. Pure match
+/// (no env read) so it works under `SOCCER_FORCE_ATTACK_STRATEGY` and the learner; the heuristic
+/// only ever PROPOSES these when [`dd_soccer_enable_outside_mid_attack_defender`] is set, so by
+/// default they are never the active strategy and these arms are inert.
+pub(crate) fn is_outside_mid_attack_strategy(strategy: TeamAttackStrategy) -> bool {
+    matches!(
+        strategy,
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
+    )
+}
+
+/// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
+/// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
+/// carrier driving the flank in the opponent half, and the deeper cross-release window (cross in
+/// the last ~20-30yd rather than only at the byline) applies to the wide-cross program. Unset
+/// (default) the strategy is never proposed and the release window is the original, so play is
+/// byte-identical to baseline. The learner and `SOCCER_FORCE_ATTACK_STRATEGY` can still select the
+/// strategy regardless of this flag (for training / live demos).
+pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+}
+
+/// End-line depth at which the "outside mid attack defender" play releases its cross (see
+/// [`OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT`]). Learner/operator override via
+/// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 14-34yd window).
+pub(crate) fn outside_mid_cross_release_depth_yards() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| d.clamp(14.0, 34.0))
+            .unwrap_or(OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT)
+    })
 }
 
 fn tactical_directive_for_team(
@@ -15960,10 +16092,17 @@ fn tactical_directive_for_team(
         && attack_progress > 0.0
         && width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
         && !matches!(ball_side, StrategyLane::Center);
-    let byline_drive_context =
-        wide_cross_program_context && endline_depth > BYLINE_CROSS_RELEASE_DEPTH_YARDS;
-    let crash_box_context =
-        wide_cross_program_context && endline_depth <= BYLINE_CROSS_RELEASE_DEPTH_YARDS;
+    // "Outside mid attack defender" deepens the cross-release window (cross in the last ~20-30yd
+    // rather than only at the ~11yd byline) — but ONLY when the play is enabled, so the default
+    // split is byte-identical to baseline.
+    let outside_mid_attack_enabled = dd_soccer_enable_outside_mid_attack_defender();
+    let cross_release_depth = if outside_mid_attack_enabled {
+        outside_mid_cross_release_depth_yards()
+    } else {
+        BYLINE_CROSS_RELEASE_DEPTH_YARDS
+    };
+    let byline_drive_context = wide_cross_program_context && endline_depth > cross_release_depth;
+    let crash_box_context = wide_cross_program_context && endline_depth <= cross_release_depth;
     let pressure_fit = ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64
         + 2.0)
         / 5.0)
@@ -15997,6 +16136,15 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::CounterTransitionVertical
     } else if byline_drive_context {
         match ball_side {
+            // With the play enabled, the wide drive becomes a take-the-man-on program (still drives
+            // the corner + crosses via the shared byline machinery, plus the isolated-defender
+            // take-on appetite); otherwise it is the plain byline cross drive (byte-identical).
+            StrategyLane::Left if outside_mid_attack_enabled => {
+                TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            }
+            StrategyLane::Right if outside_mid_attack_enabled => {
+                TeamAttackStrategy::OutsideMidAttackDefenderRight
+            }
             StrategyLane::Left => TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
             StrategyLane::Right => TeamAttackStrategy::BylineCrossRightToPenaltySpot,
             StrategyLane::Center => unreachable!("wide byline context cannot be central"),
@@ -44403,6 +44551,8 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        loose_ball_commit_head: None,
+        loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         clock_seconds: frame.clock_seconds,

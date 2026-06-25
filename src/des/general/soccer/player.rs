@@ -432,6 +432,10 @@ fn is_give_and_go_strategy(strategy: TeamAttackStrategy) -> bool {
             | TeamAttackStrategy::OneTwoRightRelease
             | TeamAttackStrategy::CentralDoubleOneTwo
             | TeamAttackStrategy::BackheelDisguisedRelease
+            // The "outside mid attack defender" play wants the wide man to either take the isolated
+            // full-back on OR beat him with a give-and-go — so it requests the one-two appetite too.
+            | TeamAttackStrategy::OutsideMidAttackDefenderLeft
+            | TeamAttackStrategy::OutsideMidAttackDefenderRight
     )
 }
 
@@ -4336,6 +4340,27 @@ impl PlayerAgent {
                 decisive_family_floor,
             );
         }
+        // Quick forward ground-pass priority: a short progressive ball (≈5–8 m) to an OPEN,
+        // advanced teammate should be RELEASED quickly, not dwelt on. Floor the primary pass
+        // option and trim the dwell options (carry/dribble/shield/hold) in proportion to its
+        // value so the carrier knocks it forward and keeps the ball moving — "passing sooner."
+        // Deferred to the goal-threat logic above (don't drain a real shot/killer ball). Gate
+        // OFF ⇒ `quick_forward_pass_value` is 0 ⇒ byte-identical no-op.
+        if pass_target_count > 0
+            && observation.quick_forward_pass_value > 0.0
+            && !goal_attack_shot_blocks_alternatives
+            && !observation.threaded_goal_pass_available
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let quick_value = observation.quick_forward_pass_value.clamp(0.0, 1.0);
+            let urgency = (0.62 + decision_urgency * 0.38).clamp(0.62, 1.0);
+            let quick_floor = ((0.40 + quick_value * 0.46) * urgency).clamp(0.36, 0.88);
+            ensure_min_legal_option_probability(&mut options, "pass1", quick_floor);
+            let dwell_damp = (1.0 - quick_value * 0.34).clamp(0.62, 1.0);
+            for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+        }
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
@@ -4525,6 +4550,18 @@ impl PlayerAgent {
                     (1.0 - short_upfield_ground_pass_fit * 0.46).clamp(0.36, 1.0);
                 scale_legal_option_score(&mut options, control_label, control_multiplier);
             }
+        }
+        // Quick forward ground-pass priority on the first touch: when a short progressive ball
+        // (≈5–8 m) to an OPEN, advanced teammate is available AND the one-touch is physically on,
+        // play it FIRST-TIME rather than settling — floor the first-time-pass and trim the
+        // controlling touch in proportion to the value. The chosen pass is delivered through the
+        // MPC pass path. Gate OFF ⇒ value is 0 ⇒ byte-identical no-op.
+        if pass_legal && !one_touch_pass_blocked && observation.quick_forward_pass_value > 0.0 {
+            let quick_value = observation.quick_forward_pass_value.clamp(0.0, 1.0);
+            let quick_floor = (0.44 + quick_value * 0.44).clamp(0.44, 0.88);
+            ensure_min_legal_option_probability(&mut options, "first-time-pass", quick_floor);
+            let control_multiplier = (1.0 - quick_value * 0.45).clamp(0.45, 1.0);
+            scale_legal_option_score(&mut options, control_label, control_multiplier);
         }
         normalize_action_options(options)
     }
@@ -7565,7 +7602,9 @@ impl PlayerAgent {
                     - (observation.yards_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
+                let ambition_appetite = if attack_ambition_enabled() { 1.45 } else { 1.0 };
                 let raw_wall_appetite = WALL_PASS_BASE_APPETITE
+                    * ambition_appetite
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
@@ -8669,7 +8708,18 @@ impl PlayerAgent {
                             &observation,
                             self.role,
                         ) {
-                            let target = pass_targets[rank];
+                            // The primary pass adopts the quick forward (≈5–8 m, open, advanced)
+                            // teammate when one qualifies, so the floored "pass sooner" release
+                            // actually goes forward to feet. None when the gate is off ⇒ the
+                            // ranked target is used unchanged.
+                            let target = if rank == 0 {
+                                observation
+                                    .quick_forward_pass_target
+                                    .filter(|id| pass_targets.contains(id))
+                                    .unwrap_or(pass_targets[rank])
+                            } else {
+                                pass_targets[rank]
+                            };
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
@@ -10132,10 +10182,14 @@ impl PlayerAgent {
                 ))
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
-                let target = snapshot
-                    .ranked_visible_pass_targets(self.id, 1)
-                    .first()
-                    .copied();
+                let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
+                // Prefer the quick forward (≈5–8 m, open, advanced) teammate when one is on —
+                // played first-time and delivered through the MPC pass path. None when the gate
+                // is off ⇒ falls back to the top-ranked visible target (unchanged).
+                let target = observation
+                    .quick_forward_pass_target
+                    .filter(|id| visible.contains(id))
+                    .or_else(|| visible.first().copied());
                 target.map(|target| {
                     (
                         SoccerAction::Pass {

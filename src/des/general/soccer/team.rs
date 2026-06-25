@@ -149,10 +149,23 @@ pub enum TeamAttackStrategy {
     /// [`SoccerMatch::flank_cross_arrival_target_for`] and the spread box-arrival run in
     /// [`SoccerMatch::crash_the_box_target_for`].
     CrashTheBox,
+    /// "Outside mid attack defender" (left flank): when a wide midfielder/winger carries into the
+    /// opponent half on the left and the full-back facing them is ISOLATED (no covering defender
+    /// within ~10yd), back them to TAKE THE MAN ON — sprint-and-dribble around the isolated
+    /// defender (the existing `runaround_dribble_option_for` gets a learnable appetite uplift),
+    /// keep the ball WIDE rather than cutting in, try a give-and-go to beat the man, and whip a
+    /// cross in once inside the last 20-30yd of the byline. A wide-flank variant of the byline-
+    /// cross program ([`Self::BylineCrossLeftToPenaltySpot`]) that prizes beating the full-back
+    /// 1v1 when the cover is absent. Only proposed by the heuristic when
+    /// `DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER` is set (the learner/`SOCCER_FORCE_ATTACK_STRATEGY`
+    /// can also select it); off by default it is never the active strategy, so play is byte-identical.
+    OutsideMidAttackDefenderLeft,
+    /// Mirror of [`Self::OutsideMidAttackDefenderLeft`] down the right flank.
+    OutsideMidAttackDefenderRight,
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 40] = [
+    pub const ALL: [TeamAttackStrategy; 42] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -193,6 +206,8 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::BylineCrossLeftToPenaltySpot,
         TeamAttackStrategy::BylineCrossRightToPenaltySpot,
         TeamAttackStrategy::CrashTheBox,
+        TeamAttackStrategy::OutsideMidAttackDefenderLeft,
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -239,6 +254,10 @@ impl TeamAttackStrategy {
                 "byline-cross-right-to-penalty-spot"
             }
             TeamAttackStrategy::CrashTheBox => "crash-the-box",
+            TeamAttackStrategy::OutsideMidAttackDefenderLeft => "outside-mid-attack-defender-left",
+            TeamAttackStrategy::OutsideMidAttackDefenderRight => {
+                "outside-mid-attack-defender-right"
+            }
         }
     }
 
@@ -298,6 +317,11 @@ impl TeamAttackStrategy {
             // Immediate box flood around a wide final-third cross: direct, few touches —
             // pack the box and finish.
             TeamAttackStrategy::CrashTheBox => s(Center, Center, 2, 0.72),
+            // Outside mid attacks the isolated full-back: start AND resolve wide (keep the ball on
+            // the flank, beat the man, deliver from the corner) — a take-on-and-cross with an
+            // optional give-and-go, so a short horizon and fairly direct.
+            TeamAttackStrategy::OutsideMidAttackDefenderLeft => s(Left, Left, 3, 0.62),
+            TeamAttackStrategy::OutsideMidAttackDefenderRight => s(Right, Right, 3, 0.62),
         }
     }
 }
@@ -444,6 +468,10 @@ mod team_strategy_mode_tests {
         let slots = soccer_formation_lp_slot_inputs(&snapshot, Team::Home, &directive, &weights);
         brain.update_problem_for_tick(&snapshot, &directive, &weights, &slots);
 
+        // Default (realtime/live) solver is Clarabel: it solves this LP to optimality well
+        // under the 5ms tick budget. (Headless determinism-critical paths opt into the slower
+        // deterministic simplex via SOCCER_FORMATION_LP_DETERMINISTIC; that path has no
+        // realtime contract, so it is not exercised here.)
         let mut best_micros = u128::MAX;
         let mut any_optimal = false;
         for _ in 0..3 {
@@ -1058,6 +1086,27 @@ fn soccer_formation_lp_internal_simplex_enabled() -> bool {
     soccer_env_flag_tristate("SOCCER_FORMATION_LP_IPM")
         .or_else(|| soccer_env_flag_tristate("SOCCER_FORMATION_LP_INTERNAL_SIMPLEX"))
         .unwrap_or(!cfg!(debug_assertions))
+}
+
+/// Whether the formation LP solves with the DETERMINISTIC internal simplex (true) or fast
+/// Clarabel (false, default). See `SoccerFormationLpBrain::solve_exact_formation_lp` for the
+/// determinism-vs-latency tradeoff. Headless determinism-critical entry points
+/// (`enable_deterministic_formation_lp`, the learning runners, the measurement harness) opt
+/// in; the live/realtime path stays on fast Clarabel. `SOCCER_FORMATION_LP_DETERMINISTIC`
+/// overrides at runtime.
+fn soccer_formation_lp_deterministic_solver() -> bool {
+    soccer_env_flag_tristate("SOCCER_FORMATION_LP_DETERMINISTIC").unwrap_or(false)
+}
+
+/// Opt a headless/determinism-critical process (self-play learning runner, tournament
+/// runner, measurement/A-B harness) into the reproducible formation-LP solver. Call once at
+/// process start, before the first match step. This is the programmatic equivalent of
+/// `SOCCER_FORMATION_LP_DETERMINISTIC=1`; it routes the formation LP through the deterministic
+/// internal simplex so identical seeds produce byte-identical matches. Do NOT call it on the
+/// live/realtime path -- the deterministic solve is slow enough to break controller-input
+/// timing (use the default fast Clarabel there).
+pub fn enable_deterministic_formation_lp() {
+    std::env::set_var("SOCCER_FORMATION_LP_DETERMINISTIC", "1");
 }
 
 fn soccer_formation_lp_budgeted_fallback_solution() -> crate::des::general::lp::LPSolution {
@@ -1803,7 +1852,30 @@ impl SoccerFormationLpBrain {
         // optimality directly. The formation only needs an optimal *point* (player
         // positions), not a vertex, so we skip the IPM->simplex crossover/polish
         // entirely — that polish was the ~400ms bottleneck for a vertex we never use.
-        // The circuit breaker in `solve_tick` still guards realtime.
+        // Determinism vs realtime latency cannot be had together on this degenerate LP:
+        //   * Clarabel (interior point) is FAST (<5ms) but PER-PROCESS NONDETERMINISTIC --
+        //     byte-identical input yields a different iterate and even a different terminal
+        //     status (optimal vs iter-limit) run to run. That is the sole source of
+        //     match-level nondeterminism (same seed -> different scorelines; noisy self-play
+        //     rewards) and it cascades chaotically within ~50-900 ticks.
+        //   * The internal Bland's-rule simplex is DETERMINISTIC by construction but SLOW on
+        //     the cold ~567-var/798-constraint problem (~600ms/solve), which blows the
+        //     realtime tick budget and breaks live controller-input timing.
+        // So Clarabel stays the default (live/realtime path: fast, and the formation LP
+        // genuinely solves). Headless determinism-critical paths -- the self-play learning
+        // runners and the measurement/A-B harness -- opt into the deterministic simplex via
+        // `SOCCER_FORMATION_LP_DETERMINISTIC=1`, where the cold solve's latency is irrelevant
+        // (no realtime contract) but reproducibility is essential.
+        if soccer_formation_lp_deterministic_solver() {
+            return crate::des::general::lp::solve_lp_internal(
+                &self.problem,
+                &crate::des::general::lp::InternalSimplexOptions {
+                    max_iter: Some(SOCCER_FORMATION_LP_SIMPLEX_MAX_ITER),
+                    tol: None,
+                    basis_start: None,
+                },
+            );
+        }
         solve_lp_clarabel(&self.problem)
     }
 
@@ -1824,6 +1896,11 @@ impl SoccerFormationLpBrain {
         self.solve_count = self.solve_count.saturating_add(1);
         self.last_solve_micros = elapsed_micros;
         self.last_solve_status = solution.status.as_str().to_string();
+        // Reproducible cost proxy for the circuit-breaker decision below. Using the solver
+        // iteration count (deterministic) instead of `elapsed_micros` (wall-clock) keeps the
+        // breaker -- and therefore whether the LP guides or the heuristic fallback runs --
+        // identical across processes, which is required for match determinism.
+        let solve_iterations = solution.iters.unwrap_or(0);
         if soccer_lp_debug_enabled() && self.solve_count <= 2 {
             let ineq = self.problem.a_ub.as_ref().map(|m| m.len()).unwrap_or(0);
             let eq = self.problem.a_eq.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -1835,32 +1912,33 @@ impl SoccerFormationLpBrain {
         // Adaptive time-budgeting + failure telemetry only apply to a real solve;
         // the heuristic fallback is intentionally suboptimal (not a failure).
         if simplex {
-            if elapsed_micros > SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS {
+            if solve_iterations > SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET {
                 self.solve_timeout_count = self.solve_timeout_count.saturating_add(1);
                 self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
                 self.adaptive_max_iter =
                     (self.adaptive_max_iter / 2).max(SOCCER_FORMATION_LP_MIN_ITER);
                 if self.consecutive_timeouts >= SOCCER_FORMATION_LP_TIMEOUT_CIRCUIT_LIMIT {
-                    // Repeatedly too slow for realtime: trip the breaker and run the
+                    // Repeatedly too expensive for realtime: trip the breaker and run the
                     // fast heuristic fallback for the rest of the match.
                     self.simplex_circuit_open = true;
                     if soccer_lp_debug_enabled() {
                         eprintln!(
-                            "[soccer-lp] {:?} circuit OPEN after {} consecutive timeouts -> heuristic fallback",
+                            "[soccer-lp] {:?} circuit OPEN after {} consecutive over-budget solves -> heuristic fallback",
                             self.team, self.consecutive_timeouts
                         );
                     }
                 }
                 if soccer_lp_debug_enabled() {
                     eprintln!(
-                        "[soccer-lp] {:?} solve {}us over budget ({}us); max_iter->{}",
+                        "[soccer-lp] {:?} solve {} iters over budget ({} iters, {}us); max_iter->{}",
                         self.team,
+                        solve_iterations,
+                        SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET,
                         elapsed_micros,
-                        SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS,
                         self.adaptive_max_iter
                     );
                 }
-            } else if elapsed_micros * 3 < SOCCER_FORMATION_LP_SOLVE_BUDGET_MICROS {
+            } else if solve_iterations * 3 < SOCCER_FORMATION_LP_REALTIME_ITER_BUDGET {
                 self.consecutive_timeouts = 0;
                 self.adaptive_max_iter = (self.adaptive_max_iter
                     + SOCCER_FORMATION_LP_ITER_RECOVER_STEP)
@@ -3422,6 +3500,15 @@ fn soccer_formation_lp_apply_strategy_profile(
                 weights.space_occupation *= 1.42;
                 weights.expected_goal *= 1.22;
             }
+            // Outside mid attacks the isolated full-back: a 1v1 take-on to beat the man wide and
+            // get a cross away — prize progression and the chance created, hold width, accept the
+            // carry risk of running at a defender.
+            OutsideMidAttackDefenderLeft | OutsideMidAttackDefenderRight => {
+                weights.progression *= 1.20;
+                weights.space_occupation *= 1.22;
+                weights.expected_goal *= 1.14;
+                weights.transition_risk *= 1.10;
+            }
             _ => {}
         }
     }
@@ -4244,6 +4331,7 @@ pub(crate) fn soccer_formation_lp_slot_inputs(
             length,
             dt,
             snapshot.ball.position,
+            snapshot.team_attack_spacing_target_min(team),
         );
     }
     slots
@@ -4263,6 +4351,11 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     length: f64,
     dt_seconds: f64,
     ball: Vec2,
+    // Learnable attacking-spacing floor (yards): when `Some`, the in-possession
+    // attacking lines (midfield + forwards) spread to at least this learned, context-
+    // dependent gap on a fixed ~2s grace horizon, instead of the fixed
+    // `MIDLINE_LATERAL_MIN_YARDS`. `None` ⇒ the existing fixed floors (byte-identical).
+    attack_spacing_min: Option<f64>,
 ) {
     let attack_dir = team.attack_dir();
     let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(0.0);
@@ -4369,13 +4462,40 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
         BACKLINE_LATERAL_MAX_YARDS,
         lateral_correction(grace_for(slots, PlayerRole::Defender)),
     );
+    // Attacking lines (midfield + forwards). When the learnable attacking-spacing model
+    // is on and the team is in possession, spread these lines to at least the learned,
+    // context-dependent floor on a fixed ~2s grace (the user's "5-8yd, ~2s grace");
+    // otherwise keep the fixed `MIDLINE_LATERAL_MIN_YARDS` floor on the ball-proximity
+    // grace, and leave the forward line untouched (byte-identical). The back four is
+    // deliberately excluded — its width is structural, not an attacking spacing choice.
+    let (mid_min, attack_grace, spread_forwards) = match attack_spacing_min {
+        Some(min) => (
+            min.max(MIDLINE_LATERAL_MIN_YARDS * 0.5),
+            ATTACK_SPACING_REGROUP_GRACE_SECONDS,
+            true,
+        ),
+        None => (
+            MIDLINE_LATERAL_MIN_YARDS,
+            grace_for(slots, PlayerRole::Midfielder),
+            false,
+        ),
+    };
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Midfielder,
-        MIDLINE_LATERAL_MIN_YARDS,
+        mid_min,
         f64::INFINITY,
-        lateral_correction(grace_for(slots, PlayerRole::Midfielder)),
+        lateral_correction(attack_grace),
     );
+    if spread_forwards {
+        soccer_formation_lp_spread_line_x(
+            slots,
+            PlayerRole::Forward,
+            mid_min,
+            f64::INFINITY,
+            lateral_correction(attack_grace),
+        );
+    }
 
     for s in slots.iter_mut().filter(|s| s.active) {
         s.anchor = s.anchor.clamp_to_pitch(width, length);
@@ -5050,6 +5170,20 @@ impl CentralBrain {
                         .flank_overlap_run_probability
                         .max(NESTED_OVERLAP_RUN_PROBABILITY);
                     directive.width_yards = (directive.width_yards * 1.06).min(width * 0.96);
+                }
+                OutsideMidAttackDefenderLeft | OutsideMidAttackDefenderRight => {
+                    // Keep the ball WIDE and back the wide man to TAKE ON the isolated full-back:
+                    // maximal width, a carry-over-pass bias (the take-on is a carry), more risk
+                    // tolerance, and a high cross once the byline is reached. The per-player
+                    // isolated-defender take-on appetite uplift lives in
+                    // `WorldSnapshot::runaround_dribble_option_for` / `outside_mid_take_on_*`.
+                    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+                    directive.flank_overlap_run_probability = directive
+                        .flank_overlap_run_probability
+                        .max(NESTED_OVERLAP_RUN_PROBABILITY);
+                    directive.width_yards = (directive.width_yards * 1.08).min(width * 0.98);
+                    directive.carry_priority = (directive.carry_priority * 1.22).clamp(0.4, 1.6);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
                 }
                 _ => {}
             }
