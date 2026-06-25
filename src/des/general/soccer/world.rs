@@ -12247,6 +12247,11 @@ impl SoccerMatch {
         self.ball.last_touch_team = Some(holder_team);
         self.last_touch_player = Some(holder);
         self.restart_double_touch_guard = None;
+        // A deliberate header/flick is a fresh play of the ball. Any offside
+        // phase from the previous pass/long ball ends once this touch happens.
+        self.pending_pass = None;
+        self.ball.untargeted_long_ball_flight = None;
+        self.ball.untargeted_long_ball_launcher = None;
         true
     }
 

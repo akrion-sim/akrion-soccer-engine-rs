@@ -40606,6 +40606,57 @@ fn deliberate_defender_control_resets_pending_offside_phase() {
 }
 
 #[test]
+fn deliberate_defender_header_resets_pending_offside_phase() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 5;
+    let runner = 9;
+    let onside_pressurer = 8;
+    let defender = 12;
+    sim.players[passer].position = Vec2::new(40.0, 70.0);
+    sim.players[runner].position = Vec2::new(40.0, 108.0);
+    sim.players[onside_pressurer].position = Vec2::new(41.0, 96.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(8.0 + away as f64, 82.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[defender].position = Vec2::new(40.0, 96.0);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.holder = Some(passer);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(runner),
+            power: 1.0,
+            flight: PassFlight::Aerial,
+        },
+        sprint: false,
+    });
+    assert!(sim
+        .pending_pass
+        .as_ref()
+        .and_then(|pass| pass.offside.as_ref())
+        .is_some());
+
+    let header_position = sim.players[defender].position;
+    sim.ball.position = header_position;
+    assert!(sim.try_aerial_header(defender, Team::Away, 2.0));
+    assert_eq!(sim.ball.last_touch_team, Some(Team::Away));
+    assert_eq!(sim.last_touch_player, Some(defender));
+    assert!(sim.pending_pass.is_none());
+
+    sim.ball.holder = Some(runner);
+    sim.ball.position = sim.players[runner].position;
+    assert!(!sim.call_pending_offside_interference_before_control_if_needed(
+        header_position,
+        sim.ball.position
+    ));
+
+    assert_eq!(sim.stats.offsides_home, 0);
+    assert!(!sim.events.iter().any(|event| event.kind == "offside"));
+}
+
+#[test]
 fn ai_best_pass_target_avoids_offside_runner() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.players[5].position = Vec2::new(40.0, 70.0);
