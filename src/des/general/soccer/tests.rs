@@ -15912,6 +15912,82 @@ fn committed_loose_ball_chaser_attacks_ball_before_support_shape() {
 }
 
 #[test]
+fn loose_ball_uncontested_too_long_forces_the_retriever_to_attack_now() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51,
+        ..Default::default()
+    });
+    // Park everyone well away from a fast, grounded loose ball so nothing contests it.
+    for player in sim.players.iter_mut() {
+        player.position = Vec2::new(2.0, 2.0);
+        player.velocity = Vec2::zero();
+    }
+    let chaser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+        .map(|p| p.id)
+        .unwrap();
+    sim.players[chaser].position = Vec2::new(40.0, 30.0);
+    sim.players[chaser].home_position = Vec2::new(40.0, 30.0);
+    sim.players[chaser].skills.first_touch = 0.1; // poor touch ⇒ would prefer to let it run
+    sim.ball.holder = None;
+    sim.pending_pass = None;
+    sim.ball.position = Vec2::new(40.0, 44.0);
+    sim.ball.velocity = Vec2::new(0.0, 9.0); // quick ball — clean reception is "later"
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    // The uncontested clock: nobody is near or closing on the ball, so an update sets it.
+    let snap0 = WorldSnapshot::from_match(&sim);
+    sim.update_loose_ball_urgency(&snap0);
+    assert!(
+        sim.loose_ball_uncontested_since_tick.is_some(),
+        "an unchallenged loose ball must start the uncontested clock"
+    );
+
+    // Not yet past the ¼s threshold ⇒ no urgency.
+    let snap_fresh = WorldSnapshot::from_match(&sim);
+    assert!(!snap_fresh.loose_ball_urgency_active());
+
+    // Advance time past ¼s with the ball still uncontested ⇒ urgency fires.
+    sim.tick = sim
+        .loose_ball_uncontested_since_tick
+        .unwrap()
+        .saturating_add(8);
+    let snap_late = WorldSnapshot::from_match(&sim);
+    assert!(
+        snap_late.loose_ball_urgency_active(),
+        "a loose ball uncontested for >¼s must raise urgency"
+    );
+    // Under urgency the retriever attacks NOW (traps at the earliest reachable point)
+    // instead of waiting for a cleaner, slower reception.
+    assert!(
+        snap_late.loose_ball_control_plan_for(chaser).1,
+        "urgency must force the retriever to trap the ball now"
+    );
+
+    // The disable gate restores the prior behavior (no urgency override).
+    std::env::set_var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY", "1");
+    let disabled = !snap_late.loose_ball_urgency_active();
+    std::env::remove_var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY");
+    assert!(
+        disabled,
+        "DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY must turn the urgency override off"
+    );
+
+    // A teammate right on the ball means it IS contested ⇒ the clock clears.
+    sim.players[chaser].position = sim.ball.position;
+    let snap_contested = WorldSnapshot::from_match(&sim);
+    sim.update_loose_ball_urgency(&snap_contested);
+    assert!(
+        sim.loose_ball_uncontested_since_tick.is_none(),
+        "a ball being challenged at close quarters is contested — the clock clears"
+    );
+}
+
+#[test]
 fn midfield_line_holds_band_in_front_of_defenders() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

@@ -57,6 +57,8 @@ mod pitch_value;
 pub use pitch_value::*;
 mod back_four_line;
 pub use back_four_line::*;
+mod loose_ball_commit;
+pub use loose_ball_commit::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -2753,6 +2755,19 @@ const RESTART_HOOF_POWER: f64 = 0.85;
 // speed. Otherwise ONE defender claims it and the others peel off goalside into space.
 const LOOSE_BALL_SHIELD_PRESSURE_RADIUS_YARDS: f64 = 4.0;
 const LOOSE_BALL_SHIELD_CLOSING_YPS: f64 = 3.0;
+// ---- Loose-ball urgency: no unpossessed ball sits uncontested for too long ----
+// A loose ball is "contested" this tick if any outfielder is within this radius of
+// it (challenging at close quarters) OR is closing on it from within the approach
+// radius at/above the approach speed (genuinely running it down). When neither holds,
+// the uncontested clock runs; once it exceeds `LOOSE_BALL_MAX_UNCONTESTED_SECONDS`
+// the designated retriever is forced to attack the ball NOW (trap it, no let-it-run),
+// so a ball never lingers unchallenged the way it does not in real soccer.
+const LOOSE_BALL_URGENCY_CONTEST_RADIUS_YARDS: f64 = 2.25;
+const LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS: f64 = 7.0;
+const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
+// ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
+// touch, they do not stand off it.
+const LOOSE_BALL_MAX_UNCONTESTED_SECONDS: f64 = 0.25;
 // ---- Off-ball pass-reception belief / hand-off (anticipate the trajectory; best man receives) ----
 // When a ground pass is in flight, the receiving team predicts where it will arrive and the
 // genuinely best-placed team-mate goes to meet it. A team-mate is only treated as a live contender
@@ -44080,6 +44095,8 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        loose_ball_commit_head: None,
+        loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         clock_seconds: frame.clock_seconds,

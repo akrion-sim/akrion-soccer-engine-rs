@@ -286,6 +286,21 @@ pub struct SoccerMatch {
     pub(crate) line_depth_samples: Vec<LineDepthSample>,
     /// Open line-depth decisions awaiting their windowed reward.
     pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
+    /// The trained loose-ball commit head (which player attacks a loose ball), when
+    /// present. Carried + trained across games by the learner; `None` ⇒ analytic
+    /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// Rolling RL corpus for the loose-ball commit head: per-candidate state + the
+    /// commit action taken + the windowed possession/territorial reward. Collected
+    /// only while the commit model is enabled; empty + untouched in the default process.
+    pub(crate) loose_ball_commit_samples: Vec<LooseBallCommitSample>,
+    /// Open loose-ball commit decisions awaiting their windowed reward.
+    pub(crate) pending_loose_ball_commit: Vec<PendingLooseBallCommitDecision>,
+    /// Tick at which the ball most recently became loose AND went uncontested (no
+    /// player challenging it). `None` whenever the ball is held / contested. Drives
+    /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
+    /// each [`WorldSnapshot`] so the retriever decision can read it.
+    pub(crate) loose_ball_uncontested_since_tick: Option<u64>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
     /// only while the turnover-window penalty is enabled, so a dispossession/interception
     /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
@@ -1653,6 +1668,10 @@ impl SoccerMatch {
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
+            loose_ball_commit_head: None,
+            loose_ball_commit_samples: Vec::new(),
+            pending_loose_ball_commit: Vec::new(),
+            loose_ball_uncontested_since_tick: None,
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             defensive_delay_clocks: HashMap::new(),
@@ -6044,6 +6063,10 @@ impl SoccerMatch {
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
         self.collect_line_depth_rl_samples(&next_snapshot);
+        // Maintain the loose-ball urgency clock (every tick) and, when the commit model
+        // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
+        self.update_loose_ball_urgency(&next_snapshot);
+        self.collect_loose_ball_commit_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -8436,6 +8459,43 @@ impl SoccerMatch {
         );
         for penalty in signal.defender_penalties {
             self.record_reward_event_at(tick, penalty.player_id, penalty.amount);
+        }
+    }
+
+    /// Maintain the "loose ball uncontested for too long" clock (runs every tick,
+    /// learning or not). A loose ball is contested when an outfielder is right on it
+    /// or genuinely closing it down; otherwise the clock runs and, once it passes
+    /// [`LOOSE_BALL_MAX_UNCONTESTED_SECONDS`], [`WorldSnapshot::loose_ball_urgency_active`]
+    /// forces the designated retriever to attack it (see `loose_ball_control_plan_for`).
+    pub(crate) fn update_loose_ball_urgency(&mut self, snapshot: &WorldSnapshot) {
+        if snapshot.ball.holder.is_some()
+            || snapshot.pending_pass.is_some()
+            || self.active_set_play.is_some()
+        {
+            self.loose_ball_uncontested_since_tick = None;
+            return;
+        }
+        let ball_pos = snapshot.ball.position;
+        let contested = snapshot.players.iter().any(|p| {
+            if p.role == PlayerRole::Goalkeeper {
+                return false;
+            }
+            let pos = snapshot.player_snapshot_position(p);
+            let to_ball = ball_pos - pos;
+            let dist = to_ball.len();
+            if dist <= LOOSE_BALL_URGENCY_CONTEST_RADIUS_YARDS {
+                return true;
+            }
+            if dist <= LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS && dist > 1e-3 {
+                let vel = snapshot.player_velocity(p.id).unwrap_or(p.velocity);
+                return vel.dot(to_ball * (1.0 / dist)) >= LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS;
+            }
+            false
+        });
+        if contested {
+            self.loose_ball_uncontested_since_tick = None;
+        } else if self.loose_ball_uncontested_since_tick.is_none() {
+            self.loose_ball_uncontested_since_tick = Some(self.tick);
         }
     }
 
@@ -16600,6 +16660,16 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// The trained loose-ball commit head, carried from the match for live
+    /// consumption in the retriever election. `None` ⇒ analytic seed (parity).
+    /// Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// Carried from the match: the tick the loose ball last went uncontested (see
+    /// `SoccerMatch::loose_ball_uncontested_since_tick`). `None` ⇒ not loose /
+    /// contested. Read by the urgency override so a stale loose ball is attacked.
+    #[serde(skip)]
+    pub(crate) loose_ball_uncontested_since_tick: Option<u64>,
     /// Per-team tactical genomes (constant for the whole match). Default = neutral
     /// genome, so a genome-agnostic match is byte-identical to before; consumers
     /// read style via [`WorldSnapshot::genome_for`]. `serde(default)` keeps older
@@ -17067,6 +17137,23 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
+}
+
+/// The loose-ball urgency override (force the designated retriever to attack a ball
+/// that has sat uncontested for >¼s) is ON by default — a loose ball lingering
+/// unchallenged is unrealistic. Set `DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY` to restore
+/// the prior let-it-run-as-long-as-it-likes behavior (byte-identical to before).
+pub(crate) fn dd_soccer_disable_loose_ball_urgency() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY").is_ok())
+    }
 }
 /// Tactical model-based look-ahead depth for the value blend (`neural_blended_action`):
 /// AlphaZero/MuZero-style planning that rolls the learned world model (`predict_next`)
@@ -17853,6 +17940,8 @@ impl WorldSnapshot {
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             line_depth_head: m.line_depth_head.clone(),
+            loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
             clock_seconds: m.clock_seconds,
@@ -26617,7 +26706,7 @@ impl WorldSnapshot {
     /// when it clearly wins the race to the contest point (a near-certain interception is
     /// cheap), capped so nobody is dragged clear across the pitch. This is the mechanism
     /// that keeps defenders in shape: an interception outside the budget is declined.
-    fn pass_contest_position_budget_for(
+    pub(crate) fn pass_contest_position_budget_for(
         &self,
         player: &PlayerSnapshot,
         reception: Vec2,
@@ -26781,6 +26870,25 @@ impl WorldSnapshot {
             return None;
         }
         Some((reception, true))
+    }
+
+    /// True when the ball has been loose AND uncontested for longer than
+    /// [`LOOSE_BALL_MAX_UNCONTESTED_SECONDS`] — the cue for the designated retriever
+    /// to stop waiting and attack the ball now. Reads the clock the match maintains
+    /// in [`SoccerMatch::update_loose_ball_urgency`] (carried into this snapshot).
+    pub(crate) fn loose_ball_urgency_active(&self) -> bool {
+        if dd_soccer_disable_loose_ball_urgency() {
+            return false;
+        }
+        if self.ball.holder.is_some() || self.pending_pass.is_some() {
+            return false;
+        }
+        let Some(since) = self.loose_ball_uncontested_since_tick else {
+            return false;
+        };
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        let elapsed = self.tick.saturating_sub(since) as f64 * dt;
+        elapsed >= LOOSE_BALL_MAX_UNCONTESTED_SECONDS
     }
 
     pub(crate) fn projected_loose_ball_target(&self) -> Option<Vec2> {
@@ -26993,9 +27101,14 @@ impl WorldSnapshot {
         };
         let lane_affinity = self.dynamic_lane_affinity_for_player_target(player, target);
         let receipt_shape = self.ball_receipt_shape_fit_for_player_target(player, target);
-        dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT)
+        let base = dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT)
             - lane_affinity * 1.35
-            - receipt_shape * BALL_RECEIPT_RETRIEVAL_SHAPE_WEIGHT_YARDS
+            - receipt_shape * BALL_RECEIPT_RETRIEVAL_SHAPE_WEIGHT_YARDS;
+        // Learned commit selector (gated off by default ⇒ adds exactly 0.0, so the
+        // election is byte-identical): refines who attacks the loose ball, lowering
+        // the score of a high-priority attacker and raising that of a candidate the
+        // model judges would be dragged out of formation shape to chase it.
+        base + self.loose_ball_commit_score_adjustment(player, target, base)
     }
 
     /// The single designated retriever is the teammate whose stride/trajectory best
@@ -27519,6 +27632,13 @@ impl WorldSnapshot {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return (early, true, early_speed);
         };
+        // Urgency: the ball has sat loose and uncontested too long (>¼s). The committed
+        // retriever must attack it NOW (trap at the earliest reachable point) rather than
+        // wait for a cleaner, slower reception — a loose ball does not linger unchallenged
+        // in real soccer. Same effect as opponent-denial, just driven by elapsed neglect.
+        if self.loose_ball_urgency_active() {
+            return (early, true, early_speed);
+        }
         // Miscontrol risk of taking the EARLY ball: rises with ball speed past a clean-control
         // pace, falls with the player's first touch. A clean (slow) early ball ⇒ ~0 risk.
         let first_touch = ability01(me.skills.first_touch);
@@ -28043,7 +28163,7 @@ impl WorldSnapshot {
     /// allowed to engage the ball: the live formation-LP target (the team block,
     /// already shifted toward the ball) clamped to the player's role, or the
     /// static home position when LP guidance is unavailable.
-    fn formation_slot_anchor_for(&self, player_id: usize, home: Vec2) -> Vec2 {
+    pub(crate) fn formation_slot_anchor_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         self.formation_lp_guidance_for(player_id)
             .map(|guidance| self.clamp_to_role_position(player_id, guidance.target, home, false))
             .unwrap_or(home)
