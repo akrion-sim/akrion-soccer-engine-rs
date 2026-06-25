@@ -284,6 +284,26 @@ pub fn analytic_midfield_gap_fraction(inputs: &BackFourLineInputs) -> f64 {
     frac.clamp(0.0, 1.0)
 }
 
+/// One reward-weighted RL training row for a line-depth head: the state at a line
+/// decision, the gap fraction the line ACTUALLY used (the action), and the reward
+/// attributed to that decision over the following window (higher = the depth led to
+/// a better territorial / fewer-chances-conceded outcome). Collected during
+/// self-play, drained to the learner, and consumed by
+/// [`BackFourLineHead::train_reward_weighted`]. Mirrors [`SoccerPassOutcomeSample`]'s
+/// role for the pass head, but carries a continuous *action + reward* (not a binary
+/// outcome) because the line decision is an action to improve, not an event to
+/// predict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineDepthSample {
+    /// State features at the line decision.
+    pub inputs: BackFourLineInputs,
+    /// The gap fraction the line actually used (the action), in `[0, 1]`.
+    pub action_gap_fraction: f64,
+    /// Reward attributed to the decision over the following window (any scale; only
+    /// relative-to-batch matters — the trainer baselines it).
+    pub reward: f64,
+}
+
 /// Learned regression head for the line-centre gap fraction: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, sigmoid) mirroring [`SoccerPassCompletionHead`]. The live
 /// net is not serde; like the other learned heads it round-trips through the
@@ -345,6 +365,68 @@ impl BackFourLineHead {
             let result = self
                 .network
                 .train_sample_clipped(&features[..], &target, learning_rate, 4.0);
+            if result.applied && result.loss.is_finite() {
+                total += result.loss;
+                applied += 1;
+                self.training_steps += 1;
+            }
+        }
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
+        self.last_loss = Some(mean);
+        mean
+    }
+
+    /// One **reward-weighted-regression** epoch over RL samples (offline policy
+    /// improvement). Regress the head toward each sample's ACTION (the gap actually
+    /// used), weighted by how much its reward beat the batch baseline: above-average
+    /// decisions are imitated strongly, below-average ones barely (and never pushed
+    /// to the opposite action). So the head concentrates on the depths that produced
+    /// good outcomes rather than merely imitating the analytic seed. Returns the mean
+    /// step loss.
+    pub fn train_reward_weighted(
+        &mut self,
+        samples: &[LineDepthSample],
+        learning_rate: f64,
+    ) -> f64 {
+        let finite: Vec<&LineDepthSample> = samples
+            .iter()
+            .filter(|s| s.reward.is_finite() && s.action_gap_fraction.is_finite())
+            .collect();
+        if finite.is_empty() {
+            return 0.0;
+        }
+        // Baseline = mean reward; advantage = (reward − baseline) / std. Standardizing
+        // by the batch spread keeps the weight scale stable across reward magnitudes.
+        let n = finite.len() as f64;
+        let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
+        let std = (finite
+            .iter()
+            .map(|s| (s.reward - baseline).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt()
+            .max(1e-3);
+        let mut total = 0.0;
+        let mut applied = 0usize;
+        for s in finite {
+            let features = s.inputs.to_features();
+            if features.iter().any(|v| !v.is_finite()) {
+                continue;
+            }
+            let advantage = (s.reward - baseline) / std;
+            // Exponential weight, clamped: above-baseline ⇒ weight > 1, below ⇒ → 0.
+            let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
+            let target = [s.action_gap_fraction.clamp(0.0, 1.0)];
+            let result = self.network.train_sample_clipped(
+                &features[..],
+                &target,
+                learning_rate * weight,
+                4.0,
+            );
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
@@ -697,5 +779,53 @@ mod back_four_line_tests {
             analytic_midfield_gap_fraction(&ours) > analytic_midfield_gap_fraction(&theirs),
             "controlling the ball should push the midfield up (larger gap)"
         );
+    }
+
+    #[test]
+    fn reward_weighted_training_steers_toward_the_high_reward_action() {
+        let mut head = BackFourLineHead::new(23);
+        let inputs = baseline_inputs();
+        let before = head.predict(&inputs).expect("finite");
+        // Same state, two competing actions: a DEEP line (0.85) is rewarded, a HIGH
+        // line (0.15) is penalized. RWR should pull the head toward the deep action.
+        let samples: Vec<LineDepthSample> = (0..32)
+            .flat_map(|_| {
+                [
+                    LineDepthSample {
+                        inputs: inputs.clone(),
+                        action_gap_fraction: 0.85,
+                        reward: 1.0,
+                    },
+                    LineDepthSample {
+                        inputs: inputs.clone(),
+                        action_gap_fraction: 0.15,
+                        reward: -1.0,
+                    },
+                ]
+            })
+            .collect();
+        let mut last = f64::INFINITY;
+        for _ in 0..80 {
+            last = head.train_reward_weighted(&samples, 0.05);
+        }
+        let after = head.predict(&inputs).expect("finite");
+        assert!(last.is_finite());
+        assert!(
+            after > before && after > 0.5,
+            "RWR should move the head toward the high-reward deep action: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn reward_weighted_training_is_a_noop_on_empty_or_nonfinite() {
+        let mut head = BackFourLineHead::new(5);
+        assert_eq!(head.train_reward_weighted(&[], 0.05), 0.0);
+        let bad = vec![LineDepthSample {
+            inputs: baseline_inputs(),
+            action_gap_fraction: f64::NAN,
+            reward: f64::NAN,
+        }];
+        assert_eq!(head.train_reward_weighted(&bad, 0.05), 0.0);
+        assert_eq!(head.training_steps(), 0);
     }
 }
