@@ -48913,6 +48913,70 @@ fn spacing_scores_reward_the_in_band_separation() {
 }
 
 #[test]
+fn off_ball_space_discipline_is_a_no_op_when_no_open_outlet_yet() {
+    // Gate OFF (or: player has no clean in-range outlet) => `current_outlet_open == false` =>
+    // the adjustment is exactly 0.0 for every candidate, so `open_space_for` is byte-identical.
+    for cand_to_carrier in [2.0, 5.0, 9.0, 18.0] {
+        assert_eq!(
+            off_ball_space_discipline_adjustment(false, 5.5, 1.2, cand_to_carrier, 10.0),
+            0.0,
+            "no-outlet (gate-off) state must leave the candidate score untouched"
+        );
+    }
+}
+
+#[test]
+fn off_ball_space_discipline_punishes_spiralling_into_the_carrier() {
+    // The red flag: a teammate who ALREADY offers a clean, in-range outlet (10yd from the
+    // carrier, lane open) keeps closing toward the ball to <3yd. With the discipline on, a
+    // candidate that collapses inside the carrier keep-out radius must score strictly worse
+    // than one that holds/widens — and the spiral-in candidate must be net-penalised.
+    let short_outlet_bonus = 5.5; // the show-for-ball pull the old code rewarded near the ball
+    let ball_arrival_bonus = 1.2;
+    let current_to_carrier = 10.0;
+
+    // Candidate A: spirals in to 3yd of the carrier (the bug behaviour).
+    let collapse = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        3.0,
+        current_to_carrier,
+    );
+    // Candidate B: holds a stretched 12yd, outside the keep-out radius.
+    let hold = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        12.0,
+        current_to_carrier,
+    );
+
+    assert!(
+        collapse < hold - 1e-9,
+        "collapsing into the carrier must score worse than holding width: collapse={collapse} hold={hold}"
+    );
+    assert!(
+        collapse < 0.0,
+        "the spiral-in candidate must be net-penalised, not merely neutral: {collapse}"
+    );
+    // The proximity pull that drove the spiral is largely cancelled even before the keep-out
+    // penalty (a candidate just inside the radius but not closer than now keeps only the cancel).
+    let marginal_only = off_ball_space_discipline_adjustment(
+        true,
+        short_outlet_bonus,
+        ball_arrival_bonus,
+        current_to_carrier, // same distance: no active collapse, only the marginal cancel
+        current_to_carrier,
+    );
+    assert!(
+        marginal_only < 0.0 && marginal_only > collapse,
+        "holding position cancels the proximity pull but skips the collapse penalty: \
+         marginal={marginal_only} collapse={collapse}"
+    );
+}
+
+#[test]
 fn tactical_trace_penalizes_endline_camping_and_deep_retreat() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;

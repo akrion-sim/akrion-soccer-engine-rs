@@ -17016,6 +17016,35 @@ pub(crate) fn open_space_score_from_distances(
     open_space_score_from_distances_with_axis_pressure(opponent_distance, teammate_crowding, 0.0)
 }
 
+/// Off-ball spacing-discipline score adjustment for one `open_space_for` candidate. Pure so it
+/// can be unit-tested without the (process-cached) env gate; the caller passes
+/// `current_outlet_open = false` whenever the gate is OFF, making this a no-op (returns 0.0) and
+/// `open_space_for` byte-identical. When the player ALREADY offers a clean, in-range outlet:
+///   1. most of the show-for-ball / ball-arrival proximity pull is cancelled (closing the gap
+///      to the carrier opens no new lane, so it earns ~nothing — the reward becomes marginal);
+///   2. a candidate that actively collapses inside the carrier keep-out radius (closer to the
+///      carrier than the player is now) is penalised in proportion to how far inside it sits.
+pub(crate) fn off_ball_space_discipline_adjustment(
+    current_outlet_open: bool,
+    short_outlet_bonus: f64,
+    ball_arrival_bonus: f64,
+    candidate_to_carrier_yards: f64,
+    current_to_carrier_yards: f64,
+) -> f64 {
+    if !current_outlet_open {
+        return 0.0;
+    }
+    let mut adj = -(short_outlet_bonus + ball_arrival_bonus) * OFF_BALL_MARGINAL_OUTLET_CANCEL;
+    if candidate_to_carrier_yards < OFF_BALL_CARRIER_KEEP_OUT_YARDS
+        && candidate_to_carrier_yards < current_to_carrier_yards - 1e-6
+    {
+        let intrusion = (OFF_BALL_CARRIER_KEEP_OUT_YARDS - candidate_to_carrier_yards)
+            / OFF_BALL_CARRIER_KEEP_OUT_YARDS.max(1.0);
+        adj -= intrusion * OFF_BALL_CARRIER_COLLAPSE_PENALTY;
+    }
+    adj
+}
+
 fn open_space_score_from_distances_with_axis_pressure(
     opponent_distance: f64,
     teammate_crowding: f64,
@@ -31278,21 +31307,13 @@ impl WorldSnapshot {
                 //      candidate that merely closes the gap to the carrier earns nothing extra;
                 //   2. penalise candidates that actively collapse inside the carrier's keep-out
                 //      radius (crowding the carrier's space instead of stretching the defence).
-                let off_ball_space_discipline = if current_outlet_open {
-                    let mut adj =
-                        -(short_outlet_bonus + ball_arrival_bonus) * OFF_BALL_MARGINAL_OUTLET_CANCEL;
-                    let cand_to_carrier = carrier_position.distance(p);
-                    if cand_to_carrier < OFF_BALL_CARRIER_KEEP_OUT_YARDS
-                        && cand_to_carrier < current_to_carrier - 1e-6
-                    {
-                        let intrusion = (OFF_BALL_CARRIER_KEEP_OUT_YARDS - cand_to_carrier)
-                            / OFF_BALL_CARRIER_KEEP_OUT_YARDS.max(1.0);
-                        adj -= intrusion * OFF_BALL_CARRIER_COLLAPSE_PENALTY;
-                    }
-                    adj
-                } else {
-                    0.0
-                };
+                let off_ball_space_discipline = off_ball_space_discipline_adjustment(
+                    current_outlet_open,
+                    short_outlet_bonus,
+                    ball_arrival_bonus,
+                    carrier_position.distance(p),
+                    current_to_carrier,
+                );
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + goal_directness_bonus
