@@ -275,6 +275,13 @@ pub struct SoccerMatch {
     pub(crate) pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     /// The learned pass-completion model, when present (trained from `pass_outcome_samples`).
     pub(crate) pass_completion_head: Option<SoccerPassCompletionHead>,
+    /// Rolling RL training corpus for the line-depth heads (Gap 5): a state + the gap
+    /// the line used + the windowed territorial reward. Collected only while a
+    /// line-depth model is enabled (`collect_line_depth_rl_samples`); drained by the
+    /// cluster learner. Empty + untouched in the default (gated-off) process.
+    pub(crate) line_depth_samples: Vec<LineDepthSample>,
+    /// Open line-depth decisions awaiting their windowed reward.
+    pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
     /// only while the turnover-window penalty is enabled, so a dispossession/interception
     /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
@@ -1639,6 +1646,8 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             pass_outcome_samples: Vec::new(),
             pass_completion_head: None,
+            line_depth_samples: Vec::new(),
+            pending_line_depth: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             defensive_delay_clocks: HashMap::new(),
@@ -6027,6 +6036,9 @@ impl SoccerMatch {
         self.update_player_facing_dizziness_energy();
         self.update_player_tick_carryover();
         let next_snapshot = WorldSnapshot::from_match_for_learning(self);
+        // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
+        // byte-identical unless a line-depth model is enabled).
+        self.collect_line_depth_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,

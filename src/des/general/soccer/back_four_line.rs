@@ -304,6 +304,26 @@ pub struct LineDepthSample {
     pub reward: f64,
 }
 
+/// An open line-depth decision awaiting its windowed reward. Recorded at the
+/// decision tick with the team's territorial advantage then; resolved
+/// `LINE_DEPTH_REWARD_WINDOW_TICKS` later by differencing the territorial advantage
+/// into a [`LineDepthSample`]'s reward.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingLineDepthDecision {
+    pub team: Team,
+    pub inputs: BackFourLineInputs,
+    pub action_gap_fraction: f64,
+    pub decision_territorial: f64,
+    pub due_tick: u64,
+}
+
+/// How often (ticks) a line-depth RL decision is sampled while a line model is on.
+pub const LINE_DEPTH_SAMPLE_INTERVAL_TICKS: u64 = 15;
+/// Window (ticks) over which a sampled decision's territorial reward is measured.
+pub const LINE_DEPTH_REWARD_WINDOW_TICKS: u64 = 45;
+/// Cap on the rolling RL sample buffer (drained by the learner).
+pub const LINE_DEPTH_SAMPLE_CAP: usize = 4096;
+
 /// Learned regression head for the line-centre gap fraction: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, sigmoid) mirroring [`SoccerPassCompletionHead`]. The live
 /// net is not serde; like the other learned heads it round-trips through the
@@ -629,6 +649,72 @@ impl WorldSnapshot {
         let inputs = self.build_line_depth_inputs(me.team, PlayerRole::Midfielder)?;
         let frac = analytic_midfield_gap_fraction(&inputs);
         frac.is_finite().then(|| frac.clamp(0.0, 1.0))
+    }
+}
+
+impl SoccerMatch {
+    /// Gated per-tick RL sample collection for the line-depth heads (Gap 5), driven
+    /// off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
+    /// byte-identical) unless a line-depth model is enabled, so the default learner
+    /// is unaffected. When on: resolves decisions whose reward window has elapsed
+    /// (reward = the defending team's territorial-advantage change over the window —
+    /// higher means the chosen line depth kept the opponent out), and samples a fresh
+    /// back-four decision every [`LINE_DEPTH_SAMPLE_INTERVAL_TICKS`]. Drained by the
+    /// learner via [`Self::drain_line_depth_samples`].
+    pub(crate) fn collect_line_depth_rl_samples(&mut self, snapshot: &WorldSnapshot) {
+        if !back_four_line_model_enabled() && !midfield_line_model_enabled() {
+            return;
+        }
+        let tick = self.tick;
+        // Resolve decisions whose reward window has elapsed.
+        let mut i = 0;
+        while i < self.pending_line_depth.len() {
+            if self.pending_line_depth[i].due_tick <= tick {
+                let decision = self.pending_line_depth.swap_remove(i);
+                let now_territorial = territorial_advantage(snapshot, decision.team);
+                if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    self.line_depth_samples.push(LineDepthSample {
+                        inputs: decision.inputs,
+                        action_gap_fraction: decision.action_gap_fraction,
+                        reward: now_territorial - decision.decision_territorial,
+                    });
+                    if self.line_depth_samples.len() > LINE_DEPTH_SAMPLE_CAP {
+                        let overflow = self.line_depth_samples.len() - LINE_DEPTH_SAMPLE_CAP;
+                        self.line_depth_samples.drain(0..overflow);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // Sample a fresh decision on cadence. The back four is the offside-setting
+        // line and the primary line-depth decision; its features also describe the
+        // state the midfield model reads, so one sample per team suffices for now.
+        if tick % LINE_DEPTH_SAMPLE_INTERVAL_TICKS == 0 {
+            for team in [Team::Home, Team::Away] {
+                let Some(inputs) = snapshot.build_line_depth_inputs(team, PlayerRole::Defender)
+                else {
+                    continue;
+                };
+                let action = analytic_line_centre_gap_fraction(&inputs);
+                let territorial = territorial_advantage(snapshot, team);
+                if action.is_finite() && territorial.is_finite() {
+                    self.pending_line_depth.push(PendingLineDepthDecision {
+                        team,
+                        inputs,
+                        action_gap_fraction: action,
+                        decision_territorial: territorial,
+                        due_tick: tick + LINE_DEPTH_REWARD_WINDOW_TICKS,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain the collected line-depth RL samples for the cluster learner (train the
+    /// head + persist), mirroring [`Self::drain_pass_outcome_samples`].
+    pub(crate) fn drain_line_depth_samples(&mut self) -> Vec<LineDepthSample> {
+        std::mem::take(&mut self.line_depth_samples)
     }
 }
 
