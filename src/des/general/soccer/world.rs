@@ -17184,6 +17184,19 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST").is_ok())
 }
+/// Off-ball spacing discipline (gated, default OFF = byte-identical for clean A/B). When ON,
+/// `open_space_for` rewards off-ball teammates for *improving* the passing picture rather than
+/// merely closing on the ball: the "show for the ball" / ball-arrival proximity pulls are
+/// cancelled for a player who is ALREADY a clean, in-range outlet, and candidates that collapse
+/// inside the carrier's comfortable receiving radius are penalised (unless the carrier is
+/// pressured and genuinely needs a short option). This kills the "two off-ball players >4yd
+/// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
+/// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
+fn dd_soccer_enable_off_ball_space_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+}
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
 /// partner is bound to collect it, so the give can't be thrown into space the partner never
@@ -31048,6 +31061,30 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Off-ball spacing discipline (gated): reward IMPROVING the passing picture, not merely
+        // closing on the ball. Computed once here so the per-candidate term is marginal vs the
+        // player's CURRENT position. OFF (default) leaves the loop below byte-identical.
+        let space_discipline = possession
+            && self.ball.holder != Some(player_id)
+            && me.role != PlayerRole::Goalkeeper
+            && dd_soccer_enable_off_ball_space_discipline();
+        let carrier_position = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .map(|h| self.player_snapshot_position(h))
+            .unwrap_or(self.ball.position);
+        // A pressured carrier genuinely wants a short option, so the discipline is suspended.
+        let carrier_pressured = space_discipline
+            && self.nearest_opponent_distance_at(me.team, carrier_position)
+                < OFF_BALL_CARRIER_PRESSURED_YARDS;
+        // Is the player ALREADY a clean, in-range outlet from where they stand? If so, closing
+        // the gap further opens no new lane, so the proximity pulls earn ~nothing.
+        let current_outlet_open = space_discipline
+            && !carrier_pressured
+            && self.ball.position.distance(me_position) <= SHORT_OUTLET_SHOW_MAX_YARDS
+            && self.clear_line(self.ball.position, me_position, me.team.other(), 2.0);
+        let current_to_carrier = carrier_position.distance(me_position);
         for dx in [-22.0, -13.0, -6.0, 0.0, 6.0, 13.0, 22.0] {
             for dy in [-8.0, 0.0, 7.0, 14.0, 22.0, 30.0] {
                 let raw_p = Vec2::new(
@@ -31235,6 +31272,27 @@ impl WorldSnapshot {
                 };
                 let vacuum_run_bonus =
                     self.attacking_vacuum_run_bonus(me, me_position, p, occupancy, forward);
+                // Off-ball spacing discipline (gated; 0.0 when OFF). Two effects, both only when
+                // the player already offers a clean outlet (so they are NOT needed shorter):
+                //   1. cancel most of the show-for-ball / ball-arrival proximity pull, so a
+                //      candidate that merely closes the gap to the carrier earns nothing extra;
+                //   2. penalise candidates that actively collapse inside the carrier's keep-out
+                //      radius (crowding the carrier's space instead of stretching the defence).
+                let off_ball_space_discipline = if current_outlet_open {
+                    let mut adj =
+                        -(short_outlet_bonus + ball_arrival_bonus) * OFF_BALL_MARGINAL_OUTLET_CANCEL;
+                    let cand_to_carrier = carrier_position.distance(p);
+                    if cand_to_carrier < OFF_BALL_CARRIER_KEEP_OUT_YARDS
+                        && cand_to_carrier < current_to_carrier - 1e-6
+                    {
+                        let intrusion = (OFF_BALL_CARRIER_KEEP_OUT_YARDS - cand_to_carrier)
+                            / OFF_BALL_CARRIER_KEEP_OUT_YARDS.max(1.0);
+                        adj -= intrusion * OFF_BALL_CARRIER_COLLAPSE_PENALTY;
+                    }
+                    adj
+                } else {
+                    0.0
+                };
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + goal_directness_bonus
@@ -31253,6 +31311,7 @@ impl WorldSnapshot {
                     + dynamic_lane_fit_bonus
                     + ball_arrival_bonus
                     + short_outlet_bonus
+                    + off_ball_space_discipline
                     - offside_penalty
                     - lane_position_penalty
                     - teammate_occupation_penalty
