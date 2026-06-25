@@ -31766,6 +31766,7 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -31776,6 +31777,8 @@ impl WorldSnapshot {
                 continue;
             }
             visible_forward_pass_options += 1;
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(current.distance(target_position));
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -31795,7 +31798,11 @@ impl WorldSnapshot {
             nearest_forward_teammate_distance_yards: if nearest_forward_teammate_distance_yards
                 .is_finite()
             {
-                nearest_forward_teammate_distance_yards
+                if nearest_visible_forward_pass_distance_yards.is_finite() {
+                    nearest_visible_forward_pass_distance_yards
+                } else {
+                    nearest_forward_teammate_distance_yards
+                }
             } else {
                 self.field_length
             },

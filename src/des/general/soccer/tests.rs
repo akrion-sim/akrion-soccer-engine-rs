@@ -7015,6 +7015,72 @@ fn short_upfield_ground_outlet_raises_early_pass_probability() {
 }
 
 #[test]
+fn short_upfield_distance_uses_visible_forward_pass_option_not_blocked_teammate() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_517,
+        ..Default::default()
+    });
+    let carrier = 7;
+    let blocked_near_teammate = 8;
+    let far_outlet = 9;
+    let blocker = 13;
+    park_players_except(&mut sim, &[carrier, blocked_near_teammate, far_outlet, blocker]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].position = Vec2::new(40.0, 50.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].action_facing = FacingBucket::South;
+    sim.players[carrier].skills.passing_completion_rate = 8.0;
+    sim.players[carrier].skills.passing = 8.0;
+    sim.players[carrier].skills.vision = 8.0;
+    sim.players[blocked_near_teammate].team = Team::Home;
+    sim.players[blocked_near_teammate].role = PlayerRole::Midfielder;
+    sim.players[blocked_near_teammate].position = Vec2::new(42.0, 57.2);
+    sim.players[blocked_near_teammate].home_position = sim.players[blocked_near_teammate].position;
+    sim.players[far_outlet].team = Team::Home;
+    sim.players[far_outlet].role = PlayerRole::Forward;
+    sim.players[far_outlet].position = Vec2::new(58.0, 62.0);
+    sim.players[far_outlet].home_position = sim.players[far_outlet].position;
+    sim.players[blocker].team = Team::Away;
+    sim.players[blocker].role = PlayerRole::Defender;
+    sim.players[blocker].position = Vec2::new(41.2, 54.3);
+    sim.players[blocker].home_position = sim.players[blocker].position;
+    sim.players[blocker].velocity = Vec2::zero();
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass_targets = snapshot.ranked_visible_pass_targets(carrier, 6);
+    assert!(
+        !pass_targets.contains(&blocked_near_teammate),
+        "blocked 5-8yd teammate must not be an actionable ground target: {pass_targets:?}"
+    );
+    assert!(
+        pass_targets.contains(&far_outlet),
+        "setup needs a farther actionable forward ground outlet: {pass_targets:?}"
+    );
+    let observation = snapshot.observation_for(carrier);
+    let far_distance = sim.players[carrier]
+        .position
+        .distance(sim.players[far_outlet].position);
+    assert!(observation.visible_forward_pass_options >= 1);
+    assert!(
+        observation.nearest_forward_teammate_distance_yards > FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS,
+        "blocked short teammate should not create the 5-8yd urgency fit: {observation:?}"
+    );
+    assert!(
+        (observation.nearest_forward_teammate_distance_yards - far_distance).abs() <= 1e-6,
+        "nearest forward pass distance should follow the actionable outlet, not every teammate ahead: far_distance={far_distance} observation={observation:?}"
+    );
+}
+
+#[test]
 fn first_time_pass_prioritizes_open_short_upfield_ground_outlet() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
