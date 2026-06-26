@@ -911,12 +911,14 @@ fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
 }
 
 fn soccer_behavior_old_action_probability(
-    behavior_probability: f64,
+    behavior_probability: Option<f64>,
     actor_probability: Option<f64>,
 ) -> Option<f64> {
-    let behavior_probability = finite_unit_interval(behavior_probability);
-    if behavior_probability > 0.0 {
-        return Some(behavior_probability);
+    if let Some(behavior_probability) = behavior_probability {
+        let behavior_probability = finite_unit_interval(behavior_probability);
+        if behavior_probability > 0.0 {
+            return Some(behavior_probability);
+        }
     }
     actor_probability
         .map(finite_unit_interval)
@@ -934,6 +936,7 @@ fn stamp_learned_policy_behavior_probability_on_decision(
     if decision.operation_order.first().map(|entry| entry.as_str()) != Some("learned-policy") {
         return;
     }
+    decision.behavior_policy_probability = Some(probability);
     decision.action_options = vec![AgentActionOptionTrace {
         label: decision.action.clone(),
         score: probability,
@@ -970,18 +973,18 @@ mod tests {
     #[test]
     fn behavior_old_action_probability_prefers_rank_mix_over_actor_softmax() {
         assert_eq!(
-            soccer_behavior_old_action_probability(0.20, Some(0.83)),
+            soccer_behavior_old_action_probability(Some(0.20), Some(0.83)),
             Some(0.20)
         );
         assert_eq!(
-            soccer_behavior_old_action_probability(0.0, Some(0.83)),
+            soccer_behavior_old_action_probability(Some(0.0), Some(0.83)),
             Some(0.83)
         );
         assert_eq!(
-            soccer_behavior_old_action_probability(f64::NAN, Some(0.83)),
+            soccer_behavior_old_action_probability(Some(f64::NAN), Some(0.83)),
             Some(0.83)
         );
-        assert_eq!(soccer_behavior_old_action_probability(0.0, None), None);
+        assert_eq!(soccer_behavior_old_action_probability(None, None), None);
     }
 
     #[test]
@@ -1002,6 +1005,7 @@ mod tests {
             action_target: None,
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
+            behavior_policy_probability: None,
             action: "pass".to_string(),
         };
 
@@ -1009,6 +1013,7 @@ mod tests {
         let option_context =
             soccer_action_option_learning_context(&decision.action, &decision.action_options);
         assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+        assert_eq!(decision.behavior_policy_probability, Some(0.20));
         assert_eq!(decision.action_options.len(), 1);
         assert!((decision.action_options[0].probability - 0.20).abs() < 1e-9);
 
@@ -1373,6 +1378,7 @@ mod tests {
                 rejected_execution_probability: 0.02,
                 candidate_count: 1,
             }),
+            behavior_policy_probability: None,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -1454,6 +1460,59 @@ mod tests {
             .expect("keeper short distribution action");
         assert_eq!(samples[0].action_index, distribute_short);
         assert!(samples[0].advantage < 0.0);
+    }
+
+    #[test]
+    fn actor_advantage_marl_tick_rewards_exclude_rejected_mpc_counterexamples() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let player = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = sim.neural_decision_transition(
+            &snapshot,
+            player.id,
+            player.team,
+            player.role,
+            &mdp_state,
+            &observation,
+        );
+        realized.tick = 77;
+        realized.action = "hold".to_string();
+        realized.reward = 1.0;
+
+        let mut rejected = realized.clone();
+        rejected.action = "pass".to_string();
+        rejected.reward = -2.5;
+        rejected.decision_context.learned_mpc_replanned = true;
+        rejected.decision_context.learned_mpc_original_action = Some("pass".to_string());
+        rejected.decision_context.learned_mpc_replacement_action = Some("hold".to_string());
+
+        let tick_rewards =
+            soccer_actor_advantage_tick_rewards(&[realized.clone(), rejected.clone()]);
+        let tick_reward = tick_rewards.get(&77).copied().expect("tick reward");
+        assert!((tick_reward.average_for(Team::Home) - 1.0).abs() < 1e-9);
+
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            marl_algorithm: SoccerMarlAlgorithm::Mappo,
+            mappo_team_reward_share: 1.0,
+            marl_team_reward_weight: 0.0,
+            marl_intermediate_reward_weight: 1.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        assert_eq!(
+            soccer_actor_advantage_reward(&realized, &tick_rewards, &config),
+            1.0
+        );
+        assert_eq!(
+            soccer_actor_advantage_reward(&rejected, &tick_rewards, &config),
+            -2.5
+        );
     }
 
     #[test]
@@ -1942,6 +2001,40 @@ fn learned_mpc_rejected_action_counterexample(transition: &SoccerLearningTransit
 fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
     !transition.decision_context.learned_mpc_replanned
         || learned_mpc_rejected_action_counterexample(transition)
+}
+
+fn soccer_actor_advantage_tick_rewards(
+    transitions: &[SoccerLearningTransition],
+) -> HashMap<u64, SoccerMarlTickReward> {
+    let mut tick_rewards = HashMap::new();
+    for transition in transitions
+        .iter()
+        .filter(|transition| !learned_mpc_rejected_action_counterexample(transition))
+    {
+        tick_rewards
+            .entry(transition.tick)
+            .or_insert_with(SoccerMarlTickReward::default)
+            .record(
+                transition.team,
+                transition.reward,
+                transition
+                    .observation
+                    .neural_extended
+                    .energy_waste_pressure,
+            );
+    }
+    tick_rewards
+}
+
+fn soccer_actor_advantage_reward(
+    transition: &SoccerLearningTransition,
+    tick_rewards: &HashMap<u64, SoccerMarlTickReward>,
+    config: &SoccerNeuralLearningConfig,
+) -> f64 {
+    if learned_mpc_rejected_action_counterexample(transition) {
+        return finite_metric(transition.reward);
+    }
+    soccer_marl_adjusted_reward(transition, tick_rewards, config)
 }
 
 fn learned_mpc_rejected_action_reward(rejected_execution_probability: f64) -> f64 {
@@ -5519,8 +5612,11 @@ impl SoccerMatch {
                 .unwrap_or_else(|| soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma))
         };
 
-        // Per-tick team reward aggregation for centralized MARL shaping.
-        let tick_rewards = soccer_marl_tick_rewards(replay);
+        // Per-tick team reward aggregation for centralized MARL shaping. Synthetic
+        // learned-MPC rejected-action rows are actor counterexamples, not events
+        // the team actually produced on the pitch, so they stay out of the team
+        // mean and keep their own direct penalty below.
+        let tick_rewards = soccer_actor_advantage_tick_rewards(replay);
 
         // Per-transition row: the MARL-adjusted reward (critic value in reward units), terminal
         // flag, action index, and state features. Both convergent cooperative-MARL shapings are
@@ -5531,7 +5627,11 @@ impl SoccerMatch {
         let reward_adv: Vec<f64> = replay
             .iter()
             .map(|transition| {
-                soccer_marl_adjusted_reward(transition, &tick_rewards, &self.config.neural_learning)
+                soccer_actor_advantage_reward(
+                    transition,
+                    &tick_rewards,
+                    &self.config.neural_learning,
+                )
             })
             .collect();
         let values: Vec<f64> = replay
@@ -5612,8 +5712,10 @@ impl SoccerMatch {
                     .as_ref()
                     .and_then(|head| head.action_distribution(&state_features))
                     .and_then(|probs| probs.get(action_index).copied());
+                // Stochastic top-k selection records the true behavior policy;
+                // older/deterministic rows fall back to the actor head.
                 let old_action_probability = soccer_behavior_old_action_probability(
-                    transition.decision_context.chosen_action_probability,
+                    transition.decision_context.behavior_policy_probability,
                     actor_probability,
                 );
                 advantage.is_finite().then(|| SoccerPolicySample {
@@ -18686,6 +18788,15 @@ pub struct TeammateSpacingNotice {
 #[serde(rename_all = "camelCase")]
 pub struct WorldSnapshot {
     pub tick: u64,
+    /// The match `config.seed`, carried onto the snapshot so the immutable
+    /// decision path can derive a reproducible per-decision draw for stochastic
+    /// top-k policy selection (see
+    /// [`crate::des::general::soccer::policy_select`]) without a mutable RNG.
+    /// Only read when `DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` is on, so it is
+    /// inert (byte-identical) by default. `#[serde(default)]` keeps old snapshots
+    /// loadable.
+    #[serde(default)]
+    pub decision_seed: u64,
     /// Dedicated GK head's sweep-vs-set commit bias per team (`[home, away]`), in `[-1, 1]`.
     /// `0.0` unless `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is on and the head is warm; read by
     /// [`WorldSnapshot::goalkeeper_should_commit_to_loose_ball`]. Computed on the sim side (where
@@ -20445,6 +20556,7 @@ impl WorldSnapshot {
 
         let mut snapshot = WorldSnapshot {
             tick: m.tick,
+            decision_seed: m.config.seed as u64,
             keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
