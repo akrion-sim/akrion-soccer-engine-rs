@@ -27,6 +27,18 @@ const STATIONARY_HOLDER_TARGET_EPSILON_YARDS: f64 = 0.72;
 const STATIONARY_HOLDER_CARRY_MAX_PRESSURE: f64 = 0.34;
 const STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS: f64 = 2.25;
 const STATIONARY_HOLDER_CARRY_TARGET_YARDS: f64 = 4.2;
+// First-touch escape: when a stationary receiver is under pressure (the band the calm
+// stationary-carry helper bails on) it must move the ball out of its feet rather than freeze
+// on a static shield. The escape probes a corridor this wide (half-width, yards) for clearance
+// along each candidate direction.
+const FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS: f64 = 3.0;
+// The escape only commits to a direction that actually gains this much distance from the nearest
+// presser — so the carrier never dribbles INTO the man it is escaping (and so a genuinely boxed-in
+// carrier falls through to the shield instead of a pointless shuffle).
+const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
+// ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
+// first touch lands in real space, not under a second defender.
+const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -17884,6 +17896,17 @@ fn dd_soccer_disable_hold_drive_into_space() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE").is_ok())
 }
+/// Disables the "first-touch escape under pressure" mechanic, restoring the prior behaviour where a
+/// stationary carrier under pressure stays put on a static shield (the freeze the user flagged).
+/// Default-off: the escape is ON, so a pressed stationary receiver pushes the ball out of its feet
+/// into the safest available space (forward into a clear lane if there is one, else lateral away
+/// from the presser, else — for defenders / own-third carriers — a safe backward outlet). When no
+/// direction clears the cushion bar the carrier is genuinely boxed in and the shield is retained.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
+}
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
 /// from the real receiver controller, so moving the aim/speed off the analytic misses). Enable for
@@ -33482,6 +33505,130 @@ impl WorldSnapshot {
         (straight * (1.0 - goal_blend) + to_goal * goal_blend).normalized()
     }
 
+    /// A pressed, stationary receiver must get the ball out of its feet rather than freeze on a
+    /// static shield. Returns the best escape carry target — forward into a clear lane when one
+    /// exists, otherwise lateral away from the presser, otherwise (for defenders / own-third
+    /// carriers only) a safe backward outlet — or `None` when the carrier is genuinely boxed in
+    /// (no direction both gains a cushion on the presser and lands in real space), in which case
+    /// the caller keeps the existing shield. Gated; `None` when disabled so OFF is byte-identical.
+    ///
+    /// Never returns a target toward the presser: every candidate must INCREASE distance from the
+    /// nearest opponent by [`FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS`], so this can only push the
+    /// carrier into space, never dribble it into the tackle.
+    fn first_touch_escape_carry_target_for(
+        &self,
+        me: &PlayerSnapshot,
+        current: Vec2,
+        kind: Option<DribbleMoveKind>,
+    ) -> Option<Vec2> {
+        if dd_soccer_disable_first_touch_escape() {
+            return None;
+        }
+        // Nutmeg / xavi-turn are themselves close-control evasive moves with their own geometry —
+        // don't second-guess them with a carry redirect.
+        if matches!(kind, Some(DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn)) {
+            return None;
+        }
+        let opp = me.team.other();
+        let (_, defender_pos, _) = self.nearest_opponent_at(me.team, current)?;
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        // Unit vector pointing away from the presser (the safe side to shield/escape toward).
+        let away = {
+            let v = current - defender_pos;
+            if v.len() < 1e-6 {
+                forward
+            } else {
+                v.normalized()
+            }
+        };
+        // Defenders (and any carrier pinned deep in its own third) may retreat to safety; an
+        // advanced attacker should not bail backward — for them the escape is forward/lateral or
+        // nothing (fall through to the shield).
+        let own_goal_y = me.team.goal_y(self.field_length);
+        let own_third_depth = (current.y - own_goal_y).abs();
+        let backward_ok = matches!(me.role, PlayerRole::Defender | PlayerRole::Goalkeeper)
+            || own_third_depth <= self.field_length / 3.0;
+        let role_forward_weight = match me.role {
+            PlayerRole::Forward => 1.0,
+            PlayerRole::Midfielder => 0.85,
+            PlayerRole::Defender => 0.55,
+            PlayerRole::Goalkeeper => 0.35,
+        };
+        // Candidate escape directions, biased toward the open (away-from-presser) side and forward.
+        let lateral_away = Vec2::new(away.x.signum().max(-1.0).min(1.0), 0.0);
+        let lateral_away = if lateral_away.len() < 1e-6 {
+            away
+        } else {
+            lateral_away.normalized()
+        };
+        let mut directions: Vec<Vec2> = vec![
+            forward,
+            (forward + lateral_away * 0.7).normalized(),
+            (forward * 0.6 + away).normalized(),
+            lateral_away,
+            away,
+        ];
+        if backward_ok {
+            directions.push((Vec2::new(0.0, -attack_dir) * 0.6 + lateral_away).normalized());
+            directions.push((Vec2::new(0.0, -attack_dir) * 0.7 + away * 0.7).normalized());
+        }
+        // Directional clearance probe: free distance to the nearest opponent inside a corridor
+        // along `dir` (the arbitrary-direction analogue of `forward_dribble_space_yards`).
+        let dir_space = |dir: Vec2| -> f64 {
+            let max_space = DRIBBLE_MAX_TOUCH_YARDS;
+            let mut nearest = max_space;
+            for o in self.players.iter().filter(|p| p.team == opp) {
+                let to = self.player_snapshot_position(o) - current;
+                let along = to.dot(dir);
+                if along <= 0.0 || along > max_space {
+                    continue;
+                }
+                let lateral = (to - dir * along).len();
+                if lateral <= FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        let base_cushion = current.distance(defender_pos);
+        directions
+            .into_iter()
+            .filter(|dir| dir.len() > 1e-6)
+            .filter_map(|dir| {
+                let space = dir_space(dir);
+                let step = STATIONARY_HOLDER_CARRY_TARGET_YARDS
+                    .min(DRIBBLE_MAX_TOUCH_YARDS)
+                    .min(space);
+                if step < STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS {
+                    return None;
+                }
+                let raw = current + dir * step;
+                let landing = raw.clamp_to_pitch(self.field_width, self.field_length);
+                // The clamp must not eat the whole step (escape off the touchline is no escape).
+                if landing.distance(current) < STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS {
+                    return None;
+                }
+                let cushion_gain = landing.distance(defender_pos) - base_cushion;
+                if cushion_gain < FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS {
+                    return None;
+                }
+                let landing_clear = self.nearest_opponent_distance_at(me.team, landing);
+                if landing_clear < FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS {
+                    return None;
+                }
+                let forward_gain = (landing.y - current.y) * attack_dir;
+                let open_space = (self.space_score_at(landing, me.team) / 12.0).clamp(0.0, 1.0);
+                let score = forward_gain * role_forward_weight
+                    + cushion_gain * 0.9
+                    + landing_clear * 0.18
+                    + open_space * 1.4;
+                Some((landing, score))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(landing, _)| landing)
+    }
+
     pub(crate) fn stationary_holder_open_space_carry_target_for(
         &self,
         player_id: usize,
@@ -33510,7 +33657,10 @@ impl WorldSnapshot {
             .map(|(_, _, distance)| distance)
             .unwrap_or(f64::INFINITY);
         if pressure_from_nearest_distance(nearest_opponent) > STATIONARY_HOLDER_CARRY_MAX_PRESSURE {
-            return None;
+            // Pressured: the calm forward-carry below assumes space and time the carrier no longer
+            // has. Don't freeze — move the ball out of the feet into the safest escape (gated;
+            // returns None when truly boxed in, restoring the prior shield-in-place behaviour).
+            return self.first_touch_escape_carry_target_for(me, current, kind);
         }
         let forward_space = self.forward_dribble_space_yards(player_id);
         if forward_space < WON_BALL_DRIVE_MIN_SPACE_YARDS {
