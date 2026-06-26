@@ -46620,6 +46620,8 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         runaround: player.runaround,
         hold_for_support: player.hold_for_support.clone(),
         slide_recovery_seconds: player.slide_recovery_seconds,
+        decision_commit_ticks: VecDeque::new(),
+        last_intent: None,
     }
 }
 
@@ -55042,6 +55044,8 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 runaround: None,
                 hold_for_support: None,
                 slide_recovery_seconds: 0.0,
+                decision_commit_ticks: VecDeque::new(),
+                last_intent: None,
             });
         }
     }

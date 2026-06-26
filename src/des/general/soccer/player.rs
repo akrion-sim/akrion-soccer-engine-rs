@@ -1095,6 +1095,16 @@ pub struct PlayerAgent {
     /// on the miss and bled down by `dt` each live tick. `0.0` = on its feet.
     #[serde(default)]
     pub slide_recovery_seconds: f64,
+    /// Ticks at which this player last *committed a changed deliberative decision* (most recent
+    /// last, capped at the two the refractory gate needs). Drives
+    /// [`PlayerAgent::apply_decision_refractory`]. Empty while the refractory is disabled, so it
+    /// is skipped from serialization and leaves snapshots byte-identical.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub decision_commit_ticks: VecDeque<u64>,
+    /// The intent emitted last tick, replayed to continue a held decision when a change is
+    /// refractory-blocked. `None` until the first decision / while the refractory is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_intent: Option<PlayerIntent>,
 }
 
 fn soccer_pressured_contested_pass_damp_enabled() -> bool {
@@ -2186,6 +2196,44 @@ fn mpc_reselects_candidate(
                         .decision_mpc
                         .reselect_min_ball_execution_probability
         })
+}
+
+/// Minimum ticks between two consecutive deliberative decisions (≈0.20 s at 15 Hz): at most one
+/// changed decision per 3 ticks. See [`PlayerAgent::apply_decision_refractory`].
+const DECISION_REFRACTORY_MIN_GAP_TICKS: u64 = 3;
+/// The second-to-last decision must be this many ticks old before a third may commit (≈0.47 s):
+/// at most two changed decisions per 7-tick window. Combined with the 3-tick min gap this gives
+/// the 3,4,3,4-tick cadence (decisions on ticks 1, 4, 8, 11, 15…).
+const DECISION_REFRACTORY_WINDOW_TICKS: u64 = 7;
+
+/// Master switch for the deliberative-decision refractory. OFF by default ⇒ players re-decide
+/// freely every tick exactly as before (byte-identical); set `DD_SOCCER_ENABLE_DECISION_REFRACTORY`
+/// to rate-limit how often a player may *change its mind* (human reaction time + processing +
+/// momentum). The new `PlayerAgent` continuity fields stay empty while disabled, so serialized
+/// snapshots are unchanged too.
+pub(crate) fn decision_refractory_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DECISION_REFRACTORY").is_ok())
+}
+
+/// True when the refractory forbids committing a changed decision at tick `now`, given the ticks
+/// of the last (up to two) committed decisions. Allowed iff it has been ≥3 ticks since the last
+/// decision **and** ≥7 ticks since the second-to-last.
+fn decision_refractory_blocks(commit_ticks: &VecDeque<u64>, now: u64) -> bool {
+    let len = commit_ticks.len();
+    if let Some(&last) = commit_ticks.back() {
+        if now.saturating_sub(last) < DECISION_REFRACTORY_MIN_GAP_TICKS {
+            return true;
+        }
+    }
+    if len >= 2 {
+        let second_last = commit_ticks[len - 2];
+        if now.saturating_sub(second_last) < DECISION_REFRACTORY_WINDOW_TICKS {
+            return true;
+        }
+    }
+    false
 }
 
 fn agentic_action_commitment(
@@ -6272,7 +6320,144 @@ impl PlayerAgent {
         snapshot.possession_wide_lane_floor_adjusted_intent(intent)
     }
 
+    /// Per-tick decision entry. Thin wrapper over [`Self::run_time_step_with_context_inner`]
+    /// that enforces the *deliberative decision refractory* (see
+    /// [`decision_refractory_enabled`]): a player re-derives its intent every tick (15 Hz),
+    /// but human reaction time + mental processing + momentum mean it cannot keep *changing
+    /// its mind* that fast. The inner pass produces the freshly-ranked intent; this wrapper
+    /// then decides whether the player is allowed to *commit a changed deliberative decision*
+    /// this tick or must continue the one it already committed to. Re-selecting the same
+    /// intent (steering/re-aiming it with fresh perception) is free and never throttled — we
+    /// rate-limit the *switch*, not the *tracking*. Gate is OFF by default ⇒ byte-identical.
     pub fn run_time_step_with_context(
+        &mut self,
+        snapshot: &WorldSnapshot,
+        mdp_state: SoccerMdpState,
+        observation: SoccerPomdpObservation,
+        human_input: Option<&HumanInputFrame>,
+        learned_plan: Option<&SoccerLearnedPlan>,
+        rng: &mut SeededRandom,
+    ) -> PlayerIntent {
+        if !decision_refractory_enabled() {
+            return self.run_time_step_with_context_inner(
+                snapshot,
+                mdp_state,
+                observation,
+                human_input,
+                learned_plan,
+                rng,
+            );
+        }
+        // The decision currently committed (held from a prior tick), captured before the
+        // inner pass overwrites `last_decision` with the freshly-ranked one.
+        let held_decision = self.last_decision.clone();
+        let held_label = held_decision
+            .as_ref()
+            .map(|d| normalize_soccer_action_label(&d.action).to_string());
+        let now = snapshot.tick;
+
+        let intent = self.run_time_step_with_context_inner(
+            snapshot,
+            mdp_state,
+            observation,
+            human_input,
+            learned_plan,
+            rng,
+        );
+
+        let intent = self.apply_decision_refractory(now, held_label, held_decision, intent);
+        self.last_intent = Some(intent.clone());
+        intent
+    }
+
+    /// Enforce the deliberative-decision refractory on the freshly-ranked intent.
+    ///
+    /// A *changed* deliberative decision (the canonical action label differs from the one the
+    /// player was already committed to) is only allowed to commit when **both** rate limits
+    /// clear: at least [`DECISION_REFRACTORY_MIN_GAP_TICKS`] (3) ticks since the last decision,
+    /// **and** at least [`DECISION_REFRACTORY_WINDOW_TICKS`] (7) ticks since the second-to-last.
+    /// That yields a 3,4,3,4-tick cadence — decisions land on ticks 1, 4, 8, 11, 15… — i.e. at
+    /// most 2 deliberative decisions in any 7-tick window, with the third possible on the 8th
+    /// tick. Re-selecting the same label is not a decision and passes through untouched. When a
+    /// change is blocked the player *continues the intent it already committed to* (replayed
+    /// from `last_intent`) so it does not freeze in no-man's-land; if the held intent cannot be
+    /// continued (a ball-release one-shot already played, a challenge), the change is allowed
+    /// through rather than emitting something illegal.
+    fn apply_decision_refractory(
+        &mut self,
+        now: u64,
+        held_label: Option<String>,
+        held_decision: Option<AgentDecisionTrace>,
+        intent: PlayerIntent,
+    ) -> PlayerIntent {
+        let Some(proposed_label) = self
+            .last_decision
+            .as_ref()
+            .map(|d| normalize_soccer_action_label(&d.action).to_string())
+        else {
+            return intent;
+        };
+
+        let is_change = held_label.as_deref() != Some(proposed_label.as_str());
+        if !is_change {
+            // Continuing the same deliberative decision — free, never throttled.
+            return intent;
+        }
+
+        // The very first decision (nothing held yet) commits immediately and arms the timer.
+        if held_label.is_none() {
+            self.push_decision_commit_tick(now);
+            return intent;
+        }
+
+        if !decision_refractory_blocks(&self.decision_commit_ticks, now) {
+            self.push_decision_commit_tick(now);
+            return intent;
+        }
+
+        // Blocked: keep executing the previously committed decision if it can be continued.
+        if let Some(held_intent) = self.continuation_intent() {
+            self.last_decision = held_decision;
+            return held_intent;
+        }
+
+        // Cannot replay the held intent (released ball / committed challenge): allow the change
+        // rather than emit an illegal continuation, and re-arm the timer on the new commitment.
+        self.push_decision_commit_tick(now);
+        intent
+    }
+
+    /// Replay the previously emitted intent when a decision change is refractory-blocked.
+    /// Only *sustainable* held actions can be continued tick-to-tick; a ball-release one-shot
+    /// (pass/shot/clearance) or a committed challenge (tackle) returns `None` — the ball state
+    /// has moved on, so the new decision must be allowed instead.
+    fn continuation_intent(&self) -> Option<PlayerIntent> {
+        let held = self.last_intent.as_ref()?;
+        match held.action {
+            SoccerAction::HoldShape
+            | SoccerAction::MoveTo(_)
+            | SoccerAction::Dribble(_)
+            | SoccerAction::DribbleMove { .. }
+            | SoccerAction::ControlTouch { .. } => Some(held.clone()),
+            SoccerAction::Pass { .. }
+            | SoccerAction::Clearance { .. }
+            | SoccerAction::RouteOne { .. }
+            | SoccerAction::Shoot { .. }
+            | SoccerAction::Tackle { .. }
+            | SoccerAction::SlideTackle { .. } => None,
+        }
+    }
+
+    /// Record the tick at which a changed deliberative decision was committed, keeping only the
+    /// last two (all the refractory gate needs).
+    fn push_decision_commit_tick(&mut self, now: u64) {
+        self.decision_commit_ticks.push_back(now);
+        while self.decision_commit_ticks.len() > 2 {
+            self.decision_commit_ticks.pop_front();
+        }
+    }
+
+    fn run_time_step_with_context_inner(
         &mut self,
         snapshot: &WorldSnapshot,
         mdp_state: SoccerMdpState,
@@ -11168,4 +11353,84 @@ pub struct SoccerLearnedPlan {
     pub target_player: Option<usize>,
     pub target_point: Option<Vec2>,
     pub mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
+}
+
+#[cfg(test)]
+mod decision_refractory_tests {
+    use super::{
+        decision_refractory_blocks, DECISION_REFRACTORY_MIN_GAP_TICKS,
+        DECISION_REFRACTORY_WINDOW_TICKS,
+    };
+    use std::collections::VecDeque;
+
+    /// Drive the gate the way `apply_decision_refractory` does — at every tick the player *wants*
+    /// to change its mind; record the ticks on which a changed decision is actually allowed to
+    /// commit. The spec: at most 1 decision per 3 ticks AND 2 per 7-tick window, i.e. a
+    /// 3,4,3,4-tick cadence with the third decision possible on the 8th tick.
+    fn committed_ticks(span: u64) -> Vec<u64> {
+        let mut commits: VecDeque<u64> = VecDeque::new();
+        let mut allowed = Vec::new();
+        for now in 0..span {
+            // First decision (empty history) always commits; otherwise honour the gate.
+            if commits.is_empty() || !decision_refractory_blocks(&commits, now) {
+                allowed.push(now);
+                commits.push_back(now);
+                while commits.len() > 2 {
+                    commits.pop_front();
+                }
+            }
+        }
+        allowed
+    }
+
+    #[test]
+    fn refractory_yields_3_4_cadence_two_per_seven_ticks() {
+        // Starting from tick 0: 0, +3, +4, +3, +4 ... = 0,3,7,10,14,17 over 18 ticks.
+        assert_eq!(committed_ticks(18), vec![0, 3, 7, 10, 14, 17]);
+    }
+
+    #[test]
+    fn refractory_caps_two_decisions_per_seven_tick_window() {
+        let commits = committed_ticks(30);
+        for &t in &commits {
+            let in_window = commits
+                .iter()
+                .filter(|&&u| u <= t && t.saturating_sub(u) < DECISION_REFRACTORY_WINDOW_TICKS)
+                .count();
+            assert!(
+                in_window <= 2,
+                "tick {t}: {in_window} decisions within a {DECISION_REFRACTORY_WINDOW_TICKS}-tick window"
+            );
+        }
+    }
+
+    #[test]
+    fn refractory_enforces_min_gap_between_consecutive_decisions() {
+        let commits = committed_ticks(30);
+        for pair in commits.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= DECISION_REFRACTORY_MIN_GAP_TICKS,
+                "consecutive decisions {} and {} closer than the min gap",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn third_decision_lands_on_the_eighth_tick_after_a_first_tick_start() {
+        // Mirror the user's framing with a 1-based first decision on tick 1: 1, 4, 8.
+        let mut commits: VecDeque<u64> = VecDeque::new();
+        let mut allowed = Vec::new();
+        for now in 1..=8 {
+            if commits.is_empty() || !decision_refractory_blocks(&commits, now) {
+                allowed.push(now);
+                commits.push_back(now);
+                while commits.len() > 2 {
+                    commits.pop_front();
+                }
+            }
+        }
+        assert_eq!(allowed, vec![1, 4, 8]);
+    }
 }
