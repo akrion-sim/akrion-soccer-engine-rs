@@ -1927,7 +1927,23 @@ fn run_game(
         SoccerMatch::default_11v11(config).with_team_policies((*starting_policies).clone());
     sim.set_uniform_elite_players();
     if let Some(snapshot) = initial_neural_network.as_ref() {
-        sim.set_neural_network_snapshot((**snapshot).clone())?;
+        // Warm-starting the neural net from a persisted snapshot is best-effort: a
+        // snapshot whose input_dim no longer matches the current feature schema
+        // (append-only feature additions not covered by SOCCER_NEURAL_LEGACY_FEATURE_DIMS)
+        // must NOT abort the whole run — that would freeze the learner indefinitely.
+        // Drop the stale snapshot and start the net cold at the current dim. The game
+        // still warm-starts the tabular policy + tactical weights, trains a fresh net,
+        // and persists a forward-compatible snapshot, so subsequent games warm-start
+        // normally (self-healing). Any other snapshot error still aborts.
+        if let Err(err) = sim.set_neural_network_snapshot((**snapshot).clone()) {
+            if err.contains("input_dim") && err.contains("does not match expected") {
+                eprintln!(
+                    "soccer warm-start: dropping incompatible neural snapshot, starting net cold ({err})"
+                );
+            } else {
+                return Err(err);
+            }
+        }
     }
     for window in adversarial_moment_windows.iter() {
         sim.remember_adversarial_moment_window(window.clone());
