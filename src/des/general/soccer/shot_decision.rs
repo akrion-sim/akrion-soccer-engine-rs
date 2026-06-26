@@ -263,13 +263,15 @@ impl ShotTriggerInputs {
 /// lane, executability) multiply it down.
 pub fn analytic_shot_trigger_value(inputs: &ShotTriggerInputs) -> f64 {
     let d = inputs.yards_to_goal.max(0.0);
-    // Distance base: the reward curve. 1.0 inside 16yd, → ~0.4 at 20yd, → ~0 at 30yd.
-    let distance_base = if d <= 16.0 {
+    // Distance base: full value inside ~18yd, ramping down through the 18→22yd band (the
+    // "20 or 15, not 25" zone) and toward zero by 30yd. Tuned so a clean 15-20yd chance
+    // stays high while a 25yd+ shot is low — the discipline anchor.
+    let distance_base = if d <= 18.0 {
         1.0
-    } else if d <= 20.0 {
-        1.0 - (d - 16.0) / 4.0 * 0.6
+    } else if d <= 22.0 {
+        1.0 - (d - 18.0) / 4.0 * 0.55 // 1.0 @18 → 0.45 @22
     } else {
-        (0.4 - (d - 20.0) / 10.0 * 0.4).max(0.0)
+        (0.45 - (d - 22.0) / 8.0 * 0.45).max(0.0) // 0.45 @22 → 0 @30
     };
 
     // A genuine long-range chance lifts the far tail back up: an open net / stranded
@@ -279,32 +281,44 @@ pub fn analytic_shot_trigger_value(inputs: &ShotTriggerInputs) -> f64 {
         + inputs.keeper_out_of_position * 0.30
         + inputs.rebound_second_chance * 0.25)
         .clamp(0.0, 1.0);
-    let distance_value = (distance_base + (1.0 - distance_base) * long_range_merit * 0.6).clamp(0.0, 1.0);
+    let distance_value =
+        (distance_base + (1.0 - distance_base) * long_range_merit * 0.6).clamp(0.0, 1.0);
 
-    // Quality gates (multiplicative): acute angles, a blocked lane, a covered net, or
-    // a body that can't strike the ball all kill the shot value.
+    // Two hard geometric gates (a near-impossible angle or a closed/blocked lane really do
+    // kill a shot) ...
     let angle_fit = (inputs.shot_angle_degrees / REF_SHOT_ANGLE_DEGREES).clamp(0.0, 1.0);
-    let angle_gate = (0.25 + 0.75 * angle_fit).clamp(0.0, 1.0);
+    let angle_gate = (0.45 + 0.55 * angle_fit).clamp(0.0, 1.0);
     let lane_gate = if inputs.shot_lane_open { 1.0 } else { 0.55 };
-    let block_gate = (1.0 - inputs.block_probability.clamp(0.0, 1.0) * 0.85).clamp(0.10, 1.0);
-    let on_frame_gate = (0.35 + 0.65 * inputs.on_frame_probability.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-    // Beat-keeper / open-net: a shot the keeper smothers is low value, but a live
-    // rebound restores a floor.
-    let keeper_gate = (0.30
-        + 0.70 * inputs.beat_goalkeeper_probability.clamp(0.0, 1.0))
-        .max(inputs.rebound_second_chance * 0.6)
-        .clamp(0.0, 1.0);
-    let mechanics_gate = (0.30 + 0.70 * inputs.body_mechanics_fit.clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
-    (distance_value * angle_gate * lane_gate * block_gate * on_frame_gate * keeper_gate * mechanics_gate)
-        .clamp(0.0, 1.0)
+    // ... plus ONE soft quality term (additive, not a compounding product — the old
+    // multiplicative stack crushed even clean 18yd chances toward zero). On-frame and a
+    // beatable/exposed keeper lift; a likely block pulls down; body mechanics scale it.
+    let keeper_exposure = inputs
+        .beat_goalkeeper_probability
+        .max(inputs.open_goal_fraction)
+        .max(inputs.keeper_out_of_position)
+        .max(inputs.rebound_second_chance)
+        .clamp(0.0, 1.0);
+    let quality = (0.55
+        + 0.30 * inputs.on_frame_probability.clamp(0.0, 1.0)
+        + 0.20 * keeper_exposure
+        - 0.35 * inputs.block_probability.clamp(0.0, 1.0))
+        .clamp(0.25, 1.0);
+    let mechanics = (0.55 + 0.45 * inputs.body_mechanics_fit.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
+    (distance_value * angle_gate * lane_gate * quality * mechanics).clamp(0.0, 1.0)
 }
 
-/// Map the shot-trigger value `[0,1]` to a multiplier on the engine's `shot_score`,
-/// centered so a mid-value chance is roughly neutral: a low-value (far, covered) shot
-/// is suppressed toward `~0.2×`, a high-value (close, open) one lifted toward `~1.35×`.
+/// Map the shot-trigger value `[0,1]` to a soft multiplier on the engine's `shot_score`
+/// (and the forced-path commitment chances). A low-value (far / covered) shot is demoted
+/// toward `~0.10×`, a high-value close/open chance lifted toward `~1.30×`. Deliberately
+/// *linear* and not crushing in the mid-band: a clean 18-20yd chance (value ~0.6-0.8) keeps
+/// near-full score so the striker still shoots from range it *should*. The hard ">22yd
+/// unless the value is real" cut-off is done separately by the forced-path veto, so this
+/// term only needs to nudge, not gate.
 pub fn shot_trigger_score_multiplier(value: f64) -> f64 {
-    (0.20 + 1.30 * value.clamp(0.0, 1.0)).clamp(0.20, 1.35)
+    let v = value.clamp(0.0, 1.0);
+    (0.10 + 1.20 * v).clamp(0.10, 1.30)
 }
 
 /// One reward-weighted RL row for the shot-trigger head: the state at a shot decision,
@@ -564,7 +578,24 @@ impl SoccerMatch {
         if tick % SHOT_TRIGGER_SAMPLE_INTERVAL_TICKS != 0 {
             return;
         }
-        let Some(holder) = snapshot.ball.holder else {
+        // The shot decision belongs to whoever is in control of the ball — but `holder` is
+        // only set on contact ticks, so most ticks it is `None`. Fall back to the attacking
+        // (last-touch) outfielder nearest the ball, i.e. the player in a shooting position.
+        let candidate = snapshot.ball.holder.or_else(|| {
+            let attacking_team = snapshot.ball.last_touch_team?;
+            snapshot
+                .players
+                .iter()
+                .filter(|p| p.team == attacking_team && p.role != PlayerRole::Goalkeeper)
+                .min_by(|a, b| {
+                    a.position
+                        .distance(snapshot.ball.position)
+                        .partial_cmp(&b.position.distance(snapshot.ball.position))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|p| p.id)
+        });
+        let Some(holder) = candidate else {
             return;
         };
         let Some(me) = snapshot.players.iter().find(|p| p.id == holder) else {
@@ -572,8 +603,12 @@ impl SoccerMatch {
         };
         let observation = snapshot.observation_for(holder);
         // Only sample attackers in a plausible shooting window — otherwise the corpus is
-        // dominated by midfield carriers who would never shoot.
-        if me.role == PlayerRole::Goalkeeper || observation.yards_to_goal > 32.0 {
+        // dominated by midfield carriers who would never shoot. Require the candidate to be
+        // close enough to the ball to actually be the one deciding to shoot.
+        if me.role == PlayerRole::Goalkeeper
+            || observation.yards_to_goal > 32.0
+            || me.position.distance(snapshot.ball.position) > 4.0
+        {
             return;
         }
         let shooting = ability01(me.skills.shooting);
@@ -738,7 +773,7 @@ mod shot_trigger_tests {
     fn score_multiplier_is_monotone_and_bounded() {
         let lo = shot_trigger_score_multiplier(0.0);
         let hi = shot_trigger_score_multiplier(1.0);
-        assert!(lo >= 0.20 && hi <= 1.35 && hi > lo);
+        assert!(lo >= 0.10 && lo <= 0.11 && hi <= 1.30 && hi > lo);
     }
 
     #[test]
