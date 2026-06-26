@@ -18018,7 +18018,12 @@ fn defensive_line_cushion_suspends_band_inside_own_twenty_yards() {
 }
 
 #[test]
-fn defensive_line_cushion_allows_parity_inside_own_twenty_yards() {
+fn defensive_line_cushion_holds_six_yard_line_inside_emergency_zone_in_open_play() {
+    // Even with the ball deep inside our own 5-yard emergency zone, in OPEN PLAY the back four no
+    // longer sinks to parity on the goal-line: one team-mate collects the ball while the rest hold
+    // the 6-yard line as a flat offside trap. Here the back four sits on the goal-line (y=1) with a
+    // settled opponent ball at y=4 (inside the zone, line not advanced enough to be a breakthrough);
+    // a non-collecting defender's target is pulled UP to the 6-yard line.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 22,
@@ -18039,7 +18044,7 @@ fn defensive_line_cushion_allows_parity_inside_own_twenty_yards() {
     assert_eq!(home_def.len(), 4, "test needs a back four");
 
     for &d in &home_def {
-        sim.players[d].position = Vec2::new(30.0, 4.0);
+        sim.players[d].position = Vec2::new(30.0, 1.0);
     }
     sim.players[away_id].position = Vec2::new(40.0, 4.0);
     sim.ball.holder = Some(away_id);
@@ -18049,11 +18054,12 @@ fn defensive_line_cushion_allows_parity_inside_own_twenty_yards() {
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    let parity = Vec2::new(sim.players[home_def[1]].position.x, sim.ball.position.y);
-    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], parity);
+    let deep_target = Vec2::new(sim.players[home_def[1]].position.x, 1.0);
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_target);
     assert!(
-        (adjusted.y - parity.y).abs() < 1e-9,
-        "inside the own 20-yard emergency zone, parity with the ball is allowed: target={adjusted:?} parity={parity:?}"
+        adjusted.y >= 5.0 && adjusted.y <= 8.0,
+        "open play in the emergency zone: hold the 6-yard line, not parity on the goal-line: \
+         target={adjusted:?}"
     );
 }
 

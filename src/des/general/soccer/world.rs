@@ -29605,11 +29605,23 @@ impl WorldSnapshot {
         let ball_fwd = fwd(self.ball.position);
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
-        // The band is suspended only inside THIS team's own 20-yard emergency zone
-        // (parity with the ball is fine there; forcing 10yd behind can shove the
-        // line off the end-line). Otherwise it applies even when the line has
-        // drifted ahead of the ball: that is exactly what this pull fixes.
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
+        // Six-yard-line stickiness: in OPEN PLAY the back four's AVERAGE holds the 6-yard line as
+        // its effective end-line rather than sinking onto our own goal-line. Lifted when the offside
+        // law is suspended (a restart legitimately drops the line off — corners &c.) and while an
+        // opponent is breaking clean through (the line must drop to cover the goal). Computed up
+        // front because it also governs the own-goal emergency-zone exemption below.
+        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
+        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
+            && !self.offside_currently_suspended()
+            && self.opponent_breakthrough_ball_carrier(me.team).is_none();
+        // Inside our own 5-yard emergency zone the deep-ball band is normally suspended (parity
+        // with the ball is fine; forcing 10yd behind would shove the line off the end-line). But
+        // when the six-yard floor is active (open play) the back four STILL holds the 6-yard line
+        // as a flat offside trap even with the ball in the box — a single team-mate (the GK, or the
+        // ball-holder / live-ball collector already returned above) goes to the ball while the rest
+        // of the line settles on the 6-yard line within the ~3s grace. Only when the floor is
+        // lifted (restart / breakthrough / gate off) do we fully suspend and let the line sit deep.
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !six_yard_floor_active {
             return target;
         }
         // THE RULE (simple, no regimes): the back four's AVERAGE sits 10-30yd behind
@@ -29646,18 +29658,10 @@ impl WorldSnapshot {
         // ceiling wins — bulletproof, never panics on lower > upper).
         let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
         let lower = (ball_fwd - max_behind).min(upper);
-        // Six-yard-line stickiness: in OPEN PLAY the back four's AVERAGE holds the 6-yard line as
-        // its effective end-line rather than sinking onto our own goal-line when the ball is driven
-        // deep (where `lower` reaches the goal-line). Baked into the band so every average the rule
-        // computes is floored; the ~3s consistency grace then settles the line on the 6-yard line
-        // while any one defender may still be inside 0-6yd for under ~3s. Lifted when the offside
-        // law is suspended (a restart legitimately drops the line off) and while an opponent is
-        // breaking clean through (the line must drop to cover the goal). The own 5-yard emergency
-        // zone is already handled by the exempt early-return above.
-        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
-        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
-            && !self.offside_currently_suspended()
-            && self.opponent_breakthrough_ball_carrier(me.team).is_none();
+        // Bake the six-yard floor (computed above) into the band so every AVERAGE the rule computes
+        // is floored at the 6-yard line in open play, even when `lower` would otherwise reach the
+        // goal-line (a deep ball). The ~3s consistency grace then settles the flat line on the
+        // 6-yard line while any one defender may still be inside 0-6yd transiently.
         let line_band_avg_fwd = |avg: f64| {
             let banded = avg.clamp(lower, upper);
             if six_yard_floor_active {
@@ -34603,7 +34607,34 @@ impl WorldSnapshot {
         let ball_fwd = self.ball.position.y * attack;
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
+        // No offside in force (the ball is being played directly from a throw-in &c.): the line
+        // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
+        // into a deep block, sitting at least NO_OFFSIDE_RESTART_DROP_OFF_YARDS behind the ball
+        // (capped by the max gap and by room to our own goal). The flat-line trap clamp below is
+        // likewise meaningless and is lifted for the window.
+        let offside_suspended = self.offside_currently_suspended();
+        // Six-yard-line stickiness (computed up front because it governs the emergency-zone
+        // exemption too): in OPEN PLAY the back four holds the 6-yard line as its effective
+        // end-line. Lifted when offside is suspended (a restart legitimately drops the line off)
+        // and while an opponent is breaking clean through (the line must drop to cover the goal).
+        // `breakthrough_carrier` is reused by the leveling clamp below.
+        let breakthrough_carrier = self.opponent_breakthrough_ball_carrier(me.team);
+        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
+        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
+            && !offside_suspended
+            && breakthrough_carrier.is_none();
+        let six_yard_floor = |fwd: f64| {
+            if six_yard_floor_active {
+                fwd.max(six_yard_floor_fwd)
+            } else {
+                fwd
+            }
+        };
+        // Inside our own 5-yard emergency zone the deep-ball band is normally fully suspended — but
+        // when the six-yard floor is active (open play) the back four STILL holds the 6-yard line
+        // even with the ball in the box (the designated presser below collects it; the rest hold
+        // the trap). Only with the floor lifted (restart / breakthrough / gate off) do we suspend.
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !six_yard_floor_active {
             return compact_y;
         }
         // The designated presser steps onto the ball out of the line — don't pull it back.
@@ -34611,12 +34642,6 @@ impl WorldSnapshot {
             return compact_y;
         }
         let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
-        // No offside in force (the ball is being played directly from a throw-in &c.): the line
-        // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
-        // into a deep block, sitting at least NO_OFFSIDE_RESTART_DROP_OFF_YARDS behind the ball
-        // (capped by the max gap and by room to our own goal). The flat-line trap clamp below is
-        // likewise meaningless and is lifted for the window.
-        let offside_suspended = self.offside_currently_suspended();
         // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
         // 10yd off the ball); the max still applies.
         let min_gap = if offside_suspended {
@@ -34643,27 +34668,10 @@ impl WorldSnapshot {
         // "don't sit level" ceiling wins so the line never overruns the ball.
         let deepest_fwd = deepest_fwd.min(shallowest_fwd);
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
-        // Six-yard-line stickiness: in OPEN PLAY the back four holds the 6-yard line as its
-        // effective end-line rather than retreating onto its own goal-line (the deep-ball case
-        // where the legal band's floor `deepest_fwd` otherwise reaches the goal-line). The floor
-        // is applied to the band TARGET — both this individual clamp and the line centre below —
-        // so the ~3s movement grace lets the line AVERAGE settle on the 6-yard line while any
-        // single defender may still be physically inside 0-6yd for under ~3s. Lifted when the
-        // offside law is suspended (corners &c., where the line legitimately drops off) and while
-        // an opponent is breaking clean through (the line must be free to drop and cover the
-        // goal). `breakthrough_carrier` is computed once here and reused by the leveling clamp.
-        let breakthrough_carrier = self.opponent_breakthrough_ball_carrier(me.team);
-        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
-        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
-            && !offside_suspended
-            && breakthrough_carrier.is_none();
-        let six_yard_floor = |fwd: f64| {
-            if six_yard_floor_active {
-                fwd.max(six_yard_floor_fwd)
-            } else {
-                fwd
-            }
-        };
+        // Six-yard-line stickiness (gate computed at the top of the fn): the floor is applied to the
+        // band TARGET — both this individual clamp and the line centre below — so the ~3s movement
+        // grace lets the line AVERAGE settle on the 6-yard line while any single defender may still
+        // be physically inside 0-6yd for under ~3s.
         let clamped_fwd = six_yard_floor(clamped_fwd);
         // Offside line flatness: when DEFENDING, no defender may stand AHEAD of the back-four line
         // (toward the attackers) by more than half of BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS — that is
