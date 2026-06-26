@@ -29615,13 +29615,19 @@ impl WorldSnapshot {
             && !self.offside_currently_suspended()
             && self.opponent_breakthrough_ball_carrier(me.team).is_none();
         // Inside our own 5-yard emergency zone the deep-ball band is normally suspended (parity
-        // with the ball is fine; forcing 10yd behind would shove the line off the end-line). But
-        // when the six-yard floor is active (open play) the back four STILL holds the 6-yard line
-        // as a flat offside trap even with the ball in the box — a single team-mate (the GK, or the
-        // ball-holder / live-ball collector already returned above) goes to the ball while the rest
-        // of the line settles on the 6-yard line within the ~3s grace. Only when the floor is
-        // lifted (restart / breakthrough / gate off) do we fully suspend and let the line sit deep.
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !six_yard_floor_active {
+        // with the ball is fine; forcing 10yd behind would shove the line off the end-line). When
+        // the six-yard floor is active (open play) the back four STILL holds the 6-yard line as a
+        // flat offside trap even with the ball in the box — but ONLY for a COLLECTABLE ball (loose
+        // or ours, and on the ground): a single team-mate (the GK, or the ball-holder / live-ball
+        // collector already returned above) goes to the ball while the rest of the line settles on
+        // the 6-yard line within the ~3s grace. If the OPPONENT controls the ball in the box or a
+        // CROSS is in flight into it, stepping up to a trap would abandon coverage — the line must
+        // drop and defend, so the emergency suspension still fires (as for a restart / breakthrough
+        // / gate off).
+        let collectable_box_ball = six_yard_floor_active
+            && self.controlled_possession_team() != Some(me.team.other())
+            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS;
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !collectable_box_ball {
             return target;
         }
         // THE RULE (simple, no regimes): the back four's AVERAGE sits 10-30yd behind
@@ -34632,9 +34638,14 @@ impl WorldSnapshot {
         };
         // Inside our own 5-yard emergency zone the deep-ball band is normally fully suspended — but
         // when the six-yard floor is active (open play) the back four STILL holds the 6-yard line
-        // even with the ball in the box (the designated presser below collects it; the rest hold
-        // the trap). Only with the floor lifted (restart / breakthrough / gate off) do we suspend.
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !six_yard_floor_active {
+        // even with the ball in the box, ONLY for a COLLECTABLE ball (loose or ours, on the ground):
+        // the designated presser below collects it while the rest hold the trap. If the OPPONENT
+        // controls the ball in the box or a CROSS is in flight into it, the line must drop and
+        // defend, so the emergency suspension still fires (as for a restart / breakthrough / off).
+        let collectable_box_ball = six_yard_floor_active
+            && self.controlled_possession_team() != Some(me.team.other())
+            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS;
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !collectable_box_ball {
             return compact_y;
         }
         // The designated presser steps onto the ball out of the line — don't pull it back.

@@ -18019,11 +18019,12 @@ fn defensive_line_cushion_suspends_band_inside_own_twenty_yards() {
 
 #[test]
 fn defensive_line_cushion_holds_six_yard_line_inside_emergency_zone_in_open_play() {
-    // Even with the ball deep inside our own 5-yard emergency zone, in OPEN PLAY the back four no
-    // longer sinks to parity on the goal-line: one team-mate collects the ball while the rest hold
-    // the 6-yard line as a flat offside trap. Here the back four sits on the goal-line (y=1) with a
-    // settled opponent ball at y=4 (inside the zone, line not advanced enough to be a breakthrough);
-    // a non-collecting defender's target is pulled UP to the 6-yard line.
+    // Even with the ball deep inside our own 5-yard emergency zone, in OPEN PLAY with a COLLECTABLE
+    // (loose, grounded) ball the back four no longer sinks to parity on the goal-line: one team-mate
+    // collects the ball while the rest hold the 6-yard line as a flat offside trap. Here the back
+    // four sits on the goal-line (y=1) with a loose ball at y=4; the nearest defender collects, and
+    // a FAR defender's target is pulled UP to the 6-yard line. (A ball the OPPONENT controls / a
+    // cross in flight is NOT collectable and is covered by a separate drop-and-defend path.)
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 22,
@@ -18035,20 +18036,18 @@ fn defensive_line_cushion_holds_six_yard_line_inside_emergency_zone_in_open_play
         .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
         .map(|p| p.id)
         .collect();
-    let away_id = sim
-        .players
-        .iter()
-        .find(|p| p.team == Team::Away)
-        .map(|p| p.id)
-        .unwrap();
     assert_eq!(home_def.len(), 4, "test needs a back four");
 
     for &d in &home_def {
         sim.players[d].position = Vec2::new(30.0, 1.0);
     }
-    sim.players[away_id].position = Vec2::new(40.0, 4.0);
-    sim.ball.holder = Some(away_id);
-    sim.ball.position = sim.players[away_id].position;
+    // The nearest defender to the loose ball is the collector (exempt); the tested defender sits
+    // far across the pitch so it is purely a line-holder.
+    sim.players[home_def[0]].position = Vec2::new(52.0, 1.0);
+    sim.players[home_def[1]].position = Vec2::new(8.0, 1.0);
+    // Loose, grounded ball deep in our box — no holder (collectable open play).
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(55.0, 4.0);
     sim.ball.velocity = Vec2::zero();
     sim.ball.altitude_yards = 0.0;
     sim.ball.last_touch_team = Some(Team::Away);
@@ -18058,8 +18057,8 @@ fn defensive_line_cushion_holds_six_yard_line_inside_emergency_zone_in_open_play
     let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_target);
     assert!(
         adjusted.y >= 5.0 && adjusted.y <= 8.0,
-        "open play in the emergency zone: hold the 6-yard line, not parity on the goal-line: \
-         target={adjusted:?}"
+        "open play in the emergency zone with a collectable ball: hold the 6-yard line, not parity \
+         on the goal-line: target={adjusted:?}"
     );
 }
 
