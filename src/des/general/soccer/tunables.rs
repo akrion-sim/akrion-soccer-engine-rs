@@ -303,6 +303,20 @@ pub struct ShootingTunables {
     pub shot_block_bailout_max_probability: f64,
     pub goal_approach_carry_yards: f64,
     pub striker_hold_up_min_goal_distance_yards: f64,
+    /// Shot-trigger MDP/POMDP discipline: beyond this distance a shot is only
+    /// *volunteered* by the AI when the trigger value clears
+    /// [`Self::shot_trigger_long_range_min_value`] (an open net / stranded keeper /
+    /// live rebound). Inside it, the legacy near-goal shoot logic stands. See
+    /// `shot_decision.rs`.
+    pub shot_trigger_long_range_yards: f64,
+    /// Minimum shot-trigger value `[0,1]` for a long (`> shot_trigger_long_range_yards`)
+    /// shot to be volunteered. A covered long shot falls below it and is worked closer.
+    pub shot_trigger_long_range_min_value: f64,
+    /// Score a vetoed long shot is crushed to in the possession ranker: tiny but
+    /// non-zero so it ranks below carrying/passing while staying a LEGAL option.
+    pub shot_trigger_volunteer_floor: f64,
+    /// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
+    pub shot_foot_weak_foot_execution_damp: f64,
 }
 
 impl Default for ShootingTunables {
@@ -313,6 +327,10 @@ impl Default for ShootingTunables {
             shot_block_bailout_max_probability: 0.86,
             goal_approach_carry_yards: 45.0,
             striker_hold_up_min_goal_distance_yards: 45.0,
+            shot_trigger_long_range_yards: 22.0,
+            shot_trigger_long_range_min_value: 0.25,
+            shot_trigger_volunteer_floor: 0.002,
+            shot_foot_weak_foot_execution_damp: 0.88,
         }
     }
 }
@@ -2054,6 +2072,42 @@ impl ShootingTunables {
             15.0,
             80.0,
         );
+        sanitize_f64(
+            "shooting.shot_trigger_long_range_yards",
+            &mut self.shot_trigger_long_range_yards,
+            default.shot_trigger_long_range_yards,
+            1.0,
+            40.0,
+            12.0,
+            35.0,
+        );
+        sanitize_f64(
+            "shooting.shot_trigger_long_range_min_value",
+            &mut self.shot_trigger_long_range_min_value,
+            default.shot_trigger_long_range_min_value,
+            0.0,
+            1.0,
+            0.0,
+            0.9,
+        );
+        sanitize_f64(
+            "shooting.shot_trigger_volunteer_floor",
+            &mut self.shot_trigger_volunteer_floor,
+            default.shot_trigger_volunteer_floor,
+            0.0,
+            1.0,
+            0.0,
+            0.5,
+        );
+        sanitize_f64(
+            "shooting.shot_foot_weak_foot_execution_damp",
+            &mut self.shot_foot_weak_foot_execution_damp,
+            default.shot_foot_weak_foot_execution_damp,
+            0.0,
+            1.0,
+            0.5,
+            1.0,
+        );
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
@@ -2095,6 +2149,38 @@ impl ShootingTunables {
             self.striker_hold_up_min_goal_distance_yards,
             1.0,
             120.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_long_range_yards",
+            self.shot_trigger_long_range_yards,
+            1.0,
+            40.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_long_range_min_value",
+            self.shot_trigger_long_range_min_value,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_volunteer_floor",
+            self.shot_trigger_volunteer_floor,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_foot_weak_foot_execution_damp",
+            self.shot_foot_weak_foot_execution_damp,
+            0.0,
+            1.0,
             errors,
         );
     }
