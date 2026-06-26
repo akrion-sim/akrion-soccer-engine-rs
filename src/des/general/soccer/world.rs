@@ -39,6 +39,8 @@ const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
 // ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
 // first touch lands in real space, not under a second defender.
 const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
+// Probe cap for the defender-aware lateral escape-lane clearance exposed on the observation.
+const FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS: f64 = 8.0;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -22521,6 +22523,7 @@ impl WorldSnapshot {
                 first_touch_escape_forward_space: 0.0,
                 first_touch_escape_backward_space: 0.0,
                 first_touch_escape_target_forward_yards: 0.0,
+                pressured_escape_lane_yards: 0.0,
                 skill_top_speed: 0.0,
                 skill_acceleration: 0.0,
                 skill_stamina: 0.0,
@@ -23086,6 +23089,11 @@ impl WorldSnapshot {
         } else {
             FirstTouchEscapeProfile::default()
         };
+        let pressured_escape_lane_yards = if has_ball {
+            self.pressured_escape_lane_yards(player_id)
+        } else {
+            0.0
+        };
         let first_time_pass_field_feasibility = if first_touch_available {
             first_time_pass_field_feasibility_for_snapshot(
                 &visible_pass_targets,
@@ -23633,6 +23641,7 @@ impl WorldSnapshot {
             first_touch_escape_forward_space: first_touch_escape.forward_space,
             first_touch_escape_backward_space: first_touch_escape.backward_space,
             first_touch_escape_target_forward_yards: first_touch_escape.target_forward_yards,
+            pressured_escape_lane_yards,
             skill_top_speed: me.skills.top_speed,
             skill_acceleration: me.skills.acceleration,
             skill_stamina: me.skills.stamina,
@@ -35721,6 +35730,64 @@ impl WorldSnapshot {
             }
         }
         nearest_block
+    }
+
+    /// Defender-aware best escape-lane clearance (yards) for a pressed carrier: the largest corridor
+    /// clearance among the forward and LATERAL directions that lead away from the nearest opponent.
+    /// Complements the existing first-touch-escape forward/backward space signals with the lateral
+    /// dimension — 0 when boxed in, large when a turn into space is on. Exposed on the observation as
+    /// `pressured_escape_lane_yards`. No opponent in range ⇒ wide open (the probe cap).
+    pub fn pressured_escape_lane_yards(&self, player_id: usize) -> f64 {
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return 0.0;
+        };
+        let opp = me.team.other();
+        let current = self.player_snapshot_position(me);
+        let Some((_, defender_pos, _)) = self.nearest_opponent_at(me.team, current) else {
+            return FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+        };
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        let away = {
+            let v = current - defender_pos;
+            if v.len() < 1e-6 {
+                forward
+            } else {
+                v.normalized()
+            }
+        };
+        let lateral_away = if away.x.abs() < 1e-6 {
+            away
+        } else {
+            Vec2::new(away.x.signum(), 0.0)
+        };
+        let dir_space = |dir: Vec2| -> f64 {
+            let cap = FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+            let mut nearest = cap;
+            for o in self.players.iter().filter(|p| p.team == opp) {
+                let to = self.player_snapshot_position(o) - current;
+                let along = to.dot(dir);
+                if along <= 0.0 || along > cap {
+                    continue;
+                }
+                let lateral = (to - dir * along).len();
+                if lateral <= FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        [
+            forward,
+            (forward + lateral_away * 0.7).normalized(),
+            (forward * 0.6 + away).normalized(),
+            lateral_away,
+            away,
+        ]
+        .into_iter()
+        .filter(|dir| dir.len() > 1e-6 && dir.dot(away) > 0.0)
+        .map(dir_space)
+        .fold(0.0_f64, f64::max)
     }
 
     pub fn goal_angle_degrees(&self, position: Vec2, attacking_team: Team) -> f64 {
