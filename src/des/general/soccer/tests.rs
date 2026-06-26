@@ -62485,6 +62485,179 @@ fn boxed_in_pressured_receiver_keeps_the_shield() {
 }
 
 #[test]
+fn unpressured_carrier_keeps_rolling_forward_instead_of_stopping() {
+    // No opponent close and clear grass ahead: a settle/near-self target must be turned into a
+    // forward carry so the carrier keeps the ball rolling rather than pulling up to a dead stop.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let roll = snapshot
+        .carrier_keep_rolling_target_for(holder, origin)
+        .expect("an unpressured carrier with open grass ahead must keep rolling, not stop");
+    assert!(
+        (roll.y - origin.y) * Team::Home.attack_dir() >= KEEP_ROLLING_CARRY_MIN_STEP_YARDS,
+        "keep-rolling target should be a real forward carry: origin={origin:?} roll={roll:?}"
+    );
+}
+
+#[test]
+fn keep_rolling_continues_along_the_current_travel_line() {
+    // A carrier already drifting diagonally should keep rolling along that line, not snap onto the
+    // pure-forward axis.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::new(2.0, 2.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let roll = snapshot
+        .carrier_keep_rolling_target_for(holder, origin)
+        .expect("a rolling carrier should keep its momentum");
+    assert!(
+        roll.x - origin.x > 0.5,
+        "roll should track the carrier's diagonal momentum, not the pure-forward axis: origin={origin:?} roll={roll:?}"
+    );
+}
+
+#[test]
+fn pressured_carrier_keep_rolling_stands_down() {
+    // A defender inside the keep-distance radius can make a settle/shield the right call, so the
+    // guard must stand down and leave the normal decision in place.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let marker = 14;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[marker].position = Vec2::new(40.0, 60.0); // 2yd away, inside the 3yd radius
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    assert!(
+        snapshot
+            .carrier_keep_rolling_target_for(holder, origin)
+            .is_none(),
+        "a pressured carrier must not be forced to roll forward into the defender"
+    );
+}
+
+#[test]
+fn carrier_moving_with_intent_is_left_untouched_by_keep_rolling() {
+    // A genuine forward carry (target several yards ahead) is not a near-stop, so the guard returns
+    // None and the path is byte-identical to baseline.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let driving_target = origin + Vec2::new(0.0, 5.0 * Team::Home.attack_dir());
+    assert!(
+        snapshot
+            .carrier_keep_rolling_target_for(holder, driving_target)
+            .is_none(),
+        "a real forward carry is not a near-stop and must be left exactly as decided"
+    );
+}
+
+#[test]
+fn carrier_with_no_forward_space_does_not_force_a_roll() {
+    // An opponent blocking the forward lane (but outside the keep-distance radius) leaves nowhere to
+    // roll into, so the guard stands down and the settle/turn/look-for-a-pass behaviour is kept.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let blocker = 14;
+    park_players_except(&mut sim, &[holder, blocker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    // Directly ahead, 4yd out: outside the 3yd radius (unpressured) but kills the forward lane.
+    sim.players[blocker].position = Vec2::new(40.0, 58.0 + 4.0 * Team::Home.attack_dir());
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    assert!(
+        snapshot.forward_dribble_space_yards(holder) < KEEP_ROLLING_MIN_SPACE_YARDS,
+        "test setup should leave no clear lane ahead of the carrier"
+    );
+    assert!(
+        snapshot
+            .carrier_keep_rolling_target_for(holder, origin)
+            .is_none(),
+        "with no forward space the carrier must not be shoved into the blocker"
+    );
+}
+
+#[test]
+fn keep_rolling_moves_a_settling_holder_body_and_ball_upfield() {
+    // End-to-end: an unpressured holder handed a near-self MoveTo (the settle that produces the
+    // walk-stop flicker) keeps rolling — body and led ball both advance upfield.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[holder].skills.dribbling = 7.8;
+    sim.players[holder].skills.first_touch = 7.8;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let origin = sim.players[holder].position;
+    sim.apply_player_intent(PlayerIntent {
+        player_id: holder,
+        action: SoccerAction::MoveTo(origin),
+        sprint: false,
+    });
+
+    assert!(
+        (sim.players[holder].position.y - origin.y) * Team::Home.attack_dir() > 0.0,
+        "settling holder body should keep rolling upfield, not stop: before={origin:?} after={:?}",
+        sim.players[holder].position
+    );
+    assert!(
+        (sim.ball.position.y - origin.y) * Team::Home.attack_dir() > 0.5,
+        "carried ball should be led into space, not left dead at the feet: before={origin:?} ball={:?}",
+        sim.ball.position
+    );
+}
+
+#[test]
 fn pressured_escape_lane_obs_is_defender_aware() {
     // The observation's lateral escape-lane clearance keys on real opponent geometry: an open lane
     // reads large, and closing it with a second defender drives it down — unlike pitch-edge room.

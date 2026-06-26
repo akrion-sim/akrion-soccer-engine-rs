@@ -2,3 +2,6 @@ target/
 Cargo.lock
 out/
 tmp
+
+# local per-worktree cargo target dirs
+.cargo-target-*/
