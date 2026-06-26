@@ -7,6 +7,16 @@ x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimensio
 MDP = markov decision process
 MPC = model predictive control
 POMDP = partially observable markov decision process
+LP = linear program (continuous variables, linear objective + constraints)
+IP / IPM = interior-point / interior-point METHOD — the algorithm that solves the
+  formation LP. IP here is NOT integer programming: there are NO integer/binary
+  decision variables and NO MILP/branch-and-bound anywhere in the engine. The only
+  mathematical program is the continuous formation LP, solved by Clarabel's IPM.
+Clarabel = the Rust conic/LP solver used for the formation LP (`solve_lp_clarabel`),
+  a sparse interior-point method; an internal simplex is the deterministic fallback
+  (`SOCCER_FORMATION_LP_DETERMINISTIC`). It is the ONLY optimization solver in the
+  engine — distance/cover checks, threshold gates, and "budgets" elsewhere are plain
+  geometry, not LP/IP, so do not describe them as IP/IPM.
 
 ## Control architecture: who decides what
 
