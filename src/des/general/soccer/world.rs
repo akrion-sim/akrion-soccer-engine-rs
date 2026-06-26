@@ -12576,6 +12576,36 @@ impl SoccerMatch {
         let latent = self.mpc_latent_execution_objective(player_id, my_team);
         let desired_cfg = self.mpc_planar_config(horizon, dt, accel_cap, latent);
         let reference_target = self.mpc_latent_shaped_target(my_team, target, latent);
+        // xT terminal-cost shaping (gated; identity when off): nudge the reference
+        // up the control-weighted-threat gradient so an in-possession outfielder
+        // settles in the most valuable *controllable* space within reach of its
+        // assigned slot — the "cost-to-go" wire. Bounded + gradient-scaled, so it
+        // never overrides the LP/support destination.
+        let reference_target = if xt_terminal_cost_enabled()
+            && self.controlled_possession_team_now() == Some(my_team)
+            && self
+                .players
+                .get(player_id)
+                .map_or(false, |p| p.role != PlayerRole::Goalkeeper)
+        {
+            let (fw, fl) = sane_pitch_dimensions(
+                self.config.field_width_yards,
+                self.config.field_length_yards,
+            );
+            let points: Vec<XtControlPoint> = self
+                .players
+                .iter()
+                .map(|p| XtControlPoint {
+                    team: p.team,
+                    position: p.position,
+                    velocity: p.velocity,
+                    top_speed: player_top_speed_yps(p.role, &p.skills),
+                })
+                .collect();
+            xt_terminal_shaped_target(&points, my_team, reference_target, fw, fl)
+        } else {
+            reference_target
+        };
 
         // Field awareness: the controlled player is the MPC state; every other
         // player plus the ball becomes a moving soft keep-out, projected with
