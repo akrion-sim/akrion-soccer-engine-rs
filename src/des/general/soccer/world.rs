@@ -21337,7 +21337,7 @@ impl WorldSnapshot {
     /// carrier in the central danger lane, eases on top of the box (square up to deny the shot),
     /// and tapers to nothing once the carrier is already pinned against a touchline. No-op unless
     /// the gate is on; only ever called for the single nearest presser, so the block keeps shape.
-    fn shepherd_show_wide_adjusted_target(
+    pub(crate) fn shepherd_show_wide_adjusted_target(
         &self,
         me: &PlayerSnapshot,
         carrier: Vec2,
@@ -21346,6 +21346,18 @@ impl WorldSnapshot {
         if !dd_soccer_enable_defensive_shepherd() {
             return engage_target;
         }
+        self.shepherd_show_wide_core(me, carrier, engage_target)
+    }
+
+    /// Gate-free shepherding math (see [`Self::shepherd_show_wide_adjusted_target`]). Split out so
+    /// it is directly unit-testable without the process-global env gate; returns `engage_target`
+    /// unchanged whenever shepherding does not apply (outside the band / pinned wide).
+    pub(crate) fn shepherd_show_wide_core(
+        &self,
+        me: &PlayerSnapshot,
+        carrier: Vec2,
+        engage_target: Vec2,
+    ) -> Vec2 {
         // Active only while the carrier is in front of our goal within the shepherding band.
         let goal_distance = (carrier.y - self.own_goal_y_for(me.team)).abs();
         if !goal_distance.is_finite() || goal_distance > SHEPHERD_BAND_FAR_YARDS {
