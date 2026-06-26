@@ -4735,6 +4735,103 @@ fn long_backward_pass_penalty_grows_linearly_past_short_reset() {
 }
 
 #[test]
+fn aerial_pass_in_bounds_launch_speed_caps_overcooked_loft_toward_touchline() {
+    let field_width = 80.0;
+    let field_length = 115.0;
+    let origin = Vec2::new(40.0, 60.0);
+    // Aim a long loft toward the right touchline; the receiver is just inside the line.
+    let aim = Vec2::new(76.0, 60.0);
+    let reference_distance = origin.distance(aim);
+    let overcooked_speed = 60.0;
+    let capped = aerial_pass_in_bounds_launch_speed(
+        origin,
+        aim,
+        overcooked_speed,
+        reference_distance,
+        field_width,
+        field_length,
+    );
+    assert!(
+        capped < overcooked_speed,
+        "an over-hit loft toward the touchline must be trimmed: {capped} !< {overcooked_speed}"
+    );
+    // The capped pace must actually land inside the pitch margin along the aim direction.
+    let apex = lofted_pass_apex_yards(reference_distance);
+    let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+    let carry = capped * hang_time / AERIAL_LAND_AT_TARGET_DRAG_COMP;
+    let landing = origin + (aim - origin).normalized() * carry;
+    assert!(
+        landing.x <= field_width - AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS + 1e-6,
+        "capped loft must land inside the touchline margin: landing.x={}",
+        landing.x
+    );
+}
+
+#[test]
+fn aerial_pass_in_bounds_launch_speed_leaves_safe_central_loft_untouched() {
+    let field_width = 80.0;
+    let field_length = 115.0;
+    let origin = Vec2::new(40.0, 50.0);
+    let aim = Vec2::new(40.0, 78.0); // central, well short of the far byline
+    let reference_distance = origin.distance(aim);
+    let speed = 16.0; // a weighted loft that comfortably lands at the target
+    let result = aerial_pass_in_bounds_launch_speed(
+        origin,
+        aim,
+        speed,
+        reference_distance,
+        field_width,
+        field_length,
+    );
+    assert!(
+        (result - speed).abs() < 1e-9,
+        "a loft that already lands in-field must be unchanged: {result} vs {speed}"
+    );
+}
+
+#[test]
+fn aerial_pass_landing_safety_drops_near_the_touchline() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 7_777,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let central_receiver = 7usize;
+    let wide_receiver = 8usize;
+    park_players_except(&mut sim, &[passer, central_receiver, wide_receiver]);
+
+    let passer_pos = Vec2::new(40.0, 70.0);
+    sim.players[passer].position = passer_pos;
+    sim.players[passer].velocity = Vec2::zero();
+    // One outlet deep in midfield, one hugging the right touchline.
+    let central_pos = Vec2::new(40.0, 45.0);
+    let wide_pos = Vec2::new(sim.config.field_width_yards - 2.0, 45.0);
+    sim.players[central_receiver].position = central_pos;
+    sim.players[central_receiver].velocity = Vec2::zero();
+    sim.players[wide_receiver].position = wide_pos;
+    sim.players[wide_receiver].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = passer_pos;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let central_safety =
+        aerial_pass_landing_safety_for_snapshot(&snapshot, passer_pos, central_receiver);
+    let wide_safety =
+        aerial_pass_landing_safety_for_snapshot(&snapshot, passer_pos, wide_receiver);
+    assert!(
+        wide_safety < central_safety,
+        "a loft to a touchline-hugger must read less safe than one to a central outlet: \
+         wide={wide_safety} central={central_safety}"
+    );
+    assert!(
+        central_safety > 0.9,
+        "a central outlet should read essentially safe: {central_safety}"
+    );
+}
+
+#[test]
 fn backward_pass_path_traffic_prices_floor_and_aerial_retreats() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -52970,6 +53067,78 @@ fn goalkeeper_support_shape_still_tracks_ball_goal_line() {
 }
 
 #[test]
+fn goalkeeper_drops_goalside_on_a_loose_ball_we_only_last_touched() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    // The keeper has pushed up as a buildup outlet.
+    sim.players[keeper].position = Vec2::new(30.0, 40.0);
+    // A loose ball in our half that we merely last touched (a cleared / deflected ball), with an
+    // opponent sitting on it as the favourite to win it.
+    let away_outfielder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 25.0);
+    sim.players[away_outfielder].position = sim.ball.position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // possession_team() still reports Home via the last-touch fallback ...
+    assert_eq!(snapshot.possession_team(), Some(Team::Home));
+    // ... but the keeper is NOT entitled to the upfield buildup shape: an opponent is the
+    // favourite to the loose ball.
+    assert_ne!(
+        snapshot.goalkeeper_buildup_possession_team(),
+        Some(Team::Home)
+    );
+
+    let line_target = snapshot.goalkeeper_ball_goal_tracking_target(Team::Home);
+    let shape = snapshot.defensive_shape_for(keeper, sim.players[keeper].home_position);
+    assert!(
+        shape.distance(line_target) < 1e-9,
+        "keeper should drop onto its ball-goal tracking line for a loose ball: shape={shape:?} line_target={line_target:?}"
+    );
+    let goal = Vec2::new(
+        snapshot.field_width * 0.5,
+        snapshot.own_goal_y_for(Team::Home),
+    );
+    let line_distance = segment_distance_to_point(goal, snapshot.ball.position, shape);
+    let projection = segment_projection_factor(goal, snapshot.ball.position, shape);
+    assert!(
+        line_distance < 1e-9 && (0.0..=1.0).contains(&projection),
+        "keeper target should sit between the goal centre and the ball: line_distance={line_distance} projection={projection}"
+    );
+}
+
+#[test]
+fn goalkeeper_holds_buildup_shape_for_our_pass_in_flight() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let teammate = 6;
+    // Our pass is in flight (no holder) but a teammate is the favourite to receive it, so the
+    // keeper must NOT yo-yo back onto its bare line — it keeps the buildup outlet shape.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 30.0);
+    sim.players[teammate].position = sim.ball.position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.goalkeeper_buildup_possession_team(),
+        Some(Team::Home)
+    );
+    let line_target = snapshot.goalkeeper_ball_goal_tracking_target(Team::Home);
+    let shape = snapshot.defensive_shape_for(keeper, sim.players[keeper].home_position);
+    assert!(
+        shape.distance(line_target) > 1e-6,
+        "keeper should keep its buildup shape (not snap to the bare line) while we still control: shape={shape:?} line_target={line_target:?}"
+    );
+}
+
+#[test]
 fn goalkeeper_runtime_support_ignores_off_line_lp_guidance() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
@@ -62126,6 +62295,124 @@ fn boxed_in_pressured_receiver_keeps_the_shield() {
             )
             .is_none(),
         "a genuinely boxed-in carrier must keep the shield (no escape lane), not shuffle"
+    );
+}
+
+#[test]
+fn pressured_escape_lane_obs_is_defender_aware() {
+    // The observation's lateral escape-lane clearance keys on real opponent geometry: an open lane
+    // reads large, and closing it with a second defender drives it down — unlike pitch-edge room.
+    let lane = |boxed_in: bool| -> f64 {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let holder = 6;
+        park_players_except(&mut sim, &[holder, 16, 17]);
+        let origin = Vec2::new(40.0, 58.0);
+        sim.players[holder].position = origin;
+        sim.players[holder].home_position = origin;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = origin;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[16].position = Vec2::new(41.6, 58.2); // presser on the right
+        sim.players[17].position = if boxed_in {
+            Vec2::new(38.2, 58.0) // closes the left lane
+        } else {
+            Vec2::new(10.0, 10.0) // far away: left lane open
+        };
+        let snapshot = WorldSnapshot::from_match(&sim);
+        snapshot.observation_for(holder).pressured_escape_lane_yards
+    };
+
+    let open = lane(false);
+    let boxed = lane(true);
+    assert!(
+        open > boxed + 1.0,
+        "an open defender-aware lane must read materially larger than a boxed-in one: open={open} boxed={boxed}"
+    );
+}
+
+#[test]
+fn defender_aware_open_lane_lifts_side_step_escape_on_pressured_receipt() {
+    // A fresh receiver pressed on the right. With the LEFT lane genuinely open (defender-aware) the
+    // dedicated evade (side-step) is floored up; closing that lane boxes the carrier in and the lift
+    // collapses. We compare the side-step score and its standing vs the static shield.
+    let score = |boxed_in: bool| -> (f64, f64) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7,
+            ..Default::default()
+        });
+        let holder = 6;
+        park_players_except(&mut sim, &[holder, 16, 17]);
+        sim.active_set_play = None;
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = Vec2::new(40.0, 58.0);
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[holder].position = sim.ball.position;
+        sim.players[holder].home_position = sim.ball.position;
+        sim.players[holder].incoming_ball = None;
+        sim.players[holder].skills.dribbling = 5.5; // mid-skill: gets the escape floor (not elite)
+        sim.players[16].position = Vec2::new(41.6, 58.2);
+        sim.players[17].position = if boxed_in {
+            Vec2::new(38.2, 58.0)
+        } else {
+            Vec2::new(10.0, 10.0)
+        };
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let directive = snapshot.tactical_directive(Team::Home);
+        let options = sim.players[holder].possession_action_options(
+            &observation,
+            &directive,
+            2,
+            1,
+            false,
+            sim.config.dt_seconds,
+            sim.config.field_width_yards,
+        );
+        (
+            action_option_score(&options, "side-step"),
+            action_option_score(&options, "protect-ball"),
+        )
+    };
+
+    let (open_side_step, open_shield) = score(false);
+    let (boxed_side_step, _boxed_shield) = score(true);
+    assert!(
+        open_side_step > boxed_side_step + 0.05,
+        "an open defender-aware lane must lift the side-step escape vs being boxed in: \
+         open={open_side_step} boxed={boxed_side_step}"
+    );
+    assert!(
+        open_side_step >= open_shield,
+        "with an open lane on fresh receipt under pressure, the side-step escape should be at least \
+         as valued as freezing on the shield: side_step={open_side_step} shield={open_shield}"
+    );
+}
+
+#[test]
+fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
+    // The lateral escape-lane tail is appended after the shot-trigger tail, growing FEATURE_DIM by
+    // its block width, and the pre-block total is a legacy dim so old nets migrate by zero-padding.
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM
+            + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM
+    );
+    assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM, 2);
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM),
+        "the pre-lateral-escape total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
+    assert_ne!(
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN,
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK
     );
 }
 
@@ -79014,7 +79301,7 @@ fn audit_defender_goalside_in_lane() {
     const LANE_TOL: f64 = 8.0; // within this of home.x => "holding lane / zonal"
     const NEAR_BALL: f64 = 6.0; // closer than this => legit contester, exempt
     const WRONG_SIDE: f64 = 1.0; // ball-side by more than this (yards) => violation
-    const TICK_CAP: u64 = 6000;
+    const TICK_CAP: u64 = 5000;
 
     #[derive(Default, Clone)]
     struct Acc {
@@ -79022,10 +79309,12 @@ fn audit_defender_goalside_in_lane() {
         def_obs: u64,
         viol_in_lane: u64,
         viol_out_lane: u64,
-        worst: Vec<(u64, String, f64, f64, f64, f64)>, // tick, who, margin, lane_dev, ball_dist, depth
+        worst: Vec<(u64, String, f64, f64, f64, f64, String)>, // tick, who, margin, lane_dev, ball_dist, depth, action
+        by_shirt: std::collections::BTreeMap<u8, u64>,
+        by_action: std::collections::BTreeMap<String, u64>,
     }
 
-    for seed_run in 0..3u64 {
+    for seed_run in 0..1u64 {
         let mut m = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
         let mut acc = Acc::default();
         let mut tick: u64 = 0;
@@ -79062,15 +79351,23 @@ fn audit_defender_goalside_in_lane() {
                 }
                 let lane_dev = (p.position.x - p.home_position.x).abs();
                 // own-goal depth of the defender (how deep he is)
-                let own_goal_y = defending.other().goal_y(m.config.field_length_yards);
+                let own_goal_y = defending.other().goal_y(snap.field_length);
                 let depth = (p.position.y - own_goal_y).abs();
                 if lane_dev <= LANE_TOL {
                     acc.viol_in_lane += 1;
+                    let action = p
+                        .last_decision
+                        .as_ref()
+                        .map(|d| d.action.clone())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    *acc.by_shirt.entry(p.shirt).or_default() += 1;
+                    *acc.by_action.entry(action.clone()).or_default() += 1;
                     let who = format!(
                         "{:?}#{} (home x={:.1})",
                         defending, p.shirt, p.home_position.x
                     );
-                    acc.worst.push((tick, who, margin, lane_dev, ball_dist, depth));
+                    acc.worst
+                        .push((tick, who, margin, lane_dev, ball_dist, depth, action));
                 } else {
                     acc.viol_out_lane += 1;
                 }
@@ -79091,10 +79388,12 @@ fn audit_defender_goalside_in_lane() {
             acc.viol_out_lane,
             pct(acc.viol_out_lane, acc.def_obs),
         );
-        eprintln!("worst 12 IN-LANE ball-side examples (defender stuck in zone, ahead of ball):");
-        for (t, who, margin, lane_dev, bd, depth) in acc.worst.iter().take(12) {
+        eprintln!("in-lane violations by shirt: {:?}", acc.by_shirt);
+        eprintln!("in-lane violations by chosen action label: {:?}", acc.by_action);
+        eprintln!("worst 15 IN-LANE ball-side examples (defender stuck in zone, ahead of ball):");
+        for (t, who, margin, lane_dev, bd, depth, action) in acc.worst.iter().take(15) {
             eprintln!(
-                "  tick {t:>5}  {who:<28} ahead-of-ball={:.1}yd  lane_dev={:.1}yd  ball_dist={:.1}yd  own-depth={:.1}yd",
+                "  tick {t:>5}  {who:<26} ahead-of-ball={:.1}yd  lane_dev={:.1}yd  ball_dist={:.1}yd  own-depth={:.1}yd  action={action}",
                 -margin, lane_dev, bd, depth
             );
         }

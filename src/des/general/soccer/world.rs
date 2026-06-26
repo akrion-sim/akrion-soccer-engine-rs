@@ -39,6 +39,8 @@ const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
 // ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
 // first touch lands in real space, not under a second defender.
 const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
+// Probe cap for the defender-aware lateral escape-lane clearance exposed on the observation.
+const FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS: f64 = 8.0;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -261,6 +263,12 @@ pub struct SoccerMatch {
     pub active_set_play: Option<SoccerSetPlayCall>,
     pub(crate) rng: SeededRandom,
     pub(crate) pending_pass: Option<PendingPass>,
+    /// One-shot guard: set true for the duration of an `apply_restart` when the aerial-pass
+    /// out-of-bounds penalty has already claimed the event (a qualifying long loft sailed out),
+    /// so the generic [`Self::record_out_of_bounds_turnover_penalty`] defers instead of
+    /// double-charging the same passer. Always cleared after the restart. Only ever true when
+    /// `DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE` is on ⇒ baseline byte-identical.
+    pub(crate) suppress_generic_oob_turnover: bool,
     pub(crate) pending_shot: Option<PendingShot>,
     pub(crate) pending_rebound: Option<PendingRebound>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
@@ -1775,6 +1783,7 @@ impl SoccerMatch {
             active_set_play: None,
             rng,
             pending_pass: None,
+            suppress_generic_oob_turnover: false,
             pending_shot: None,
             pending_rebound: None,
             coach_set_play_hints: HashMap::new(),
@@ -10890,6 +10899,26 @@ impl SoccerMatch {
                             }
                         }
                     }
+                    // MPC/execution side of the aerial-OOB loop: cap a lofted ball's launch
+                    // pace so its gravity-fixed carry lands inside the pitch along the (already
+                    // pitch-clamped) aim direction — an over-cooked loft no longer sails out for
+                    // a throw-in / goal-kick. Aim and direction are untouched; only the speed is
+                    // trimmed, and only when it would actually carry out. Gate OFF / non-aerial ⇒
+                    // unchanged.
+                    let speed = if dd_soccer_enable_aerial_pass_oob_discipline()
+                        && flight.is_aerial()
+                    {
+                        aerial_pass_in_bounds_launch_speed(
+                            player_pos,
+                            aimed_target,
+                            speed,
+                            player_pos.distance(aimed_target),
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
+                    } else {
+                        speed
+                    };
                     let pass_curl_probability = pass_curl_probability_for_player(
                         &self.players[player_id].skills,
                         flight,
@@ -13631,8 +13660,20 @@ impl SoccerMatch {
                 shot,
                 shot_off_target_yards,
             } => {
-                let pending_pass_for_out_of_play = self.pending_pass.clone();
-                self.pending_pass = None;
+                // A pass still pending when the ball leaves play sailed out untouched — the
+                // unforced aerial-OOB error. Capture it BEFORE clearing so the passer can be
+                // credited (see `record_aerial_pass_out_of_bounds_penalty`, which supersedes the
+                // old inline long-aerial-bounds penalty and coordinates with the restart turnover).
+                let oob_pass = self.pending_pass.take();
+                let was_shot = shot.is_some();
+                // Learning capture (kept from the inline path): a pass conceded out of play is a
+                // failed pass — feed the pass-completion corpus before the deferred penalty acts.
+                if let Some(pass) = oob_pass.as_ref() {
+                    if restart.awarded_team != pass.team {
+                        let own_half = self.pass_from_own_half(pass.team, pass.origin);
+                        self.record_pass_outcome_sample(pass, false, own_half);
+                    }
+                }
                 self.pending_shot = None;
                 self.pending_rebound = None;
                 self.ball.altitude_yards = 0.0;
@@ -13646,28 +13687,22 @@ impl SoccerMatch {
                     );
                     self.record_miss_event(shot);
                 }
-                if let Some(pass) = pending_pass_for_out_of_play {
-                    if restart.awarded_team != pass.team {
-                        let own_half = self.pass_from_own_half(pass.team, pass.origin);
-                        self.record_pass_outcome_sample(&pass, false, own_half);
-                        if pass.flight.is_aerial()
-                            && pass.distance_yards >= LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS
-                        {
-                            let bounds = long_aerial_bounds_risk_for_target(
-                                pass.origin,
-                                pass.intended_target,
-                                self.config.field_width_yards,
-                                self.config.field_length_yards,
-                                pass.flight,
-                            );
-                            let penalty = LONG_AERIAL_OUT_OF_PLAY_PASSER_PENALTY_POINTS
-                                * (0.45 + bounds.risk.clamp(0.0, 1.0) * 0.55);
-                            self.record_reward_event(pass.from, -penalty);
-                            self.penalize_turnover_window(pass.team);
-                        }
-                    }
+                let restart_kind = restart.kind;
+                let restart_awarded = restart.awarded_team;
+                let restart_position = restart.position;
+                // Apply the aerial-OOB penalty FIRST so it can claim the event; the generic
+                // turnover penalty inside `apply_restart` then defers via the guard flag.
+                if !was_shot {
+                    self.suppress_generic_oob_turnover = self
+                        .record_aerial_pass_out_of_bounds_penalty(
+                            oob_pass.as_ref(),
+                            restart_kind,
+                            restart_awarded,
+                            restart_position,
+                        );
                 }
                 self.apply_restart(restart);
+                self.suppress_generic_oob_turnover = false;
             }
         }
     }
@@ -15167,11 +15202,65 @@ impl SoccerMatch {
         }
     }
 
+    /// MDP side of the aerial-OOB loop. A LONG lofted pass that was still in flight when the
+    /// ball left play sailed out untouched — over the touchline (throw-in to the other team) or
+    /// the opponent byline (a conceded goal-kick). Penalise the PASSER, scaled per-yard by how
+    /// far the exit point landed from where the ball was aimed (the same "hit the frame" shaping
+    /// the shot-off-target penalty uses), so the policy learns to weight an ambitious loft rather
+    /// than blaze it out. Returns true when it applied (the caller then suppresses the generic
+    /// out-of-bounds turnover penalty for this restart so the passer is not double-charged).
+    /// Gate OFF, non-aerial / short passes, a shot, or a ball the passer's team kept ⇒ no event
+    /// and false (baseline byte-identical).
+    fn record_aerial_pass_out_of_bounds_penalty(
+        &mut self,
+        pass: Option<&PendingPass>,
+        restart_kind: BallRestartKind,
+        awarded_team: Team,
+        restart_position: Vec2,
+    ) -> bool {
+        if !dd_soccer_enable_aerial_pass_oob_discipline() {
+            return false;
+        }
+        let Some(pass) = pass else {
+            return false;
+        };
+        if !pass.flight.is_aerial() {
+            return false;
+        }
+        // Only a loft the passer's team CONCEDED out of play: a throw-in or goal-kick awarded to
+        // the other team. (A corner is won off a defensive touch — not the passer's error.)
+        let conceded = matches!(
+            restart_kind,
+            BallRestartKind::ThrowIn | BallRestartKind::GoalKick
+        ) && awarded_team != pass.team;
+        if !conceded || pass.distance_yards < AERIAL_PASS_OOB_MIN_DISTANCE_YARDS {
+            return false;
+        }
+        // How far the ball exited from where it was aimed: a loft that just grazes out next to
+        // its target is unlucky; one that sails out 15yd away was badly over-hit.
+        let overrun = restart_position.distance(pass.intended_target);
+        let over = (overrun - AERIAL_PASS_OOB_FORGIVENESS_YARDS).max(0.0);
+        let penalty = (AERIAL_PASS_OOB_BASE_PENALTY_POINTS
+            + over * AERIAL_PASS_OOB_PENALTY_PER_YARD)
+            .min(AERIAL_PASS_OOB_MAX_PENALTY_POINTS);
+        self.record_reward_event(pass.from, -penalty);
+        // An aerial hoofed out is also a turnover: give the offending team's last few seconds the
+        // same retroactive, all-learner penalty (per-tick de-dup guarded), mirroring the generic
+        // handler this one supersedes.
+        self.penalize_turnover_window(pass.team);
+        true
+    }
+
     fn record_out_of_bounds_turnover_penalty(
         &mut self,
         restart_kind: BallRestartKind,
         awarded_team: Team,
     ) {
+        // The aerial-pass OOB handler already claimed this restart (and applied a
+        // distance-shaped penalty + turnover window); don't double-charge the passer.
+        if self.suppress_generic_oob_turnover {
+            return;
+        }
         // Only throw-ins unambiguously mean "the ball was dribbled/passed out
         // over the touchline." Goal kicks can be wide shots and corners can be
         // defensive deflections, so attributing those as turnovers misfires.
@@ -18084,6 +18173,19 @@ fn dd_soccer_disable_winger_byline_option() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
 }
+/// Keeper goalside guard. ON by default: the goalkeeper only abandons its goalside ball↔goal
+/// tracking line to push up into the buildup-outlet shape when our team GENUINELY controls the
+/// ball — it is held by a teammate, or one of our passes is in flight with a teammate the
+/// favourite to receive it. Previously the keeper's "in possession" test fell back to
+/// `last_touch_team`, so a LOOSE ball we last touched (a deflection, a popped-loose tackle, a
+/// cleared ball an opponent is about to win) kept the keeper upfield instead of dropping between
+/// the centre of its goal and the ball. Set `DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD=1` to restore the
+/// prior last-touch behaviour (byte-identical, A/B / parity). See `goalkeeper_buildup_possession_team`.
+fn dd_soccer_disable_gk_goalside_guard() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD").is_ok())
+}
 /// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
 /// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
 /// the carrier reliably HAS a teammate to play to — instead of being left to thump it to nobody or
@@ -18991,6 +19093,43 @@ impl WorldSnapshot {
             .holder
             .and_then(|id| self.players.iter().find(|p| p.id == id))
             .map(|p| p.team)
+    }
+
+    /// The team (if any) whose keeper is entitled to leave its goalside ball↔goal tracking line and
+    /// push up into the buildup-outlet shape. Unlike `possession_team()`, a bare `last_touch_team`
+    /// is NOT enough: a genuinely loose ball must keep the keeper goalside. We count it as "ours for
+    /// buildup" only when a teammate actually HOLDS the ball, or — for an in-flight ball with no
+    /// holder — when we last touched it AND our nearest outfield player is the favourite to reach it
+    /// (so an ordinary pass between our players doesn't yo-yo the keeper off its line, but a loose
+    /// ball an opponent is winning drops the keeper goalside).
+    pub(crate) fn goalkeeper_buildup_possession_team(&self) -> Option<Team> {
+        if let Some(team) = self.controlled_possession_team() {
+            return Some(team);
+        }
+        // No holder: the ball is in flight or loose. Retain buildup possession only if we last
+        // touched it and our team is the favourite to the ball.
+        let last_touch = self.ball.last_touch_team?;
+        let nearest_team = self
+            .players
+            .iter()
+            .filter(|p| p.role != PlayerRole::Goalkeeper)
+            .min_by(|a, b| {
+                self.player_snapshot_position(a)
+                    .distance(self.ball.position)
+                    .partial_cmp(
+                        &self
+                            .player_snapshot_position(b)
+                            .distance(self.ball.position),
+                    )
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.id.cmp(&b.id))
+            })
+            .map(|p| p.team);
+        if nearest_team == Some(last_touch) {
+            Some(last_touch)
+        } else {
+            None
+        }
     }
 
     fn possession_team_for_ball_sample(&self, sample: &BallPositionSample) -> Option<Team> {
@@ -20318,12 +20457,8 @@ impl WorldSnapshot {
                 lane_tunables.lookahead_min_seconds,
                 lane_tunables.lookahead_max_seconds,
             );
-        let predicted_ball = finite_pitch_point(
-            self.predicted_ball_position(lookahead),
-            width,
-            length,
-            ball_position,
-        );
+        let predicted_ball =
+            finite_pitch_point(self.predicted_ball_position(lookahead), width, length, ball_position);
         let lane_discipline_v2 = lane_discipline::lane_discipline_v2_enabled();
         let lane_match = |a: usize, b: usize| -> f64 {
             if lane_discipline_v2 {
@@ -22567,6 +22702,7 @@ impl WorldSnapshot {
                 long_aerial_bounds_risk: 0.0,
                 long_aerial_bounds_margin_yards: 0.0,
                 long_aerial_bounds_inward_correction_yards: 0.0,
+                aerial_pass_landing_safety: 1.0,
                 aerial_forward_runner_pass_multiplier: 1.0,
                 ball_position_confidence: 0.0,
                 teammate_position_confidence: 0.0,
@@ -22738,6 +22874,7 @@ impl WorldSnapshot {
                 first_touch_escape_forward_space: 0.0,
                 first_touch_escape_backward_space: 0.0,
                 first_touch_escape_target_forward_yards: 0.0,
+                pressured_escape_lane_yards: 0.0,
                 skill_top_speed: 0.0,
                 skill_acceleration: 0.0,
                 skill_stamina: 0.0,
@@ -23071,6 +23208,19 @@ impl WorldSnapshot {
             best_aerial_pass_quality.long_aerial_bounds_margin_yards;
         let long_aerial_bounds_inward_correction_yards =
             best_aerial_pass_quality.long_aerial_bounds_inward_correction_yards;
+        // POMDP side of the aerial-OOB loop: how safely the BEST aerial option's projected
+        // landing sits inside the pitch (1.0 = safe, 0.0 = on/over a line). Always computed so
+        // the field is populated; it only changes behaviour when the OOB-discipline gate is on
+        // (see `pass_quality_for_patience`). No aerial option ⇒ 1.0 (no score suppression).
+        let aerial_pass_landing_safety = if has_ball {
+            self.best_aerial_pass_target(player_id)
+                .map(|target_id| {
+                    aerial_pass_landing_safety_for_snapshot(self, me_position, target_id)
+                })
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
         let flank_cross_arrival_target =
             self.flank_cross_arrival_target_for(player_id, me.home_position);
         let flank_cross_arrival_distance_yards = flank_cross_arrival_target
@@ -23306,6 +23456,11 @@ impl WorldSnapshot {
             self.first_touch_escape_profile_for(player_id)
         } else {
             FirstTouchEscapeProfile::default()
+        };
+        let pressured_escape_lane_yards = if has_ball {
+            self.pressured_escape_lane_yards(player_id)
+        } else {
+            0.0
         };
         let first_time_pass_field_feasibility = if first_touch_available {
             first_time_pass_field_feasibility_for_snapshot(
@@ -23745,6 +23900,7 @@ impl WorldSnapshot {
             long_aerial_bounds_risk,
             long_aerial_bounds_margin_yards,
             long_aerial_bounds_inward_correction_yards,
+            aerial_pass_landing_safety,
             aerial_forward_runner_pass_multiplier,
             ball_position_confidence,
             teammate_position_confidence,
@@ -23927,6 +24083,7 @@ impl WorldSnapshot {
             first_touch_escape_forward_space: first_touch_escape.forward_space,
             first_touch_escape_backward_space: first_touch_escape.backward_space,
             first_touch_escape_target_forward_yards: first_touch_escape.target_forward_yards,
+            pressured_escape_lane_yards,
             skill_top_speed: me.skills.top_speed,
             skill_acceleration: me.skills.acceleration,
             skill_stamina: me.skills.stamina,
@@ -27465,60 +27622,41 @@ impl WorldSnapshot {
         {
             return None;
         }
-        let path = pass.intended_target - pass.origin;
-        let path_len = path.len();
-        if path_len <= 1e-6 {
-            return None;
-        }
-        let apex = lofted_pass_apex_yards(pass.distance_yards);
-        if apex < LONG_AERIAL_FALL_CONTROL_HIGH_YARDS {
-            return None;
-        }
+        let apex = pending_pass_snapshot_apex_yards(pass);
+        let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        // Past the controllable descent (the ball has dropped below the settle height on
+        // the way DOWN) ⇒ the window has closed. (Checked against the descending root so the
+        // rising phase below 5ft right after launch is NOT mistaken for a closed window.)
         let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
-        let descending_time_for_height = |height: f64| -> Option<f64> {
-            if height > apex {
+        let low_disc = hang_time * hang_time
+            - 8.0 * AERIAL_CONTROL_BAND_SWEET_YARDS / GRAVITY_YPS2;
+        if low_disc >= 0.0 {
+            let low_time = (hang_time + low_disc.sqrt()) * 0.5;
+            if time_aloft > low_time + self.dt_seconds {
                 return None;
             }
-            let discriminant = hang_time * hang_time - 8.0 * height / GRAVITY_YPS2;
-            if discriminant < 0.0 {
-                return None;
-            }
-            Some((hang_time + discriminant.sqrt()) * 0.5)
-        };
-        let high_time = descending_time_for_height(LONG_AERIAL_FALL_CONTROL_HIGH_YARDS)?;
-        let low_time = descending_time_for_height(LONG_AERIAL_FALL_CONTROL_LOW_YARDS)?;
-        if low_time <= high_time {
-            return None;
         }
-        let elapsed = (self.tick.saturating_sub(pass.launch_tick) as f64 * self.dt_seconds)
-            .clamp(0.0, hang_time);
-        if elapsed > low_time + self.dt_seconds {
-            return None;
-        }
-        let target_time = if elapsed < high_time {
-            high_time
-        } else {
-            (elapsed + self.dt_seconds * 0.5).clamp(high_time, low_time)
-        };
-        let seconds_until_window = (target_time - elapsed).max(0.0);
-        let direction = path / path_len;
-        let current_progress =
-            (dot(self.ball.position - pass.origin, path) / (path_len * path_len)).clamp(0.0, 1.0);
-        let current_along = current_progress * path_len;
-        let speed_along = self.ball.velocity.dot(direction).max(0.0);
-        let projected_along = current_along + speed_along * seconds_until_window;
-        let ballistic_along = pass.launch_speed_yps.max(1.0) * target_time;
-        let blended_along = if seconds_until_window <= 1e-6 {
-            current_along
-        } else {
-            projected_along * 0.65 + ballistic_along * 0.35
-        }
-        .clamp(current_along, path_len);
-        let target = (pass.origin + direction * blended_along)
-            .clamp_to_pitch(self.field_width, self.field_length);
+        // Unified descent geometry: the SAME drag-aware projection the reception plan uses
+        // (single source of truth — `aerial_descent_plan`), replacing the old duplicate
+        // blended ballistic/velocity projection. The window opens when the ball drops to the
+        // top of the control band; the target is where it settles to the feet.
+        let plan = aerial_descent_plan(
+            apex,
+            time_aloft,
+            self.ball.position,
+            self.ball.velocity,
+            pass.intended_target,
+            self.field_width,
+            self.field_length,
+        )?;
+        // Aim at the point where the ball first drops into reach (the top of the band): the
+        // receiver gets there ready, then tracks it down. Once inside the window `time_to_attack`
+        // is 0, so `attack_point` collapses to the ball's current ground position — the same
+        // "track where it is now" the old window did, but drag-aware. (Mirrors the old
+        // `target_time = high_time` before the window, current position once inside.)
         Some(LongAerialFallingWindow {
-            target,
-            seconds_until_window,
+            target: plan.attack_point,
+            seconds_until_window: plan.time_to_attack,
         })
     }
 
@@ -27612,7 +27750,9 @@ impl WorldSnapshot {
         pass: &PendingPassSnapshot,
         current: Vec2,
     ) -> Option<(AerialDescentPlan, AerialReceptionInputs, AerialReceptionPlan)> {
-        if !pass.flight.is_aerial() {
+        if !pass.flight.is_aerial() || me.role == PlayerRole::Goalkeeper {
+            // Keepers claim crosses with the hands on a separate model; this is outfield
+            // chest/head/foot reception.
             return None;
         }
         // Only anticipate while the ball is still genuinely above the control band and
@@ -27622,12 +27762,14 @@ impl WorldSnapshot {
         }
         let apex = pending_pass_snapshot_apex_yards(pass);
         let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        // Project the descent from the CURRENT ball state (drag-aware to date), not the
+        // launch pace — a long aerial bleeds real horizontal pace in flight.
         let descent = aerial_descent_plan(
             apex,
-            pass.launch_speed_yps,
-            pass.origin,
-            pass.intended_target,
             time_aloft,
+            self.ball.position,
+            self.ball.velocity,
+            pass.intended_target,
             self.field_width,
             self.field_length,
         )?;
@@ -36071,6 +36213,64 @@ impl WorldSnapshot {
         nearest_block
     }
 
+    /// Defender-aware best escape-lane clearance (yards) for a pressed carrier: the largest corridor
+    /// clearance among the forward and LATERAL directions that lead away from the nearest opponent.
+    /// Complements the existing first-touch-escape forward/backward space signals with the lateral
+    /// dimension — 0 when boxed in, large when a turn into space is on. Exposed on the observation as
+    /// `pressured_escape_lane_yards`. No opponent in range ⇒ wide open (the probe cap).
+    pub fn pressured_escape_lane_yards(&self, player_id: usize) -> f64 {
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return 0.0;
+        };
+        let opp = me.team.other();
+        let current = self.player_snapshot_position(me);
+        let Some((_, defender_pos, _)) = self.nearest_opponent_at(me.team, current) else {
+            return FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+        };
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        let away = {
+            let v = current - defender_pos;
+            if v.len() < 1e-6 {
+                forward
+            } else {
+                v.normalized()
+            }
+        };
+        let lateral_away = if away.x.abs() < 1e-6 {
+            away
+        } else {
+            Vec2::new(away.x.signum(), 0.0)
+        };
+        let dir_space = |dir: Vec2| -> f64 {
+            let cap = FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+            let mut nearest = cap;
+            for o in self.players.iter().filter(|p| p.team == opp) {
+                let to = self.player_snapshot_position(o) - current;
+                let along = to.dot(dir);
+                if along <= 0.0 || along > cap {
+                    continue;
+                }
+                let lateral = (to - dir * along).len();
+                if lateral <= FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        [
+            forward,
+            (forward + lateral_away * 0.7).normalized(),
+            (forward * 0.6 + away).normalized(),
+            lateral_away,
+            away,
+        ]
+        .into_iter()
+        .filter(|dir| dir.len() > 1e-6 && dir.dot(away) > 0.0)
+        .map(dir_space)
+        .fold(0.0_f64, f64::max)
+    }
+
     pub fn goal_angle_degrees(&self, position: Vec2, attacking_team: Team) -> f64 {
         let goal_y = attacking_team.goal_y(self.field_length);
         let left_post = Vec2::new(self.field_width * 0.5 - self.goal_width * 0.5, goal_y);
@@ -36609,13 +36809,21 @@ impl WorldSnapshot {
         };
         let ball_y = self.ball.position.y;
         let directive = self.tactical_directive(me.team);
-        if me.role == PlayerRole::Goalkeeper
-            && self
-                .controlled_possession_team()
-                .or_else(|| self.possession_team())
-                != Some(me.team)
-        {
-            return self.goalkeeper_ball_goal_tracking_target(me.team);
+        if me.role == PlayerRole::Goalkeeper {
+            // The keeper only leaves its goalside ball↔goal tracking line for the upfield buildup
+            // shape when our team genuinely controls the ball. Default-on guard: a bare last-touch
+            // (a loose / contested ball we merely deflected last) no longer keeps the keeper
+            // upfield — it drops goalside. Disable with DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD for the
+            // prior last-touch behaviour (byte-identical).
+            let buildup_possession = if dd_soccer_disable_gk_goalside_guard() {
+                self.controlled_possession_team()
+                    .or_else(|| self.possession_team())
+            } else {
+                self.goalkeeper_buildup_possession_team()
+            };
+            if buildup_possession != Some(me.team) {
+                return self.goalkeeper_ball_goal_tracking_target(me.team);
+            }
         }
         let role_line_bias = match me.role {
             PlayerRole::Goalkeeper => 0.10,

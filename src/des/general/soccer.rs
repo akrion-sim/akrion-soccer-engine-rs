@@ -923,8 +923,9 @@ const SHORT_LOFT_APEX_YARDS: f64 = 3.05; // ~9 ft (apex of a ~15yd lofted pass)
 const LOFT_APEX_PER_YARD: f64 = 0.11;
 const LOFT_APEX_MIN_YARDS: f64 = 1.6; // ~5 ft — a short clipped chip still clears a foot
 const LONG_AERIAL_CONTROL_MIN_DISTANCE_YARDS: f64 = 24.0;
-const LONG_AERIAL_FALL_CONTROL_HIGH_YARDS: f64 = 8.0 / 3.0;
-const LONG_AERIAL_FALL_CONTROL_LOW_YARDS: f64 = 5.0 / 3.0;
+// The control band (8ft top / 5ft settle) is owned by `aerial_reception`: the long-aerial
+// profile shares `AERIAL_CONTROL_BAND_TOP_YARDS` / `AERIAL_CONTROL_BAND_SWEET_YARDS` so the
+// two aerial-control paths can never drift apart (they were once duplicated as 8/3 & 5/3).
 const LONG_AERIAL_CONTROL_ENGAGE_RADIUS_YARDS: f64 = 16.0;
 const LONG_AERIAL_CONTROL_REFERENCE_DISTANCE_YARDS: f64 = 16.0;
 const LONG_AERIAL_CONTROL_REFERENCE_SECONDS: f64 = 1.2;
@@ -1189,11 +1190,32 @@ const SHORT_BACK_PASS_MAX_YARDS: f64 = 14.0;
 const FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE: f64 = 0.40;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD: f64 = 0.11;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS: f64 = 3.0;
+// Probe cap normalising the defender-aware lateral escape-lane neural feature (mirrors the
+// world-side FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS).
+const FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS: f64 = 8.0;
 // Conceding a throw-in/goal-kick/corner by knocking the ball out is a turnover.
 // Penalize the offending player unless they were under heavy pressure (>=8/10),
 // where clearing it out of play is an acceptable last resort.
 const OUT_OF_BOUNDS_TURNOVER_PENALTY_POINTS: f64 = 6.0;
 const OUT_OF_BOUNDS_PRESSURE_EXEMPT_THRESHOLD: f64 = 0.8;
+// Aerial-pass-out-of-bounds discipline (gated `DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE`,
+// default OFF ⇒ byte-identical). A LONG lofted pass that sails out of play untouched — over
+// the touchline (throw-in) or the opponent byline (a conceded goal-kick) — is an unforced
+// technique error: the passer over-hit or mis-aimed the loft. Unlike a pressured clearance
+// hoofed clear (already exempted by `OUT_OF_BOUNDS_PRESSURE_EXEMPT_THRESHOLD`), this is
+// penalised even when the passer was unmarked, and the bite grows per-yard with how far the
+// ball exited from the spot it was aimed at — the same "hit the frame" shaping the
+// shot-off-target penalty uses. Teaches the policy to weight an ambitious loft, not blaze it
+// out. The decision-time observation (`aerial_pass_landing_safety`) and the MPC launch-speed
+// cap (`aerial_pass_in_bounds_launch_speed`) close the POMDP/MPC sides of the same loop.
+const AERIAL_PASS_OOB_MIN_DISTANCE_YARDS: f64 = 18.0;
+const AERIAL_PASS_OOB_FORGIVENESS_YARDS: f64 = 2.5;
+const AERIAL_PASS_OOB_PENALTY_PER_YARD: f64 = 0.45;
+const AERIAL_PASS_OOB_BASE_PENALTY_POINTS: f64 = 3.0;
+const AERIAL_PASS_OOB_MAX_PENALTY_POINTS: f64 = 9.0;
+/// How far inside the nearest boundary the MPC launch-speed cap aims a lofted ball to land,
+/// and the reference span over which `aerial_pass_landing_safety` ramps 0→1.
+const AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS: f64 = 2.5;
 // Attackers may run offside briefly, but should get back onside within a few
 // seconds. After the grace window the penalty grows with how long they linger,
 // and stepping back onside after lingering earns a small recovery reward.
@@ -3596,10 +3618,17 @@ const SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM: usize =
 const SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
         + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
+// Both branches appended learner tail blocks at the same long-aerial-bounds anchor.
+// Keep the shot-trigger/POMDP-MPC slots stable, then append the lateral
+// first-touch escape-lane slots after them so both migrations remain append-only.
+const SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize = 2;
 const SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM + SOCCER_NEURAL_SHOT_TRIGGER_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM
+        + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3904,6 +3933,10 @@ const SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS: usize =
     SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_ACCELERATION + 1;
 const SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT: usize =
     SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS + 1;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN: usize =
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4006,6 +4039,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM,
     // Same schema with pass-and-move channels, before long-aerial control channels.
     SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM,
+    // Same schema with shot-trigger timing/MPC channels, before the lateral escape-lane tail.
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5357,6 +5392,12 @@ pub struct SoccerNeuralExtendedObservation {
     pub nearest_opponent_lateral_offset: f64,
 }
 
+/// Serde default for [`SoccerPomdpObservation::aerial_pass_landing_safety`]: a missing field
+/// (older persisted observations) reads as fully safe so it never suppresses an aerial.
+fn aerial_pass_landing_safety_default() -> f64 {
+    1.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerPomdpObservation {
@@ -5424,6 +5465,14 @@ pub struct SoccerPomdpObservation {
     pub aerial_pass_bypass_score: f64,
     #[serde(default)]
     pub aerial_pass_interception_risk: f64,
+    /// Safety margin [0,1] of the best aerial pass's projected landing point relative to the
+    /// nearest pitch boundary: 1.0 = lands comfortably in-field, 0.0 = lands on/over a line
+    /// (a throw-in / conceded goal-kick risk). DECISION-ONLY — folded into the aerial pass
+    /// score by [`pass_quality_for_patience`] when the OOB-discipline gate is on; it is NOT a
+    /// neural feature, so it does not change `SOCCER_NEURAL_FEATURE_DIM`. Defaults to 1.0 (no
+    /// aerial option ⇒ no penalty to the score).
+    #[serde(default = "aerial_pass_landing_safety_default")]
+    pub aerial_pass_landing_safety: f64,
     #[serde(default)]
     pub long_aerial_bounds_risk: f64,
     #[serde(default)]
@@ -5832,6 +5881,11 @@ pub struct SoccerPomdpObservation {
     pub first_touch_escape_backward_space: f64,
     #[serde(default)]
     pub first_touch_escape_target_forward_yards: f64,
+    /// Defender-aware best LATERAL/forward escape-lane clearance (yards) among away-from-presser
+    /// directions — the lateral dimension the forward/backward escape signals don't cover. See
+    /// `WorldSnapshot::pressured_escape_lane_yards`.
+    #[serde(default)]
+    pub pressured_escape_lane_yards: f64,
     #[serde(default)]
     pub skill_top_speed: f64,
     #[serde(default)]
@@ -16467,6 +16521,17 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+}
+
+/// Gate for aerial-pass-out-of-bounds discipline. OFF (the default) ⇒ no extra penalty event,
+/// the decision-time aerial pass score ignores `aerial_pass_landing_safety`, and the MPC
+/// launch-speed cap is skipped, so play and rewards are byte-identical to baseline. ON wires
+/// all three (MDP reward + POMDP observation + MPC execution) so the policy learns to stop
+/// blazing long lofts out of play. See [`AERIAL_PASS_OOB_MIN_DISTANCE_YARDS`] and friends.
+pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE").is_ok())
 }
 
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
@@ -31560,22 +31625,6 @@ impl SoccerPassCompletionHead {
     }
 }
 
-fn normalize_pass_completion_features(features: &[f32]) -> Option<Vec<f32>> {
-    if features.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    match features.len() {
-        SOCCER_PASS_COMPLETION_FEATURE_DIM => Some(features.to_vec()),
-        SOCCER_PASS_COMPLETION_FEATURE_DIM_V1 => {
-            let mut migrated = Vec::with_capacity(SOCCER_PASS_COMPLETION_FEATURE_DIM);
-            migrated.extend_from_slice(features);
-            migrated.resize(SOCCER_PASS_COMPLETION_FEATURE_DIM, 0.0);
-            Some(migrated)
-        }
-        _ => None,
-    }
-}
-
 /// Minimum SGD steps a [`SoccerPassCompletionHead`] must have taken before the live pass-quality
 /// assessor will blend its prediction into `expected_completion`. Below this the head is still
 /// noisy, so the analytic estimate stands alone (mirrors [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`]).
@@ -31618,6 +31667,22 @@ impl SoccerMatch {
     /// [`PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS`] and the gate is on.
     pub fn set_pass_completion_head(&mut self, head: SoccerPassCompletionHead) {
         self.pass_completion_head = Some(std::sync::Arc::new(head));
+    }
+}
+
+fn normalize_pass_completion_features(features: &[f32]) -> Option<Vec<f32>> {
+    if features.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    match features.len() {
+        SOCCER_PASS_COMPLETION_FEATURE_DIM => Some(features.to_vec()),
+        SOCCER_PASS_COMPLETION_FEATURE_DIM_V1 => {
+            let mut migrated = Vec::with_capacity(SOCCER_PASS_COMPLETION_FEATURE_DIM);
+            migrated.extend_from_slice(features);
+            migrated.resize(SOCCER_PASS_COMPLETION_FEATURE_DIM, 0.0);
+            Some(migrated)
+        }
+        _ => None,
     }
 }
 
@@ -36650,6 +36715,22 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(shot_observation_body_mechanics_fit(obs));
     features[SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT] =
         soccer_neural_unit(shot_observation_preferred_foot_fit(obs));
+    // Lateral escape-lane tail: defender-aware lateral lane availability + freeze-risk composite
+    // (pressed with no easy out), complementing the forward/backward escape features above. Gated:
+    // zeroed when disabled so the appended slots contribute nothing.
+    if !dd_soccer_disable_first_touch_escape() {
+        let lane_norm = (obs.pressured_escape_lane_yards
+            / FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS)
+            .clamp(0.0, 1.0);
+        let freeze_risk = (obs
+            .immediate_dispossession_risk
+            .max(obs.perceived_pressure)
+            .clamp(0.0, 1.0)
+            * (1.0 - lane_norm))
+            .clamp(0.0, 1.0);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN] = soccer_neural_unit(lane_norm);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK] = soccer_neural_unit(freeze_risk);
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -50015,7 +50096,7 @@ fn pass_quality_for_patience(observation: &SoccerPomdpObservation, flight: PassF
             + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.18)
             .clamp(0.0, 1.0),
         PassFlight::Aerial | PassFlight::Scoop => {
-            (observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.46
+            let base = (observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.46
                 + observation
                     .best_aerial_pass_receiver_openness
                     .clamp(0.0, 1.0)
@@ -50023,7 +50104,16 @@ fn pass_quality_for_patience(observation: &SoccerPomdpObservation, flight: PassF
                 + observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.20
                 + (1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0)) * 0.06
                 + (1.0 - observation.long_aerial_bounds_risk.clamp(0.0, 1.0)) * 0.04)
-                .clamp(0.0, 1.0)
+                .clamp(0.0, 1.0);
+            // POMDP side of the aerial-OOB loop: a loft whose projected landing sits on/over a
+            // boundary reads as a POOR pass, so the patience logic prefers carrying / a safer
+            // outlet over blazing it out of play. Gate OFF ⇒ safety factor ignored (the field
+            // defaults to 1.0 anyway), so this is byte-identical to baseline.
+            if dd_soccer_enable_aerial_pass_oob_discipline() {
+                (base * observation.aerial_pass_landing_safety.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+            } else {
+                base
+            }
         }
     }
 }
@@ -50835,6 +50925,96 @@ fn aerial_pass_interception_risk_for_snapshot(
     } else {
         (total / count as f64).clamp(0.0, 1.0)
     }
+}
+
+/// POMDP signal for the aerial-OOB loop: how safely a lofted ball to `target_id` would land
+/// inside the pitch. The aerial calibration lands the ball ~on the target, so the landing is
+/// the receiver's point nudged a little further along the pass line (the natural firm-up /
+/// drag overhit — exactly the ball that sails out). Returns 1.0 when that point sits a
+/// comfortable margin inside every boundary, ramping to 0.0 as it reaches a touchline /
+/// byline. Cheap geometry; missing target ⇒ 1.0 so no aerial is suppressed by accident.
+pub(crate) fn aerial_pass_landing_safety_for_snapshot(
+    snapshot: &WorldSnapshot,
+    origin: Vec2,
+    target_id: usize,
+) -> f64 {
+    let Some(target) = snapshot.players.iter().find(|p| p.id == target_id) else {
+        return 1.0;
+    };
+    let target_position = snapshot
+        .player_position(target_id)
+        .unwrap_or(target.position);
+    let to_target = target_position - origin;
+    if to_target.len() <= 1e-6 {
+        return 1.0;
+    }
+    let landing =
+        target_position + to_target.normalized() * AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS;
+    let margin = landing
+        .x
+        .min(snapshot.field_width - landing.x)
+        .min(landing.y)
+        .min(snapshot.field_length - landing.y);
+    // A landing on/over a boundary is 0 (max risk); a few yards inside is fully safe.
+    let ramp = (AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS * 2.4).max(1.0);
+    (margin / ramp).clamp(0.0, 1.0)
+}
+
+/// MPC/execution guard for the aerial-OOB feature: cap a lofted ball's launch SPEED so its
+/// gravity-fixed carry lands at least `AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS` inside the
+/// nearest pitch boundary along the launch direction. The aim point (already clamped to the
+/// pitch by the caller) and thus the pass DIRECTION are preserved; only an over-cooked pace
+/// that would sail the ball out is trimmed. Returns the speed unchanged when the natural
+/// landing is already safely in-field, when the geometry is degenerate, or for a ball struck
+/// from the boundary back into the field. Gate-checked by the caller.
+pub(crate) fn aerial_pass_in_bounds_launch_speed(
+    origin: Vec2,
+    aim: Vec2,
+    speed_yps: f64,
+    reference_distance_yards: f64,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    if !speed_yps.is_finite() || speed_yps <= 0.0 {
+        return speed_yps;
+    }
+    let dir = aim - origin;
+    if dir.len() <= 1e-6 {
+        return speed_yps;
+    }
+    let dir = dir.normalized();
+    let apex = lofted_pass_apex_yards(reference_distance_yards.max(0.1));
+    let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+    if hang_time <= 1e-3 {
+        return speed_yps;
+    }
+    let margin = AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS;
+    let max_x = (field_width - margin).max(margin);
+    let max_y = (field_length - margin).max(margin);
+    let min_x = margin.min(max_x);
+    let min_y = margin.min(max_y);
+    // Distance along `dir` until the launch ray reaches the inset rectangle edge.
+    let mut max_carry = f64::INFINITY;
+    if dir.x > 1e-9 {
+        max_carry = max_carry.min((max_x - origin.x) / dir.x);
+    } else if dir.x < -1e-9 {
+        max_carry = max_carry.min((min_x - origin.x) / dir.x);
+    }
+    if dir.y > 1e-9 {
+        max_carry = max_carry.min((max_y - origin.y) / dir.y);
+    } else if dir.y < -1e-9 {
+        max_carry = max_carry.min((min_y - origin.y) / dir.y);
+    }
+    if !max_carry.is_finite() || max_carry <= 0.0 {
+        return speed_yps;
+    }
+    // Invert the landing calibration (`land_at_target = distance / hang_time * drag_comp`):
+    // the pace whose gravity-fixed carry lands at `max_carry`.
+    let speed_cap = max_carry * AERIAL_LAND_AT_TARGET_DRAG_COMP / hang_time;
+    if !speed_cap.is_finite() {
+        return speed_yps;
+    }
+    speed_yps.min(speed_cap.max(0.0))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
