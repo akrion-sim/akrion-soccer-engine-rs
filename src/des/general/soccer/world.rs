@@ -25811,21 +25811,20 @@ impl WorldSnapshot {
         let force = soccer_force_runaround();
         let attack_dir = carrier.team.attack_dir();
         let carrier_pos = self.player_snapshot_position(carrier);
-        // "Outside mid attack defender": a wide man takes the isolated full-back on far
-        // more readily, so the static-start precondition is relaxed. Two parallel signals,
-        // unified here: the tactical DIRECTIVE calling for the take-on (a winger who just
-        // received can still attack the man), OR a strong measured take-on/isolation score.
+        let outside_mid_isolation = self.outside_mid_takeon_isolation_for(carrier);
+        let outside_mid_attack_defender = outside_mid_isolation >= 0.55;
+        // "Outside mid attack defender": a wide man on this play takes the isolated full-back on
+        // far more readily, so the static-start precondition is relaxed (a winger who has just
+        // received can still attack the man rather than needing to already be at speed).
         let omad_take_on = is_outside_mid_attack_strategy(
             self.tactical_directive(carrier.team).attack_strategy,
         ) && self.is_wide_attacker(carrier);
-        let outside_mid_isolation = self.outside_mid_takeon_isolation_for(carrier);
-        let outside_mid_attack_defender = omad_take_on || outside_mid_isolation >= 0.55;
         // Precondition: forward momentum (running AT the defender), not standing.
         let forward_speed = carrier.velocity.y * attack_dir;
-        let min_forward_speed = if outside_mid_attack_defender {
-            // The directive-driven take-on relaxes hardest; a purely score-driven one
-            // (no directive) keeps a higher momentum bar.
-            RUNAROUND_MIN_FORWARD_SPEED_YPS * if omad_take_on { 0.45 } else { 0.80 }
+        let min_forward_speed = if omad_take_on {
+            RUNAROUND_MIN_FORWARD_SPEED_YPS * 0.45
+        } else if outside_mid_attack_defender {
+            RUNAROUND_MIN_FORWARD_SPEED_YPS * 0.80
         } else {
             RUNAROUND_MIN_FORWARD_SPEED_YPS
         };
@@ -25857,12 +25856,13 @@ impl WorldSnapshot {
             .filter(|p| p.team != carrier.team && p.id != defender_id)
             .map(|p| self.player_snapshot_position(p).distance(defender_pos))
             .fold(f64::INFINITY, f64::min);
-        let defender_isolated =
-            omad_take_on && defender_cover_dist >= OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS;
-        // Against a directive take-on of a fully-uncovered man the beat is safe even without a
-        // clear pace edge (any non-negative advantage). A score-driven take-on still relaxes the
-        // pace bar but keeps some edge; otherwise the usual pace gate holds.
-        let min_speed_advantage = if defender_isolated {
+        let defender_isolated = defender_cover_dist >= OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS;
+        let omad_isolated_take_on = omad_take_on && defender_isolated;
+        // Against an isolated man the beat is safe even without a clear pace edge, so allow the
+        // named outside-mid take-on at any non-negative advantage. The learned isolation cue still
+        // relaxes the normal gate, but less aggressively because it is a POMDP appetite rather than
+        // an explicit team strategy.
+        let min_speed_advantage = if omad_isolated_take_on {
             0.0
         } else if outside_mid_attack_defender {
             RUNAROUND_MIN_SPEED_ADVANTAGE * 0.45
@@ -25959,7 +25959,7 @@ impl WorldSnapshot {
         // more isolated the man (cover further than the 10yd radius) and the bigger the pace edge,
         // the more we back the carrier to beat him 1v1. Off this play `defender_isolated` is false,
         // so the quality (and thus the carrier's appetite in player.rs) is byte-identical.
-        let quality = if defender_isolated {
+        let quality = if omad_isolated_take_on {
             let isolation_term = ((defender_cover_dist
                 - OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS)
                 / OUTSIDE_MID_DEFENDER_COVER_RADIUS_YARDS)
@@ -27790,19 +27790,13 @@ impl WorldSnapshot {
         };
         let lane_affinity = self.dynamic_lane_affinity_for_player_target(player, target);
         let receipt_shape = self.ball_receipt_shape_fit_for_player_target(player, target);
-        // Always-on shape-safety bias: prefer a retriever who can attack the ball WITHOUT
-        // breaking formation shape (good receipt shape + role-line cohesion, with an
-        // emergency-proximity override when the ball is right at someone's feet). This is
-        // the analytic, formation-aware seed.
         let shape_safety = self.loose_ball_attack_shape_safety_for_player_target(player, target);
         let base = dist * (1.0 - alignment * LOOSE_BALL_STRIDE_MATCH_WEIGHT)
             - lane_affinity * 1.35
             - receipt_shape * BALL_RECEIPT_RETRIEVAL_SHAPE_WEIGHT_YARDS
             - shape_safety * LOOSE_BALL_SHAPE_SAFE_RETRIEVAL_WEIGHT_YARDS;
-        // Learned commit selector (gated off by default ⇒ adds exactly 0.0, so the election
-        // stays exactly the shape-safe heuristic above): refines who attacks the loose ball
-        // ON TOP of that heuristic, lowering a high-priority attacker's score and raising that
-        // of a candidate the model judges would be dragged out of formation shape.
+        // Learned commit selector (gated off by default ⇒ adds exactly 0.0): refines who
+        // attacks the loose ball on top of the analytic, shape-safe retriever election.
         base + self.loose_ball_commit_score_adjustment(player, target, base)
     }
 
@@ -32435,6 +32429,14 @@ impl WorldSnapshot {
                 };
                 let vacuum_run_bonus =
                     self.attacking_vacuum_run_bonus(me, me_position, p, occupancy, forward);
+                let attacking_spacing_profile = if possession && me.role != PlayerRole::Goalkeeper {
+                    self.attacking_support_spacing_profile_at(me, p)
+                } else {
+                    AttackSupportSpacingProfile::default()
+                };
+                let attacking_spacing_bonus = attacking_spacing_profile.combined_score()
+                    * (1.20 + width_shortage * 0.65)
+                    + attacking_spacing_profile.forward_fill * 0.85;
                 // Off-ball spacing discipline (gated; 0.0 when OFF). Two effects, both only when
                 // the player already offers a clean outlet (so they are NOT needed shorter):
                 //   1. cancel most of the show-for-ball / ball-arrival proximity pull, so a
@@ -32448,17 +32450,6 @@ impl WorldSnapshot {
                     carrier_position.distance(p),
                     current_to_carrier,
                 );
-                // alex-1's attacking support-spacing bonus: reward a candidate that fills the
-                // right support distance / forward space when we have the ball. Complementary to
-                // the discipline term above (which trims redundant short pulls), so both apply.
-                let attacking_spacing_profile = if possession && me.role != PlayerRole::Goalkeeper {
-                    self.attacking_support_spacing_profile_at(me, p)
-                } else {
-                    AttackSupportSpacingProfile::default()
-                };
-                let attacking_spacing_bonus = attacking_spacing_profile.combined_score()
-                    * (1.20 + width_shortage * 0.65)
-                    + attacking_spacing_profile.forward_fill * 0.85;
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + goal_directness_bonus
@@ -32717,9 +32708,9 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
-        let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -33051,13 +33042,33 @@ impl WorldSnapshot {
         touch_intent_fit: f64,
     ) -> f64 {
         let position = self.player_snapshot_position(player);
-        let nearest_opponent_distance = self
-            .nearest_opponent_at(player.team, position)
+        let nearest_opponent = self.nearest_opponent_at(player.team, position);
+        let nearest_opponent_distance = nearest_opponent
             .map(|(_, _, distance)| distance)
             .unwrap_or(36.0);
+        let nearest_opponent_closing_rate = nearest_opponent
+            .map(|(opponent_id, opponent_position, _)| {
+                let opponent_velocity = self
+                    .player_velocity(opponent_id)
+                    .unwrap_or_else(|| {
+                        self.players
+                            .iter()
+                            .find(|candidate| candidate.id == opponent_id)
+                            .map(|candidate| candidate.velocity)
+                            .unwrap_or(Vec2::zero())
+                    });
+                dribble_closing_rate_toward_point(opponent_position, opponent_velocity, position)
+            })
+            .unwrap_or(0.0);
         let pressure = pressure_from_nearest_distance(nearest_opponent_distance);
+        let spacing_pressure = dribble_spacing_pressure_for_state(
+            player.role,
+            pass_origin_in_own_half(player.team, position, self.field_length),
+            nearest_opponent_distance,
+            nearest_opponent_closing_rate,
+        );
         let defender_spacing_pressure = if player.role == PlayerRole::Defender {
-            dribble_spacing_pressure_for_role(player.role, nearest_opponent_distance)
+            spacing_pressure
         } else {
             0.0
         };
@@ -33127,11 +33138,14 @@ impl WorldSnapshot {
         } else if forward_component.abs() <= 0.20 {
             distance *= 0.82;
         }
-        if defender_spacing_pressure > 0.0 {
-            distance *= (1.0 - defender_spacing_pressure * 0.34).clamp(0.62, 1.0);
+        if spacing_pressure > 0.0 {
+            distance *= (1.0 - spacing_pressure * 0.22).clamp(0.72, 1.0);
             if forward_component > 0.20 {
-                distance -= defender_spacing_pressure * 0.45;
+                distance -= spacing_pressure * 0.35;
             }
+        }
+        if defender_spacing_pressure > 0.0 {
+            distance *= (1.0 - defender_spacing_pressure * 0.18).clamp(0.68, 1.0);
         }
         let cap = if forward_component > 0.20 {
             (forward_space + PLAYER_CONTROL_RADIUS_YARDS * 2.1)
@@ -33439,25 +33453,83 @@ impl WorldSnapshot {
             }
         }
 
-        if me.role == PlayerRole::Defender
-            && !matches!(
-                dribble_final_cut_kind(kind),
-                DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
-            )
-        {
-            if let Some((_, defender_position, defender_distance)) = nearest_defender {
-                let spacing_pressure =
-                    dribble_spacing_pressure_for_role(me.role, defender_distance);
+        if !matches!(
+            dribble_final_cut_kind(kind),
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
+        ) {
+            if let Some((defender_id, defender_position, defender_distance)) = nearest_defender {
+                let defender_velocity = self.player_velocity(defender_id).unwrap_or(Vec2::zero());
+                let closing_rate =
+                    dribble_closing_rate_toward_point(defender_position, defender_velocity, current);
+                let target_closing_rate =
+                    dribble_closing_rate_toward_point(defender_position, defender_velocity, target);
+                let own_half = pass_origin_in_own_half(me.team, current, self.field_length);
+                let current_spacing_pressure = dribble_spacing_pressure_for_state(
+                    me.role,
+                    own_half,
+                    defender_distance,
+                    closing_rate,
+                );
+                let target_spacing_pressure = dribble_spacing_pressure_for_state(
+                    me.role,
+                    own_half,
+                    target.distance(defender_position),
+                    target_closing_rate,
+                );
+                let spacing_pressure = current_spacing_pressure.max(target_spacing_pressure);
+                let comfort_gap = dribble_comfort_space_yards_for_position(
+                    me.role,
+                    me.team,
+                    current,
+                    self.field_length,
+                );
                 let min_gap = defender_distance
-                    .min(DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS)
+                    .min(comfort_gap)
                     .max(DRIBBLE_OPPONENT_MIN_SPACE_YARDS);
-                if spacing_pressure > 0.0 && target.distance(defender_position) < min_gap {
+                if spacing_pressure > 0.04 && target.distance(defender_position) < min_gap {
                     let away = (current - defender_position).normalized();
                     if away.len() > 1e-6 {
-                        let escape_distance =
-                            (touch.distance_yards * (0.35 + spacing_pressure * 0.20))
-                                .clamp(0.75, 1.75);
-                        target = current + away * escape_distance;
+                        let forward = Vec2::new(0.0, me.team.attack_dir());
+                        let lateral_sign = if current.x >= defender_position.x { 1.0 } else { -1.0 };
+                        let lateral = Vec2::new(lateral_sign, 0.0);
+                        let escape_distance = (touch.distance_yards
+                            * (0.38 + spacing_pressure * 0.24))
+                            .clamp(0.80, if own_half { 2.65 } else { 2.25 });
+                        if me.role == PlayerRole::Defender {
+                            target = current + away * escape_distance;
+                        } else {
+                            let directions = [
+                                away,
+                                (away * 0.74 + forward * 0.32).normalized(),
+                                (lateral * 0.82 + forward * 0.50).normalized(),
+                                (lateral * -0.82 + forward * 0.50).normalized(),
+                            ];
+                            let mut best_target = current + away * escape_distance;
+                            let mut best_score = f64::NEG_INFINITY;
+                            for direction in directions {
+                                if direction.len() <= 1e-6 {
+                                    continue;
+                                }
+                                let raw = current + direction * escape_distance;
+                                let candidate =
+                                    raw.clamp_to_pitch(self.field_width, self.field_length);
+                                let pitch_loss = raw.distance(candidate);
+                                let gap = candidate.distance(defender_position);
+                                let forward_progress =
+                                    (candidate.y - current.y) * me.team.attack_dir();
+                                let gap_deficit = (min_gap - gap).max(0.0);
+                                let score = gap.min(min_gap + 1.0)
+                                    + forward_progress.max(0.0) * 0.78
+                                    - (-forward_progress).max(0.0) * 0.55
+                                    - gap_deficit * 2.0
+                                    - pitch_loss * 0.60;
+                                if score > best_score {
+                                    best_score = score;
+                                    best_target = candidate;
+                                }
+                            }
+                            target = best_target;
+                        }
                     }
                 }
             }

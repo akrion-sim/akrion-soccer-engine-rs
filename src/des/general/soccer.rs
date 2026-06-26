@@ -680,10 +680,13 @@ const RISING_PRESSURE_CLOSING_RATE_YPS: f64 = 4.0;
 // it is a near-certain interceptor, so the ball must not be played into it.
 const SLOW_OPPONENT_INTERCEPT_YPS: f64 = 1.96; // 4 mph
 const PASS_SET_INTERCEPTOR_LANE_RADIUS_YARDS: f64 = 3.2;
-// Outside the final third, the carrier should not dribble straight into an opponent —
-// keep at least this much open space ahead. In the final attacking third more risk is
-// allowed, so the guard is relaxed there.
+// The carrier should not dribble straight into an opponent: keep at least 2yd in
+// open play and 3yd in its own half when possible. If the opponent is moving away
+// from the carry lane, the pressure is relieved rather than treated as a static wall.
 const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
+const DRIBBLE_OWN_HALF_MIN_SPACE_YARDS: f64 = 3.0;
+const DRIBBLE_MOVING_AWAY_FULL_RELIEF_YPS: f64 = 2.5;
+const DRIBBLE_MOVING_AWAY_MAX_RELIEF: f64 = 0.86;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // Critical spacing discipline: most carriers should keep 2+ yards between the
 // ball and the NEAREST defender (in any direction), not just space straight ahead.
@@ -2802,10 +2805,8 @@ const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
 // ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
 // touch, they do not stand off it.
 const LOOSE_BALL_MAX_UNCONTESTED_SECONDS: f64 = 0.25;
-// Parallel loose-ball-attack tunables from the `alex-1` line of work (kept alongside
-// the urgency constants above — they drive its own shape-safe retrieval weighting and
-// its learning rewards/penalties for attacking vs. standing off an uncontested ball).
-const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 = 0.25;
+const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 =
+    LOOSE_BALL_MAX_UNCONTESTED_SECONDS;
 const LOOSE_BALL_SHAPE_SAFE_RETRIEVAL_WEIGHT_YARDS: f64 = 2.4;
 const LOOSE_BALL_ATTACK_CANDIDATE_REWARD: f64 = 0.20;
 const LOOSE_BALL_UNCONTESTED_HOLD_PENALTY: f64 = 0.34;
@@ -47099,10 +47100,110 @@ fn pressure_from_nearest_distance(nearest_opponent_distance: f64) -> f64 {
     }
 }
 
-fn dribble_comfort_space_yards_for_role(role: PlayerRole) -> f64 {
-    match role {
+fn dribble_comfort_space_yards_for_state(role: PlayerRole, own_half: bool) -> f64 {
+    let base = match role {
         PlayerRole::Defender => DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS,
         _ => DRIBBLE_OPPONENT_MIN_SPACE_YARDS,
+    };
+    if own_half {
+        base.max(DRIBBLE_OWN_HALF_MIN_SPACE_YARDS)
+    } else {
+        base
+    }
+}
+
+fn dribble_comfort_space_yards_for_role(role: PlayerRole) -> f64 {
+    dribble_comfort_space_yards_for_state(role, false)
+}
+
+fn dribble_comfort_space_yards_for_position(
+    role: PlayerRole,
+    team: Team,
+    position: Vec2,
+    field_length: f64,
+) -> f64 {
+    dribble_comfort_space_yards_for_state(role, pass_origin_in_own_half(team, position, field_length))
+}
+
+fn dribble_own_half_from_distances(yards_to_goal: f64, yards_to_own_goal: f64) -> bool {
+    yards_to_goal.is_finite()
+        && yards_to_own_goal.is_finite()
+        && yards_to_own_goal < yards_to_goal
+}
+
+fn dribble_moving_away_relief_from_closing_rate(closing_rate_yps: f64) -> f64 {
+    if closing_rate_yps.is_finite() && closing_rate_yps < 0.0 {
+        ((-closing_rate_yps) / DRIBBLE_MOVING_AWAY_FULL_RELIEF_YPS)
+            .clamp(0.0, 1.0)
+            * DRIBBLE_MOVING_AWAY_MAX_RELIEF
+    } else {
+        0.0
+    }
+}
+
+fn dribble_spacing_pressure_for_state(
+    role: PlayerRole,
+    own_half: bool,
+    nearest_opponent_distance: f64,
+    nearest_opponent_closing_rate_yps: f64,
+) -> f64 {
+    if nearest_opponent_distance.is_finite() {
+        let comfort_space = dribble_comfort_space_yards_for_state(role, own_half);
+        let static_pressure = (1.0 - nearest_opponent_distance / comfort_space).clamp(0.0, 1.0);
+        let moving_away_relief =
+            dribble_moving_away_relief_from_closing_rate(nearest_opponent_closing_rate_yps);
+        (static_pressure * (1.0 - moving_away_relief)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn dribble_closing_rate_toward_point(
+    source_position: Vec2,
+    source_velocity: Vec2,
+    point: Vec2,
+) -> f64 {
+    let to_point = point - source_position;
+    if to_point.len() > 1e-6 && source_velocity.x.is_finite() && source_velocity.y.is_finite() {
+        source_velocity.dot(to_point.normalized())
+    } else {
+        0.0
+    }
+}
+
+fn dribble_comfort_adjusted_gap(
+    gap_yards: f64,
+    closing_rate_yps: f64,
+    comfort_space_yards: f64,
+) -> f64 {
+    if gap_yards.is_finite() {
+        gap_yards
+            + dribble_moving_away_relief_from_closing_rate(closing_rate_yps)
+                * comfort_space_yards
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn dribble_comfort_path_margin_yards(
+    clearance_yards: f64,
+    role: PlayerRole,
+    team: Team,
+    current: Vec2,
+    target: Vec2,
+    field_length: f64,
+) -> f64 {
+    let comfort_space = dribble_comfort_space_yards_for_position(role, team, current, field_length)
+        .max(dribble_comfort_space_yards_for_position(
+            role,
+            team,
+            target,
+            field_length,
+        ));
+    if clearance_yards.is_finite() {
+        clearance_yards - comfort_space
+    } else {
+        8.0
     }
 }
 
@@ -49596,6 +49697,18 @@ fn dribble_mpc_control_estimate_for_snapshot(
         control_radius,
         0.045,
     );
+    let comfort_space_yards = dribble_comfort_space_yards_for_position(
+        role,
+        team,
+        current,
+        snapshot.field_length,
+    )
+    .max(dribble_comfort_space_yards_for_position(
+        role,
+        team,
+        target,
+        snapshot.field_length,
+    ));
     let mut nearest_target_gap = f64::INFINITY;
     let mut nearest_path_gap = f64::INFINITY;
     let mut opponent_time = f64::INFINITY;
@@ -49603,9 +49716,25 @@ fn dribble_mpc_control_estimate_for_snapshot(
         let opponent_position = snapshot
             .player_position(opponent.id)
             .unwrap_or(opponent.position);
-        nearest_target_gap = nearest_target_gap.min(opponent_position.distance(target));
-        nearest_path_gap =
-            nearest_path_gap.min(segment_distance_to_point(current, target, opponent_position));
+        let opponent_velocity = snapshot
+            .player_velocity(opponent.id)
+            .unwrap_or(opponent.velocity);
+        let target_closing =
+            dribble_closing_rate_toward_point(opponent_position, opponent_velocity, target);
+        let path_projection = segment_projection_factor(current, target, opponent_position);
+        let path_point = current + (target - current) * path_projection;
+        let path_closing =
+            dribble_closing_rate_toward_point(opponent_position, opponent_velocity, path_point);
+        nearest_target_gap = nearest_target_gap.min(dribble_comfort_adjusted_gap(
+            opponent_position.distance(target),
+            target_closing,
+            comfort_space_yards,
+        ));
+        nearest_path_gap = nearest_path_gap.min(dribble_comfort_adjusted_gap(
+            segment_distance_to_point(current, target, opponent_position),
+            path_closing,
+            comfort_space_yards,
+        ));
         let opponent_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
             * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
             * MovementGait::Sprint.speed_multiplier())
@@ -49625,12 +49754,9 @@ fn dribble_mpc_control_estimate_for_snapshot(
         .fold(f64::INFINITY, f64::min);
     let pressure = pressure_from_nearest_distance(nearest_current_gap);
     let clearance = nearest_target_gap.min(nearest_path_gap + 0.75);
-    let space_margin_yards = if clearance.is_finite() {
-        clearance - PLAYER_CONTROL_RADIUS_YARDS
-    } else {
-        8.0
-    };
-    let space_fit = ((space_margin_yards + 0.65) / 5.25).clamp(0.0, 1.0);
+    let space_margin_yards =
+        dribble_comfort_path_margin_yards(clearance, role, team, current, target, snapshot.field_length);
+    let space_fit = ((space_margin_yards + 0.45) / 5.10).clamp(0.0, 1.0);
     let player_time = distance / (top_speed * MovementGait::Sprint.speed_multiplier()).max(0.85);
     let race_advantage = if opponent_time.is_finite() {
         opponent_time - player_time
@@ -54453,20 +54579,34 @@ fn open_support_outlet_fit(observation: &SoccerPomdpObservation) -> f64 {
     (observation.open_support_outlets as f64 / 3.0).clamp(0.0, 1.0)
 }
 
-/// Multiplier (<=1) that discourages dribbling straight into an opponent OUTSIDE the
-/// final third: with less than ~2 yds of space ahead the carrier is running into a
-/// defender for no reason, so the carry/dribble score is cut. In the final attacking
-/// third (`yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL`) more risk pays off, so
-/// the guard is lifted entirely.
-fn dribble_into_opponent_penalty(forward_dribble_space_yards: f64, yards_to_goal: f64) -> f64 {
-    if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL
-        || forward_dribble_space_yards >= DRIBBLE_OPPONENT_MIN_SPACE_YARDS
-    {
+/// Multiplier (<=1) that discourages dribbling straight into an opponent: 2yd is
+/// the open-play buffer and 3yd applies in the carrier's own half. The penalty is
+/// soft, lighter near goal, and relieved when the nearest opponent is moving away.
+fn dribble_into_opponent_penalty(
+    forward_dribble_space_yards: f64,
+    yards_to_goal: f64,
+    yards_to_own_goal: f64,
+    nearest_opponent_closing_rate_yps: f64,
+) -> f64 {
+    let own_half = dribble_own_half_from_distances(yards_to_goal, yards_to_own_goal);
+    let min_space = dribble_comfort_space_yards_for_state(PlayerRole::Midfielder, own_half);
+    if forward_dribble_space_yards >= min_space {
+        return 1.0;
+    }
+    let moving_away_relief =
+        dribble_moving_away_relief_from_closing_rate(nearest_opponent_closing_rate_yps);
+    if moving_away_relief >= 0.70 && forward_dribble_space_yards >= min_space * 0.62 {
         return 1.0;
     }
     let closeness =
-        (1.0 - forward_dribble_space_yards / DRIBBLE_OPPONENT_MIN_SPACE_YARDS).clamp(0.0, 1.0);
-    (1.0 - closeness * 0.70).clamp(0.30, 1.0)
+        (1.0 - forward_dribble_space_yards / min_space).clamp(0.0, 1.0)
+            * (1.0 - moving_away_relief);
+    let penalty_strength = if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL {
+        0.48
+    } else {
+        0.70
+    };
+    (1.0 - closeness * penalty_strength).clamp(0.30, 1.0)
 }
 
 fn pressure_release_signal(observation: &SoccerPomdpObservation) -> f64 {
@@ -54474,11 +54614,19 @@ fn pressure_release_signal(observation: &SoccerPomdpObservation) -> f64 {
         .perceived_pressure
         .max(observation.pressure_urgency)
         .max(observation.immediate_dispossession_risk);
+    let own_half =
+        dribble_own_half_from_distances(observation.yards_to_goal, observation.yards_to_own_goal);
+    let comfort_space = dribble_comfort_space_yards_for_state(PlayerRole::Midfielder, own_half);
+    let moving_away_relief = dribble_moving_away_relief_from_closing_rate(
+        observation
+            .neural_extended
+            .nearest_opponent_closing_rate_yps,
+    );
     let close_gap_release = if observation.nearest_opponent_distance.is_finite() {
-        (((DRIBBLE_OPPONENT_MIN_SPACE_YARDS + 0.4 - observation.nearest_opponent_distance)
-            / DRIBBLE_OPPONENT_MIN_SPACE_YARDS)
+        (((comfort_space + 0.4 - observation.nearest_opponent_distance) / comfort_space)
             .clamp(0.0, 1.0)
-            * 1.05)
+            * 1.05
+            * (1.0 - moving_away_relief))
             .clamp(0.0, 0.98)
     } else {
         0.0
