@@ -1083,6 +1083,12 @@ pub struct PlayerAgent {
     /// distinct from `fatigue`, which is the slow aerobic drain over the match.
     #[serde(default)]
     pub anaerobic_load: f64,
+    /// Metabolic locomotion cost spent THIS tick (J) — the di Prampero running model
+    /// (run + accel power × dt) the W′ update already uses, surfaced for the learning
+    /// layer. Read only by the wasted-energy reward (`remember_recent_learning_transitions`);
+    /// it never feeds a decision, so it leaves the simulation trajectory byte-identical.
+    #[serde(default)]
+    pub last_tick_locomotion_joules: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
@@ -1272,6 +1278,57 @@ struct MpcExecutionEstimate {
     recommended_curve: &'static str,
     horizon_seconds: f64,
     reselect_reason: &'static str,
+    /// MPC shot foot choice: which foot the strike is taken with ("right"/"left"), and
+    /// that foot's power rating. Empty / `0.0` for non-shot actions or when the foot-choice
+    /// MPC is disabled (`DD_SOCCER_DISABLE_SHOT_FOOT_MPC`).
+    recommended_foot: &'static str,
+    recommended_foot_power: f64,
+}
+
+/// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
+const WEAK_FOOT_EXECUTION_DAMP: f64 = 0.88;
+
+/// Beyond this distance a shot is only a legal *volunteer* when the shot-trigger MDP
+/// value clears [`SHOT_TRIGGER_LONG_RANGE_MIN_VALUE`]. Inside it, legacy legality stands.
+/// This is the hard half of the "work it to 20/15, don't hammer it from 25" discipline.
+const SHOT_TRIGGER_LONG_RANGE_YARDS: f64 = 22.0;
+/// Minimum shot-trigger value for a >22yd shot to be a legal volunteer (open net /
+/// stranded keeper / live rebound clears it; a covered long shot does not).
+const SHOT_TRIGGER_LONG_RANGE_MIN_VALUE: f64 = 0.25;
+/// Score a vetoed long shot is crushed to in the possession ranker: tiny but non-zero so
+/// it ranks below carrying/passing alternatives (the carrier works it closer) while staying
+/// a LEGAL, selectable option.
+const SHOT_TRIGGER_VOLUNTEER_FLOOR: f64 = 0.002;
+
+/// MPC shot foot choice: pick which foot to strike with from the ball-vs-body geometry
+/// and the per-foot power. The ball sitting on a given side of the body, and a target
+/// swept toward that side, both favor the same-side foot; the choice is then weighted by
+/// each foot's power so a player swivels onto a stronger foot when geometry is neutral.
+/// Returns `(foot, power, weak_foot)` where `weak_foot` is true when forced onto the
+/// weaker foot (used to damp execution probability).
+fn shot_foot_choice(
+    skills: &SkillProfile,
+    ball_lateral_offset: f64,
+    target_lateral_sweep: f64,
+) -> (&'static str, f64, bool) {
+    let right_power = skills.right_foot_shot_power.max(0.0);
+    let left_power = skills.left_foot_shot_power.max(0.0);
+    // Geometry score: positive ⇒ right foot is naturally placed, negative ⇒ left. The ball
+    // on the right of the body (+x offset) and a strike swept to the right both favor right.
+    let geometry = ball_lateral_offset * 0.7 + target_lateral_sweep * 0.3;
+    // Power asymmetry (normalized): how much stronger the right foot is than the left.
+    let power_bias = (right_power - left_power) / 10.0;
+    // Combine: geometry dominates when pronounced, power breaks a near-neutral stance.
+    let decision = geometry + power_bias * 2.0;
+    let strong_foot_power = right_power.max(left_power);
+    let (foot, power) = if decision >= 0.0 {
+        ("right", right_power)
+    } else {
+        ("left", left_power)
+    };
+    // Weak foot = the chosen foot is materially weaker than the player's strong foot.
+    let weak_foot = power + 1.0 < strong_foot_power;
+    (foot, power, weak_foot)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1638,15 +1695,32 @@ fn mpc_execution_estimate_for_action(
     if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
         let observation = snapshot.observation_for(player.id);
         let first_time = matches!(label, "first-time-shot" | "first-time-header");
+        // MPC shot foot choice (default-ON; kill-switch `DD_SOCCER_DISABLE_SHOT_FOOT_MPC`).
+        // A header has no foot; otherwise pick the foot from ball-vs-body geometry and the
+        // per-foot power, instead of blindly taking the stronger foot's power. Disabled ⇒
+        // `None` ⇒ the legacy `.max()` power ⇒ byte-identical.
+        let foot_choice = if shot_foot_mpc_enabled() && label != "first-time-header" {
+            let attack_dir = player.team.attack_dir();
+            let ball_lateral_offset = (snapshot.ball.position.x - current.x) * attack_dir;
+            let target_lateral_sweep = (snapshot.field_width * 0.5 - current.x) * attack_dir;
+            Some(shot_foot_choice(
+                &player.skills,
+                ball_lateral_offset,
+                target_lateral_sweep,
+            ))
+        } else {
+            None
+        };
+        let chosen_foot_power = foot_choice.map(|(_, power, _)| power).unwrap_or_else(|| {
+            player
+                .skills
+                .right_foot_shot_power
+                .max(player.skills.left_foot_shot_power)
+        });
         let finish_skill = if label == "first-time-header" {
             aerial_duel_skill_from_agent(player)
         } else {
-            (ability01(
-                player
-                    .skills
-                    .right_foot_shot_power
-                    .max(player.skills.left_foot_shot_power),
-            ) * 0.62
+            (ability01(chosen_foot_power) * 0.62
                 + ability01(player.skills.shooting) * 0.26
                 + ability01(player.skills.first_touch) * 0.12)
                 .clamp(0.0, 1.0)
@@ -1699,6 +1773,16 @@ fn mpc_execution_estimate_for_action(
             + first_touch_fit * 0.10)
             * body_fit)
             .clamp(0.0, 0.99);
+        // Record the MPC foot choice and damp execution when geometry forces the weaker
+        // foot (a less reliable strike). Skipped when the foot-choice MPC is off (parity).
+        if let Some((foot, power, weak_foot)) = foot_choice {
+            estimate.recommended_foot = foot;
+            estimate.recommended_foot_power = power;
+            if weak_foot {
+                estimate.execution_probability =
+                    (estimate.execution_probability * WEAK_FOOT_EXECUTION_DAMP).clamp(0.0, 0.99);
+            }
+        }
         estimate.recommended_speed_yps = shot_speed;
         let shot_target_delta = shot_mpc.target_point - current;
         if shot_target_delta.len() > 1e-6 {
@@ -2520,6 +2604,21 @@ impl PlayerAgent {
             };
         self.fatigue = (self.fatigue + rotation_fatigue + involvement_fatigue).clamp(0.0, 1.0);
 
+        // Per-tick locomotion metabolic cost (J) for the wasted-energy reward. Computed
+        // every tick from the same speed/forward-accel running model the W′ branch uses,
+        // independent of `dd_soccer_disable_power_duration_ceiling()` so the metric exists
+        // under either energy model. Read-only metric: never changes a decision.
+        {
+            let speed_yps = self.velocity.len();
+            let accel_forward_yps2 = if speed_yps > 0.5 {
+                dot(self.acceleration, self.velocity / speed_yps).max(0.0)
+            } else {
+                self.acceleration.len()
+            };
+            self.last_tick_locomotion_joules =
+                metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2) * dt;
+        }
+
         if dd_soccer_disable_power_duration_ceiling() {
             let burst_load = match self.movement_gait {
                 MovementGait::Sprint => ANAEROBIC_SPRINT_LOAD_PER_SECOND,
@@ -3170,7 +3269,7 @@ impl PlayerAgent {
             .max(goal_proximity_shot_pressure)
             .max(decisive_goal_pressure * 0.72)
             .clamp(0.0, 1.0);
-        let shot_score = (self.preferences.shoot_bias
+        let shot_score_base = (self.preferences.shoot_bias
             * (0.52 + shooting * 0.62)
             * (1.0 + directive.risk_tolerance * 0.35)
             * (0.78 + (observation.opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0) * 0.44)
@@ -3224,6 +3323,53 @@ impl PlayerAgent {
             } else {
                 0.0
             });
+        // Learnable shot-trigger MDP/POMDP: scale the whole shot score (floors included)
+        // by the value of shooting NOW. This is what fixes "shoots from 25 when he should
+        // work it to 20/15": a far, covered, low-value chance is suppressed toward ~0.2×
+        // while a close, open, high-value one is lifted toward ~1.35×. Default-ON; the
+        // kill-switch (`DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP`) skips this entirely ⇒
+        // byte-identical. The MPC then still re-checks executability and can veto/reselect.
+        let shot_trigger_value = if shot_trigger_mdp_enabled() {
+            Some(if observation.shot_trigger_mdp_value >= 0.0 {
+                // Populated by the snapshot seam (trained head or analytic seed).
+                observation.shot_trigger_mdp_value
+            } else {
+                // Observation built without the snapshot seam (e.g. a direct unit test):
+                // recompute the analytic seed so the discipline still applies.
+                analytic_shot_trigger_value(&ShotTriggerInputs::from_observation(
+                    observation,
+                    self.role,
+                    shooting,
+                    1.0,
+                ))
+            })
+        } else {
+            None
+        };
+        // The shot stays a LEGAL option from range (a human / genuine speculative chance can
+        // still take it) — the discipline is to make the AI not *volunteer* low-value long
+        // shots. Inside range, a mild value-scaled demotion; beyond
+        // `SHOT_TRIGGER_LONG_RANGE_YARDS` with a low MDP value (a covered long shot), the
+        // score is crushed below the carrying/passing alternatives so the carrier works it
+        // closer — but `shot_legal` is untouched, so it stays a selectable option.
+        let shot_score = match shot_trigger_value {
+            Some(v)
+                if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE =>
+            {
+                shot_score_base.min(SHOT_TRIGGER_VOLUNTEER_FLOOR)
+            }
+            Some(v) => shot_score_base * shot_trigger_score_multiplier(v),
+            None => shot_score_base,
+        };
+        // Whether the stop-volunteering discipline vetoes a long shot here. Also used below
+        // to skip the near-goal shoot *floors* (which would otherwise re-boost shoot above
+        // the crush and defeat the discipline). `false` when the kill-switch is set.
+        let shot_trigger_long_range_veto = matches!(
+            shot_trigger_value,
+            Some(v) if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+        );
         let fatigue_dribble = fatigue_dribble_multiplier(observation);
         let shot_creation_carry = shot_creation_carry_multiplier(observation);
         let patience_factor = low_pressure_patience_factor(observation);
@@ -4461,7 +4607,7 @@ impl PlayerAgent {
         let shot_floor = near_goal_shot_pressure_floor(observation, self.role, shooting).max(
             goal_proximity_shot_pressure_floor(observation, self.role, shooting),
         );
-        if shot_floor > 0.0 {
+        if shot_floor > 0.0 && !shot_trigger_long_range_veto {
             let decisive_shot_floor = if shot_legal && decisive_goal_pressure > 0.0 {
                 let shot_lane_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.42
                     + observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.28
@@ -4627,9 +4773,17 @@ impl PlayerAgent {
                         0.78
                     },
                 );
+            // When the long shot is vetoed (stop-volunteering), don't let the decisive
+            // near-goal floor re-boost SHOOT — keep only the killer-pass in the family so
+            // the carrier threads / works it closer instead of hammering from range.
+            let decisive_family: &[&str] = if shot_trigger_long_range_veto {
+                &["killer-pass"]
+            } else {
+                &["shoot", "killer-pass"]
+            };
             ensure_min_legal_option_family_probability(
                 &mut options,
-                &["shoot", "killer-pass"],
+                decisive_family,
                 decisive_family_floor,
             );
         }
@@ -7448,8 +7602,42 @@ impl PlayerAgent {
             };
         }
 
+        // Learnable shot-trigger MDP/POMDP value of shooting NOW. The *forced* shot rule
+        // paths below fire before `possession_action_options` and are the ones pulling the
+        // trigger from 25yd; the veto derived from this value makes a striker work a far,
+        // covered ball closer instead of hammering it from distance. `None` (kill-switch) ⇒
+        // no veto ⇒ byte-identical.
+        let shot_trigger_value = if shot_trigger_mdp_enabled() {
+            Some(if observation.shot_trigger_mdp_value >= 0.0 {
+                observation.shot_trigger_mdp_value
+            } else {
+                analytic_shot_trigger_value(&ShotTriggerInputs::from_observation(
+                    &observation,
+                    self.role,
+                    shooting_skill,
+                    1.0,
+                ))
+            })
+        } else {
+            None
+        };
+        // Stop-volunteering discipline: beyond `SHOT_TRIGGER_LONG_RANGE_YARDS` a *forced*
+        // shot needs a real MDP justification (open net / stranded keeper / live rebound),
+        // otherwise the rule paths below are skipped and the carrier works it closer. Inside
+        // that range the forced paths fire exactly as before (a clean 18-22yd must-shoot is
+        // untouched). `None` (kill-switch) ⇒ no veto ⇒ byte-identical.
+        let shot_trigger_long_range_veto = match shot_trigger_value {
+            Some(v) => {
+                observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+            }
+            None => false,
+        };
+        let shot_trigger_allows_forced_shot = !shot_trigger_long_range_veto;
+
         if has_ball
             && goal_attack_shot_blocks_alternatives(&observation, self.role)
+            && shot_trigger_allows_forced_shot
             && !threaded_goal_pass_can_override_forced_shot(&observation, self.role)
         {
             let action = SoccerAction::Shoot {
@@ -7471,7 +7659,10 @@ impl PlayerAgent {
                 action,
                 sprint: false,
             };
-        } else if has_ball && striker_shot_window_is_qualified(&observation, self.role) {
+        } else if has_ball
+            && !shot_trigger_long_range_veto
+            && striker_shot_window_is_qualified(&observation, self.role)
+        {
             let striker_shot_bonus = striker_legal_shot_attempt_bonus(&observation, self.role);
             let window_shot_chance = (0.66 + shooting_skill * 0.14 + striker_shot_bonus * 0.18
                 - observation.shot_block_probability.clamp(0.0, 1.0) * 0.08)
@@ -7503,6 +7694,7 @@ impl PlayerAgent {
                 };
             }
         } else if has_ball
+            && !shot_trigger_long_range_veto
             && (shot_decision_is_qualified_for_role(&observation, self.role)
                 || contested_final_third_shot_is_qualified(&observation, self.role, shooting_skill))
             && !threaded_goal_pass_can_override_forced_shot(&observation, self.role)
@@ -11878,5 +12070,43 @@ mod decision_refractory_tests {
             }
         }
         assert_eq!(allowed, vec![1, 4, 8]);
+    }
+}
+
+#[cfg(test)]
+mod shot_foot_choice_tests {
+    use super::{shot_foot_choice, WEAK_FOOT_EXECUTION_DAMP};
+    use crate::des::general::soccer::SkillProfile;
+
+    fn right_footed() -> SkillProfile {
+        let mut s = SkillProfile::default();
+        s.right_foot_shot_power = 9.0;
+        s.left_foot_shot_power = 4.0;
+        s
+    }
+
+    #[test]
+    fn neutral_geometry_picks_the_stronger_foot() {
+        let skills = right_footed();
+        // Ball centred on the body, no sweep ⇒ the power bias should win → right.
+        let (foot, power, weak) = shot_foot_choice(&skills, 0.0, 0.0);
+        assert_eq!(foot, "right");
+        assert!((power - 9.0).abs() < 1e-9);
+        assert!(!weak, "strong foot is never the weak foot");
+    }
+
+    #[test]
+    fn ball_far_on_the_weak_side_forces_the_weak_foot_and_flags_it() {
+        let skills = right_footed();
+        // Ball a long way to the left of the body overrides the modest power bias.
+        let (foot, power, weak) = shot_foot_choice(&skills, -20.0, -5.0);
+        assert_eq!(foot, "left");
+        assert!((power - 4.0).abs() < 1e-9);
+        assert!(weak, "a forced weaker foot should be flagged for the execution damp");
+    }
+
+    #[test]
+    fn weak_foot_damp_is_a_reduction() {
+        assert!(WEAK_FOOT_EXECUTION_DAMP > 0.0 && WEAK_FOOT_EXECUTION_DAMP < 1.0);
     }
 }

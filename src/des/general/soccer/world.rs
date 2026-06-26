@@ -45,6 +45,10 @@ const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
 // ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
 // first touch lands in real space, not under a second defender.
 const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
+/// Beat-the-defender duel (gated): a defender must be at least this tight (yards) before the
+/// keep-distance peel-away ([`WorldSnapshot::dribble_away_from_pressure_target_for`]) overrides a
+/// stalling shield. Beyond it there is no proximate pressure to dribble away from.
+const BEAT_KEEP_DISTANCE_TRIGGER_YARDS: f64 = 5.2;
 // Probe cap for the defender-aware lateral escape-lane clearance exposed on the observation.
 const FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS: f64 = 8.0;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
@@ -183,6 +187,17 @@ impl OpponentPressBelief {
             self.beta *= scale;
         }
     }
+}
+
+/// One windowed wasted-energy sample: a transition where the player was "moving a lot"
+/// (locomotion cost above [`WASTED_ENERGY_MIN_JOULES_PER_TICK`]), held until its 10s
+/// lookahead closes. If no ball interaction lands in that window the transition is re-trained
+/// with a small negative reward scaled by `joules`; otherwise it is dropped. See
+/// [`SoccerMatch::finalize_wasted_energy_window`].
+#[derive(Clone)]
+pub(crate) struct WastedEnergySample {
+    pub(crate) transition: SoccerLearningTransition,
+    pub(crate) joules: f64,
 }
 
 pub struct SoccerMatch {
@@ -373,6 +388,17 @@ pub struct SoccerMatch {
     pub(crate) aerial_reception_samples: Vec<AerialReceptionSample>,
     /// Open aerial receptions awaiting their control outcome.
     pub(crate) pending_aerial_reception: Vec<PendingAerialReception>,
+    /// The trained shot-trigger value head (when to pull the trigger on a shot), when
+    /// present. Carried + trained across games by the learner; `None` ⇒ the analytic
+    /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone so the shot decision
+    /// reads the same learned value.
+    pub(crate) shot_trigger_head: Option<std::sync::Arc<ShotTriggerHead>>,
+    /// Rolling RL corpus for the shot-trigger head: the shot-decision state + whether a
+    /// shot was taken + the windowed reward. Collected only while the model is enabled
+    /// (`collect_shot_trigger_rl_samples`); empty + untouched in the default process.
+    pub(crate) shot_trigger_samples: Vec<ShotTriggerSample>,
+    /// Open shot decisions awaiting their windowed reward.
+    pub(crate) pending_shot_trigger: Vec<PendingShotTriggerDecision>,
     /// Tick at which the ball most recently became loose AND went uncontested (no
     /// player challenging it). `None` whenever the ball is held / contested. Drives
     /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
@@ -392,6 +418,15 @@ pub struct SoccerMatch {
     pub(crate) turnover_penalty_history: VecDeque<SoccerLearningTransition>,
     /// De-dupes the windowed penalty when multiple turnover signals fire on one tick.
     pub(crate) last_turnover_penalty_tick: Option<u64>,
+    /// Rolling ~10s window of recent "moving a lot" transitions awaiting their wasted-energy
+    /// verdict, evicted by tick-age. Maintained only while the wasted-energy penalty is enabled.
+    /// Each sample whose 10s lookahead closes with no ball touch is re-queued into
+    /// `deferred_reward_transitions` with a tiny negative reward (`finalize_wasted_energy_window`).
+    pub(crate) wasted_energy_history: VecDeque<WastedEnergySample>,
+    /// Per-player tick of the most recent ball interaction (touch or holding it). A windowed
+    /// energy sample at tick `t` is "wasted" iff this is `< t` when the 10s window closes.
+    /// Maintained only while the wasted-energy penalty is enabled.
+    pub(crate) player_last_ball_interaction_tick: HashMap<usize, u64>,
     pub(crate) defensive_delay_clocks: HashMap<usize, f64>,
     pub(crate) defensive_beat_clocks: HashMap<usize, f64>,
     pub(crate) offside_clocks: HashMap<usize, f64>,
@@ -1895,11 +1930,16 @@ impl SoccerMatch {
             aerial_reception_head: None,
             aerial_reception_samples: Vec::new(),
             pending_aerial_reception: Vec::new(),
+            shot_trigger_head: None,
+            shot_trigger_samples: Vec::new(),
+            pending_shot_trigger: Vec::new(),
             loose_ball_uncontested_since_tick: None,
             attack_spacing_samples: Vec::new(),
             pending_attack_spacing: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
+            wasted_energy_history: VecDeque::new(),
+            player_last_ball_interaction_tick: HashMap::new(),
             defensive_delay_clocks: HashMap::new(),
             defensive_beat_clocks: HashMap::new(),
             offside_clocks: HashMap::new(),
@@ -6479,6 +6519,14 @@ impl SoccerMatch {
         // tick on the final positions (independent of learning).
         self.update_player_facing_dizziness_energy();
         self.update_player_tick_carryover();
+        // The current holder is interacting with the ball this tick (covers a long dribble,
+        // where `record_possession_touch` only fired at the receive). No-op when the feature
+        // is off. Touch/interception/receive events are timestamped in `record_possession_touch`.
+        if dd_soccer_enable_wasted_energy_penalty() {
+            if let Some(holder) = self.ball.holder {
+                self.player_last_ball_interaction_tick.insert(holder, self.tick);
+            }
+        }
         let next_snapshot = WorldSnapshot::from_match_for_learning(self);
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
@@ -6493,6 +6541,10 @@ impl SoccerMatch {
         // Learnable aerial-reception control RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_AERIAL_RECEPTION` is set).
         self.collect_aerial_reception_rl_samples(&next_snapshot);
+        // Learnable shot-trigger (when to shoot) RL samples. Default-ON model, but the
+        // collector is a no-op when the kill-switch `DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP`
+        // is set.
+        self.collect_shot_trigger_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -7154,6 +7206,10 @@ impl SoccerMatch {
     pub(crate) fn record_possession_touch(&mut self, player_id: usize) {
         if player_id >= self.players.len() {
             return;
+        }
+        if dd_soccer_enable_wasted_energy_penalty() {
+            self.player_last_ball_interaction_tick
+                .insert(player_id, self.tick);
         }
         let previous_touch_team = self.previous_touch_team_for_goal();
         // Last-touch tracking + no-double-touch-on-restart: record who touched it,
@@ -9239,8 +9295,14 @@ impl SoccerMatch {
         let pressure = pressure_from_observation(&observation)
             .max(pressure_from_nearest_distance(nearest_pressure));
         let requested_target = target;
-        let stationary_escape_target =
-            snapshot.stationary_holder_open_space_carry_target_for(player_id, target, kind, touch);
+        let stationary_escape_target = snapshot
+            .stationary_holder_open_space_carry_target_for(player_id, requested_target, kind, touch)
+            // Beat-the-defender duel (gated, default-ON): if the carrier would otherwise stall into
+            // a back-to-goal shield, peel away into space to keep distance from the presser. Off =>
+            // this returns None and the `.unwrap_or` is byte-identical to before.
+            .or_else(|| {
+                snapshot.dribble_away_from_pressure_target_for(player_id, requested_target, kind)
+            });
         let target = stationary_escape_target.unwrap_or(requested_target);
         let pressured_shield_escape = stationary_escape_target.is_some()
             && matches!(kind, Some(DribbleMoveKind::ProtectBall))
@@ -11424,11 +11486,31 @@ impl SoccerMatch {
                                     &self.players[player_id].skills,
                                     DefenderDribbleResponse::Commit,
                                 );
-                                // Shielding protects the ball but sacrifices the
-                                // dribble: halve the chance of beating the
-                                // defender while doing it.
                                 if holder_is_shielding && !holder_is_xavi_turn {
+                                    // Shielding protects the ball but sacrifices the
+                                    // dribble: halve the chance of beating the
+                                    // defender while doing it.
                                     beat_probability *= 0.5;
+                                } else if beat_defender_duel_enabled() {
+                                    // Beat-the-defender duel (gated): the defender lunged into a
+                                    // tackle and MISSED — they are over-committed, their momentum
+                                    // carrying them past. Blend in the kinematic exploit so the
+                                    // carrier accelerates past more often than the skill-only model
+                                    // alone allows. Off ⇒ `beat_probability` is unchanged (parity).
+                                    let carrier = &self.players[target_player];
+                                    let defender = &self.players[player_id];
+                                    let commitment = DefenderCommitmentState::evaluate(
+                                        carrier.team.attack_dir(),
+                                        carrier.position,
+                                        defender.position,
+                                        defender.velocity,
+                                        &defender.skills,
+                                        defender.fatigue,
+                                    );
+                                    let uplift = over_commit_beat_uplift(&commitment);
+                                    beat_probability = (beat_probability
+                                        + uplift * (1.0 - beat_probability))
+                                        .clamp(0.0, 0.97);
                                 }
                                 beaten_by_dribble = beat_probability >= 0.52;
                             }
@@ -11554,6 +11636,24 @@ impl SoccerMatch {
                             );
                             if holder_is_shielding && !holder_is_xavi_turn {
                                 beat_probability *= 0.5;
+                            } else if beat_defender_duel_enabled() {
+                                // Beat-the-defender duel (gated): a MISSED slide tackle is the most
+                                // over-committed a defender can be — off their feet, momentum spent.
+                                // Blend in the kinematic exploit. Off ⇒ unchanged (parity).
+                                let carrier = &self.players[target_player];
+                                let defender = &self.players[player_id];
+                                let commitment = DefenderCommitmentState::evaluate(
+                                    carrier.team.attack_dir(),
+                                    carrier.position,
+                                    defender.position,
+                                    defender.velocity,
+                                    &defender.skills,
+                                    defender.fatigue,
+                                );
+                                let uplift = over_commit_beat_uplift(&commitment);
+                                beat_probability = (beat_probability
+                                    + uplift * (1.0 - beat_probability))
+                                    .clamp(0.0, 0.97);
                             }
                             beaten_by_dribble = beat_probability >= 0.52;
                         }
@@ -12798,7 +12898,35 @@ impl SoccerMatch {
         let horizon = self.config.mpc.player_horizon.max(1);
         let latent = self.mpc_latent_execution_objective(player_id, my_team);
         let latent_target = self.mpc_latent_shaped_target(my_team, target, latent);
-        let reference_target = self.mpc_pitch_value_shaped_target(player_id, latent_target);
+        let pitch_value_target = self.mpc_pitch_value_shaped_target(player_id, latent_target);
+        // xT terminal-cost shaping (gated; identity when off): nudge the already pitch-value-shaped
+        // reference up the control-weighted-threat gradient so an in-possession outfielder settles
+        // in the most valuable controllable space within reach of its assigned slot.
+        let reference_target = if xt_terminal_cost_enabled()
+            && self.controlled_possession_team_now() == Some(my_team)
+            && self
+                .players
+                .get(player_id)
+                .map_or(false, |p| p.role != PlayerRole::Goalkeeper)
+        {
+            let (fw, fl) = sane_pitch_dimensions(
+                self.config.field_width_yards,
+                self.config.field_length_yards,
+            );
+            let points: Vec<XtControlPoint> = self
+                .players
+                .iter()
+                .map(|p| XtControlPoint {
+                    team: p.team,
+                    position: p.position,
+                    velocity: p.velocity,
+                    top_speed: player_top_speed_yps(p.role, &p.skills),
+                })
+                .collect();
+            xt_terminal_shaped_target(&points, my_team, pitch_value_target, fw, fl)
+        } else {
+            pitch_value_target
+        };
         let pitch_value_terminal_gain =
             self.mpc_pitch_value_terminal_gain_for(player_id, reference_target);
         let desired_cfg =
@@ -16289,6 +16417,67 @@ impl SoccerMatch {
                 self.turnover_penalty_history.pop_front();
             }
         }
+        // Wasted-energy window: retain this tick's "moving a lot" transitions, then settle any
+        // whose 10s lookahead has now closed. Gated so it adds zero cost when off.
+        if dd_soccer_enable_wasted_energy_penalty() && self.config.learning_enabled {
+            for transition in transitions {
+                let joules = self
+                    .players
+                    .get(transition.player_id)
+                    .map_or(0.0, |player| player.last_tick_locomotion_joules);
+                if joules.is_finite() && joules >= WASTED_ENERGY_MIN_JOULES_PER_TICK {
+                    self.wasted_energy_history.push_back(WastedEnergySample {
+                        transition: transition.clone(),
+                        joules,
+                    });
+                }
+            }
+            while self.wasted_energy_history.len() > WASTED_ENERGY_MAX_PENDING_SAMPLES {
+                self.wasted_energy_history.pop_front();
+            }
+            self.finalize_wasted_energy_window();
+        }
+    }
+
+    /// Settle wasted-energy samples whose 10s lookahead has closed as of the current tick. A
+    /// sample at tick `t` is "wasted" iff the player logged NO ball interaction in `[t, t+10s]`
+    /// (tracked monotonically in [`Self::player_last_ball_interaction_tick`]); such a transition is
+    /// re-queued into `deferred_reward_transitions` with a tiny negative reward scaled by the
+    /// joules it spent, so every gradient learner nudges that state→action pair down a touch.
+    /// Samples that DID lead to a touch are simply dropped (no reward change). No-op when disabled.
+    pub(crate) fn finalize_wasted_energy_window(&mut self) {
+        let window = WASTED_ENERGY_WINDOW_TICKS.max(1);
+        let points = wasted_energy_penalty_points();
+        // History is tick-ordered (oldest at the front); stop at the first sample still inside
+        // its lookahead window.
+        while self
+            .wasted_energy_history
+            .front()
+            .is_some_and(|sample| self.tick.saturating_sub(sample.transition.tick) >= window)
+        {
+            let sample = self.wasted_energy_history.pop_front().expect("front exists");
+            let player_id = sample.transition.player_id;
+            let last_interaction = self
+                .player_last_ball_interaction_tick
+                .get(&player_id)
+                .copied();
+            // A touch at or after the sample's tick means the running paid off — drop it.
+            let touched_in_window =
+                last_interaction.is_some_and(|interaction| interaction >= sample.transition.tick);
+            if touched_in_window || points <= 0.0 {
+                continue;
+            }
+            let ratio = (sample.joules / WASTED_ENERGY_REFERENCE_JOULES_PER_TICK)
+                .clamp(0.0, WASTED_ENERGY_PENALTY_RATIO_CLAMP);
+            let penalty = points * ratio;
+            if penalty <= 1e-9 || !penalty.is_finite() {
+                continue;
+            }
+            let mut penalized = sample.transition;
+            penalized.reward -= penalty;
+            self.deferred_reward_transitions.push(penalized);
+        }
+        self.cap_deferred_reward_transitions();
     }
 
     /// Retroactively penalize the losing team's actions over the last
@@ -17710,6 +17899,11 @@ pub struct WorldSnapshot {
     /// serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
+    /// Carried from the match for live consumption in the shot decision: the trained
+    /// shot-trigger value head (when to pull the trigger). `None` ⇒ analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) shot_trigger_head: Option<std::sync::Arc<ShotTriggerHead>>,
     /// Carried from the match: the tick the loose ball last went uncontested (see
     /// `SoccerMatch::loose_ball_uncontested_since_tick`). `None` ⇒ not loose /
     /// contested. Read by the urgency override so a stale loose ball is attacked.
@@ -18488,6 +18682,25 @@ fn dd_soccer_disable_defensive_pushup() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP").is_ok())
 }
+/// Field-numbers vector (ON by default). When enabled, every player's observation carries
+/// the 11v11 numbers-up/numbers-down picture ([`SoccerFieldNumbersVector`]) summarized from
+/// all 22 bodies' position + kinematics onto that player's attack axis, and its two
+/// urgencies are folded into the observation's offensive/defensive urgency so a numerical
+/// overload ahead (exploit it) or exposure behind (recover) sparks urgency on both sides of
+/// the ball. Set `DD_SOCCER_DISABLE_FIELD_NUMBERS_VECTOR` to leave the vector zeroed and skip
+/// the fold — byte-identical to before the feature — for A/B comparison.
+pub(crate) fn dd_soccer_disable_field_numbers_vector() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_DISABLE_FIELD_NUMBERS_VECTOR").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIELD_NUMBERS_VECTOR").is_ok())
+    }
+}
 // Default ON: in open play the back four holds the 6-yard line as its effective end-line instead
 // of retreating onto its own goal-line. Set DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR to disable
 // (byte-identical to the prior behaviour) for A/B comparison.
@@ -18519,6 +18732,28 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
+}
+/// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
+/// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
+/// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
+pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+}
+/// Per-fully-wasted-sprint-tick penalty points, overridable via
+/// `DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS` for A/B tuning. Falls back to
+/// [`WASTED_ENERGY_PENALTY_POINTS`]; a non-finite/negative override is ignored.
+fn wasted_energy_penalty_points() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS")
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .filter(|points| points.is_finite() && *points >= 0.0)
+            .unwrap_or(WASTED_ENERGY_PENALTY_POINTS)
+    })
 }
 fn dd_soccer_disable_offball_settle() -> bool {
     use std::sync::OnceLock;
@@ -18697,6 +18932,10 @@ const RUNAROUND_BODY_CLEARANCE_YARDS: f64 = 1.10;
 const RUNAROUND_MOMENTUM_ESCAPE_REFERENCE_YPS: f64 = 4.5;
 const RUNAROUND_TOUCHLINE_MARGIN_YARDS: f64 = 2.5;
 const RUNAROUND_MIN_QUALITY: f64 = 0.45;
+/// Beat-the-defender duel (gated): quality bonus added to the run-around side whose knock goes to
+/// the OPEN side — away from an over-committed defender's lean — so the carrier exits where the
+/// defender's momentum cannot recover within their reaction window. Off ⇒ never applied (parity).
+const RUNAROUND_MOMENTUM_SIDE_BONUS: f64 = 0.22;
 // Appetite shaping: the move is much MORE inclined the bigger the speed differential over the
 // defender, and the clearer the space behind them (nobody to intercept the longer touch). These set
 // where each term saturates.
@@ -19340,6 +19579,7 @@ impl WorldSnapshot {
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
+            shot_trigger_head: m.shot_trigger_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
@@ -23064,6 +23304,7 @@ impl WorldSnapshot {
                 visible_pass_options: 0,
                 visible_aerial_pass_options: 0,
                 open_support_outlets: 0,
+                shot_trigger_mdp_value: shot_trigger_mdp_value_unset(),
                 teammates_ahead: 0,
                 field_players_ahead: 0,
                 field_players_behind: 0,
@@ -23254,6 +23495,7 @@ impl WorldSnapshot {
                 offensive_urgency: 0.0,
                 defensive_urgency: 0.0,
                 decision_urgency: 0.0,
+                field_numbers: SoccerFieldNumbersVector::default(),
                 goal_attack_window_score: 0.0,
                 killer_pass_goal_pressure: 0.0,
                 single_thread_goal_pressure: 0.0,
@@ -24254,7 +24496,43 @@ impl WorldSnapshot {
             + behind_numbers_disadvantage * behind_player_density * 0.75
             + opponent_center_drive * 0.28)
             .clamp(0.0, 1.0);
-        let offensive_urgency = if has_ball {
+        // 11v11 field-numbers vector: the numbers-up / numbers-down picture around this
+        // player, read off the full field vector (all 22 bodies' position + kinematics)
+        // projected onto this player's own attack axis. Computed once here so EVERY
+        // decision that consumes the observation has it as an input; gated default-ON
+        // (left at zero when disabled ⇒ byte-identical). See `field_numbers` module.
+        let field_numbers_enabled = !dd_soccer_disable_field_numbers_vector();
+        let field_numbers = if field_numbers_enabled {
+            let attack = me.team.attack_dir();
+            let mut bodies: Vec<FieldNumbersBody> =
+                Vec::with_capacity(opponents.len() + teammates.len());
+            let mut push_body = |player: &PlayerSnapshot, is_teammate: bool| {
+                let position = self.player_snapshot_position(player);
+                bodies.push(FieldNumbersBody {
+                    is_teammate,
+                    forward_offset_yards: (position.y - me_position.y) * attack,
+                    forward_velocity_yps: player.velocity.y * attack,
+                    forward_acceleration_yps2: player.acceleration.y * attack,
+                    forward_jerk_yps3: player.jerk.y * attack,
+                });
+            };
+            for player in &teammates {
+                push_body(player, true);
+            }
+            for player in &opponents {
+                push_body(player, false);
+            }
+            let team_has_possession = self.possession_team() == Some(me.team);
+            compute_field_numbers(
+                &bodies,
+                me.velocity.y * attack,
+                me.acceleration.y * attack,
+                team_has_possession,
+            )
+        } else {
+            SoccerFieldNumbersVector::default()
+        };
+        let base_offensive_urgency = if has_ball {
             (shot_geometry_urgency
                 + team_directive.attacking_overload_score.clamp(0.0, 1.0) * 0.14
                 + field_offensive_urgency * 0.12)
@@ -24264,6 +24542,11 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Fold the vectorized numbers urgency into the scalar field-context urgency:
+        // an overload ahead is a break to play forward NOW, before the defence recovers.
+        let offensive_urgency =
+            (base_offensive_urgency + field_numbers.offensive_numbers_urgency * 0.40)
+                .clamp(0.0, 1.0);
         let own_half = pass_origin_in_own_half(me.team, me_position, self.field_length);
         let own_goal_pressure = if own_half {
             (1.0 - (own_goal.y - me_position.y).abs() / (self.field_length * 0.46).max(1.0))
@@ -24277,7 +24560,7 @@ impl WorldSnapshot {
             PlayerRole::Midfielder => 0.72,
             PlayerRole::Forward => 0.36,
         };
-        let defensive_urgency = if has_ball && own_half {
+        let base_defensive_urgency = if has_ball && own_half {
             ((0.28
                 + own_goal_pressure * 0.48
                 + perceived_pressure * 0.24
@@ -24290,6 +24573,11 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // Fold the defensive numbers vector in after the scalar context. Exposure behind
+        // must spark recovery urgency even off the ball, while staying bounded as a lift.
+        let defensive_urgency = (base_defensive_urgency
+            + field_numbers.defensive_numbers_urgency * defensive_role_urgency * 0.40)
+            .clamp(0.0, 1.0);
         let pressure_urgency = if has_ball {
             (perceived_pressure * 0.58
                 + immediate_dispossession_risk * 0.52
@@ -24369,6 +24657,7 @@ impl WorldSnapshot {
             visible_pass_options: visible_pass_targets.len(),
             visible_aerial_pass_options: visible_aerial_pass_targets.len(),
             open_support_outlets,
+            shot_trigger_mdp_value: shot_trigger_mdp_value_unset(),
             teammates_ahead: forward_support_context.teammates_ahead,
             field_players_ahead: field_front_behind_context.field_players_ahead,
             field_players_behind: field_front_behind_context.field_players_behind,
@@ -24610,6 +24899,7 @@ impl WorldSnapshot {
             offensive_urgency,
             defensive_urgency,
             decision_urgency,
+            field_numbers,
             goal_attack_window_score,
             killer_pass_goal_pressure: 0.0,
             single_thread_goal_pressure: 0.0,
@@ -24686,6 +24976,12 @@ impl WorldSnapshot {
         };
         observation.decisive_goal_action_pressure =
             near_goal_decisive_action_pressure_score(&observation, me.role);
+        // Learnable shot-trigger value (when to pull the trigger): consume the trained
+        // head if promoted, else the analytic seed. `None` (gated off) ⇒ the unset
+        // sentinel, so the decision layer reproduces the legacy heuristic (byte-identical).
+        observation.shot_trigger_mdp_value = self
+            .shot_trigger_mdp_value(&observation, me.role, ability01(me.skills.shooting))
+            .unwrap_or_else(shot_trigger_mdp_value_unset);
         let total_elapsed = observation_started.elapsed();
         if soccer_observation_telemetry_enabled()
             && total_elapsed > soccer_observation_telemetry_min_duration()
@@ -26701,18 +26997,40 @@ impl WorldSnapshot {
         let Some(facing) = facing else {
             return true;
         };
-        if self.ball.holder == Some(observer_id) {
+        let visible_by_fov = if self.ball.holder == Some(observer_id) {
             let angle = angle_between_vectors_degrees(facing, to_point);
-            return angle
-                <= (BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES)
-                && self.point_occlusion_score_for_observer(observer_id, point, ignored_player_id)
-                    < PERCEPTION_OCCLUSION_VISIBILITY_CUTOFF;
+            angle <= (BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES)
+        } else {
+            let fov = player_field_of_view(observer);
+            let half_fov_cos = (fov.to_radians() * 0.5).cos();
+            facing.dot(to_point.normalized()) >= half_fov_cos
+        };
+        if !visible_by_fov {
+            return false;
         }
-        let fov = player_field_of_view(observer);
-        let half_fov_cos = (fov.to_radians() * 0.5).cos();
-        facing.dot(to_point.normalized()) >= half_fov_cos
-            && self.point_occlusion_score_for_observer(observer_id, point, ignored_player_id)
-                < PERCEPTION_OCCLUSION_VISIBILITY_CUTOFF
+        if self.point_occlusion_score_for_observer(observer_id, point, ignored_player_id)
+            >= PERCEPTION_OCCLUSION_VISIBILITY_CUTOFF
+        {
+            return false;
+        }
+        // True body-occlusion (gated; OFF => skipped). A body standing on the line of sight
+        // screens the target even when it is within range and inside the FOV cone.
+        if occlusion_enabled() {
+            let blockers = self.players.iter().filter_map(|p| {
+                (p.id != observer_id && Some(p.id) != ignored_player_id)
+                    .then(|| self.player_snapshot_position(p))
+            });
+            let occ = sightline_occlusion_fraction(
+                observer_position,
+                point,
+                blockers,
+                OCCLUSION_BODY_RADIUS_YARDS,
+            );
+            if occ >= OCCLUSION_BLOCK_THRESHOLD {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn point_occlusion_score_for_observer(
@@ -26844,6 +27162,51 @@ impl WorldSnapshot {
             in_front,
             observer_has_ball,
         ))
+    }
+
+    /// The position `observer_id` PERCEIVES `target_id` at: the true position
+    /// degraded by a bounded, deterministic error that grows as the existing
+    /// per-target perception confidence drops — and, when occlusion is enabled, as
+    /// the sightline is screened by intervening bodies. This is the missing
+    /// counterpart to the confidence model: it turns "how sure am I" into "where do
+    /// I think they are", so a decision can act on the imperfect estimate.
+    ///
+    /// Gated by `DD_SOCCER_ENABLE_PERCEPTION_NOISE`; OFF ⇒ returns the true
+    /// position (byte-identical). The seed buckets `tick` by
+    /// [`PERCEPTION_REFRESH_TICKS`] so the mis-location holds for ~a reaction window
+    /// then refreshes, rather than dithering every tick.
+    pub fn perceived_player_position(&self, observer_id: usize, target_id: usize) -> Option<Vec2> {
+        let target = self.players.iter().find(|p| p.id == target_id)?;
+        let true_pos = self.player_snapshot_position(target);
+        if !perception_noise_enabled() || observer_id == target_id {
+            return Some(true_pos);
+        }
+        let mut confidence = self
+            .player_position_confidence_for_point(observer_id, true_pos)
+            .unwrap_or(1.0);
+        if occlusion_enabled() {
+            if let Some(observer) = self.players.iter().find(|p| p.id == observer_id) {
+                let observer_position = self
+                    .player_position(observer.id)
+                    .unwrap_or(observer.position);
+                let blockers = self.players.iter().filter_map(|p| {
+                    (p.id != observer_id && p.id != target_id)
+                        .then(|| self.player_snapshot_position(p))
+                });
+                let occ = sightline_occlusion_fraction(
+                    observer_position,
+                    true_pos,
+                    blockers,
+                    OCCLUSION_BODY_RADIUS_YARDS,
+                );
+                confidence *= 1.0 - occ;
+            }
+        }
+        let bucket = self.tick / PERCEPTION_REFRESH_TICKS.max(1);
+        let seed = (observer_id as u64).wrapping_mul(0x9E37_79B1)
+            ^ (target_id as u64).wrapping_mul(0x85EB_CA77).rotate_left(17)
+            ^ bucket.wrapping_mul(0xC2B2_AE3D);
+        Some(perceived_position(true_pos, confidence, seed))
     }
 
     pub fn player_position_confidence_entry(
@@ -28068,6 +28431,24 @@ impl WorldSnapshot {
         };
         let speed_advantage = (carrier.skills.top_speed - defender.skills.top_speed)
             .max(forward_speed - defender_velocity.len());
+        // Beat-the-defender duel (gated): read the defender's COMMITTED momentum. When they are
+        // over-committed (leaning to a side / diving in), the carrier can round them on their
+        // momentum even without a pace edge, and should exit on the side away from the lean. Off ⇒
+        // `over_committed` is false and `momentum_open_side` is 0, so the gate/side are unchanged.
+        let beat_commitment = if beat_defender_duel_enabled() {
+            Some(DefenderCommitmentState::evaluate(
+                attack_dir,
+                carrier_pos,
+                defender_pos,
+                defender_velocity,
+                &defender.skills,
+                defender.fatigue,
+            ))
+        } else {
+            None
+        };
+        let over_committed = beat_commitment.map_or(false, |c| c.is_over_committed());
+        let momentum_open_side = beat_commitment.map_or(0.0, |c| c.open_side);
         // Is the man being taken on ISOLATED? — no covering opponent (other than the man himself)
         // within the cover radius (the user's "no defender within 10yd of the defender they are
         // beating"). This is the interception-feasibility budget that makes a wide take-on safe.
@@ -28084,7 +28465,8 @@ impl WorldSnapshot {
         // named outside-mid take-on at any non-negative advantage. The learned isolation cue still
         // relaxes the normal gate, but less aggressively because it is a POMDP appetite rather than
         // an explicit team strategy.
-        let min_speed_advantage = if omad_isolated_take_on {
+        let min_speed_advantage = if omad_isolated_take_on || over_committed {
+            // An over-committed defender is beaten by their own momentum — no pace edge required.
             0.0
         } else if outside_mid_attack_defender {
             RUNAROUND_MIN_SPEED_ADVANTAGE * 0.45
@@ -28182,6 +28564,17 @@ impl WorldSnapshot {
                 .clamp(0.0, 1.0);
             let speed_term = (speed_advantage / RUNAROUND_SPEED_ADVANTAGE_FULL_YPS).clamp(0.0, 1.0);
             let space = self.space_score_at(recollect, carrier.team).clamp(0.0, 1.0);
+            // Beat-the-defender duel (gated): knock the ball to the side AWAY from the defender's
+            // lean — exploiting their momentum so they cannot recover across to it within their
+            // reaction window. Off ⇒ `momentum_open_side == 0`, so no side is favoured (parity).
+            let momentum_side_bonus = if over_committed
+                && momentum_open_side != 0.0
+                && (sign - momentum_open_side).abs() < f64::EPSILON
+            {
+                RUNAROUND_MOMENTUM_SIDE_BONUS
+            } else {
+                0.0
+            };
             // MORE inclined the bigger the speed differential AND the clearer the space behind the
             // defender; raw space is only a minor tiebreaker.
             let quality = (0.18
@@ -28192,6 +28585,7 @@ impl WorldSnapshot {
                 + 0.11 * momentum_escape_fit
                 + 0.06 * defender_reaction_fit
                 + 0.05 * body_clearance_fit
+                + momentum_side_bonus
                 - wrong_momentum_penalty)
                 .clamp(0.0, 1.0);
             Some((push, recollect, quality))
@@ -34979,6 +35373,18 @@ impl WorldSnapshot {
         let mut best = base.clamp_to_pitch(self.field_width, self.field_length);
         let mut best_score = f64::NEG_INFINITY;
         let mut open_space_hypotheses: Vec<(Vec2, f64)> = Vec::new();
+        // Multimodal run prediction (gated; OFF ⇒ never collects, argmax stands so
+        // the destination is byte-identical). When on, the scored candidate surface
+        // is captured so the chosen target can be a softmax blend of the argmax's
+        // spatial cluster (sub-grid smoothing that kills the grid-snap jitter)
+        // rather than the bare argmax cell — replacing the hard argmax with a
+        // weighted hypothesis set. Distinct alternative runs are preserved for
+        // cross-agent consumers via `run_hypotheses`.
+        let collect_run_modes = possession
+            && me.role != PlayerRole::Goalkeeper
+            && self.ball.holder != Some(player_id)
+            && multimodal_run_prediction_enabled();
+        let mut scored_candidates: Vec<(Vec2, f64)> = Vec::new();
         // Final-third directness: when the ball is advanced into the attacking
         // third, off-ball runners balance open space with a direct route to goal
         // (a receivable slip/channel), not just space and time on the ball.
@@ -35283,21 +35689,31 @@ impl WorldSnapshot {
                     - teammate_occupation_penalty
                     - line_shape_penalty;
                 Self::push_open_space_hypothesis(&mut open_space_hypotheses, p, score);
+                if collect_run_modes && score.is_finite() {
+                    scored_candidates.push((p, score));
+                }
                 if score > best_score {
                     best = p;
                     best_score = score;
                 }
             }
         }
-        let best = if possession
+        if possession
             && self.ball.holder != Some(player_id)
             && me.role != PlayerRole::Goalkeeper
         {
-            self.weighted_open_space_hypothesis_target(&open_space_hypotheses, best)
-                .unwrap_or(best)
-        } else {
-            best
-        };
+            if let Some(weighted) =
+                self.weighted_open_space_hypothesis_target(&open_space_hypotheses, best)
+            {
+                best = weighted;
+            }
+        }
+        // Multimodal blend (gated): smooth the argmax to sub-grid resolution over
+        // its own spatial cluster. No-op when off (empty `scored_candidates`) or
+        // when the argmax sits alone ⇒ byte-identical to the bare argmax.
+        if collect_run_modes {
+            best = blended_argmax_destination(&scored_candidates, best);
+        }
         // Final safety: hold attacking players onside (forwards/mids, in
         // possession, not on a sanctioned in-behind run) so they never camp
         // beyond the last line even if scoring would have placed them there.
@@ -36433,6 +36849,61 @@ impl WorldSnapshot {
             })
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(landing, _)| landing)
+    }
+
+    /// Beat-the-defender duel (gated, default-ON): KEEP DISTANCE from a tight defender instead of
+    /// freezing into a back-to-goal shield. A carrier that "just stops moving" under pressure has
+    /// almost always turned its back to the defender to shield — sub-optimal for attacking forward.
+    /// When the carrier is about to STALL (a `ProtectBall` shield, or sitting on its requested
+    /// target) with a defender genuinely tight, peel the ball AWAY into space (forward / lateral
+    /// away from the presser) rather than hold still — "dribble away, not toward".
+    ///
+    /// This deliberately reuses the away-into-space break of
+    /// [`Self::first_touch_escape_carry_target_for`] (the geometry is identical — bias away +
+    /// forward, cushion-gain + landing-clearance filtered); the only new thing is the *trigger* — it
+    /// fires in steady state on a shield/stall, not only on a fresh receipt. Returns `None` when
+    /// genuinely boxed in (no away lane that gains real distance) so the shield correctly stands, and
+    /// `None` when the duel gate is off (parity) or there is no proximate pressure to peel from.
+    pub(crate) fn dribble_away_from_pressure_target_for(
+        &self,
+        player_id: usize,
+        requested_target: Vec2,
+        kind: Option<DribbleMoveKind>,
+    ) -> Option<Vec2> {
+        if !beat_defender_duel_enabled() {
+            return None;
+        }
+        // Close-control turns own their geometry — don't redirect them.
+        if matches!(
+            kind,
+            Some(DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn)
+        ) {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(me.team)
+            || me.role == PlayerRole::Goalkeeper
+            || !requested_target.x.is_finite()
+            || !requested_target.y.is_finite()
+        {
+            return None;
+        }
+        let current = self.player_snapshot_position(me);
+        let (_, _, defender_dist) = self.nearest_opponent_at(me.team, current)?;
+        // Only intervene under REAL proximity pressure — a tight man at the carrier's back. With no
+        // close defender there is nothing to peel away from (and the calm carry path stands).
+        if defender_dist > BEAT_KEEP_DISTANCE_TRIGGER_YARDS {
+            return None;
+        }
+        // Only when the carrier is about to STALL: shielding (ProtectBall) or sitting on its target
+        // (no onward carry). A carrier already driving toward a real carry target is left alone.
+        let stalling = matches!(kind, Some(DribbleMoveKind::ProtectBall))
+            || current.distance(requested_target) <= STATIONARY_HOLDER_TARGET_EPSILON_YARDS;
+        if !stalling {
+            return None;
+        }
+        self.first_touch_escape_carry_target_for(me, current, kind)
     }
 
     pub(crate) fn stationary_holder_open_space_carry_target_for(

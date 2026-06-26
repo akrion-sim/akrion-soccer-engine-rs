@@ -69,6 +69,23 @@ const EXPECTED_THREAT_SHOOTING_EXPONENT: f64 = 4.0;
 /// an unconfigured process stays byte-identical.
 const PITCH_VALUE_REWARD_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_PITCH_VALUE_REWARD";
 
+/// Env gate enabling the xT **terminal-cost** shaping of the per-player MPC
+/// reference (the "cost-to-go" wire). Off (unset) by default so an unconfigured
+/// process is byte-identical: [`xt_terminal_shaped_target`] returns its input.
+const XT_TERMINAL_COST_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_XT_TERMINAL_COST";
+
+/// Largest distance (yards) the xT terminal shaping may move a player's MPC
+/// reference point. The LP/support search owns the destination; this is a bounded
+/// nudge toward more valuable controllable space, never an override.
+const XT_TERMINAL_MAX_STEP_YARDS: f64 = 2.5;
+/// Finite-difference probe radius (yards) for the control-weighted-threat
+/// gradient. Comfortably larger than the value surface's local noise.
+const XT_TERMINAL_PROBE_YARDS: f64 = 2.0;
+/// Gradient magnitude (value per yard) that earns the full
+/// [`XT_TERMINAL_MAX_STEP_YARDS`] step. Below this the step scales down linearly,
+/// so flat regions of the value surface barely move.
+const XT_TERMINAL_FULL_STEP_GRADIENT: f64 = 0.010;
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|raw| {
@@ -89,6 +106,22 @@ pub fn pitch_value_reward_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV))
+    }
+}
+
+/// Whether the xT terminal-cost MPC shaping is enabled this process. Off (unset)
+/// by default ⇒ [`xt_terminal_shaped_target`] is the identity, so the per-player
+/// MPC reference is byte-identical to before this wire existed.
+pub fn xt_terminal_cost_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(XT_TERMINAL_COST_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled(XT_TERMINAL_COST_ENABLE_ENV))
     }
 }
 
@@ -135,28 +168,30 @@ fn player_top_speed(player: &PlayerSnapshot) -> f64 {
     }
 }
 
-/// Velocity-aware time (seconds) for `player` to arrive at `cell`. A player
-/// already moving toward the cell gets a momentum head start; one moving away
-/// pays for it.
-fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
-    if !cell.x.is_finite()
-        || !cell.y.is_finite()
-        || !player.position.x.is_finite()
-        || !player.position.y.is_finite()
-    {
+/// Velocity-aware time (seconds) for a body at `pos` moving at `vel` with modeled
+/// top speed `vmax` to arrive at `cell`. A body already moving toward the cell
+/// gets a momentum head start; one moving away pays for it. The single source of
+/// truth for the arrival race, shared by the snapshot and lightweight-kinematic
+/// control paths.
+fn arrival_time_core(pos: Vec2, vel: Vec2, vmax: f64, cell: Vec2) -> f64 {
+    if !cell.x.is_finite() || !cell.y.is_finite() || !pos.x.is_finite() || !pos.y.is_finite() {
         return f64::INFINITY;
     }
-    let to_cell = cell - player.position;
+    let to_cell = cell - pos;
     let dist = to_cell.len();
     if !dist.is_finite() {
         return f64::INFINITY;
     }
-    let vmax = player_top_speed(player);
+    let vmax = if vmax.is_finite() {
+        vmax.max(PITCH_CONTROL_MIN_TOP_SPEED_YPS)
+    } else {
+        PITCH_CONTROL_MIN_TOP_SPEED_YPS
+    };
     if dist <= 1e-6 {
         return 0.0;
     }
     let dir = Vec2::new(to_cell.x / dist, to_cell.y / dist);
-    let vel_toward = player.velocity.dot(dir);
+    let vel_toward = vel.dot(dir);
     let vel_toward = if vel_toward.is_finite() {
         vel_toward
     } else {
@@ -165,6 +200,11 @@ fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
     let head_start = vel_toward * PITCH_CONTROL_MOMENTUM_SECONDS;
     let effective_dist = (dist - head_start).max(0.0);
     effective_dist / vmax
+}
+
+/// Velocity-aware time (seconds) for `player` to arrive at `cell`.
+fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
+    arrival_time_core(player.position, player.velocity, player_top_speed(player), cell)
 }
 
 /// Minimum arrival time over a team's players, or `None` if the team has nobody.
@@ -235,6 +275,112 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
 /// Positive means the team grips more dangerous space than it concedes.
 pub fn territorial_advantage(snapshot: &WorldSnapshot, team: Team) -> f64 {
     team_expected_threat(snapshot, team) - team_expected_threat(snapshot, team.other())
+}
+
+/// A lightweight kinematic stand-in for a player when computing pitch control off
+/// the hot path (the live MPC tick holds `PlayerAgent`s, not `PlayerSnapshot`s).
+/// Carries only what the time-to-arrive race needs.
+#[derive(Clone, Copy, Debug)]
+pub struct XtControlPoint {
+    pub team: Team,
+    pub position: Vec2,
+    pub velocity: Vec2,
+    /// Modeled top speed (yd/s); floored internally so a degenerate value is safe.
+    pub top_speed: f64,
+}
+
+/// Minimum arrival time over a team's [`XtControlPoint`]s, or `None` if the team
+/// has nobody scoreable.
+fn team_min_arrival_points(points: &[XtControlPoint], team: Team, cell: Vec2) -> Option<f64> {
+    points
+        .iter()
+        .filter(|p| p.team == team)
+        .map(|p| arrival_time_core(p.position, p.velocity, p.top_speed, cell))
+        .filter(|t| t.is_finite())
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |best| best.min(t)))
+        })
+}
+
+/// Probability the home team controls `cell`, from a slice of lightweight
+/// [`XtControlPoint`]s (mirrors [`pitch_control_home`]).
+fn pitch_control_home_points(points: &[XtControlPoint], cell: Vec2) -> f64 {
+    let home = team_min_arrival_points(points, Team::Home, cell);
+    let away = team_min_arrival_points(points, Team::Away, cell);
+    match (home, away) {
+        (Some(h), Some(a)) => {
+            let advantage = (a - h) / PITCH_CONTROL_TEMPERATURE_SECONDS;
+            1.0 / (1.0 + (-advantage).exp())
+        }
+        (Some(_), None) => 1.0,
+        (None, Some(_)) => 0.0,
+        (None, None) => 0.5,
+    }
+}
+
+/// Control-weighted threat **value** of `team` arriving at `p`: the closed-form
+/// [`expected_threat`] gated by the probability `team` actually controls that
+/// point (the time-to-arrive race). This is the cost-to-go surface the xT
+/// terminal shaping ascends — a player is only pulled toward valuable space it
+/// can realistically grip, not toward unreachable danger zones.
+fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f64, l: f64) -> f64 {
+    let home_control = pitch_control_home_points(points, p);
+    let control = match team {
+        Team::Home => home_control,
+        Team::Away => 1.0 - home_control,
+    };
+    control * expected_threat(team, p, w, l)
+}
+
+/// xT **terminal-cost** shaping of a per-player MPC reference point (the AV
+/// "cost-to-go" wire). Given the destination the LP / support search already
+/// chose (`reference`), nudge it by at most [`XT_TERMINAL_MAX_STEP_YARDS`] up the
+/// gradient of [`control_weighted_threat`], so the controlled player settles in
+/// the most valuable *controllable* space within reach of its assigned slot
+/// rather than the bare geometric point. The step is bounded and gradient-scaled,
+/// so it nudges and never overrides the destination — honouring the
+/// "LP decides the shape, MPC executes" division of labour.
+///
+/// Returns `reference` unchanged when the gate is off, the inputs are degenerate,
+/// or the local value surface is flat — keeping the default path byte-identical.
+pub fn xt_terminal_shaped_target(
+    points: &[XtControlPoint],
+    team: Team,
+    reference: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> Vec2 {
+    if !xt_terminal_cost_enabled() {
+        return reference;
+    }
+    if !reference.x.is_finite()
+        || !reference.y.is_finite()
+        || field_width <= 0.0
+        || field_length <= 0.0
+        || !field_width.is_finite()
+        || !field_length.is_finite()
+    {
+        return reference;
+    }
+    let h = XT_TERMINAL_PROBE_YARDS;
+    let v = |p: Vec2| control_weighted_threat(points, team, p, field_width, field_length);
+    // Central finite-difference gradient of the value surface at `reference`.
+    let gx = (v(Vec2::new(reference.x + h, reference.y)) - v(Vec2::new(reference.x - h, reference.y)))
+        / (2.0 * h);
+    let gy = (v(Vec2::new(reference.x, reference.y + h)) - v(Vec2::new(reference.x, reference.y - h)))
+        / (2.0 * h);
+    if !gx.is_finite() || !gy.is_finite() {
+        return reference;
+    }
+    let mag = (gx * gx + gy * gy).sqrt();
+    if mag <= 1e-9 {
+        return reference;
+    }
+    // Step length scales with gradient strength (capped): flat space barely moves,
+    // a steep value ridge earns the full bounded step.
+    let step = XT_TERMINAL_MAX_STEP_YARDS * (mag / XT_TERMINAL_FULL_STEP_GRADIENT).clamp(0.0, 1.0);
+    let shaped = Vec2::new(reference.x + gx / mag * step, reference.y + gy / mag * step);
+    finite_pitch_point(shaped, field_width, field_length, reference)
 }
 
 /// Dense learning reward for the acting `team`: the change in its **net**
@@ -495,5 +641,76 @@ mod tests {
         let mut snap = snapshot_with(players, Vec2::new(W * 0.5, L * 0.5));
         snap.field_width = f64::NAN;
         assert_eq!(team_expected_threat(&snap, Team::Home), 0.0);
+    }
+
+    // A reference point in central midfield where the home player is the nearest
+    // controller, so the control-weighted-threat gradient points up-field toward
+    // the away goal (Home attacks +y).
+    fn xt_point(team: Team, pos: Vec2) -> XtControlPoint {
+        XtControlPoint {
+            team,
+            position: pos,
+            velocity: Vec2::zero(),
+            top_speed: 7.5,
+        }
+    }
+
+    fn xt_fixture() -> (Vec<XtControlPoint>, Vec2) {
+        let reference = Vec2::new(W * 0.5, L * 0.5);
+        let points = vec![
+            xt_point(Team::Home, Vec2::new(W * 0.5, L * 0.5 - 2.0)),
+            xt_point(Team::Away, Vec2::new(W * 0.5, L * 0.2)),
+        ];
+        (points, reference)
+    }
+
+    #[test]
+    fn xt_terminal_shaping_is_identity_when_disabled() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        std::env::remove_var(XT_TERMINAL_COST_ENABLE_ENV);
+        let (players, reference) = xt_fixture();
+        let shaped = xt_terminal_shaped_target(&players, Team::Home, reference, W, L);
+        assert_eq!(
+            shaped, reference,
+            "gate off ⇒ the reference must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn xt_terminal_shaping_pulls_toward_controllable_value() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        std::env::set_var(XT_TERMINAL_COST_ENABLE_ENV, "1");
+        let (players, reference) = xt_fixture();
+        let shaped = xt_terminal_shaped_target(&players, Team::Home, reference, W, L);
+        std::env::remove_var(XT_TERMINAL_COST_ENABLE_ENV);
+        // The move is bounded and points up the value gradient: forward (toward the
+        // away goal at +y) into space this player controls.
+        assert!(
+            shaped.y > reference.y,
+            "shaping should pull forward up the xT gradient: {} -> {}",
+            reference.y,
+            shaped.y
+        );
+        assert!(
+            reference.distance(shaped) <= XT_TERMINAL_MAX_STEP_YARDS + 1e-6,
+            "shaping step must stay within the bound: {}",
+            reference.distance(shaped)
+        );
+    }
+
+    #[test]
+    fn xt_terminal_shaping_sanitizes_non_finite_reference() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        std::env::set_var(XT_TERMINAL_COST_ENABLE_ENV, "1");
+        let (players, _) = xt_fixture();
+        let bad = Vec2::new(f64::NAN, L * 0.5);
+        let shaped = xt_terminal_shaped_target(&players, Team::Home, bad, W, L);
+        std::env::remove_var(XT_TERMINAL_COST_ENABLE_ENV);
+        // Returned unchanged: x stays NaN (so != comparison can't be used) and y is
+        // untouched — the guard bailed before computing any gradient.
+        assert!(
+            shaped.x.is_nan() && shaped.y == bad.y,
+            "a non-finite reference is returned unchanged: {shaped:?}"
+        );
     }
 }
