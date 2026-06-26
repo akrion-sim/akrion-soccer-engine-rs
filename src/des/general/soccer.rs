@@ -69,6 +69,8 @@ mod support_scorer;
 pub use support_scorer::*;
 mod run_prediction;
 pub use run_prediction::*;
+mod perception;
+pub use perception::*;
 mod spacing_target;
 pub use spacing_target::*;
 mod aerial_reception;

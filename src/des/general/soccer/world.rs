@@ -26413,14 +26413,37 @@ impl WorldSnapshot {
         let Some(facing) = facing else {
             return true;
         };
-        if self.ball.holder == Some(observer_id) {
+        let visible_by_fov = if self.ball.holder == Some(observer_id) {
             let angle = angle_between_vectors_degrees(facing, to_point);
-            return angle
-                <= (BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES);
+            angle <= (BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES)
+        } else {
+            let fov = player_field_of_view(observer);
+            let half_fov_cos = (fov.to_radians() * 0.5).cos();
+            facing.dot(to_point.normalized()) >= half_fov_cos
+        };
+        if !visible_by_fov {
+            return false;
         }
-        let fov = player_field_of_view(observer);
-        let half_fov_cos = (fov.to_radians() * 0.5).cos();
-        facing.dot(to_point.normalized()) >= half_fov_cos
+        // True body-occlusion (gated; OFF ⇒ skipped ⇒ byte-identical). A teammate or
+        // opponent standing on the line of sight screens the target even when it is
+        // within range and inside the FOV cone — the geometric check the existing
+        // range+FOV+`in_front` model never made. A body essentially at the target is
+        // excluded by the depth guard inside `sightline_occlusion_fraction`.
+        if occlusion_enabled() {
+            let blockers = self.players.iter().filter_map(|p| {
+                (p.id != observer_id).then(|| self.player_snapshot_position(p))
+            });
+            let occ = sightline_occlusion_fraction(
+                observer_position,
+                point,
+                blockers,
+                OCCLUSION_BODY_RADIUS_YARDS,
+            );
+            if occ >= OCCLUSION_BLOCK_THRESHOLD {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn player_position_confidence_for_point(
@@ -26474,6 +26497,51 @@ impl WorldSnapshot {
             in_front,
             observer_has_ball,
         ))
+    }
+
+    /// The position `observer_id` PERCEIVES `target_id` at: the true position
+    /// degraded by a bounded, deterministic error that grows as the existing
+    /// per-target perception confidence drops — and, when occlusion is enabled, as
+    /// the sightline is screened by intervening bodies. This is the missing
+    /// counterpart to the confidence model: it turns "how sure am I" into "where do
+    /// I think they are", so a decision can act on the imperfect estimate.
+    ///
+    /// Gated by `DD_SOCCER_ENABLE_PERCEPTION_NOISE`; OFF ⇒ returns the true
+    /// position (byte-identical). The seed buckets `tick` by
+    /// [`PERCEPTION_REFRESH_TICKS`] so the mis-location holds for ~a reaction window
+    /// then refreshes, rather than dithering every tick.
+    pub fn perceived_player_position(&self, observer_id: usize, target_id: usize) -> Option<Vec2> {
+        let target = self.players.iter().find(|p| p.id == target_id)?;
+        let true_pos = self.player_snapshot_position(target);
+        if !perception_noise_enabled() || observer_id == target_id {
+            return Some(true_pos);
+        }
+        let mut confidence = self
+            .player_position_confidence_for_point(observer_id, true_pos)
+            .unwrap_or(1.0);
+        if occlusion_enabled() {
+            if let Some(observer) = self.players.iter().find(|p| p.id == observer_id) {
+                let observer_position = self
+                    .player_position(observer.id)
+                    .unwrap_or(observer.position);
+                let blockers = self.players.iter().filter_map(|p| {
+                    (p.id != observer_id && p.id != target_id)
+                        .then(|| self.player_snapshot_position(p))
+                });
+                let occ = sightline_occlusion_fraction(
+                    observer_position,
+                    true_pos,
+                    blockers,
+                    OCCLUSION_BODY_RADIUS_YARDS,
+                );
+                confidence *= 1.0 - occ;
+            }
+        }
+        let bucket = self.tick / PERCEPTION_REFRESH_TICKS.max(1);
+        let seed = (observer_id as u64).wrapping_mul(0x9E37_79B1)
+            ^ (target_id as u64).wrapping_mul(0x85EB_CA77).rotate_left(17)
+            ^ bucket.wrapping_mul(0xC2B2_AE3D);
+        Some(perceived_position(true_pos, confidence, seed))
     }
 
     pub fn player_position_confidence_entry(
