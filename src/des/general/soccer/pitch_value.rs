@@ -157,7 +157,11 @@ fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
     }
     let dir = Vec2::new(to_cell.x / dist, to_cell.y / dist);
     let vel_toward = player.velocity.dot(dir);
-    let vel_toward = if vel_toward.is_finite() { vel_toward } else { 0.0 };
+    let vel_toward = if vel_toward.is_finite() {
+        vel_toward
+    } else {
+        0.0
+    };
     let head_start = vel_toward * PITCH_CONTROL_MOMENTUM_SECONDS;
     let effective_dist = (dist - head_start).max(0.0);
     effective_dist / vmax
@@ -300,8 +304,7 @@ mod tests {
         let central = Vec2::new(W * 0.5, L * 0.9);
         let wide = Vec2::new(W * 0.02, L * 0.9);
         assert!(
-            expected_threat(Team::Home, central, W, L)
-                > expected_threat(Team::Home, wide, W, L)
+            expected_threat(Team::Home, central, W, L) > expected_threat(Team::Home, wide, W, L)
         );
     }
 
@@ -331,8 +334,18 @@ mod tests {
     fn pitch_control_favors_the_nearer_team() {
         let cell = Vec2::new(W * 0.5, L * 0.5);
         let players = vec![
-            player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 2.0), Vec2::zero()),
-            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 20.0), Vec2::zero()),
+            player_at(
+                0,
+                Team::Home,
+                Vec2::new(W * 0.5, L * 0.5 - 2.0),
+                Vec2::zero(),
+            ),
+            player_at(
+                1,
+                Team::Away,
+                Vec2::new(W * 0.5, L * 0.5 + 20.0),
+                Vec2::zero(),
+            ),
         ];
         let home = pitch_control_home(&players, cell);
         assert!(home > 0.5, "home is far closer, expected >0.5, got {home}");
@@ -346,11 +359,26 @@ mod tests {
         let toward = Vec2::new(0.0, 6.0);
         let moving = vec![
             player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 10.0), toward),
-            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 10.0), Vec2::zero()),
+            player_at(
+                1,
+                Team::Away,
+                Vec2::new(W * 0.5, L * 0.5 + 10.0),
+                Vec2::zero(),
+            ),
         ];
         let still = vec![
-            player_at(0, Team::Home, Vec2::new(W * 0.5, L * 0.5 - 10.0), Vec2::zero()),
-            player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5 + 10.0), Vec2::zero()),
+            player_at(
+                0,
+                Team::Home,
+                Vec2::new(W * 0.5, L * 0.5 - 10.0),
+                Vec2::zero(),
+            ),
+            player_at(
+                1,
+                Team::Away,
+                Vec2::new(W * 0.5, L * 0.5 + 10.0),
+                Vec2::zero(),
+            ),
         ];
         assert!(pitch_control_home(&moving, cell) > pitch_control_home(&still, cell));
     }
@@ -377,7 +405,10 @@ mod tests {
         };
         let deep = team_expected_threat(&make(L * 0.30), Team::Home);
         let high = team_expected_threat(&make(L * 0.85), Team::Home);
-        assert!(high > deep, "advancing should raise threat: {deep} -> {high}");
+        assert!(
+            high > deep,
+            "advancing should raise threat: {deep} -> {high}"
+        );
     }
 
     #[test]
@@ -411,8 +442,14 @@ mod tests {
         let home_reward = pitch_value_reward_delta(&before, &after, Team::Home);
         let away_reward = pitch_value_reward_delta(&before, &after, Team::Away);
         std::env::remove_var(PITCH_VALUE_REWARD_ENABLE_ENV);
-        assert!(home_reward > 0.0, "advancing into space should reward Home: {home_reward}");
-        assert!(away_reward < 0.0, "Home advancing should penalize Away: {away_reward}");
+        assert!(
+            home_reward > 0.0,
+            "advancing into space should reward Home: {home_reward}"
+        );
+        assert!(
+            away_reward < 0.0,
+            "Home advancing should penalize Away: {away_reward}"
+        );
     }
 
     #[test]
@@ -426,20 +463,34 @@ mod tests {
         );
         let home_adv = territorial_advantage(&snap, Team::Home);
         let away_adv = territorial_advantage(&snap, Team::Away);
-        assert!((home_adv + away_adv).abs() < 1e-9, "{home_adv} + {away_adv}");
+        assert!(
+            (home_adv + away_adv).abs() < 1e-9,
+            "{home_adv} + {away_adv}"
+        );
     }
 
     #[test]
     fn pitch_value_model_sanitizes_non_finite_inputs() {
         let threat = expected_threat(Team::Home, Vec2::new(f64::NAN, f64::INFINITY), W, L);
-        assert!(threat.is_finite(), "expected threat should stay finite: {threat}");
+        assert!(
+            threat.is_finite(),
+            "expected threat should stay finite: {threat}"
+        );
 
         let players = vec![
             player_at(0, Team::Home, Vec2::new(f64::NAN, L * 0.5), Vec2::zero()),
-            player_at(1, Team::Away, Vec2::new(W * 0.5, f64::INFINITY), Vec2::zero()),
+            player_at(
+                1,
+                Team::Away,
+                Vec2::new(W * 0.5, f64::INFINITY),
+                Vec2::zero(),
+            ),
         ];
         let control = pitch_control_home(&players, Vec2::new(W * 0.5, L * 0.5));
-        assert!(control.is_finite(), "pitch control should stay finite: {control}");
+        assert!(
+            control.is_finite(),
+            "pitch control should stay finite: {control}"
+        );
 
         let mut snap = snapshot_with(players, Vec2::new(W * 0.5, L * 0.5));
         snap.field_width = f64::NAN;

@@ -460,19 +460,20 @@ pub(crate) fn official_agent_operation_order(
         + id as f64 * 0.0001
         + scheduled_index.unwrap_or(0) as f64 * 0.0001
         + kind_salt as f64 * 0.00001;
-    weighted_agentic_order(
-        vec![
-            ("sense-ball".to_string(), 1.10),
-            ("sample-offside-line".to_string(), offside_weight * stable_context_bias),
-            (
-                "choose-referee-target".to_string(),
-                centroid_weight * stable_context_bias,
-            ),
-            ("avoid-player-lanes".to_string(), 0.94),
-            ("clamp-duty-zone".to_string(), 1.24),
-            ("update-kinematics".to_string(), 1.06),
-        ],
-    )
+    weighted_agentic_order(vec![
+        ("sense-ball".to_string(), 1.10),
+        (
+            "sample-offside-line".to_string(),
+            offside_weight * stable_context_bias,
+        ),
+        (
+            "choose-referee-target".to_string(),
+            centroid_weight * stable_context_bias,
+        ),
+        ("avoid-player-lanes".to_string(), 0.94),
+        ("clamp-duty-zone".to_string(), 1.24),
+        ("update-kinematics".to_string(), 1.06),
+    ])
 }
 
 fn assistant_ref_touchline_x(kind: OfficialKind, field_width: f64) -> f64 {

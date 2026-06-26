@@ -227,7 +227,11 @@ impl SupportScorerHead {
         if x.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network.predict(&x[..]).first().copied().filter(|p| p.is_finite())
+        self.network
+            .predict(&x[..])
+            .first()
+            .copied()
+            .filter(|p| p.is_finite())
     }
 
     /// One SGD epoch regressing the head toward `(features, target_value)` rows — either a
@@ -251,7 +255,11 @@ impl SupportScorerHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -344,7 +352,10 @@ mod tests {
     fn head_predicts_finite_and_trains_toward_reward() {
         let head = SupportScorerHead::new(7);
         let f = baseline_features();
-        assert!(head.predict(&f).is_some(), "a seeded head predicts a finite value");
+        assert!(
+            head.predict(&f).is_some(),
+            "a seeded head predicts a finite value"
+        );
 
         // A separable corpus: open space ⇒ high reward, crowded ⇒ low. After training the
         // head should rank the open candidate strictly above the crowded one.
@@ -356,9 +367,15 @@ mod tests {
         let samples: Vec<SupportMoveSample> = (0..64)
             .map(|i| {
                 if i % 2 == 0 {
-                    SupportMoveSample { features: open.clone(), reward: 1.0 }
+                    SupportMoveSample {
+                        features: open.clone(),
+                        reward: 1.0,
+                    }
                 } else {
-                    SupportMoveSample { features: crowded.clone(), reward: -1.0 }
+                    SupportMoveSample {
+                        features: crowded.clone(),
+                        reward: -1.0,
+                    }
                 }
             })
             .collect();

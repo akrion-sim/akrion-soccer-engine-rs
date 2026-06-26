@@ -482,7 +482,10 @@ mod team_strategy_mode_tests {
             any_optimal |= solution.status == LPStatus::Optimal;
         }
         eprintln!("[formation-lp-ipm] best solve = {best_micros}us");
-        assert!(any_optimal, "interior-point formation LP should reach optimality");
+        assert!(
+            any_optimal,
+            "interior-point formation LP should reach optimality"
+        );
         // The <5ms realtime budget is an optimized-build guarantee; a debug build's
         // unoptimized linear algebra is ~20-50x slower, so only enforce the bound
         // when optimizations are on (the configuration that actually runs live).
@@ -2176,9 +2179,9 @@ impl SoccerFormationLpBrain {
                 let attacking_spacing_pair_weight =
                     soccer_lp_unit((a.attacking_spacing_weight + b.attacking_spacing_weight) * 0.5)
                         * 0.14;
-                let spacing_shape_weight =
-                    (same_role_spacing_weight + attacking_spacing_pair_weight)
-                        * (1.0 - shape_relief).clamp(0.15, 1.0);
+                let spacing_shape_weight = (same_role_spacing_weight
+                    + attacking_spacing_pair_weight)
+                    * (1.0 - shape_relief).clamp(0.15, 1.0);
                 let line_shape_weight =
                     same_role_line_y_weight * (1.0 - shape_relief).clamp(0.15, 1.0);
                 let pair_x_weight = soccer_lp_unit(base_pair_weight + spacing_shape_weight);
@@ -3463,13 +3466,8 @@ fn soccer_formation_lp_apply_strategy_profile(
             // clean give-and-return lanes, so value clean passing lanes alongside the goal
             // threat they create. (Previously these fell into the no-op catch-all and so had
             // no value-head identity at all.)
-            GiveAndGoCentral
-            | OneTwoLeftRelease
-            | OneTwoRightRelease
-            | CentralDoubleOneTwo
-            | ThirdManRunCentral
-            | HalfSpaceComboLeft
-            | HalfSpaceComboRight => {
+            GiveAndGoCentral | OneTwoLeftRelease | OneTwoRightRelease | CentralDoubleOneTwo
+            | ThirdManRunCentral | HalfSpaceComboLeft | HalfSpaceComboRight => {
                 weights.expected_goal *= 1.18;
                 weights.progression *= 1.12;
                 weights.passing_lane_quality *= 1.15;
@@ -3895,9 +3893,7 @@ fn soccer_throw_in_defender_lane_rank(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.id.cmp(&b.id))
     });
-    defenders
-        .iter()
-        .position(|player| player.id == player_id)
+    defenders.iter().position(|player| player.id == player_id)
 }
 
 fn soccer_throw_in_no_offside_runner_targets_for(
@@ -3940,10 +3936,7 @@ fn soccer_throw_in_no_offside_runner_targets_for(
     targets.sort_by(|a, b| {
         a.x.partial_cmp(&b.x)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                a.y.partial_cmp(&b.y)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
     });
     targets
 }
@@ -4452,9 +4445,8 @@ pub(crate) fn soccer_formation_lp_stagger_role_layers(
     // overlap does not reshuffle the line). The per-tick correction rate follows the
     // SAME ball-proximity grace as the fore-aft layering (3*dt/grace, capped), so the
     // line snaps laterally into band when the ball is near and eases when it is far.
-    let lateral_correction = |grace: f64| -> f64 {
-        (3.0 * dt / grace.max(1e-6)).clamp(0.0, LATERAL_STAGGER_CORRECTION)
-    };
+    let lateral_correction =
+        |grace: f64| -> f64 { (3.0 * dt / grace.max(1e-6)).clamp(0.0, LATERAL_STAGGER_CORRECTION) };
     soccer_formation_lp_spread_line_x(
         slots,
         PlayerRole::Defender,
@@ -4573,7 +4565,8 @@ pub(crate) fn soccer_formation_lp_state_values(
 ) -> Vec<f64> {
     let mut values = vec![
         0.0;
-        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
+        SOCCER_FORMATION_LP_WORLD_PLAYER_CAPACITY
+            * SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
             + SOCCER_FORMATION_LP_WORLD_ENTITY_FEATURES
             + SOCCER_FORMATION_LP_CONTEXT_FEATURES
     ];
@@ -5037,7 +5030,11 @@ impl CentralBrain {
                     | TeamDefenseStrategy::DoubleTeamBallCarrier
                     | TeamDefenseStrategy::ContainAndDelayCounter
             );
-        if !commitment.set || tick >= commitment.review_tick || possession_flip || defense_window_interrupt {
+        if !commitment.set
+            || tick >= commitment.review_tick
+            || possession_flip
+            || defense_window_interrupt
+        {
             // Learn: credit the just-finished commitment with the field advantage it
             // gained while running (only while we held the ball — attacking value).
             if commitment.set && commitment.committed_has_ball {
@@ -5068,7 +5065,8 @@ impl CentralBrain {
             for learned_strategy in TeamAttackStrategy::ALL {
                 if learned_strategy == rule_candidate
                     || (commitment.set && learned_strategy == held)
-                    || !has_ball && learned_strategy != TeamAttackStrategy::CounterTransitionVertical
+                    || !has_ball
+                        && learned_strategy != TeamAttackStrategy::CounterTransitionVertical
                 {
                     continue;
                 }
@@ -5204,22 +5202,28 @@ impl CentralBrain {
             match directive.defense_strategy {
                 ForceWideLeftTrap | ForceWideRightTrap => {
                     let shape = directive.defense_strategy.shape();
-                    directive.press_intensity = directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
+                    directive.press_intensity =
+                        directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
                     directive.defensive_cover_target = directive.defensive_cover_target.max(3);
-                    directive.width_yards = (directive.width_yards * 0.92).clamp(width * 0.48, width * 0.72);
+                    directive.width_yards =
+                        (directive.width_yards * 0.92).clamp(width * 0.48, width * 0.72);
                     directive.risk_tolerance = (directive.risk_tolerance - 0.04).clamp(0.20, 0.96);
                 }
                 DoubleTeamBallCarrier => {
                     let shape = directive.defense_strategy.shape();
-                    directive.press_intensity = directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
+                    directive.press_intensity =
+                        directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
                     directive.defensive_cover_target = directive.defensive_cover_target.max(3);
-                    directive.width_yards = (directive.width_yards * 0.86).clamp(width * 0.44, width * 0.68);
+                    directive.width_yards =
+                        (directive.width_yards * 0.86).clamp(width * 0.44, width * 0.68);
                     directive.risk_tolerance = (directive.risk_tolerance - 0.06).clamp(0.20, 0.96);
                 }
                 ContainAndDelayCounter => {
-                    directive.press_intensity = directive.press_intensity.max(0.52).clamp(0.22, 1.0);
+                    directive.press_intensity =
+                        directive.press_intensity.max(0.52).clamp(0.22, 1.0);
                     directive.defensive_cover_target = directive.defensive_cover_target.max(2);
-                    directive.width_yards = (directive.width_yards * 0.90).clamp(width * 0.46, width * 0.72);
+                    directive.width_yards =
+                        (directive.width_yards * 0.90).clamp(width * 0.46, width * 0.72);
                     directive.risk_tolerance = (directive.risk_tolerance - 0.08).clamp(0.20, 0.96);
                 }
                 _ => {}

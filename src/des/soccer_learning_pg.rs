@@ -13,19 +13,20 @@ use uuid::Uuid;
 
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
-    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
-    SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
-    SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
-    SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
-    CONFIG_FEATURE_DIM_V1, SOCCER_MOMENT_EMBEDDING_DIM,
+    SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics,
+    SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey,
+    SoccerQTargetEntry, SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights,
+    SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM, CONFIG_FEATURE_DIM_V1,
+    SOCCER_MOMENT_EMBEDDING_DIM, SOCCER_PASS_COMPLETION_FEATURE_DIM,
+    SOCCER_PASS_COMPLETION_FEATURE_DIM_V1,
 };
 use crate::des::general::tournament::{
     MatchReport, SoccerTeamGenome, TournamentFormat, TournamentTeam,
 };
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
-    soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
-    SoccerLearningPolicyDelta, SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
+    soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame, SoccerLearningPolicyDelta,
+    SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
 use std::collections::HashMap;
 
@@ -2424,8 +2425,7 @@ impl SoccerLearningPgStore {
         let completed_pass_gain_yards_micros =
             soccer_learning_to_micros(metrics.completed_pass_gain_yards);
         let pass_chains = count(metrics.pass_chains);
-        let pass_chain_gain_yards_micros =
-            soccer_learning_to_micros(metrics.pass_chain_gain_yards);
+        let pass_chain_gain_yards_micros = soccer_learning_to_micros(metrics.pass_chain_gain_yards);
         let pass_chains_net_loss = count(metrics.pass_chains_net_loss);
         let shots_on_target = count(metrics.shots_on_target);
         let shots_after_pass = count(metrics.shots_after_pass);
@@ -4310,17 +4310,21 @@ fn ensure_soccer_pass_outcome_tables(tx: &mut postgres::Transaction<'_>) -> Resu
           completed boolean not null,
           own_half boolean not null,
           created_at timestamptz not null default now(),
-          deleted_at timestamptz,
-          constraint des_soccer_pass_outcome_features_len_chk
-            check (array_length(features, 1) = {dim})
+          deleted_at timestamptz
         );
+        alter table des_soccer_pass_outcome_samples
+          drop constraint if exists des_soccer_pass_outcome_features_len_chk;
+        alter table des_soccer_pass_outcome_samples
+          add constraint des_soccer_pass_outcome_features_len_chk
+            check (array_length(features, 1) in ({legacy_dim}, {dim}));
         create index if not exists des_soccer_pass_outcome_run_idx
           on des_soccer_pass_outcome_samples (run_id);
         create index if not exists des_soccer_pass_outcome_live_created_idx
           on des_soccer_pass_outcome_samples (experiment_id, created_at)
           where deleted_at is null;
         "#,
-        dim = SOCCER_PASS_COMPLETION_FEATURE_DIM
+        dim = SOCCER_PASS_COMPLETION_FEATURE_DIM,
+        legacy_dim = SOCCER_PASS_COMPLETION_FEATURE_DIM_V1
     ))
     .map_err(|err| format!("ensure soccer pass-outcome tables: {err}"))
 }

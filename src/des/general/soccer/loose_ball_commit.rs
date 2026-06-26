@@ -312,7 +312,11 @@ impl LooseBallCommitHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -366,7 +370,11 @@ impl LooseBallCommitHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -569,7 +577,8 @@ impl WorldSnapshot {
         target: Vec2,
         heuristic_score: f64,
     ) -> f64 {
-        let Some(priority) = self.loose_ball_commit_priority(player, target, heuristic_score) else {
+        let Some(priority) = self.loose_ball_commit_priority(player, target, heuristic_score)
+        else {
             return 0.0;
         };
         // priority 1 ⇒ −SWING (better); priority 0 ⇒ +SWING (worse).
@@ -723,8 +732,7 @@ mod loose_ball_commit_tests {
         far.dist_to_target = 22.0;
         far.arrival_time = 3.0;
         assert!(
-            analytic_loose_ball_commit_priority(&near)
-                > analytic_loose_ball_commit_priority(&far),
+            analytic_loose_ball_commit_priority(&near) > analytic_loose_ball_commit_priority(&far),
             "the closer, faster candidate should have higher commit priority"
         );
     }
