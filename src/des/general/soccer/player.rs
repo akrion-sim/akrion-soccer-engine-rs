@@ -1262,6 +1262,18 @@ struct MpcExecutionEstimate {
 /// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
 const WEAK_FOOT_EXECUTION_DAMP: f64 = 0.88;
 
+/// Beyond this distance a shot is only a legal *volunteer* when the shot-trigger MDP
+/// value clears [`SHOT_TRIGGER_LONG_RANGE_MIN_VALUE`]. Inside it, legacy legality stands.
+/// This is the hard half of the "work it to 20/15, don't hammer it from 25" discipline.
+const SHOT_TRIGGER_LONG_RANGE_YARDS: f64 = 22.0;
+/// Minimum shot-trigger value for a >22yd shot to be a legal volunteer (open net /
+/// stranded keeper / live rebound clears it; a covered long shot does not).
+const SHOT_TRIGGER_LONG_RANGE_MIN_VALUE: f64 = 0.25;
+/// Score a vetoed long shot is crushed to in the possession ranker: tiny but non-zero so
+/// it ranks below carrying/passing alternatives (the carrier works it closer) while staying
+/// a LEGAL, selectable option.
+const SHOT_TRIGGER_VOLUNTEER_FLOOR: f64 = 0.002;
+
 /// MPC shot foot choice: pick which foot to strike with from the ball-vs-body geometry
 /// and the per-foot power. The ball sitting on a given side of the body, and a target
 /// swept toward that side, both favor the same-side foot; the choice is then weighted by
@@ -3260,8 +3272,8 @@ impl PlayerAgent {
         // while a close, open, high-value one is lifted toward ~1.35×. Default-ON; the
         // kill-switch (`DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP`) skips this entirely ⇒
         // byte-identical. The MPC then still re-checks executability and can veto/reselect.
-        let shot_score = if shot_trigger_mdp_enabled() {
-            let mdp_value = if observation.shot_trigger_mdp_value >= 0.0 {
+        let shot_trigger_value = if shot_trigger_mdp_enabled() {
+            Some(if observation.shot_trigger_mdp_value >= 0.0 {
                 // Populated by the snapshot seam (trained head or analytic seed).
                 observation.shot_trigger_mdp_value
             } else {
@@ -3273,11 +3285,34 @@ impl PlayerAgent {
                     shooting,
                     1.0,
                 ))
-            };
-            shot_score_base * shot_trigger_score_multiplier(mdp_value)
+            })
         } else {
-            shot_score_base
+            None
         };
+        // The shot stays a LEGAL option from range (a human / genuine speculative chance can
+        // still take it) — the discipline is to make the AI not *volunteer* low-value long
+        // shots. Inside range, a mild value-scaled demotion; beyond
+        // `SHOT_TRIGGER_LONG_RANGE_YARDS` with a low MDP value (a covered long shot), the
+        // score is crushed below the carrying/passing alternatives so the carrier works it
+        // closer — but `shot_legal` is untouched, so it stays a selectable option.
+        let shot_score = match shot_trigger_value {
+            Some(v)
+                if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE =>
+            {
+                shot_score_base.min(SHOT_TRIGGER_VOLUNTEER_FLOOR)
+            }
+            Some(v) => shot_score_base * shot_trigger_score_multiplier(v),
+            None => shot_score_base,
+        };
+        // Whether the stop-volunteering discipline vetoes a long shot here. Also used below
+        // to skip the near-goal shoot *floors* (which would otherwise re-boost shoot above
+        // the crush and defeat the discipline). `false` when the kill-switch is set.
+        let shot_trigger_long_range_veto = matches!(
+            shot_trigger_value,
+            Some(v) if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+        );
         let fatigue_dribble = fatigue_dribble_multiplier(observation);
         let shot_creation_carry = shot_creation_carry_multiplier(observation);
         let patience_factor = low_pressure_patience_factor(observation);
@@ -4406,7 +4441,7 @@ impl PlayerAgent {
         let shot_floor = near_goal_shot_pressure_floor(observation, self.role, shooting).max(
             goal_proximity_shot_pressure_floor(observation, self.role, shooting),
         );
-        if shot_floor > 0.0 {
+        if shot_floor > 0.0 && !shot_trigger_long_range_veto {
             let decisive_shot_floor = if shot_legal && decisive_goal_pressure > 0.0 {
                 let shot_lane_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.42
                     + observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.28
@@ -4573,9 +4608,17 @@ impl PlayerAgent {
                         0.78
                     },
                 );
+            // When the long shot is vetoed (stop-volunteering), don't let the decisive
+            // near-goal floor re-boost SHOOT — keep only the killer-pass in the family so
+            // the carrier threads / works it closer instead of hammering from range.
+            let decisive_family: &[&str] = if shot_trigger_long_range_veto {
+                &["killer-pass"]
+            } else {
+                &["shoot", "killer-pass"]
+            };
             ensure_min_legal_option_family_probability(
                 &mut options,
-                &["shoot", "killer-pass"],
+                decisive_family,
                 decisive_family_floor,
             );
         }
@@ -7340,8 +7383,42 @@ impl PlayerAgent {
             };
         }
 
+        // Learnable shot-trigger MDP/POMDP value of shooting NOW. The *forced* shot rule
+        // paths below fire before `possession_action_options` and are the ones pulling the
+        // trigger from 25yd; the veto derived from this value makes a striker work a far,
+        // covered ball closer instead of hammering it from distance. `None` (kill-switch) ⇒
+        // no veto ⇒ byte-identical.
+        let shot_trigger_value = if shot_trigger_mdp_enabled() {
+            Some(if observation.shot_trigger_mdp_value >= 0.0 {
+                observation.shot_trigger_mdp_value
+            } else {
+                analytic_shot_trigger_value(&ShotTriggerInputs::from_observation(
+                    &observation,
+                    self.role,
+                    shooting_skill,
+                    1.0,
+                ))
+            })
+        } else {
+            None
+        };
+        // Stop-volunteering discipline: beyond `SHOT_TRIGGER_LONG_RANGE_YARDS` a *forced*
+        // shot needs a real MDP justification (open net / stranded keeper / live rebound),
+        // otherwise the rule paths below are skipped and the carrier works it closer. Inside
+        // that range the forced paths fire exactly as before (a clean 18-22yd must-shoot is
+        // untouched). `None` (kill-switch) ⇒ no veto ⇒ byte-identical.
+        let shot_trigger_long_range_veto = match shot_trigger_value {
+            Some(v) => {
+                observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
+                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+            }
+            None => false,
+        };
+        let shot_trigger_allows_forced_shot = !shot_trigger_long_range_veto;
+
         if has_ball
             && goal_attack_shot_blocks_alternatives(&observation, self.role)
+            && shot_trigger_allows_forced_shot
             && !threaded_goal_pass_can_override_forced_shot(&observation, self.role)
         {
             let action = SoccerAction::Shoot {
@@ -7363,7 +7440,10 @@ impl PlayerAgent {
                 action,
                 sprint: false,
             };
-        } else if has_ball && striker_shot_window_is_qualified(&observation, self.role) {
+        } else if has_ball
+            && !shot_trigger_long_range_veto
+            && striker_shot_window_is_qualified(&observation, self.role)
+        {
             let striker_shot_bonus = striker_legal_shot_attempt_bonus(&observation, self.role);
             let window_shot_chance = (0.66 + shooting_skill * 0.14 + striker_shot_bonus * 0.18
                 - observation.shot_block_probability.clamp(0.0, 1.0) * 0.08)
@@ -7395,6 +7475,7 @@ impl PlayerAgent {
                 };
             }
         } else if has_ball
+            && !shot_trigger_long_range_veto
             && (shot_decision_is_qualified_for_role(&observation, self.role)
                 || contested_final_third_shot_is_qualified(&observation, self.role, shooting_skill))
             && !threaded_goal_pass_can_override_forced_shot(&observation, self.role)
