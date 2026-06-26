@@ -60,7 +60,7 @@ const DEFAULT_SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT: bool = true;
 const DEFAULT_SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM: bool = true;
 const DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_DELTA_ROWS: usize = 50_000;
 const DEFAULT_SOCCER_POSTGRES_TRAINING_REPLAY_PRIOR_WEIGHT: f64 = 1.0;
-const DEFAULT_SOCCER_MAX_AUTO_PARALLEL_GAMES: usize = 10;
+const DEFAULT_SOCCER_CONTINUOUS_PARALLEL_GAMES: usize = 1;
 const DEFAULT_SOCCER_WRITE_GAME_ARTIFACTS: bool = false;
 const DEFAULT_SOCCER_WRITE_FINAL_POLICY_ARTIFACT: bool = true;
 const DEFAULT_SOCCER_WRITE_EPISODE_LOG: bool = true;
@@ -224,10 +224,9 @@ fn soccer_learning_database_url_env_configured() -> bool {
 }
 
 fn default_soccer_parallel_games() -> usize {
-    thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .clamp(1, DEFAULT_SOCCER_MAX_AUTO_PARALLEL_GAMES)
+    // The continuous learner is the deterministic single-game lane; scale-out
+    // belongs in main_soccer_learning_queue or an explicit SOCCER_PARALLEL_GAMES.
+    DEFAULT_SOCCER_CONTINUOUS_PARALLEL_GAMES
 }
 
 fn env_neural_learning_backend(
@@ -5473,9 +5472,8 @@ mod tests {
     }
 
     #[test]
-    fn default_parallel_games_uses_bounded_local_parallelism() {
-        let default_parallel_games = default_soccer_parallel_games();
-        assert!((1..=DEFAULT_SOCCER_MAX_AUTO_PARALLEL_GAMES).contains(&default_parallel_games));
+    fn default_parallel_games_keeps_continuous_runner_single_game() {
+        assert_eq!(default_soccer_parallel_games(), 1);
     }
 
     #[test]
