@@ -2215,6 +2215,53 @@ fn agentic_action_commitment(
     time_window_probability(score, dt_seconds) >= threshold
 }
 
+fn decision_cadence_labels_match(committed_label: &str, candidate_label: &str) -> bool {
+    let committed_label = normalize_soccer_action_label(committed_label);
+    let candidate_label = normalize_soccer_action_label(candidate_label);
+    committed_label == candidate_label
+        || (committed_label == "defend"
+            && matches!(candidate_label, "defend-shape" | "defend-roam"))
+}
+
+fn decision_cadence_immediate_label(label: &str) -> bool {
+    matches!(
+        normalize_soccer_action_label(label),
+        "tackle" | "slide-tackle" | "recover"
+    )
+}
+
+fn decision_cadence_hold_label_from_weights(
+    observation: &SoccerPomdpObservation,
+    weighted_ops: &[(String, f64)],
+    tick: u64,
+) -> Option<String> {
+    let carryover = observation.previous_tick_carryover.as_ref()?;
+    if !soccer_decision_commitment_switch_locked_for_history(&carryover.commitment_ticks, tick) {
+        return None;
+    }
+    weighted_ops
+        .iter()
+        .filter(|(_, score)| score.is_finite() && *score > 0.0)
+        .find(|(label, _)| decision_cadence_labels_match(&carryover.action, label))
+        .map(|(label, _)| label.clone())
+}
+
+fn apply_decision_cadence_hold_weights(weighted_ops: &mut [(String, f64)], hold_label: &str) {
+    let best_score = weighted_ops
+        .iter()
+        .map(|(_, score)| if score.is_finite() { *score } else { 0.0 })
+        .fold(0.0_f64, f64::max);
+    for (label, score) in weighted_ops.iter_mut() {
+        if decision_cadence_labels_match(hold_label, label) {
+            *score = (*score).max(best_score + 1.0).max(1.0);
+        } else if decision_cadence_immediate_label(label) {
+            *score = (*score).max(0.0);
+        } else {
+            *score *= 0.01;
+        }
+    }
+}
+
 fn agentic_action_order<T>(items: Vec<(T, f64)>) -> Vec<T> {
     let mut keyed = Vec::with_capacity(items.len());
     for (ordinal, (item, weight)) in items.into_iter().enumerate() {
@@ -7960,9 +8007,20 @@ impl PlayerAgent {
                 let label = format!("aerial-pass{}", rank + 1);
                 weighted_ops.push((label.clone(), action_option_score(&action_options, &label)));
             }
+            let cadence_hold_label = decision_cadence_hold_label_from_weights(
+                &observation,
+                &weighted_ops,
+                snapshot.tick,
+            );
+            if let Some(label) = cadence_hold_label.as_deref() {
+                apply_decision_cadence_hold_weights(&mut weighted_ops, label);
+            }
             let ops = agentic_action_order(weighted_ops);
             let full_ops = ops.clone();
             let mut order_names = Vec::with_capacity(ops.len());
+            if let Some(label) = cadence_hold_label.as_deref() {
+                order_names.push(format!("decision-cadence-hold:{label}"));
+            }
             if let Some(label) = learned_mpc_reselect_label.as_deref() {
                 order_names.push(format!("learned-mpc-reselect:{}", label));
             }
@@ -9396,17 +9454,25 @@ impl PlayerAgent {
         } else if possession_team == Some(self.team) {
             let support_context = self.support_action_context(snapshot);
             action_options = support_context.options.clone();
-            let support_order = agentic_action_order(
-                action_options
-                    .iter()
-                    .map(|option| {
-                        (
-                            option.label.clone(),
-                            if option.legal { option.score } else { 0.0 },
-                        )
-                    })
-                    .collect(),
+            let mut support_weighted_ops = action_options
+                .iter()
+                .map(|option| {
+                    (
+                        option.label.clone(),
+                        if option.legal { option.score } else { 0.0 },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let cadence_hold_label = decision_cadence_hold_label_from_weights(
+                &observation,
+                &support_weighted_ops,
+                snapshot.tick,
             );
+            if let Some(label) = cadence_hold_label.as_deref() {
+                apply_decision_cadence_hold_weights(&mut support_weighted_ops, label);
+                order_names.push(format!("decision-cadence-hold:{label}"));
+            }
+            let support_order = agentic_action_order(support_weighted_ops);
             let first_support_label = support_order
                 .first()
                 .map(|label| normalize_soccer_action_label(label.as_str()))
@@ -9520,26 +9586,34 @@ impl PlayerAgent {
         } else if possession_team == Some(self.team.other()) {
             action_options =
                 self.defensive_action_options(snapshot, &directive, snapshot.dt_seconds);
-            let ops = agentic_action_order(
-                vec![
-                    ("tackle", action_option_score(&action_options, "tackle")),
-                    (
-                        "defend-shape",
-                        action_option_score(&action_options, "defend-shape"),
-                    ),
-                    (
-                        "defend-roam",
-                        action_option_score(&action_options, "defend-roam"),
-                    ),
-                    (
-                        "press-cover",
-                        action_option_score(&action_options, "press-cover"),
-                    ),
-                ],
+            let mut defensive_weighted_ops = vec![
+                ("tackle".to_string(), action_option_score(&action_options, "tackle")),
+                (
+                    "defend-shape".to_string(),
+                    action_option_score(&action_options, "defend-shape"),
+                ),
+                (
+                    "defend-roam".to_string(),
+                    action_option_score(&action_options, "defend-roam"),
+                ),
+                (
+                    "press-cover".to_string(),
+                    action_option_score(&action_options, "press-cover"),
+                ),
+            ];
+            let cadence_hold_label = decision_cadence_hold_label_from_weights(
+                &observation,
+                &defensive_weighted_ops,
+                snapshot.tick,
             );
+            if let Some(label) = cadence_hold_label.as_deref() {
+                apply_decision_cadence_hold_weights(&mut defensive_weighted_ops, label);
+                order_names.push(format!("decision-cadence-hold:{label}"));
+            }
+            let ops = agentic_action_order(defensive_weighted_ops);
             let mut chosen = None;
             for op in ops {
-                match op {
+                match op.as_str() {
                     "tackle" => {
                         order_names.push("tackle".to_string());
                         if let Some(holder) = snapshot.ball.holder {
@@ -9575,9 +9649,9 @@ impl PlayerAgent {
                         }
                     }
                     "defend-shape" | "defend-roam" | "press-cover" => {
-                        let press_cover = op == "press-cover";
-                        let roam = op == "defend-roam" || press_cover;
-                        order_names.push(op.to_string());
+                        let press_cover = op.as_str() == "press-cover";
+                        let roam = op.as_str() == "defend-roam" || press_cover;
+                        order_names.push(op.clone());
                         let dist = self.position.distance(snapshot.ball.position);
                         let defend_radius = 3.0 + directive.press_intensity * 3.0;
                         let target = if self.role == PlayerRole::Goalkeeper {

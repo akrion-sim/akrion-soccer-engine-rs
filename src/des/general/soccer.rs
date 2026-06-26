@@ -1138,6 +1138,13 @@ const DRIBBLE_DWELL_GRACE_SECONDS: f64 = 2.1;
 const DRIBBLE_DWELL_RAMP_SECONDS: f64 = 3.0;
 const DRIBBLE_DWELL_DRIBBLE_DAMP: f64 = 0.28;
 const DRIBBLE_DWELL_RELEASE_LIFT: f64 = 0.22;
+// Human-scale decision cadence: at 15Hz, tick indexes 0, 3, 7 are legal
+// commitments (1st, 4th, 8th ticks). This keeps players from changing strategy
+// faster than reaction/mental processing speed while still allowing genuine
+// reflex branches elsewhere in the player logic.
+const PLAYER_DECISION_COMMITMENT_MIN_GAP_TICKS: u64 = 3;
+const PLAYER_DECISION_COMMITMENT_WINDOW_TICKS: u64 = 7;
+const PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW: usize = 2;
 // Anti-spasm: a holder commits to one dribble move-kind (and its touch) for this window
 // instead of re-evaluating a fresh cut/feint/swivel every single tick. Without it the ball
 // jerks in a new direction each frame (the "spasm" look). ~0.45s is long enough to read as
@@ -3386,6 +3393,10 @@ const SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM: usize = 8;
 /// break shape to win an unpossessed ball, balancing race urgency with LP-backed
 /// shape safety.
 const SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = 3;
+/// Append-only player decision-cadence block. The POMDP already carries the
+/// previous decision; these channels let neural learners see whether the actor is
+/// still inside the human reaction/commitment window before switching strategy.
+const SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM: usize = 3;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3408,8 +3419,10 @@ const SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_M
     + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM
     + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM
+const SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM
     + SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM
+    + SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3652,6 +3665,12 @@ const SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_SHAPE_SAFETY: usize =
     SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_CANDIDATE + 1;
 const SOCCER_NEURAL_FEATURE_LOOSE_BALL_UNCONTESTED_URGENCY: usize =
     SOCCER_NEURAL_FEATURE_LOOSE_BALL_ATTACK_SHAPE_SAFETY + 1;
+const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE: usize =
+    SOCCER_NEURAL_FEATURE_LOOSE_BALL_UNCONTESTED_URGENCY + 1;
+const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE + 1;
+const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED: usize =
+    SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3740,6 +3759,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM + 7,
     // Same schema with attacking-spacing channels, before loose-ball attack selection.
     SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM,
+    // Same schema with loose-ball attack selection, before decision-cadence channels.
+    SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5969,6 +5990,123 @@ pub struct SoccerPlayerTickCarryover {
     pub has_ball_after_action: bool,
     #[serde(default)]
     pub same_action_ticks: u32,
+    #[serde(default)]
+    pub commitment_ticks: Vec<u64>,
+    #[serde(default)]
+    pub ticks_since_commitment: u64,
+    #[serde(default)]
+    pub recent_commitment_count_7_ticks: u8,
+    #[serde(default)]
+    pub decision_cadence_switch_locked: bool,
+}
+
+fn soccer_compact_decision_commitment_history(mut history: Vec<u64>, tick: u64) -> Vec<u64> {
+    history.sort_unstable();
+    history.dedup();
+    let Some(last_commitment) = history.last().copied() else {
+        return history;
+    };
+    history.retain(|&commitment_tick| {
+        tick.saturating_sub(commitment_tick) < PLAYER_DECISION_COMMITMENT_WINDOW_TICKS
+            || commitment_tick == last_commitment
+    });
+    history
+}
+
+pub(crate) fn soccer_decision_commitment_history_after_decision(
+    previous: Option<&SoccerPlayerTickCarryover>,
+    action: &str,
+    decision_tick: u64,
+) -> Vec<u64> {
+    let action_label = normalize_soccer_action_label(action);
+    let mut history = previous
+        .map(|carryover| carryover.commitment_ticks.clone())
+        .unwrap_or_default();
+    match previous {
+        Some(carryover) => {
+            if history.is_empty() {
+                history.push(carryover.decision_tick);
+            }
+            if normalize_soccer_action_label(&carryover.action) != action_label {
+                history.push(decision_tick);
+            }
+        }
+        None => history.push(decision_tick),
+    }
+    soccer_compact_decision_commitment_history(history, decision_tick)
+}
+
+fn soccer_decision_commitment_recent_count(history: &[u64], tick: u64) -> usize {
+    history
+        .iter()
+        .filter(|&&commitment_tick| {
+            tick.saturating_sub(commitment_tick) < PLAYER_DECISION_COMMITMENT_WINDOW_TICKS
+        })
+        .count()
+}
+
+fn soccer_decision_commitment_ticks_since(history: &[u64], tick: u64) -> u64 {
+    history
+        .last()
+        .map(|&commitment_tick| tick.saturating_sub(commitment_tick))
+        .unwrap_or(u64::MAX)
+}
+
+pub(crate) fn soccer_decision_commitment_switch_locked_for_history(
+    history: &[u64],
+    tick: u64,
+) -> bool {
+    if history.is_empty() {
+        return false;
+    }
+    if soccer_decision_commitment_ticks_since(history, tick)
+        < PLAYER_DECISION_COMMITMENT_MIN_GAP_TICKS
+    {
+        return true;
+    }
+    soccer_decision_commitment_recent_count(history, tick)
+        >= PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW
+}
+
+pub(crate) fn soccer_decision_commitment_cadence_blocks(
+    previous: Option<&SoccerPlayerTickCarryover>,
+    candidate_action: &str,
+    tick: u64,
+) -> bool {
+    let Some(carryover) = previous else {
+        return false;
+    };
+    if normalize_soccer_action_label(&carryover.action)
+        == normalize_soccer_action_label(candidate_action)
+    {
+        return false;
+    }
+    let mut history = carryover.commitment_ticks.clone();
+    if history.is_empty() {
+        history.push(carryover.decision_tick);
+    }
+    let history = soccer_compact_decision_commitment_history(history, tick);
+    soccer_decision_commitment_switch_locked_for_history(&history, tick)
+}
+
+pub(crate) fn soccer_refresh_decision_commitment_cadence(
+    carryover: &mut SoccerPlayerTickCarryover,
+    observed_at_tick: u64,
+) {
+    carryover.commitment_ticks = soccer_compact_decision_commitment_history(
+        carryover.commitment_ticks.clone(),
+        observed_at_tick,
+    );
+    if carryover.commitment_ticks.is_empty() {
+        carryover.commitment_ticks.push(carryover.decision_tick);
+    }
+    carryover.ticks_since_commitment =
+        soccer_decision_commitment_ticks_since(&carryover.commitment_ticks, observed_at_tick);
+    carryover.recent_commitment_count_7_ticks =
+        soccer_decision_commitment_recent_count(&carryover.commitment_ticks, observed_at_tick)
+            .min(u8::MAX as usize) as u8;
+    carryover.decision_cadence_switch_locked =
+        soccer_decision_commitment_switch_locked_for_history(&carryover.commitment_ticks, observed_at_tick);
 }
 
 /// The live "Pause & Analyze" ring retains only the last
@@ -34861,6 +34999,18 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(obs.loose_ball_attack_shape_safety);
     features[SOCCER_NEURAL_FEATURE_LOOSE_BALL_UNCONTESTED_URGENCY] =
         soccer_neural_unit(obs.loose_ball_uncontested_urgency);
+    if let Some(carryover) = obs.previous_tick_carryover.as_ref() {
+        features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE] = soccer_neural_scaled(
+            carryover.ticks_since_commitment as f64,
+            PLAYER_DECISION_COMMITMENT_WINDOW_TICKS as f64,
+        );
+        features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE] = soccer_neural_unit(
+            carryover.recent_commitment_count_7_ticks as f64
+                / PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW as f64,
+        );
+        features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED] =
+            soccer_neural_bool(carryover.decision_cadence_switch_locked);
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -54295,6 +54445,99 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
 #[cfg(test)]
 mod locomotion_commitment_tests {
     use super::*;
+
+    fn test_carryover(
+        action: &str,
+        decision_tick: u64,
+        commitment_ticks: Vec<u64>,
+    ) -> SoccerPlayerTickCarryover {
+        let mut carryover = SoccerPlayerTickCarryover {
+            player_id: 7,
+            decision_tick,
+            observed_at_tick: decision_tick,
+            age_ticks: 0,
+            clock_seconds: 0.0,
+            action: action.to_string(),
+            action_target: None,
+            mdp_phase: TacticalPhase::Kickoff,
+            mdp_ball_grid: PitchGridAddress::default(),
+            mdp_player_grid: PitchGridAddress::default(),
+            mdp_receive_facing: FacingBucket::Unknown,
+            mdp_action_facing: FacingBucket::Unknown,
+            pomdp_visible_ball: true,
+            pomdp_visible_teammates: 0,
+            pomdp_visible_opponents: 0,
+            pomdp_ball_position_confidence: 1.0,
+            pomdp_teammate_position_confidence: 1.0,
+            pomdp_opponent_position_confidence: 1.0,
+            pomdp_perceived_pressure: 0.0,
+            pomdp_decision_urgency: 0.0,
+            decision_confidence: 1.0,
+            mpc_guidance_present: false,
+            chosen_action_mpc_feasibility: 1.0,
+            mpc_comparison: None,
+            executed_position: Vec2::zero(),
+            executed_velocity: Vec2::zero(),
+            executed_acceleration: Vec2::zero(),
+            has_ball_after_action: false,
+            same_action_ticks: 1,
+            commitment_ticks,
+            ticks_since_commitment: 0,
+            recent_commitment_count_7_ticks: 0,
+            decision_cadence_switch_locked: false,
+        };
+        soccer_refresh_decision_commitment_cadence(&mut carryover, decision_tick);
+        carryover
+    }
+
+    #[test]
+    fn decision_cadence_blocks_new_commitment_inside_three_ticks() {
+        let carryover = test_carryover("carry-forward", 0, vec![0]);
+
+        assert!(soccer_decision_commitment_cadence_blocks(
+            Some(&carryover),
+            "switch-play",
+            2
+        ));
+        assert!(!soccer_decision_commitment_cadence_blocks(
+            Some(&carryover),
+            "switch-play",
+            3
+        ));
+    }
+
+    #[test]
+    fn decision_cadence_allows_third_commitment_on_eighth_tick() {
+        let carryover = test_carryover("switch-play", 3, vec![0, 3]);
+
+        assert!(soccer_decision_commitment_cadence_blocks(
+            Some(&carryover),
+            "carry-forward",
+            6
+        ));
+        assert!(!soccer_decision_commitment_cadence_blocks(
+            Some(&carryover),
+            "carry-forward",
+            7
+        ));
+    }
+
+    #[test]
+    fn decision_cadence_repeating_same_commitment_does_not_spend_budget() {
+        let carryover = test_carryover("switch-play", 3, vec![0, 3]);
+        let history = soccer_decision_commitment_history_after_decision(
+            Some(&carryover),
+            "switch-play",
+            4,
+        );
+
+        assert_eq!(history, vec![0, 3]);
+        assert!(!soccer_decision_commitment_cadence_blocks(
+            Some(&carryover),
+            "switch-play",
+            4
+        ));
+    }
 
     #[test]
     fn effort_tier_orders_gaits_by_intensity() {
