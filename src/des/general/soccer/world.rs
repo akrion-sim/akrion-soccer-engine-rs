@@ -19855,8 +19855,16 @@ impl WorldSnapshot {
             );
         let predicted_ball =
             finite_pitch_point(self.predicted_ball_position(lookahead), width, length, ball_position);
+        let lane_discipline_v2 = lane_discipline::lane_discipline_v2_enabled();
         let lane_match = |a: usize, b: usize| -> f64 {
-            (1.0 - a.abs_diff(b) as f64 / lane_tunables.lane_match_span_lanes).clamp(0.0, 1.0)
+            if lane_discipline_v2 {
+                // Yard-based: a same-size lane gap means the same lateral distance
+                // regardless of how many lanes the grid is sliced into.
+                lane_discipline::lane_match(a, b, width)
+            } else {
+                // Legacy path stays byte-identical to the `lane_affinity`-tuned baseline.
+                (1.0 - a.abs_diff(b) as f64 / lane_tunables.lane_match_span_lanes).clamp(0.0, 1.0)
+            }
         };
         let row_match = |a: usize, b: usize| -> f64 {
             (1.0 - a.abs_diff(b) as f64 / lane_tunables.row_match_span_rows).clamp(0.0, 1.0)
@@ -19931,7 +19939,9 @@ impl WorldSnapshot {
                 + flow_score * lane_tunables.role_flow_weight
                 + field_config_score * lane_tunables.role_field_config_weight
         };
-        (lane_score * possession_factor).clamp(0.0, 1.0)
+        // Global lane-discipline strength: the one knob every consumer of this
+        // affinity feels (1.0 / identity when v2 is off).
+        (lane_score * possession_factor * lane_discipline::strength()).clamp(0.0, 1.0)
     }
 
     fn lane_biased_player_target_score(
@@ -19956,8 +19966,11 @@ impl WorldSnapshot {
         if fit.commitment <= 1e-9 {
             return 0.0;
         }
-        (1.0 - fit.affinity_score) * (3.4 + fit.commitment * 5.6)
-            + fit.deviation_yards * 0.070 * fit.commitment
+        // Scaled by the global lane-discipline strength (identity when v2 is off),
+        // so one knob moves this penalty in lockstep with the affinity bonus.
+        ((1.0 - fit.affinity_score) * (3.4 + fit.commitment * 5.6)
+            + fit.deviation_yards * 0.070 * fit.commitment)
+            * lane_discipline::strength()
     }
 
     fn offensive_high_speed_run_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
@@ -35706,7 +35719,13 @@ impl WorldSnapshot {
                 self.field_width,
                 in_possession,
             );
-            if fit.commitment >= 0.65 && relief < 0.15 {
+            if lane_discipline::lane_discipline_v2_enabled() {
+                // Smooth relief taper instead of the legacy cliff: a mild relief
+                // relaxes the lane, it doesn't abandon it (floored at the same soft
+                // blend the legacy else-branch used under full relief).
+                let blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                bounded.x = bounded.x * (1.0 - blend) + lane_x * blend;
+            } else if fit.commitment >= 0.65 && relief < 0.15 {
                 bounded.x = lane_x;
             } else {
                 let lane_blend = (fit.commitment * 0.72).clamp(0.0, 0.72);
