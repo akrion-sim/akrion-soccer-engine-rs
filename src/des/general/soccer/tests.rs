@@ -78339,7 +78339,7 @@ fn audit_defender_goalside_in_lane() {
     const LANE_TOL: f64 = 8.0; // within this of home.x => "holding lane / zonal"
     const NEAR_BALL: f64 = 6.0; // closer than this => legit contester, exempt
     const WRONG_SIDE: f64 = 1.0; // ball-side by more than this (yards) => violation
-    const TICK_CAP: u64 = 6000;
+    const TICK_CAP: u64 = 5000;
 
     #[derive(Default, Clone)]
     struct Acc {
@@ -78347,10 +78347,12 @@ fn audit_defender_goalside_in_lane() {
         def_obs: u64,
         viol_in_lane: u64,
         viol_out_lane: u64,
-        worst: Vec<(u64, String, f64, f64, f64, f64)>, // tick, who, margin, lane_dev, ball_dist, depth
+        worst: Vec<(u64, String, f64, f64, f64, f64, String)>, // tick, who, margin, lane_dev, ball_dist, depth, action
+        by_shirt: std::collections::BTreeMap<u8, u64>,
+        by_action: std::collections::BTreeMap<String, u64>,
     }
 
-    for seed_run in 0..3u64 {
+    for seed_run in 0..1u64 {
         let mut m = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
         let mut acc = Acc::default();
         let mut tick: u64 = 0;
@@ -78387,15 +78389,23 @@ fn audit_defender_goalside_in_lane() {
                 }
                 let lane_dev = (p.position.x - p.home_position.x).abs();
                 // own-goal depth of the defender (how deep he is)
-                let own_goal_y = defending.other().goal_y(m.field_length);
+                let own_goal_y = defending.other().goal_y(snap.field_length);
                 let depth = (p.position.y - own_goal_y).abs();
                 if lane_dev <= LANE_TOL {
                     acc.viol_in_lane += 1;
+                    let action = p
+                        .last_decision
+                        .as_ref()
+                        .map(|d| d.action.clone())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    *acc.by_shirt.entry(p.shirt).or_default() += 1;
+                    *acc.by_action.entry(action.clone()).or_default() += 1;
                     let who = format!(
                         "{:?}#{} (home x={:.1})",
                         defending, p.shirt, p.home_position.x
                     );
-                    acc.worst.push((tick, who, margin, lane_dev, ball_dist, depth));
+                    acc.worst
+                        .push((tick, who, margin, lane_dev, ball_dist, depth, action));
                 } else {
                     acc.viol_out_lane += 1;
                 }
@@ -78416,10 +78426,12 @@ fn audit_defender_goalside_in_lane() {
             acc.viol_out_lane,
             pct(acc.viol_out_lane, acc.def_obs),
         );
-        eprintln!("worst 12 IN-LANE ball-side examples (defender stuck in zone, ahead of ball):");
-        for (t, who, margin, lane_dev, bd, depth) in acc.worst.iter().take(12) {
+        eprintln!("in-lane violations by shirt: {:?}", acc.by_shirt);
+        eprintln!("in-lane violations by chosen action label: {:?}", acc.by_action);
+        eprintln!("worst 15 IN-LANE ball-side examples (defender stuck in zone, ahead of ball):");
+        for (t, who, margin, lane_dev, bd, depth, action) in acc.worst.iter().take(15) {
             eprintln!(
-                "  tick {t:>5}  {who:<28} ahead-of-ball={:.1}yd  lane_dev={:.1}yd  ball_dist={:.1}yd  own-depth={:.1}yd",
+                "  tick {t:>5}  {who:<26} ahead-of-ball={:.1}yd  lane_dev={:.1}yd  ball_dist={:.1}yd  own-depth={:.1}yd  action={action}",
                 -margin, lane_dev, bd, depth
             );
         }
