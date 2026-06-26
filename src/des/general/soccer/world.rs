@@ -18584,6 +18584,15 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
 }
+/// Over-the-top ball keeper-avoidance angling (default ON). Set this to restore the historical
+/// behaviour byte-for-byte: an in-behind ball is projected onto the runner's raw x with no lateral
+/// nudge away from the opponent keeper, and the over-the-top selector carries no keeper-avoidance
+/// preference. See `over_the_top_gk_angled_point`.
+pub(crate) fn dd_soccer_disable_over_top_gk_angle() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OVER_TOP_GK_ANGLE").is_ok())
+}
 /// When an off-ball forward/midfielder is holding a support position (NOT timing a
 /// sanctioned in-behind run), they should sit level with the last defender — on the
 /// shoulder, onside — rather than parking `OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS`
@@ -28215,6 +28224,61 @@ impl WorldSnapshot {
             - line_penalty * 0.34
     }
 
+    /// The x-coordinate an over-the-top ball should avoid dropping onto: the opponent keeper's
+    /// current x, falling back to the goal centre when no keeper is visible.
+    pub(crate) fn over_the_top_keeper_x(&self, attacking_team: Team) -> f64 {
+        self.goalkeeper_for(attacking_team.other())
+            .and_then(|gk| self.player_position(gk))
+            .map(|p| p.x)
+            .unwrap_or(self.field_width * 0.5)
+    }
+
+    /// How well an over-the-top landing point dodges the sweeping keeper, in `[0, 1]`: 0 when the
+    /// ball drops onto the keeper's x, ramping to 1 once it is a full claim-channel clear into the
+    /// running lane. Used by the over-the-top selector so the MDP prefers the keeper-avoidant ball.
+    pub(crate) fn over_the_top_keeper_avoidance_fit(&self, attacking_team: Team, landing: Vec2) -> f64 {
+        let keeper_x = self.over_the_top_keeper_x(attacking_team);
+        ((landing.x - keeper_x).abs() / OVER_TOP_GK_CLAIM_CHANNEL_YARDS).clamp(0.0, 1.0)
+    }
+
+    /// Angle a projected over-the-top landing point a few yards AWAY from the opponent keeper so a
+    /// long ball in behind drops into the channel the runner attacks rather than straight onto the
+    /// sweeping keeper. The nudge is SLIGHT (capped at `OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS`) and only
+    /// applied to genuine over-the-top balls (`forward_yards >= OVER_TOP_BALL_MIN_FORWARD_YARDS`)
+    /// whose naive landing point sits inside the keeper's central claim channel. Short threads,
+    /// already-wide balls, and the disable gate return the point byte-identically.
+    pub(crate) fn over_the_top_gk_angled_point(
+        &self,
+        attacking_team: Team,
+        naive: Vec2,
+        forward_yards: f64,
+    ) -> Vec2 {
+        if dd_soccer_disable_over_top_gk_angle()
+            || forward_yards < OVER_TOP_BALL_MIN_FORWARD_YARDS
+        {
+            return naive;
+        }
+        let keeper_x = self.over_the_top_keeper_x(attacking_team);
+        let offset = naive.x - keeper_x;
+        // Already clear of the keeper's claim channel ⇒ the runner already attacks open grass, leave it.
+        if offset.abs() >= OVER_TOP_GK_CLAIM_CHANNEL_YARDS {
+            return naive;
+        }
+        // Push toward the side the landing already favours; if dead-central, choose the side with
+        // more room to the touchline so the ball runs into open space, not toward a corner flag.
+        let side = if offset.abs() > 1e-3 {
+            offset.signum()
+        } else if keeper_x <= self.field_width * 0.5 {
+            1.0
+        } else {
+            -1.0
+        };
+        let target_x = keeper_x + side * OVER_TOP_GK_CLAIM_CHANNEL_YARDS;
+        let shift = (target_x - naive.x)
+            .clamp(-OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS, OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS);
+        Vec2::new(naive.x + shift, naive.y).clamp_to_pitch(self.field_width, self.field_length)
+    }
+
     pub(crate) fn projected_in_behind_pass_point(
         &self,
         passer_id: usize,
@@ -28253,10 +28317,14 @@ impl WorldSnapshot {
             return None;
         }
         let projected_y = line_y + passer.team.attack_dir() * 11.0;
-        Some(
-            Vec2::new(target_position.x, projected_y)
-                .clamp_to_pitch(self.field_width, self.field_length),
-        )
+        let naive = Vec2::new(target_position.x, projected_y)
+            .clamp_to_pitch(self.field_width, self.field_length);
+        // Angle a true over-the-top ball off the keeper so it drops into the runner's channel
+        // rather than dead-central onto the sweeper. Threads the keeper-avoidance through every
+        // consumer (killer/threaded pass + long-ball selector + their POMDP observation fields).
+        let passer_position = self.player_snapshot_position(passer);
+        let forward_yards = (naive.y - passer_position.y) * passer.team.attack_dir();
+        Some(self.over_the_top_gk_angled_point(passer.team, naive, forward_yards))
     }
 
     pub(crate) fn player_forward_progress_over_seconds(
@@ -28369,9 +28437,19 @@ impl WorldSnapshot {
                 } else {
                     1.2
                 };
+                // Prefer the keeper-avoidant over-the-top ball: one angled into the runner's
+                // channel beats one dropping dead-central onto the sweeping keeper. Gated with the
+                // angling itself (off ⇒ no term ⇒ byte-identical selection).
+                let keeper_avoid = if dd_soccer_disable_over_top_gk_angle() {
+                    0.0
+                } else {
+                    self.over_the_top_keeper_avoidance_fit(passer.team, pass_point)
+                        * OVER_TOP_KEEPER_AVOID_SCORE_WEIGHT
+                };
                 let score = forward * 0.10 + self.space_score_at(pass_point, passer.team) * 0.06
                     - passer_position.distance(pass_point) * 0.010
-                    + line_bonus;
+                    + line_bonus
+                    + keeper_avoid;
                 Some((target.id, score))
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))

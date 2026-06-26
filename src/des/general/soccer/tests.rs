@@ -52135,6 +52135,76 @@ fn neutral_staging_creates_occasional_in_behind_aerial_option() {
 }
 
 #[test]
+fn over_the_top_ball_angles_off_central_keeper() {
+    // A long over-the-top ball that naively drops dead-central onto the sweeping keeper is angled a
+    // few yards into the runner's channel so the ball — not the keeper — is claimed first.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let center_x = sim.config.field_width_yards * 0.5;
+    let gk = sim
+        .players
+        .iter()
+        .position(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .expect("away keeper");
+    sim.players[gk].position = Vec2::new(center_x, sim.config.field_length_yards - 4.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let keeper_x = snapshot.over_the_top_keeper_x(Team::Home);
+    assert!((keeper_x - center_x).abs() < 1e-6, "keeper sits at goal centre");
+
+    let naive = Vec2::new(center_x, sim.config.field_length_yards - 12.0);
+    let angled = snapshot.over_the_top_gk_angled_point(Team::Home, naive, 28.0);
+    assert!(
+        (angled.x - keeper_x).abs() >= OVER_TOP_GK_CLAIM_CHANNEL_YARDS - 1e-6,
+        "central over-the-top ball should clear the keeper's claim channel: x={}",
+        angled.x
+    );
+    assert!(
+        (angled.x - naive.x).abs() <= OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS + 1e-6,
+        "the angle is slight, not a switch of play: shift={}",
+        (angled.x - naive.x).abs()
+    );
+    assert!(
+        (angled.y - naive.y).abs() < 1e-9,
+        "angling moves only x (the depth in behind is preserved)"
+    );
+    assert!(
+        snapshot.over_the_top_keeper_avoidance_fit(Team::Home, angled)
+            > snapshot.over_the_top_keeper_avoidance_fit(Team::Home, naive),
+        "the angled landing dodges the keeper better than the dead-central one"
+    );
+}
+
+#[test]
+fn over_the_top_angle_leaves_wide_and_short_balls_untouched() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let center_x = sim.config.field_width_yards * 0.5;
+    let gk = sim
+        .players
+        .iter()
+        .position(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .expect("away keeper");
+    sim.players[gk].position = Vec2::new(center_x, sim.config.field_length_yards - 4.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+
+    // A ball already a full claim-channel clear of the keeper attacks open grass — leave it.
+    let wide = Vec2::new(
+        center_x + OVER_TOP_GK_CLAIM_CHANNEL_YARDS + 3.0,
+        sim.config.field_length_yards - 12.0,
+    );
+    assert_eq!(snapshot.over_the_top_gk_angled_point(Team::Home, wide, 28.0), wide);
+
+    // A short thread (below the over-the-top forward floor) is untouched even when dead-central.
+    let short_central = Vec2::new(center_x, sim.config.field_length_yards - 12.0);
+    assert_eq!(
+        snapshot.over_the_top_gk_angled_point(
+            Team::Home,
+            short_central,
+            OVER_TOP_BALL_MIN_FORWARD_YARDS - 1.0
+        ),
+        short_central
+    );
+}
+
+#[test]
 fn spacing_scores_reward_the_in_band_separation() {
     // Attack stretches wide (the [min, ideal] plateau is much wider in possession), defense
     // stays compact; both reward the in-band separation and penalize closer/wider.

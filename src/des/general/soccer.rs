@@ -978,6 +978,16 @@ const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 3.0; // 9ft — drops back down promptly,
 const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.20;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
 const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
+// Over-the-top ball (the "killer threaded" 25-35yd lofted pass in behind the back four, ~12ft
+// apex via `lofted_pass_apex_yards`). A ball that lands DEAD-CENTRAL drops straight onto the
+// sweeping keeper, so angle the landing point a few yards into the channel the runner attacks —
+// the ball then arrives where the runner, not the keeper, is favourite. Only genuine over-the-top
+// balls (long, landing inside the keeper's central claim channel) are nudged, and the nudge is
+// deliberately SLIGHT (a small angle, never a switch of play). See `over_the_top_gk_angled_point`.
+const OVER_TOP_BALL_MIN_FORWARD_YARDS: f64 = 22.0; // a true over-the-top ball, not a short thread
+const OVER_TOP_GK_CLAIM_CHANNEL_YARDS: f64 = 7.0; // keep the landing this far in x from the keeper
+const OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS: f64 = 8.0; // cap the lateral nudge — slight angle only
+const OVER_TOP_KEEPER_AVOID_SCORE_WEIGHT: f64 = 0.30; // MDP preference for the keeper-avoidant channel
 /// Long passes are biased toward the OPPONENT's corner channels (a forward diagonal into the wide
 /// attacking area), the classic territory-winning long ball. Only balls at least this long, and
 /// only when forward (toward the opponent's goal line), earn the affinity — a long SIDEWAYS or
