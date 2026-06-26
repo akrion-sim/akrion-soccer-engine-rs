@@ -245,6 +245,12 @@ pub struct SoccerMatch {
     pub active_set_play: Option<SoccerSetPlayCall>,
     pub(crate) rng: SeededRandom,
     pub(crate) pending_pass: Option<PendingPass>,
+    /// One-shot guard: set true for the duration of an `apply_restart` when the aerial-pass
+    /// out-of-bounds penalty has already claimed the event (a qualifying long loft sailed out),
+    /// so the generic [`Self::record_out_of_bounds_turnover_penalty`] defers instead of
+    /// double-charging the same passer. Always cleared after the restart. Only ever true when
+    /// `DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE` is on ⇒ baseline byte-identical.
+    pub(crate) suppress_generic_oob_turnover: bool,
     pub(crate) pending_shot: Option<PendingShot>,
     pub(crate) pending_rebound: Option<PendingRebound>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
@@ -1689,6 +1695,7 @@ impl SoccerMatch {
             active_set_play: None,
             rng,
             pending_pass: None,
+            suppress_generic_oob_turnover: false,
             pending_shot: None,
             pending_rebound: None,
             coach_set_play_hints: HashMap::new(),
@@ -10743,6 +10750,26 @@ impl SoccerMatch {
                             }
                         }
                     }
+                    // MPC/execution side of the aerial-OOB loop: cap a lofted ball's launch
+                    // pace so its gravity-fixed carry lands inside the pitch along the (already
+                    // pitch-clamped) aim direction — an over-cooked loft no longer sails out for
+                    // a throw-in / goal-kick. Aim and direction are untouched; only the speed is
+                    // trimmed, and only when it would actually carry out. Gate OFF / non-aerial ⇒
+                    // unchanged.
+                    let speed = if dd_soccer_enable_aerial_pass_oob_discipline()
+                        && flight.is_aerial()
+                    {
+                        aerial_pass_in_bounds_launch_speed(
+                            player_pos,
+                            aimed_target,
+                            speed,
+                            player_pos.distance(aimed_target),
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
+                    } else {
+                        speed
+                    };
                     let pass_curl_probability = pass_curl_probability_for_player(
                         &self.players[player_id].skills,
                         flight,
@@ -13462,7 +13489,11 @@ impl SoccerMatch {
                 shot,
                 shot_off_target_yards,
             } => {
-                self.pending_pass = None;
+                // A pass still pending when the ball leaves play sailed out untouched — the
+                // unforced aerial-OOB error. Capture it BEFORE clearing so the passer can be
+                // credited (see `record_aerial_pass_out_of_bounds_penalty`).
+                let oob_pass = self.pending_pass.take();
+                let was_shot = shot.is_some();
                 self.pending_shot = None;
                 self.pending_rebound = None;
                 self.ball.altitude_yards = 0.0;
@@ -13476,7 +13507,22 @@ impl SoccerMatch {
                     );
                     self.record_miss_event(shot);
                 }
+                let restart_kind = restart.kind;
+                let restart_awarded = restart.awarded_team;
+                let restart_position = restart.position;
+                // Apply the aerial-OOB penalty FIRST so it can claim the event; the generic
+                // turnover penalty inside `apply_restart` then defers via the guard flag.
+                if !was_shot {
+                    self.suppress_generic_oob_turnover = self
+                        .record_aerial_pass_out_of_bounds_penalty(
+                            oob_pass.as_ref(),
+                            restart_kind,
+                            restart_awarded,
+                            restart_position,
+                        );
+                }
                 self.apply_restart(restart);
+                self.suppress_generic_oob_turnover = false;
             }
         }
     }
@@ -14975,11 +15021,65 @@ impl SoccerMatch {
         }
     }
 
+    /// MDP side of the aerial-OOB loop. A LONG lofted pass that was still in flight when the
+    /// ball left play sailed out untouched — over the touchline (throw-in to the other team) or
+    /// the opponent byline (a conceded goal-kick). Penalise the PASSER, scaled per-yard by how
+    /// far the exit point landed from where the ball was aimed (the same "hit the frame" shaping
+    /// the shot-off-target penalty uses), so the policy learns to weight an ambitious loft rather
+    /// than blaze it out. Returns true when it applied (the caller then suppresses the generic
+    /// out-of-bounds turnover penalty for this restart so the passer is not double-charged).
+    /// Gate OFF, non-aerial / short passes, a shot, or a ball the passer's team kept ⇒ no event
+    /// and false (baseline byte-identical).
+    fn record_aerial_pass_out_of_bounds_penalty(
+        &mut self,
+        pass: Option<&PendingPass>,
+        restart_kind: BallRestartKind,
+        awarded_team: Team,
+        restart_position: Vec2,
+    ) -> bool {
+        if !dd_soccer_enable_aerial_pass_oob_discipline() {
+            return false;
+        }
+        let Some(pass) = pass else {
+            return false;
+        };
+        if !pass.flight.is_aerial() {
+            return false;
+        }
+        // Only a loft the passer's team CONCEDED out of play: a throw-in or goal-kick awarded to
+        // the other team. (A corner is won off a defensive touch — not the passer's error.)
+        let conceded = matches!(
+            restart_kind,
+            BallRestartKind::ThrowIn | BallRestartKind::GoalKick
+        ) && awarded_team != pass.team;
+        if !conceded || pass.distance_yards < AERIAL_PASS_OOB_MIN_DISTANCE_YARDS {
+            return false;
+        }
+        // How far the ball exited from where it was aimed: a loft that just grazes out next to
+        // its target is unlucky; one that sails out 15yd away was badly over-hit.
+        let overrun = restart_position.distance(pass.intended_target);
+        let over = (overrun - AERIAL_PASS_OOB_FORGIVENESS_YARDS).max(0.0);
+        let penalty = (AERIAL_PASS_OOB_BASE_PENALTY_POINTS
+            + over * AERIAL_PASS_OOB_PENALTY_PER_YARD)
+            .min(AERIAL_PASS_OOB_MAX_PENALTY_POINTS);
+        self.record_reward_event(pass.from, -penalty);
+        // An aerial hoofed out is also a turnover: give the offending team's last few seconds the
+        // same retroactive, all-learner penalty (per-tick de-dup guarded), mirroring the generic
+        // handler this one supersedes.
+        self.penalize_turnover_window(pass.team);
+        true
+    }
+
     fn record_out_of_bounds_turnover_penalty(
         &mut self,
         restart_kind: BallRestartKind,
         awarded_team: Team,
     ) {
+        // The aerial-pass OOB handler already claimed this restart (and applied a
+        // distance-shaped penalty + turnover window); don't double-charge the passer.
+        if self.suppress_generic_oob_turnover {
+            return;
+        }
         // Only throw-ins unambiguously mean "the ball was dribbled/passed out
         // over the touchline." Goal kicks can be wide shots and corners can be
         // defensive deflections, so attributing those as turnovers misfires.
@@ -22361,6 +22461,7 @@ impl WorldSnapshot {
                 expected_aerial_pass_completion: 0.0,
                 aerial_pass_bypass_score: 0.0,
                 aerial_pass_interception_risk: 0.0,
+                aerial_pass_landing_safety: 1.0,
                 aerial_forward_runner_pass_multiplier: 1.0,
                 ball_position_confidence: 0.0,
                 teammate_position_confidence: 0.0,
@@ -22849,6 +22950,19 @@ impl WorldSnapshot {
             )
         } else {
             0.0
+        };
+        // POMDP side of the aerial-OOB loop: how safely the BEST aerial option's projected
+        // landing sits inside the pitch (1.0 = safe, 0.0 = on/over a line). Always computed so
+        // the field is populated; it only changes behaviour when the OOB-discipline gate is on
+        // (see `pass_quality_for_patience`). No aerial option ⇒ 1.0 (no score suppression).
+        let aerial_pass_landing_safety = if has_ball {
+            self.best_aerial_pass_target(player_id)
+                .map(|target_id| {
+                    aerial_pass_landing_safety_for_snapshot(self, me_position, target_id)
+                })
+                .unwrap_or(1.0)
+        } else {
+            1.0
         };
         let flank_cross_arrival_target =
             self.flank_cross_arrival_target_for(player_id, me.home_position);
@@ -23463,6 +23577,7 @@ impl WorldSnapshot {
             expected_aerial_pass_completion: best_aerial_pass_quality.expected_completion,
             aerial_pass_bypass_score,
             aerial_pass_interception_risk,
+            aerial_pass_landing_safety,
             aerial_forward_runner_pass_multiplier,
             ball_position_confidence,
             teammate_position_confidence,
