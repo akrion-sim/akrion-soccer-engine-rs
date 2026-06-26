@@ -1112,6 +1112,9 @@ const SHORT_BACK_PASS_MAX_YARDS: f64 = 14.0;
 // backward) and KEEPS possession made the right call, but the forward-carry reward misses it
 // because there is no forward gain. Credit the cushion gained, scaled by danger. Kept well below
 // the forward-carry reward so forward progress stays strictly the most valuable carry.
+// Probe cap used to normalise the defender-aware escape-lane neural feature (mirrors the world-side
+// FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS).
+const FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS: f64 = 8.0;
 const FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE: f64 = 0.40;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD: f64 = 0.11;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS: f64 = 3.0;
@@ -3456,8 +3459,8 @@ const SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = SOCCER_NEURAL_PRE
     + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM
     + SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM
-    + SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+    + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3706,6 +3709,17 @@ const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE + 1;
 const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED: usize =
     SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE + 1;
+// First-touch-escape tail block (#3): gives the policy two LEARNABLE signals about the
+// receive-under-pressure moment the heuristic layer already acts on — the defender-aware escape-lane
+// availability and a freeze-risk composite (pressed, with no easy out). Appended after the
+// decision-cadence block so old nets migrate by zero-padding (see SOCCER_NEURAL_LEGACY_FEATURE_DIMS).
+const SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM: usize = 2;
+const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM + SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE: usize =
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3796,6 +3810,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM,
     // Same schema with loose-ball attack selection, before decision-cadence channels.
     SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM,
+    // Same schema with decision-cadence channels, before the first-touch-escape tail.
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -35667,6 +35683,22 @@ fn soccer_neural_transition_features_with_action(
         );
         features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED] =
             soccer_neural_bool(carryover.decision_cadence_switch_locked);
+    }
+    // First-touch-escape tail (#3): defender-aware escape-lane availability + a freeze-risk
+    // composite (pressed with no easy out) so the policy can LEARN the move-out-of-feet response
+    // the heuristic layer already produces. Gated: zeroed when disabled (the appended slots then
+    // contribute nothing), so OFF is byte-identical to the prior feature contract bar the migration.
+    if !dd_soccer_disable_first_touch_escape() {
+        let lane_norm =
+            (obs.pressured_escape_lane_yards / FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS).clamp(0.0, 1.0);
+        let freeze_risk = (obs
+            .immediate_dispossession_risk
+            .max(obs.perceived_pressure)
+            .clamp(0.0, 1.0)
+            * (1.0 - lane_norm))
+            .clamp(0.0, 1.0);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE] = soccer_neural_unit(lane_norm);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK] = soccer_neural_unit(freeze_risk);
     }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features

@@ -61168,6 +61168,7 @@ fn defender_aware_open_lane_lifts_side_step_escape_on_pressured_receipt() {
         sim.players[holder].position = sim.ball.position;
         sim.players[holder].home_position = sim.ball.position;
         sim.players[holder].incoming_ball = None; // perceived_time_on_ball ~0 => fresh receipt
+        sim.players[holder].skills.dribbling = 5.5; // mid-skill: gets the escape floor (not elite)
         // Presser on the right, on top of the carrier.
         sim.players[16].position = Vec2::new(41.6, 58.2);
         sim.players[16].home_position = sim.players[16].position;
@@ -61209,6 +61210,61 @@ fn defender_aware_open_lane_lifts_side_step_escape_on_pressured_receipt() {
         open_side_step >= open_shield,
         "with an open lane on fresh receipt under pressure, the side-step escape should be at least \
          as valued as freezing on the shield: side_step={open_side_step} shield={open_shield}"
+    );
+}
+
+#[test]
+fn first_touch_escape_neural_block_is_appended_and_migration_safe() {
+    // The first-touch-escape tail is appended after decision-cadence, growing FEATURE_DIM by its
+    // block width, and the pre-block total is registered as a legacy dim so old nets zero-pad.
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+            + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+    );
+    assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM, 2);
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM),
+        "the pre-first-touch-escape total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
+    assert_ne!(
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE,
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK
+    );
+}
+
+#[test]
+fn pressured_escape_lane_obs_is_defender_aware() {
+    // The observation's escape-lane clearance keys on real opponent geometry: an open lane reads
+    // large, and closing it with a second defender drives it down — unlike pitch-edge room.
+    let lane = |boxed_in: bool| -> f64 {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let holder = 6;
+        park_players_except(&mut sim, &[holder, 16, 17]);
+        let origin = Vec2::new(40.0, 58.0);
+        sim.players[holder].position = origin;
+        sim.players[holder].home_position = origin;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = origin;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[16].position = Vec2::new(41.6, 58.2); // presser on the right
+        sim.players[17].position = if boxed_in {
+            Vec2::new(38.2, 58.0) // closes the left lane
+        } else {
+            Vec2::new(10.0, 10.0) // far away: left lane open
+        };
+        let snapshot = WorldSnapshot::from_match(&sim);
+        snapshot.observation_for(holder).pressured_escape_lane_yards
+    };
+
+    let open = lane(false);
+    let boxed = lane(true);
+    assert!(
+        open > boxed + 1.0,
+        "an open defender-aware lane must read materially larger than a boxed-in one: open={open} boxed={boxed}"
     );
 }
 

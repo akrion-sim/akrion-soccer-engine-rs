@@ -3656,8 +3656,15 @@ impl PlayerAgent {
         // the side-step on the fresh-receipt-escape signal INDEPENDENTLY of the damped base, so when
         // a defender-aware lane is open on receipt the carrier breaks contact rather than freezing.
         // Collapses to 0 (boxed in / open play / gate-off), so normal play is untouched.
-        let side_step_escape_floor =
-            (first_touch_escape_signal * FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT).clamp(0.0, side_step_ceiling);
+        // Skill-gate the floor (as the shield/hold gates do): an elite dribbler has better evasive
+        // moves on receipt — the xavi-turn, cuts — so don't floor him into a plain side-step. The
+        // floor is for the mid/low-skill carrier who would otherwise just freeze on the shield.
+        let skilled_escape_relief =
+            ((dribbling - (NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF - 0.28)) / 0.28).clamp(0.0, 1.0);
+        let side_step_escape_floor = (first_touch_escape_signal
+            * FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT
+            * (1.0 - skilled_escape_relief))
+            .clamp(0.0, side_step_ceiling);
         let side_step_score = (dribble_score
             * (0.30 + pressure_urgency.max(pressure) * 0.88)
             * (1.0
