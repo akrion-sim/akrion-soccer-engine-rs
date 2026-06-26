@@ -74,6 +74,33 @@ const REF_SHOT_ANGLE_DEGREES: f64 = 42.0;
 /// Reference speed/accel for ball kinematics normalization.
 const REF_BALL_SPEED_YPS: f64 = 24.0;
 const REF_BALL_ACCEL_YPS2: f64 = 12.0;
+/// Max skill rating (0-10), used to normalize per-foot power / shooting skill to `[0,1]`.
+const MAX_SKILL_RATING: f64 = 10.0;
+
+// --- Analytic shot-value distance curve (`analytic_shot_trigger_value`) ---
+/// Inside this distance a shot keeps full distance value (1.0).
+const SHOT_VALUE_FULL_DISTANCE_YARDS: f64 = 18.0;
+/// End of the "20 or 15, not 25" taper band; distance value is `SHOT_VALUE_TAPER_FLOOR` here.
+/// (Bare distance value then eases to 0 over the next 8yd, i.e. by ~30yd.)
+const SHOT_VALUE_TAPER_DISTANCE_YARDS: f64 = 22.0;
+/// Distance value at [`SHOT_VALUE_TAPER_DISTANCE_YARDS`] (before any long-range merit lift).
+const SHOT_VALUE_TAPER_FLOOR: f64 = 0.45;
+
+// --- Shot-score multiplier (`shot_trigger_score_multiplier`) ---
+/// Soft multiplier on `shot_score` at value 0 (a far/covered chance is demoted toward this).
+const SHOT_TRIGGER_MULT_FLOOR: f64 = 0.10;
+/// Slope of the value→multiplier map.
+const SHOT_TRIGGER_MULT_SLOPE: f64 = 1.20;
+/// Ceiling of the value→multiplier map (a close/open chance is lifted toward this).
+const SHOT_TRIGGER_MULT_CEILING: f64 = 1.30;
+
+// --- RL sample collection (`collect_shot_trigger_rl_samples`) ---
+/// Only sample shot decisions inside this goal distance (else the corpus is midfield carriers).
+const SHOT_TRIGGER_SAMPLE_MAX_GOAL_DISTANCE_YARDS: f64 = 32.0;
+/// The sampled candidate must be this close to the ball to be the one deciding to shoot.
+const SHOT_TRIGGER_SAMPLE_BALL_PROXIMITY_YARDS: f64 = 4.0;
+/// Analytic value at/above which the sampled action is recorded as "a shot was taken".
+const SHOT_TRIGGER_SAMPLE_SHOOT_ACTION_THRESHOLD: f64 = 0.5;
 
 /// Kill-switch: set to a truthy value to DISABLE the learnable shot trigger and keep
 /// the engine byte-identical to before this module existed. Default (unset) = ON.
@@ -128,7 +155,7 @@ pub fn shot_rebound_second_chance_score(observation: &SoccerPomdpObservation) ->
     let power = observation
         .skill_right_foot_shot_power
         .max(observation.skill_left_foot_shot_power);
-    let power01 = (power / 10.0).clamp(0.0, 1.0);
+    let power01 = (power / MAX_SKILL_RATING).clamp(0.0, 1.0);
     // A keeper who gets a hand to it (low beat-probability) but is reachable parries
     // a powerful strike; a wide-open net is just a goal, not a rebound.
     let stop_likelihood = (1.0 - observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0))
@@ -246,7 +273,7 @@ impl ShotTriggerInputs {
             p(self.goal_attack_window),
             p(self.body_mechanics_fit),
             p(self.shooting_skill),
-            (self.strong_foot_power / 10.0).clamp(0.0, 1.0),
+            (self.strong_foot_power / MAX_SKILL_RATING).clamp(0.0, 1.0),
             b(self.is_forward),
         ]
     }
@@ -266,12 +293,15 @@ pub fn analytic_shot_trigger_value(inputs: &ShotTriggerInputs) -> f64 {
     // Distance base: full value inside ~18yd, ramping down through the 18→22yd band (the
     // "20 or 15, not 25" zone) and toward zero by 30yd. Tuned so a clean 15-20yd chance
     // stays high while a 25yd+ shot is low — the discipline anchor.
-    let distance_base = if d <= 18.0 {
+    // Full (1.0) inside FULL; eases to SHOT_VALUE_TAPER_FLOOR over the 4yd FULL→TAPER band
+    // (slope 0.55 = 1.0 − floor); then to 0 over the 8yd TAPER→ZERO band (slope = the floor).
+    // Slope/span literals are kept verbatim so the curve is bit-for-bit the original.
+    let distance_base = if d <= SHOT_VALUE_FULL_DISTANCE_YARDS {
         1.0
-    } else if d <= 22.0 {
-        1.0 - (d - 18.0) / 4.0 * 0.55 // 1.0 @18 → 0.45 @22
+    } else if d <= SHOT_VALUE_TAPER_DISTANCE_YARDS {
+        1.0 - (d - SHOT_VALUE_FULL_DISTANCE_YARDS) / 4.0 * 0.55
     } else {
-        (0.45 - (d - 22.0) / 8.0 * 0.45).max(0.0) // 0.45 @22 → 0 @30
+        (SHOT_VALUE_TAPER_FLOOR - (d - SHOT_VALUE_TAPER_DISTANCE_YARDS) / 8.0 * 0.45).max(0.0)
     };
 
     // A genuine long-range chance lifts the far tail back up: an open net / stranded
@@ -318,7 +348,8 @@ pub fn analytic_shot_trigger_value(inputs: &ShotTriggerInputs) -> f64 {
 /// term only needs to nudge, not gate.
 pub fn shot_trigger_score_multiplier(value: f64) -> f64 {
     let v = value.clamp(0.0, 1.0);
-    (0.10 + 1.20 * v).clamp(0.10, 1.30)
+    (SHOT_TRIGGER_MULT_FLOOR + SHOT_TRIGGER_MULT_SLOPE * v)
+        .clamp(SHOT_TRIGGER_MULT_FLOOR, SHOT_TRIGGER_MULT_CEILING)
 }
 
 /// One reward-weighted RL row for the shot-trigger head: the state at a shot decision,
@@ -606,15 +637,20 @@ impl SoccerMatch {
         // dominated by midfield carriers who would never shoot. Require the candidate to be
         // close enough to the ball to actually be the one deciding to shoot.
         if me.role == PlayerRole::Goalkeeper
-            || observation.yards_to_goal > 32.0
-            || me.position.distance(snapshot.ball.position) > 4.0
+            || observation.yards_to_goal > SHOT_TRIGGER_SAMPLE_MAX_GOAL_DISTANCE_YARDS
+            || me.position.distance(snapshot.ball.position) > SHOT_TRIGGER_SAMPLE_BALL_PROXIMITY_YARDS
         {
             return;
         }
         let shooting = ability01(me.skills.shooting);
         let inputs = ShotTriggerInputs::from_observation(&observation, me.role, shooting, 1.0);
         // Action proxy: a high analytic value means a shot is the live intent this tick.
-        let action_shoot = if analytic_shot_trigger_value(&inputs) >= 0.5 { 1.0 } else { 0.0 };
+        let action_shoot = if analytic_shot_trigger_value(&inputs) >= SHOT_TRIGGER_SAMPLE_SHOOT_ACTION_THRESHOLD
+        {
+            1.0
+        } else {
+            0.0
+        };
         let pitch_value = shot_decision_pitch_value(snapshot, me.team, holder);
         if pitch_value.is_finite() {
             self.pending_shot_trigger.push(PendingShotTriggerDecision {
