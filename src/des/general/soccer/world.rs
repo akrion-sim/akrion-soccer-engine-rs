@@ -1153,6 +1153,7 @@ mod tests {
                 rejected_execution_probability: 0.02,
                 candidate_count: 1,
             }),
+            behavior_policy_probability: None,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -4869,12 +4870,24 @@ impl SoccerMatch {
                     advantages[index]
                 };
                 let state_features = self.policy_state_features(transition);
-                let old_action_probability = self
-                    .policy_head
-                    .as_ref()
-                    .and_then(|head| head.action_distribution(&state_features))
-                    .and_then(|probs| probs.get(action_index).copied())
-                    .filter(|probability| probability.is_finite() && *probability > 0.0);
+                // Behaviour-policy probability for PPO/MAPPO importance weighting. When
+                // stochastic top-k selection was the behaviour policy this tick, the
+                // action was drawn from the rank mix (70/20/10), NOT the actor head's
+                // softmax — so the recorded rank-weight is the honest behaviour
+                // probability. Falls back to recomputing the head distribution (the
+                // historical path) whenever no rank-mix probability was recorded, i.e.
+                // for every transition produced with the gate off ⇒ byte-identical.
+                let old_action_probability = transition
+                    .decision_context
+                    .behavior_policy_probability
+                    .filter(|probability| probability.is_finite() && *probability > 0.0)
+                    .or_else(|| {
+                        self.policy_head
+                            .as_ref()
+                            .and_then(|head| head.action_distribution(&state_features))
+                            .and_then(|probs| probs.get(action_index).copied())
+                            .filter(|probability| probability.is_finite() && *probability > 0.0)
+                    });
                 advantage.is_finite().then(|| SoccerPolicySample {
                     state_features,
                     action_index,
@@ -17938,6 +17951,15 @@ pub struct TeammateSpacingNotice {
 #[serde(rename_all = "camelCase")]
 pub struct WorldSnapshot {
     pub tick: u64,
+    /// The match `config.seed`, carried onto the snapshot so the immutable
+    /// decision path can derive a reproducible per-decision draw for stochastic
+    /// top-k policy selection (see
+    /// [`crate::des::general::soccer::policy_select`]) without a mutable RNG.
+    /// Only read when `DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` is on, so it is
+    /// inert (byte-identical) by default. `#[serde(default)]` keeps old snapshots
+    /// loadable.
+    #[serde(default)]
+    pub decision_seed: u64,
     /// Dedicated GK head's sweep-vs-set commit bias per team (`[home, away]`), in `[-1, 1]`.
     /// `0.0` unless `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is on and the head is warm; read by
     /// [`WorldSnapshot::goalkeeper_should_commit_to_loose_ball`]. Computed on the sim side (where
@@ -19697,6 +19719,7 @@ impl WorldSnapshot {
 
         let mut snapshot = WorldSnapshot {
             tick: m.tick,
+            decision_seed: m.config.seed as u64,
             keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),

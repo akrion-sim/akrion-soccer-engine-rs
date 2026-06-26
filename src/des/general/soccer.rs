@@ -83,6 +83,8 @@ mod reward_shaping;
 pub use reward_shaping::*;
 mod field_numbers;
 pub use field_numbers::*;
+mod policy_select;
+pub use policy_select::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -6571,6 +6573,16 @@ pub struct SoccerDecisionContext {
     pub legal_action_option_count: usize,
     #[serde(default)]
     pub chosen_action_probability: f64,
+    /// The **behaviour-policy** probability of the executed action when stochastic
+    /// top-k selection promoted a non-greedy option (the renormalised rank weight;
+    /// see [`crate::des::general::soccer::policy_select`]). `None` ⇒ deterministic
+    /// argmax. PPO/MAPPO importance weighting must use THIS as the behaviour
+    /// probability — the rank mix, not the actor head's softmax, is the policy the
+    /// action was actually drawn from. Distinct from `chosen_action_probability`
+    /// (a score-normalised diagnostic that also feeds reward shaping / neural
+    /// features), so recording it here changes neither of those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_policy_probability: Option<f64>,
     #[serde(default)]
     pub chosen_action_score: f64,
     #[serde(default)]
@@ -6639,6 +6651,14 @@ pub struct AgentDecisionTrace {
     pub mdp_mpc_comparison: Option<SoccerMdpMpcComparisonTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
+    /// When stochastic top-k policy selection promoted a non-greedy action, the
+    /// **behaviour-policy** probability of the chosen action (the renormalised
+    /// rank weight; see [`crate::des::general::soccer::policy_select`]). `None`
+    /// ⇒ deterministic argmax, so PPO/MAPPO falls back to the actor head's own
+    /// probability. Carrying it here is what keeps on-policy learning honest once
+    /// the rank mix becomes the behaviour policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_policy_probability: Option<f64>,
     pub action: String,
 }
 
@@ -19719,6 +19739,7 @@ fn soccer_decision_context_for(
         action_option_count: 0,
         legal_action_option_count: 0,
         chosen_action_probability: 0.0,
+        behavior_policy_probability: None,
         chosen_action_score: 0.0,
         best_legal_action_score: 0.0,
         action_score_margin: 0.0,
@@ -19766,6 +19787,12 @@ fn soccer_decision_context_with_trace(
         context.learned_mpc_original_action = Some(replan.original_action.clone());
         context.learned_mpc_replacement_action = Some(replan.replacement_action.clone());
     }
+    // The behaviour-policy probability of the executed action under stochastic
+    // top-k selection (the renormalised rank weight recorded at decision time).
+    // Carried verbatim so the PPO/MAPPO sample builder can use the TRUE behaviour
+    // probability instead of recomputing the actor head's own softmax — `None`
+    // (the default) leaves on-policy learning exactly as it was.
+    context.behavior_policy_probability = decision.behavior_policy_probability;
     let option_context =
         soccer_action_option_learning_context(&decision.action, &decision.action_options);
     context.action_option_count = option_context.action_option_count;
@@ -44755,6 +44782,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 action_target,
                 mdp_mpc_comparison: None,
                 learned_mpc_replan: None,
+                behavior_policy_probability: None,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);
@@ -47351,6 +47379,7 @@ fn tracking_frame_to_world_snapshot(
     let score_diff_home = score_home as i32 - score_away as i32;
     WorldSnapshot {
         tick: frame.tick,
+        decision_seed: config.seed as u64,
         keeper_commit_bias: [0.0, 0.0],
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -48630,6 +48659,7 @@ fn soccer_moment_replay_transition(
             action_target: action_target.clone(),
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
+            behavior_policy_probability: None,
             action: action.clone(),
         },
         &before,
@@ -48711,6 +48741,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         controller_slot: None,
         preferences: player.preferences.clone(),
         last_decision: None,
+        pending_policy_behavior_probability: None,
         decision_confidence: 1.0,
         one_two: player.one_two,
         runaround: player.runaround,
@@ -57449,6 +57480,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 controller_slot: None,
                 preferences,
                 last_decision: None,
+                pending_policy_behavior_probability: None,
                 decision_confidence: 1.0,
                 one_two: None,
                 runaround: None,

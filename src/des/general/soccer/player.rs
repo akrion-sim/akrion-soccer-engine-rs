@@ -1105,6 +1105,15 @@ pub struct PlayerAgent {
     pub controller_slot: Option<usize>,
     pub preferences: AgentPreferences,
     pub last_decision: Option<AgentDecisionTrace>,
+    /// Transient: the behaviour-policy probability of the action the stochastic
+    /// top-k selector promoted this tick (renormalised rank weight), or `None`
+    /// when the deterministic argmax was used. Reset at the start of each
+    /// decision and folded into [`AgentDecisionTrace::behavior_policy_probability`]
+    /// by `decision_trace`. Never serialized — purely a within-tick relay so the
+    /// learning layer can read the true behaviour probability. Inert (always
+    /// `None`) unless `DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` is on.
+    #[serde(skip)]
+    pub pending_policy_behavior_probability: Option<f64>,
     /// The player's belief-grounded confidence in its current action, in `[0.2, 1.0]`
     /// (the engine sees truth; this is the player's read). Drives decisiveness (move
     /// speed) and proaction-vs-reaction. Recomputed each decision in `run_time_step`.
@@ -6047,6 +6056,7 @@ impl PlayerAgent {
             action_target,
             mdp_mpc_comparison,
             learned_mpc_replan: None,
+            behavior_policy_probability: self.pending_policy_behavior_probability,
             action: action_label,
         }
     }
@@ -6970,6 +6980,10 @@ impl PlayerAgent {
             .filter(|input| human_input_matches_player(input, self.id, self.controller_slot));
         annotate_human_control_observation(&mut observation, self.controller_slot, human_input);
         Self::apply_field_vector_context(self, snapshot, &mut observation);
+        // Clear last tick's stochastic-selection relay; each ranker that fires
+        // this tick sets it to the behaviour probability of the option it
+        // promoted (or leaves it `None` for a deterministic argmax).
+        self.pending_policy_behavior_probability = None;
         let belief = belief_from_observation(&observation);
         // Belief-grounded confidence for this decision: drives decisiveness (move speed)
         // in movement and proaction. Engine=truth, brain=strong belief, player=this.
@@ -7567,7 +7581,17 @@ impl PlayerAgent {
                     )
                 })
                 .collect::<Vec<_>>();
-            let ops = agentic_action_order(weighted_ops);
+            let ops = {
+                let sampled = reorder_by_draw_traced(
+                    agentic_action_order(weighted_ops),
+                    snapshot.decision_seed,
+                    self.id,
+                    snapshot.tick,
+                    site::FIRST_TOUCH,
+                );
+                self.pending_policy_behavior_probability = sampled.behavior_probability;
+                sampled.ordered
+            };
             let full_ops = ops.clone();
             let mut order_names = forced_first_touch_order;
             order_names.reserve(ops.len());
@@ -8789,7 +8813,17 @@ impl PlayerAgent {
             if let Some(label) = cadence_hold_label.as_deref() {
                 apply_decision_cadence_hold_weights(&mut weighted_ops, label);
             }
-            let ops = agentic_action_order(weighted_ops);
+            let ops = {
+                let sampled = reorder_by_draw_traced(
+                    agentic_action_order(weighted_ops),
+                    snapshot.decision_seed,
+                    self.id,
+                    snapshot.tick,
+                    site::POSSESSION,
+                );
+                self.pending_policy_behavior_probability = sampled.behavior_probability;
+                sampled.ordered
+            };
             let full_ops = ops.clone();
             let mut order_names = Vec::with_capacity(ops.len());
             if let Some(label) = cadence_hold_label.as_deref() {
@@ -10240,7 +10274,17 @@ impl PlayerAgent {
                 apply_decision_cadence_hold_weights(&mut support_weighted_ops, label);
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
-            let support_order = agentic_action_order(support_weighted_ops);
+            let support_order = {
+                let sampled = reorder_by_draw_traced(
+                    agentic_action_order(support_weighted_ops),
+                    snapshot.decision_seed,
+                    self.id,
+                    snapshot.tick,
+                    site::SUPPORT,
+                );
+                self.pending_policy_behavior_probability = sampled.behavior_probability;
+                sampled.ordered
+            };
             let first_support_label = support_order
                 .first()
                 .map(|label| normalize_soccer_action_label(label.as_str()))
@@ -10383,7 +10427,17 @@ impl PlayerAgent {
                 apply_decision_cadence_hold_weights(&mut defensive_weighted_ops, label);
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
-            let ops = agentic_action_order(defensive_weighted_ops);
+            let ops = {
+                let sampled = reorder_by_draw_traced(
+                    agentic_action_order(defensive_weighted_ops),
+                    snapshot.decision_seed,
+                    self.id,
+                    snapshot.tick,
+                    site::DEFENSIVE,
+                );
+                self.pending_policy_behavior_probability = sampled.behavior_probability;
+                sampled.ordered
+            };
             let mut chosen = None;
             for op in ops {
                 match op.as_str() {
@@ -10514,17 +10568,27 @@ impl PlayerAgent {
                     .attack_candidate
                     >= 0.65,
             );
-            let loose_order = agentic_action_order(
-                loose_options
-                    .iter()
-                    .map(|option| {
-                        (
-                            option.label.clone(),
-                            if option.legal { option.score } else { 0.0 },
-                        )
-                    })
-                    .collect(),
-            );
+            let loose_order = {
+                let sampled = reorder_by_draw_traced(
+                    agentic_action_order(
+                        loose_options
+                            .iter()
+                            .map(|option| {
+                                (
+                                    option.label.clone(),
+                                    if option.legal { option.score } else { 0.0 },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    snapshot.decision_seed,
+                    self.id,
+                    snapshot.tick,
+                    site::LOOSE_BALL,
+                );
+                self.pending_policy_behavior_probability = sampled.behavior_probability;
+                sampled.ordered
+            };
             // A defender genuinely placed to cut an in-flight ground pass on its lane ALWAYS
             // steps to intercept — it is not subject to the anti-swarm "recover" legality cap
             // (closer-teammates), which otherwise let a ground pass roll right past a defender

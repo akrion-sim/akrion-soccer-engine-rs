@@ -87,6 +87,10 @@ pub struct Tunables {
     /// `DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2` is set; see
     /// [`crate::des::general::soccer::lane_discipline`].
     pub lane_discipline: LaneDisciplineTunables,
+    /// Per-rank weights for stochastic top-k policy selection. Read only when
+    /// `DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` is set; see
+    /// [`crate::des::general::soccer::policy_select`].
+    pub policy_selection: PolicySelectionTunables,
 }
 
 impl Default for Tunables {
@@ -104,6 +108,37 @@ impl Default for Tunables {
             killer_pass_over_top: KillerPassOverTopTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
+            policy_selection: PolicySelectionTunables::default(),
+        }
+    }
+}
+
+/// Per-rank weights for **stochastic top-k policy selection** (see
+/// [`crate::des::general::soccer::policy_select`]). When its gate
+/// (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK`) is on, each MDP/POMDP decision
+/// draws among its best three candidate actions with these probabilities
+/// (renormalised over however many candidates exist). With the gate off the
+/// engine takes the deterministic argmax and these values are never read, so an
+/// unconfigured process is byte-identical to before this group existed.
+///
+/// Defaults are the requested **70 / 20 / 10**.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySelectionTunables {
+    /// Probability weight of committing to the **best** (rank-0) candidate.
+    pub top1_weight: f64,
+    /// Probability weight of committing to the **2nd-best** (rank-1) candidate.
+    pub top2_weight: f64,
+    /// Probability weight of committing to the **3rd-best** (rank-2) candidate.
+    pub top3_weight: f64,
+}
+
+impl Default for PolicySelectionTunables {
+    fn default() -> Self {
+        PolicySelectionTunables {
+            top1_weight: 0.70,
+            top2_weight: 0.20,
+            top3_weight: 0.10,
         }
     }
 }
@@ -3291,6 +3326,9 @@ mod tests {
         assert_eq!(t.lane_affinity.row_match_span_rows, 8.0);
         assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.05);
         assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
+        assert_eq!(t.policy_selection.top1_weight, 0.70);
+        assert_eq!(t.policy_selection.top2_weight, 0.20);
+        assert_eq!(t.policy_selection.top3_weight, 0.10);
     }
 
     #[test]
