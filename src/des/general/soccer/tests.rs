@@ -8195,6 +8195,68 @@ fn transition_reward_infers_threaded_killer_pass_goal_channel_bonus() {
 }
 
 #[test]
+fn transition_reward_credits_pressured_lateral_escape_that_keeps_possession() {
+    // A pressed carrier with no forward gain who carries the ball AWAY from the nearest defender
+    // and keeps possession should learn MORE than the same carry that gains no cushion. This is the
+    // carry analogue of the pressure-relief PASS bonus — it credits the safe escape over freezing.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 991,
+        ..Default::default()
+    });
+    let holder = 6; // Home
+    let defender = 16; // Away
+    park_players_except(&mut sim, &[holder, defender]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    let origin = Vec2::new(40.0, 58.0);
+    sim.players[holder].position = origin;
+    sim.players[holder].home_position = origin;
+    sim.players[defender].position = Vec2::new(41.0, 58.0); // 1yd to the right: on top of the carrier
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = origin;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+
+    // Reward a lateral carry to `dest` (same y => no forward gain) that retains possession.
+    let reward_for_dest = |dest: Vec2| {
+        let mut after = before.clone();
+        after.ball.holder = Some(holder);
+        after.ball.position = dest;
+        after.ball.velocity = Vec2::zero();
+        after.set_player_position(holder, dest);
+        let mut decision = test_decision_trace(&before, holder, "carry-out-left");
+        // Under genuine pressure with the defender 1yd away on receipt.
+        decision.observation.perceived_pressure = 0.75;
+        decision.observation.pressure_urgency = 0.70;
+        decision.observation.immediate_dispossession_risk = 0.65;
+        decision.observation.nearest_opponent_distance = 1.0;
+        soccer_transition_reward(
+            &sim.players[holder],
+            &decision,
+            &before,
+            &after,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+    };
+
+    // Escape: 4yd left, away from the defender (cushion gained). Stay-put: no cushion gained.
+    let escape = reward_for_dest(Vec2::new(36.0, 58.0));
+    let stay = reward_for_dest(Vec2::new(40.0, 58.0));
+    assert!(
+        escape > stay + 0.2,
+        "a pressured lateral escape that keeps possession must learn above the no-cushion carry: \
+         escape={escape} stay={stay}"
+    );
+}
+
+#[test]
 fn transition_reward_ramps_threaded_killer_pass_as_goal_gets_closer() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
