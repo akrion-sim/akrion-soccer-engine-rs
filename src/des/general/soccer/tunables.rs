@@ -31,6 +31,27 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(crate) const KILLER_PASS_OVER_TOP_PASS_FLIGHT_ALIASES: &[&str] = &[
+    "overtop",
+    "overhitbackfour",
+    "killerlob",
+    "killerloft",
+    "threadedlob",
+];
+pub(crate) const KILLER_PASS_OVER_TOP_DISTANCE_BINS_YARDS: [f64; 4] = [25.0, 28.0, 32.0, 35.0];
+pub(crate) const KILLER_PASS_OVER_TOP_HEIGHT_BINS_YARDS: [f64; 4] = [2.0, 3.4, 4.6, 6.0];
+pub(crate) const KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS: [f64; 4] =
+    [1.0, 3.0, 5.0, 8.0];
+pub(crate) const KILLER_PASS_OVER_TOP_BACK_LINE_CLEARANCE_BINS_YARDS: [f64; 4] =
+    [0.5, 2.0, 4.0, 7.0];
+pub(crate) const KILLER_PASS_OVER_TOP_GOALKEEPER_AVOIDANCE_BINS_YARDS: [f64; 4] =
+    [2.0, 4.0, 6.0, 9.0];
+pub(crate) const KILLER_PASS_OVER_TOP_NEURAL_LATERAL_NORMALIZER_FACTOR: f64 = 2.0;
+pub(crate) const KILLER_PASS_OVER_TOP_NEURAL_BACK_LINE_CLEARANCE_NORMALIZER_YARDS: f64 = 10.0;
+pub(crate) const KILLER_PASS_OVER_TOP_NEURAL_GOALKEEPER_AVOIDANCE_NORMALIZER_YARDS: f64 = 16.0;
+pub(crate) const KILLER_PASS_OVER_TOP_PITCH_MARGIN_CAP_FACTOR: f64 = 0.45;
+pub(crate) const KILLER_PASS_OVER_TOP_NUMERIC_EPSILON: f64 = 1e-6;
+
 /// Root of the tunable-weights tree. Grouped by subsystem; each group is a
 /// plain serde struct with `#[serde(default)]` fields so a partial override
 /// only names what it changes.
@@ -58,6 +79,8 @@ pub struct Tunables {
     /// Goalkeeper positioning shaping (resting line, alignment score, buildup
     /// fan-out, loose-ball commit). See [`GoalkeeperTunables`].
     pub goalkeeper: GoalkeeperTunables,
+    /// 25-35yd clipped killer-pass over the opponent back four.
+    pub killer_pass_over_top: KillerPassOverTopTunables,
     /// Fine-grid lane/row affinity used by formation, support, and retrieval.
     pub lane_affinity: LaneAffinityTunables,
     /// Centralized lane-discipline weights (12-lane grid). Read only when
@@ -78,6 +101,7 @@ impl Default for Tunables {
             carrier_keep_rolling: CarrierKeepRollingTunables::default(),
             fresh_possession_escape: FreshPossessionEscapeTunables::default(),
             goalkeeper: GoalkeeperTunables::default(),
+            killer_pass_over_top: KillerPassOverTopTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
         }
@@ -520,6 +544,70 @@ pub struct GoalkeeperTunables {
     pub backpass_commit_teammate_margin_seconds: f64,
 }
 
+/// Central knobs for the killer-pass variant clipped over an opponent back four:
+/// 25-35yd, ~12ft apex, and angled away from the goalkeeper. Defaults reproduce
+/// the original feature constants; override with
+/// `DD_SOCCER_TUNABLE__killer_pass_over_top.<field>` or `SOCCER_TUNABLES_JSON`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KillerPassOverTopTunables {
+    pub min_distance_yards: f64,
+    pub max_distance_yards: f64,
+    pub target_distance_yards: f64,
+    pub height_yards: f64,
+    pub back_line_margin_yards: f64,
+    pub lateral_offset_yards: f64,
+    pub keeper_avoid_radius_yards: f64,
+    pub lane_fit: f64,
+    pub target_line_slack_yards: f64,
+    pub side_basis_epsilon_yards: f64,
+    pub touchline_margin_yards: f64,
+    pub byline_margin_yards: f64,
+    pub target_lateral_velocity_projection_seconds: f64,
+    pub target_lateral_velocity_cap_yards: f64,
+    pub central_gap_keeper_radius_factor: f64,
+    pub secondary_lateral_offset_factor: f64,
+    pub keeper_avoidance_min_factor: f64,
+    pub fit_distance_weight: f64,
+    pub fit_angle_weight: f64,
+    pub fit_line_weight: f64,
+    pub fit_keeper_weight: f64,
+    pub fit_line_normalizer_yards: f64,
+    pub fit_keeper_normalizer_yards: f64,
+    pub score_bonus_weight: f64,
+}
+
+impl Default for KillerPassOverTopTunables {
+    fn default() -> Self {
+        KillerPassOverTopTunables {
+            min_distance_yards: 25.0,
+            max_distance_yards: 35.0,
+            target_distance_yards: 30.0,
+            height_yards: 4.0,
+            back_line_margin_yards: 2.5,
+            lateral_offset_yards: 4.5,
+            keeper_avoid_radius_yards: 5.0,
+            lane_fit: 0.72,
+            target_line_slack_yards: 6.0,
+            side_basis_epsilon_yards: 0.75,
+            touchline_margin_yards: 3.0,
+            byline_margin_yards: 2.0,
+            target_lateral_velocity_projection_seconds: 0.35,
+            target_lateral_velocity_cap_yards: 3.0,
+            central_gap_keeper_radius_factor: 0.55,
+            secondary_lateral_offset_factor: 0.45,
+            keeper_avoidance_min_factor: 0.70,
+            fit_distance_weight: 0.34,
+            fit_angle_weight: 0.18,
+            fit_line_weight: 0.26,
+            fit_keeper_weight: 0.22,
+            fit_line_normalizer_yards: 8.0,
+            fit_keeper_normalizer_yards: 10.0,
+            score_bonus_weight: 1.45,
+        }
+    }
+}
+
 impl Default for GoalkeeperTunables {
     fn default() -> Self {
         GoalkeeperTunables {
@@ -720,6 +808,7 @@ impl Tunables {
         self.defensive_shape.sanitize();
         self.carrier_keep_rolling.sanitize();
         self.fresh_possession_escape.sanitize();
+        self.killer_pass_over_top.sanitize();
         self.lane_affinity.sanitize();
         self
     }
@@ -740,6 +829,8 @@ impl Tunables {
             .validate_strict("carrier_keep_rolling", &mut errors);
         self.fresh_possession_escape
             .validate_strict("fresh_possession_escape", &mut errors);
+        self.killer_pass_over_top
+            .validate_strict("killer_pass_over_top", &mut errors);
         self.lane_affinity
             .validate_strict("lane_affinity", &mut errors);
         if errors.is_empty() {
@@ -2814,6 +2905,142 @@ impl FreshPossessionEscapeTunables {
             errors.push(format!(
                 "{prefix}.target_yards < {prefix}.min_cushion_gain_yards"
             ));
+        }
+    }
+}
+
+impl KillerPassOverTopTunables {
+    fn sanitize(&mut self) {
+        let default = KillerPassOverTopTunables::default();
+        macro_rules! sanitize_field {
+            ($field:ident, $hard_min:expr, $hard_max:expr, $sane_min:expr, $sane_max:expr) => {
+                sanitize_f64(
+                    concat!("killer_pass_over_top.", stringify!($field)),
+                    &mut self.$field,
+                    default.$field,
+                    $hard_min,
+                    $hard_max,
+                    $sane_min,
+                    $sane_max,
+                );
+            };
+        }
+
+        sanitize_field!(min_distance_yards, 5.0, 60.0, 18.0, 32.0);
+        sanitize_field!(max_distance_yards, 10.0, 80.0, 30.0, 45.0);
+        sanitize_field!(target_distance_yards, 5.0, 80.0, 25.0, 35.0);
+        sanitize_field!(height_yards, 0.5, 12.0, 3.0, 6.0);
+        sanitize_field!(back_line_margin_yards, 0.0, 10.0, 1.5, 5.0);
+        sanitize_field!(lateral_offset_yards, 0.0, 15.0, 2.0, 7.0);
+        sanitize_field!(keeper_avoid_radius_yards, 0.0, 20.0, 3.0, 8.0);
+        sanitize_field!(lane_fit, 0.0, 1.0, 0.45, 0.90);
+        sanitize_field!(target_line_slack_yards, 0.0, 20.0, 3.0, 9.0);
+        sanitize_field!(side_basis_epsilon_yards, 0.05, 5.0, 0.25, 1.5);
+        sanitize_field!(touchline_margin_yards, 0.5, 12.0, 2.0, 5.0);
+        sanitize_field!(byline_margin_yards, 0.5, 12.0, 1.5, 5.0);
+        sanitize_field!(
+            target_lateral_velocity_projection_seconds,
+            0.0,
+            2.0,
+            0.15,
+            0.70
+        );
+        sanitize_field!(target_lateral_velocity_cap_yards, 0.0, 12.0, 1.0, 5.0);
+        sanitize_field!(central_gap_keeper_radius_factor, 0.0, 2.0, 0.25, 0.85);
+        sanitize_field!(secondary_lateral_offset_factor, 0.0, 1.0, 0.25, 0.65);
+        sanitize_field!(keeper_avoidance_min_factor, 0.0, 1.0, 0.55, 0.85);
+        sanitize_field!(fit_distance_weight, 0.0, 1.0, 0.05, 0.55);
+        sanitize_field!(fit_angle_weight, 0.0, 1.0, 0.05, 0.40);
+        sanitize_field!(fit_line_weight, 0.0, 1.0, 0.05, 0.50);
+        sanitize_field!(fit_keeper_weight, 0.0, 1.0, 0.05, 0.45);
+        sanitize_field!(fit_line_normalizer_yards, 0.5, 40.0, 5.0, 16.0);
+        sanitize_field!(fit_keeper_normalizer_yards, 0.5, 40.0, 6.0, 18.0);
+        sanitize_field!(score_bonus_weight, 0.0, 5.0, 0.5, 2.5);
+
+        if self.min_distance_yards > self.max_distance_yards {
+            eprintln!("soccer tunables: killer_pass_over_top min distance exceeded max; swapping");
+            std::mem::swap(&mut self.min_distance_yards, &mut self.max_distance_yards);
+        }
+        if self.target_distance_yards < self.min_distance_yards
+            || self.target_distance_yards > self.max_distance_yards
+        {
+            eprintln!(
+                "soccer tunables: killer_pass_over_top target distance outside min/max; clamping"
+            );
+            self.target_distance_yards = self
+                .target_distance_yards
+                .clamp(self.min_distance_yards, self.max_distance_yards);
+        }
+        let fit_weight_sum = self.fit_distance_weight
+            + self.fit_angle_weight
+            + self.fit_line_weight
+            + self.fit_keeper_weight;
+        if fit_weight_sum <= 1e-9 {
+            eprintln!("soccer tunables: killer_pass_over_top fit weights sum to zero; using defaults");
+            self.fit_distance_weight = default.fit_distance_weight;
+            self.fit_angle_weight = default.fit_angle_weight;
+            self.fit_line_weight = default.fit_line_weight;
+            self.fit_keeper_weight = default.fit_keeper_weight;
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        macro_rules! validate_field {
+            ($field:ident, $hard_min:expr, $hard_max:expr) => {
+                validate_f64(
+                    prefix,
+                    stringify!($field),
+                    self.$field,
+                    $hard_min,
+                    $hard_max,
+                    errors,
+                );
+            };
+        }
+
+        validate_field!(min_distance_yards, 5.0, 60.0);
+        validate_field!(max_distance_yards, 10.0, 80.0);
+        validate_field!(target_distance_yards, 5.0, 80.0);
+        validate_field!(height_yards, 0.5, 12.0);
+        validate_field!(back_line_margin_yards, 0.0, 10.0);
+        validate_field!(lateral_offset_yards, 0.0, 15.0);
+        validate_field!(keeper_avoid_radius_yards, 0.0, 20.0);
+        validate_field!(lane_fit, 0.0, 1.0);
+        validate_field!(target_line_slack_yards, 0.0, 20.0);
+        validate_field!(side_basis_epsilon_yards, 0.05, 5.0);
+        validate_field!(touchline_margin_yards, 0.5, 12.0);
+        validate_field!(byline_margin_yards, 0.5, 12.0);
+        validate_field!(target_lateral_velocity_projection_seconds, 0.0, 2.0);
+        validate_field!(target_lateral_velocity_cap_yards, 0.0, 12.0);
+        validate_field!(central_gap_keeper_radius_factor, 0.0, 2.0);
+        validate_field!(secondary_lateral_offset_factor, 0.0, 1.0);
+        validate_field!(keeper_avoidance_min_factor, 0.0, 1.0);
+        validate_field!(fit_distance_weight, 0.0, 1.0);
+        validate_field!(fit_angle_weight, 0.0, 1.0);
+        validate_field!(fit_line_weight, 0.0, 1.0);
+        validate_field!(fit_keeper_weight, 0.0, 1.0);
+        validate_field!(fit_line_normalizer_yards, 0.5, 40.0);
+        validate_field!(fit_keeper_normalizer_yards, 0.5, 40.0);
+        validate_field!(score_bonus_weight, 0.0, 5.0);
+
+        if self.min_distance_yards > self.max_distance_yards {
+            errors.push(format!(
+                "{prefix}.min_distance_yards > {prefix}.max_distance_yards"
+            ));
+        }
+        if self.target_distance_yards < self.min_distance_yards
+            || self.target_distance_yards > self.max_distance_yards
+        {
+            errors.push(format!(
+                "{prefix}.target_distance_yards outside {prefix}.min_distance_yards..={prefix}.max_distance_yards"
+            ));
+        }
+        let fit_weight_sum = self.fit_distance_weight
+            + self.fit_angle_weight
+            + self.fit_line_weight
+            + self.fit_keeper_weight;
+        if fit_weight_sum <= 1e-9 {
+            errors.push(format!("{prefix}.fit weights sum to zero"));
         }
     }
 }

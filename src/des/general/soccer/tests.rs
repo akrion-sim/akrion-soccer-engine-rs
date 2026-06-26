@@ -4798,6 +4798,7 @@ fn aerial_pass_in_bounds_launch_speed_caps_overcooked_loft_toward_touchline() {
         aim,
         overcooked_speed,
         reference_distance,
+        PassFlight::Aerial,
         field_width,
         field_length,
     );
@@ -4830,6 +4831,7 @@ fn aerial_pass_in_bounds_launch_speed_leaves_safe_central_loft_untouched() {
         aim,
         speed,
         reference_distance,
+        PassFlight::Aerial,
         field_width,
         field_length,
     );
@@ -74326,6 +74328,230 @@ fn killer_pass_selector_prefers_single_goal_channel_runner_over_wide_outlet() {
 }
 
 #[test]
+fn killer_pass_over_top_clears_back_four_and_reaches_learning_surfaces() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_249,
+        ..Default::default()
+    });
+    let attacker = 8;
+    let runner = 9;
+    let keeper = 11;
+    let back_four = [13, 14, 15, 16];
+    park_players_except(
+        &mut sim,
+        &[
+            attacker,
+            runner,
+            keeper,
+            back_four[0],
+            back_four[1],
+            back_four[2],
+            back_four[3],
+        ],
+    );
+    sim.players[attacker].role = PlayerRole::Midfielder;
+    sim.players[attacker].position = Vec2::new(40.0, 82.0);
+    sim.players[attacker].velocity = Vec2::new(0.0, 3.8);
+    sim.players[attacker].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[attacker].skills.passing_completion_rate = 9.5;
+    sim.players[attacker].skills.passing = 9.3;
+    sim.players[attacker].skills.vision = 9.6;
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].position = Vec2::new(36.0, 104.0);
+    sim.players[runner].velocity = Vec2::new(0.0, 2.4);
+    sim.players[runner].skills.shooting = 9.0;
+    sim.players[runner].skills.first_touch = 8.8;
+    sim.players[runner].skills.top_speed = 9.2;
+    sim.players[keeper].role = PlayerRole::Goalkeeper;
+    sim.players[keeper].position = Vec2::new(40.0, 116.5);
+    for (idx, defender) in back_four.iter().copied().enumerate() {
+        sim.players[defender].role = PlayerRole::Defender;
+        sim.players[defender].position = match idx {
+            0 => Vec2::new(24.0, 106.5),
+            1 => Vec2::new(30.0, 107.5),
+            2 => Vec2::new(50.0, 108.5),
+            _ => Vec2::new(56.0, 107.5),
+        };
+        sim.players[defender].velocity = Vec2::zero();
+        sim.players[defender].skills.defending = 8.8;
+        sim.players[defender].skills.defensive_tracking = 8.8;
+    }
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let over_top = tunables().killer_pass_over_top;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let expected_aim = snapshot
+        .killer_pass_over_top_aim_point_for(attacker, runner)
+        .expect("runner should have a valid 25-35yd angled over-top aim");
+    let passer_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == attacker)
+        .expect("passer snapshot");
+    let runner_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == runner)
+        .expect("runner snapshot");
+    let runner_position = snapshot
+        .player_position(runner)
+        .unwrap_or(runner_snapshot.position);
+    assert!(
+        !snapshot.pass_target_concedes_to_perceived_opponent(attacker, runner, PassFlight::OverTop),
+        "over-top runner should not be a perceived concession"
+    );
+    let quality = pass_target_quality_for_snapshot_threaded(
+        &snapshot,
+        passer_snapshot,
+        sim.players[attacker].position,
+        runner_snapshot,
+        runner_position,
+        PassFlight::OverTop,
+    );
+    assert!(
+        quality.expected_completion >= KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION,
+        "over-top runner should clear the threaded quality floor: {quality:?}"
+    );
+    let assessment = snapshot
+        .killer_pass_target_assessment_for(attacker, &[runner])
+        .expect("onside runner behind the back four should expose the clipped killer pass");
+    let aim = assessment
+        .over_top_aim_point
+        .expect("over-top assessment should carry the angled aim point");
+
+    assert_eq!(assessment.target_id, runner);
+    assert_eq!(assessment.flight, PassFlight::OverTop);
+    assert!(assessment.over_top_available);
+    assert_eq!(
+        snapshot.killer_pass_flight_for(attacker, &[runner]),
+        PassFlight::OverTop
+    );
+    assert_eq!(
+        snapshot.killer_pass_over_top_aim_point_for(attacker, runner),
+        Some(expected_aim)
+    );
+    assert_eq!(aim, expected_aim);
+    assert!(
+        (over_top.min_distance_yards..=over_top.max_distance_yards)
+            .contains(&assessment.over_top_distance_yards),
+        "over-top killer pass should stay in the 25-35yd band: {assessment:?}"
+    );
+    assert_eq!(assessment.over_top_height_yards, over_top.height_yards);
+    assert!(
+        assessment.over_top_back_line_clearance_yards >= over_top.back_line_margin_yards,
+        "aim should clear the averaged back-four line: {assessment:?}"
+    );
+    assert!(
+        assessment.over_top_goalkeeper_avoidance_yards
+            >= over_top.keeper_avoid_radius_yards * over_top.keeper_avoidance_min_factor,
+        "aim should be angled away from the opposing keeper: {assessment:?}"
+    );
+    assert!(
+        assessment.over_top_lateral_offset_yards.abs()
+            >= over_top.lateral_offset_yards * over_top.secondary_lateral_offset_factor,
+        "aim should be visibly angled rather than straight down the keeper's line: {assessment:?}"
+    );
+
+    let observation = snapshot.observation_for(attacker);
+    assert!(observation.threaded_goal_pass_over_top_available);
+    assert_eq!(
+        observation.threaded_goal_pass_over_top_distance_yards,
+        assessment.over_top_distance_yards
+    );
+    assert_eq!(
+        observation.threaded_goal_pass_over_top_height_yards,
+        over_top.height_yards
+    );
+    assert_eq!(
+        observation.threaded_goal_pass_over_top_lateral_offset_yards,
+        assessment.over_top_lateral_offset_yards
+    );
+    assert_eq!(
+        observation.threaded_goal_pass_over_top_back_line_clearance_yards,
+        assessment.over_top_back_line_clearance_yards
+    );
+    assert_eq!(
+        observation.threaded_goal_pass_over_top_goalkeeper_avoidance_yards,
+        assessment.over_top_goalkeeper_avoidance_yards
+    );
+
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(attacker),
+        &observation,
+        Team::Home,
+        PlayerRole::Midfielder,
+    );
+    assert!(q_key.threaded_goal_pass_over_top_available);
+    assert!(q_key.threaded_goal_pass_over_top_distance_bin > 0);
+    assert!(q_key.threaded_goal_pass_over_top_height_bin > 0);
+    assert!(q_key.threaded_goal_pass_over_top_lateral_offset_bin > 0);
+    assert!(q_key.threaded_goal_pass_over_top_back_line_clearance_bin > 0);
+    assert!(q_key.threaded_goal_pass_over_top_goalkeeper_avoidance_bin > 0);
+
+    let decision = test_decision_trace(&snapshot, attacker, "killer-pass");
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: attacker,
+        team: Team::Home,
+        role: PlayerRole::Midfielder,
+        state: snapshot.mdp_state_for_player(attacker),
+        observation: observation.clone(),
+        belief: decision.belief,
+        action: "killer-pass".to_string(),
+        action_target: decision.action_target,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(attacker),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE],
+        1.0
+    );
+    assert!(features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_HEIGHT] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_LATERAL_OFFSET].abs() > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_GOALKEEPER_AVOIDANCE] > 0.0);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: attacker,
+        action: SoccerAction::Pass {
+            target_player: Some(runner),
+            power: 0.82,
+            flight: PassFlight::OverTop,
+        },
+        sprint: false,
+    });
+    let pending = sim
+        .pending_pass
+        .as_ref()
+        .expect("over-top killer pass should release");
+    assert_eq!(pending.flight, PassFlight::OverTop);
+    assert_eq!(pending.target, Some(runner));
+    assert!(
+        pending.intended_target.distance(aim) <= KILLER_PASS_OVER_TOP_NUMERIC_EPSILON,
+        "executor should preserve the POMDP over-top aim: pending={pending:?} aim={aim:?}"
+    );
+    assert!(
+        pending.intended_target.x != sim.players[runner].position.x,
+        "release target should be angled off the runner's straight central line"
+    );
+    assert!(
+        (pending.intended_target.x - sim.players[keeper].position.x).abs()
+            >= over_top.keeper_avoid_radius_yards * over_top.keeper_avoidance_min_factor,
+        "released pass should not be driven straight at the opposing keeper: pending={pending:?}"
+    );
+}
+
+#[test]
 fn blocked_final_third_holder_prefers_killer_pass_to_runner() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -75179,9 +75405,15 @@ fn learned_generic_pass_upgrades_to_killer_pass_near_goal() {
     match &intent.action {
         SoccerAction::Pass {
             target_player: Some(target),
-            flight: PassFlight::Floor,
+            flight,
             ..
-        } => assert_eq!(*target, runner),
+        } => {
+            assert_eq!(*target, runner);
+            assert!(
+                matches!(flight, PassFlight::Floor | PassFlight::OverTop),
+                "learned killer pass should stay a threaded floor ball or upgrade to the back-four over-top variant, got {flight:?}"
+            );
+        }
         other => panic!("learned generic pass should upgrade to killer pass, got {other:?}"),
     }
 
@@ -76381,6 +76613,24 @@ fn assert_soccer_decision_model_contract_json(meta: &serde_json::Value) {
     assert_eq!(model["threadedGoalPassQualityInPomdpObservation"], true);
     assert_eq!(model["threadedGoalPassQualityBinnedInMdpState"], true);
     assert_eq!(model["threadedGoalPassQualityInNeuralFeatures"], true);
+    let over_top = tunables().killer_pass_over_top;
+    assert_eq!(model["killerPassOverTopEnabled"], true);
+    assert_eq!(
+        model["killerPassOverTopMinYards"],
+        over_top.min_distance_yards
+    );
+    assert_eq!(
+        model["killerPassOverTopMaxYards"],
+        over_top.max_distance_yards
+    );
+    assert_eq!(
+        model["killerPassOverTopHeightYards"],
+        over_top.height_yards
+    );
+    assert_eq!(model["killerPassOverTopAngledAwayFromGoalkeeper"], true);
+    assert_eq!(model["killerPassOverTopInPomdpObservation"], true);
+    assert_eq!(model["killerPassOverTopBinnedInMdpState"], true);
+    assert_eq!(model["killerPassOverTopInNeuralFeatures"], true);
     assert_eq!(model["goalEntryBoostsKillerPassScore"], true);
     assert_eq!(model["singleThreadGoalPressureBoostsDecisiveAction"], true);
     assert_eq!(model["singleThreadGoalPressureDampsRecycling"], true);

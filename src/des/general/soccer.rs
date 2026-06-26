@@ -893,6 +893,8 @@ const LONG_SHOT_GK_TOTALLY_OUT: f64 = 0.80;
 const KILLER_PASS_MAX_YARDS_TO_GOAL: f64 = 52.0;
 const KILLER_PASS_MIN_FORWARD_YARDS: f64 = 4.0;
 const KILLER_PASS_MIN_RECEIVER_GOAL_GAIN_YARDS: f64 = 5.0;
+const KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION: f64 = 0.24;
+const KILLER_PASS_MIN_LANE_FIT: f64 = 0.30;
 // A threaded ball whose GROUND lane is blocked by a defender is not hidden — it is lifted OVER
 // them onto the runner (a chip/clipped ball), provided a loft actually clears the block. The
 // aerial lane is tested with a tighter corridor (only a defender almost directly under the
@@ -3712,6 +3714,9 @@ const SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM: usize = 18;
 /// Append-only energy-economy block: off-ball movement spend, likely ball involvement,
 /// waste pressure, and the team's surge/recovery rhythm.
 const SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM: usize = 5;
+/// Append-only killer over-top block: whether a threaded pass can clip the back four,
+/// plus distance, 12ft apex, lateral angle, back-line clearance, and keeper avoidance.
+const SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM: usize = 6;
 const SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
@@ -3727,8 +3732,10 @@ const SOCCER_NEURAL_PRE_TEAM_CENTER_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_PERCEPTION_NOISE_FEATURE_DIM + SOCCER_NEURAL_PERCEPTION_NOISE_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_TEAM_CENTER_FEATURE_DIM + SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4103,6 +4110,18 @@ const SOCCER_NEURAL_FEATURE_TEAM_ENERGY_RHYTHM: usize =
     SOCCER_NEURAL_FEATURE_ENERGY_BALL_INTERACTION_10S + 1;
 const SOCCER_NEURAL_FEATURE_TEAM_ENERGY_DEBT: usize =
     SOCCER_NEURAL_FEATURE_TEAM_ENERGY_RHYTHM + 1;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE: usize =
+    SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE + 1;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_HEIGHT: usize =
+    SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE + 1;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_LATERAL_OFFSET: usize =
+    SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_HEIGHT + 1;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE: usize =
+    SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_LATERAL_OFFSET + 1;
+const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_GOALKEEPER_AVOIDANCE: usize =
+    SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4217,6 +4236,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_TEAM_CENTER_FEATURE_DIM,
     // Same schema with team-center features, before energy-economy channels.
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM,
+    // Same schema with energy-economy features, before killer over-top pass channels.
+    SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5080,14 +5101,23 @@ pub enum PassFlight {
     /// fixed and its loft is high — both decoupled from power (an Aerial can't be ~10mph;
     /// its floor is ~19mph, and aerial loft scales with speed, the opposite of a scoop).
     Scoop,
+    /// A killer-pass variant clipped over the opponent back four: 25-35yd, about 12ft up,
+    /// with an angled target away from the opposing goalkeeper rather than straight at goal.
+    OverTop,
 }
 
 impl PassFlight {
     fn is_aerial(self) -> bool {
-        matches!(self, PassFlight::Aerial | PassFlight::Scoop)
+        matches!(
+            self,
+            PassFlight::Aerial | PassFlight::Scoop | PassFlight::OverTop
+        )
     }
     fn is_scoop(self) -> bool {
         matches!(self, PassFlight::Scoop)
+    }
+    fn is_over_top(self) -> bool {
+        matches!(self, PassFlight::OverTop)
     }
 }
 
@@ -5683,6 +5713,18 @@ pub struct SoccerPomdpObservation {
     pub threaded_goal_pass_expected_completion: f64,
     #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
     pub threaded_goal_pass_stride_fit: f64,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_available: bool,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub threaded_goal_pass_over_top_distance_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub threaded_goal_pass_over_top_height_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub threaded_goal_pass_over_top_lateral_offset_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub threaded_goal_pass_over_top_back_line_clearance_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub threaded_goal_pass_over_top_goalkeeper_avoidance_yards: f64,
     #[serde(default)]
     pub best_forward_pass_receiver_openness: f64,
     #[serde(default)]
@@ -8388,6 +8430,18 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub threaded_goal_pass_stride_fit_bin: u8,
     #[serde(default)]
+    pub threaded_goal_pass_over_top_available: bool,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_distance_bin: u8,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_height_bin: u8,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_lateral_offset_bin: u8,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_back_line_clearance_bin: u8,
+    #[serde(default)]
+    pub threaded_goal_pass_over_top_goalkeeper_avoidance_bin: u8,
+    #[serde(default)]
     pub best_forward_pass_receiver_openness_bin: u8,
     #[serde(default)]
     pub nearest_forward_teammate_distance_bin: u8,
@@ -8937,6 +8991,30 @@ impl SoccerQStateKey {
                 observation.threaded_goal_pass_stride_fit,
                 &[0.20, 0.40, 0.62, 0.82],
             ),
+            threaded_goal_pass_over_top_available: observation
+                .threaded_goal_pass_over_top_available,
+            threaded_goal_pass_over_top_distance_bin: distance_bucket(
+                observation.threaded_goal_pass_over_top_distance_yards,
+                &KILLER_PASS_OVER_TOP_DISTANCE_BINS_YARDS,
+            ),
+            threaded_goal_pass_over_top_height_bin: distance_bucket(
+                observation.threaded_goal_pass_over_top_height_yards,
+                &KILLER_PASS_OVER_TOP_HEIGHT_BINS_YARDS,
+            ),
+            threaded_goal_pass_over_top_lateral_offset_bin: distance_bucket(
+                observation
+                    .threaded_goal_pass_over_top_lateral_offset_yards
+                    .abs(),
+                &KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS,
+            ),
+            threaded_goal_pass_over_top_back_line_clearance_bin: distance_bucket(
+                observation.threaded_goal_pass_over_top_back_line_clearance_yards,
+                &KILLER_PASS_OVER_TOP_BACK_LINE_CLEARANCE_BINS_YARDS,
+            ),
+            threaded_goal_pass_over_top_goalkeeper_avoidance_bin: distance_bucket(
+                observation.threaded_goal_pass_over_top_goalkeeper_avoidance_yards,
+                &KILLER_PASS_OVER_TOP_GOALKEEPER_AVOIDANCE_BINS_YARDS,
+            ),
             best_forward_pass_receiver_openness_bin: distance_bucket(
                 observation.best_forward_pass_receiver_openness,
                 &[0.20, 0.40, 0.62, 0.82],
@@ -9469,6 +9547,18 @@ impl SoccerQStateKey {
             && self.threaded_goal_pass_expected_completion_bin
                 == other.threaded_goal_pass_expected_completion_bin
             && self.threaded_goal_pass_stride_fit_bin == other.threaded_goal_pass_stride_fit_bin
+            && self.threaded_goal_pass_over_top_available
+                == other.threaded_goal_pass_over_top_available
+            && self.threaded_goal_pass_over_top_distance_bin
+                == other.threaded_goal_pass_over_top_distance_bin
+            && self.threaded_goal_pass_over_top_height_bin
+                == other.threaded_goal_pass_over_top_height_bin
+            && self.threaded_goal_pass_over_top_lateral_offset_bin
+                == other.threaded_goal_pass_over_top_lateral_offset_bin
+            && self.threaded_goal_pass_over_top_back_line_clearance_bin
+                == other.threaded_goal_pass_over_top_back_line_clearance_bin
+            && self.threaded_goal_pass_over_top_goalkeeper_avoidance_bin
+                == other.threaded_goal_pass_over_top_goalkeeper_avoidance_bin
             && self.best_forward_pass_receiver_openness_bin
                 == other.best_forward_pass_receiver_openness_bin
             && self.nearest_forward_teammate_distance_bin
@@ -9606,6 +9696,8 @@ impl SoccerQStateKey {
             && self.defensive_cross_arrival_threat_available
                 == other.defensive_cross_arrival_threat_available
             && self.threaded_goal_pass_available == other.threaded_goal_pass_available
+            && self.threaded_goal_pass_over_top_available
+                == other.threaded_goal_pass_over_top_available
             && self.first_touch_kind == other.first_touch_kind
             && self.receiving_pending_pass == other.receiving_pending_pass
             && facing_bucket_matches(self.receive_facing, other.receive_facing)
@@ -18445,7 +18537,7 @@ fn completed_killer_pass_reward_from_parts(
     receiver_openness: f64,
     stride_fit: f64,
 ) -> f64 {
-    if is_cross || flight.is_aerial() {
+    if is_cross || (flight.is_aerial() && !flight.is_over_top()) {
         return 0.0;
     }
     let forward_yards = (target.y - origin.y) * team.attack_dir();
@@ -29806,6 +29898,14 @@ pub struct SoccerDecisionModelContract {
     pub threaded_goal_pass_quality_in_pomdp_observation: bool,
     pub threaded_goal_pass_quality_binned_in_mdp_state: bool,
     pub threaded_goal_pass_quality_in_neural_features: bool,
+    pub killer_pass_over_top_enabled: bool,
+    pub killer_pass_over_top_min_yards: f64,
+    pub killer_pass_over_top_max_yards: f64,
+    pub killer_pass_over_top_height_yards: f64,
+    pub killer_pass_over_top_angled_away_from_goalkeeper: bool,
+    pub killer_pass_over_top_in_pomdp_observation: bool,
+    pub killer_pass_over_top_binned_in_mdp_state: bool,
+    pub killer_pass_over_top_in_neural_features: bool,
     pub goal_entry_boosts_killer_pass_score: bool,
     pub single_thread_goal_pressure_boosts_decisive_action: bool,
     pub single_thread_goal_pressure_damps_recycling: bool,
@@ -30644,6 +30744,7 @@ fn soccer_player_physical_trait_contract_fields() -> Vec<String> {
 }
 
 fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
+    let killer_pass_over_top = tunables().killer_pass_over_top;
     SoccerDecisionModelContract {
         mdp_state_grid_enabled: true,
         pomdp_observation_grid_enabled: true,
@@ -30663,6 +30764,14 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         threaded_goal_pass_quality_in_pomdp_observation: true,
         threaded_goal_pass_quality_binned_in_mdp_state: true,
         threaded_goal_pass_quality_in_neural_features: true,
+        killer_pass_over_top_enabled: true,
+        killer_pass_over_top_min_yards: killer_pass_over_top.min_distance_yards,
+        killer_pass_over_top_max_yards: killer_pass_over_top.max_distance_yards,
+        killer_pass_over_top_height_yards: killer_pass_over_top.height_yards,
+        killer_pass_over_top_angled_away_from_goalkeeper: true,
+        killer_pass_over_top_in_pomdp_observation: true,
+        killer_pass_over_top_binned_in_mdp_state: true,
+        killer_pass_over_top_in_neural_features: true,
         goal_entry_boosts_killer_pass_score: true,
         single_thread_goal_pressure_boosts_decisive_action: true,
         single_thread_goal_pressure_damps_recycling: true,
@@ -37664,6 +37773,35 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(obs.neural_extended.team_energy_rhythm_phase);
     features[SOCCER_NEURAL_FEATURE_TEAM_ENERGY_DEBT] =
         soccer_neural_unit(obs.neural_extended.team_energy_debt);
+    let killer_pass_over_top = tunables().killer_pass_over_top;
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE] = if obs
+        .threaded_goal_pass_over_top_available
+    {
+        1.0
+    } else {
+        0.0
+    };
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE] = soccer_neural_scaled(
+        obs.threaded_goal_pass_over_top_distance_yards,
+        killer_pass_over_top.max_distance_yards,
+    );
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_HEIGHT] = soccer_neural_scaled(
+        obs.threaded_goal_pass_over_top_height_yards,
+        killer_pass_over_top.height_yards,
+    );
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_LATERAL_OFFSET] = soccer_neural_scaled(
+        obs.threaded_goal_pass_over_top_lateral_offset_yards,
+        killer_pass_over_top.lateral_offset_yards
+            * KILLER_PASS_OVER_TOP_NEURAL_LATERAL_NORMALIZER_FACTOR,
+    );
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE] = soccer_neural_scaled(
+        obs.threaded_goal_pass_over_top_back_line_clearance_yards,
+        KILLER_PASS_OVER_TOP_NEURAL_BACK_LINE_CLEARANCE_NORMALIZER_YARDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_GOALKEEPER_AVOIDANCE] = soccer_neural_scaled(
+        obs.threaded_goal_pass_over_top_goalkeeper_avoidance_yards,
+        KILLER_PASS_OVER_TOP_NEURAL_GOALKEEPER_AVOIDANCE_NORMALIZER_YARDS,
+    );
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -47096,7 +47234,11 @@ fn parse_tracking_role(raw: &str, line_no: usize) -> Result<PlayerRole, String> 
 }
 
 fn parse_tracking_pass_flight(raw: &str, line_no: usize) -> Result<PassFlight, String> {
-    match normalize_csv_header(raw).as_str() {
+    let normalized = normalize_csv_header(raw);
+    if KILLER_PASS_OVER_TOP_PASS_FLIGHT_ALIASES.contains(&normalized.as_str()) {
+        return Ok(PassFlight::OverTop);
+    }
+    match normalized.as_str() {
         "floor" | "ground" | "groundpass" | "grounded" | "low" | "rolling" | "roll" | "0" => {
             Ok(PassFlight::Floor)
         }
@@ -47640,9 +47782,13 @@ fn tracking_incoming_context_from_frames(
         team: Some(target.team),
         kind: match (flight, is_cross) {
             (PassFlight::Floor, false) => IncomingBallKind::GroundPass,
-            (PassFlight::Aerial, false) | (PassFlight::Scoop, _) => IncomingBallKind::AerialPass,
+            (PassFlight::Aerial, false)
+            | (PassFlight::Scoop, _)
+            | (PassFlight::OverTop, false) => IncomingBallKind::AerialPass,
             (PassFlight::Floor, true) => IncomingBallKind::Cross,
-            (PassFlight::Aerial, true) => IncomingBallKind::AerialCross,
+            (PassFlight::Aerial, true) | (PassFlight::OverTop, true) => {
+                IncomingBallKind::AerialCross
+            }
         },
         origin: Some(origin),
         intended_target: Some(intended_target),
@@ -51025,7 +51171,7 @@ fn pass_quality_for_patience(observation: &SoccerPomdpObservation, flight: PassF
             + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.32
             + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.18)
             .clamp(0.0, 1.0),
-        PassFlight::Aerial | PassFlight::Scoop => {
+        PassFlight::Aerial | PassFlight::Scoop | PassFlight::OverTop => {
             let base = (observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.46
                 + observation
                     .best_aerial_pass_receiver_openness
@@ -51902,6 +52048,7 @@ pub(crate) fn aerial_pass_in_bounds_launch_speed(
     aim: Vec2,
     speed_yps: f64,
     reference_distance_yards: f64,
+    flight: PassFlight,
     field_width: f64,
     field_length: f64,
 ) -> f64 {
@@ -51913,7 +52060,11 @@ pub(crate) fn aerial_pass_in_bounds_launch_speed(
         return speed_yps;
     }
     let dir = dir.normalized();
-    let apex = lofted_pass_apex_yards(reference_distance_yards.max(0.1));
+    let apex = if flight.is_over_top() {
+        tunables().killer_pass_over_top.height_yards
+    } else {
+        lofted_pass_apex_yards(reference_distance_yards.max(0.1))
+    };
     let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
     if hang_time <= 1e-3 {
         return speed_yps;
@@ -51994,17 +52145,33 @@ pub(crate) fn long_aerial_bounds_risk_for_target(
     }
     let width = field_width.max(1.0);
     let length = field_length.max(1.0);
+    let killer_pass_over_top = tunables().killer_pass_over_top;
+    let safe_touchline_margin = if flight.is_over_top() {
+        killer_pass_over_top
+            .touchline_margin_yards
+            .min(width * KILLER_PASS_OVER_TOP_PITCH_MARGIN_CAP_FACTOR)
+    } else {
+        LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS.min(width * 0.45)
+    };
+    let safe_byline_margin = if flight.is_over_top() {
+        killer_pass_over_top
+            .byline_margin_yards
+            .min(length * KILLER_PASS_OVER_TOP_PITCH_MARGIN_CAP_FACTOR)
+    } else {
+        LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS.min(length * 0.45)
+    };
     let x_margin = target.x.min(width - target.x);
     let y_margin = target.y.min(length - target.y);
     let margin_yards = x_margin.min(y_margin);
-    let safe_target = long_aerial_safe_in_bounds_target(target, width, length);
+    let safe_target = Vec2::new(
+        target.x.clamp(safe_touchline_margin, width - safe_touchline_margin),
+        target.y.clamp(safe_byline_margin, length - safe_byline_margin),
+    );
     let inward_correction_yards = target.distance(safe_target);
-    let touch_deficit = ((LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS - x_margin)
-        / LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS.max(1e-6))
-    .clamp(0.0, 1.0);
-    let byline_deficit = ((LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS - y_margin)
-        / LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS.max(1e-6))
-    .clamp(0.0, 1.0);
+    let touch_deficit =
+        ((safe_touchline_margin - x_margin) / safe_touchline_margin.max(1e-6)).clamp(0.0, 1.0);
+    let byline_deficit =
+        ((safe_byline_margin - y_margin) / safe_byline_margin.max(1e-6)).clamp(0.0, 1.0);
     let distance_fit = ((distance - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
         / (LONG_AERIAL_BOUNDS_REFERENCE_DISTANCE_YARDS - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
             .max(1.0))
@@ -53351,9 +53518,13 @@ fn incoming_context_from_pass(
         team: Some(pass.team),
         kind: match (pass.flight, pass.is_cross) {
             (PassFlight::Floor, false) => IncomingBallKind::GroundPass,
-            (PassFlight::Aerial, false) | (PassFlight::Scoop, _) => IncomingBallKind::AerialPass,
+            (PassFlight::Aerial, false)
+            | (PassFlight::Scoop, _)
+            | (PassFlight::OverTop, false) => IncomingBallKind::AerialPass,
             (PassFlight::Floor, true) => IncomingBallKind::Cross,
-            (PassFlight::Aerial, true) => IncomingBallKind::AerialCross,
+            (PassFlight::Aerial, true) | (PassFlight::OverTop, true) => {
+                IncomingBallKind::AerialCross
+            }
         },
         origin: Some(pass.origin),
         intended_target: Some(pass.intended_target),
@@ -53406,6 +53577,8 @@ pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f6
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         scoop_loft_apex_yards(pass.distance_yards, unit)
+    } else if pass.flight.is_over_top() {
+        tunables().killer_pass_over_top.height_yards
     } else {
         lofted_pass_apex_yards(pass.distance_yards)
     }
@@ -53419,6 +53592,8 @@ fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
         scoop_loft_apex_yards(pass.distance_yards, unit)
+    } else if pass.flight.is_over_top() {
+        tunables().killer_pass_over_top.height_yards
     } else {
         lofted_pass_apex_yards(pass.distance_yards)
     }
@@ -53705,7 +53880,7 @@ impl DiscretizedKickElevation {
     fn from_pass_flight(flight: PassFlight) -> Self {
         match flight {
             PassFlight::Floor => DiscretizedKickElevation::Floor,
-            PassFlight::Aerial => DiscretizedKickElevation::Aerial,
+            PassFlight::Aerial | PassFlight::OverTop => DiscretizedKickElevation::Aerial,
             PassFlight::Scoop => DiscretizedKickElevation::Scoop,
         }
     }
@@ -54049,7 +54224,11 @@ fn modulated_pass_speed_yps(
         // the receiver, landing 2-3x too far. The only launch speed that LANDS the ball at the
         // target is distance / T (plus a touch for in-flight drag): short/lateral lofts are struck
         // softly, only genuine goal-to-goal balls get real pace.
-        let apex_yards = lofted_pass_apex_yards(distance);
+        let apex_yards = if flight.is_over_top() {
+            tunables().killer_pass_over_top.height_yards
+        } else {
+            lofted_pass_apex_yards(distance)
+        };
         let hang_time = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
         let land_at_target = (distance / hang_time.max(0.35)) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
         // A ball into pressure is struck a touch firmer so it beats the press; an open receiver gets

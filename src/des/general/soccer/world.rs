@@ -10646,6 +10646,20 @@ impl SoccerMatch {
                             target = resolve_outlet(&mut target_id);
                         }
                     }
+                    let over_top_killer_aim = if flight.is_over_top() {
+                        target_id
+                            .and_then(|id| snapshot.killer_pass_over_top_aim_point_for(player_id, id))
+                    } else {
+                        None
+                    };
+                    if let Some(aim) = over_top_killer_aim {
+                        target = aim.clamp_to_pitch(
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        );
+                    } else if flight.is_over_top() {
+                        flight = PassFlight::Aerial;
+                    }
                     let initial_is_cross = pass_would_be_cross(
                         player_pos,
                         target,
@@ -10687,7 +10701,12 @@ impl SoccerMatch {
                     let is_one_two_give = !dd_soccer_disable_one_two_give_to_feet()
                         && target_id.is_some()
                         && self.players[player_id].one_two.map(|o| o.wall_partner) == target_id;
-                    let mut led_target = if is_one_two_give {
+                    let mut led_target = if let Some(aim) = over_top_killer_aim {
+                        aim.clamp_to_pitch(
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
+                    } else if is_one_two_give {
                         target.clamp_to_pitch(
                             self.config.field_width_yards,
                             self.config.field_length_yards,
@@ -10983,15 +11002,19 @@ impl SoccerMatch {
                             speed
                         };
                     let mut distance = player_pos.distance(led_target);
-                    let mut aimed_target = noisy_pass_target_with_receiver_openness(
-                        player_pos,
-                        led_target,
-                        effective_pass_skill,
-                        pressure,
-                        distance,
-                        receiver_openness,
-                        &mut self.rng,
-                    )
+                    let mut aimed_target = if flight.is_over_top() {
+                        led_target
+                    } else {
+                        noisy_pass_target_with_receiver_openness(
+                            player_pos,
+                            led_target,
+                            effective_pass_skill,
+                            pressure,
+                            distance,
+                            receiver_openness,
+                            &mut self.rng,
+                        )
+                    }
                     .clamp_to_pitch(
                         self.config.field_width_yards,
                         self.config.field_length_yards,
@@ -11122,6 +11145,7 @@ impl SoccerMatch {
                             aimed_target,
                             speed,
                             player_pos.distance(aimed_target),
+                            flight,
                             self.config.field_width_yards,
                             self.config.field_length_yards,
                         )
@@ -18363,9 +18387,25 @@ pub(crate) struct KillerPassTargetAssessment {
     pub(crate) expected_completion: f64,
     pub(crate) stride_fit: f64,
     pub(crate) score: f64,
-    /// How to play it: `Floor` when the ground lane is clean, otherwise a `Scoop`/`Aerial`
-    /// loft clipped OVER the defender blocking the ground lane onto the runner.
+    /// How to play it: `OverTop` when the back-four clip is on, `Floor` on a clean
+    /// ground lane, otherwise a `Scoop`/`Aerial` loft over the blocking defender.
     pub(crate) flight: PassFlight,
+    pub(crate) over_top_available: bool,
+    pub(crate) over_top_aim_point: Option<Vec2>,
+    pub(crate) over_top_distance_yards: f64,
+    pub(crate) over_top_height_yards: f64,
+    pub(crate) over_top_lateral_offset_yards: f64,
+    pub(crate) over_top_back_line_clearance_yards: f64,
+    pub(crate) over_top_goalkeeper_avoidance_yards: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KillerPassOverTopAim {
+    aim_point: Vec2,
+    distance_yards: f64,
+    lateral_offset_yards: f64,
+    back_line_clearance_yards: f64,
+    goalkeeper_avoidance_yards: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23408,6 +23448,12 @@ impl WorldSnapshot {
                 threaded_goal_pass_receiver_openness: 0.0,
                 threaded_goal_pass_expected_completion: 0.0,
                 threaded_goal_pass_stride_fit: 0.0,
+                threaded_goal_pass_over_top_available: false,
+                threaded_goal_pass_over_top_distance_yards: 0.0,
+                threaded_goal_pass_over_top_height_yards: 0.0,
+                threaded_goal_pass_over_top_lateral_offset_yards: 0.0,
+                threaded_goal_pass_over_top_back_line_clearance_yards: 0.0,
+                threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
@@ -24783,6 +24829,30 @@ impl WorldSnapshot {
                 .as_ref()
                 .map(|assessment| assessment.stride_fit)
                 .unwrap_or(0.0),
+            threaded_goal_pass_over_top_available: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_available)
+                .unwrap_or(false),
+            threaded_goal_pass_over_top_distance_yards: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_distance_yards)
+                .unwrap_or(0.0),
+            threaded_goal_pass_over_top_height_yards: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_height_yards)
+                .unwrap_or(0.0),
+            threaded_goal_pass_over_top_lateral_offset_yards: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_lateral_offset_yards)
+                .unwrap_or(0.0),
+            threaded_goal_pass_over_top_back_line_clearance_yards: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_back_line_clearance_yards)
+                .unwrap_or(0.0),
+            threaded_goal_pass_over_top_goalkeeper_avoidance_yards: threaded_goal_pass_assessment
+                .as_ref()
+                .map(|assessment| assessment.over_top_goalkeeper_avoidance_yards)
+                .unwrap_or(0.0),
             best_forward_pass_receiver_openness: forward_support_context
                 .best_forward_pass_receiver_openness,
             nearest_forward_teammate_distance_yards: forward_support_context
@@ -25775,9 +25845,9 @@ impl WorldSnapshot {
             .map(|assessment| assessment.target_id)
     }
 
-    /// How the chosen killer pass should be played — `Floor` on a clean ground lane, otherwise
-    /// a `Scoop`/`Aerial` loft clipped over the defender blocking it. `Floor` when no killer
-    /// pass is on (the caller has already gated on availability).
+    /// How the chosen killer pass should be played — `Floor` on a clean ground lane, `OverTop`
+    /// when a 25-35yd clipped ball can clear the back four, otherwise a `Scoop`/`Aerial` loft
+    /// over the defender blocking it. `Floor` when no killer pass is on.
     pub fn killer_pass_flight_for(
         &self,
         player_id: usize,
@@ -25786,6 +25856,178 @@ impl WorldSnapshot {
         self.killer_pass_target_assessment_for(player_id, visible_targets)
             .map(|assessment| assessment.flight)
             .unwrap_or(PassFlight::Floor)
+    }
+
+    pub(crate) fn killer_pass_over_top_aim_point_for(
+        &self,
+        player_id: usize,
+        target_id: usize,
+    ) -> Option<Vec2> {
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.ball.holder != Some(player_id) || me.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let target = self.players.iter().find(|p| p.id == target_id)?;
+        if target.role == PlayerRole::Goalkeeper
+            || target.team != me.team
+            || self.pending_offside_for_pass(player_id, target_id).is_some()
+        {
+            return None;
+        }
+        let me_position = self.player_snapshot_position(me);
+        let target_position = self.player_snapshot_position(target);
+        let nominal_speed = pass_speed_yps_from_power(0.82, PassFlight::Floor, false, &me.skills);
+        let reception = self
+            .anticipated_pass_reception_point(player_id, target_id, PassFlight::Floor, nominal_speed)
+            .unwrap_or(target_position);
+        self.killer_pass_over_top_aim_for_candidate(me, me_position, target, reception)
+            .map(|aim| aim.aim_point)
+    }
+
+    fn opponent_back_four_line_y_for(&self, attacking_team: Team) -> Option<f64> {
+        let opponent = attacking_team.other();
+        let attack_dir = attacking_team.attack_dir();
+        let mut defender_ys: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|player| player.team == opponent && player.role == PlayerRole::Defender)
+            .map(|player| self.player_snapshot_position(player).y)
+            .filter(|y| y.is_finite())
+            .collect();
+        if defender_ys.len() < 3 {
+            defender_ys = self
+                .players
+                .iter()
+                .filter(|player| player.team == opponent && player.role != PlayerRole::Goalkeeper)
+                .map(|player| self.player_snapshot_position(player).y)
+                .filter(|y| y.is_finite())
+                .collect();
+        }
+        if defender_ys.len() < 3 {
+            return None;
+        }
+        if attack_dir > 0.0 {
+            defender_ys.sort_by(|a, b| b.total_cmp(a));
+        } else {
+            defender_ys.sort_by(|a, b| a.total_cmp(b));
+        }
+        let defenders_used = defender_ys.len().min(4);
+        Some(
+            defender_ys
+                .iter()
+                .take(defenders_used)
+                .copied()
+                .sum::<f64>()
+                / defenders_used as f64,
+        )
+    }
+
+    fn killer_pass_over_top_aim_for_candidate(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+        target: &PlayerSnapshot,
+        reception: Vec2,
+    ) -> Option<KillerPassOverTopAim> {
+        let over_top = tunables().killer_pass_over_top;
+        let attack_dir = me.team.attack_dir();
+        let back_line_y = self.opponent_back_four_line_y_for(me.team)?;
+        let line_forward = (back_line_y - me_position.y) * attack_dir;
+        if line_forward <= KILLER_PASS_MIN_FORWARD_YARDS {
+            return None;
+        }
+        let target_line_gap = (reception.y - back_line_y) * attack_dir;
+        if target_line_gap < -over_top.target_line_slack_yards {
+            return None;
+        }
+        let forward_to_clear = line_forward + over_top.back_line_margin_yards;
+        if forward_to_clear > over_top.max_distance_yards {
+            return None;
+        }
+        let mut forward_yards = over_top
+            .target_distance_yards
+            .max(forward_to_clear)
+            .clamp(over_top.min_distance_yards, over_top.max_distance_yards);
+        let goal_y = me.team.goal_y(self.field_length);
+        let byline_margin = over_top.byline_margin_yards;
+        let mut aim_y = me_position.y + attack_dir * forward_yards;
+        aim_y = if attack_dir > 0.0 {
+            aim_y.min(goal_y - byline_margin)
+        } else {
+            aim_y.max(goal_y + byline_margin)
+        };
+        forward_yards = (aim_y - me_position.y) * attack_dir;
+        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&forward_yards)
+        {
+            return None;
+        }
+
+        let center_x = self.field_width * 0.5;
+        let touch_margin = over_top
+            .touchline_margin_yards
+            .min(self.field_width * KILLER_PASS_OVER_TOP_PITCH_MARGIN_CAP_FACTOR);
+        let direct_x = (reception.x
+            + (target.velocity.x * over_top.target_lateral_velocity_projection_seconds).clamp(
+                -over_top.target_lateral_velocity_cap_yards,
+                over_top.target_lateral_velocity_cap_yards,
+            ))
+        .clamp(touch_margin, self.field_width - touch_margin);
+        let keeper_position = self
+            .goalkeeper_for(me.team.other())
+            .and_then(|keeper_id| self.player_position(keeper_id))
+            .unwrap_or_else(|| Vec2::new(center_x, goal_y));
+        let mut side_basis = direct_x - keeper_position.x;
+        if side_basis.abs() < over_top.side_basis_epsilon_yards {
+            side_basis = direct_x - center_x;
+        }
+        if side_basis.abs() < over_top.side_basis_epsilon_yards {
+            side_basis = reception.x - center_x;
+        }
+        if side_basis.abs() < over_top.side_basis_epsilon_yards {
+            side_basis = me_position.x - center_x;
+        }
+        let side_sign = if side_basis.abs() >= over_top.side_basis_epsilon_yards {
+            side_basis.signum()
+        } else if target.id % 2 == 0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let keeper_gap = (direct_x - keeper_position.x).abs();
+        let central_gap = (direct_x - center_x).abs();
+        let lateral_nudge = if keeper_gap < over_top.keeper_avoid_radius_yards
+            || central_gap
+                < over_top.keeper_avoid_radius_yards * over_top.central_gap_keeper_radius_factor
+        {
+            over_top.lateral_offset_yards
+        } else {
+            over_top.lateral_offset_yards * over_top.secondary_lateral_offset_factor
+        };
+        let aim_x = (direct_x + side_sign * lateral_nudge)
+            .clamp(touch_margin, self.field_width - touch_margin);
+        let aim_point = Vec2::new(aim_x, aim_y).clamp_to_pitch(self.field_width, self.field_length);
+        let distance_yards = me_position.distance(aim_point);
+        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&distance_yards)
+        {
+            return None;
+        }
+        let back_line_clearance_yards = (aim_point.y - back_line_y) * attack_dir;
+        if back_line_clearance_yards < over_top.back_line_margin_yards {
+            return None;
+        }
+        let goalkeeper_avoidance_yards = (aim_point.x - keeper_position.x).abs();
+        if goalkeeper_avoidance_yards
+            < over_top.keeper_avoid_radius_yards * over_top.keeper_avoidance_min_factor
+        {
+            return None;
+        }
+        Some(KillerPassOverTopAim {
+            aim_point,
+            distance_yards,
+            lateral_offset_yards: aim_point.x - direct_x,
+            back_line_clearance_yards,
+            goalkeeper_avoidance_yards,
+        })
     }
 
     pub(crate) fn killer_pass_target_assessment_for(
@@ -25807,6 +26049,7 @@ impl WorldSnapshot {
             return None;
         }
 
+        let over_top = tunables().killer_pass_over_top;
         let attack_dir = me.team.attack_dir();
         let nominal_speed = pass_speed_yps_from_power(0.82, PassFlight::Floor, false, &me.skills);
         // Candidate pool for the threaded ball: the un-gated threaded set (a superset of the
@@ -25849,12 +26092,15 @@ impl WorldSnapshot {
                 if goal_gain < KILLER_PASS_MIN_RECEIVER_GOAL_GAIN_YARDS {
                     return None;
                 }
-                // Ground lane clean? Then thread it on the floor. If it is blocked, do NOT hide
-                // the option — lift it OVER the defender onto the runner, but only when a loft
-                // actually clears the block (tighter aerial corridor). A genuinely smothered lane
-                // (blocked on the ground AND under the flight path) is still rejected below.
+                let over_top_aim =
+                    self.killer_pass_over_top_aim_for_candidate(me, me_position, target, reception);
+                // Back-four clip available? Prefer the planned 25-35yd over-top ball. Otherwise,
+                // thread a clean ground lane on the floor; if that is blocked, lift it over the
+                // specific defender only when the tighter aerial corridor actually clears.
                 let ground_clear = self.clear_line(me_position, reception, me.team.other(), 1.8);
-                let (flight, lane_fit) = if ground_clear {
+                let (flight, lane_fit) = if over_top_aim.is_some() {
+                    (PassFlight::OverTop, over_top.lane_fit)
+                } else if ground_clear {
                     (PassFlight::Floor, 1.0)
                 } else if self.clear_line(
                     me_position,
@@ -25893,7 +26139,9 @@ impl WorldSnapshot {
                     target_position,
                     flight,
                 );
-                if quality.expected_completion < 0.24 || lane_fit < 0.30 {
+                if quality.expected_completion < KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                    || lane_fit < KILLER_PASS_MIN_LANE_FIT
+                {
                     return None;
                 }
                 let reception_teammate_pressure =
@@ -25925,6 +26173,31 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let over_top_fit = over_top_aim
+                    .map(|aim| {
+                        let distance_fit = (1.0
+                            - (aim.distance_yards - over_top.target_distance_yards).abs()
+                                / (over_top.max_distance_yards - over_top.target_distance_yards)
+                                    .max(1.0))
+                        .clamp(0.0, 1.0);
+                        let angle_fit = (aim.lateral_offset_yards.abs()
+                            / over_top
+                                .lateral_offset_yards
+                                .max(KILLER_PASS_OVER_TOP_NUMERIC_EPSILON))
+                        .clamp(0.0, 1.0);
+                        let line_fit = (aim.back_line_clearance_yards
+                            / over_top.fit_line_normalizer_yards)
+                            .clamp(0.0, 1.0);
+                        let keeper_fit = (aim.goalkeeper_avoidance_yards
+                            / over_top.fit_keeper_normalizer_yards)
+                            .clamp(0.0, 1.0);
+                        (distance_fit * over_top.fit_distance_weight
+                            + angle_fit * over_top.fit_angle_weight
+                            + line_fit * over_top.fit_line_weight
+                            + keeper_fit * over_top.fit_keeper_weight)
+                            .clamp(0.0, 1.0)
+                    })
+                    .unwrap_or(0.0);
                 let score = goal_gain * 0.12 * goal_entry_pass_learning
                     + forward.min(24.0) * 0.055
                     + window * 4.8 * goal_entry_pass_learning
@@ -25934,6 +26207,7 @@ impl WorldSnapshot {
                     + lane_fit * 1.3
                     + goal_channel_fit * 1.35 * goal_entry_pass_learning
                     + range_fit * 1.2 * goal_entry_pass_learning
+                    + over_top_fit * over_top.score_bonus_weight * goal_entry_pass_learning
                     + role_bonus
                     + runner_bonus
                     - reception_teammate_penalty * 0.72;
@@ -25948,6 +26222,23 @@ impl WorldSnapshot {
                     stride_fit: quality.stride_fit,
                     score,
                     flight,
+                    over_top_available: over_top_aim.is_some(),
+                    over_top_aim_point: over_top_aim.map(|aim| aim.aim_point),
+                    over_top_distance_yards: over_top_aim
+                        .map(|aim| aim.distance_yards)
+                        .unwrap_or(0.0),
+                    over_top_height_yards: over_top_aim
+                        .map(|_| over_top.height_yards)
+                        .unwrap_or(0.0),
+                    over_top_lateral_offset_yards: over_top_aim
+                        .map(|aim| aim.lateral_offset_yards)
+                        .unwrap_or(0.0),
+                    over_top_back_line_clearance_yards: over_top_aim
+                        .map(|aim| aim.back_line_clearance_yards)
+                        .unwrap_or(0.0),
+                    over_top_goalkeeper_avoidance_yards: over_top_aim
+                        .map(|aim| aim.goalkeeper_avoidance_yards)
+                        .unwrap_or(0.0),
                 })
             })
             .max_by(|a, b| {
@@ -29222,7 +29513,7 @@ impl WorldSnapshot {
         &self,
         pass: &PendingPassSnapshot,
     ) -> Option<LongAerialFallingWindow> {
-        if !matches!(pass.flight, PassFlight::Aerial)
+        if !matches!(pass.flight, PassFlight::Aerial | PassFlight::OverTop)
             || pass.distance_yards < LONG_AERIAL_CONTROL_MIN_DISTANCE_YARDS
         {
             return None;
