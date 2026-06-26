@@ -77890,8 +77890,13 @@ fn long_aerial_bounds_risk_reaims_and_reaches_learning_features() {
     // risk, corrected inward for execution, and recorded in the learned completion feature vector.
     let origin = Vec2::new(40.0, 30.0);
     let risky_target = Vec2::new(1.0, 105.0);
-    let risk =
-        long_aerial_bounds_risk_for_target(origin, risky_target, 80.0, 120.0, PassFlight::Aerial);
+    let risk = long_aerial_bounds_risk_for_target(
+        origin,
+        risky_target,
+        80.0,
+        120.0,
+        PassFlight::Aerial,
+    );
     assert!(
         risk.risk > 0.45,
         "wide long aerial near touchline/byline should carry out-of-bounds risk: {risk:?}"

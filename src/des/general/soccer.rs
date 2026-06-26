@@ -1447,7 +1447,8 @@ const LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS: f64 = 24.0;
 const LONG_AERIAL_BOUNDS_REFERENCE_DISTANCE_YARDS: f64 = 46.0;
 const LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS: f64 =
     PASS_FORWARD_OUTLET_TOUCHLINE_MARGIN_YARDS;
-const LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS: f64 = PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS;
+const LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS: f64 =
+    PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS;
 const LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS: f64 = 8.0;
 const LONG_AERIAL_BOUNDS_COMPLETION_GATE_STRENGTH: f64 = 0.72;
 const LONG_AERIAL_BOUNDS_SCORE_PENALTY: f64 = 6.4;
@@ -8441,7 +8442,7 @@ impl SoccerQStateKey {
             ),
             long_aerial_bounds_correction_bin: distance_bucket(
                 observation.long_aerial_bounds_inward_correction_yards,
-                &[0.75, 1.75, 3.5, 6.0],
+                &[0.5, 1.75, 3.5, 6.0],
             ),
             aerial_forward_runner_pass_boost_bin: distance_bucket(
                 observation.aerial_forward_runner_pass_multiplier.max(1.0) - 1.0,
@@ -50671,10 +50672,10 @@ pub(crate) fn long_aerial_bounds_risk_for_target(
     let inward_correction_yards = target.distance(safe_target);
     let touch_deficit = ((LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS - x_margin)
         / LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS.max(1e-6))
-    .clamp(0.0, 1.0);
+        .clamp(0.0, 1.0);
     let byline_deficit = ((LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS - y_margin)
         / LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS.max(1e-6))
-    .clamp(0.0, 1.0);
+        .clamp(0.0, 1.0);
     let distance_fit = ((distance - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
         / (LONG_AERIAL_BOUNDS_REFERENCE_DISTANCE_YARDS - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
             .max(1.0))

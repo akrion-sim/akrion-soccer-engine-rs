@@ -35792,8 +35792,8 @@ impl WorldSnapshot {
         );
         features.push(bounds.risk.clamp(0.0, 1.0) as f32);
         features.push(
-            (bounds.margin_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS).clamp(-1.0, 1.0)
-                as f32,
+            (bounds.margin_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+                .clamp(-1.0, 1.0) as f32,
         );
         features.push(
             (bounds.inward_correction_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
