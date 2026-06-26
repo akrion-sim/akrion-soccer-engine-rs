@@ -57856,10 +57856,11 @@ fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
 }
 
 #[test]
-fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy() {
-    // Execution: the drive-to-corner carry fires ONLY when the team has committed to the byline
-    // drive — otherwise a wide carrier is free to cut inside as before (so this never spuriously
-    // hijacks a carry). The handoff to the cross at the corner is also checked.
+fn byline_drive_steers_the_carry_to_the_corner_under_commitment_or_solo_opt_in() {
+    // Execution: the drive-to-corner carry fires when the team has committed to the byline drive OR
+    // when an individual wide carrier opts in on his own (isolated wide, in the build-up band, with
+    // an open lane) — see `winger_byline_drive_opt_in`. Outside both it never spuriously hijacks a
+    // carry. The handoff to the cross at the corner is also checked.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 5151,
@@ -57881,12 +57882,20 @@ fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy
             | TeamAttackStrategy::BylineCrossRightToPenaltySpot
             | TeamAttackStrategy::CrashTheBox
     );
+    let solo_opt_in = snapshot.winger_byline_drive_opt_in(carrier);
+    // Wide, in the build-up band, with an open lane (everyone else parked): the solo opt-in alone
+    // is enough to engage the drive even with no team commitment — the fix for "stalls ~30yd out".
+    assert!(
+        solo_opt_in,
+        "an isolated wide carrier in the build-up band must be able to drive the byline on his own"
+    );
     let drive = snapshot.byline_corner_drive_target_for(carrier);
-    // The execution gate exactly mirrors the committed decision: corner drive iff committed.
+    // The execution gate fires iff committed OR the individual opt-in is on.
     assert_eq!(
         drive.is_some(),
-        committed,
-        "the corner drive must fire iff the byline-drive strategy is committed (committed={committed})"
+        committed || solo_opt_in,
+        "the corner drive must fire iff committed or the solo opt-in is on \
+         (committed={committed} solo_opt_in={solo_opt_in})"
     );
     if let Some(corner) = drive {
         // When it fires, the carry heads forward-and-wide toward the left corner flag.
@@ -57910,6 +57919,70 @@ fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy
     assert!(
         at_corner.byline_corner_drive_target_for(carrier).is_none(),
         "at the corner the drive yields to the (legal, scored) flank cross"
+    );
+}
+
+#[test]
+fn winger_byline_solo_opt_in_respects_band_width_and_lane() {
+    // The solo (no team-commitment) byline opt-in is deliberately scoped so it does not hijack
+    // good central / finishing / blocked situations: it fires only for a WIDE carrier in the
+    // BUILD-UP band with an OPEN lane ahead. Lock those discriminators in.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 5151,
+        ..Default::default()
+    });
+    let carrier = 7;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    let set = |sim: &mut SoccerMatch, pos: Vec2| {
+        sim.players[carrier].position = pos;
+        sim.players[carrier].home_position = pos;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = pos;
+        sim.ball.last_touch_team = Some(Team::Home);
+    };
+
+    // Baseline: touchline LEFT, 32yd from the byline (in the build-up band), lane clear -> opt in.
+    set(&mut sim, Vec2::new(6.0, 88.0));
+    assert!(
+        WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "touchline winger in the build-up band with an open lane should opt in"
+    );
+
+    // Too CENTRAL (not a wide attacker) -> defer to the cut-inside / goal drive.
+    set(&mut sim, Vec2::new(34.0, 88.0));
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a central carrier drives at goal, not the corner"
+    );
+
+    // Merely HALF-SPACE wide (well infield of the touchline) -> keeps the deliberate cut-inside
+    // toward goal in the approach band; only a touchline-hugging winger drives the corner.
+    set(&mut sim, Vec2::new(66.0, 88.0));
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a half-space carrier cuts inside toward goal rather than driving the corner"
+    );
+
+    // Too DEEP (inside the finishing zone) -> reserve the run to the byline for the committed drive.
+    set(&mut sim, Vec2::new(8.0, 108.0)); // 12yd from the byline
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "in the deep finishing zone, cutting inside to shoot wins over a solo corner run"
+    );
+
+    // Wide + build-up band, but the LANE is blocked by a defender straight ahead -> no reckless run.
+    set(&mut sim, Vec2::new(8.0, 88.0));
+    let blocker = sim
+        .players
+        .iter()
+        .position(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .expect("an away outfielder");
+    sim.players[blocker].position = Vec2::new(8.0, 92.0); // 4yd directly ahead, in the lane
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a defender packing the lane should suppress the solo drive"
     );
 }
 

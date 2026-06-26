@@ -17651,6 +17651,16 @@ fn dd_soccer_disable_byline_drive_to_corner() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BYLINE_DRIVE_TO_CORNER").is_ok())
 }
+/// Individual winger "drive the byline" opt-in. ON by default: a wide carrier isolated wide with a
+/// clear lane drives for the corner flag (then crosses) ON HIS OWN — without waiting for the team
+/// strategy selector to commit to a byline-cross strategy — instead of stalling ~30yd out. Set
+/// `DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION=1` to restore the team-commitment-only behaviour
+/// (A/B / parity). See `winger_byline_drive_opt_in`.
+fn dd_soccer_disable_winger_byline_option() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
+}
 /// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
 /// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
 /// the carrier reliably HAS a teammate to play to — instead of being left to thump it to nobody or
@@ -31112,21 +31122,35 @@ impl WorldSnapshot {
             return false;
         }
         let strategy = self.tactical_directive(player.team).attack_strategy;
-        if !is_byline_cross_drive_strategy(strategy) {
+        let team_byline = is_byline_cross_drive_strategy(strategy);
+        // Individual winger opt-in: a wide carrier executes the byline drive on his own even when
+        // the team directive has NOT committed to a byline-cross strategy (see
+        // `winger_byline_drive_opt_in`), so the moving-phase flag (no central pull, corner steering)
+        // engages for him too. Short-circuits to the team path when the team has committed, leaving
+        // that path byte-identical.
+        let solo_opt_in = !team_byline && self.winger_byline_drive_opt_in(player_id);
+        if !team_byline && !solo_opt_in {
             return false;
         }
         let current = self.player_snapshot_position(player);
         let attack_dir = player.team.attack_dir();
         let in_opposition_half = (current.y - self.field_length * 0.5) * attack_dir > 0.0;
         let on_wing = flank_lane_score(current, self.field_width) >= 0.30;
-        let on_strategy_side = match strategy {
-            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
-            | TeamAttackStrategy::OutsideMidAttackDefenderLeft => current.x < self.field_width * 0.5,
-            TeamAttackStrategy::BylineCrossRightToPenaltySpot
-            | TeamAttackStrategy::OutsideMidAttackDefenderRight => {
-                current.x > self.field_width * 0.5
+        let on_strategy_side = if solo_opt_in {
+            // The solo carrier is on his own wing by construction (the opt-in requires flank width).
+            true
+        } else {
+            match strategy {
+                TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+                | TeamAttackStrategy::OutsideMidAttackDefenderLeft => {
+                    current.x < self.field_width * 0.5
+                }
+                TeamAttackStrategy::BylineCrossRightToPenaltySpot
+                | TeamAttackStrategy::OutsideMidAttackDefenderRight => {
+                    current.x > self.field_width * 0.5
+                }
+                _ => false,
             }
-            _ => false,
         };
         // The outside-mid take-on releases its cross earlier (last ~20-30yd) than the deep byline
         // drive — so it stops the wide carry at the deeper release depth.
@@ -31137,6 +31161,58 @@ impl WorldSnapshot {
         };
         let endline_depth = (player.team.goal_y(self.field_length) - current.y).abs();
         in_opposition_half && on_wing && on_strategy_side && endline_depth > release_depth
+    }
+
+    /// Individual "drive the byline" opt-in for a wide carrier, DECOUPLED from the team-level
+    /// byline-cross strategy commitment. Returns true when a winger (wide mid / wide forward) is
+    /// the carrier, advanced and wide in the opponent half, inside the byline activation window,
+    /// with a genuinely open lane ahead — so he drives for the corner flag (then crosses) on his
+    /// own instead of stalling ~30yd out waiting for the strategy selector to commit. The
+    /// team-committed drive is vetted by the selector; this solo path bypasses it, so it carries
+    /// its own clearance guard. ON by default; gated by `dd_soccer_disable_winger_byline_option`.
+    pub(crate) fn winger_byline_drive_opt_in(&self, player_id: usize) -> bool {
+        if dd_soccer_disable_winger_byline_option() {
+            return false;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return false;
+        };
+        // The carrier in possession, and a wide attacking player (wide mid or wide forward).
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(me.team)
+            || me.role == PlayerRole::Goalkeeper
+            || !(self.is_wide_midfielder(me) || self.is_wide_attacker(me))
+        {
+            return false;
+        }
+        let pos = self.player_snapshot_position(me);
+        let attack_dir = me.team.attack_dir();
+        // Attacking, in the opponent half.
+        if (pos.y - self.field_length * 0.5) * attack_dir <= 0.0 {
+            return false;
+        }
+        // BUILD-UP band only: from the activation reach in to the deep-finishing floor. Outside the
+        // finishing zone (where cutting inside to shoot / a goalmouth carry is the better individual
+        // play) — this is the band where a winger otherwise stalls ~30yd out instead of driving.
+        // The deeper run all the way to the byline stays reserved for the team-committed drive.
+        let goal_y = me.team.goal_y(self.field_length);
+        let yards_to_byline = (goal_y - pos.y).abs();
+        if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
+            || yards_to_byline < WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
+        {
+            return false;
+        }
+        // Reserved for a genuinely TOUCHLINE-HUGGING winger — the player actually positioned to
+        // drive the corner flag. A merely half-space-wide carrier keeps the deliberate "cut inside
+        // toward goal in the approach band" behaviour, which is the better play from there.
+        let touchline_distance = pos.x.min(self.field_width - pos.x);
+        if touchline_distance > WINGER_BYLINE_MAX_TOUCHLINE_DISTANCE_YARDS {
+            return false;
+        }
+        // A sound option, not a reckless run: only opt in when there is a genuinely open lane to
+        // drive into. This is exactly the situation where a winger otherwise stalls ~30yd out with
+        // the ball at his feet instead of carrying for the corner.
+        self.forward_dribble_space_yards(player_id) >= WINGER_BYLINE_MIN_DRIVE_SPACE_YARDS
     }
 
     fn wingback_attacking_cover_count(&self, player: &PlayerSnapshot) -> usize {
@@ -33775,15 +33851,18 @@ impl WorldSnapshot {
         if self.ball.holder != Some(player_id) || me.role == PlayerRole::Goalkeeper {
             return None;
         }
-        // Drive the corner ONLY when the team has COMMITTED to the byline-drive strategy (the
-        // MDP/POMDP decision, held for `STRATEGY_COMMIT_TICKS`). Otherwise a wide carrier is free to
-        // cut inside toward goal as before — the two are deliberately different decisions.
-        if !matches!(
+        // Drive the corner when the team has COMMITTED to the byline-drive strategy (the MDP/POMDP
+        // decision, held for `STRATEGY_COMMIT_TICKS`) OR when an individual wide carrier opts into
+        // the drive on his own (`winger_byline_drive_opt_in`) — isolated wide with a clear lane —
+        // instead of stalling ~30yd out. Otherwise a wide carrier is free to cut inside toward goal
+        // as before — those remain deliberately different decisions.
+        let team_committed = matches!(
             self.tactical_directive(me.team).attack_strategy,
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot
                 | TeamAttackStrategy::BylineCrossRightToPenaltySpot
                 | TeamAttackStrategy::CrashTheBox
-        ) {
+        );
+        if !team_committed && !self.winger_byline_drive_opt_in(player_id) {
             return None;
         }
         // Outside mid or striker — the players this programmed move is for.
