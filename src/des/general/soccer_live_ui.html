@@ -2997,18 +2997,8 @@ function drawPendingPassPhase(r) {
   ctx.setLineDash(aerial ? [8, 6] : []);
   ctx.stroke();
   ctx.setLineDash([]);
-  const urgency = clamp(Number(pass.receiverUrgency ?? 0), 0, 1);
-  const receiver = pass.nearestReceiver != null
-    ? state.frame.players?.find(player => player.id === pass.nearestReceiver)
-    : null;
-  if (receiver?.position) {
-    const pt = mapPoint(receiver.position, r);
-    ctx.beginPath();
-    ctx.arc(pt.x, pt.y, 15 + urgency * 9, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(246,201,68,${0.28 + urgency * 0.42})`;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
+  // The receiver itself is ringed by drawPlayer's dedicated yellow pass-target ring
+  // (urgency rides its glow); only the pass line and the offside overlay live here.
   if (offside?.position) {
     const pt = mapPoint(offside.position, r);
     const radius = yardsToCanvasRadius(offside.interferenceRadiusYards ?? 3, r);
@@ -3315,7 +3305,7 @@ function drawPlayerRing(pt, radius, color, width, glow) {
   ctx.stroke();
   ctx.restore();
 }
-function drawPlayer(p, r, holderId = null, passTargetId = null) {
+function drawPlayer(p, r, holderId = null, passTargetId = null, passTargetUrgency = 0) {
   const pt = mapPoint(p.position, r);
   const color = p.team === "Home" ? "#1f6feb" : "#d64545";
   const assigned = p.controllerSlot != null;
@@ -3323,10 +3313,16 @@ function drawPlayer(p, r, holderId = null, passTargetId = null) {
   const hovered = p.id === hoverPlayerId;
   const slotColor = assigned ? SLOT_COLORS[p.controllerSlot % SLOT_COLORS.length] : null;
   const isHolder = holderId != null && Number(p.id) === Number(holderId);
-  const isPassTarget = passTargetId != null && Number(p.id) === Number(passTargetId);
+  // The pass target ring is mutually exclusive with the holder ring: a ball in
+  // flight has no holder, so these never stack on the same player.
+  const isPassTarget = !isHolder && passTargetId != null && Number(p.id) === Number(passTargetId);
   if (p.role === "Goalkeeper") drawPlayerRing(pt, 14.4, "#7cff3a", 2.4, 10);
   if (isHolder) drawPlayerRing(pt, 18.2, "#00e5ff", 3.1, 12);
-  if (isPassTarget) drawPlayerRing(pt, 18.2, "#ffe100", 2.8, 12);
+  // Urgency (how soon the receiver must act) rides the glow, 10→20, so the single
+  // yellow ring carries what the old faint pulsing receiver ring used to show.
+  if (isPassTarget) {
+    drawPlayerRing(pt, 18.2, "#ffe100", 2.8, 10 + clamp(Number(passTargetUrgency || 0), 0, 1) * 10);
+  }
   const isDuel = Array.isArray(p.lastDecision?.operationOrder)
     && p.lastDecision.operationOrder.includes("fifty-fifty-duel");
   if (isDuel) {
@@ -3495,7 +3491,8 @@ function drawField(frame, r) {
   for (const o of frame.officials || []) drawOfficial(o, r);
   const ringHolderId = displayHolderId(frame);
   const passTargetId = pendingPassTargetId(frame);
-  for (const p of frame.players || []) drawPlayer(p, r, ringHolderId, passTargetId);
+  const passTargetUrgency = clamp(Number(pendingPassPhase(frame)?.receiverUrgency ?? 0), 0, 1);
+  for (const p of frame.players || []) drawPlayer(p, r, ringHolderId, passTargetId, passTargetUrgency);
   if (frame.ball) drawBall(frame.ball, r);
   drawCoachHintMarkers(r);
   drawCoachHintDrag(r);

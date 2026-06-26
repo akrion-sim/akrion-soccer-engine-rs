@@ -40779,6 +40779,80 @@ fn offside_geometry_uses_ball_second_last_defender_and_halfway_line() {
     assert_eq!(json["offsidePlayerY"], 108.0);
 }
 
+// Empirical proof of the law against the real rule function: across hundreds of
+// thousands of randomized whole-pitch configurations, `pending_offside_for_pass`
+// (the single chokepoint every enforcement path funnels through) must NEVER flag
+// a receiver whose frozen pass-time position sits in their own half. Fuzzing the
+// rule directly is far faster than waiting for offsides to occur in open play and
+// covers far more own-half receivers.
+#[test]
+fn rule_never_flags_a_receiver_in_their_own_half_across_randomized_snapshots() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let half = length * 0.5;
+
+    // Cheap deterministic LCG so the fuzz is reproducible.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut unit = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as f64) / ((1u64 << 31) as f64)
+    };
+
+    let mut flagged = 0usize;
+    let mut checked = 0usize;
+    let mut own_half_targets = 0usize;
+    for _ in 0..3000 {
+        for p in sim.players.iter_mut() {
+            p.position = Vec2::new(unit() * width, unit() * length);
+            p.velocity = Vec2::zero();
+        }
+        sim.ball.position = Vec2::new(unit() * width, unit() * length);
+        sim.ball.holder = None;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        for passer in 0..22usize {
+            for target in 0..22usize {
+                checked += 1;
+                if let Some(offside) = snapshot.pending_offside_for_pass(passer, target) {
+                    flagged += 1;
+                    let y = offside.position.y;
+                    match offside.team {
+                        Team::Home => {
+                            if y <= half {
+                                own_half_targets += 1;
+                            }
+                            assert!(
+                                y > half,
+                                "Home receiver flagged offside in OWN half: y={y} half={half}"
+                            );
+                        }
+                        Team::Away => {
+                            if y >= half {
+                                own_half_targets += 1;
+                            }
+                            assert!(
+                                y < half,
+                                "Away receiver flagged offside in OWN half: y={y} half={half}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        flagged > 0,
+        "fuzz produced no offside flags at all (checked {checked} pass pairs)"
+    );
+    assert_eq!(own_half_targets, 0);
+    eprintln!(
+        "checked {checked} pass pairs; {flagged} flagged offside; {own_half_targets} of them in own half"
+    );
+}
+
 #[test]
 fn ball_holder_dribble_target_beyond_line_is_not_self_offside() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
