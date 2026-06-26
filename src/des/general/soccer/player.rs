@@ -1772,8 +1772,24 @@ fn mpc_execution_estimate_for_action(
             + ability01(player.skills.first_touch) * 0.18
             + ability01(player.skills.flair_passing) * 0.10)
             .clamp(0.0, 1.0);
-        let pressure = dribble_spacing_pressure_for_role(player.role, nearest_distance)
-            .max(pressure_from_nearest_distance(nearest_distance));
+        let nearest_closing_rate = nearest_opponent
+            .map(|opponent| {
+                let opponent_position = snapshot
+                    .player_position(opponent.id)
+                    .unwrap_or(opponent.position);
+                let opponent_velocity = snapshot
+                    .player_velocity(opponent.id)
+                    .unwrap_or(opponent.velocity);
+                dribble_closing_rate_toward_point(opponent_position, opponent_velocity, current)
+            })
+            .unwrap_or(0.0);
+        let pressure = dribble_spacing_pressure_for_state(
+            player.role,
+            pass_origin_in_own_half(player.team, current, snapshot.field_length),
+            nearest_distance,
+            nearest_closing_rate,
+        )
+        .max(pressure_from_nearest_distance(nearest_distance));
         let dribble_mpc = dribble_mpc_control_estimate_for_snapshot(
             snapshot,
             player.id,
@@ -3118,12 +3134,15 @@ impl PlayerAgent {
         } else {
             1.0
         };
-        // Don't dribble straight into an opponent for no reason: OUTSIDE the final third
-        // the carrier should keep ~2 yds of space ahead (1.5-2 yd buffer). In the final
-        // attacking third more risk is worthwhile, so the guard relaxes there.
+        // Don't dribble straight into an opponent for no reason: keep 2yd where possible,
+        // 3yd in our own half, and relax only when the nearest opponent is moving away.
         let dribble_into_opponent_penalty = dribble_into_opponent_penalty(
             observation.forward_dribble_space_yards,
             observation.yards_to_goal,
+            observation.yards_to_own_goal,
+            observation
+                .neural_extended
+                .nearest_opponent_closing_rate_yps,
         );
         // A clearly-open teammate ahead is an outlet the carrier should USE rather than
         // keep dribbling — even with time on the ball (the "dribbles too long while a
@@ -3144,12 +3163,18 @@ impl PlayerAgent {
                     + pressured_release_signal * 0.18
                     + open_forward_outlet * 0.18))
             .clamp(1.0, 1.62);
-        // Critical spacing: most carriers react once the nearest defender gets inside
-        // the 2-yard floor; defenders on the ball should prefer a larger 3-4 yard buffer.
-        // The response stays soft: dribbling is damped and passing lifted rather than
-        // making carry options illegal.
-        let defender_crowding =
-            dribble_spacing_pressure_for_role(self.role, observation.nearest_opponent_distance);
+        // Critical spacing: most carriers react inside the 2-yard floor; everyone
+        // wants 3yd in their own half, and defenders keep the wider 3-4yd cushion.
+        // Moving-away opponents are less urgent. The response stays soft: dribbling
+        // is damped and passing lifted rather than making carry options illegal.
+        let defender_crowding = dribble_spacing_pressure_for_state(
+            self.role,
+            own_half,
+            observation.nearest_opponent_distance,
+            observation
+                .neural_extended
+                .nearest_opponent_closing_rate_yps,
+        );
         let crowded_dribble_damp =
             (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
         // The flip side: when a defender closes the spacing gap AND a receiver is open,

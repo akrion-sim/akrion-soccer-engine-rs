@@ -32716,13 +32716,33 @@ impl WorldSnapshot {
         touch_intent_fit: f64,
     ) -> f64 {
         let position = self.player_snapshot_position(player);
-        let nearest_opponent_distance = self
-            .nearest_opponent_at(player.team, position)
+        let nearest_opponent = self.nearest_opponent_at(player.team, position);
+        let nearest_opponent_distance = nearest_opponent
             .map(|(_, _, distance)| distance)
             .unwrap_or(36.0);
+        let nearest_opponent_closing_rate = nearest_opponent
+            .map(|(opponent_id, opponent_position, _)| {
+                let opponent_velocity = self
+                    .player_velocity(opponent_id)
+                    .unwrap_or_else(|| {
+                        self.players
+                            .iter()
+                            .find(|candidate| candidate.id == opponent_id)
+                            .map(|candidate| candidate.velocity)
+                            .unwrap_or(Vec2::zero())
+                    });
+                dribble_closing_rate_toward_point(opponent_position, opponent_velocity, position)
+            })
+            .unwrap_or(0.0);
         let pressure = pressure_from_nearest_distance(nearest_opponent_distance);
+        let spacing_pressure = dribble_spacing_pressure_for_state(
+            player.role,
+            pass_origin_in_own_half(player.team, position, self.field_length),
+            nearest_opponent_distance,
+            nearest_opponent_closing_rate,
+        );
         let defender_spacing_pressure = if player.role == PlayerRole::Defender {
-            dribble_spacing_pressure_for_role(player.role, nearest_opponent_distance)
+            spacing_pressure
         } else {
             0.0
         };
@@ -32792,11 +32812,14 @@ impl WorldSnapshot {
         } else if forward_component.abs() <= 0.20 {
             distance *= 0.82;
         }
-        if defender_spacing_pressure > 0.0 {
-            distance *= (1.0 - defender_spacing_pressure * 0.34).clamp(0.62, 1.0);
+        if spacing_pressure > 0.0 {
+            distance *= (1.0 - spacing_pressure * 0.22).clamp(0.72, 1.0);
             if forward_component > 0.20 {
-                distance -= defender_spacing_pressure * 0.45;
+                distance -= spacing_pressure * 0.35;
             }
+        }
+        if defender_spacing_pressure > 0.0 {
+            distance *= (1.0 - defender_spacing_pressure * 0.18).clamp(0.68, 1.0);
         }
         let cap = if forward_component > 0.20 {
             (forward_space + PLAYER_CONTROL_RADIUS_YARDS * 2.1)
@@ -33104,25 +33127,83 @@ impl WorldSnapshot {
             }
         }
 
-        if me.role == PlayerRole::Defender
-            && !matches!(
-                dribble_final_cut_kind(kind),
-                DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
-            )
-        {
-            if let Some((_, defender_position, defender_distance)) = nearest_defender {
-                let spacing_pressure =
-                    dribble_spacing_pressure_for_role(me.role, defender_distance);
+        if !matches!(
+            dribble_final_cut_kind(kind),
+            DribbleMoveKind::ProtectBall | DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn
+        ) {
+            if let Some((defender_id, defender_position, defender_distance)) = nearest_defender {
+                let defender_velocity = self.player_velocity(defender_id).unwrap_or(Vec2::zero());
+                let closing_rate =
+                    dribble_closing_rate_toward_point(defender_position, defender_velocity, current);
+                let target_closing_rate =
+                    dribble_closing_rate_toward_point(defender_position, defender_velocity, target);
+                let own_half = pass_origin_in_own_half(me.team, current, self.field_length);
+                let current_spacing_pressure = dribble_spacing_pressure_for_state(
+                    me.role,
+                    own_half,
+                    defender_distance,
+                    closing_rate,
+                );
+                let target_spacing_pressure = dribble_spacing_pressure_for_state(
+                    me.role,
+                    own_half,
+                    target.distance(defender_position),
+                    target_closing_rate,
+                );
+                let spacing_pressure = current_spacing_pressure.max(target_spacing_pressure);
+                let comfort_gap = dribble_comfort_space_yards_for_position(
+                    me.role,
+                    me.team,
+                    current,
+                    self.field_length,
+                );
                 let min_gap = defender_distance
-                    .min(DEFENDER_DRIBBLE_COMFORT_SPACE_YARDS)
+                    .min(comfort_gap)
                     .max(DRIBBLE_OPPONENT_MIN_SPACE_YARDS);
-                if spacing_pressure > 0.0 && target.distance(defender_position) < min_gap {
+                if spacing_pressure > 0.04 && target.distance(defender_position) < min_gap {
                     let away = (current - defender_position).normalized();
                     if away.len() > 1e-6 {
-                        let escape_distance =
-                            (touch.distance_yards * (0.35 + spacing_pressure * 0.20))
-                                .clamp(0.75, 1.75);
-                        target = current + away * escape_distance;
+                        let forward = Vec2::new(0.0, me.team.attack_dir());
+                        let lateral_sign = if current.x >= defender_position.x { 1.0 } else { -1.0 };
+                        let lateral = Vec2::new(lateral_sign, 0.0);
+                        let escape_distance = (touch.distance_yards
+                            * (0.38 + spacing_pressure * 0.24))
+                            .clamp(0.80, if own_half { 2.65 } else { 2.25 });
+                        if me.role == PlayerRole::Defender {
+                            target = current + away * escape_distance;
+                        } else {
+                            let directions = [
+                                away,
+                                (away * 0.74 + forward * 0.32).normalized(),
+                                (lateral * 0.82 + forward * 0.50).normalized(),
+                                (lateral * -0.82 + forward * 0.50).normalized(),
+                            ];
+                            let mut best_target = current + away * escape_distance;
+                            let mut best_score = f64::NEG_INFINITY;
+                            for direction in directions {
+                                if direction.len() <= 1e-6 {
+                                    continue;
+                                }
+                                let raw = current + direction * escape_distance;
+                                let candidate =
+                                    raw.clamp_to_pitch(self.field_width, self.field_length);
+                                let pitch_loss = raw.distance(candidate);
+                                let gap = candidate.distance(defender_position);
+                                let forward_progress =
+                                    (candidate.y - current.y) * me.team.attack_dir();
+                                let gap_deficit = (min_gap - gap).max(0.0);
+                                let score = gap.min(min_gap + 1.0)
+                                    + forward_progress.max(0.0) * 0.78
+                                    - (-forward_progress).max(0.0) * 0.55
+                                    - gap_deficit * 2.0
+                                    - pitch_loss * 0.60;
+                                if score > best_score {
+                                    best_score = score;
+                                    best_target = candidate;
+                                }
+                            }
+                            target = best_target;
+                        }
                     }
                 }
             }

@@ -8672,20 +8672,28 @@ fn rising_pressure_from_a_closing_defender_raises_release_signal() {
 }
 
 #[test]
-fn dribbling_into_a_close_opponent_is_cut_outside_the_final_third_only() {
-    // Outside the final third, < 2 yds of space ahead cuts the carry score.
-    let cramped_mid = dribble_into_opponent_penalty(0.5, 80.0);
-    let open_mid = dribble_into_opponent_penalty(8.0, 80.0);
+fn dribbling_into_a_close_opponent_is_cut_unless_marker_is_moving_away() {
+    // In open play, < 2 yds of space ahead cuts the carry score.
+    let cramped_mid = dribble_into_opponent_penalty(0.5, 80.0, 40.0, 0.0);
+    let open_mid = dribble_into_opponent_penalty(8.0, 80.0, 40.0, 0.0);
     assert!(cramped_mid < open_mid);
     assert!(
         cramped_mid <= 0.55,
-        "tight space outside the final third is cut hard: {cramped_mid}"
+        "tight space in open play is cut hard: {cramped_mid}"
     );
     assert_eq!(open_mid, 1.0);
-    // In the final attacking third the guard is lifted — risk is allowed.
-    assert_eq!(dribble_into_opponent_penalty(0.5, 20.0), 1.0);
+    // Near goal the same guard is softer but no longer fully waived.
+    let cramped_final_third = dribble_into_opponent_penalty(0.5, 20.0, 100.0, 0.0);
+    assert!(
+        cramped_final_third > cramped_mid && cramped_final_third < 1.0,
+        "final-third risk should be softer, not a free dribble into bodies: mid={cramped_mid} final={cramped_final_third}"
+    );
+    // In our own half, the comfort gap widens to 3yd.
+    assert!(dribble_into_opponent_penalty(2.5, 80.0, 40.0, 0.0) < 1.0);
     // At/above the 2-yard buffer there is no penalty.
-    assert_eq!(dribble_into_opponent_penalty(2.0, 80.0), 1.0);
+    assert_eq!(dribble_into_opponent_penalty(2.0, 80.0, 100.0, 0.0), 1.0);
+    // If the opponent is clearly moving away, a just-under-buffer carry can continue.
+    assert_eq!(dribble_into_opponent_penalty(2.6, 80.0, 40.0, -3.0), 1.0);
 }
 
 #[test]
@@ -44785,6 +44793,75 @@ fn dribble_mpc_qp_fit_rewards_reachable_control_touch() {
 }
 
 #[test]
+fn dribble_mpc_space_margin_uses_own_half_comfort_gap_and_moving_away_relief() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 24_623,
+        ..Default::default()
+    });
+    let dribbler = 6usize;
+    let defender = 16usize;
+    park_players_except(&mut sim, &[dribbler, defender]);
+    sim.players[dribbler].team = Team::Home;
+    sim.players[dribbler].role = PlayerRole::Midfielder;
+    sim.players[dribbler].position = Vec2::new(40.0, 38.0);
+    sim.players[dribbler].velocity = Vec2::new(0.0, 3.8);
+    sim.players[dribbler].skills.dribbling = 8.4;
+    sim.players[dribbler].skills.first_touch = 8.0;
+    sim.players[dribbler].skills.acceleration = 8.2;
+    sim.players[defender].team = Team::Away;
+    sim.players[defender].position = Vec2::new(42.6, 42.0);
+    sim.players[defender].velocity = Vec2::zero();
+    sim.ball.holder = Some(dribbler);
+    sim.ball.position = sim.players[dribbler].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let current = sim.players[dribbler].position;
+    let target = Vec2::new(40.0, 42.0);
+    let crowded_snapshot = WorldSnapshot::from_match(&sim);
+    let crowded = dribble_mpc_control_estimate_for_snapshot(
+        &crowded_snapshot,
+        dribbler,
+        Team::Home,
+        sim.players[dribbler].role,
+        &sim.players[dribbler].skills,
+        sim.players[dribbler].fatigue,
+        current,
+        sim.players[dribbler].velocity,
+        target,
+        3.0,
+    );
+
+    sim.players[defender].velocity = Vec2::new(5.0, 0.0);
+    let retreating_snapshot = WorldSnapshot::from_match(&sim);
+    let retreating = dribble_mpc_control_estimate_for_snapshot(
+        &retreating_snapshot,
+        dribbler,
+        Team::Home,
+        sim.players[dribbler].role,
+        &sim.players[dribbler].skills,
+        sim.players[dribbler].fatigue,
+        current,
+        sim.players[dribbler].velocity,
+        target,
+        3.0,
+    );
+
+    assert!(
+        crowded.space_margin_yards < -0.25,
+        "static marker 2.6yd from an own-half touch should be below the 3yd comfort margin: {crowded:?}"
+    );
+    assert!(
+        retreating.space_margin_yards > crowded.space_margin_yards + 2.0,
+        "MPC margin should relieve a marker moving away from the dribble target: crowded={crowded:?} retreating={retreating:?}"
+    );
+    assert!(
+        retreating.control_probability > crowded.control_probability,
+        "moving-away relief should improve the learned dribble-control prior: crowded={crowded:?} retreating={retreating:?}"
+    );
+}
+
+#[test]
 fn shot_mpc_qp_target_fit_rewards_clean_execution() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -60309,6 +60386,154 @@ fn defender_carry_target_preserves_spacing_gap_under_pressure() {
     assert!(
         (target.y - origin.y) * Team::Home.attack_dir() <= 0.1,
         "with the nearest opponent straight ahead, the safe defender target should not poke forward: origin={origin:?} target={target:?}"
+    );
+}
+
+#[test]
+fn ballholder_carry_target_keeps_two_yard_gap_from_static_marker() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let marker = 12;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 62.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 8.1;
+    sim.players[holder].skills.acceleration = 8.6;
+    sim.players[marker].position = Vec2::new(40.0, 65.0);
+    sim.players[marker].velocity = Vec2::zero();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let marker_position = sim.players[marker].position;
+    let target = snapshot.dribble_move_target_for_touch(
+        holder,
+        sim.players[holder].home_position,
+        DribbleMoveKind::CarryForward,
+        DribbleTouchDecision::new(0, 4.8),
+    );
+
+    assert!(
+        target.distance(marker_position) >= DRIBBLE_OPPONENT_MIN_SPACE_YARDS - 1e-6,
+        "ballholder should not carry directly inside the 2yd marker gap: target={target:?} marker={marker_position:?}"
+    );
+    assert!(
+        (target.y - origin.y) * Team::Home.attack_dir() > 0.4,
+        "safe escape should still make useful upfield progress: origin={origin:?} target={target:?}"
+    );
+}
+
+#[test]
+fn own_half_ballholder_carry_target_preserves_three_yard_gap() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let marker = 12;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 38.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 8.1;
+    sim.players[holder].skills.acceleration = 8.6;
+    sim.players[marker].position = Vec2::new(40.0, 41.5);
+    sim.players[marker].velocity = Vec2::zero();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let marker_position = sim.players[marker].position;
+    let target = snapshot.dribble_move_target_for_touch(
+        holder,
+        sim.players[holder].home_position,
+        DribbleMoveKind::CarryForward,
+        DribbleTouchDecision::new(0, 4.8),
+    );
+
+    assert!(
+        target.distance(marker_position) >= DRIBBLE_OWN_HALF_MIN_SPACE_YARDS - 1e-6,
+        "own-half holder should preserve a 3yd cushion when possible: target={target:?} marker={marker_position:?}"
+    );
+    assert!(
+        (target.y - origin.y) * Team::Home.attack_dir() > 0.4,
+        "own-half spacing escape should still move upfield when the lane permits: origin={origin:?} target={target:?}"
+    );
+}
+
+#[test]
+fn moving_away_marker_relieves_ballholder_spacing_pressure() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let outlet = 9;
+    park_players_except(&mut sim, &[holder, outlet]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 38.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].skills.dribbling = 7.8;
+    sim.players[holder].skills.passing_completion_rate = 7.8;
+    sim.players[outlet].team = Team::Home;
+    sim.players[outlet].role = PlayerRole::Midfielder;
+    sim.players[outlet].position = Vec2::new(46.0, 45.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let directive = snapshot.tactical_directive(Team::Home).clone();
+    let base = snapshot.observation_for(holder);
+    let scores = |closing_rate: f64| {
+        let mut observation = base.clone();
+        observation.nearest_opponent_distance = 2.6;
+        observation
+            .neural_extended
+            .nearest_opponent_closing_rate_yps = closing_rate;
+        observation.perceived_pressure = 0.18;
+        observation.pressure_urgency = 0.16;
+        observation.immediate_dispossession_risk = 0.08;
+        observation.visible_pass_options = 1;
+        observation.visible_forward_pass_options = 1;
+        observation.open_support_outlets = 1;
+        observation.expected_pass_completion = 0.82;
+        observation.best_pass_receiver_openness = 0.82;
+        observation.best_forward_pass_receiver_openness = 0.78;
+        observation.floor_pass_lane_score = 0.82;
+        observation.forward_dribble_space_yards = 9.0;
+        observation.yards_to_own_goal = 38.0;
+        observation.yards_to_goal = 82.0;
+        let options = sim.players[holder].possession_action_options(
+            &observation,
+            &directive,
+            1,
+            0,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        );
+        let pass = action_option_score(&options, "pass1");
+        let carry = action_option_score(&options, "dribble")
+            .max(action_option_score(&options, "carry-forward"));
+        (pass, carry)
+    };
+
+    let (static_pass, static_carry) = scores(0.0);
+    let (away_pass, away_carry) = scores(-3.0);
+    let static_spacing = dribble_spacing_pressure_for_state(PlayerRole::Midfielder, true, 2.6, 0.0);
+    let away_spacing = dribble_spacing_pressure_for_state(PlayerRole::Midfielder, true, 2.6, -3.0);
+
+    assert!(
+        away_spacing < static_spacing * 0.25,
+        "moving-away relief should collapse most of the static spacing pressure: static={static_spacing} away={away_spacing}"
+    );
+    assert!(
+        away_carry > static_carry,
+        "a marker moving away should not over-damp the final dribble score: static={static_carry} away={away_carry}"
+    );
+    assert!(
+        away_pass >= static_pass * 0.98,
+        "moving-away relief should not suppress a good forward pass option: static={static_pass} away={away_pass}"
     );
 }
 
