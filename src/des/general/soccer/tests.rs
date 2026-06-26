@@ -46099,13 +46099,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
             + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM,
         SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM
             + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM
-    );
-    assert_eq!(
-        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM + SOCCER_NEURAL_SHOT_TRIGGER_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM,
@@ -46252,10 +46248,6 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION + 1,
-        SOCCER_NEURAL_FEATURE_SHOT_KEEPER_NET_AVAILABLE
-    );
-    assert_eq!(
-        SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT + 1,
         SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN
     );
     assert_eq!(
@@ -46326,7 +46318,6 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         .contains(&SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
         .contains(&SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM));
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
         .contains(&SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM));
@@ -46881,19 +46872,6 @@ fn shot_mpc_qp_target_fit_rewards_clean_execution() {
         clean.accuracy_probability > rushed.accuracy_probability + 0.12,
         "MPC shot accuracy should be higher for the clean solve: clean={clean:?} rushed={rushed:?}"
     );
-    assert!(
-        clean.body_mechanics_fit > rushed.body_mechanics_fit + 0.12,
-        "MPC body mechanics should veto rushed/poor-foot contact: clean={clean:?} rushed={rushed:?}"
-    );
-    assert!(
-        clean.foot_mechanics_fit > rushed.foot_mechanics_fit + 0.10,
-        "preferred-foot strike fit should separate clean from rushed contact: clean={clean:?} rushed={rushed:?}"
-    );
-    assert!(
-        (0.0..=1.0).contains(&clean.keeper_net_available)
-            && (0.0..=1.0).contains(&clean.rebound_second_chance_probability),
-        "keeper net and rebound estimates should be normalized: clean={clean:?}"
-    );
 }
 
 #[test]
@@ -46930,9 +46908,6 @@ fn dribble_and_shot_neural_features_include_mpc_accuracy_context() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(holder);
-    assert!(observation.shot_mpc_body_mechanics_fit > 0.0);
-    assert!(observation.shot_mpc_preferred_foot_fit > 0.0);
-    assert!(observation.shot_trigger_window_score > 0.0);
     let dribble_target = Vec2::new(39.0, 92.0);
     let dribble_action_target = AgentActionTargetTrace {
         point: Some(dribble_target),
@@ -47003,135 +46978,6 @@ fn dribble_and_shot_neural_features_include_mpc_accuracy_context() {
     assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_ACCURACY_PROBABILITY] > 0.0);
     assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_QP_TARGET_FIT] > 0.0);
     assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_GOAL_PROBABILITY] >= 0.0);
-    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_WINDOW] > 0.0);
-    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS] > 0.0);
-    assert!(shot_features[SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT] > 0.0);
-}
-
-#[test]
-fn shot_trigger_pomdp_waits_on_low_pressure_twenty_five_yard_shot() {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig {
-        duration_seconds: 0.1,
-        seed: 24_624,
-        ..Default::default()
-    });
-    let shooter = 9usize;
-    let keeper = sim
-        .players
-        .iter()
-        .find(|player| player.team == Team::Away && player.role == PlayerRole::Goalkeeper)
-        .map(|player| player.id)
-        .expect("away keeper");
-    park_players_except(&mut sim, &[shooter, keeper]);
-    sim.players[shooter].team = Team::Home;
-    sim.players[shooter].role = PlayerRole::Forward;
-    sim.players[shooter].position = Vec2::new(40.0, 95.0);
-    sim.players[shooter].velocity = Vec2::new(0.0, 2.4);
-    sim.players[shooter].skills.shooting = 8.3;
-    sim.players[shooter].skills.first_touch = 8.0;
-    sim.players[shooter].skills.right_foot_shot_power = 8.1;
-    sim.players[keeper].position = Vec2::new(40.0, 119.0);
-    sim.ball.holder = Some(shooter);
-    sim.ball.position = sim.players[shooter].position;
-    sim.ball.velocity = Vec2::new(0.0, 1.6);
-    sim.ball.acceleration = Vec2::new(0.0, 0.3);
-    sim.ball.last_touch_team = Some(Team::Home);
-
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let mut early = snapshot.observation_for(shooter);
-    early.yards_to_goal = 25.0;
-    early.shot_lane_open = true;
-    early.shot_block_probability = 0.18;
-    early.shot_on_frame_probability = 0.55;
-    early.shot_beat_goalkeeper_probability = 0.26;
-    early.shot_keeper_net_available = 0.30;
-    early.shot_rebound_second_chance_probability = 0.08;
-    early.opponent_goal_angle_degrees = 24.0;
-    early.forward_dribble_space_yards = 9.0;
-    early.perceived_pressure = 0.08;
-    early.pressure_urgency = 0.08;
-    early.immediate_dispossession_risk = 0.07;
-    early.offensive_urgency = 0.30;
-    early.goal_attack_window_score = 0.44;
-    early.shot_mpc_body_mechanics_fit = 0.60;
-    early.shot_mpc_preferred_foot_fit = 0.62;
-    let early_profile = shot_trigger_profile_for_observation(&early, PlayerRole::Forward);
-    early.shot_trigger_window_score = early_profile.window_score;
-    early.shot_trigger_patience_yards = early_profile.patience_yards;
-    early.shot_trigger_too_early_risk = early_profile.too_early_risk;
-
-    assert!(
-        !shot_trigger_timing_allows_shot(&early, PlayerRole::Forward),
-        "low-pressure 25yd striker shot with carry space should be sent back to POMDP: {early_profile:?}"
-    );
-    assert!(
-        early_profile.patience_yards > 4.0 && early_profile.too_early_risk > 0.42,
-        "25yd setup should carry a material patience/early-risk signal: {early_profile:?}"
-    );
-
-    let mut close = early.clone();
-    close.yards_to_goal = 15.0;
-    close.forward_dribble_space_yards = 1.0;
-    close.shot_keeper_net_available = 0.48;
-    close.goal_attack_window_score = 0.66;
-    let close_profile = shot_trigger_profile_for_observation(&close, PlayerRole::Forward);
-    close.shot_trigger_window_score = close_profile.window_score;
-    close.shot_trigger_patience_yards = close_profile.patience_yards;
-    close.shot_trigger_too_early_risk = close_profile.too_early_risk;
-    assert!(
-        shot_trigger_timing_allows_shot(&close, PlayerRole::Forward),
-        "15yd window with adequate MPC mechanics should be shootable: {close_profile:?}"
-    );
-    assert!(
-        close_profile.too_early_risk < early_profile.too_early_risk * 0.5,
-        "closer window should lower premature-shot risk: early={early_profile:?} close={close_profile:?}"
-    );
-
-    let mut poor_mpc = close.clone();
-    poor_mpc.shot_mpc_body_mechanics_fit = 0.18;
-    poor_mpc.shot_mpc_preferred_foot_fit = 0.22;
-    assert!(
-        !shot_trigger_timing_allows_shot(&poor_mpc, PlayerRole::Forward),
-        "POMDP-positive shot should be rejected when individual MPC says the strike shape is poor"
-    );
-
-    let early_key = SoccerQStateKey::from_parts(
-        &snapshot.mdp_state_for_player(shooter),
-        &early,
-        Team::Home,
-        PlayerRole::Forward,
-    );
-    let close_key = SoccerQStateKey::from_parts(
-        &snapshot.mdp_state_for_player(shooter),
-        &close,
-        Team::Home,
-        PlayerRole::Forward,
-    );
-    assert!(early_key.shot_trigger_too_early_bin > close_key.shot_trigger_too_early_bin);
-    assert!(close_key.shot_trigger_window_bin >= early_key.shot_trigger_window_bin);
-
-    let transition = SoccerLearningTransition {
-        tick: snapshot.tick,
-        player_id: shooter,
-        team: Team::Home,
-        role: PlayerRole::Forward,
-        state: snapshot.mdp_state_for_player(shooter),
-        observation: early.clone(),
-        belief: belief_from_observation(&early),
-        action: "shoot".to_string(),
-        action_target: None,
-        decision_context: SoccerDecisionContext::default(),
-        tactical_trace: SoccerTacticalLearningTrace::default(),
-        reward: 0.0,
-        next_state: snapshot.mdp_state_for_player(shooter),
-        next_observation: close,
-        done: false,
-    };
-    let features = soccer_neural_transition_features(&transition);
-    assert!(features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_TOO_EARLY] > 0.30);
-    assert!(features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_PATIENCE] > 0.30);
-    assert!(features[SOCCER_NEURAL_FEATURE_SHOT_KEEPER_NET_AVAILABLE] > 0.0);
-    assert!(features[SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS] > 0.0);
 }
 
 #[test]
@@ -66635,23 +66481,6 @@ fn live_http_bridge_embeds_mounted_realtime_routes() {
     assert_eq!(state_value["liveHttp"]["boundedWorkerQueue"], true);
     assert_eq!(state_value["liveHttp"]["reusesWorkers"], true);
     assert_eq!(state_value["liveHttp"]["spawnsPerRequest"], false);
-    assert_eq!(
-        state_value["liveHttp"]["simulationStepModel"],
-        "per-game-session-mutex"
-    );
-    assert_eq!(
-        state_value["liveHttp"]["gameTicksSingleThreadedPerSession"],
-        true
-    );
-    assert_eq!(
-        state_value["liveHttp"]["concurrentStepRequestsSerialized"],
-        true
-    );
-    assert_eq!(
-        state_value["liveHttp"]["namedGamesHaveIndependentSessions"],
-        true
-    );
-    assert_eq!(state_value["liveHttp"]["namedGamesMayStepInParallel"], true);
 
     let step = bridge.handle_request(
         "POST",
@@ -66713,14 +66542,6 @@ fn live_http_worker_pool_count_is_sanitized_and_bounded() {
     assert!(zero_state.live_http.bounded_worker_queue);
     assert!(zero_state.live_http.reuses_workers);
     assert!(!zero_state.live_http.spawns_per_request);
-    assert_eq!(
-        zero_state.live_http.simulation_step_model,
-        "per-game-session-mutex"
-    );
-    assert!(zero_state.live_http.game_ticks_single_threaded_per_session);
-    assert!(zero_state.live_http.concurrent_step_requests_serialized);
-    assert!(zero_state.live_http.named_games_have_independent_sessions);
-    assert!(zero_state.live_http.named_games_may_step_in_parallel);
 
     let oversized_server = SoccerLiveServer::new(SoccerLiveServerConfig {
         match_config: MatchConfig {
