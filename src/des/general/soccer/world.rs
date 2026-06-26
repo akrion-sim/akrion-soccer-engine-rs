@@ -378,6 +378,17 @@ pub struct SoccerMatch {
     pub(crate) loose_ball_commit_samples: Vec<LooseBallCommitSample>,
     /// Open loose-ball commit decisions awaiting their windowed reward.
     pub(crate) pending_loose_ball_commit: Vec<PendingLooseBallCommitDecision>,
+    /// The trained long-pass run head (which attacker should break forward so a deep carrier
+    /// can pick them out), when present. Carried + trained across games by the learner; `None`
+    /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) long_pass_run_head: Option<std::sync::Arc<LongPassRunHead>>,
+    /// Rolling RL corpus for the long-pass run head: per-runner state + the run action taken +
+    /// the windowed territorial reward. Collected only while the model is enabled
+    /// (`collect_long_pass_run_rl_samples`); empty + untouched in the default process.
+    pub(crate) long_pass_run_samples: Vec<LongPassRunSample>,
+    /// Open long-pass run decisions awaiting their windowed reward.
+    pub(crate) pending_long_pass_run: Vec<PendingLongPassRunDecision>,
     /// The trained aerial-reception control head (how high to attack a dropping lofted
     /// ball), when present. Carried + trained across games by the learner; `None` ⇒ the
     /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -1927,6 +1938,9 @@ impl SoccerMatch {
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
+            long_pass_run_head: None,
+            long_pass_run_samples: Vec::new(),
+            pending_long_pass_run: Vec::new(),
             aerial_reception_head: None,
             aerial_reception_samples: Vec::new(),
             pending_aerial_reception: Vec::new(),
@@ -6535,6 +6549,7 @@ impl SoccerMatch {
         // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
         self.update_loose_ball_urgency(&next_snapshot);
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
         self.collect_attack_spacing_rl_samples(&next_snapshot);
@@ -11303,20 +11318,6 @@ impl SoccerMatch {
                     let goal_y = player_team.goal_y(self.config.field_length_yards);
                     let goal_center_x = self.config.field_width_yards * 0.5;
                     let half_goal = self.config.goal_width_yards * 0.5;
-                    let raw_shot_speed =
-                        shot_speed_yps_from_power(power, &self.players[player_id].skills);
-                    let shot_mpc = shot_mpc_accuracy_estimate_for_snapshot(
-                        &snapshot,
-                        player_id,
-                        player_team,
-                        &self.players[player_id].skills,
-                        self.players[player_id].fatigue,
-                        player_pos,
-                        self.players[player_id].velocity,
-                        raw_shot_speed,
-                        false,
-                        pressure,
-                    );
                     let curl_probability = shot_curl_probability_for_player(
                         &self.players[player_id].skills,
                         pressure,
@@ -11344,17 +11345,15 @@ impl SoccerMatch {
                     } else if dd_soccer_enable_scored_shot_placement() {
                         // Price the placement: aim a non-curl shot at the goal-mouth spot
                         // the keeper can least reach, instead of dead-centre into them.
-                        if shot_mpc.qp_target_fit >= 0.34 && shot_mpc.body_mechanics_fit >= 0.28 {
-                            shot_mpc.target_point.x
-                        } else {
-                            snapshot.scored_shot_placement_x(
-                                player_team,
-                                player_pos,
-                                goal_y,
-                                raw_shot_speed,
-                                ability01(self.players[player_id].skills.shooting),
-                            )
-                        }
+                        let shot_speed =
+                            shot_speed_yps_from_power(power, &self.players[player_id].skills);
+                        snapshot.scored_shot_placement_x(
+                            player_team,
+                            player_pos,
+                            goal_y,
+                            shot_speed,
+                            ability01(self.players[player_id].skills.shooting),
+                        )
                     } else {
                         goal_center_x
                     };
@@ -11373,12 +11372,7 @@ impl SoccerMatch {
                         ),
                         goal_y,
                     );
-                    let speed = (raw_shot_speed
-                        * (0.88 + shot_mpc.foot_mechanics_fit.clamp(0.0, 1.0) * 0.12))
-                        .clamp(
-                            mph_to_yps(SHOT_MIN_SPEED_MPH),
-                            mph_to_yps(SHOT_MAX_SPEED_MPH),
-                        );
+                    let speed = shot_speed_yps_from_power(power, &self.players[player_id].skills);
                     let mut curve = DiscretizedKickCurve::None;
                     let mut curve_bend_yards = 0.0;
                     if use_curl {
@@ -17979,6 +17973,11 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained long-pass run head, carried from the match for live consumption in
+    /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
+    /// serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) long_pass_run_head: Option<std::sync::Arc<LongPassRunHead>>,
     /// The trained attacking-spacing head, carried from the match for live
     /// consumption by the off-ball target scorer and formation-LP spacing floor.
     /// `None` ⇒ analytic seed (parity). Skipped by serde (internal decision aid;
@@ -18633,6 +18632,15 @@ pub(crate) fn dd_soccer_disable_spacing_nudge() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SPACING_NUDGE").is_ok())
 }
+/// Over-the-top ball keeper-avoidance angling (default ON). Set this to restore the historical
+/// behaviour byte-for-byte: an in-behind ball is projected onto the runner's raw x with no lateral
+/// nudge away from the opponent keeper, and the over-the-top selector carries no keeper-avoidance
+/// preference. See `over_the_top_gk_angled_point`.
+pub(crate) fn dd_soccer_disable_over_top_gk_angle() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OVER_TOP_GK_ANGLE").is_ok())
+}
 /// When an off-ball forward/midfielder is holding a support position (NOT timing a
 /// sanctioned in-behind run), they should sit level with the last defender — on the
 /// shoulder, onside — rather than parking `OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS`
@@ -18890,6 +18898,17 @@ fn dd_soccer_disable_winger_byline_option() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
+}
+/// Long-pass run requirement (Part B of the long-pass-option-runs feature). ON by default: a
+/// DEEP carrier may only pre-empt-commit a long aerial to a teammate who actually made the run
+/// (`backfield_long_pass_run_invite_for > 0`), so a calm backfield holder picks out a runner
+/// instead of lofting a long ball into empty space. Set `DD_SOCCER_DISABLE_LONG_PASS_RUN_REQUIRED=1`
+/// to restore the unrestricted behaviour byte-for-byte (the deep-holder long ball fires whenever
+/// the viability gate passes, regardless of whether a runner is on).
+fn dd_soccer_disable_long_pass_run_required() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LONG_PASS_RUN_REQUIRED").is_ok())
 }
 /// Keeper goalside guard. ON by default: the goalkeeper only abandons its goalside ball↔goal
 /// tracking line to push up into the buildup-outlet shape when our team GENUINELY controls the
@@ -19684,6 +19703,7 @@ impl WorldSnapshot {
             line_depth_head: m.line_depth_head.clone(),
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            long_pass_run_head: m.long_pass_run_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
             shot_trigger_head: m.shot_trigger_head.clone(),
@@ -23600,17 +23620,6 @@ impl WorldSnapshot {
                 shot_on_frame_probability: 0.0,
                 shot_beat_goalkeeper_probability: 0.0,
                 shot_curl_probability: 0.0,
-                shot_keeper_net_available: 0.0,
-                shot_rebound_second_chance_probability: 0.0,
-                shot_trigger_window_score: 0.0,
-                shot_trigger_patience_yards: 0.0,
-                shot_trigger_too_early_risk: 0.0,
-                shot_ball_x_fraction: 0.0,
-                shot_ball_y_fraction: 0.0,
-                shot_ball_goalward_velocity_yps: 0.0,
-                shot_ball_goalward_acceleration_yps2: 0.0,
-                shot_mpc_body_mechanics_fit: 0.0,
-                shot_mpc_preferred_foot_fit: 0.0,
                 pass_curl_probability: 0.0,
                 immediate_dispossession_risk: 0.0,
                 yards_to_goal: 0.0,
@@ -24509,38 +24518,6 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let shot_keeper_net_available = shot_mpc_accuracy
-            .map(|estimate| estimate.keeper_net_available)
-            .unwrap_or(0.0);
-        let shot_rebound_second_chance_probability = shot_mpc_accuracy
-            .map(|estimate| estimate.rebound_second_chance_probability)
-            .unwrap_or(0.0);
-        let shot_mpc_body_mechanics_fit = shot_mpc_accuracy
-            .map(|estimate| estimate.body_mechanics_fit)
-            .unwrap_or(0.0);
-        let shot_mpc_preferred_foot_fit = shot_mpc_accuracy
-            .map(|estimate| estimate.foot_mechanics_fit)
-            .unwrap_or(0.0);
-        let shot_ball_x_fraction = if has_ball {
-            (self.ball.position.x / self.field_width.max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let shot_ball_y_fraction = if has_ball {
-            (self.ball.position.y / self.field_length.max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let shot_ball_goalward_velocity_yps = if has_ball {
-            self.ball.velocity.y * me.team.attack_dir()
-        } else {
-            0.0
-        };
-        let shot_ball_goalward_acceleration_yps2 = if has_ball {
-            self.ball.acceleration.y * me.team.attack_dir()
-        } else {
-            0.0
-        };
         let shot_eval_elapsed = phase_started.elapsed();
         let phase_started = Instant::now();
         let immediate_dispossession_risk = if has_ball {
@@ -24722,30 +24699,6 @@ impl WorldSnapshot {
             .max(offensive_urgency)
             .max(defensive_urgency)
             .clamp(0.0, 1.0);
-        let shot_trigger_profile = shot_trigger_profile_from_inputs(
-            me.role,
-            has_ball,
-            yards_to_goal,
-            shot_lane_open,
-            shot_block_probability,
-            shot_on_frame_probability,
-            shot_beat_goalkeeper_probability,
-            shot_curl_probability,
-            shot_keeper_net_available,
-            shot_rebound_second_chance_probability,
-            opponent_goal_angle_degrees,
-            opposing_goalkeeper_out_of_position,
-            forward_dribble_space_yards,
-            perceived_pressure,
-            pressure_urgency,
-            immediate_dispossession_risk,
-            offensive_urgency,
-            goal_attack_window_score,
-            shot_ball_goalward_velocity_yps,
-            shot_ball_goalward_acceleration_yps2,
-            shot_mpc_body_mechanics_fit,
-            shot_mpc_preferred_foot_fit,
-        );
         let excessive_hold_pressure = if has_ball {
             excessive_hold_pressure_from_parts(
                 actual_time_on_ball_seconds,
@@ -25024,17 +24977,6 @@ impl WorldSnapshot {
             shot_on_frame_probability,
             shot_beat_goalkeeper_probability,
             shot_curl_probability,
-            shot_keeper_net_available,
-            shot_rebound_second_chance_probability,
-            shot_trigger_window_score: shot_trigger_profile.window_score,
-            shot_trigger_patience_yards: shot_trigger_profile.patience_yards,
-            shot_trigger_too_early_risk: shot_trigger_profile.too_early_risk,
-            shot_ball_x_fraction,
-            shot_ball_y_fraction,
-            shot_ball_goalward_velocity_yps,
-            shot_ball_goalward_acceleration_yps2,
-            shot_mpc_body_mechanics_fit,
-            shot_mpc_preferred_foot_fit,
             pass_curl_probability,
             immediate_dispossession_risk,
             yards_to_goal,
@@ -27851,28 +27793,83 @@ impl WorldSnapshot {
     /// a scored POMDP/MAPPO signal, not a forced movement override: off-ball attackers still choose
     /// their own "run-in-behind" action, and the holder still ranks a concrete receiver.
     pub(crate) fn backfield_long_pass_run_invite_for(&self, runner_id: usize) -> f64 {
-        let Some(holder_id) = self.ball.holder else {
+        let Some(inputs) = self.long_pass_run_inputs_for(runner_id) else {
             return 0.0;
         };
-        if holder_id == runner_id {
-            return 0.0;
+        let analytic = analytic_long_pass_run_invite(&inputs);
+        // Gate OFF (default) ⇒ the analytic seed stands, byte-identical to the historical
+        // inline weighted sum. Gate ON with a sufficiently-trained head ⇒ the learned
+        // per-runner invite refines WHICH attacker should make the run and WHEN.
+        if !long_pass_run_model_enabled() {
+            return analytic;
+        }
+        self.long_pass_run_head
+            .as_ref()
+            .filter(|head| head.training_steps() >= LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(&inputs))
+            .map(|p| p.clamp(0.0, 1.0))
+            .unwrap_or(analytic)
+    }
+
+    /// Public accessor for the per-runner long-pass run state (RL sample collection / tests).
+    pub(crate) fn build_long_pass_run_inputs(&self, runner_id: usize) -> Option<LongPassRunInputs> {
+        self.long_pass_run_inputs_for(runner_id)
+    }
+
+    /// Pass-side discipline (Part B): may a holder pre-empt-commit a long aerial to
+    /// `target_id`? When the holder is **deep** (still in his own half), the long ball is only
+    /// released to a teammate who actually MADE the run (`backfield_long_pass_run_invite_for >
+    /// 0`) — so a calm backfield carrier picks out a runner instead of hoofing a long ball into
+    /// space with nobody there (the user's "going way out of bounds to nobody"). A holder past
+    /// midfield, a goalkeeper, or the disable gate ⇒ unrestricted (`true`), so ordinary
+    /// midfield/advanced long balls are untouched and the gate-off path is byte-identical.
+    pub(crate) fn deep_long_aerial_target_is_committed_runner(
+        &self,
+        holder_id: usize,
+        target_id: usize,
+    ) -> bool {
+        if dd_soccer_disable_long_pass_run_required() {
+            return true;
         }
         let Some(holder) = self.players.iter().find(|p| p.id == holder_id) else {
-            return 0.0;
+            return true;
         };
-        let Some(runner) = self.players.iter().find(|p| p.id == runner_id) else {
-            return 0.0;
-        };
+        if holder.role == PlayerRole::Goalkeeper {
+            return true;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        let attack_dir = holder.team.attack_dir();
+        let holder_progress_from_midfield = (holder_pos.y - self.field_length * 0.5) * attack_dir;
+        // Holder is past the backfield band (around/over midfield) ⇒ ordinary long ball, no
+        // run requirement. Only the genuinely DEEP carrier must pick out a committed runner.
+        if holder_progress_from_midfield > BACKFIELD_LONG_PASS_RUN_MIDFIELD_MARGIN_YARDS {
+            return true;
+        }
+        self.backfield_long_pass_run_invite_for(target_id) > 0.0
+    }
+
+    /// Build the per-runner [`LongPassRunInputs`] — all the analytic determinants plus extra
+    /// context (raw geometry, the runner's forward stride, and how many OTHER attackers are
+    /// offering a run) — or `None` where a run is not invited at all (every case the historical
+    /// invite returned `0.0` for). The fit arithmetic here is the SINGLE source the analytic
+    /// seed reads, kept identical to the old inline sum so the gate-off invite is byte-identical.
+    fn long_pass_run_inputs_for(&self, runner_id: usize) -> Option<LongPassRunInputs> {
+        let holder_id = self.ball.holder?;
+        if holder_id == runner_id {
+            return None;
+        }
+        let holder = self.players.iter().find(|p| p.id == holder_id)?;
+        let runner = self.players.iter().find(|p| p.id == runner_id)?;
         if holder.team != runner.team
             || self.possession_team() != Some(holder.team)
             || holder.role == PlayerRole::Goalkeeper
         {
-            return 0.0;
+            return None;
         }
         let attacking_midfielder = runner.role == PlayerRole::Midfielder
             && runner.preferences.offensive_mindedness >= runner.preferences.defensive_mindedness;
         if runner.role != PlayerRole::Forward && !attacking_midfielder {
-            return 0.0;
+            return None;
         }
 
         let holder_pos = self.player_snapshot_position(holder);
@@ -27880,19 +27877,17 @@ impl WorldSnapshot {
         let attack_dir = holder.team.attack_dir();
         let holder_progress_from_midfield = (holder_pos.y - self.field_length * 0.5) * attack_dir;
         if holder_progress_from_midfield > BACKFIELD_LONG_PASS_RUN_MIDFIELD_MARGIN_YARDS {
-            return 0.0;
+            return None;
         }
         let forward_from_holder = (runner_pos.y - holder_pos.y) * attack_dir;
         if forward_from_holder < FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS * 0.5 {
-            return 0.0;
+            return None;
         }
         let holder_pressure = self.attacker_pressure_on_point(holder.team, holder_pos);
         if holder_pressure > BACKFIELD_LONG_PASS_RUN_MAX_PRESSURE {
-            return 0.0;
+            return None;
         }
-        let Some(line_y) = self.second_last_defender_line_for(holder.team) else {
-            return 0.0;
-        };
+        let line_y = self.second_last_defender_line_for(holder.team)?;
         let onside_y = line_y - attack_dir * ONSIDE_RUN_HOLD_BUFFER_YARDS;
         let run_target =
             Vec2::new(runner_pos.x, onside_y).clamp_to_pitch(self.field_width, self.field_length);
@@ -27901,13 +27896,13 @@ impl WorldSnapshot {
         if run_gain < HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS
             || outlet_gain < FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS
         {
-            return 0.0;
+            return None;
         }
         if self
             .pending_offside_for_pass(holder_id, runner_id)
             .is_some()
         {
-            return 0.0;
+            return None;
         }
 
         let nearest_holder_opp = self.nearest_opponent_distance_at(holder.team, holder_pos);
@@ -27944,7 +27939,7 @@ impl WorldSnapshot {
             0.0
         };
         if lane_fit <= 0.0 {
-            return 0.0;
+            return None;
         }
 
         let role_fit = if runner.role == PlayerRole::Forward {
@@ -27952,14 +27947,47 @@ impl WorldSnapshot {
         } else {
             0.86
         };
-        (role_fit
-            * (backfield_fit * 0.16
-                + pressure_fit * 0.22
-                + space_fit * 0.18
-                + dribble_space_fit * 0.14
-                + room_fit * 0.18
-                + lane_fit * 0.12))
-            .clamp(0.0, 1.0)
+
+        // Extra (non-analytic) context the learned head can use: the runner's forward stride
+        // this tick, and how many OTHER attackers are already offering a forward run for this
+        // holder — the centralized coordination signal so the team doesn't pile everyone onto
+        // the same run.
+        let runner_forward_speed = runner.velocity.y * attack_dir;
+        let competing_runners = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.id != holder_id
+                    && p.id != runner_id
+                    && p.team == holder.team
+                    && (p.role == PlayerRole::Forward
+                        || (p.role == PlayerRole::Midfielder
+                            && p.preferences.offensive_mindedness
+                                >= p.preferences.defensive_mindedness))
+                    && (self.player_snapshot_position(p).y - holder_pos.y) * attack_dir
+                        >= FORWARD_MOMENTUM_LONG_BALL_FORWARD_YARDS * 0.5
+            })
+            .count() as f64;
+
+        let mut inputs = LongPassRunInputs {
+            backfield_fit,
+            pressure_fit,
+            space_fit,
+            dribble_space_fit,
+            room_fit,
+            lane_fit,
+            role_fit,
+            forward_from_holder,
+            run_gain,
+            outlet_gain,
+            holder_pressure,
+            nearest_holder_opp,
+            runner_forward_speed,
+            competing_runners,
+            analytic_seed: 0.0,
+        };
+        inputs.analytic_seed = analytic_long_pass_run_invite(&inputs);
+        Some(inputs)
     }
 
     fn open_space_support_line_y(&self, team: Team, second_last_line_y: f64) -> f64 {
@@ -28485,6 +28513,61 @@ impl WorldSnapshot {
             - line_penalty * 0.34
     }
 
+    /// The x-coordinate an over-the-top ball should avoid dropping onto: the opponent keeper's
+    /// current x, falling back to the goal centre when no keeper is visible.
+    pub(crate) fn over_the_top_keeper_x(&self, attacking_team: Team) -> f64 {
+        self.goalkeeper_for(attacking_team.other())
+            .and_then(|gk| self.player_position(gk))
+            .map(|p| p.x)
+            .unwrap_or(self.field_width * 0.5)
+    }
+
+    /// How well an over-the-top landing point dodges the sweeping keeper, in `[0, 1]`: 0 when the
+    /// ball drops onto the keeper's x, ramping to 1 once it is a full claim-channel clear into the
+    /// running lane. Used by the over-the-top selector so the MDP prefers the keeper-avoidant ball.
+    pub(crate) fn over_the_top_keeper_avoidance_fit(&self, attacking_team: Team, landing: Vec2) -> f64 {
+        let keeper_x = self.over_the_top_keeper_x(attacking_team);
+        ((landing.x - keeper_x).abs() / OVER_TOP_GK_CLAIM_CHANNEL_YARDS).clamp(0.0, 1.0)
+    }
+
+    /// Angle a projected over-the-top landing point a few yards AWAY from the opponent keeper so a
+    /// long ball in behind drops into the channel the runner attacks rather than straight onto the
+    /// sweeping keeper. The nudge is SLIGHT (capped at `OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS`) and only
+    /// applied to genuine over-the-top balls (`forward_yards >= OVER_TOP_BALL_MIN_FORWARD_YARDS`)
+    /// whose naive landing point sits inside the keeper's central claim channel. Short threads,
+    /// already-wide balls, and the disable gate return the point byte-identically.
+    pub(crate) fn over_the_top_gk_angled_point(
+        &self,
+        attacking_team: Team,
+        naive: Vec2,
+        forward_yards: f64,
+    ) -> Vec2 {
+        if dd_soccer_disable_over_top_gk_angle()
+            || forward_yards < OVER_TOP_BALL_MIN_FORWARD_YARDS
+        {
+            return naive;
+        }
+        let keeper_x = self.over_the_top_keeper_x(attacking_team);
+        let offset = naive.x - keeper_x;
+        // Already clear of the keeper's claim channel ⇒ the runner already attacks open grass, leave it.
+        if offset.abs() >= OVER_TOP_GK_CLAIM_CHANNEL_YARDS {
+            return naive;
+        }
+        // Push toward the side the landing already favours; if dead-central, choose the side with
+        // more room to the touchline so the ball runs into open space, not toward a corner flag.
+        let side = if offset.abs() > 1e-3 {
+            offset.signum()
+        } else if keeper_x <= self.field_width * 0.5 {
+            1.0
+        } else {
+            -1.0
+        };
+        let target_x = keeper_x + side * OVER_TOP_GK_CLAIM_CHANNEL_YARDS;
+        let shift = (target_x - naive.x)
+            .clamp(-OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS, OVER_TOP_GK_ANGLE_MAX_SHIFT_YARDS);
+        Vec2::new(naive.x + shift, naive.y).clamp_to_pitch(self.field_width, self.field_length)
+    }
+
     pub(crate) fn projected_in_behind_pass_point(
         &self,
         passer_id: usize,
@@ -28523,10 +28606,14 @@ impl WorldSnapshot {
             return None;
         }
         let projected_y = line_y + passer.team.attack_dir() * 11.0;
-        Some(
-            Vec2::new(target_position.x, projected_y)
-                .clamp_to_pitch(self.field_width, self.field_length),
-        )
+        let naive = Vec2::new(target_position.x, projected_y)
+            .clamp_to_pitch(self.field_width, self.field_length);
+        // Angle a true over-the-top ball off the keeper so it drops into the runner's channel
+        // rather than dead-central onto the sweeper. Threads the keeper-avoidance through every
+        // consumer (killer/threaded pass + long-ball selector + their POMDP observation fields).
+        let passer_position = self.player_snapshot_position(passer);
+        let forward_yards = (naive.y - passer_position.y) * passer.team.attack_dir();
+        Some(self.over_the_top_gk_angled_point(passer.team, naive, forward_yards))
     }
 
     pub(crate) fn player_forward_progress_over_seconds(
@@ -28639,9 +28726,19 @@ impl WorldSnapshot {
                 } else {
                     1.2
                 };
+                // Prefer the keeper-avoidant over-the-top ball: one angled into the runner's
+                // channel beats one dropping dead-central onto the sweeping keeper. Gated with the
+                // angling itself (off ⇒ no term ⇒ byte-identical selection).
+                let keeper_avoid = if dd_soccer_disable_over_top_gk_angle() {
+                    0.0
+                } else {
+                    self.over_the_top_keeper_avoidance_fit(passer.team, pass_point)
+                        * OVER_TOP_KEEPER_AVOID_SCORE_WEIGHT
+                };
                 let score = forward * 0.10 + self.space_score_at(pass_point, passer.team) * 0.06
                     - passer_position.distance(pass_point) * 0.010
-                    + line_bonus;
+                    + line_bonus
+                    + keeper_avoid;
                 Some((target.id, score))
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
