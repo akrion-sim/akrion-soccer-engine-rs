@@ -31191,19 +31191,22 @@ impl WorldSnapshot {
         if (pos.y - self.field_length * 0.5) * attack_dir <= 0.0 {
             return false;
         }
-        // The same activation window the team-committed drive uses: near enough that the corner is
-        // the destination, but not already at the byline (where the cross decision takes over).
+        // BUILD-UP band only: from the activation reach in to the deep-finishing floor. Outside the
+        // finishing zone (where cutting inside to shoot / a goalmouth carry is the better individual
+        // play) — this is the band where a winger otherwise stalls ~30yd out instead of driving.
+        // The deeper run all the way to the byline stays reserved for the team-committed drive.
         let goal_y = me.team.goal_y(self.field_length);
         let yards_to_byline = (goal_y - pos.y).abs();
         if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
-            || yards_to_byline <= BYLINE_DRIVE_CROSS_TRIGGER_YARDS
+            || yards_to_byline < WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
         {
             return false;
         }
-        // Wide enough that the corner — not the goal — is the right destination.
-        let mid = self.field_width * 0.5;
-        let width_from_center = ((pos.x - mid).abs() / mid.max(1.0)).clamp(0.0, 1.0);
-        if width_from_center < BYLINE_DRIVE_MIN_FLANK_WIDTH {
+        // Reserved for a genuinely TOUCHLINE-HUGGING winger — the player actually positioned to
+        // drive the corner flag. A merely half-space-wide carrier keeps the deliberate "cut inside
+        // toward goal in the approach band" behaviour, which is the better play from there.
+        let touchline_distance = pos.x.min(self.field_width - pos.x);
+        if touchline_distance > WINGER_BYLINE_MAX_TOUCHLINE_DISTANCE_YARDS {
             return false;
         }
         // A sound option, not a reckless run: only opt in when there is a genuinely open lane to

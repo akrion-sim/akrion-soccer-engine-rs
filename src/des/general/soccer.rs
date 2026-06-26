@@ -838,6 +838,16 @@ const BYLINE_DRIVE_CROSS_TRIGGER_YARDS: f64 = 7.0;
 // drive into — which is exactly the situation where a winger otherwise stalls ~30yd out instead of
 // driving for the corner. See `winger_byline_drive_opt_in`.
 const WINGER_BYLINE_MIN_DRIVE_SPACE_YARDS: f64 = 6.0;
+// The solo winger opt-in only fires in the BUILD-UP band — at least this far from the byline.
+// Inside it (the deep finishing zone) cutting inside to shoot or a goalmouth carry is the better
+// individual play, so the deep run to the corner stays reserved for the team-committed byline-cross
+// strategy. ~30yd out — where a winger otherwise stalls — sits comfortably inside the band.
+const WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS: f64 = 20.0;
+// The solo opt-in is reserved for a genuinely TOUCHLINE-HUGGING winger (within this many yards of
+// the nearest touchline) — the player actually positioned to drive the corner flag and cross. A
+// merely half-space-wide carrier (further infield) keeps the deliberate "cut inside toward goal in
+// the approach band" behaviour, which is the better individual play from there.
+const WINGER_BYLINE_MAX_TOUCHLINE_DISTANCE_YARDS: f64 = 9.0;
 const STRIKER_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.72;
 const STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.12;
 const STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.06;
