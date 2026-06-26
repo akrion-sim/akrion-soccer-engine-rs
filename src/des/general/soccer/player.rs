@@ -38,6 +38,15 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
+/// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
+/// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
+/// from the nearest presser into the open lane instead of settling into a shield/recycle. Set
+/// `DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE=1` to disable (byte-identical to baseline).
+fn dd_soccer_disable_won_ball_pressure_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE").is_ok())
+}
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -4742,6 +4751,64 @@ impl PlayerAgent {
                 &["turnover-burst", "carry-forward", "vertical-attack"],
                 drive_floor,
             );
+        }
+        // Won the ball in a CROWD under pressure: BREAK AWAY into space. The forward-drive floor
+        // above only fires with clear grass ahead and little pressure (`pressure < 0.55`,
+        // `forward_dribble_space >= WON_BALL_DRIVE_MIN_SPACE_YARDS`) — precisely the situation a
+        // freshly-won ball in traffic is NOT in, so nothing currently turns the genuine win moment
+        // into an explosive break. There the real-soccer move is to accelerate the ball AWAY from
+        // the nearest presser into whatever lane exists (usually lateral/diagonal, rarely straight
+        // ahead) rather than settle into a shield and recycle. This is the pressured complement of
+        // the drive block: same fresh-win trigger (`just_won_fit`, off the genuine elapsed
+        // possession time — NOT the pressure-proxy perceived time the steady-state escape signals
+        // use), but it fires UNDER pressure and routes the floor onto the break-into-space family
+        // (turnover-burst / carry-out-left|right / side-step), whose execution already steers the
+        // ball into the best escape lane (`first_touch_escape_carry_target_for`). Scaled by
+        // acceleration skill so it reads as an explosive break, by the escape-lane room so it stands
+        // its ground when truly boxed in (lane ~0), and by pressure so it collapses to nothing in
+        // calm possession. Default-ON; `DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE` restores parity.
+        if self.role != PlayerRole::Goalkeeper
+            && !dd_soccer_disable_won_ball_pressure_escape()
+            && just_won_fit > 0.0
+            && escape_lane_fit > 0.0
+            && !goalmouth_carry_forced
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let crowd_pressure = pressure_urgency
+                .max(pressure)
+                .max(pressure_from_nearest_distance(
+                    observation.nearest_opponent_distance,
+                ))
+                .clamp(0.0, 1.0);
+            if crowd_pressure >= WON_BALL_PRESSURE_ESCAPE_MIN_PRESSURE {
+                let role_floor = match self.role {
+                    PlayerRole::Forward => 0.40,
+                    PlayerRole::Midfielder => 0.36,
+                    PlayerRole::Defender => 0.24,
+                    PlayerRole::Goalkeeper => 0.0,
+                };
+                let accel_fit = 0.70 + ability01(self.skills.acceleration) * 0.30;
+                // Only when there is no easy way out: an open, makeable outlet means the carrier can
+                // lay it off, so don't force a break into the crowd. `bad_outlet_escape_fit` collapses
+                // to ~0 with a good pass available and ~1 when the carrier is genuinely trapped.
+                let escape_floor = (role_floor
+                    * just_won_fit
+                    * escape_lane_fit
+                    * crowd_pressure
+                    * accel_fit
+                    * bad_outlet_escape_fit)
+                    .clamp(0.0, 0.50);
+                ensure_min_legal_option_family_probability(
+                    &mut options,
+                    &[
+                        "turnover-burst",
+                        "carry-out-left",
+                        "carry-out-right",
+                        "side-step",
+                    ],
+                    escape_floor,
+                );
+            }
         }
         if decisive_goal_pressure >= 0.12 && (shot_legal || killer_pass_legal) {
             let recycle_multiplier = (1.0

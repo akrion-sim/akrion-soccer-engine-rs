@@ -1332,6 +1332,12 @@ const WON_BALL_DRIVE_MIN_SPACE_YARDS: f64 = 4.0;
 /// How long after gaining possession a carry still counts as a "just won the ball" transition for
 /// the drive-into-space floor (real elapsed possession time, `actual_time_on_ball_seconds`).
 const WON_BALL_DRIVE_FRESH_SECONDS: f64 = 0.8;
+/// Minimum (proximity/closing) pressure for the CROWDED won-ball escape floor to fire. Below it the
+/// win is calm enough that the clear-grass forward-drive floor owns the transition; at or above it
+/// the freshly-won carrier is in traffic and should accelerate AWAY into the open lane instead of
+/// settling into a shield. Sits just under the forward-drive block's `pressure < 0.55` cutoff so the
+/// two are complementary (calm+clear → drive forward; pressured+crowded → break into space).
+const WON_BALL_PRESSURE_ESCAPE_MIN_PRESSURE: f64 = 0.45;
 // "There's an open man — play it." When the learned policy proposes a dribble
 // but a teammate is this open with at least this expected completion, release
 // the ball to them rather than carrying on into traffic. Closes the hole where

@@ -6702,6 +6702,86 @@ fn possession_action_options_expose_dt_scaled_tick_probabilities() {
 }
 
 #[test]
+fn just_won_ball_in_a_crowd_breaks_away_into_space() {
+    // Winning the ball in TRAFFIC — a tight presser, no clear grass straight ahead, but a lateral
+    // escape lane open — must give a real probability to the break-into-space family (turnover-burst
+    // / carry-out-left|right / side-step) so the carrier accelerates AWAY from pressure rather than
+    // settling into a shield. Keyed on REAL elapsed possession time (just won), and only when a lane
+    // actually exists — boxed in, or once the ball has been held a while, the floor must not apply.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        seed: 151,
+        ..Default::default()
+    });
+    let holder = 6;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 55.0); // midfield, Home attacks +y
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let directive = snapshot.tactical_directive(Team::Home);
+    let break_family = [
+        "turnover-burst",
+        "carry-out-left",
+        "carry-out-right",
+        "side-step",
+    ];
+    let family_prob = |opts: &[AgentActionOptionTrace]| -> f64 {
+        let legal_total: f64 = opts
+            .iter()
+            .filter(|o| o.legal)
+            .map(|o| o.score.max(0.0))
+            .sum();
+        let fam: f64 = opts
+            .iter()
+            .filter(|o| o.legal && break_family.contains(&o.label.as_str()))
+            .map(|o| o.score.max(0.0))
+            .sum();
+        if legal_total > 0.0 {
+            fam / legal_total
+        } else {
+            0.0
+        }
+    };
+    // Crowded picture: tight defender, forward lane choked, but a real lateral escape lane open.
+    let opts_for = |secs: f64, lane_yards: f64| {
+        let mut obs = snapshot.observation_for(holder);
+        obs.actual_time_on_ball_seconds = secs;
+        obs.forward_dribble_space_yards = 1.4; // forward choked (won't trip the clear-grass drive)
+        obs.perceived_pressure = 0.8;
+        obs.pressure_urgency = 0.8;
+        obs.nearest_opponent_distance = 2.0; // a man right on top of the carrier
+        obs.pressured_escape_lane_yards = lane_yards;
+        sim.players[holder].possession_action_options(
+            &obs,
+            &directive,
+            2,
+            1,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        )
+    };
+    let fresh_p = family_prob(&opts_for(0.1, 8.0)); // just won, lane open
+    let held_p = family_prob(&opts_for(5.0, 8.0)); // had it a while — floor gone
+    let boxed_p = family_prob(&opts_for(0.1, 0.0)); // just won but boxed in — no lane
+    assert!(
+        fresh_p > 0.18,
+        "a just-won ball in a crowd with a lateral lane must give a real break-into-space probability: {fresh_p}"
+    );
+    assert!(
+        fresh_p > held_p + 1e-3,
+        "winning the ball in traffic must break away MORE than holding it a while: fresh={fresh_p} held={held_p}"
+    );
+    assert!(
+        fresh_p > boxed_p + 1e-3,
+        "the escape floor must only fire when a lane exists, not when boxed in: fresh={fresh_p} boxed={boxed_p}"
+    );
+}
+
+#[test]
 fn just_won_ball_with_space_drives_forward_into_it() {
     // Winning the ball with clear grass ahead and little pressure must give a real probability to
     // the forward-drive family (carry-forward / vertical-attack / turnover-burst) so the carrier
