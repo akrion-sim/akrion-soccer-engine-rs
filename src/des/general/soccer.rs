@@ -69,6 +69,8 @@ mod spacing_target;
 pub use spacing_target::*;
 mod aerial_reception;
 pub use aerial_reception::*;
+mod shot_decision;
+pub use shot_decision::*;
 mod reward_shaping;
 pub use reward_shaping::*;
 
@@ -5854,6 +5856,14 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub skill_defensive_tracking: f64,
     pub open_space_score: f64,
+    /// Learnable **shot-trigger MDP/POMDP value** in `[0, 1]` — *how worth it is to shoot
+    /// NOW* (closer-disciplined, distance/angle/keeper/block/rebound/mechanics aware).
+    /// Populated by [`WorldSnapshot::observation_for`] from the snapshot-carried head (or
+    /// the analytic seed). [`SHOT_TRIGGER_MDP_VALUE_UNSET`] (`-1.0`) when the model is
+    /// gated off or the observation was built directly in a test — the decision layer then
+    /// falls back to recomputing the analytic seed. Read by `possession_action_options`.
+    #[serde(default = "shot_trigger_mdp_value_unset")]
+    pub shot_trigger_mdp_value: f64,
     /// Temporal / relational / opponent-intent channels for the value head. See
     /// [`SoccerNeuralExtendedObservation`]. Defaulted (all-zero) for legacy
     /// transitions so old episodes deserialize unchanged.
@@ -46261,6 +46271,7 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         attack_spacing_head: None,
         aerial_reception_head: None,
+        shot_trigger_head: None,
         loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),

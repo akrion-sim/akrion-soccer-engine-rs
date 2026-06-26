@@ -367,6 +367,17 @@ pub struct SoccerMatch {
     pub(crate) aerial_reception_samples: Vec<AerialReceptionSample>,
     /// Open aerial receptions awaiting their control outcome.
     pub(crate) pending_aerial_reception: Vec<PendingAerialReception>,
+    /// The trained shot-trigger value head (when to pull the trigger on a shot), when
+    /// present. Carried + trained across games by the learner; `None` ⇒ the analytic
+    /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone so the shot decision
+    /// reads the same learned value.
+    pub(crate) shot_trigger_head: Option<std::sync::Arc<ShotTriggerHead>>,
+    /// Rolling RL corpus for the shot-trigger head: the shot-decision state + whether a
+    /// shot was taken + the windowed reward. Collected only while the model is enabled
+    /// (`collect_shot_trigger_rl_samples`); empty + untouched in the default process.
+    pub(crate) shot_trigger_samples: Vec<ShotTriggerSample>,
+    /// Open shot decisions awaiting their windowed reward.
+    pub(crate) pending_shot_trigger: Vec<PendingShotTriggerDecision>,
     /// Tick at which the ball most recently became loose AND went uncontested (no
     /// player challenging it). `None` whenever the ball is held / contested. Drives
     /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
@@ -1828,6 +1839,9 @@ impl SoccerMatch {
             aerial_reception_head: None,
             aerial_reception_samples: Vec::new(),
             pending_aerial_reception: Vec::new(),
+            shot_trigger_head: None,
+            shot_trigger_samples: Vec::new(),
+            pending_shot_trigger: Vec::new(),
             loose_ball_uncontested_since_tick: None,
             attack_spacing_samples: Vec::new(),
             pending_attack_spacing: Vec::new(),
@@ -6439,6 +6453,10 @@ impl SoccerMatch {
         // Learnable aerial-reception control RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_AERIAL_RECEPTION` is set).
         self.collect_aerial_reception_rl_samples(&next_snapshot);
+        // Learnable shot-trigger (when to shoot) RL samples. Default-ON model, but the
+        // collector is a no-op when the kill-switch `DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP`
+        // is set.
+        self.collect_shot_trigger_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -17362,6 +17380,11 @@ pub struct WorldSnapshot {
     /// serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
+    /// Carried from the match for live consumption in the shot decision: the trained
+    /// shot-trigger value head (when to pull the trigger). `None` ⇒ analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) shot_trigger_head: Option<std::sync::Arc<ShotTriggerHead>>,
     /// Carried from the match: the tick the loose ball last went uncontested (see
     /// `SoccerMatch::loose_ball_uncontested_since_tick`). `None` ⇒ not loose /
     /// contested. Read by the urgency override so a stale loose ball is attacked.
@@ -18940,6 +18963,7 @@ impl WorldSnapshot {
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
+            shot_trigger_head: m.shot_trigger_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
@@ -22657,6 +22681,7 @@ impl WorldSnapshot {
                 visible_pass_options: 0,
                 visible_aerial_pass_options: 0,
                 open_support_outlets: 0,
+                shot_trigger_mdp_value: shot_trigger_mdp_value_unset(),
                 teammates_ahead: 0,
                 visible_forward_pass_options: 0,
                 threaded_goal_pass_available: false,
@@ -23766,6 +23791,7 @@ impl WorldSnapshot {
             visible_pass_options: visible_pass_targets.len(),
             visible_aerial_pass_options: visible_aerial_pass_targets.len(),
             open_support_outlets,
+            shot_trigger_mdp_value: shot_trigger_mdp_value_unset(),
             teammates_ahead: forward_support_context.teammates_ahead,
             visible_forward_pass_options: forward_support_context.visible_forward_pass_options,
             threaded_goal_pass_available,
@@ -24021,6 +24047,12 @@ impl WorldSnapshot {
         };
         observation.decisive_goal_action_pressure =
             near_goal_decisive_action_pressure_score(&observation, me.role);
+        // Learnable shot-trigger value (when to pull the trigger): consume the trained
+        // head if promoted, else the analytic seed. `None` (gated off) ⇒ the unset
+        // sentinel, so the decision layer reproduces the legacy heuristic (byte-identical).
+        observation.shot_trigger_mdp_value = self
+            .shot_trigger_mdp_value(&observation, me.role, ability01(me.skills.shooting))
+            .unwrap_or_else(shot_trigger_mdp_value_unset);
         let total_elapsed = observation_started.elapsed();
         if soccer_observation_telemetry_enabled()
             && total_elapsed > soccer_observation_telemetry_min_duration()
