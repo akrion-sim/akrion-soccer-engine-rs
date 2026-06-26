@@ -896,6 +896,8 @@ let hoverPlayerId = null;
 let inspectedPlayerId = null;
 let playerMenuPlayerId = null;
 let lastSemanticBallAction = null;
+let stickyHolder = { id: null, team: null };
+let stickyPassTarget = { playerId: null, point: null, urgency: 0 };
 const LIVE_STEP_INTERVAL_MS = 100;
 // Single fallback for the simulation timestep when a frame/config somehow omits it.
 // Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
@@ -2981,11 +2983,60 @@ function yardsToCanvasRadius(yards, r) {
   const fieldLength = Number(state.config.fieldLengthYards || 120);
   return Number(yards || 0) * ((r.w / fieldLength) + (r.h / fieldWidth)) * 0.5;
 }
-function drawPendingPassPhase(r) {
-  const pass = pendingPassPhase();
-  if (!pass?.origin || !pass?.intendedTarget) return;
+function resetStickyPassTarget() {
+  stickyPassTarget.playerId = null;
+  stickyPassTarget.point = null;
+  stickyPassTarget.urgency = 0;
+}
+function passTargetPlayerId(pass) {
+  return pass?.target ?? pass?.targetPlayer ?? pass?.target_player ?? pass?.nearestReceiver ?? pass?.nearest_receiver ?? null;
+}
+function passTargetPoint(pass) {
+  return pass?.intendedTarget ?? pass?.intended_target ?? pass?.receiverPositionAtLaunch ?? pass?.receiver_position_at_launch ?? null;
+}
+function displayPassTarget(frame = state?.frame) {
+  if (frame?.ball?.holder != null) {
+    resetStickyPassTarget();
+    return null;
+  }
+  const pass = pendingPassPhase(frame);
+  if (pass) {
+    stickyPassTarget.playerId = passTargetPlayerId(pass);
+    stickyPassTarget.point = passTargetPoint(pass);
+    stickyPassTarget.urgency = clamp(Number(pass.receiverUrgency ?? pass.receiver_urgency ?? 0), 0, 1);
+  }
+  if (stickyPassTarget.playerId == null && !stickyPassTarget.point) return null;
+  return stickyPassTarget;
+}
+function drawPassTargetCue(target, frame, r) {
+  const player = target.playerId != null
+    ? frame?.players?.find(p => Number(p.id) === Number(target.playerId))
+    : null;
+  const point = player?.position || target.point;
+  if (!point) return;
+  const pt = mapPoint(point, r);
+  const urgency = clamp(Number(target.urgency ?? 0), 0, 1);
+  const pulse = 0.5 + Math.sin(Date.now() / 135) * 0.5;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(pt.x, pt.y, 17 + urgency * 8 + pulse * 3, 0, Math.PI * 2);
+  ctx.strokeStyle = `rgba(255,232,64,${0.72 + urgency * 0.2})`;
+  ctx.lineWidth = 2.6 + urgency * 1.1;
+  ctx.shadowColor = "rgba(255,232,64,.78)";
+  ctx.shadowBlur = 14;
+  ctx.stroke();
+  ctx.restore();
+}
+function drawPendingPassPhase(r, frame = state?.frame) {
+  const pass = pendingPassPhase(frame);
+  const target = displayPassTarget(frame);
+  const intendedTarget = passTargetPoint(pass);
+  if (!pass?.origin || !intendedTarget) {
+    if (target) drawPassTargetCue(target, frame, r);
+    return;
+  }
   const from = mapPoint(pass.origin, r);
-  const to = mapPoint(pass.intendedTarget, r);
+  const to = mapPoint(intendedTarget, r);
   const aerial = String(pass.flight || "").toLowerCase() === "aerial";
   const offside = pass.offside || null;
   ctx.save();
@@ -2997,18 +3048,7 @@ function drawPendingPassPhase(r) {
   ctx.setLineDash(aerial ? [8, 6] : []);
   ctx.stroke();
   ctx.setLineDash([]);
-  const urgency = clamp(Number(pass.receiverUrgency ?? 0), 0, 1);
-  const receiver = pass.nearestReceiver != null
-    ? state.frame.players?.find(player => player.id === pass.nearestReceiver)
-    : null;
-  if (receiver?.position) {
-    const pt = mapPoint(receiver.position, r);
-    ctx.beginPath();
-    ctx.arc(pt.x, pt.y, 15 + urgency * 9, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(246,201,68,${0.28 + urgency * 0.42})`;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
+  if (target) drawPassTargetCue(target, frame, r);
   if (offside?.position) {
     const pt = mapPoint(offside.position, r);
     const radius = yardsToCanvasRadius(offside.interferenceRadiusYards ?? 3, r);
@@ -3315,6 +3355,65 @@ function drawPlayerRing(pt, radius, color, width, glow) {
   ctx.stroke();
   ctx.restore();
 }
+function resetStickyHolder() {
+  stickyHolder.id = null;
+  stickyHolder.team = null;
+}
+const STICKY_HOLDER_RELEASE_ACTIONS = new Set([
+  "pass",
+  "aerial-pass",
+  "flank-low-cross",
+  "flank-high-cross",
+  "first-time-pass",
+  "killer-pass",
+  "clearance",
+  "route-one",
+  "shoot",
+  "first-time-shot",
+  "first-time-header",
+  "save",
+  "shot-blocked",
+  "goal",
+  "offside"
+]);
+function ballFrameAction(ball) {
+  return normalizeUiActionLabel(ball?.lastDecision?.action ?? ball?.lastAction);
+}
+function displayHolderId(frame) {
+  const ball = frame?.ball;
+  const raw = ball?.holder;
+  if (raw != null) {
+    const player = frame?.players?.find(p => Number(p.id) === Number(raw));
+    stickyHolder.id = raw;
+    stickyHolder.team = player?.team ?? ball?.lastTouchTeam ?? null;
+    return raw;
+  }
+  const prev = stickyHolder.id;
+  if (prev == null || !ball?.position) return null;
+  if (frame?.pendingPass || frame?.pending_pass || frame?.pendingShot || frame?.pending_shot || frame?.pendingRebound || frame?.pending_rebound) {
+    resetStickyHolder();
+    return null;
+  }
+  if (ballAltitudeYards(ball) > 0.5 || STICKY_HOLDER_RELEASE_ACTIONS.has(ballFrameAction(ball))) {
+    resetStickyHolder();
+    return null;
+  }
+  const p = frame?.players?.find(player => Number(player.id) === Number(prev));
+  const ballTeam = ball?.lastTouchTeam ?? null;
+  if (!p || (ballTeam && stickyHolder.team && ballTeam !== stickyHolder.team)) {
+    resetStickyHolder();
+    return null;
+  }
+  const d = Math.hypot(
+    Number(p.position?.x ?? 1e9) - Number(ball.position.x ?? 0),
+    Number(p.position?.y ?? 1e9) - Number(ball.position.y ?? 0)
+  );
+  if (!Number.isFinite(d) || d > 2.0) {
+    resetStickyHolder();
+    return null;
+  }
+  return prev;
+}
 function drawPlayer(p, r, holderId = null) {
   const pt = mapPoint(p.position, r);
   const color = p.team === "Home" ? "#1f6feb" : "#d64545";
@@ -3377,17 +3476,22 @@ function drawBall(ball, r) {
   const altitude = ballAltitudeYards(ball);
   const lift = Math.min(15, altitude * 1.65);
   const radius = 6.5 + Math.min(2.2, altitude * 0.16);
+  ctx.save();
   ctx.beginPath();
   ctx.ellipse(pt.x + lift * 0.18, pt.y + lift * 0.14, radius * 0.95, radius * 0.44, 0, 0, Math.PI * 2);
   ctx.fillStyle = `rgba(21, 29, 17, ${altitude > 0.05 ? 0.26 : 0.18})`;
   ctx.fill();
   ctx.beginPath();
   ctx.arc(pt.x, pt.y - lift, radius, 0, Math.PI * 2);
-  ctx.fillStyle = "#c58a13";
+  ctx.fillStyle = "#ffe44d";
+  ctx.shadowColor = "rgba(255,228,77,.52)";
+  ctx.shadowBlur = 10;
   ctx.fill();
-  ctx.strokeStyle = "#4b3306";
-  ctx.lineWidth = 1;
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(255,255,255,.96)";
+  ctx.lineWidth = 1.6;
   ctx.stroke();
+  ctx.restore();
 }
 // --- Smooth 60fps field rendering via entity interpolation -------------------
 // Server frames arrive at ~10Hz (LIVE_STEP_INTERVAL_MS) and the /api/step
@@ -3448,14 +3552,15 @@ function drawField(frame, r) {
   drawPitchGridOverlay(r);
   drawAssistantOffsideLines(r);
   drawOffsideFlash(r);
-  drawPendingPassPhase(r);
+  drawPendingPassPhase(r, frame);
   drawPendingReboundPhase(r);
   drawFlankPolicyLanes(r);
   drawMovementTrails(r);
   drawSelectedVision(inspectedPlayer(), r);
   drawDecisionIntentTraces(r);
+  const holderId = displayHolderId(frame);
   for (const o of frame.officials || []) drawOfficial(o, r);
-  for (const p of frame.players || []) drawPlayer(p, r, frame.ball?.holder);
+  for (const p of frame.players || []) drawPlayer(p, r, holderId);
   if (frame.ball) drawBall(frame.ball, r);
   drawCoachHintMarkers(r);
   drawCoachHintDrag(r);
@@ -5174,6 +5279,8 @@ async function resetMatch(options = {}) {
     eventLog = [];
     recentLearningTransitions = [];
     lastSemanticBallAction = null;
+    resetStickyHolder();
+    resetStickyPassTarget();
     queuedInputs = [];
     if (inputFlushTimer != null) {
       clearTimeout(inputFlushTimer);
@@ -5334,6 +5441,8 @@ async function loadState() {
   state = await res.json();
   recentLearningTransitions = [];
   lastSemanticBallAction = null;
+  resetStickyHolder();
+  resetStickyPassTarget();
   rememberSemanticBallActionsFromFrames([state.frame]);
   applyAssignmentsToFrame(state.controllerAssignments);
   maybeAutoAssignFirstController();

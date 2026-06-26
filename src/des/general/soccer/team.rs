@@ -5026,7 +5026,18 @@ impl CentralBrain {
             ),
         };
         let possession_flip = commitment.set && commitment.committed_has_ball != has_ball;
-        if !commitment.set || tick >= commitment.review_tick || possession_flip {
+        let defense_rule_candidate = directive.defense_strategy;
+        let defense_window_interrupt = !has_ball
+            && commitment.set
+            && defense_rule_candidate != commitment.defense
+            && matches!(
+                defense_rule_candidate,
+                TeamDefenseStrategy::ForceWideLeftTrap
+                    | TeamDefenseStrategy::ForceWideRightTrap
+                    | TeamDefenseStrategy::DoubleTeamBallCarrier
+                    | TeamDefenseStrategy::ContainAndDelayCounter
+            );
+        if !commitment.set || tick >= commitment.review_tick || possession_flip || defense_window_interrupt {
             // Learn: credit the just-finished commitment with the field advantage it
             // gained while running (only while we held the ball — attacking value).
             if commitment.set && commitment.committed_has_ball {
@@ -5184,6 +5195,32 @@ impl CentralBrain {
                     directive.width_yards = (directive.width_yards * 1.08).min(width * 0.98);
                     directive.carry_priority = (directive.carry_priority * 1.22).clamp(0.4, 1.6);
                     directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
+                }
+                _ => {}
+            }
+        }
+        {
+            use TeamDefenseStrategy::*;
+            match directive.defense_strategy {
+                ForceWideLeftTrap | ForceWideRightTrap => {
+                    let shape = directive.defense_strategy.shape();
+                    directive.press_intensity = directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
+                    directive.defensive_cover_target = directive.defensive_cover_target.max(3);
+                    directive.width_yards = (directive.width_yards * 0.92).clamp(width * 0.48, width * 0.72);
+                    directive.risk_tolerance = (directive.risk_tolerance - 0.04).clamp(0.20, 0.96);
+                }
+                DoubleTeamBallCarrier => {
+                    let shape = directive.defense_strategy.shape();
+                    directive.press_intensity = directive.press_intensity.max(shape.press).clamp(0.22, 1.0);
+                    directive.defensive_cover_target = directive.defensive_cover_target.max(3);
+                    directive.width_yards = (directive.width_yards * 0.86).clamp(width * 0.44, width * 0.68);
+                    directive.risk_tolerance = (directive.risk_tolerance - 0.06).clamp(0.20, 0.96);
+                }
+                ContainAndDelayCounter => {
+                    directive.press_intensity = directive.press_intensity.max(0.52).clamp(0.22, 1.0);
+                    directive.defensive_cover_target = directive.defensive_cover_target.max(2);
+                    directive.width_yards = (directive.width_yards * 0.90).clamp(width * 0.46, width * 0.72);
+                    directive.risk_tolerance = (directive.risk_tolerance - 0.08).clamp(0.20, 0.96);
                 }
                 _ => {}
             }

@@ -88,6 +88,9 @@ pub const ATTACK_SPACING_SAMPLE_INTERVAL_TICKS: u64 = 15;
 pub const ATTACK_SPACING_REWARD_WINDOW_TICKS: u64 = 45;
 /// Cap on the rolling RL sample buffer (drained by the learner).
 pub const ATTACK_SPACING_SAMPLE_CAP: usize = 4096;
+/// Minimum training steps before the live off-ball scorer/formation LP trusts the
+/// carried attacking-spacing head over the analytic 5-8yd seed.
+pub const ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS: usize = 200;
 
 // Normalization references for the network input (raw -> ~unit range).
 const REF_FWD_YARDS: f64 = 30.0;
@@ -521,6 +524,13 @@ impl SoccerMatch {
     pub fn drain_attack_spacing_samples(&mut self) -> Vec<AttackSpacingSample> {
         std::mem::take(&mut self.attack_spacing_samples)
     }
+
+    /// Install the trained attacking-spacing head for live consumption. The learner
+    /// carries + trains it across games and re-installs it each game; wrapped in `Arc`
+    /// so every per-tick snapshot shares it cheaply.
+    pub fn set_attack_spacing_head(&mut self, head: AttackSpacingHead) {
+        self.attack_spacing_head = Some(std::sync::Arc::new(head));
+    }
 }
 
 #[cfg(test)]
@@ -662,5 +672,47 @@ mod tests {
         }];
         assert_eq!(head.train(&bad, 0.05), 0.0);
         assert_eq!(head.training_steps(), 0);
+    }
+
+    #[test]
+    fn installed_attack_spacing_head_changes_served_target_once_warm() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        sim.ball.holder = Some(6);
+        sim.ball.position = Vec2::new(40.0, 60.0);
+        sim.players[6].position = sim.ball.position;
+        sim.players[6].velocity = Vec2::new(0.0, Team::Home.attack_dir() * 4.0);
+        sim.players[8].position = Vec2::new(44.0, 65.0);
+        for away in 11..22 {
+            sim.players[away].position = Vec2::new(60.0, 83.0 + (away - 11) as f64 * 0.8);
+            sim.players[away].velocity = Vec2::new(0.0, -Team::Home.attack_dir());
+        }
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let (ctx, _held) = snapshot
+            .attack_spacing_team_context(Team::Home)
+            .expect("team spacing context");
+        let analytic = snapshot.resolved_attack_spacing_target(&ctx);
+        let samples: Vec<AttackSpacingSample> = (0..ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS)
+            .map(|_| AttackSpacingSample {
+                context: ctx,
+                held_spacing_yards: ATTACK_SPACING_ABS_MAX_YARDS,
+                reward: 1.0,
+            })
+            .collect();
+        let mut head = AttackSpacingHead::new(99);
+        let mut final_loss = 0.0;
+        for _ in 0..8 {
+            final_loss = head.train(&samples, 0.05);
+        }
+        assert!(final_loss.is_finite());
+        assert!(head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS);
+
+        sim.set_attack_spacing_head(head);
+        let learned_snapshot = WorldSnapshot::from_match(&sim);
+        let learned = learned_snapshot.resolved_attack_spacing_target(&ctx);
+        assert!(
+            learned.ideal > analytic.ideal + 0.25,
+            "warm installed head should move the served band: analytic={analytic:?} learned={learned:?}"
+        );
     }
 }

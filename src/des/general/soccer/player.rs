@@ -4032,6 +4032,17 @@ impl PlayerAgent {
             killer_pass_score,
             killer_pass_legal,
         ));
+        let pass_and_move_forward_lift = (1.0
+            + observation
+                .pass_and_move_forward_opportunity
+                .clamp(0.0, 1.0)
+                * 0.24
+            + observation
+                .pass_and_move_numbers_advantage
+                .clamp(0.0, 1.0)
+                * 0.16
+            + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.10)
+            .clamp(1.0, 1.50);
         for rank in 0..pass_target_count.min(3) {
             let rank_weight = match rank {
                 0 => 1.00,
@@ -4069,6 +4080,7 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * low_cross_multiplier
                 * short_upfield_ground_pass_multiplier
+                * pass_and_move_forward_lift
                 * crowded_pass_lift
                 * pressured_release_multiplier
                 * panic_pass_damp
@@ -4230,6 +4242,23 @@ impl PlayerAgent {
                 "pass1",
                 short_forward_release_floor,
             );
+        }
+        if pass_target_count > 0
+            && observation.pass_and_move_forward_opportunity >= 0.35
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let pass_and_move_floor = (0.22
+                + observation
+                    .pass_and_move_forward_opportunity
+                    .clamp(0.0, 1.0)
+                    * 0.32
+                + observation
+                    .pass_and_move_numbers_advantage
+                    .clamp(0.0, 1.0)
+                    * 0.16
+                + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.10)
+                .clamp(0.34, 0.74);
+            ensure_min_legal_option_probability(&mut options, "pass1", pass_and_move_floor);
         }
         if clearance_legal && hold_pressure >= 0.16 && release_pressure >= 0.42 {
             let danger_clearance_floor =
@@ -7017,6 +7046,8 @@ impl PlayerAgent {
                     "control-touch".to_string(),
                 )
             });
+            let first_touch_escape_sprint = matches!(action, SoccerAction::ControlTouch { .. })
+                && observation.first_touch_escape_pressure >= FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE;
             self.last_decision = Some(self.decision_trace(
                 snapshot,
                 mdp_state,
@@ -7030,7 +7061,7 @@ impl PlayerAgent {
             return PlayerIntent {
                 player_id: self.id,
                 action,
-                sprint: false,
+                sprint: first_touch_escape_sprint,
             };
         }
 
@@ -7543,7 +7574,13 @@ impl PlayerAgent {
                             });
                         }
                     }
-                    let sprint = if action_label == "runaround-dribble" {
+                    let first_touch_escape_sprint =
+                        matches!(action, SoccerAction::ControlTouch { .. })
+                            && observation.first_touch_escape_pressure
+                                >= FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE;
+                    let sprint = if first_touch_escape_sprint {
+                        true
+                    } else if action_label == "runaround-dribble" {
                         true
                     } else {
                         open_pass_lane_sprint_for_action(

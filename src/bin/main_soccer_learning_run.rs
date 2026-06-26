@@ -11,18 +11,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
-    soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset, MatchConfig,
+    report_soccer_pass_completion_training, soccer_moment_records_from_jsonl,
+    soccer_moment_records_to_learning_dataset, AttackSpacingHead,
+    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, BackFourLineHead, LooseBallCommitHead, MatchConfig,
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    BackFourLineHead, LooseBallCommitHead, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
-    report_attack_spacing_training, report_line_depth_training,
-    report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
-    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -1885,6 +1883,12 @@ static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
 static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory attacking-spacing target head, carried + trained across games WITHIN a
+/// learner process, then installed into the next game so off-ball support and the LP
+/// spacing floor consume what was learned.
+static CARRIED_ATTACK_SPACING_HEAD: std::sync::Mutex<Option<AttackSpacingHead>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -1921,6 +1925,11 @@ fn run_game(
     // live once trained. No-op unless the commit model is enabled.
     if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
         sim.set_loose_ball_commit_head(head.clone());
+    }
+    // Install the carried attacking-spacing target head so off-ball support and the
+    // formation LP consume the learned spacing band once trained.
+    if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
+        sim.set_attack_spacing_head(head.clone());
     }
 
     for tick_idx in 0..total_ticks {
@@ -1987,17 +1996,24 @@ fn run_game(
             final_loss
         );
     }
-    // Learnable attacking-spacing target: train this game's reward-weighted RL corpus
-    // and log it so the spacing is demonstrably learned from. Empty + skipped unless
-    // DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET is set. Cross-game Postgres persistence +
-    // live head consumption are the remaining integration steps (as for the line head).
+    // Train the CARRIED attacking-spacing head on this game's reward-weighted RL
+    // corpus and install it into the next game, so the learner actually changes the
+    // served off-ball/LP spacing band once warm. Empty + skipped unless
+    // DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET is set.
     let attack_spacing_samples = sim.drain_attack_spacing_samples();
     if !attack_spacing_samples.is_empty() {
-        let report =
-            report_attack_spacing_training(&attack_spacing_samples, episode_seed as u32, 4, 0.02);
+        let mut guard = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| AttackSpacingHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train(&attack_spacing_samples, 0.02);
+        }
         eprintln!(
-            "attack_spacing_training samples={} training_steps={} epochs={} final_loss={:.5}",
-            report.samples, report.training_steps, report.epochs, report.final_loss
+            "attack_spacing_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            attack_spacing_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+            final_loss
         );
     }
     let mut artifact = sim.team_policy_artifact();
@@ -3595,7 +3611,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 manifest_games.len()
             );
             eprintln!(
-                "soccer_learning_signal_capture episode={} pass_outcome_samples={} defender_line_depth_rows={} midfield_line_depth_rows={} back_four_gate={} midfield_gate={} pitch_value_gate={}",
+                "soccer_learning_signal_capture episode={} pass_outcome_samples={} defender_line_depth_rows={} midfield_line_depth_rows={} back_four_gate={} midfield_gate={} pitch_value_gate={} loose_ball_commit_gate={} attack_spacing_gate={}",
                 game.episode_summary.episode,
                 game.pass_outcome_samples.len(),
                 game.artifact
@@ -3606,7 +3622,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .midfield_line_depth_training_rows,
                 env_value("DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL").unwrap_or_else(|| "0".to_string()),
                 env_value("DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL").unwrap_or_else(|| "0".to_string()),
-                env_value("DD_SOCCER_ENABLE_PITCH_VALUE_REWARD").unwrap_or_else(|| "0".to_string())
+                env_value("DD_SOCCER_ENABLE_PITCH_VALUE_REWARD").unwrap_or_else(|| "0".to_string()),
+                env_value("DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL").unwrap_or_else(|| "0".to_string()),
+                env_value("DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET").unwrap_or_else(|| "0".to_string())
             );
             if let Some(episode_log) = episode_log.as_mut() {
                 if episode_log_flush_interval_games > 0
@@ -4305,6 +4323,32 @@ mod tests {
             Some("5")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_PITCH_VALUE_REWARD"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET"),
+            Some("true")
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true",
+        );
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_GAME_ARTIFACT_MODE"),
             Some("summary")
         );
@@ -4359,21 +4403,39 @@ mod tests {
     fn continuous_manifest_uses_restart_safe_source_checkout() {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REPO"),
-            Some("https://github.com/ORESoftware/discrete-event-system.rs.git")
+            Some("https://github.com/ORESoftware/soccer-sim-game-engine.rs.git")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REF"),
+            Some("learning")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_ENGINE_SOURCE_REPO"),
+            Some("https://github.com/ORESoftware/discrete-event-system.rs.git")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_ENGINE_SOURCE_REF"),
             Some("main")
         );
-        assert_continuous_manifest_contains("source_ref=\"${SOCCER_SOURCE_REF:-main}\"");
-        assert_continuous_manifest_contains("if [ -d \"${work}/.git\" ]; then");
+        assert_continuous_manifest_contains("source_ref=\"${SOCCER_SOURCE_REF:-learning}\"");
+        assert_continuous_manifest_contains("engine_ref=\"${SOCCER_ENGINE_SOURCE_REF:-main}\"");
+        assert_continuous_manifest_contains("sync_ref() {");
+        assert_continuous_manifest_contains("if [ -d \"${dir}/.git\" ]; then");
+        assert_continuous_manifest_contains("git -C \"${dir}\" fetch --depth 1 origin \"${ref}\"");
+        assert_continuous_manifest_contains("git -C \"${dir}\" switch --detach FETCH_HEAD");
+        assert_continuous_manifest_contains("source_checkout_mode=fetch dir=${dir} ref=${ref}");
+        assert_continuous_manifest_contains("source_checkout_mode=clone dir=${dir} ref=${ref}");
         assert_continuous_manifest_contains(
-            "git -C \"${work}\" fetch --depth 1 origin \"${source_ref}\"",
+            "git clone --depth 1 --filter=blob:none --no-checkout \"${repo}\" \"${dir}\"",
         );
-        assert_continuous_manifest_contains("git -C \"${work}\" checkout --force FETCH_HEAD");
-        assert_continuous_manifest_contains("source_checkout_mode=clone-after-existing-path");
         assert_continuous_manifest_contains(
-            "git clone --depth 1 --branch \"${source_ref}\" \"${source_repo}\" \"${work}\"",
+            "sync_ref \"${engine_repo}\" \"${engine_ref}\" \"${engine}\"",
+        );
+        assert_continuous_manifest_contains(
+            "sync_ref \"${source_repo}\" \"${source_ref}\" \"${soccer}\"",
+        );
+        assert_continuous_manifest_contains(
+            "/usr/local/cargo/bin/cargo build --release --features postgres-persistence --bin main_soccer_learning_run",
         );
     }
 

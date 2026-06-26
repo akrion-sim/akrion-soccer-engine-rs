@@ -9091,6 +9091,148 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
 }
 
 #[test]
+fn pass_and_move_forward_reward_requires_overload_and_forward_floor() {
+    let origin = Vec2::new(40.0, 44.0);
+    let target = Vec2::new(40.0, 56.0);
+
+    let overload_reward = pass_and_move_forward_reward_from_parts(
+        Team::Home,
+        PassFlight::Floor,
+        false,
+        origin,
+        target,
+        0.78,
+        0.82,
+        0.70,
+    );
+    assert!(
+        overload_reward > 0.0,
+        "a forward floor pass with an overload lane should earn explicit pass-and-move credit"
+    );
+    assert!(overload_reward <= PASS_AND_MOVE_FORWARD_REWARD_CAP_POINTS + 1e-9);
+    assert_eq!(
+        pass_and_move_forward_reward_from_parts(
+            Team::Home,
+            PassFlight::Floor,
+            false,
+            origin,
+            target,
+            0.78,
+            0.0,
+            0.70,
+        ),
+        0.0,
+        "no numbers advantage should suppress the combination reward"
+    );
+    assert_eq!(
+        pass_and_move_forward_reward_from_parts(
+            Team::Home,
+            PassFlight::Floor,
+            false,
+            origin,
+            Vec2::new(40.0, 46.0),
+            0.78,
+            0.82,
+            0.70,
+        ),
+        0.0,
+        "tiny forward resets are not the pass-and-move-forward pattern"
+    );
+    assert_eq!(
+        pass_and_move_forward_reward_from_parts(
+            Team::Home,
+            PassFlight::Aerial,
+            false,
+            origin,
+            target,
+            0.78,
+            0.82,
+            0.70,
+        ),
+        0.0,
+        "this reward is for floor pass-and-move combinations, not hopeful aerial balls"
+    );
+    assert_eq!(
+        pass_and_move_forward_reward_from_parts(
+            Team::Home,
+            PassFlight::Floor,
+            true,
+            origin,
+            target,
+            0.78,
+            0.82,
+            0.70,
+        ),
+        0.0,
+        "crosses use their own reward path"
+    );
+}
+
+#[test]
+fn pass_and_move_forward_overload_is_visible_to_q_and_neural_learners() {
+    let mut sim = home_numbers_up_overload_match();
+    let before = WorldSnapshot::from_match(&sim);
+    let mut rng = mulberry32(24_760);
+    sim.central_brain.run_time_step(&before, &mut rng);
+    let snapshot = WorldSnapshot::from_match(&sim);
+
+    let holder = 6;
+    let observation = snapshot.observation_for(holder);
+    assert_eq!(observation.attacking_numbers_advantage, 4);
+    assert!(
+        observation.pass_and_move_forward_opportunity > 0.10,
+        "numbers-up forward receiver should expose a pass-and-move opportunity: {observation:?}"
+    );
+    assert!(
+        observation.pass_and_move_forward_yards >= PASS_AND_MOVE_FORWARD_MIN_YARDS,
+        "opportunity should be meaningfully forward: {observation:?}"
+    );
+    assert!(
+        observation.pass_and_move_numbers_advantage > 0.60,
+        "numbers-up directive should be converted into learner input: {observation:?}"
+    );
+    assert!(
+        observation.pass_and_move_run_lane_score > 0.0,
+        "the mover's forward lane should be visible to the learner"
+    );
+
+    let state = snapshot.mdp_state_for_player(holder);
+    let q_key = SoccerQStateKey::from_parts(
+        &state,
+        &observation,
+        Team::Home,
+        sim.players[holder].role,
+    );
+    assert!(q_key.pass_and_move_forward_opportunity_bin > 0);
+    assert!(q_key.pass_and_move_forward_yards_bin > 0);
+    assert!(q_key.pass_and_move_numbers_advantage_bin > 0);
+    assert!(q_key.pass_and_move_run_lane_bin > 0);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: holder,
+        team: Team::Home,
+        role: sim.players[holder].role,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(holder),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_YARDS] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_NUMBERS_ADVANTAGE] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE] > 0.0);
+}
+
+#[test]
 fn short_pass_preference_favours_sub_20_yard_balls_more_when_calm() {
     // A real controlled forward pass peaks at 8yd exactly; shorter support balls
     // and 12yd+ passes are useful but not the optimum.
@@ -11565,8 +11707,8 @@ fn tactical_directive_rule_selector_can_invoke_every_attack_strategy() {
         },
     ];
     let mut seen = std::collections::HashSet::new();
-    let xs = [4.0, 10.0, 18.0, 28.0, 40.0, 52.0, 62.0, 72.0, 78.0];
-    let ys = [18.0, 34.0, 50.0, 66.0, 82.0, 96.0, 108.0, 116.0];
+    let xs = [4.0, 10.0, 18.0, 28.0, 34.0, 40.0, 52.0, 62.0, 72.0, 78.0];
+    let ys = [18.0, 34.0, 45.0, 50.0, 66.0, 75.0, 82.0, 96.0, 108.0, 116.0];
     for phase in [
         TacticalPhase::HomeBuildUp,
         TacticalPhase::HomeAttack,
@@ -13489,6 +13631,74 @@ fn team_brain_cover_rule_sets_goal_side_defensive_line() {
     assert_eq!(conservative.foremost_attacker_y, Some(33.0));
     assert!(conservative.defensive_line_y < 33.0);
     assert!(conservative.defensive_line_y < aggressive.defensive_line_y);
+}
+
+#[test]
+fn defensive_team_strategy_channels_carrier_between_forty_and_fifteen_yards() {
+    let covered = DefensiveCoverProfile {
+        target: 3,
+        actual: 3,
+        foremost_attacker_y: Some(35.0),
+    };
+    let left_half = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::AwayAttack,
+        Some(Team::Away),
+        Vec2::new(34.0, 35.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        covered,
+        AttackingOverloadProfile::default(),
+        false,
+        &SoccerTacticalLearningWeights::default(),
+    );
+    let right_half = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::AwayAttack,
+        Some(Team::Away),
+        Vec2::new(46.0, 35.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        covered,
+        AttackingOverloadProfile::default(),
+        false,
+        &SoccerTacticalLearningWeights::default(),
+    );
+    let already_wide = tactical_directive_for_team(
+        Team::Home,
+        TacticalPhase::AwayAttack,
+        Some(Team::Away),
+        Vec2::new(10.0, 25.0),
+        0,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+        DefensiveCoverProfile {
+            target: 3,
+            actual: 2,
+            foremost_attacker_y: Some(25.0),
+        },
+        AttackingOverloadProfile::default(),
+        false,
+        &SoccerTacticalLearningWeights::default(),
+    );
+
+    assert_eq!(
+        left_half.defense_strategy,
+        TeamDefenseStrategy::ForceWideLeftTrap,
+        "left-half carrier should be shown to the left touchline"
+    );
+    assert_eq!(
+        right_half.defense_strategy,
+        TeamDefenseStrategy::ForceWideRightTrap,
+        "right-half carrier should be shown to the right touchline"
+    );
+    assert_eq!(
+        already_wide.defense_strategy,
+        TeamDefenseStrategy::DoubleTeamBallCarrier,
+        "a covered wide carrier near the box should trigger the trap/double-team"
+    );
 }
 
 #[test]
@@ -44543,7 +44753,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     // of all 22 + ball" block appends after it, then the Kalman perception-belief block, the
     // Bayesian opponent-press belief block, the learned-MPC replan tail, the
     // option-control / human-intent learning tail, the back-four line-model tail,
-    // the legal carrier line-break tail, and the midfield-four band tail.
+    // the legal carrier line-break tail, midfield-four band tail, support-spacing
+    // tail, loose-ball attack tail, decision-cadence tail, defensive carrier-channel tail,
+    // first-touch escape tail, and pass-and-move forward tail.
     assert_eq!(SOCCER_NEURAL_BASE_FEATURE_DIM, 192);
     assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER, 8);
     assert_eq!(
@@ -44570,9 +44782,40 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
             + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM,
         SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM
             + SOCCER_NEURAL_MIDFIELD_FOUR_BAND_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM + SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM + SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+            + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM + SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
+            + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM
     );
     // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
@@ -44669,6 +44912,26 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_EVENTUAL_CONSISTENCY_NEXT + 1,
+        SOCCER_NEURAL_FEATURE_SUPPORT_HOLDER_DISTANCE
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED + 1,
+        SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_PRESSURE
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER + 1,
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_TARGET_FORWARD + 1,
+        SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE + 1,
+        SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_ATTACK
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -44694,6 +44957,15 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM)
     );
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM));
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM)
+    );
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM));
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -44842,6 +45114,14 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         .observation
         .first_time_shot_field_feasibility = 0.31;
     mpc_transition.observation.first_touch_shape_prior = 0.56;
+    mpc_transition.observation.first_touch_escape_pressure = 0.68;
+    mpc_transition.observation.first_touch_escape_forward_space = 0.74;
+    mpc_transition.observation.first_touch_escape_backward_space = 0.28;
+    mpc_transition.observation.first_touch_escape_target_forward_yards = 2.4;
+    mpc_transition.observation.pass_and_move_forward_opportunity = 0.72;
+    mpc_transition.observation.pass_and_move_forward_yards = 12.0;
+    mpc_transition.observation.pass_and_move_numbers_advantage = 0.66;
+    mpc_transition.observation.pass_and_move_run_lane_score = 0.58;
     let first_touch_key = SoccerQStateKey::from_parts(
         &mpc_transition.state,
         &mpc_transition.observation,
@@ -44853,6 +45133,13 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(first_touch_key.first_time_pass_bin > first_touch_key.control_touch_bin);
     assert!(first_touch_key.first_time_pass_field_bin > first_touch_key.first_time_shot_field_bin);
     assert!(first_touch_key.first_touch_shape_prior_bin > 0);
+    assert!(first_touch_key.first_touch_escape_pressure_bin > 0);
+    assert!(first_touch_key.first_touch_escape_forward_space_bin > 0);
+    assert_eq!(first_touch_key.first_touch_escape_direction_bin, 1);
+    assert!(first_touch_key.pass_and_move_forward_opportunity_bin > 0);
+    assert!(first_touch_key.pass_and_move_forward_yards_bin > 0);
+    assert!(first_touch_key.pass_and_move_numbers_advantage_bin > 0);
+    assert!(first_touch_key.pass_and_move_run_lane_bin > 0);
     let first_time_pass_features =
         soccer_neural_transition_features_with_action(&mpc_transition, "first-time-pass");
     assert_eq!(
@@ -44878,6 +45165,44 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         "neural heads should see one-touch pass field feasibility separately from contact score"
     );
     assert!(first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_SHAPE_PRIOR] > 0.0);
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE],
+        soccer_neural_unit(mpc_transition.observation.first_touch_escape_pressure)
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_FORWARD_SPACE],
+        soccer_neural_unit(mpc_transition.observation.first_touch_escape_forward_space)
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_BACKWARD_SPACE],
+        soccer_neural_unit(mpc_transition.observation.first_touch_escape_backward_space)
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_TARGET_FORWARD],
+        soccer_neural_signed_unit(
+            mpc_transition.observation.first_touch_escape_target_forward_yards
+                / FIRST_TOUCH_ESCAPE_MAX_STEP_YARDS
+        )
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY],
+        soccer_neural_unit(mpc_transition.observation.pass_and_move_forward_opportunity)
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_YARDS],
+        soccer_neural_scaled(
+            mpc_transition.observation.pass_and_move_forward_yards,
+            PASS_AND_MOVE_FORWARD_REFERENCE_YARDS
+        )
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_NUMBERS_ADVANTAGE],
+        soccer_neural_unit(mpc_transition.observation.pass_and_move_numbers_advantage)
+    );
+    assert_eq!(
+        first_time_pass_features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE],
+        soccer_neural_unit(mpc_transition.observation.pass_and_move_run_lane_score)
+    );
     let first_time_shot_features =
         soccer_neural_transition_features_with_action(&mpc_transition, "one-touch-shot");
     assert_eq!(
@@ -61887,6 +62212,126 @@ fn nearest_defender_engages_fast_carrier_instead_of_containing() {
 }
 
 #[test]
+fn force_wide_channel_pressure_steps_defender_to_inside_shoulder_and_reaches_learning_state() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let cover = 3;
+    let carrier = 17;
+    for id in 0..=10 {
+        if sim.players[id].role != PlayerRole::Goalkeeper
+            && id != defender
+            && id != cover
+        {
+            sim.players[id].position = Vec2::new(8.0, 96.0);
+            sim.players[id].home_position = sim.players[id].position;
+        }
+    }
+    sim.players[defender].position = Vec2::new(38.0, 31.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.players[cover].position = Vec2::new(38.0, 22.0);
+    sim.players[cover].home_position = sim.players[cover].position;
+    sim.players[carrier].position = Vec2::new(34.0, 35.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -2.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.central_brain.home_directive.defense_strategy = TeamDefenseStrategy::ForceWideLeftTrap;
+    sim.central_brain.home_directive.defensive_cover_target = 3;
+    sim.central_brain.home_directive.defensive_cover_actual = 2;
+    sim.central_brain.home_directive.press_intensity = 0.75;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let me = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == defender)
+        .unwrap();
+    assert!(
+        snapshot.fast_carrier_engage_target_for(me).is_none(),
+        "a jogging carrier should not trigger the all-in fast engage"
+    );
+    assert!(
+        snapshot.advancing_carrier_steal_urgency(defender) > 1.0,
+        "with cover behind, the nearest defender may challenge instead of retreating"
+    );
+
+    let carrier_pos = snapshot.player_snapshot_position(
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == carrier)
+            .unwrap(),
+    );
+    let defender_pos = snapshot.player_snapshot_position(me);
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.distance(carrier_pos) < defender_pos.distance(carrier_pos),
+        "channel pressure should close the carrier distance: defender={defender_pos:?} \
+         target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.x > carrier_pos.x,
+        "forcing left should put the defender on the carrier's inside/right shoulder: \
+         target={assignment:?} carrier={carrier_pos:?}"
+    );
+
+    let observation = snapshot.observation_for(defender);
+    assert!(
+        observation.defensive_carrier_channel_pressure > 0.15,
+        "POMDP should expose the active 40-to-15yd channel pressure"
+    );
+    assert!(
+        observation.defensive_carrier_channel_side < -0.5,
+        "POMDP should expose that the carrier is being shown left"
+    );
+    assert!(
+        observation.defensive_carrier_channel_cover_count >= 2,
+        "POMDP should expose goal-side cover behind the pressure"
+    );
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(defender),
+        &observation,
+        Team::Home,
+        sim.players[defender].role,
+    );
+    assert!(key.defensive_carrier_channel_pressure_bin >= 1);
+    assert_eq!(key.defensive_carrier_channel_side_bin, -1);
+    assert!(key.defensive_carrier_channel_cover_bin >= 2);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: defender,
+        team: Team::Home,
+        role: sim.players[defender].role,
+        state: snapshot.mdp_state_for_player(defender),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "press-cover".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(defender),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_PRESSURE] > 0.15,
+        "neural learner should directly see carrier-channel pressure"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_SIDE] < -0.5,
+        "neural learner should directly see the force-left side"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER] > 0.0,
+        "neural learner should directly see cover count"
+    );
+}
+
+#[test]
 fn close_to_goal_carrier_pulls_nearest_defender_out_of_retreat() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     // No covering defender behind: every other Home outfielder is far upfield, so
@@ -69204,6 +69649,166 @@ fn pressured_first_touch_cushions_away_from_marker() {
 }
 
 #[test]
+fn stationary_pressured_first_touch_escapes_forward_space_and_reaches_learning_state() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 2234,
+        pass_anticipation_enabled: true,
+        ..Default::default()
+    });
+    let receiver = 8;
+    let marker = 13;
+    park_players_except(&mut sim, &[receiver, marker]);
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(40.0, 60.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].skills.first_touch = 8.4;
+    sim.players[marker].position = Vec2::new(42.1, 60.0);
+    sim.players[marker].velocity = Vec2::zero();
+    install_fresh_controlled_ground_reception(&mut sim, receiver, Vec2::new(36.0, 51.0));
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(receiver);
+    let origin = sim.players[receiver].position;
+    let marker_pos = sim.players[marker].position;
+    assert!(observation.first_touch_available);
+    assert!(
+        observation.first_touch_escape_pressure >= FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE,
+        "static close pressure should enter the first-touch escape state: {observation:?}"
+    );
+    assert!(
+        observation.first_touch_escape_forward_space > 0.0,
+        "the forward escape lane should be exposed to the learner"
+    );
+
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(receiver),
+        &observation,
+        Team::Home,
+        sim.players[receiver].role,
+    );
+    assert!(key.first_touch_escape_pressure_bin > 0);
+    assert!(key.first_touch_escape_forward_space_bin > 0);
+    assert_eq!(key.first_touch_escape_direction_bin, 1);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: receiver,
+        team: Team::Home,
+        role: sim.players[receiver].role,
+        state: snapshot.mdp_state_for_player(receiver),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "control-touch".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(receiver),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE] > 0.0,
+        "neural training should see first-touch escape pressure"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_FORWARD_SPACE] > 0.0,
+        "neural training should see the forward escape lane"
+    );
+
+    let mut player = sim.players[receiver].clone();
+    let intent = player.run_time_step_with_context(
+        &snapshot,
+        snapshot.mdp_state_for_player(receiver),
+        observation,
+        None,
+        None,
+        &mut SeededRandom::new(22_934),
+    );
+    let SoccerAction::ControlTouch { target } = intent.action else {
+        panic!("expected control touch, got {intent:?}");
+    };
+    assert!(intent.sprint, "stationary pressured receiver should burst on the first touch");
+    assert!(
+        target.y > origin.y + 0.75,
+        "first touch should start into forward space when it is safe: target={target:?}"
+    );
+    assert!(
+        target.distance(marker_pos) > origin.distance(marker_pos) + 0.40,
+        "first touch should move away from the static marker: target={target:?}"
+    );
+}
+
+#[test]
+fn defender_stationary_first_touch_uses_backward_escape_when_forward_lane_is_trapped() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 2235,
+        pass_anticipation_enabled: true,
+        ..Default::default()
+    });
+    let receiver = 2;
+    let marker = 13;
+    let blocker = 14;
+    park_players_except(&mut sim, &[receiver, marker, blocker]);
+    sim.players[receiver].role = PlayerRole::Defender;
+    sim.players[receiver].position = Vec2::new(40.0, 38.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].skills.first_touch = 7.8;
+    sim.players[marker].position = Vec2::new(42.0, 38.0);
+    sim.players[marker].velocity = Vec2::zero();
+    sim.players[blocker].position = Vec2::new(40.0, 40.6);
+    sim.players[blocker].velocity = Vec2::zero();
+    install_fresh_controlled_ground_reception(&mut sim, receiver, Vec2::new(40.0, 30.0));
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(receiver);
+    let origin = sim.players[receiver].position;
+    assert!(observation.first_touch_available);
+    assert!(
+        observation.first_touch_escape_backward_space
+            >= observation.first_touch_escape_forward_space,
+        "trapped forward lane should make backward safety at least as attractive: {observation:?}"
+    );
+    assert!(
+        observation.first_touch_escape_target_forward_yards < -0.35,
+        "defender should choose a backward first-touch escape when forward space is unsafe"
+    );
+
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(receiver),
+        &observation,
+        Team::Home,
+        sim.players[receiver].role,
+    );
+    assert_eq!(key.first_touch_escape_direction_bin, -1);
+    assert!(key.first_touch_escape_backward_space_bin > 0);
+
+    let plan = SoccerLearnedPlan {
+        action: "control-touch".to_string(),
+        target_player: None,
+        target_point: None,
+        mpc_replan: None,
+    };
+    let player = sim.players[receiver].clone();
+    let (action, label) = player
+        .action_from_learned_plan(&plan, &snapshot, &observation)
+        .expect("learned control touch");
+    let SoccerAction::ControlTouch { target } = action else {
+        panic!("expected control touch, got {action:?}");
+    };
+    assert_eq!(label, "control-touch");
+    assert!(
+        target.y < origin.y - 0.45,
+        "defender first touch should escape backward when forward is trapped: target={target:?}"
+    );
+}
+
+#[test]
 fn clear_goal_approach_striker_shoots_instead_of_extra_dribble() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -75653,6 +76258,54 @@ fn outside_mid_attack_defender_strategy_is_registered_and_classified() {
     );
 }
 
+#[test]
+fn outside_mid_attack_defender_keeps_driving_to_corner_inside_thirty_yards() {
+    let mut sim = outside_mid_take_on_scenario(
+        TeamAttackStrategy::OutsideMidAttackDefenderRight,
+        4.0,
+        8.0,
+    );
+    let carrier = 7usize;
+    sim.players[carrier].position = Vec2::new(64.0, 90.0); // 30yd from the Home attacking byline
+    sim.ball.position = sim.players[carrier].position;
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[carrier].position;
+    let corner = snapshot
+        .byline_corner_drive_target_for(carrier)
+        .expect("outside-mid byline strategy should target the corner flag at 30yd");
+    assert!(
+        snapshot.byline_cross_drive_active_for(carrier),
+        "outside mid should still be in the drive phase at 30yd from the byline"
+    );
+    assert!(
+        corner.x > snapshot.field_width - 8.0 && corner.y > snapshot.field_length - 8.0,
+        "right outside mid should drive at the right corner flag: {corner:?}"
+    );
+
+    let target = snapshot.dribble_move_target_for_touch(
+        carrier,
+        sim.players[carrier].home_position,
+        DribbleMoveKind::CarryForward,
+        DribbleTouchDecision::new(0, 4.8),
+    );
+    assert!(
+        target.distance(corner) < origin.distance(corner),
+        "carry touch should move closer to the corner flag: origin={origin:?} target={target:?} corner={corner:?}"
+    );
+    assert!(
+        target.x > origin.x && target.y > origin.y,
+        "right-sided byline drive should go forward-and-wide, not stop/cut inside: origin={origin:?} target={target:?}"
+    );
+
+    sim.players[carrier].position = Vec2::new(64.0, 96.0); // 24yd from the byline
+    sim.ball.position = sim.players[carrier].position;
+    let nearer_snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        nearer_snapshot.byline_cross_drive_active_for(carrier),
+        "outside mid should not flip to the cross-release phase around 25yd"
+    );
+}
+
 /// A wide-right midfielder carrying at a committed full-back who has no covering team-mate near him.
 fn outside_mid_take_on_scenario(
     strategy: TeamAttackStrategy,
@@ -76055,6 +76708,105 @@ fn pass_anticipation_intended_target_backs_off_when_teammate_is_closer() {
 }
 
 #[test]
+fn long_aerial_pass_receiver_attacks_descending_control_window() {
+    // A long aerial should be attacked at the playable falling window (8ft -> 5ft), not only at
+    // the final landing point. The teammate set near that window becomes the de-facto receiver,
+    // and the POMDP/Q/neural surfaces all expose the control decision for learning.
+    let from = Vec2::new(40.0, 20.0);
+    let to = Vec2::new(40.0, 85.0);
+    let named_receiver = 9usize;
+    let window_receiver = 10usize;
+    let mut sim = pass_anticipation_scene(&[window_receiver], from, to, true);
+    sim.ball.velocity = (to - from).normalized() * 24.0;
+    sim.players[named_receiver].position = to;
+    sim.players[named_receiver].velocity = Vec2::zero();
+    sim.players[window_receiver].position = Vec2::new(40.0, 75.0);
+    sim.players[window_receiver].velocity = Vec2::zero();
+    sim.players[window_receiver].skills.first_touch = 8.4;
+    sim.players[window_receiver].skills.height = 7.6;
+    sim.players[window_receiver].skills.vision = 7.8;
+    let pass = sim.pending_pass.as_mut().expect("pending pass");
+    pass.flight = PassFlight::Aerial;
+    pass.launch_speed_yps = sim.ball.velocity.len();
+    pass.distance_yards = from.distance(to);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let profile = snapshot.long_aerial_control_profile_for(window_receiver);
+    assert!(
+        profile.available,
+        "nearby teammate should see a long-aerial falling control window: {profile:?}"
+    );
+    assert!(
+        profile.target.y < to.y - 5.0 && profile.target.y > from.y + 45.0,
+        "control target should be the descending 8ft->5ft window before final landing: {:?}",
+        profile.target
+    );
+    assert!(
+        profile.distance_yards <= 2.0,
+        "fixture player should be near the falling control point: {profile:?}"
+    );
+
+    let named_target = snapshot.pending_pass_reception_target_for(named_receiver);
+    assert!(
+        named_target.is_none(),
+        "named receiver at final landing should defer to the teammate already at the falling window"
+    );
+    let (target, sprint) = snapshot
+        .pending_pass_reception_target_for(window_receiver)
+        .expect("window receiver should attack the aerial control point");
+    assert!(sprint, "attacking the falling long ball should be a sprint");
+    assert!(
+        target.distance(profile.target) < 0.75,
+        "movement target should use the falling-window control point: target={target:?} profile={profile:?}"
+    );
+
+    let observation = snapshot.observation_for(window_receiver);
+    assert!(observation.receiving_pending_pass);
+    assert!(observation.long_aerial_control_window_available);
+    assert!(observation.long_aerial_control_attack_score >= 0.45);
+    assert!(
+        observation.pending_pass_receiver_urgency >= 0.40,
+        "long-aerial control score should lift receiver urgency: {:?}",
+        observation.pending_pass_receiver_urgency
+    );
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(window_receiver),
+        &observation,
+        Team::Home,
+        sim.players[window_receiver].role,
+    );
+    assert!(q_key.long_aerial_control_window_available);
+    assert!(q_key.long_aerial_control_attack_bin >= 2);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: window_receiver,
+        team: Team::Home,
+        role: sim.players[window_receiver].role,
+        state: snapshot.mdp_state_for_player(window_receiver),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "recover".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(window_receiver),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_ATTACK] > 0.40,
+        "neural learner should see the aerial-control attack score"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE] > 0.80,
+        "neural learner should see the receiver is close to the control window"
+    );
+}
+
+#[test]
 fn pass_anticipation_first_touch_retains_away_from_a_bearing_down_marker() {
     // No team-mate to flick to: under a marker closing straight onto him, the receiver's first
     // touch pushes the ball into space AWAY from the marker's momentum to keep it.
@@ -76114,6 +76866,32 @@ fn pass_anticipation_first_touch_flicks_onto_a_forward_runner() {
         neutral,
         "with anticipation off the first touch is the neutral controlling touch"
     );
+}
+
+fn install_fresh_controlled_ground_reception(
+    sim: &mut SoccerMatch,
+    receiver: usize,
+    origin: Vec2,
+) {
+    let position = sim.players[receiver].position;
+    let team = sim.players[receiver].team;
+    sim.players[receiver].incoming_ball = Some(IncomingBallContext {
+        from_player: Some(6),
+        target_player: Some(receiver),
+        team: Some(team),
+        kind: IncomingBallKind::GroundPass,
+        origin: Some(origin),
+        intended_target: Some(position),
+        speed_yps: 14.0,
+        distance_yards: origin.distance(position),
+        received_tick: sim.tick,
+        is_cross: false,
+        is_aerial: false,
+    });
+    sim.ball.holder = Some(receiver);
+    sim.ball.position = position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(team);
 }
 
 fn resisted_airborne_distance_for_pass(pass: &PendingPass) -> (f64, f64) {

@@ -96,6 +96,8 @@ spec:
               require_value SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM true
               require_value SOCCER_EVOLUTION_ENABLED true
               require_value SOCCER_EVOLUTION_INTERVAL_GAMES 5
+              require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true
+              require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -295,6 +297,10 @@ spec:
             - name: DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL
               value: "true"
             - name: DD_SOCCER_ENABLE_PITCH_VALUE_REWARD
+              value: "true"
+            - name: DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL
+              value: "true"
+            - name: DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET
               value: "true"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
