@@ -25,6 +25,12 @@ const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
 // Floor lift for the side-step escape (analogue of PINNED_SHIELD_FLOOR_LIFT): sized so a strong
 // fresh-receipt-escape signal floors the evade above the pinned no-outlet shield.
 const FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT: f64 = 2.7;
+// A ball-holder under close pressure who is barely moving is usually just shielding with their
+// back to goal. When a defender-aware escape lane exists, prefer breaking the cushion over
+// dwelling on that static shield.
+const PRESSURED_SLOW_HOLDER_SPEED_YPS: f64 = 1.65;
+const PRESSURED_SLOW_HOLDER_ESCAPE_FLOOR_LIFT: f64 = 1.70;
+const PRESSURED_SLOW_HOLDER_SHIELD_DAMP: f64 = 0.34;
 /// Selector-side mirror of the first-touch-escape gate (same env var so the whole behaviour toggles
 /// together). Default-off (escape ON); OFF zeroes the lift so the side-step score is byte-identical.
 fn dd_soccer_disable_first_touch_escape() -> bool {
@@ -3552,18 +3558,44 @@ impl PlayerAgent {
         };
         let escape_urgency = (pressure_urgency.max(pressure) * forward_blocked).clamp(0.0, 1.0);
         let steal_escape_urgency = escape_urgency.max(steal_risk_escape_lift).clamp(0.0, 1.0);
+        let escape_lane_fit = (observation.pressured_escape_lane_yards
+            / FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS)
+            .clamp(0.0, 1.0);
+        let slow_holder_fit =
+            (1.0 - observation.actor_speed_yps / PRESSURED_SLOW_HOLDER_SPEED_YPS).clamp(0.0, 1.0);
+        let slow_holder_escape_signal = if dd_soccer_disable_first_touch_escape() {
+            0.0
+        } else {
+            let close_pressure =
+                pressure_urgency
+                    .max(pressure)
+                    .max(pressure_from_nearest_distance(
+                        observation.nearest_opponent_distance,
+                    ));
+            (slow_holder_fit
+                * close_pressure
+                * escape_lane_fit
+                * (0.42 + 0.58 * forward_blocked.max(steal_risk_escape_lift)))
+            .clamp(0.0, 1.0)
+        };
         // Lift the away-carry ceiling under escape pressure so a decisive break into
         // lateral space can outscore options that keep the holder pinned in the duel.
-        let carry_out_escape_ceiling = (0.96 + steal_escape_urgency * 0.26).clamp(0.96, 1.22);
+        let carry_out_escape_ceiling =
+            (0.96 + steal_escape_urgency * 0.26 + slow_holder_escape_signal * 0.36)
+                .clamp(0.96, 1.36);
         let carry_out_left_score = (carry_out_score
             * flank_drive_multiplier
             * (0.76 + (left_room / 18.0).clamp(0.0, 1.0) * 0.32)
-            * (1.0 + steal_escape_urgency * (left_room / 12.0).clamp(0.0, 1.0) * 0.66))
+            * (1.0
+                + steal_escape_urgency * (left_room / 12.0).clamp(0.0, 1.0) * 0.66
+                + slow_holder_escape_signal * (left_room / 10.0).clamp(0.0, 1.0) * 0.70))
             .clamp(0.01, carry_out_escape_ceiling);
         let carry_out_right_score = (carry_out_score
             * flank_drive_multiplier
             * (0.76 + (right_room / 18.0).clamp(0.0, 1.0) * 0.32)
-            * (1.0 + steal_escape_urgency * (right_room / 12.0).clamp(0.0, 1.0) * 0.66))
+            * (1.0
+                + steal_escape_urgency * (right_room / 12.0).clamp(0.0, 1.0) * 0.66
+                + slow_holder_escape_signal * (right_room / 10.0).clamp(0.0, 1.0) * 0.70))
             .clamp(0.01, carry_out_escape_ceiling);
         let carry_out_left_legal = carry_out_legal && left_room > 2.0;
         let carry_out_right_legal = carry_out_legal && right_room > 2.0;
@@ -3608,6 +3640,10 @@ impl PlayerAgent {
             + pressured_no_outlet_shield * 0.30
             + steal_risk_escape_lift * STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT)
             .clamp(0.88, 1.68);
+        let attack_escape_bias = if own_half { 0.55 } else { 1.0 };
+        let protect_ball_escape_damp = (1.0
+            - slow_holder_escape_signal * PRESSURED_SLOW_HOLDER_SHIELD_DAMP * attack_escape_bias)
+            .clamp(0.62, 1.0);
         // A pinned holder with no good outlet can always turn and shield, regardless of
         // dribbling skill — so floor the shield on the pressured-no-outlet / steal-risk signal
         // INDEPENDENTLY of the (pressure-damped) dribble base, capped at the same ceiling.
@@ -3616,7 +3652,8 @@ impl PlayerAgent {
         // open play (no steal risk / a real outlet), so normal possession is unaffected.
         let pinned_shield_floor = (pressured_no_outlet_shield.max(steal_risk_escape_lift)
             * PINNED_SHIELD_FLOOR_LIFT)
-            .clamp(0.0, protect_ball_ceiling);
+            .clamp(0.0, protect_ball_ceiling)
+            * protect_ball_escape_damp;
         let protect_ball_score = (dribble_score
             * (0.12
                 + pressure_urgency.max(pressure) * 0.76
@@ -3630,6 +3667,7 @@ impl PlayerAgent {
                 // body between him and the ball -- lift the shield's urgency hard.
                 + pressure_rising * 0.80
                 + (1.0 - observation.perceived_time_on_ball_seconds / 2.8).clamp(0.0, 1.0) * 0.24)
+            * protect_ball_escape_damp
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, protect_ball_ceiling)
             .max(pinned_shield_floor);
@@ -3644,8 +3682,9 @@ impl PlayerAgent {
         let calm_pass_focus = (1.0
             - calm_quiet * floor_pass_quality.clamp(0.0, 1.0) * CALM_PASS_FOCUS_DAMP)
             .clamp(CALM_PASS_FOCUS_FLOOR, 1.0);
-        let side_step_legal =
-            observation.nearest_opponent_distance <= 4.6 && pressure_urgency.max(pressure) >= 0.28;
+        let side_step_legal = (observation.nearest_opponent_distance <= 4.6
+            && pressure_urgency.max(pressure) >= 0.28)
+            || slow_holder_escape_signal >= 0.18;
         // First-touch escape: a player who just received under pressure WITH a defender-aware
         // lateral lane open should break contact with the side-step now instead of freezing on the
         // shield. Collapses to 0 when boxed in (lane ~0), in open play, off fresh receipt, or when
@@ -3655,22 +3694,23 @@ impl PlayerAgent {
         } else {
             (1.0 - observation.perceived_time_on_ball_seconds / 1.5).clamp(0.0, 1.0)
                 * pressure_urgency.max(pressure)
-                * (observation.pressured_escape_lane_yards / FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS)
-                    .clamp(0.0, 1.0)
+                * escape_lane_fit
         };
+        let active_escape_signal = first_touch_escape_signal.max(slow_holder_escape_signal);
         // The side-step is the dedicated evade — knock the ball away from the
         // defender and step past. Under escape pressure it gets a real urgency boost
         // (and a lifted ceiling) so a pinned holder breaks contact instead of dwelling.
         let side_step_ceiling =
-            (0.82 + steal_escape_urgency * 0.52 + first_touch_escape_signal * 0.42).clamp(0.82, 1.40);
+            (0.82 + steal_escape_urgency * 0.52 + active_escape_signal * 0.52).clamp(0.82, 1.48);
         // Escape FLOOR (analogue of pinned_shield_floor): under pressure the dribble base is damped
         // to ~0, so a multiplier alone can't lift the evade above the floored shield. Skill-gate it
         // (as the shield/hold gates do) so an elite dribbler keeps his better moves (xavi-turn/cuts)
         // and only the mid/low-skill carrier — who would otherwise just freeze — gets floored.
         let skilled_escape_relief =
             ((dribbling - (NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF - 0.28)) / 0.28).clamp(0.0, 1.0);
-        let side_step_escape_floor = (first_touch_escape_signal
+        let side_step_escape_floor = ((first_touch_escape_signal
             * FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT
+            + slow_holder_escape_signal * PRESSURED_SLOW_HOLDER_ESCAPE_FLOOR_LIFT)
             * (1.0 - skilled_escape_relief))
             .clamp(0.0, side_step_ceiling);
         let side_step_score = (dribble_score
@@ -3678,7 +3718,7 @@ impl PlayerAgent {
             * (1.0
                 + (1.0 - observation.forward_dribble_space_yards / 14.0).clamp(0.0, 1.0) * 0.24
                 + steal_escape_urgency * 1.02
-                + first_touch_escape_signal * 1.20)
+                + active_escape_signal * 1.24)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, side_step_ceiling)
@@ -3690,8 +3730,31 @@ impl PlayerAgent {
                 observation.nearest_opponent_distance,
             ))
             .clamp(0.0, 1.0);
+        let defender_overcommit = observation
+            .neural_extended
+            .nearest_defender_overcommit_score
+            .clamp(0.0, 1.0);
+        let defender_reaction_delay_fit = ((observation
+            .neural_extended
+            .nearest_defender_reaction_delay_seconds
+            - PLAYER_POMDP_REACTION_MIN_SECONDS)
+            / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS).max(1e-6))
+        .clamp(0.0, 1.0);
+        let momentum_escape_side = observation
+            .neural_extended
+            .dribble_momentum_escape_side
+            .clamp(-1.0, 1.0);
+        let nutmeg_window = observation
+            .neural_extended
+            .dribble_nutmeg_window_score
+            .clamp(0.0, 1.0);
+        let dribble_beat_pressure = technical_escape_pressure
+            .max(defender_overcommit)
+            .max(nutmeg_window * 0.86)
+            .max(slow_holder_escape_signal * 0.84)
+            .clamp(0.0, 1.0);
         let cut_legal = observation.nearest_opponent_distance <= 4.8
-            && technical_escape_pressure >= 0.30
+            && dribble_beat_pressure >= 0.30
             && !goalmouth_carry_forced
             && !goal_attack_shot_blocks_alternatives;
         let left_cut_legal = cut_legal && left_room > 1.5;
@@ -3699,6 +3762,8 @@ impl PlayerAgent {
         let cut_score_base = (dribble_score
             * (0.18
                 + technical_escape_pressure * 0.68
+                + defender_overcommit * 0.34
+                + defender_reaction_delay_fit * 0.08
                 + decision_urgency * 0.16
                 + steal_escape_urgency * 0.52
                 + steal_risk_escape_lift * 0.42)
@@ -3706,14 +3771,29 @@ impl PlayerAgent {
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, (0.66 + steal_escape_urgency * 0.32).clamp(0.66, 0.98));
-        let left_cut_score =
-            (cut_score_base * (0.82 + (left_room / 12.0).clamp(0.0, 1.0) * 0.28)).clamp(0.01, 1.02);
+        let left_momentum_fit = if momentum_escape_side < -0.25 {
+            (-momentum_escape_side).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let right_momentum_fit = if momentum_escape_side > 0.25 {
+            momentum_escape_side.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let left_cut_score = (cut_score_base
+            * (0.82
+                + (left_room / 12.0).clamp(0.0, 1.0) * 0.28
+                + defender_overcommit * left_momentum_fit * 0.20))
+            .clamp(0.01, 1.08);
         let right_cut_score = (cut_score_base
-            * (0.82 + (right_room / 12.0).clamp(0.0, 1.0) * 0.28))
-            .clamp(0.01, 1.02);
+            * (0.82
+                + (right_room / 12.0).clamp(0.0, 1.0) * 0.28
+                + defender_overcommit * right_momentum_fit * 0.20))
+            .clamp(0.01, 1.08);
         let flair = ability01(self.skills.flair_passing);
-        let nutmeg_legal = observation.nearest_opponent_distance <= 2.6
-            && technical_escape_pressure >= 0.38
+        let nutmeg_legal = observation.nearest_opponent_distance <= 3.2
+            && dribble_beat_pressure.max(nutmeg_window) >= 0.34
             && self.role != PlayerRole::Goalkeeper
             && !own_half
             && !goalmouth_carry_forced
@@ -3721,6 +3801,9 @@ impl PlayerAgent {
         let nutmeg_score = (dribble_score
             * (0.08
                 + technical_escape_pressure * 0.52
+                + defender_overcommit * 0.36
+                + nutmeg_window * 0.58
+                + defender_reaction_delay_fit * 0.10
                 + decision_urgency * 0.18
                 + steal_escape_urgency * 0.34)
             * (0.52 + dribbling * 0.34 + flair * 0.30 + ability01(self.skills.first_touch) * 0.14)
@@ -3728,10 +3811,11 @@ impl PlayerAgent {
             * keeper_carry_under_pressure_damp)
             .clamp(
                 0.01,
-                (0.42 + steal_escape_urgency * 0.24 + flair * 0.18).clamp(0.42, 0.84),
+                (0.42 + steal_escape_urgency * 0.24 + flair * 0.18 + nutmeg_window * 0.16)
+                    .clamp(0.42, 0.96),
             );
         let feint_legal =
-            observation.nearest_opponent_distance <= 5.2 && pressure_urgency.max(pressure) >= 0.34;
+            observation.nearest_opponent_distance <= 5.2 && dribble_beat_pressure >= 0.30;
         // Feints are already pressure-gated (feint_legal). Keep the ceiling low so a
         // carrier does not throw a feint every other tick — fewer feints per second,
         // reserved for when they're genuinely needed under pressure. The calm-pass-focus
@@ -3739,12 +3823,17 @@ impl PlayerAgent {
         let feint_score = (dribble_score
             * (0.22
                 + pressure_urgency * 0.66
+                + defender_overcommit * 0.30
+                + defender_reaction_delay_fit * 0.08
                 + decision_urgency * 0.18
                 + steal_risk_escape_lift * 0.52)
             * (0.78 + dribbling * 0.28)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, (0.55 + steal_escape_urgency * 0.28).clamp(0.55, 0.83));
+            .clamp(
+                0.01,
+                (0.55 + steal_escape_urgency * 0.28 + defender_overcommit * 0.14).clamp(0.55, 0.94),
+            );
         let hold_up_flank_score = ((self.preferences.dribble_bias
             * (0.46 + dribbling * 0.42 + ability01(self.skills.strength) * 0.18)
             * (0.74 + pressure * 0.18)
@@ -4794,16 +4883,21 @@ impl PlayerAgent {
         };
         let flank_policy_active =
             possession_team == Some(self.team) && directive.flank_attack_policy.is_flank();
-        // A striker holding up in the opponent half, OR a midfielder/striker carrying the
-        // ball and driving at goal, both pull the other attackers into roaming runs to find
-        // space in behind — the latter is the urgency cue for a teammate running at the
-        // defence (not just a settled forward).
+        // A striker holding up in the opponent half, a midfielder/striker carrying at goal,
+        // or a calm backfield holder lining up a long pass all pull attackers into roaming
+        // runs to find space in behind.
+        let backfield_long_pass_run = snapshot
+            .backfield_long_pass_run_invite_for(self.id)
+            .clamp(0.0, 1.0);
+        let run_prediction =
+            snapshot.off_ball_run_prediction_profile_for(self.id, self.home_position);
         let striker_attack = snapshot
             .striker_holder_in_opponent_half(self.team)
             .is_some()
             || snapshot
                 .attacking_carrier_driving_at_goal(self.team)
                 .is_some()
+            || backfield_long_pass_run >= BACKFIELD_LONG_PASS_RUN_MIN_INVITE
             || snapshot.forward_attacking_momentum(self.team);
         let shape_support_urgency = attacking_shape_support_urgency(snapshot, self.team);
         let holder_pressure_urgency = holder_pressure_support_urgency(snapshot, self.team);
@@ -4829,6 +4923,9 @@ impl PlayerAgent {
         }
         if holder_pressure_urgency >= 0.22 {
             roam_weight = (roam_weight + holder_pressure_urgency * 0.22).clamp(0.10, 0.76);
+        }
+        if run_prediction.entropy > 0.0 {
+            roam_weight = (roam_weight + run_prediction.entropy * 0.08).clamp(0.10, 0.80);
         }
         let special_targets = SupportSpecialTargets {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
@@ -4907,12 +5004,16 @@ impl PlayerAgent {
                 "support-shape",
                 (1.0 - roam_weight)
                     * self.preferences.open_space_bias
-                    * (1.0 + support_urgency * 0.14),
+                    * (1.0
+                        + support_urgency * 0.14
+                        + run_prediction.weight_for_label("support-shape") * 0.18),
                 true,
             ),
             AgentActionOptionTrace::new(
                 "support-roam",
-                roam_weight * self.preferences.open_space_bias * (1.0 + support_urgency * 0.18),
+                roam_weight
+                    * self.preferences.open_space_bias
+                    * (1.0 + support_urgency * 0.18 + run_prediction.entropy * 0.16),
                 true,
             ),
         ];
@@ -4928,6 +5029,7 @@ impl PlayerAgent {
                     0.42 + ball_gain.min(8.0) * 0.030
                         + shape_support_urgency * 2.6
                         + holder_pressure_urgency * 0.58
+                        + run_prediction.weight_for_label("check-to-ball") * 0.42
                         - clear_lane_support_hold_signal * 1.05,
                 ),
                 true,
@@ -4945,7 +5047,11 @@ impl PlayerAgent {
                 "run-in-behind",
                 special_score(
                     target,
-                    0.68 + shape_support_urgency * 0.10 + holder_pressure_urgency * 0.18,
+                    0.68 + shape_support_urgency * 0.10
+                        + holder_pressure_urgency * 0.18
+                        + backfield_long_pass_run * 0.46
+                        + run_prediction.weight_for_label("run-in-behind") * 0.58
+                        + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
                 true,
             ));
@@ -4956,7 +5062,10 @@ impl PlayerAgent {
                 "exploit-space-run",
                 special_score(
                     target,
-                    0.66 + shape_support_urgency * 0.16 + holder_pressure_urgency * 0.14,
+                    0.66 + shape_support_urgency * 0.16
+                        + holder_pressure_urgency * 0.14
+                        + run_prediction.weight_for_label("exploit-space-run") * 0.54
+                        + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
                 true,
             ));
@@ -4977,6 +5086,7 @@ impl PlayerAgent {
                         + width_shortage * WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT
                         + shape_support_urgency * 0.20
                         + holder_pressure_urgency * 0.34
+                        + run_prediction.weight_for_label("wide-outlet") * 0.46
                         + if flank_policy_active {
                             0.28 + directive.flank_overlap_run_probability * 0.22
                         } else {
@@ -5011,6 +5121,8 @@ impl PlayerAgent {
                         + shape_support_urgency * 0.20
                         + holder_pressure_urgency * 0.18
                         + directive.flank_overlap_run_probability * 0.22
+                        + run_prediction.weight_for_label("shot-creation-run") * 0.48
+                        + run_prediction.off_ball_pitch_value_score_lift() * 0.70
                         + crash_box_bonus,
                 ),
                 true,
@@ -5249,6 +5361,18 @@ impl PlayerAgent {
                 .clamp(0.28, 0.58);
                 ensure_min_legal_option_probability(&mut options, "wide-outlet", wide_floor);
             }
+        }
+        if backfield_long_pass_run >= BACKFIELD_LONG_PASS_RUN_MIN_INVITE
+            && options
+                .iter()
+                .any(|option| option.legal && option.label == "run-in-behind")
+        {
+            let run_floor = (BACKFIELD_LONG_PASS_RUN_OPTION_FLOOR_BASE
+                + backfield_long_pass_run * BACKFIELD_LONG_PASS_RUN_OPTION_FLOOR_LIFT)
+                .clamp(BACKFIELD_LONG_PASS_RUN_OPTION_FLOOR_BASE, 0.72);
+            ensure_min_legal_option_probability(&mut options, "run-in-behind", run_floor);
+            scale_legal_option_score(&mut options, "support-shape", 0.82);
+            scale_legal_option_score(&mut options, "support-roam", 0.90);
         }
         if exploit_space_strategy_active
             && options
@@ -6573,6 +6697,7 @@ impl PlayerAgent {
         let human_input = human_input
             .filter(|input| human_input_matches_player(input, self.id, self.controller_slot));
         annotate_human_control_observation(&mut observation, self.controller_slot, human_input);
+        Self::apply_field_vector_context(self, snapshot, &mut observation);
         let belief = belief_from_observation(&observation);
         // Belief-grounded confidence for this decision: drives decisiveness (move speed)
         // in movement and proaction. Engine=truth, brain=strong belief, player=this.
@@ -7916,15 +8041,32 @@ impl PlayerAgent {
                 snapshot.runaround_dribble_option_for(self.id).map(|plan| {
                     let outside_mid_takeon =
                         observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
-                    let appetite = (0.18 + plan.quality * 0.58 + outside_mid_takeon * 0.28).clamp(
-                        0.05,
-                        if outside_mid_takeon >= 0.55 {
-                            0.97
-                        } else {
-                            0.86
-                        },
-                    );
-                    let strategy_commits = outside_mid_takeon >= 0.75 && plan.quality >= 0.60;
+                    let defender_overcommit = observation
+                        .neural_extended
+                        .nearest_defender_overcommit_score
+                        .clamp(0.0, 1.0);
+                    let defender_reaction_delay_fit = ((observation
+                        .neural_extended
+                        .nearest_defender_reaction_delay_seconds
+                        - PLAYER_POMDP_REACTION_MIN_SECONDS)
+                        / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS)
+                            .max(1e-6))
+                    .clamp(0.0, 1.0);
+                    let appetite = (0.18
+                        + plan.quality * 0.58
+                        + outside_mid_takeon * 0.28
+                        + defender_overcommit * 0.26
+                        + defender_reaction_delay_fit * 0.08)
+                        .clamp(
+                            0.05,
+                            if outside_mid_takeon >= 0.55 || defender_overcommit >= 0.45 {
+                                0.97
+                            } else {
+                                0.86
+                            },
+                        );
+                    let strategy_commits = (outside_mid_takeon >= 0.75 && plan.quality >= 0.60)
+                        || (defender_overcommit >= 0.72 && plan.quality >= 0.55);
                     (plan, appetite, strategy_commits)
                 });
             if let Some((_, appetite, strategy_commits)) = runaround_dribble_option {
@@ -10218,6 +10360,178 @@ impl PlayerAgent {
             action,
             sprint,
         }
+    }
+
+    fn apply_field_vector_context(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &mut SoccerPomdpObservation,
+    ) {
+        let current = snapshot.player_position(self.id).unwrap_or(self.position);
+        let attack_dir = self.team.attack_dir();
+        let mut players_ahead = 0usize;
+        let mut players_behind = 0usize;
+        let mut teammates_ahead = 0usize;
+        let mut teammates_behind = 0usize;
+        let mut opponents_ahead = 0usize;
+        let mut opponents_behind = 0usize;
+        let mut own_position_sum = Vec2::zero();
+        let mut own_velocity_sum = Vec2::zero();
+        let mut own_acceleration_sum = Vec2::zero();
+        let mut own_count = 0.0;
+        let mut opponent_position_sum = Vec2::zero();
+        let mut opponent_velocity_sum = Vec2::zero();
+        let mut opponent_acceleration_sum = Vec2::zero();
+        let mut opponent_count = 0.0;
+
+        for player in &snapshot.players {
+            let position = snapshot
+                .player_position(player.id)
+                .unwrap_or(player.position);
+            let velocity = snapshot
+                .player_velocity(player.id)
+                .unwrap_or(player.velocity);
+            let acceleration = snapshot
+                .player_acceleration(player.id)
+                .unwrap_or(player.acceleration);
+            if player.team == self.team {
+                own_position_sum += position;
+                own_velocity_sum += velocity;
+                own_acceleration_sum += acceleration;
+                own_count += 1.0;
+            } else {
+                opponent_position_sum += position;
+                opponent_velocity_sum += velocity;
+                opponent_acceleration_sum += acceleration;
+                opponent_count += 1.0;
+            }
+            if player.id == self.id {
+                continue;
+            }
+            let forward = (position.y - current.y) * attack_dir;
+            let teammate = player.team == self.team;
+            if forward >= 0.0 {
+                players_ahead += 1;
+                if teammate {
+                    teammates_ahead += 1;
+                } else {
+                    opponents_ahead += 1;
+                }
+            } else {
+                players_behind += 1;
+                if teammate {
+                    teammates_behind += 1;
+                } else {
+                    opponents_behind += 1;
+                }
+            }
+        }
+
+        let ahead_ratio = if players_ahead > 0 {
+            teammates_ahead as f64 / players_ahead as f64
+        } else {
+            0.5
+        };
+        let behind_ratio = if players_behind > 0 {
+            teammates_behind as f64 / players_behind as f64
+        } else {
+            0.5
+        };
+        observation.field_players_ahead = players_ahead;
+        observation.field_players_behind = players_behind;
+        observation.field_teammates_ahead = teammates_ahead;
+        observation.field_teammates_behind = teammates_behind;
+        observation.field_opponents_ahead = opponents_ahead;
+        observation.field_opponents_behind = opponents_behind;
+        observation.field_ahead_teammate_ratio = ahead_ratio.clamp(0.0, 1.0);
+        observation.field_behind_teammate_ratio = behind_ratio.clamp(0.0, 1.0);
+        let average = |sum: Vec2, count: f64, fallback: Vec2| {
+            if count > 0.0 {
+                sum / count
+            } else {
+                fallback
+            }
+        };
+        let own_center_of_mass = average(own_position_sum, own_count, current);
+        let opponent_center_of_mass = average(opponent_position_sum, opponent_count, current);
+        let own_center_velocity = average(own_velocity_sum, own_count, Vec2::zero());
+        let opponent_center_velocity = average(opponent_velocity_sum, opponent_count, Vec2::zero());
+        let own_center_acceleration = average(own_acceleration_sum, own_count, Vec2::zero());
+        let opponent_center_acceleration =
+            average(opponent_acceleration_sum, opponent_count, Vec2::zero());
+        let canonical_point = |point: Vec2| {
+            (
+                finite_metric((point.y - current.y) * attack_dir),
+                finite_metric((point.x - current.x) * attack_dir),
+            )
+        };
+        let canonical_vector = |vector: Vec2| {
+            (
+                finite_metric(vector.y * attack_dir),
+                finite_metric(vector.x * attack_dir),
+            )
+        };
+        let (own_com_forward, own_com_lateral) = canonical_point(own_center_of_mass);
+        let (opponent_com_forward, opponent_com_lateral) = canonical_point(opponent_center_of_mass);
+        let (own_cov_forward, own_cov_lateral) = canonical_vector(own_center_velocity);
+        let (opponent_cov_forward, opponent_cov_lateral) =
+            canonical_vector(opponent_center_velocity);
+        let (own_coa_forward, own_coa_lateral) = canonical_vector(own_center_acceleration);
+        let (opponent_coa_forward, opponent_coa_lateral) =
+            canonical_vector(opponent_center_acceleration);
+        observation.own_team_center_of_mass_forward_yards = own_com_forward;
+        observation.own_team_center_of_mass_lateral_yards = own_com_lateral;
+        observation.opponent_team_center_of_mass_forward_yards = opponent_com_forward;
+        observation.opponent_team_center_of_mass_lateral_yards = opponent_com_lateral;
+        observation.team_center_of_mass_forward_gap_yards = opponent_com_forward - own_com_forward;
+        observation.team_center_of_mass_lateral_gap_yards = opponent_com_lateral - own_com_lateral;
+        observation.own_team_center_velocity_forward_yps = own_cov_forward;
+        observation.own_team_center_velocity_lateral_yps = own_cov_lateral;
+        observation.opponent_team_center_velocity_forward_yps = opponent_cov_forward;
+        observation.opponent_team_center_velocity_lateral_yps = opponent_cov_lateral;
+        observation.team_center_velocity_forward_gap_yps = opponent_cov_forward - own_cov_forward;
+        observation.team_center_velocity_lateral_gap_yps = opponent_cov_lateral - own_cov_lateral;
+        observation.own_team_center_acceleration_forward_yps2 = own_coa_forward;
+        observation.own_team_center_acceleration_lateral_yps2 = own_coa_lateral;
+        observation.opponent_team_center_acceleration_forward_yps2 = opponent_coa_forward;
+        observation.opponent_team_center_acceleration_lateral_yps2 = opponent_coa_lateral;
+        observation.team_center_acceleration_forward_gap_yps2 =
+            opponent_coa_forward - own_coa_forward;
+        observation.team_center_acceleration_lateral_gap_yps2 =
+            opponent_coa_lateral - own_coa_lateral;
+
+        let front_numbers_advantage = ((ahead_ratio - 0.5) * 2.0).clamp(0.0, 1.0);
+        let front_numbers_disadvantage = ((0.5 - ahead_ratio) * 2.0).clamp(0.0, 1.0);
+        let behind_numbers_disadvantage = ((0.5 - behind_ratio) * 2.0).clamp(0.0, 1.0);
+        let front_density = (players_ahead as f64 / 21.0).clamp(0.0, 1.0);
+        let behind_density = (players_behind as f64 / 21.0).clamp(0.0, 1.0);
+        let offensive_lift = (front_numbers_advantage * front_density * 0.12).clamp(0.0, 1.0);
+        let defensive_lift = (front_numbers_disadvantage * front_density * 0.18
+            + behind_numbers_disadvantage * behind_density * 0.24)
+            .clamp(0.0, 1.0);
+        let own_center_drive = ((own_cov_forward / 7.0).max(0.0)
+            + (own_coa_forward / 10.0).max(0.0) * 0.35)
+            .clamp(0.0, 1.0);
+        let opponent_center_drive = ((-opponent_cov_forward / 7.0).max(0.0)
+            + (-opponent_coa_forward / 10.0).max(0.0) * 0.35)
+            .clamp(0.0, 1.0);
+        let offensive_lift = (offensive_lift + own_center_drive * 0.05).clamp(0.0, 1.0);
+        let defensive_lift = (defensive_lift + opponent_center_drive * 0.07).clamp(0.0, 1.0);
+
+        if observation.has_ball || snapshot.controlled_possession_team() == Some(self.team) {
+            observation.offensive_urgency = observation.offensive_urgency.max(offensive_lift);
+        }
+        if !observation.has_ball
+            || snapshot.controlled_possession_team() == Some(self.team.other())
+            || pass_origin_in_own_half(self.team, current, snapshot.field_length)
+        {
+            observation.defensive_urgency = observation.defensive_urgency.max(defensive_lift);
+        }
+        observation.decision_urgency = observation
+            .decision_urgency
+            .max(observation.offensive_urgency)
+            .max(observation.defensive_urgency)
+            .clamp(0.0, 1.0);
     }
 
     pub(crate) fn action_from_learned_plan(
