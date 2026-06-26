@@ -24,6 +24,10 @@ const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
 // away from the defender and step past", which is directionally safe (it always goes away from the
 // presser) — by a fresh-receipt × pressure × lane signal. A full lane is this many yards.
 const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
+// Floor lift for the side-step escape (analogue of PINNED_SHIELD_FLOOR_LIFT): sized so a strong
+// fresh-receipt-escape signal floors the evade above the pinned no-outlet shield, so a pressed
+// receiver with an open lane breaks contact rather than freezing.
+const FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT: f64 = 2.7;
 /// Selector-side mirror of the first-touch-escape gate (same env var so the whole behaviour —
 /// carry geometry, this side-step lift, and the escape-retain reward — toggles together).
 /// Default-off (escape ON); OFF zeroes the lift so the side-step score is byte-identical.
@@ -3645,6 +3649,15 @@ impl PlayerAgent {
         // The side-step is the dedicated evade — knock the ball away from the
         // defender and step past. Under escape pressure it gets a real urgency boost
         // (and a lifted ceiling) so a pinned holder breaks contact instead of dwelling.
+        let side_step_ceiling =
+            (0.82 + steal_escape_urgency * 0.52 + first_touch_escape_signal * 0.42).clamp(0.82, 1.40);
+        // Escape FLOOR, mirroring `pinned_shield_floor`: under pressure the dribble base is damped
+        // to near-zero, so a multiplier alone can't lift the evade above the floored shield. Floor
+        // the side-step on the fresh-receipt-escape signal INDEPENDENTLY of the damped base, so when
+        // a defender-aware lane is open on receipt the carrier breaks contact rather than freezing.
+        // Collapses to 0 (boxed in / open play / gate-off), so normal play is untouched.
+        let side_step_escape_floor =
+            (first_touch_escape_signal * FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT).clamp(0.0, side_step_ceiling);
         let side_step_score = (dribble_score
             * (0.30 + pressure_urgency.max(pressure) * 0.88)
             * (1.0
@@ -3653,11 +3666,8 @@ impl PlayerAgent {
                 + first_touch_escape_signal * 1.20)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(
-                0.01,
-                (0.82 + steal_escape_urgency * 0.52 + first_touch_escape_signal * 0.42)
-                    .clamp(0.82, 1.40),
-            );
+            .clamp(0.01, side_step_ceiling)
+            .max(side_step_escape_floor);
         let technical_escape_pressure = pressure_urgency
             .max(pressure)
             .max(observation.immediate_dispossession_risk.clamp(0.0, 1.0))

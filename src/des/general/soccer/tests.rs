@@ -61145,6 +61145,74 @@ fn boxed_in_pressured_receiver_keeps_the_shield() {
 }
 
 #[test]
+fn defender_aware_open_lane_lifts_side_step_escape_on_pressured_receipt() {
+    // A fresh receiver pressed on the right. When the LEFT lane is genuinely open (defender-aware),
+    // the dedicated evade (side-step) is lifted hard; when a second defender closes that lane the
+    // carrier is boxed in and the side-step lift collapses back. We compare the side-step score and
+    // its margin over the static shield in the two pictures.
+    let score = |boxed_in: bool| -> (f64, f64) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7,
+            ..Default::default()
+        });
+        let holder = 6; // Home
+        park_players_except(&mut sim, &[holder, 16, 17]);
+        sim.active_set_play = None;
+        sim.pending_pass = None;
+        sim.pending_shot = None;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = Vec2::new(40.0, 58.0);
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[holder].position = sim.ball.position;
+        sim.players[holder].home_position = sim.ball.position;
+        sim.players[holder].incoming_ball = None; // perceived_time_on_ball ~0 => fresh receipt
+        // Presser on the right, on top of the carrier.
+        sim.players[16].position = Vec2::new(41.6, 58.2);
+        sim.players[16].home_position = sim.players[16].position;
+        // The second defender either sits far away (left lane open) or closes the left lane (boxed).
+        sim.players[17].position = if boxed_in {
+            Vec2::new(38.2, 58.0)
+        } else {
+            Vec2::new(10.0, 10.0)
+        };
+        sim.players[17].home_position = sim.players[17].position;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let directive = snapshot.tactical_directive(Team::Home);
+        let options = sim.players[holder].possession_action_options(
+            &observation,
+            &directive,
+            2,
+            1,
+            false,
+            sim.config.dt_seconds,
+            sim.config.field_width_yards,
+        );
+        (
+            action_option_score(&options, "side-step"),
+            action_option_score(&options, "protect-ball"),
+        )
+    };
+
+    let (open_side_step, open_shield) = score(false);
+    let (boxed_side_step, _boxed_shield) = score(true);
+
+    assert!(
+        open_side_step > boxed_side_step + 0.05,
+        "an open defender-aware lane must lift the side-step escape vs being boxed in: \
+         open={open_side_step} boxed={boxed_side_step}"
+    );
+    assert!(
+        open_side_step >= open_shield,
+        "with an open lane on fresh receipt under pressure, the side-step escape should be at least \
+         as valued as freezing on the shield: side_step={open_side_step} shield={open_shield}"
+    );
+}
+
+#[test]
 fn player_movement_limits_acceleration_and_jerk_to_conserve_energy() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mover = 8;
