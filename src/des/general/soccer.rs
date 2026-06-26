@@ -587,6 +587,16 @@ const CARRIER_CLOSE_GOAL_STEPUP_FRACTION: f64 = 1.0;
 const CARRIER_ADVANCE_JOCKEY_YARDS: f64 = 2.8;
 const CARRIER_CLOSE_GOAL_JOCKEY_YARDS: f64 = 1.4;
 const CARRIER_CLOSE_GOAL_PRESS_MIN: f64 = 0.38;
+/// Team-defense channeling window: when an opponent carrier is 40->15yd from
+/// our goal, real defending shifts from pure retreat to angled pressure that
+/// shows one side and keeps cover behind the first defender.
+const CARRIER_CHANNEL_PRESS_START_YARDS: f64 = 40.0;
+const CARRIER_CHANNEL_PRESS_FULL_YARDS: f64 = 15.0;
+const CARRIER_CHANNEL_JOCKEY_YARDS: f64 = 2.2;
+const CARRIER_CHANNEL_SIDE_BLOCK_YARDS: f64 = 1.6;
+const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.62;
+const CARRIER_CHANNEL_DOUBLE_TEAM_PRESS_MIN: f64 = 0.40;
+const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// Depth-scaled pressing aggression in our own defensive third. The closer an
 /// opponent carrier gets to our own goal, the less a defender can afford to sit
 /// off and contain — letting a dribbler stroll into the box uncontested is worse
@@ -874,6 +884,13 @@ const SHORT_LOFT_APEX_YARDS: f64 = 3.05; // ~9 ft (apex of a ~15yd lofted pass)
 // How fast the apex grows with horizontal distance, and the floor for the very shortest chips.
 const LOFT_APEX_PER_YARD: f64 = 0.11;
 const LOFT_APEX_MIN_YARDS: f64 = 1.6; // ~5 ft — a short clipped chip still clears a foot
+const LONG_AERIAL_CONTROL_MIN_DISTANCE_YARDS: f64 = 24.0;
+const LONG_AERIAL_FALL_CONTROL_HIGH_YARDS: f64 = 8.0 / 3.0;
+const LONG_AERIAL_FALL_CONTROL_LOW_YARDS: f64 = 5.0 / 3.0;
+const LONG_AERIAL_CONTROL_ENGAGE_RADIUS_YARDS: f64 = 16.0;
+const LONG_AERIAL_CONTROL_REFERENCE_DISTANCE_YARDS: f64 = 16.0;
+const LONG_AERIAL_CONTROL_REFERENCE_SECONDS: f64 = 1.2;
+const LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS: f64 = 1.4;
 /// An aerial ball is aloft for a gravity-fixed hang time (set by the loft apex), so to LAND at the
 /// target it must be launched at ~`distance / hang_time`. In flight it loses a little pace to air
 /// drag, so launch marginally above that bare ballistic speed to actually reach the target. Erring
@@ -1670,6 +1687,12 @@ const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
+const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
+const PASS_AND_MOVE_FORWARD_REFERENCE_YARDS: f64 = 18.0;
+const PASS_AND_MOVE_NUMBERS_ADVANTAGE_REFERENCE: f64 = 3.0;
+const PASS_AND_MOVE_RUN_LANE_REFERENCE_YARDS: f64 = 14.0;
+const PASS_AND_MOVE_FORWARD_REWARD_POINTS: f64 = 6.0;
+const PASS_AND_MOVE_FORWARD_REWARD_CAP_POINTS: f64 = 8.0;
 // --- Sterile vs. progressive passing WITHIN a retained possession (no turnover) ---
 // A handoff of the ball has a cost and every pass carries interception risk. A run of
 // STAGNANT_PASS_MIN_RUN+ completed passes whose ball travel never escapes this radius is
@@ -2883,6 +2906,11 @@ const FIRST_TOUCH_RETAIN_PUSH_YARDS: f64 = 2.2;
 // is within this range AND genuinely bearing down (its momentum points at the receiver); with no
 // such pressure a neutral controlling touch is fine.
 const FIRST_TOUCH_MARKER_PRESSURE_RADIUS_YARDS: f64 = 6.0;
+const FIRST_TOUCH_ESCAPE_MIN_PRESSURE: f64 = 0.36;
+const FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE: f64 = 0.48;
+const FIRST_TOUCH_ESCAPE_STATIONARY_SPEED_YPS: f64 = 1.25;
+const FIRST_TOUCH_ESCAPE_MIN_STEP_YARDS: f64 = 1.85;
+const FIRST_TOUCH_ESCAPE_MAX_STEP_YARDS: f64 = 3.55;
 // A first-time flick onto a team-mate's run is taken only when a team-mate is making a forward run
 // into space within this range, at least _MIN_AHEAD ahead, and the short lane to him is clear.
 const FIRST_TOUCH_FLICK_RUNNER_MAX_YARDS: f64 = 18.0;
@@ -3070,10 +3098,10 @@ const HOLD_FOR_SUPPORT_SUMMON_SHAPE_SCALE: f64 = 1.25;
 /// end-line depth, then the team changes from the byline drive to the cross-release phase.
 const BYLINE_CROSS_RELEASE_DEPTH_YARDS: f64 = 11.0;
 /// Cross-release end-line depth used by the "outside mid attack defender" play
-/// ([`dd_soccer_enable_outside_mid_attack_defender`]): the wide man whips the ball in once inside
-/// the last ~25yd of the byline (the user's "cross in the last 20-30yds") rather than driving all
-/// the way to the ~11yd byline first. Override with `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS`.
-const OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT: f64 = 25.0;
+/// ([`dd_soccer_enable_outside_mid_attack_defender`]): by default the wide man keeps carrying to
+/// the same near-byline release as the normal corner-flag drive. Override with
+/// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` when deliberately training an earlier cross.
+const OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT: f64 = BYLINE_CROSS_RELEASE_DEPTH_YARDS;
 /// Minimum normalized distance from pitch center for the committed byline program. This is
 /// deliberately wider than the generic left/right strategy-lane split: it is for true wingers.
 const BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER: f64 = 0.52;
@@ -3440,6 +3468,22 @@ const SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = 3;
 /// previous decision; these channels let neural learners see whether the actor is
 /// still inside the human reaction/commitment window before switching strategy.
 const SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM: usize = 3;
+/// Append-only defensive carrier-channel block. These POMDP channels expose when
+/// the team is showing a dribbler wide from 40->15yd out, which side is being
+/// offered, and whether enough cover exists for aggressive pressure.
+const SOCCER_NEURAL_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM: usize = 3;
+/// Append-only pressured first-touch escape block. These channels make the
+/// receive-under-pressure choice learnable: pressure, forward escape, backward
+/// safety escape, and the chosen escape target direction.
+const SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM: usize = 4;
+/// Append-only pass-and-move-forward block. These channels let MAPPO/MARL see
+/// when a grounded forward combination is especially valuable: opportunity,
+/// forward gain, numbers advantage, and the passer's next runner lane.
+const SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM: usize = 4;
+/// Append-only long-aerial control block. These channels let the value head learn
+/// who should attack a long ball's descending 8ft->5ft control window and how
+/// soon/contested that reception will be.
+const SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = 4;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3464,8 +3508,16 @@ const SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM: usize = SOCCER_NEURAL_PRE
     + SOCCER_NEURAL_SUPPORT_SPACING_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM
     + SOCCER_NEURAL_LOOSE_BALL_ATTACK_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM
+const SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM
     + SOCCER_NEURAL_DECISION_CADENCE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM
+    + SOCCER_NEURAL_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM
+    + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM
+    + SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
+    + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3714,6 +3766,36 @@ const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE + 1;
 const SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED: usize =
     SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED + 1;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_SIDE: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_SIDE + 1;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER + 1;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_FORWARD_SPACE: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_BACKWARD_SPACE: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_FORWARD_SPACE + 1;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_TARGET_FORWARD: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_BACKWARD_SPACE + 1;
+const SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_TARGET_FORWARD + 1;
+const SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_YARDS: usize =
+    SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY + 1;
+const SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_NUMBERS_ADVANTAGE: usize =
+    SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_YARDS + 1;
+const SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE: usize =
+    SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_NUMBERS_ADVANTAGE + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_ATTACK: usize =
+    SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_ATTACK + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3804,6 +3886,14 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_LOOSE_BALL_ATTACK_FEATURE_DIM,
     // Same schema with loose-ball attack selection, before decision-cadence channels.
     SOCCER_NEURAL_PRE_DECISION_CADENCE_FEATURE_DIM,
+    // Same schema with decision-cadence channels, before carrier-channel defense.
+    SOCCER_NEURAL_PRE_DEFENSIVE_CARRIER_CHANNEL_FEATURE_DIM,
+    // Same schema with carrier-channel defense, before first-touch escape channels.
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_FEATURE_DIM,
+    // Same schema with first-touch escape channels, before pass-and-move channels.
+    SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM,
+    // Same schema with pass-and-move channels, before long-aerial control channels.
+    SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5415,6 +5505,12 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub defensive_line_break_threat: f64,
     #[serde(default)]
+    pub defensive_carrier_channel_pressure: f64,
+    #[serde(default)]
+    pub defensive_carrier_channel_side: f64,
+    #[serde(default)]
+    pub defensive_carrier_channel_cover_count: usize,
+    #[serde(default)]
     pub team_brain_defensive_cover_target: usize,
     #[serde(default)]
     pub team_brain_defensive_cover_actual: usize,
@@ -5444,6 +5540,14 @@ pub struct SoccerPomdpObservation {
     pub attacking_numbers_advantage: i32,
     #[serde(default)]
     pub attacking_overload_score: f64,
+    #[serde(default)]
+    pub pass_and_move_forward_opportunity: f64,
+    #[serde(default)]
+    pub pass_and_move_forward_yards: f64,
+    #[serde(default)]
+    pub pass_and_move_numbers_advantage: f64,
+    #[serde(default)]
+    pub pass_and_move_run_lane_score: f64,
     pub shot_lane_open: bool,
     #[serde(default)]
     pub shot_block_probability: f64,
@@ -5530,6 +5634,16 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub pending_pass_receiver_urgency: f64,
     #[serde(default)]
+    pub long_aerial_control_window_available: bool,
+    #[serde(default)]
+    pub long_aerial_control_window_distance_yards: f64,
+    #[serde(default)]
+    pub long_aerial_control_window_seconds: f64,
+    #[serde(default)]
+    pub long_aerial_control_race_advantage_seconds: f64,
+    #[serde(default)]
+    pub long_aerial_control_attack_score: f64,
+    #[serde(default)]
     pub first_time_shot_score: f64,
     #[serde(default)]
     pub first_time_pass_score: f64,
@@ -5561,6 +5675,14 @@ pub struct SoccerPomdpObservation {
     pub quick_forward_pass_target: Option<usize>,
     #[serde(default)]
     pub first_touch_shape_prior: f64,
+    #[serde(default)]
+    pub first_touch_escape_pressure: f64,
+    #[serde(default)]
+    pub first_touch_escape_forward_space: f64,
+    #[serde(default)]
+    pub first_touch_escape_backward_space: f64,
+    #[serde(default)]
+    pub first_touch_escape_target_forward_yards: f64,
     #[serde(default)]
     pub skill_top_speed: f64,
     #[serde(default)]
@@ -7619,6 +7741,12 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub defensive_line_break_threat_bin: u8,
     #[serde(default)]
+    pub defensive_carrier_channel_pressure_bin: u8,
+    #[serde(default)]
+    pub defensive_carrier_channel_side_bin: i8,
+    #[serde(default)]
+    pub defensive_carrier_channel_cover_bin: u8,
+    #[serde(default)]
     pub team_brain_cover_target_bin: u8,
     #[serde(default)]
     pub team_brain_cover_actual_bin: u8,
@@ -7702,6 +7830,14 @@ pub struct SoccerQStateKey {
     pub attacking_numbers_advantage_bin: u8,
     #[serde(default)]
     pub attacking_overload_score_bin: u8,
+    #[serde(default)]
+    pub pass_and_move_forward_opportunity_bin: u8,
+    #[serde(default)]
+    pub pass_and_move_forward_yards_bin: u8,
+    #[serde(default)]
+    pub pass_and_move_numbers_advantage_bin: u8,
+    #[serde(default)]
+    pub pass_and_move_run_lane_bin: u8,
     #[serde(default)]
     pub aerial_pass_bypass_score_bin: u8,
     #[serde(default)]
@@ -7817,6 +7953,16 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub pending_pass_receiver_urgency_bin: u8,
     #[serde(default)]
+    pub long_aerial_control_window_available: bool,
+    #[serde(default)]
+    pub long_aerial_control_distance_bin: u8,
+    #[serde(default)]
+    pub long_aerial_control_time_bin: u8,
+    #[serde(default)]
+    pub long_aerial_control_race_bin: i8,
+    #[serde(default)]
+    pub long_aerial_control_attack_bin: u8,
+    #[serde(default)]
     pub first_time_shot_bin: u8,
     #[serde(default)]
     pub first_time_pass_bin: u8,
@@ -7828,6 +7974,14 @@ pub struct SoccerQStateKey {
     pub first_time_shot_field_bin: u8,
     #[serde(default)]
     pub first_touch_shape_prior_bin: u8,
+    #[serde(default)]
+    pub first_touch_escape_pressure_bin: u8,
+    #[serde(default)]
+    pub first_touch_escape_forward_space_bin: u8,
+    #[serde(default)]
+    pub first_touch_escape_backward_space_bin: u8,
+    #[serde(default)]
+    pub first_touch_escape_direction_bin: i8,
     // NOTE: the 22 per-player skill bins (top_speed, acceleration, stamina,
     // strength, height, weight, dribbling, aggression, foot-shot power, passing,
     // first_touch, flair, vision, crossing, goalkeeping, defending, shooting,
@@ -7975,6 +8129,20 @@ impl SoccerQStateKey {
                 observation.defensive_line_break_threat,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            defensive_carrier_channel_pressure_bin: distance_bucket(
+                observation.defensive_carrier_channel_pressure,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            defensive_carrier_channel_side_bin: if observation.defensive_carrier_channel_side < -0.25 {
+                -1
+            } else if observation.defensive_carrier_channel_side > 0.25 {
+                1
+            } else {
+                0
+            },
+            defensive_carrier_channel_cover_bin: observation
+                .defensive_carrier_channel_cover_count
+                .min(4) as u8,
             team_brain_cover_target_bin: observation.team_brain_defensive_cover_target.min(4) as u8,
             team_brain_cover_actual_bin: observation.team_brain_defensive_cover_actual.min(4) as u8,
             team_centroid_ball_distance_bin: distance_bucket(
@@ -8110,6 +8278,22 @@ impl SoccerQStateKey {
             ),
             attacking_overload_score_bin: distance_bucket(
                 observation.attacking_overload_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            pass_and_move_forward_opportunity_bin: distance_bucket(
+                observation.pass_and_move_forward_opportunity,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            pass_and_move_forward_yards_bin: distance_bucket(
+                observation.pass_and_move_forward_yards,
+                &[4.0, 8.0, 14.0, 22.0],
+            ),
+            pass_and_move_numbers_advantage_bin: distance_bucket(
+                observation.pass_and_move_numbers_advantage,
+                &[0.18, 0.38, 0.62, 0.82],
+            ),
+            pass_and_move_run_lane_bin: distance_bucket(
+                observation.pass_and_move_run_lane_score,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
             aerial_pass_bypass_score_bin: distance_bucket(
@@ -8302,6 +8486,27 @@ impl SoccerQStateKey {
                 observation.pending_pass_receiver_urgency,
                 &[0.20, 0.40, 0.60, 0.82],
             ),
+            long_aerial_control_window_available: observation
+                .long_aerial_control_window_available,
+            long_aerial_control_distance_bin: distance_bucket(
+                observation.long_aerial_control_window_distance_yards,
+                &[2.0, 5.0, 9.0, 14.0],
+            ),
+            long_aerial_control_time_bin: distance_bucket(
+                observation.long_aerial_control_window_seconds,
+                &[0.15, 0.35, 0.65, 1.05],
+            ),
+            long_aerial_control_race_bin: if observation.long_aerial_control_race_advantage_seconds > 0.25 {
+                1
+            } else if observation.long_aerial_control_race_advantage_seconds < -0.25 {
+                -1
+            } else {
+                0
+            },
+            long_aerial_control_attack_bin: distance_bucket(
+                observation.long_aerial_control_attack_score,
+                &[0.20, 0.40, 0.60, 0.82],
+            ),
             first_time_shot_bin: distance_bucket(
                 observation.first_time_shot_score,
                 &[0.15, 0.35, 0.60, 0.82],
@@ -8326,6 +8531,25 @@ impl SoccerQStateKey {
                 observation.first_touch_shape_prior,
                 &[0.12, 0.28, 0.48, 0.70],
             ),
+            first_touch_escape_pressure_bin: distance_bucket(
+                observation.first_touch_escape_pressure,
+                &[0.20, 0.36, 0.52, 0.70],
+            ),
+            first_touch_escape_forward_space_bin: distance_bucket(
+                observation.first_touch_escape_forward_space,
+                &[0.18, 0.38, 0.58, 0.78],
+            ),
+            first_touch_escape_backward_space_bin: distance_bucket(
+                observation.first_touch_escape_backward_space,
+                &[0.18, 0.38, 0.58, 0.78],
+            ),
+            first_touch_escape_direction_bin: if observation.first_touch_escape_target_forward_yards > 0.35 {
+                1
+            } else if observation.first_touch_escape_target_forward_yards < -0.35 {
+                -1
+            } else {
+                0
+            },
             open_space_bin: distance_bucket(observation.open_space_score, &[8.0, 14.0, 22.0, 32.0]),
         }
     }
@@ -8391,6 +8615,12 @@ impl SoccerQStateKey {
             && self.goalkeeper_ball_goal_line_alignment_bin
                 == other.goalkeeper_ball_goal_line_alignment_bin
             && self.defensive_line_break_threat_bin == other.defensive_line_break_threat_bin
+            && self.defensive_carrier_channel_pressure_bin
+                == other.defensive_carrier_channel_pressure_bin
+            && self.defensive_carrier_channel_side_bin
+                == other.defensive_carrier_channel_side_bin
+            && self.defensive_carrier_channel_cover_bin
+                == other.defensive_carrier_channel_cover_bin
             && self.team_brain_cover_target_bin == other.team_brain_cover_target_bin
             && self.team_brain_cover_actual_bin == other.team_brain_cover_actual_bin
             && self.team_centroid_ball_distance_bin == other.team_centroid_ball_distance_bin
@@ -8440,6 +8670,14 @@ impl SoccerQStateKey {
             && self.best_aerial_pass_stride_fit_bin == other.best_aerial_pass_stride_fit_bin
             && self.expected_pass_completion_bin == other.expected_pass_completion_bin
             && self.expected_aerial_pass_completion_bin == other.expected_aerial_pass_completion_bin
+            && self.attacking_numbers_advantage_bin == other.attacking_numbers_advantage_bin
+            && self.attacking_overload_score_bin == other.attacking_overload_score_bin
+            && self.pass_and_move_forward_opportunity_bin
+                == other.pass_and_move_forward_opportunity_bin
+            && self.pass_and_move_forward_yards_bin == other.pass_and_move_forward_yards_bin
+            && self.pass_and_move_numbers_advantage_bin
+                == other.pass_and_move_numbers_advantage_bin
+            && self.pass_and_move_run_lane_bin == other.pass_and_move_run_lane_bin
             && self.aerial_pass_bypass_score_bin == other.aerial_pass_bypass_score_bin
             && self.aerial_pass_interception_risk_bin == other.aerial_pass_interception_risk_bin
             && self.aerial_forward_runner_pass_boost_bin
@@ -8501,12 +8739,24 @@ impl SoccerQStateKey {
             && self.receiving_pending_pass == other.receiving_pending_pass
             && self.pending_pass_off_target_bin == other.pending_pass_off_target_bin
             && self.pending_pass_receiver_urgency_bin == other.pending_pass_receiver_urgency_bin
+            && self.long_aerial_control_window_available
+                == other.long_aerial_control_window_available
+            && self.long_aerial_control_distance_bin == other.long_aerial_control_distance_bin
+            && self.long_aerial_control_time_bin == other.long_aerial_control_time_bin
+            && self.long_aerial_control_race_bin == other.long_aerial_control_race_bin
+            && self.long_aerial_control_attack_bin == other.long_aerial_control_attack_bin
             && self.first_time_shot_bin == other.first_time_shot_bin
             && self.first_time_pass_bin == other.first_time_pass_bin
             && self.control_touch_bin == other.control_touch_bin
             && self.first_time_pass_field_bin == other.first_time_pass_field_bin
             && self.first_time_shot_field_bin == other.first_time_shot_field_bin
             && self.first_touch_shape_prior_bin == other.first_touch_shape_prior_bin
+            && self.first_touch_escape_pressure_bin == other.first_touch_escape_pressure_bin
+            && self.first_touch_escape_forward_space_bin
+                == other.first_touch_escape_forward_space_bin
+            && self.first_touch_escape_backward_space_bin
+                == other.first_touch_escape_backward_space_bin
+            && self.first_touch_escape_direction_bin == other.first_touch_escape_direction_bin
             && self.open_space_bin == other.open_space_bin
             && facing_bucket_matches(self.receive_facing, other.receive_facing)
             && facing_bucket_matches(self.action_facing, other.action_facing)
@@ -15942,11 +16192,9 @@ pub(crate) fn is_outside_mid_attack_strategy(strategy: TeamAttackStrategy) -> bo
 
 /// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
 /// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
-/// carrier driving the flank in the opponent half, and the deeper cross-release window (cross in
-/// the last ~20-30yd rather than only at the byline) applies to the wide-cross program. Unset
-/// (default) the strategy is never proposed and the release window is the original, so play is
-/// byte-identical to baseline. The learner and `SOCCER_FORCE_ATTACK_STRATEGY` can still select the
-/// strategy regardless of this flag (for training / live demos).
+/// carrier driving the flank in the opponent half. Unset (default) the strategy is never proposed,
+/// so play is byte-identical to baseline. The learner and `SOCCER_FORCE_ATTACK_STRATEGY` can still
+/// select the strategy regardless of this flag (for training / live demos).
 pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -15955,7 +16203,7 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
 
 /// End-line depth at which the "outside mid attack defender" play releases its cross (see
 /// [`OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT`]). Learner/operator override via
-/// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 14-34yd window).
+/// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 7-34yd window).
 pub(crate) fn outside_mid_cross_release_depth_yards() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -15964,7 +16212,7 @@ pub(crate) fn outside_mid_cross_release_depth_yards() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|d| d.is_finite() && *d > 0.0)
-            .map(|d| d.clamp(14.0, 34.0))
+            .map(|d| d.clamp(BYLINE_DRIVE_CROSS_TRIGGER_YARDS, 34.0))
             .unwrap_or(OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT)
     })
 }
@@ -16017,6 +16265,12 @@ fn tactical_directive_for_team(
     let defensive_line_bias =
         tactical_learning_weight_bias(tactical_learning.defensive_line_press_learning_weight);
     let attack_dir = team.attack_dir();
+    let own_goal_y = team.other().goal_y(field_length);
+    let carrier_goal_distance_to_own_goal = (ball_position.y - own_goal_y).abs();
+    let carrier_channel_window = defending
+        && carrier_goal_distance_to_own_goal.is_finite()
+        && carrier_goal_distance_to_own_goal <= CARRIER_CHANNEL_PRESS_START_YARDS
+        && carrier_goal_distance_to_own_goal >= CARRIER_CHANNEL_PRESS_FULL_YARDS;
     let mut line_seed = if has_ball {
         let holding_distance: f64 = if own_half_possession {
             14.0
@@ -16291,9 +16545,8 @@ fn tactical_directive_for_team(
         && attack_progress > 0.0
         && width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
         && !matches!(ball_side, StrategyLane::Center);
-    // "Outside mid attack defender" deepens the cross-release window (cross in the last ~20-30yd
-    // rather than only at the ~11yd byline) — but ONLY when the play is enabled, so the default
-    // split is byte-identical to baseline.
+    // "Outside mid attack defender" may override the cross-release window for training/operator
+    // experiments, but by default it shares the same near-byline release as the corner drive.
     let outside_mid_attack_enabled = dd_soccer_enable_outside_mid_attack_defender();
     let cross_release_depth = if outside_mid_attack_enabled {
         outside_mid_cross_release_depth_yards()
@@ -16402,6 +16655,29 @@ fn tactical_directive_for_team(
                 ),
             ], strategy_draw),
         }
+    } else if attacking_phase
+        && !in_final_third
+        && matches!(ball_side, StrategyLane::Center)
+        && overload_score <= 0.55
+        && trailing
+        && strategy_draw < 0.50
+    {
+        TeamAttackStrategy::AerialFlickOnRelease
+    } else if attacking_phase
+        && !in_final_third
+        && matches!(ball_side, StrategyLane::Center)
+        && overload_score <= 0.55
+        && compact_possession
+        && strategy_draw < 0.24
+    {
+        TeamAttackStrategy::PlayBackwardsToGoad
+    } else if attacking_phase
+        && !in_final_third
+        && matches!(ball_side, StrategyLane::Center)
+        && overload_score <= 0.55
+        && strategy_draw < 0.30
+    {
+        TeamAttackStrategy::BaitOffsideThenThroughBall
     } else if flank_attack_policy.is_flank() && (!in_final_third || deep_in_attack) {
         match ball_side {
             StrategyLane::Left if deep_in_attack => {
@@ -16655,7 +16931,27 @@ fn tactical_directive_for_team(
     {
         flank_overlap_run_probability = flank_overlap_run_probability.max(0.78).clamp(0.0, 0.86);
     }
-    let defense_strategy = if leading && defending {
+    let defense_strategy = if carrier_channel_window {
+        let channel_pressure = ((CARRIER_CHANNEL_PRESS_START_YARDS
+            - carrier_goal_distance_to_own_goal)
+            / (CARRIER_CHANNEL_PRESS_START_YARDS - CARRIER_CHANNEL_PRESS_FULL_YARDS).max(1.0))
+        .clamp(0.0, 1.0);
+        let center_offset_fraction =
+            ((ball_position.x - field_width * 0.5).abs() / (field_width * 0.5).max(1.0))
+                .clamp(0.0, 1.0);
+        if center_offset_fraction >= CARRIER_CHANNEL_WIDE_TRAP_FRACTION
+            && defensive_cover.actual >= 2
+            && channel_pressure >= CARRIER_CHANNEL_DOUBLE_TEAM_PRESS_MIN
+        {
+            TeamDefenseStrategy::DoubleTeamBallCarrier
+        } else if defensive_cover.actual == 0 && channel_pressure < 0.55 {
+            TeamDefenseStrategy::ContainAndDelayCounter
+        } else if ball_position.x <= field_width * 0.5 {
+            TeamDefenseStrategy::ForceWideLeftTrap
+        } else {
+            TeamDefenseStrategy::ForceWideRightTrap
+        }
+    } else if leading && defending {
         TeamDefenseStrategy::LowBlockCompact
     } else if press_intensity > 0.80 {
         TeamDefenseStrategy::HighPressManOriented
@@ -16900,6 +17196,51 @@ fn completed_pass_reward_for_pitch(
 
 fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
     completed_pass_reward_for_pitch(team, origin, target, DEFAULT_FIELD_WIDTH_YARDS, field_length)
+}
+
+fn pass_and_move_numbers_advantage_fit(advantage: f64) -> f64 {
+    if !advantage.is_finite() {
+        return 0.0;
+    }
+    (advantage.max(0.0) / PASS_AND_MOVE_NUMBERS_ADVANTAGE_REFERENCE).clamp(0.0, 1.0)
+}
+
+fn pass_and_move_run_lane_score_from_distance(distance_yards: f64) -> f64 {
+    if !distance_yards.is_finite() {
+        return 0.0;
+    }
+    (distance_yards.max(0.0) / PASS_AND_MOVE_RUN_LANE_REFERENCE_YARDS).clamp(0.0, 1.0)
+}
+
+fn pass_and_move_forward_reward_from_parts(
+    team: Team,
+    flight: PassFlight,
+    is_cross: bool,
+    origin: Vec2,
+    target: Vec2,
+    receiver_openness: f64,
+    numbers_advantage_fit: f64,
+    run_lane_score: f64,
+) -> f64 {
+    if flight.is_aerial() || is_cross {
+        return 0.0;
+    }
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if !forward_yards.is_finite() || forward_yards < PASS_AND_MOVE_FORWARD_MIN_YARDS {
+        return 0.0;
+    }
+    let numbers_fit = numbers_advantage_fit.clamp(0.0, 1.0);
+    if numbers_fit <= 1e-6 {
+        return 0.0;
+    }
+    let forward_fit = (forward_yards / PASS_AND_MOVE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    let openness_fit = receiver_openness.clamp(0.0, 1.0);
+    let run_fit = run_lane_score.clamp(0.0, 1.0);
+    let pattern_fit =
+        (forward_fit * 0.36 + openness_fit * 0.26 + numbers_fit * 0.24 + run_fit * 0.14)
+            .clamp(0.0, 1.0);
+    (PASS_AND_MOVE_FORWARD_REWARD_POINTS * pattern_fit * (0.72 + numbers_fit * 0.28))
+        .clamp(0.0, PASS_AND_MOVE_FORWARD_REWARD_CAP_POINTS)
 }
 
 fn first_time_short_forward_pass_fit(team: Team, origin: Vec2, target: Vec2) -> f64 {
@@ -18953,6 +19294,7 @@ fn soccer_goal_credit_transition_score(
             let weight_fit = soccer_goal_credit_pass_weight_fit(context);
             let stride_fit = pass_into_stride_fit_for_context(context, transition.team);
             let pressure_release = pressure * completion;
+            let pass_and_move = obs.pass_and_move_forward_opportunity.clamp(0.0, 1.0);
             let backward_penalty = if context.target_forward_yards < -4.0 && pressure < 0.35 {
                 0.52
             } else {
@@ -18966,6 +19308,9 @@ fn soccer_goal_credit_transition_score(
                 + target_forward.max(0.0) * 0.58
                 + (forward_gain / 24.0).clamp(-0.25, 1.0) * 0.62
                 + pressure_release * 0.28
+                + pass_and_move * 0.42
+                + obs.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.24
+                + obs.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.18
                 + weight_fit * 0.48
                 + stride_fit * 0.42
                 - obs.aerial_pass_interception_risk.clamp(0.0, 1.0) * 0.54
@@ -19187,6 +19532,16 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         receiver_openness,
                         pass_into_stride_fit_for_context(&action_context, player.team),
+                    );
+                    reward += pass_and_move_forward_reward_from_parts(
+                        player.team,
+                        flight,
+                        is_cross,
+                        origin,
+                        target,
+                        receiver_openness,
+                        decision.observation.pass_and_move_numbers_advantage,
+                        decision.observation.pass_and_move_run_lane_score,
                     );
                     if flight == PassFlight::Floor && !is_cross {
                         let target_forward_yards = (target.y - origin.y) * player.team.attack_dir();
@@ -35651,6 +36006,59 @@ fn soccer_neural_transition_features_with_action(
         features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED] =
             soccer_neural_bool(carryover.decision_cadence_switch_locked);
     }
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_PRESSURE] =
+        soccer_neural_unit(obs.defensive_carrier_channel_pressure);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_SIDE] =
+        soccer_neural_signed_unit(obs.defensive_carrier_channel_side);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER] = soccer_neural_unit(
+        obs.defensive_carrier_channel_cover_count.min(4) as f64 / 4.0,
+    );
+    features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_PRESSURE] =
+        soccer_neural_unit(obs.first_touch_escape_pressure);
+    features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_FORWARD_SPACE] =
+        soccer_neural_unit(obs.first_touch_escape_forward_space);
+    features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_BACKWARD_SPACE] =
+        soccer_neural_unit(obs.first_touch_escape_backward_space);
+    features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_TARGET_FORWARD] =
+        soccer_neural_signed_unit(
+            obs.first_touch_escape_target_forward_yards / FIRST_TOUCH_ESCAPE_MAX_STEP_YARDS,
+        );
+    features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_OPPORTUNITY] =
+        soccer_neural_unit(obs.pass_and_move_forward_opportunity);
+    features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_FORWARD_YARDS] = soccer_neural_scaled(
+        obs.pass_and_move_forward_yards.max(0.0),
+        PASS_AND_MOVE_FORWARD_REFERENCE_YARDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_NUMBERS_ADVANTAGE] =
+        soccer_neural_unit(obs.pass_and_move_numbers_advantage);
+    features[SOCCER_NEURAL_FEATURE_PASS_AND_MOVE_RUN_LANE] =
+        soccer_neural_unit(obs.pass_and_move_run_lane_score);
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_ATTACK] =
+        soccer_neural_unit(obs.long_aerial_control_attack_score);
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE] = if obs
+        .long_aerial_control_window_available
+    {
+        1.0 - soccer_neural_scaled(
+            obs.long_aerial_control_window_distance_yards.max(0.0),
+            LONG_AERIAL_CONTROL_REFERENCE_DISTANCE_YARDS,
+        )
+    } else {
+        0.0
+    };
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS] = if obs
+        .long_aerial_control_window_available
+    {
+        1.0 - soccer_neural_scaled(
+            obs.long_aerial_control_window_seconds.max(0.0),
+            LONG_AERIAL_CONTROL_REFERENCE_SECONDS,
+        )
+    } else {
+        0.0
+    };
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE] = soccer_neural_signed_unit(
+        obs.long_aerial_control_race_advantage_seconds
+            / LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS,
+    );
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -45347,6 +45755,7 @@ fn tracking_frame_to_world_snapshot(
         line_depth_head: None,
         pass_completion_head: None,
         loose_ball_commit_head: None,
+        attack_spacing_head: None,
         loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
