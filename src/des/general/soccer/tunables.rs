@@ -51,6 +51,10 @@ pub struct Tunables {
     pub shooting: ShootingTunables,
     /// Defensive line and back-four shape thresholds.
     pub defensive_shape: DefensiveShapeTunables,
+    /// Ball-carrier anti-stutter / keep-rolling thresholds.
+    pub carrier_keep_rolling: CarrierKeepRollingTunables,
+    /// Freshly-won possession escape burst thresholds.
+    pub fresh_possession_escape: FreshPossessionEscapeTunables,
     /// Goalkeeper positioning shaping (resting line, alignment score, buildup
     /// fan-out, loose-ball commit). See [`GoalkeeperTunables`].
     pub goalkeeper: GoalkeeperTunables,
@@ -71,6 +75,8 @@ impl Default for Tunables {
             decision_mpc: DecisionMpcTunables::default(),
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
+            carrier_keep_rolling: CarrierKeepRollingTunables::default(),
+            fresh_possession_escape: FreshPossessionEscapeTunables::default(),
             goalkeeper: GoalkeeperTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
@@ -368,6 +374,75 @@ impl Default for DefensiveShapeTunables {
     }
 }
 
+/// Ball-carrier keep-rolling thresholds. These govern the execution-layer guard
+/// that turns an unpressured holder's short settle target into a real carry so
+/// the carrier does not flicker walk/stop/walk while the ball would naturally
+/// keep rolling.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CarrierKeepRollingTunables {
+    pub enabled: bool,
+    pub stop_target_yards: f64,
+    pub min_opponent_distance_yards: f64,
+    pub min_space_yards: f64,
+    pub carry_target_yards: f64,
+    pub carry_min_step_yards: f64,
+    pub momentum_yps: f64,
+}
+
+impl Default for CarrierKeepRollingTunables {
+    fn default() -> Self {
+        CarrierKeepRollingTunables {
+            enabled: true,
+            stop_target_yards: 1.85,
+            min_opponent_distance_yards: 3.0,
+            min_space_yards: 5.0,
+            carry_target_yards: 4.2,
+            carry_min_step_yards: 2.25,
+            momentum_yps: 0.6,
+        }
+    }
+}
+
+/// Fresh ball-winner pressure escape knobs. These govern the transition touch
+/// after an outfield player wins possession in a crowd: accelerate away from
+/// the nearest pressure into a landing point that gains cushion and stays clear.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FreshPossessionEscapeTunables {
+    pub enabled: bool,
+    pub fresh_seconds: f64,
+    pub min_pressure: f64,
+    pub crowded_radius_yards: f64,
+    pub crowded_min_opponents: usize,
+    pub min_forward_space_yards: f64,
+    pub target_yards: f64,
+    pub corridor_half_width_yards: f64,
+    pub min_cushion_gain_yards: f64,
+    pub min_landing_clearance_yards: f64,
+    pub initial_push_yps: f64,
+    pub decision_floor_max_probability: f64,
+}
+
+impl Default for FreshPossessionEscapeTunables {
+    fn default() -> Self {
+        FreshPossessionEscapeTunables {
+            enabled: true,
+            fresh_seconds: 0.8,
+            min_pressure: 0.55,
+            crowded_radius_yards: 6.0,
+            crowded_min_opponents: 2,
+            min_forward_space_yards: 4.0,
+            target_yards: 4.8,
+            corridor_half_width_yards: 3.0,
+            min_cushion_gain_yards: 0.85,
+            min_landing_clearance_yards: 2.2,
+            initial_push_yps: 1.45,
+            decision_floor_max_probability: 0.56,
+        }
+    }
+}
+
 /// **Goalkeeper positioning** knobs — the shaping numbers behind where the keeper
 /// rests on its ball↔goal tracking line, how its line alignment is scored, how it
 /// fans defenders out for buildup, and how confidently it commits to a loose ball.
@@ -643,6 +718,8 @@ impl Tunables {
         self.decision_mpc.sanitize();
         self.shooting.sanitize();
         self.defensive_shape.sanitize();
+        self.carrier_keep_rolling.sanitize();
+        self.fresh_possession_escape.sanitize();
         self.lane_affinity.sanitize();
         self
     }
@@ -659,6 +736,10 @@ impl Tunables {
         self.shooting.validate_strict("shooting", &mut errors);
         self.defensive_shape
             .validate_strict("defensive_shape", &mut errors);
+        self.carrier_keep_rolling
+            .validate_strict("carrier_keep_rolling", &mut errors);
+        self.fresh_possession_escape
+            .validate_strict("fresh_possession_escape", &mut errors);
         self.lane_affinity
             .validate_strict("lane_affinity", &mut errors);
         if errors.is_empty() {
@@ -2439,6 +2520,304 @@ impl DefensiveShapeTunables {
     }
 }
 
+impl CarrierKeepRollingTunables {
+    fn sanitize(&mut self) {
+        let default = CarrierKeepRollingTunables::default();
+        sanitize_f64(
+            "carrier_keep_rolling.stop_target_yards",
+            &mut self.stop_target_yards,
+            default.stop_target_yards,
+            0.0,
+            6.0,
+            0.5,
+            2.5,
+        );
+        sanitize_f64(
+            "carrier_keep_rolling.min_opponent_distance_yards",
+            &mut self.min_opponent_distance_yards,
+            default.min_opponent_distance_yards,
+            0.0,
+            15.0,
+            2.0,
+            6.0,
+        );
+        sanitize_f64(
+            "carrier_keep_rolling.min_space_yards",
+            &mut self.min_space_yards,
+            default.min_space_yards,
+            0.0,
+            40.0,
+            3.0,
+            12.0,
+        );
+        sanitize_f64(
+            "carrier_keep_rolling.carry_target_yards",
+            &mut self.carry_target_yards,
+            default.carry_target_yards,
+            0.5,
+            25.0,
+            2.0,
+            8.0,
+        );
+        sanitize_f64(
+            "carrier_keep_rolling.carry_min_step_yards",
+            &mut self.carry_min_step_yards,
+            default.carry_min_step_yards,
+            0.0,
+            12.0,
+            1.0,
+            5.0,
+        );
+        sanitize_f64(
+            "carrier_keep_rolling.momentum_yps",
+            &mut self.momentum_yps,
+            default.momentum_yps,
+            0.0,
+            12.0,
+            0.2,
+            3.0,
+        );
+        if self.carry_min_step_yards > self.carry_target_yards {
+            eprintln!(
+                "soccer tunables: carrier_keep_rolling min step exceeded target; clamping min step"
+            );
+            self.carry_min_step_yards = self.carry_target_yards;
+        }
+        if self.min_space_yards < self.carry_min_step_yards {
+            eprintln!(
+                "soccer tunables: carrier_keep_rolling min space below min step; raising min space"
+            );
+            self.min_space_yards = self.carry_min_step_yards;
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "stop_target_yards", self.stop_target_yards, 0.0, 6.0, errors);
+        validate_f64(
+            prefix,
+            "min_opponent_distance_yards",
+            self.min_opponent_distance_yards,
+            0.0,
+            15.0,
+            errors,
+        );
+        validate_f64(prefix, "min_space_yards", self.min_space_yards, 0.0, 40.0, errors);
+        validate_f64(
+            prefix,
+            "carry_target_yards",
+            self.carry_target_yards,
+            0.5,
+            25.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "carry_min_step_yards",
+            self.carry_min_step_yards,
+            0.0,
+            12.0,
+            errors,
+        );
+        validate_f64(prefix, "momentum_yps", self.momentum_yps, 0.0, 12.0, errors);
+        if self.carry_min_step_yards > self.carry_target_yards {
+            errors.push(format!(
+                "{prefix}.carry_min_step_yards > {prefix}.carry_target_yards"
+            ));
+        }
+        if self.min_space_yards < self.carry_min_step_yards {
+            errors.push(format!(
+                "{prefix}.min_space_yards < {prefix}.carry_min_step_yards"
+            ));
+        }
+    }
+}
+
+impl FreshPossessionEscapeTunables {
+    fn sanitize(&mut self) {
+        let default = FreshPossessionEscapeTunables::default();
+        sanitize_f64(
+            "fresh_possession_escape.fresh_seconds",
+            &mut self.fresh_seconds,
+            default.fresh_seconds,
+            0.0,
+            5.0,
+            0.2,
+            1.5,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.min_pressure",
+            &mut self.min_pressure,
+            default.min_pressure,
+            0.0,
+            1.0,
+            0.25,
+            0.80,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.crowded_radius_yards",
+            &mut self.crowded_radius_yards,
+            default.crowded_radius_yards,
+            0.0,
+            20.0,
+            3.0,
+            10.0,
+        );
+        sanitize_usize(
+            "fresh_possession_escape.crowded_min_opponents",
+            &mut self.crowded_min_opponents,
+            default.crowded_min_opponents,
+            0,
+            8,
+            1,
+            4,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.min_forward_space_yards",
+            &mut self.min_forward_space_yards,
+            default.min_forward_space_yards,
+            0.0,
+            20.0,
+            2.0,
+            8.0,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.target_yards",
+            &mut self.target_yards,
+            default.target_yards,
+            0.5,
+            12.0,
+            2.5,
+            7.0,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.corridor_half_width_yards",
+            &mut self.corridor_half_width_yards,
+            default.corridor_half_width_yards,
+            0.5,
+            8.0,
+            1.5,
+            4.5,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.min_cushion_gain_yards",
+            &mut self.min_cushion_gain_yards,
+            default.min_cushion_gain_yards,
+            0.0,
+            4.0,
+            0.4,
+            1.8,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.min_landing_clearance_yards",
+            &mut self.min_landing_clearance_yards,
+            default.min_landing_clearance_yards,
+            0.0,
+            8.0,
+            1.2,
+            4.0,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.initial_push_yps",
+            &mut self.initial_push_yps,
+            default.initial_push_yps,
+            0.0,
+            8.0,
+            0.5,
+            3.5,
+        );
+        sanitize_f64(
+            "fresh_possession_escape.decision_floor_max_probability",
+            &mut self.decision_floor_max_probability,
+            default.decision_floor_max_probability,
+            0.0,
+            1.0,
+            0.20,
+            0.75,
+        );
+        if self.target_yards < self.min_cushion_gain_yards {
+            eprintln!(
+                "soccer tunables: fresh_possession_escape target below cushion gain; raising target"
+            );
+            self.target_yards = self.min_cushion_gain_yards;
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(prefix, "fresh_seconds", self.fresh_seconds, 0.0, 5.0, errors);
+        validate_f64(prefix, "min_pressure", self.min_pressure, 0.0, 1.0, errors);
+        validate_f64(
+            prefix,
+            "crowded_radius_yards",
+            self.crowded_radius_yards,
+            0.0,
+            20.0,
+            errors,
+        );
+        validate_usize(
+            prefix,
+            "crowded_min_opponents",
+            self.crowded_min_opponents,
+            0,
+            8,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "min_forward_space_yards",
+            self.min_forward_space_yards,
+            0.0,
+            20.0,
+            errors,
+        );
+        validate_f64(prefix, "target_yards", self.target_yards, 0.5, 12.0, errors);
+        validate_f64(
+            prefix,
+            "corridor_half_width_yards",
+            self.corridor_half_width_yards,
+            0.5,
+            8.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "min_cushion_gain_yards",
+            self.min_cushion_gain_yards,
+            0.0,
+            4.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "min_landing_clearance_yards",
+            self.min_landing_clearance_yards,
+            0.0,
+            8.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "initial_push_yps",
+            self.initial_push_yps,
+            0.0,
+            8.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "decision_floor_max_probability",
+            self.decision_floor_max_probability,
+            0.0,
+            1.0,
+            errors,
+        );
+        if self.target_yards < self.min_cushion_gain_yards {
+            errors.push(format!(
+                "{prefix}.target_yards < {prefix}.min_cushion_gain_yards"
+            ));
+        }
+    }
+}
+
 fn sanitize_f64(
     path: &str,
     value: &mut f64,
@@ -2657,6 +3036,28 @@ mod tests {
             8.0
         );
         assert_eq!(t.defensive_shape.defensive_goal_side_min_yards, 1.5);
+        assert!(t.carrier_keep_rolling.enabled);
+        assert_eq!(t.carrier_keep_rolling.stop_target_yards, 1.85);
+        assert_eq!(t.carrier_keep_rolling.min_opponent_distance_yards, 3.0);
+        assert_eq!(t.carrier_keep_rolling.min_space_yards, 5.0);
+        assert_eq!(t.carrier_keep_rolling.carry_target_yards, 4.2);
+        assert_eq!(t.carrier_keep_rolling.carry_min_step_yards, 2.25);
+        assert_eq!(t.carrier_keep_rolling.momentum_yps, 0.6);
+        assert!(t.fresh_possession_escape.enabled);
+        assert_eq!(t.fresh_possession_escape.fresh_seconds, 0.8);
+        assert_eq!(t.fresh_possession_escape.min_pressure, 0.55);
+        assert_eq!(t.fresh_possession_escape.crowded_radius_yards, 6.0);
+        assert_eq!(t.fresh_possession_escape.crowded_min_opponents, 2);
+        assert_eq!(t.fresh_possession_escape.min_forward_space_yards, 4.0);
+        assert_eq!(t.fresh_possession_escape.target_yards, 4.8);
+        assert_eq!(t.fresh_possession_escape.corridor_half_width_yards, 3.0);
+        assert_eq!(t.fresh_possession_escape.min_cushion_gain_yards, 0.85);
+        assert_eq!(t.fresh_possession_escape.min_landing_clearance_yards, 2.2);
+        assert_eq!(t.fresh_possession_escape.initial_push_yps, 1.45);
+        assert_eq!(
+            t.fresh_possession_escape.decision_floor_max_probability,
+            0.56
+        );
         assert_eq!(t.lane_affinity.forward_lane_radius, 3);
         assert_eq!(t.lane_affinity.defender_commitment_possession, 0.80);
         assert_eq!(t.lane_affinity.possession_factor, 0.80);
@@ -2671,6 +3072,16 @@ mod tests {
             "tracking": { "moved_dt_multiplier": 1.5 },
             "decision_mpc": { "reselect_min_ball_execution_probability": 0.42 },
             "defensive_shape": { "defensive_line_max_into_opp_half_yards": 4.0 },
+            "carrier_keep_rolling": {
+                "enabled": false,
+                "stop_target_yards": 1.4
+            },
+            "fresh_possession_escape": {
+                "min_pressure": 0.48,
+                "initial_push_yps": 1.8,
+                "min_forward_space_yards": 3.5,
+                "corridor_half_width_yards": 2.6
+            },
             "lane_affinity": {
                 "possession_factor": 0.74,
                 "open_space_dynamic_lane_bonus_weight": 1.3
@@ -2682,11 +3093,19 @@ mod tests {
             t.defensive_shape.defensive_line_max_into_opp_half_yards,
             4.0
         );
+        assert!(!t.carrier_keep_rolling.enabled);
+        assert_eq!(t.carrier_keep_rolling.stop_target_yards, 1.4);
+        assert_eq!(t.fresh_possession_escape.min_pressure, 0.48);
+        assert_eq!(t.fresh_possession_escape.initial_push_yps, 1.8);
+        assert_eq!(t.fresh_possession_escape.min_forward_space_yards, 3.5);
+        assert_eq!(t.fresh_possession_escape.corridor_half_width_yards, 2.6);
         assert_eq!(t.lane_affinity.possession_factor, 0.74);
         assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.3);
         // Untouched fields keep their defaults.
         assert_eq!(t.tracking.tackle_recover_max_distance_yards, 3.8);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
+        assert_eq!(t.carrier_keep_rolling.carry_target_yards, 4.2);
+        assert_eq!(t.fresh_possession_escape.target_yards, 4.8);
         assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
     }
 
@@ -2724,6 +3143,21 @@ mod tests {
                 "back_four_horizontal_min_gap_yards": 12.0,
                 "back_four_horizontal_max_gap_yards": 4.0
             },
+            "carrier_keep_rolling": {
+                "stop_target_yards": 99.0,
+                "carry_target_yards": 2.0,
+                "carry_min_step_yards": 4.0,
+                "min_space_yards": 1.0
+            },
+            "fresh_possession_escape": {
+                "fresh_seconds": 99.0,
+                "min_forward_space_yards": 99.0,
+                "target_yards": 0.5,
+                "corridor_half_width_yards": 99.0,
+                "min_cushion_gain_yards": 2.0,
+                "initial_push_yps": 99.0,
+                "crowded_min_opponents": 99
+            },
             "lane_affinity": {
                 "possession_factor": 4.0,
                 "forward_lane_radius": 99,
@@ -2735,6 +3169,17 @@ mod tests {
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 1.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 4.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 12.0);
+        assert_eq!(t.carrier_keep_rolling.stop_target_yards, 6.0);
+        assert_eq!(t.carrier_keep_rolling.carry_target_yards, 2.0);
+        assert_eq!(t.carrier_keep_rolling.carry_min_step_yards, 2.0);
+        assert_eq!(t.carrier_keep_rolling.min_space_yards, 2.0);
+        assert_eq!(t.fresh_possession_escape.fresh_seconds, 5.0);
+        assert_eq!(t.fresh_possession_escape.min_forward_space_yards, 20.0);
+        assert_eq!(t.fresh_possession_escape.target_yards, 2.0);
+        assert_eq!(t.fresh_possession_escape.corridor_half_width_yards, 8.0);
+        assert_eq!(t.fresh_possession_escape.min_cushion_gain_yards, 2.0);
+        assert_eq!(t.fresh_possession_escape.initial_push_yps, 8.0);
+        assert_eq!(t.fresh_possession_escape.crowded_min_opponents, 8);
         assert_eq!(t.lane_affinity.possession_factor, 1.0);
         assert_eq!(t.lane_affinity.forward_lane_radius, 6);
         assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
@@ -2747,12 +3192,18 @@ mod tests {
         t.shooting.shot_on_frame_min_probability = 1.2;
         t.defensive_shape.back_four_horizontal_min_gap_yards = 9.0;
         t.defensive_shape.back_four_horizontal_max_gap_yards = 6.0;
+        t.carrier_keep_rolling.carry_min_step_yards = 6.0;
+        t.carrier_keep_rolling.carry_target_yards = 4.0;
+        t.fresh_possession_escape.target_yards = 0.6;
+        t.fresh_possession_escape.min_cushion_gain_yards = 1.2;
         t.lane_affinity.possession_factor = 1.2;
         t.lane_affinity.forward_lane_radius = 9;
 
         let err = t.validate_strict().expect_err("config should be invalid");
         assert!(err.contains("shooting.shot_on_frame_min_probability"));
         assert!(err.contains("defensive_shape.back_four_horizontal_min_gap_yards >"));
+        assert!(err.contains("carrier_keep_rolling.carry_min_step_yards >"));
+        assert!(err.contains("fresh_possession_escape.target_yards <"));
         assert!(err.contains("lane_affinity.possession_factor"));
         assert!(err.contains("lane_affinity.forward_lane_radius"));
     }

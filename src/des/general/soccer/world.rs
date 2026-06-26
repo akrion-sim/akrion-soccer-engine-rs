@@ -33,25 +33,6 @@ const STATIONARY_HOLDER_ESCAPE_INITIAL_PUSH_YPS: f64 = 0.85;
 const STATIONARY_HOLDER_CARRY_MAX_PRESSURE: f64 = 0.34;
 const STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS: f64 = 2.25;
 const STATIONARY_HOLDER_CARRY_TARGET_YARDS: f64 = 4.2;
-// Carrier keep-rolling momentum (see `dd_soccer_disable_carrier_keep_rolling`). An unpressured
-// carrier whose action would bring it within this many yards of a dead stop keeps rolling instead.
-// Set above the `Stand`/`Walk` cusp (classify_movement_gait stands inside 0.18yd, walks inside
-// 1.8yd) so a settle-into-a-near-stop is caught while a real forward carry (target several yards
-// ahead) is left alone.
-const KEEP_ROLLING_STOP_TARGET_YARDS: f64 = 1.0;
-// No opponent within this radius ⇒ "unpressured": stopping buys nothing, so keep the ball moving.
-// Matches the ~3yd the user flagged (a defender inside this is close enough that a settle/shield
-// can be the right call, so the guard stands down and the normal decision plays out).
-const KEEP_ROLLING_MIN_OPPONENT_DISTANCE_YARDS: f64 = 3.0;
-// Only roll on when there is at least this much clear grass straight ahead to roll into; below it
-// there is nowhere to go and the normal (settle / turn / look-for-a-pass) behaviour is correct.
-pub(crate) const KEEP_ROLLING_MIN_SPACE_YARDS: f64 = 5.0;
-// Forward carry step the keep-rolling redirect aims for (clamped to the available forward space).
-const KEEP_ROLLING_CARRY_TARGET_YARDS: f64 = 4.2;
-pub(crate) const KEEP_ROLLING_CARRY_MIN_STEP_YARDS: f64 = 2.25;
-// Treat the carrier as "already travelling" (so the roll continues along the current line rather
-// than snapping straight up the pitch) only above this speed; below it, carry straight forward.
-const KEEP_ROLLING_MOMENTUM_YPS: f64 = 0.6;
 // First-touch escape: when a stationary receiver is under pressure (the band the calm
 // stationary-carry helper bails on) it must move the ball out of its feet rather than freeze
 // on a static shield. The escape probes a corridor this wide (half-width, yards) for clearance
@@ -9704,6 +9685,31 @@ impl SoccerMatch {
         });
     }
 
+    fn apply_fresh_possession_pressure_escape(&mut self, player_id: usize) {
+        let escape_target =
+            WorldSnapshot::from_match(self).fresh_possession_pressure_escape_target_for(player_id);
+        let Some(escape_target) = escape_target else {
+            return;
+        };
+        let current = self.players[player_id].position;
+        let escape = (escape_target - current).normalized();
+        if escape.len() > 1e-6 {
+            let escape_cfg = &tunables().fresh_possession_escape;
+            let velocity_along_escape = self.players[player_id].velocity.dot(escape);
+            if velocity_along_escape < escape_cfg.initial_push_yps {
+                self.players[player_id].velocity +=
+                    escape * (escape_cfg.initial_push_yps - velocity_along_escape);
+            }
+        }
+        self.apply_dribble_intent(
+            player_id,
+            escape_target,
+            true,
+            Some(DribbleMoveKind::CarryForward),
+            None,
+        );
+    }
+
     pub(crate) fn complete_defensive_dispossession(
         &mut self,
         defender_id: usize,
@@ -9786,6 +9792,7 @@ impl SoccerMatch {
             loser: attacker_id,
             grace_ticks,
         });
+        self.apply_fresh_possession_pressure_escape(defender_id);
         self.events.push(MatchEvent {
             tick: self.tick,
             clock_seconds: self.clock_seconds,
@@ -10387,7 +10394,8 @@ impl SoccerMatch {
         // fires when `carrier_keep_rolling_target_for` confirms the near-stop-in-space case, so the
         // path is byte-identical to baseline otherwise. Routed through the dribble executor so the
         // led ball stays glued to the feet exactly as a normal carry.
-        if !dd_soccer_disable_carrier_keep_rolling() && self.ball.holder == Some(player_id) {
+        let keep_rolling = &tunables().carrier_keep_rolling;
+        if keep_rolling.enabled && self.ball.holder == Some(player_id) {
             // `ControlTouch` is deliberately excluded: it is a first-touch reception/settle with its
             // own ball-settling semantics (it clears `incoming_ball` and draws the ball to the feet),
             // not a "stop on a ball you already hold". Only the settle/hold/carry actions that
@@ -19105,19 +19113,6 @@ fn dd_soccer_disable_hold_drive_into_space() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE").is_ok())
 }
-/// Disables the "carrier keep-rolling momentum" guard, restoring the prior behaviour where an
-/// unpressured ball-carrier could pull up to a dead stop (the walk-stop-walk-stop flicker the user
-/// flagged) when the decision layer issued a hold/settle/near-self target on a given tick. Default-
-/// off: the guard is ON, so a carrier with no opponent close and clear grass ahead keeps the ball
-/// rolling forward into the space instead of stopping (stopping concedes momentum for no gain and
-/// the ball runs on). The guard ONLY fires when the action would otherwise bring the carrier to a
-/// near-stop, so a genuine forward carry, a shielded turn, or a pass/shot is untouched — making the
-/// path byte-identical to baseline whenever the carrier was already moving with intent.
-fn dd_soccer_disable_carrier_keep_rolling() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_CARRIER_KEEP_ROLLING").is_ok())
-}
 /// Disables the "first-touch escape under pressure" mechanic, restoring the prior behaviour where a
 /// stationary carrier under pressure stays put on a static shield (the freeze the user flagged).
 /// Default-off: the escape is ON, so a pressed stationary receiver pushes the ball out of its feet
@@ -23414,6 +23409,7 @@ impl WorldSnapshot {
                 field_opponents_behind: 0,
                 field_ahead_teammate_ratio: 0.5,
                 field_behind_teammate_ratio: 0.5,
+                field_player_motion: Vec::new(),
                 visible_forward_pass_options: 0,
                 threaded_goal_pass_available: false,
                 threaded_goal_pass_target: None,
@@ -23920,6 +23916,7 @@ impl WorldSnapshot {
             self.forward_support_context_for(player_id, &visible_pass_targets);
         let field_front_behind_context = self.field_front_behind_context_for(player_id);
         let field_team_center_context = self.field_team_center_context_for(player_id);
+        let field_player_motion = soccer_field_player_motion_block(self, player_id, me.team);
         // Quick forward ground-pass priority (gated OFF = inert). Surfaces the best short
         // progressive ball (≈5–8 m) to an open, advanced teammate so the decision paths can
         // release it sooner and the execution can target that runner through the MPC pass path.
@@ -24700,6 +24697,7 @@ impl WorldSnapshot {
             field_opponents_behind: field_front_behind_context.field_opponents_behind,
             field_ahead_teammate_ratio: field_front_behind_context.field_ahead_teammate_ratio,
             field_behind_teammate_ratio: field_front_behind_context.field_behind_teammate_ratio,
+            field_player_motion,
             visible_forward_pass_options: forward_support_context.visible_forward_pass_options,
             threaded_goal_pass_available,
             threaded_goal_pass_target: threaded_goal_pass_assessment
@@ -36961,6 +36959,112 @@ impl WorldSnapshot {
             .map(|(landing, _)| landing)
     }
 
+    pub(crate) fn fresh_possession_pressure_escape_target_for(
+        &self,
+        player_id: usize,
+    ) -> Option<Vec2> {
+        let escape_cfg = &tunables().fresh_possession_escape;
+        if !escape_cfg.enabled {
+            return None;
+        }
+        let me = self.players.get(player_id)?;
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(me.team)
+            || me.role == PlayerRole::Goalkeeper
+            || me.controller_slot.is_some()
+            || self.ball_holder_possession_seconds > escape_cfg.fresh_seconds
+        {
+            return None;
+        }
+        let current = self.player_snapshot_position(me);
+        let (_, defender_pos, defender_distance) = self.nearest_opponent_at(me.team, current)?;
+        let pressure = pressure_from_nearest_distance(defender_distance);
+        let crowded_opponents = self
+            .players
+            .iter()
+            .filter(|opponent| opponent.team != me.team)
+            .filter(|opponent| {
+                self.player_snapshot_position(opponent).distance(current)
+                    <= escape_cfg.crowded_radius_yards
+            })
+            .count();
+        if pressure < escape_cfg.min_pressure
+            && crowded_opponents < escape_cfg.crowded_min_opponents
+        {
+            return None;
+        }
+
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        let away = {
+            let away = current - defender_pos;
+            if away.len() > 1e-6 {
+                away.normalized()
+            } else {
+                forward
+            }
+        };
+        let lateral_away = {
+            let lateral = Vec2::new(away.x.signum(), 0.0);
+            if lateral.len() > 1e-6 {
+                lateral.normalized()
+            } else {
+                away
+            }
+        };
+        let step = escape_cfg.target_yards.min(DRIBBLE_MAX_TOUCH_YARDS);
+        let base_cushion = current.distance(defender_pos);
+        let corridor_space = |direction: Vec2| -> f64 {
+            let mut nearest = step;
+            for opponent in self.players.iter().filter(|player| player.team != me.team) {
+                let to_opponent = self.player_snapshot_position(opponent) - current;
+                let along = to_opponent.dot(direction);
+                if along <= 0.0 || along > step {
+                    continue;
+                }
+                let lateral = (to_opponent - direction * along).len();
+                if lateral <= escape_cfg.corridor_half_width_yards {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        [
+            forward + away,
+            away,
+            lateral_away,
+            forward,
+            Vec2::new(0.0, -attack_dir) + away,
+        ]
+        .into_iter()
+        .filter(|direction| direction.len() > 1e-6)
+        .filter_map(|direction| {
+            let direction = direction.normalized();
+            if corridor_space(direction) < step {
+                return None;
+            }
+            let raw = current + direction * step;
+            let landing = raw.clamp_to_pitch(self.field_width, self.field_length);
+            if landing.distance(current) < step.min(STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS) {
+                return None;
+            }
+            let cushion_gain = landing.distance(defender_pos) - base_cushion;
+            if cushion_gain < escape_cfg.min_cushion_gain_yards {
+                return None;
+            }
+            let landing_clear = self.nearest_opponent_distance_at(me.team, landing);
+            if landing_clear < escape_cfg.min_landing_clearance_yards {
+                return None;
+            }
+            let forward_gain = ((landing.y - current.y) * attack_dir).max(0.0);
+            let score =
+                self.space_score_at(landing, me.team) + landing_clear + cushion_gain + forward_gain;
+            Some((landing, score))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(landing, _)| landing)
+    }
+
     /// Beat-the-defender duel (gated, default-ON): KEEP DISTANCE from a tight defender instead of
     /// freezing into a back-to-goal shield. A carrier that "just stops moving" under pressure has
     /// almost always turned its back to the defender to shield — sub-optimal for attacking forward.
@@ -37077,7 +37181,7 @@ impl WorldSnapshot {
             return self.first_touch_escape_carry_target_for(me, current, kind);
         }
         let forward_space = self.forward_dribble_space_yards(player_id);
-        if forward_space < WON_BALL_DRIVE_MIN_SPACE_YARDS {
+        if forward_space < tunables().fresh_possession_escape.min_forward_space_yards {
             return None;
         }
         let desired_step = touch
@@ -37127,17 +37231,15 @@ impl WorldSnapshot {
             .map(|(candidate, _)| candidate)
     }
 
-    /// Keep-rolling momentum target for an unpressured carrier (gated, default-ON; see
-    /// [`dd_soccer_disable_carrier_keep_rolling`]). When the decision layer hands the ball-carrier
-    /// an action that would pull it up to a near-stop (`requested_target` within
-    /// [`KEEP_ROLLING_STOP_TARGET_YARDS`] of the body) but there is no opponent close
-    /// ([`KEEP_ROLLING_MIN_OPPONENT_DISTANCE_YARDS`]) and clear grass ahead
-    /// ([`KEEP_ROLLING_MIN_SPACE_YARDS`]), return a forward carry target so the carrier keeps the
-    /// ball rolling into the space rather than stopping dead (the walk-stop-walk flicker). Returns
-    /// `None` — leaving the action untouched — whenever the carrier is genuinely moving with intent,
-    /// is pressured, is boxed in, is a keeper, or is human-controlled, so the path is byte-identical
-    /// to baseline outside the near-stop case. The roll continues along the current travel line when
-    /// the carrier still has momentum, else straight up the pitch.
+    /// Keep-rolling momentum target for an unpressured carrier. Tuned through
+    /// `tunables().carrier_keep_rolling`: when the decision layer hands the ball-carrier an action
+    /// that would pull it up to a near-stop, but there is no opponent close and clear grass ahead,
+    /// return a forward carry target so the carrier keeps the ball rolling into the space rather than
+    /// stopping dead (the walk-stop-walk flicker). Returns `None` — leaving the action untouched —
+    /// whenever the carrier is genuinely moving with intent, is pressured, is boxed in, is a keeper,
+    /// or is human-controlled, so the path is byte-identical to baseline outside the near-stop case.
+    /// The roll continues along the current travel line when the carrier still has momentum, else
+    /// straight up the pitch.
     pub(crate) fn carrier_keep_rolling_target_for(
         &self,
         player_id: usize,
@@ -37153,10 +37255,14 @@ impl WorldSnapshot {
         {
             return None;
         }
+        let keep_rolling = &tunables().carrier_keep_rolling;
+        if !keep_rolling.enabled {
+            return None;
+        }
         let current = self.player_snapshot_position(me);
         // Only intervene when the action would otherwise bring the carrier to a near-stop; a real
         // forward carry / drive (target several yards out) is left exactly as decided.
-        if current.distance(requested_target) > KEEP_ROLLING_STOP_TARGET_YARDS {
+        if current.distance(requested_target) > keep_rolling.stop_target_yards {
             return None;
         }
         // Unpressured: a defender inside the radius can make a settle/shield the right call, so the
@@ -37165,28 +37271,29 @@ impl WorldSnapshot {
             .nearest_opponent_at(me.team, current)
             .map(|(_, _, distance)| distance)
             .unwrap_or(f64::INFINITY);
-        if nearest_opponent <= KEEP_ROLLING_MIN_OPPONENT_DISTANCE_YARDS {
+        if nearest_opponent <= keep_rolling.min_opponent_distance_yards {
             return None;
         }
         // Need somewhere to roll into; boxed in ⇒ leave the settle/turn/look-for-a-pass behaviour.
         let forward_space = self.forward_dribble_space_yards(player_id);
-        if forward_space < KEEP_ROLLING_MIN_SPACE_YARDS {
+        if forward_space < keep_rolling.min_space_yards {
             return None;
         }
         let attack_dir = me.team.attack_dir();
         let forward = Vec2::new(0.0, attack_dir);
         // Continue along the current travel line when still rolling (so the carry never jerks
         // sideways onto the pure-forward axis), else carry straight up the pitch.
-        let heading = if me.velocity.len() > KEEP_ROLLING_MOMENTUM_YPS
+        let heading = if me.velocity.len() > keep_rolling.momentum_yps
             && me.velocity.dot(forward) > 0.0
         {
             me.velocity.normalized()
         } else {
             forward
         };
-        let step = KEEP_ROLLING_CARRY_TARGET_YARDS
+        let step = keep_rolling
+            .carry_target_yards
             .min(forward_space)
-            .max(KEEP_ROLLING_CARRY_MIN_STEP_YARDS);
+            .max(keep_rolling.carry_min_step_yards);
         let raw = current + heading * step;
         Some(raw.clamp_to_pitch(self.field_width, self.field_length))
     }

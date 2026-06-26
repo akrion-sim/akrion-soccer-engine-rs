@@ -346,6 +346,7 @@ const ENERGY_ECONOMY_LOW_VALUE_MOVEMENT_YARDS: f64 = 16.0;
 const ENERGY_ECONOMY_REFERENCE_MOVEMENT_YARDS: f64 = 42.0;
 const ENERGY_ECONOMY_FAST_SPEED_YPS: f64 = 4.0;
 const ENERGY_ECONOMY_REWARD_PENALTY_POINTS: f64 = 0.06;
+const ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS: f64 = ENERGY_ECONOMY_REWARD_PENALTY_POINTS;
 // A whole-team urgency wave: roughly six minutes rising/spent and six minutes recovering.
 const ENERGY_RHYTHM_PERIOD_SECONDS: f64 = 12.0 * 60.0;
 // Two-tier energy: `fatigue` is the slow aerobic drain; `anaerobic_load` is the
@@ -1319,17 +1320,10 @@ const EXCESSIVE_HOLD_RAMP_SPAN_SECONDS: f64 = 3.0;
 // third, where taking a man on is worth the risk.
 const DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL: f64 = 36.0;
-/// On winning the ball, a carrier needs at least this much clear space directly ahead before the
-/// "drive into space" floor fires (below it there is nothing to run into, so settle/pass/shield).
-const WON_BALL_DRIVE_MIN_SPACE_YARDS: f64 = 4.0;
-/// How long after gaining possession a carry still counts as a "just won the ball" transition for
-/// the drive-into-space floor (real elapsed possession time, `actual_time_on_ball_seconds`).
-const WON_BALL_DRIVE_FRESH_SECONDS: f64 = 0.8;
 /// Minimum (proximity/closing) pressure for the CROWDED won-ball escape floor to fire. Below it the
-/// win is calm enough that the clear-grass forward-drive floor owns the transition; at or above it
-/// the freshly-won carrier is in traffic and should accelerate AWAY into the open lane instead of
-/// settling into a shield. Sits just under the forward-drive block's `pressure < 0.55` cutoff so the
-/// two are complementary (calm+clear → drive forward; pressured+crowded → break into space).
+/// freshly-won carrier is in traffic and should accelerate AWAY into the open lane instead of
+/// settling into a shield. Sits just under the forward-drive block's pressure cutoff so the calm
+/// `tunables().fresh_possession_escape` floor and the crowded escape floor stay complementary.
 const WON_BALL_PRESSURE_ESCAPE_MIN_PRESSURE: f64 = 0.45;
 // "There's an open man — play it." When the learned policy proposes a dribble
 // but a teammate is this open with at least this expected completion, release
@@ -5630,6 +5624,11 @@ pub struct SoccerPomdpObservation {
     /// Share of back-side players who are teammates, [0, 1]; neutral 0.5 when nobody is behind.
     #[serde(default = "field_teammate_ratio_default")]
     pub field_behind_teammate_ratio: f64,
+    /// Whole-field 22-player + ball motion vector, actor-relative and team-canonical.
+    /// Mirrors [`SoccerDecisionContext::field_player_motion`] so the POMDP observation
+    /// itself contains the full field state every player decides from.
+    #[serde(default)]
+    pub field_player_motion: Vec<f32>,
     #[serde(default)]
     pub visible_forward_pass_options: usize,
     #[serde(default)]
@@ -11365,21 +11364,26 @@ impl SoccerTeamQPolicies {
 pub(crate) struct SoccerMarlTickReward {
     home_sum: f64,
     home_count: u32,
+    home_energy_waste_sum: f64,
     away_sum: f64,
     away_count: u32,
+    away_energy_waste_sum: f64,
 }
 
 impl SoccerMarlTickReward {
-    fn record(&mut self, team: Team, reward: f64) {
+    fn record(&mut self, team: Team, reward: f64, energy_waste_pressure: f64) {
         let reward = finite_metric(reward);
+        let energy_waste_pressure = finite_metric(energy_waste_pressure).clamp(0.0, 1.0);
         match team {
             Team::Home => {
                 self.home_sum += reward;
                 self.home_count = self.home_count.saturating_add(1);
+                self.home_energy_waste_sum += energy_waste_pressure;
             }
             Team::Away => {
                 self.away_sum += reward;
                 self.away_count = self.away_count.saturating_add(1);
+                self.away_energy_waste_sum += energy_waste_pressure;
             }
         }
     }
@@ -11388,6 +11392,18 @@ impl SoccerMarlTickReward {
         match team {
             Team::Home if self.home_count > 0 => self.home_sum / f64::from(self.home_count),
             Team::Away if self.away_count > 0 => self.away_sum / f64::from(self.away_count),
+            _ => 0.0,
+        }
+    }
+
+    fn energy_waste_average_for(self, team: Team) -> f64 {
+        match team {
+            Team::Home if self.home_count > 0 => {
+                (self.home_energy_waste_sum / f64::from(self.home_count)).clamp(0.0, 1.0)
+            }
+            Team::Away if self.away_count > 0 => {
+                (self.away_energy_waste_sum / f64::from(self.away_count)).clamp(0.0, 1.0)
+            }
             _ => 0.0,
         }
     }
@@ -11409,7 +11425,14 @@ pub(crate) fn soccer_marl_tick_rewards(
         tick_rewards
             .entry(transition.tick)
             .or_insert_with(SoccerMarlTickReward::default)
-            .record(transition.team, transition.reward);
+            .record(
+                transition.team,
+                transition.reward,
+                transition
+                    .observation
+                    .neural_extended
+                    .energy_waste_pressure,
+            );
     }
     tick_rewards
 }
@@ -11468,7 +11491,10 @@ fn soccer_marl_team_component(
     if balanced && !tick_reward.has_both_teams() {
         return 0.0;
     }
-    tick_reward.average_for(team) - tick_reward.average_for(team.other())
+    let reward_delta = tick_reward.average_for(team) - tick_reward.average_for(team.other());
+    let waste_delta = tick_reward.energy_waste_average_for(team)
+        - tick_reward.energy_waste_average_for(team.other());
+    finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS)
 }
 
 fn soccer_full_game_replay_transitions(
@@ -37101,17 +37127,24 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(context.shot_mpc_goal_probability),
     ];
     // Append the whole-field block so the value/critic conditions each decision on the
-    // grid + motion vector of all 22. Base-only nets migrate by zero-padding this
-    // tail; old six-channel motion nets insert zero jerk slots in the snapshot
-    // migration helper, so any slot left unfilled must stay 0.
+    // grid + motion vector of all 22 plus the ball. Prefer the POMDP observation's
+    // copy; the decision-context copy is only a compatibility fallback for older
+    // persisted transitions.
     let mut features = [0.0_f64; SOCCER_NEURAL_FEATURE_DIM];
     features[..SOCCER_NEURAL_BASE_FEATURE_DIM].copy_from_slice(&base_features);
     // The whole-field motion block fills exactly SOCCER_NEURAL_FIELD_MOTION_DIM slots after the
     // base; the zip stops there even though the tail is now longer (it also holds the belief
     // block), leaving the belief slots at 0 until filled below.
+    let field_player_motion = if transition.observation.field_player_motion.len()
+        == SOCCER_NEURAL_FIELD_MOTION_DIM
+    {
+        transition.observation.field_player_motion.as_slice()
+    } else {
+        transition.decision_context.field_player_motion.as_slice()
+    };
     for (slot, value) in features[SOCCER_NEURAL_BASE_FEATURE_DIM..]
         .iter_mut()
-        .zip(transition.decision_context.field_player_motion.iter())
+        .zip(field_player_motion.iter())
     {
         *slot = if value.is_finite() {
             f64::from(*value)
