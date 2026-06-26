@@ -687,6 +687,11 @@ const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_OWN_HALF_MIN_SPACE_YARDS: f64 = 3.0;
 const DRIBBLE_MOVING_AWAY_FULL_RELIEF_YPS: f64 = 2.5;
 const DRIBBLE_MOVING_AWAY_MAX_RELIEF: f64 = 0.86;
+// "If the opponent is moving away it's ok": an opponent ahead RECEDING at this rate or
+// faster (yds/s of separation gained) is vacating the space, so the carry-bend guard in
+// `pressure_escape_carry_direction` is lifted. Small negative threshold so genuinely
+// closing or stationary defenders still trip the guard.
+const DRIBBLE_OPPONENT_RECEDING_YPS: f64 = -0.5;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // Critical spacing discipline: most carriers should keep 2+ yards between the
 // ball and the NEAREST defender (in any direction), not just space straight ahead.
@@ -46894,6 +46899,16 @@ fn dd_soccer_disable_round_the_keeper() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ROUND_THE_KEEPER").is_ok())
+}
+
+// ON by default: the carrier keeps a cushion ahead before driving into a defender
+// (3yd in our own half, 2yd otherwise) and is freed to drive on when the defender ahead
+// is receding. Set DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE to revert to the flat
+// 2yd guard (byte-identical to the prior behavior).
+fn dd_soccer_disable_dribble_cushion_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on

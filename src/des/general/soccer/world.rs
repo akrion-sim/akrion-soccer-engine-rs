@@ -33308,7 +33308,7 @@ impl WorldSnapshot {
         ) {
             return base_direction;
         }
-        let Some((_, defender_pos, defender_distance)) = nearest_defender else {
+        let Some((defender_id, defender_pos, defender_distance)) = nearest_defender else {
             return base_direction;
         };
         let away = current - defender_pos;
@@ -33316,6 +33316,18 @@ impl WorldSnapshot {
             return base_direction;
         }
         let away = away.normalized();
+        // "If the opponent is moving away it's ok": when the nearest defender is RECEDING
+        // (the gap is opening), don't bend the carry away from it — let the carrier drive
+        // straight forward into the space it is vacating, fast. (`away` points from the
+        // defender toward the carrier, so a positive separation rate = gap widening.)
+        if !dd_soccer_disable_dribble_cushion_discipline() {
+            let defender_velocity = self.player_velocity(defender_id).unwrap_or(Vec2::zero());
+            let separation_rate = (player.velocity - defender_velocity).dot(away);
+            let closing_rate = -separation_rate;
+            if closing_rate <= DRIBBLE_OPPONENT_RECEDING_YPS {
+                return base_direction;
+            }
+        }
         let yards_to_goal = (player.team.goal_y(self.field_length) - current.y).abs();
         if player.role == PlayerRole::Defender {
             if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL
