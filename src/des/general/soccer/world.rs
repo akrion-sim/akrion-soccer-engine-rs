@@ -11271,20 +11271,6 @@ impl SoccerMatch {
                     let goal_y = player_team.goal_y(self.config.field_length_yards);
                     let goal_center_x = self.config.field_width_yards * 0.5;
                     let half_goal = self.config.goal_width_yards * 0.5;
-                    let raw_shot_speed =
-                        shot_speed_yps_from_power(power, &self.players[player_id].skills);
-                    let shot_mpc = shot_mpc_accuracy_estimate_for_snapshot(
-                        &snapshot,
-                        player_id,
-                        player_team,
-                        &self.players[player_id].skills,
-                        self.players[player_id].fatigue,
-                        player_pos,
-                        self.players[player_id].velocity,
-                        raw_shot_speed,
-                        false,
-                        pressure,
-                    );
                     let curl_probability = shot_curl_probability_for_player(
                         &self.players[player_id].skills,
                         pressure,
@@ -11312,17 +11298,15 @@ impl SoccerMatch {
                     } else if dd_soccer_enable_scored_shot_placement() {
                         // Price the placement: aim a non-curl shot at the goal-mouth spot
                         // the keeper can least reach, instead of dead-centre into them.
-                        if shot_mpc.qp_target_fit >= 0.34 && shot_mpc.body_mechanics_fit >= 0.28 {
-                            shot_mpc.target_point.x
-                        } else {
-                            snapshot.scored_shot_placement_x(
-                                player_team,
-                                player_pos,
-                                goal_y,
-                                raw_shot_speed,
-                                ability01(self.players[player_id].skills.shooting),
-                            )
-                        }
+                        let shot_speed =
+                            shot_speed_yps_from_power(power, &self.players[player_id].skills);
+                        snapshot.scored_shot_placement_x(
+                            player_team,
+                            player_pos,
+                            goal_y,
+                            shot_speed,
+                            ability01(self.players[player_id].skills.shooting),
+                        )
                     } else {
                         goal_center_x
                     };
@@ -11341,12 +11325,7 @@ impl SoccerMatch {
                         ),
                         goal_y,
                     );
-                    let speed = (raw_shot_speed
-                        * (0.88 + shot_mpc.foot_mechanics_fit.clamp(0.0, 1.0) * 0.12))
-                        .clamp(
-                            mph_to_yps(SHOT_MIN_SPEED_MPH),
-                            mph_to_yps(SHOT_MAX_SPEED_MPH),
-                        );
+                    let speed = shot_speed_yps_from_power(power, &self.players[player_id].skills);
                     let mut curve = DiscretizedKickCurve::None;
                     let mut curve_bend_yards = 0.0;
                     if use_curl {
@@ -23558,17 +23537,6 @@ impl WorldSnapshot {
                 shot_on_frame_probability: 0.0,
                 shot_beat_goalkeeper_probability: 0.0,
                 shot_curl_probability: 0.0,
-                shot_keeper_net_available: 0.0,
-                shot_rebound_second_chance_probability: 0.0,
-                shot_trigger_window_score: 0.0,
-                shot_trigger_patience_yards: 0.0,
-                shot_trigger_too_early_risk: 0.0,
-                shot_ball_x_fraction: 0.0,
-                shot_ball_y_fraction: 0.0,
-                shot_ball_goalward_velocity_yps: 0.0,
-                shot_ball_goalward_acceleration_yps2: 0.0,
-                shot_mpc_body_mechanics_fit: 0.0,
-                shot_mpc_preferred_foot_fit: 0.0,
                 pass_curl_probability: 0.0,
                 immediate_dispossession_risk: 0.0,
                 yards_to_goal: 0.0,
@@ -24466,38 +24434,6 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let shot_keeper_net_available = shot_mpc_accuracy
-            .map(|estimate| estimate.keeper_net_available)
-            .unwrap_or(0.0);
-        let shot_rebound_second_chance_probability = shot_mpc_accuracy
-            .map(|estimate| estimate.rebound_second_chance_probability)
-            .unwrap_or(0.0);
-        let shot_mpc_body_mechanics_fit = shot_mpc_accuracy
-            .map(|estimate| estimate.body_mechanics_fit)
-            .unwrap_or(0.0);
-        let shot_mpc_preferred_foot_fit = shot_mpc_accuracy
-            .map(|estimate| estimate.foot_mechanics_fit)
-            .unwrap_or(0.0);
-        let shot_ball_x_fraction = if has_ball {
-            (self.ball.position.x / self.field_width.max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let shot_ball_y_fraction = if has_ball {
-            (self.ball.position.y / self.field_length.max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let shot_ball_goalward_velocity_yps = if has_ball {
-            self.ball.velocity.y * me.team.attack_dir()
-        } else {
-            0.0
-        };
-        let shot_ball_goalward_acceleration_yps2 = if has_ball {
-            self.ball.acceleration.y * me.team.attack_dir()
-        } else {
-            0.0
-        };
         let shot_eval_elapsed = phase_started.elapsed();
         let phase_started = Instant::now();
         let immediate_dispossession_risk = if has_ball {
@@ -24679,30 +24615,6 @@ impl WorldSnapshot {
             .max(offensive_urgency)
             .max(defensive_urgency)
             .clamp(0.0, 1.0);
-        let shot_trigger_profile = shot_trigger_profile_from_inputs(
-            me.role,
-            has_ball,
-            yards_to_goal,
-            shot_lane_open,
-            shot_block_probability,
-            shot_on_frame_probability,
-            shot_beat_goalkeeper_probability,
-            shot_curl_probability,
-            shot_keeper_net_available,
-            shot_rebound_second_chance_probability,
-            opponent_goal_angle_degrees,
-            opposing_goalkeeper_out_of_position,
-            forward_dribble_space_yards,
-            perceived_pressure,
-            pressure_urgency,
-            immediate_dispossession_risk,
-            offensive_urgency,
-            goal_attack_window_score,
-            shot_ball_goalward_velocity_yps,
-            shot_ball_goalward_acceleration_yps2,
-            shot_mpc_body_mechanics_fit,
-            shot_mpc_preferred_foot_fit,
-        );
         let excessive_hold_pressure = if has_ball {
             excessive_hold_pressure_from_parts(
                 actual_time_on_ball_seconds,
@@ -24956,17 +24868,6 @@ impl WorldSnapshot {
             shot_on_frame_probability,
             shot_beat_goalkeeper_probability,
             shot_curl_probability,
-            shot_keeper_net_available,
-            shot_rebound_second_chance_probability,
-            shot_trigger_window_score: shot_trigger_profile.window_score,
-            shot_trigger_patience_yards: shot_trigger_profile.patience_yards,
-            shot_trigger_too_early_risk: shot_trigger_profile.too_early_risk,
-            shot_ball_x_fraction,
-            shot_ball_y_fraction,
-            shot_ball_goalward_velocity_yps,
-            shot_ball_goalward_acceleration_yps2,
-            shot_mpc_body_mechanics_fit,
-            shot_mpc_preferred_foot_fit,
             pass_curl_probability,
             immediate_dispossession_risk,
             yards_to_goal,
