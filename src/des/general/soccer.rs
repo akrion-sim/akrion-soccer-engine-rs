@@ -67,6 +67,8 @@ mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
 pub use support_scorer::*;
+mod run_prediction;
+pub use run_prediction::*;
 mod spacing_target;
 pub use spacing_target::*;
 mod aerial_reception;
