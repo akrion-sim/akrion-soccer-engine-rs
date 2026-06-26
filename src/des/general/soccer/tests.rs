@@ -61008,6 +61008,81 @@ fn stationary_unpressured_holder_carries_upfield_into_open_space() {
 }
 
 #[test]
+fn pressured_stationary_receiver_escapes_out_of_its_feet_instead_of_freezing() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let marker = 14;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[holder].skills.dribbling = 6.5;
+    sim.players[holder].skills.first_touch = 6.5;
+    // Presser right on top of the carrier from the side: pressured band, but the lane
+    // away from the marker is open, so the carrier must push the ball out of its feet.
+    sim.players[marker].position = Vec2::new(41.6, 58.4);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let marker_position = sim.players[marker].position;
+    let target = snapshot
+        .stationary_holder_open_space_carry_target_for(
+            holder,
+            origin,
+            Some(DribbleMoveKind::ProtectBall),
+            Some(DribbleTouchDecision::new(0, 1.0)),
+        )
+        .expect("a pressed stationary receiver with an open escape lane must move, not freeze");
+    assert!(
+        target.distance(origin) >= 2.0,
+        "escape must be a real step out of the feet: origin={origin:?} target={target:?}"
+    );
+    assert!(
+        target.distance(marker_position) > origin.distance(marker_position) + 1.0,
+        "escape must increase the cushion on the presser: origin={origin:?} target={target:?} marker={marker_position:?}"
+    );
+}
+
+#[test]
+fn boxed_in_pressured_receiver_keeps_the_shield() {
+    // Surround the carrier on all sides so no escape direction clears the cushion bar:
+    // the carrier is genuinely boxed in and must keep the shield, not shuffle pointlessly.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder, 14, 15, 16, 17]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    let origin = sim.players[holder].position;
+    sim.players[14].position = origin + Vec2::new(1.7, 0.0);
+    sim.players[15].position = origin + Vec2::new(-1.7, 0.0);
+    sim.players[16].position = origin + Vec2::new(0.0, 1.7);
+    sim.players[17].position = origin + Vec2::new(0.0, -1.7);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = origin;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot
+            .stationary_holder_open_space_carry_target_for(
+                holder,
+                origin,
+                Some(DribbleMoveKind::ProtectBall),
+                Some(DribbleTouchDecision::new(0, 1.0)),
+            )
+            .is_none(),
+        "a genuinely boxed-in carrier must keep the shield (no escape lane), not shuffle"
+    );
+}
+
+#[test]
 fn player_movement_limits_acceleration_and_jerk_to_conserve_energy() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mover = 8;
