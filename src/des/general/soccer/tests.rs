@@ -76218,6 +76218,12 @@ fn hold_for_support_scenario() -> SoccerMatch {
     for (away, x) in (12..=21).zip(line_xs) {
         sim.players[away].position = Vec2::new(x, 95.0);
     }
+    // Block the carrier's STRAIGHT-AHEAD dribbling lane: one Away player steps into the central
+    // channel ~6yd in front (calm — outside the 4.5yd press radius — but inside the 6yd
+    // drive-into-space lane), so the picture is genuinely blocked and the answer is to wait-and-
+    // summon, not to carry. Placed off the carrier→runner diagonal so it leaves that summon lane
+    // clean. Without this, an unpressured carrier with the road open drives into the space itself.
+    sim.players[15].position = Vec2::new(37.0, 65.5);
     sim
 }
 
@@ -76270,6 +76276,24 @@ fn hold_for_support_declines_when_not_calm_on_the_ball() {
     assert!(
         snapshot.hold_for_support_option_for(6).is_none(),
         "a proximate defender should rule out the calm wait"
+    );
+}
+
+#[test]
+fn hold_for_support_declines_when_open_grass_is_ahead_to_drive_into() {
+    let mut sim = hold_for_support_scenario();
+    // Clear the central blocker so the carrier has an open forward dribbling lane again. A calm,
+    // unpressured carrier with the road open in front should DRIVE into the space rather than
+    // stand on the ball to summon support — the gate must decline (this is the freeze fix).
+    sim.players[15].position = Vec2::new(56.0, 95.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.forward_dribble_space_yards(6) >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS,
+        "scenario should leave open forward space to drive into"
+    );
+    assert!(
+        snapshot.hold_for_support_option_for(6).is_none(),
+        "open grass ahead should make the carrier drive, not wait"
     );
 }
 
