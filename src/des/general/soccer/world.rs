@@ -290,7 +290,11 @@ pub struct SoccerMatch {
     /// completion; drained by the cluster learner to Postgres + [`SoccerPassCompletionHead`].
     pub(crate) pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     /// The learned pass-completion model, when present (trained from `pass_outcome_samples`).
-    pub(crate) pass_completion_head: Option<SoccerPassCompletionHead>,
+    /// Set by the learner (carried + trained across games, seeded from the Postgres corpus) so
+    /// the pass-quality assessor consumes it live; `None` ⇒ analytic completion estimate
+    /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
+    /// [`Self::line_depth_head`].
+    pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -16925,6 +16929,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// The trained pass-completion head, carried from the match for live consumption in
+    /// `pass_target_quality_for_snapshot`. `None` ⇒ analytic completion estimate (parity).
+    /// Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// The trained loose-ball commit head, carried from the match for live
     /// consumption in the retriever election. `None` ⇒ analytic seed (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
@@ -18402,6 +18411,7 @@ impl WorldSnapshot {
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             line_depth_head: m.line_depth_head.clone(),
+            pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),

@@ -40,6 +40,9 @@ use soccer_engine::des::general::tournament::{
     TournamentFormat, TournamentLearningMode, TournamentReport, TournamentTeam,
     TOURNAMENT_DEFAULT_MATCH_SECONDS,
 };
+use soccer_engine::des::general::soccer_elo::{
+    CrossPlayMatrix, EloRatings, ELO_DEFAULT_K,
+};
 use soccer_engine::des::soccer_learning::SOCCER_POLICY_STATUS_ACTIVE;
 use soccer_engine::des::soccer_learning_pg::{SoccerLearningPgStore, TournamentElite};
 use uuid::Uuid;
@@ -940,6 +943,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         champion.record.points(),
         champion.record.goal_difference(),
         started.elapsed().as_secs_f64(),
+    );
+
+    // Relative-strength read (#7): fold the whole fixture list into Elo + a
+    // cross-play payoff matrix. Unlike the bracket result, this is robust to who
+    // a team happened to draw and surfaces EXPLOITABILITY — a champion that wins
+    // the bracket but has a hard counter in the field is fragile, not dominant.
+    let elo = EloRatings::from_match_reports(&report.matches, ELO_DEFAULT_K, 16);
+    let cross_play = CrossPlayMatrix::from_match_reports(&report.matches);
+    let champion_elo = elo.rating(report.champion_id);
+    let elo_leader = elo.leader();
+    let champion_field_mean = cross_play
+        .mean_payoff_vs_field(report.champion_id)
+        .unwrap_or(f64::NAN);
+    let (worst_opponent, worst_payoff) = cross_play
+        .worst_case(report.champion_id)
+        .map(|(o, p)| (o as i64, p))
+        .unwrap_or((-1, f64::NAN));
+    println!(
+        "tournament_elo champion_elo={:.0} elo_leader_id={} elo_leader_is_champion={} champion_field_mean={:.3} champion_worst_opponent={} champion_worst_payoff={:.3}",
+        champion_elo,
+        elo_leader.map(|id| id as i64).unwrap_or(-1),
+        elo_leader == Some(report.champion_id),
+        champion_field_mean,
+        worst_opponent,
+        worst_payoff,
     );
 
     if promote {

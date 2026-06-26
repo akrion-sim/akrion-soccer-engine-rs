@@ -15,7 +15,9 @@ use soccer_engine::des::general::soccer::{
     MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
     BackFourLineHead, LooseBallCommitHead, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     report_attack_spacing_training, report_line_depth_training,
-    report_soccer_pass_completion_training, SoccerNeuralLearningBackend,
+    report_soccer_pass_completion_training, train_soccer_pass_completion_head,
+    SoccerPassCompletionHead, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
@@ -1885,6 +1887,15 @@ static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
 static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
+/// process (seeded once from the Postgres corpus at startup), mirroring
+/// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
+/// live once trained. Resets on pod restart; only consumed when
+/// DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION is on, but trained whenever pass-outcome samples
+/// accrue so the head is warm by the time the gate is flipped.
+static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletionHead>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -1921,6 +1932,12 @@ fn run_game(
     // live once trained. No-op unless the commit model is enabled.
     if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
         sim.set_loose_ball_commit_head(head.clone());
+    }
+    // Install the carried pass-completion head so the pass-quality assessor consumes it live
+    // once trained. No-op on completion scoring unless DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION
+    // is on; the head still trains regardless so it is warm when the gate is flipped.
+    if let Some(head) = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap().as_ref() {
+        sim.set_pass_completion_head(head.clone());
     }
 
     for tick_idx in 0..total_ticks {
@@ -1998,6 +2015,25 @@ fn run_game(
         eprintln!(
             "attack_spacing_training samples={} training_steps={} epochs={} final_loss={:.5}",
             report.samples, report.training_steps, report.epochs, report.final_loss
+        );
+    }
+    // Train the CARRIED pass-completion head on this game's pass-outcome corpus (whole-field
+    // config + pass features → completed?), so it accumulates across games and the assessor
+    // consumes it live once trained. Always trains when samples accrue (so the head warms
+    // independent of the consumption gate); consumption is gated separately.
+    if !pass_outcome_samples.is_empty() {
+        let mut guard = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SoccerPassCompletionHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train(&pass_outcome_samples, 0.05);
+        }
+        eprintln!(
+            "pass_completion_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            pass_outcome_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+            final_loss
         );
     }
     let mut artifact = sim.team_policy_artifact();
@@ -3036,21 +3072,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             let learning_rate = env_f64("SOCCER_PG_PASS_COMPLETION_LR", 0.05)?;
             match store.load_pass_outcome_samples(&experiment_id, pass_corpus_limit as i64) {
                 Ok(samples) => {
-                    match report_soccer_pass_completion_training(
-                        &samples,
-                        seed,
-                        epochs,
-                        learning_rate,
-                    ) {
-                        Some(report) => println!(
-                            "postgres_pass_completion_training experiment={} loaded={} trained_steps={} epochs={} final_loss={:.5} accuracy={:.3}",
-                            experiment_slug,
-                            report.samples,
-                            report.training_steps,
-                            report.epochs,
-                            report.final_loss,
-                            report.accuracy
-                        ),
+                    // Seed the carried pass-completion head from the accumulated cross-game
+                    // corpus (not just this run's samples), and KEEP it so `run_game` installs
+                    // it live. Previously the trained head was reported then discarded — the
+                    // "trained-but-unconsumed" gap this wiring closes.
+                    match train_soccer_pass_completion_head(&samples, seed, epochs, learning_rate) {
+                        Some((head, report)) => {
+                            println!(
+                                "postgres_pass_completion_training experiment={} loaded={} trained_steps={} epochs={} final_loss={:.5} accuracy={:.3}",
+                                experiment_slug,
+                                report.samples,
+                                report.training_steps,
+                                report.epochs,
+                                report.final_loss,
+                                report.accuracy
+                            );
+                            *CARRIED_PASS_COMPLETION_HEAD.lock().unwrap() = Some(head);
+                        }
                         None => println!(
                             "postgres_pass_completion_training experiment={} loaded={} (no usable samples to train)",
                             experiment_slug,

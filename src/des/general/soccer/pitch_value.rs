@@ -248,7 +248,16 @@ pub fn pitch_value_reward_delta(before: &WorldSnapshot, after: &WorldSnapshot, t
     if scale == 0.0 || !scale.is_finite() {
         return 0.0;
     }
-    let delta = territorial_advantage(after, team) - territorial_advantage(before, team);
+    // Territorial advantage Φ = net expected threat is a state potential, so its
+    // contribution is potential-based shaping (Ng et al. 1999): F = γΦ(s') − Φ(s),
+    // policy-invariant by construction. γ = 1.0 keeps this the plain difference the
+    // term already used (byte-identical); routing it through the shared primitive
+    // documents the invariance and is the template new dense terms should follow.
+    let delta = super::potential_based_shaping(
+        1.0,
+        territorial_advantage(before, team),
+        territorial_advantage(after, team),
+    );
     if !delta.is_finite() {
         return 0.0;
     }
