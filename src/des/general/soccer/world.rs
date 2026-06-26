@@ -7162,6 +7162,41 @@ impl SoccerMatch {
         }
     }
 
+    /// Attacking-overload score [0,1] for `team` from its current tactical directive — how big a
+    /// numbers advantage the team holds in the threat lane right now. Forced to 0.0 when the
+    /// overload-weighted-progression gate is OFF, so callers stay byte-identical by default.
+    fn overload_progression_weight(&self, team: Team) -> f64 {
+        if !dd_soccer_enable_overload_weighted_progression() {
+            return 0.0;
+        }
+        self.central_brain
+            .directive_for(team)
+            .attacking_overload_score
+            .clamp(0.0, 1.0)
+    }
+
+    /// Additive reward for a completed forward pass that carried the ball forward into a numbers
+    /// advantage — the forward yardage of the reception, capped, scaled by the attacking overload.
+    /// 0.0 when the gate is off, when there is no overload, or when the ball did not go forward.
+    fn overload_forward_pass_progression_bonus(&self, pass: &PendingPass, end: Vec2) -> f64 {
+        let overload = self.overload_progression_weight(pass.team);
+        if overload <= 0.0 {
+            return 0.0;
+        }
+        let forward_yards = ((end.y - pass.origin.y) * pass.team.attack_dir())
+            .clamp(0.0, OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS);
+        if forward_yards <= 0.0 {
+            return 0.0;
+        }
+        forward_yards * overload_forward_pass_progression_reward_per_yard() * overload
+    }
+
+    /// Multiplier applied to a forward pass-chain event reward, uplifting it when the chain was
+    /// played into a numbers advantage. 1.0 (no change) when the gate is off or there is no overload.
+    fn overload_pass_chain_event_multiplier(&self, team: Team) -> f64 {
+        1.0 + self.overload_progression_weight(team) * overload_pass_chain_event_bonus_fraction()
+    }
+
     pub(crate) fn record_completed_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {
         let Some(passer) = self.players.get(pass.from) else {
             return;
@@ -7193,7 +7228,8 @@ impl SoccerMatch {
                 self.config.field_length_yards,
             )
             + killer_pass_reward
-            + progressive_pass_escape_reward(pass, self.ball.position);
+            + progressive_pass_escape_reward(pass, self.ball.position)
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
         if pass.is_cross {
             match pass.team {
@@ -7481,7 +7517,8 @@ impl SoccerMatch {
         {
             self.record_significant_pass_chain_rewards(
                 &chain[..2],
-                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS
+                    * self.overload_pass_chain_event_multiplier(pass.team),
                 SoccerRewardEventKind::TwoForwardPasses,
             );
         }
@@ -7490,7 +7527,8 @@ impl SoccerMatch {
             if net_forward_yards >= PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS {
                 self.record_significant_pass_chain_rewards(
                     &chain[..3],
-                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS,
+                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS
+                        * self.overload_pass_chain_event_multiplier(pass.team),
                     SoccerRewardEventKind::ThreePassForwardNetGain,
                 );
             }

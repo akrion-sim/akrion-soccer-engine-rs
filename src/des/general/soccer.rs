@@ -1654,6 +1654,16 @@ const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
+// --- Overload-weighted progression (gated DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION) ---
+// A forward pass / forward pass-chain played while the attacking team holds a numbers advantage in
+// the threat lane (`attacking_overload_score`, see `attacking_overload_profile`) is reinforced MORE
+// than the same ball into a packed defence — teaching the policy to combine forward INTO the
+// overload (the "biggest numbers advantage" objective) rather than away from it. Every term gated
+// below is multiplied by an overload weight that is forced to 0.0 when the gate is OFF, so the
+// default path is byte-identical to the prior reward. Weights are env-overridable for PG learning.
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT: f64 = 0.10;
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS: f64 = 24.0;
+const OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT: f64 = 0.50;
 // --- Sterile vs. progressive passing WITHIN a retained possession (no turnover) ---
 // A handoff of the ball has a cost and every pass carries interception risk. A run of
 // STAGNANT_PASS_MIN_RUN+ completed passes whose ball travel never escapes this radius is
@@ -15935,6 +15945,45 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+}
+
+/// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
+/// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
+pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION").is_ok())
+}
+
+/// Per-yard reward for forward progress carried into a numbers advantage, scaled by the attacking
+/// overload score. Learner/operator override via `DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD`
+/// (clamped to a sane 0.0-0.5 window).
+pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 0.5))
+            .unwrap_or(OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT)
+    })
+}
+
+/// Fraction by which a forward pass-chain event reward is uplifted at full attacking overload.
+/// Learner/operator override via `DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION` (clamped 0.0-2.0).
+pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT)
+    })
 }
 
 /// End-line depth at which the "outside mid attack defender" play releases its cross (see
