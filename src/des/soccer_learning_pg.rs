@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
-    SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy,
-    SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
+    SOCCER_PASS_COMPLETION_FEATURE_DIM_V1, SoccerMomentEmbeddingInsert,
+    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
     CONFIG_FEATURE_DIM_V1, SOCCER_MOMENT_EMBEDDING_DIM,
 };
@@ -4310,17 +4311,21 @@ fn ensure_soccer_pass_outcome_tables(tx: &mut postgres::Transaction<'_>) -> Resu
           completed boolean not null,
           own_half boolean not null,
           created_at timestamptz not null default now(),
-          deleted_at timestamptz,
-          constraint des_soccer_pass_outcome_features_len_chk
-            check (array_length(features, 1) = {dim})
+          deleted_at timestamptz
         );
+        alter table des_soccer_pass_outcome_samples
+          drop constraint if exists des_soccer_pass_outcome_features_len_chk;
+        alter table des_soccer_pass_outcome_samples
+          add constraint des_soccer_pass_outcome_features_len_chk
+            check (array_length(features, 1) in ({legacy_dim}, {dim}));
         create index if not exists des_soccer_pass_outcome_run_idx
           on des_soccer_pass_outcome_samples (run_id);
         create index if not exists des_soccer_pass_outcome_live_created_idx
           on des_soccer_pass_outcome_samples (experiment_id, created_at)
           where deleted_at is null;
         "#,
-        dim = SOCCER_PASS_COMPLETION_FEATURE_DIM
+        dim = SOCCER_PASS_COMPLETION_FEATURE_DIM,
+        legacy_dim = SOCCER_PASS_COMPLETION_FEATURE_DIM_V1
     ))
     .map_err(|err| format!("ensure soccer pass-outcome tables: {err}"))
 }

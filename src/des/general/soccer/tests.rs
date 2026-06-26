@@ -76807,6 +76807,185 @@ fn long_aerial_pass_receiver_attacks_descending_control_window() {
 }
 
 #[test]
+fn long_aerial_bounds_risk_reaims_and_reaches_learning_features() {
+    // A long aerial aimed into the sideline/byline danger band should be priced as a pass-quality
+    // risk, corrected inward for execution, and recorded in the learned completion feature vector.
+    let origin = Vec2::new(40.0, 30.0);
+    let risky_target = Vec2::new(1.0, 105.0);
+    let risk = long_aerial_bounds_risk_for_target(
+        origin,
+        risky_target,
+        80.0,
+        120.0,
+        PassFlight::Aerial,
+    );
+    assert!(
+        risk.risk > 0.45,
+        "wide long aerial near touchline/byline should carry out-of-bounds risk: {risk:?}"
+    );
+    assert!(
+        risk.inward_correction_yards > 3.0,
+        "unsafe target should require an inward correction: {risk:?}"
+    );
+    let safe_target = long_aerial_safe_in_bounds_target(risky_target, 80.0, 120.0);
+    assert!(
+        safe_target.x >= LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS - 1e-6,
+        "safe long-aerial target should be pulled inside touchline margin: {safe_target:?}"
+    );
+    assert!(
+        safe_target.y <= 120.0 - LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS + 1e-6,
+        "safe long-aerial target should stay in front of byline margin: {safe_target:?}"
+    );
+    let floor_risk =
+        long_aerial_bounds_risk_for_target(origin, risky_target, 80.0, 120.0, PassFlight::Floor);
+    assert_eq!(
+        floor_risk.risk, 0.0,
+        "short/grounded decisions should not inherit long-aerial boundary risk"
+    );
+
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = origin;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = risky_target;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = origin;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let features = snapshot.pass_completion_learn_features(
+        Team::Home,
+        origin,
+        risky_target,
+        origin.distance(risky_target),
+        0.25,
+        0.65,
+        PassFlight::Aerial,
+    );
+    assert_eq!(features.len(), SOCCER_PASS_COMPLETION_FEATURE_DIM);
+    assert!(
+        features[SOCCER_PASS_COMPLETION_FEATURE_DIM_V1] > 0.45,
+        "pass-completion learner should see long-aerial bounds risk"
+    );
+    assert!(
+        features[SOCCER_PASS_COMPLETION_FEATURE_DIM_V1 + 2] > 0.40,
+        "pass-completion learner should see the inward correction needed to stay in play"
+    );
+}
+
+#[test]
+fn long_aerial_bounds_risk_is_pomdp_q_and_neural_ready() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 91_337,
+        formation_lp_enabled: false,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let risky_receiver = 9usize;
+    park_players_except(&mut sim, &[passer, risky_receiver]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 30.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].action_facing = FacingBucket::South;
+    sim.players[passer].skills.passing_completion_rate = 10.0;
+    sim.players[passer].skills.passing = 10.0;
+    sim.players[passer].skills.vision = 10.0;
+    sim.players[passer].skills.crossing_left = 10.0;
+    sim.players[passer].skills.crossing_right = 10.0;
+    sim.players[risky_receiver].team = Team::Home;
+    sim.players[risky_receiver].role = PlayerRole::Forward;
+    sim.players[risky_receiver].position = Vec2::new(1.0, 58.0);
+    sim.players[risky_receiver].velocity = Vec2::zero();
+    sim.players[risky_receiver].skills.height = 10.0;
+    sim.players[risky_receiver].skills.strength = 10.0;
+    sim.players[risky_receiver].skills.first_touch = 10.0;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let passer_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == passer)
+        .expect("passer");
+    let risky_receiver_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == risky_receiver)
+        .expect("risky receiver");
+    let risky_quality = pass_target_quality_for_snapshot(
+        &snapshot,
+        passer_snapshot,
+        sim.players[passer].position,
+        risky_receiver_snapshot,
+        sim.players[risky_receiver].position,
+        PassFlight::Aerial,
+    );
+    assert!(
+        risky_quality.long_aerial_bounds_risk > 0.25,
+        "risky wide receiver should be scored with long-aerial boundary risk: {risky_quality:?}"
+    );
+    let observation = snapshot.observation_for(passer);
+    let visible_aerial_targets = snapshot.ranked_visible_aerial_pass_targets(passer, 11);
+    assert!(
+        observation.long_aerial_bounds_risk > 0.05,
+        "POMDP observation should expose the best-aerial boundary risk; visible_aerial_targets={visible_aerial_targets:?} can_see={} direct_risk={}",
+        snapshot.player_can_see_player(passer, risky_receiver),
+        risky_quality.long_aerial_bounds_risk
+    );
+    assert!(
+        observation.long_aerial_bounds_inward_correction_yards > 0.25,
+        "POMDP observation should expose how far the pass must be corrected inward"
+    );
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(passer),
+        &observation,
+        Team::Home,
+        sim.players[passer].role,
+    );
+    assert!(
+        q_key.long_aerial_bounds_risk_bin > 0,
+        "Q-state key should bucket long-aerial boundary risk"
+    );
+    assert!(
+        q_key.long_aerial_bounds_correction_bin > 0,
+        "Q-state key should bucket long-aerial inward correction"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: passer,
+        team: Team::Home,
+        role: sim.players[passer].role,
+        state: snapshot.mdp_state_for_player(passer),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(passer),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_RISK] > 0.05,
+        "neural learner should see long-aerial boundary risk"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION] > 0.05,
+        "neural learner should see long-aerial inward correction"
+    );
+}
+
+#[test]
 fn pass_anticipation_first_touch_retains_away_from_a_bearing_down_marker() {
     // No team-mate to flick to: under a marker closing straight onto him, the receiver's first
     // touch pushes the ball into space AWAY from the marker's momentum to keep it.
@@ -77330,6 +77509,38 @@ fn pass_completion_head_learns_separable_pattern() {
     assert!(head.training_steps() > 0);
     // Malformed input is rejected, not panicked.
     assert!(head.predict(&[0.0; 3]).is_none());
+}
+
+#[test]
+fn pass_completion_head_accepts_legacy_six_feature_samples() {
+    let sample = |signal: f32, completed: bool| {
+        let mut features = vec![0.0f32; SOCCER_PASS_COMPLETION_FEATURE_DIM_V1];
+        *features.last_mut().unwrap() = signal;
+        features[SOCCER_MOMENT_EMBEDDING_DIM] = signal;
+        SoccerPassOutcomeSample {
+            features,
+            completed,
+            own_half: true,
+        }
+    };
+    let mut samples = Vec::new();
+    for _ in 0..96 {
+        samples.push(sample(1.0, true));
+        samples.push(sample(0.0, false));
+    }
+    let mut head = SoccerPassCompletionHead::new(19);
+    for _ in 0..250 {
+        head.train(&samples, 0.05);
+    }
+    let legacy_complete = sample(1.0, true);
+    let legacy_fail = sample(0.0, false);
+    let p_complete = head.predict(&legacy_complete.features).unwrap();
+    let p_fail = head.predict(&legacy_fail.features).unwrap();
+    assert!(
+        p_complete > p_fail + 0.2,
+        "legacy six-feature pass corpus should still train after boundary features are appended: complete={p_complete} fail={p_fail}"
+    );
+    assert!(head.training_steps() > 0);
 }
 
 #[test]

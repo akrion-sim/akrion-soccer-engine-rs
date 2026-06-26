@@ -10427,6 +10427,23 @@ impl SoccerMatch {
                         }
                         return;
                     }
+                    if flight.is_aerial() {
+                        let bounds = long_aerial_bounds_risk_for_target(
+                            player_pos,
+                            led_target,
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                            flight,
+                        );
+                        if bounds.risk >= 0.45 || bounds.inward_correction_yards >= 1.5 {
+                            led_target = long_aerial_safe_in_bounds_target(
+                                led_target,
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            );
+                            mpc_pass_speed = None;
+                        }
+                    }
                     let is_cross = pass_would_be_cross(
                         player_pos,
                         led_target,
@@ -13391,6 +13408,7 @@ impl SoccerMatch {
                 shot,
                 shot_off_target_yards,
             } => {
+                let pending_pass_for_out_of_play = self.pending_pass.clone();
                 self.pending_pass = None;
                 self.pending_shot = None;
                 self.pending_rebound = None;
@@ -13404,6 +13422,28 @@ impl SoccerMatch {
                         shot_off_target_yards,
                     );
                     self.record_miss_event(shot);
+                }
+                if let Some(pass) = pending_pass_for_out_of_play {
+                    if restart.awarded_team != pass.team {
+                        let own_half =
+                            pass_origin_in_own_half(pass.team, pass.origin, self.config.field_length_yards);
+                        self.record_pass_outcome_sample(&pass, false, own_half);
+                        if pass.flight.is_aerial()
+                            && pass.distance_yards >= LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS
+                        {
+                            let bounds = long_aerial_bounds_risk_for_target(
+                                pass.origin,
+                                pass.intended_target,
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                                pass.flight,
+                            );
+                            let penalty = LONG_AERIAL_OUT_OF_PLAY_PASSER_PENALTY_POINTS
+                                * (0.45 + bounds.risk.clamp(0.0, 1.0) * 0.55);
+                            self.record_reward_event(pass.from, -penalty);
+                            self.penalize_turnover_window(pass.team);
+                        }
+                    }
                 }
                 self.apply_restart(restart);
             }
@@ -22063,6 +22103,9 @@ impl WorldSnapshot {
                 expected_aerial_pass_completion: 0.0,
                 aerial_pass_bypass_score: 0.0,
                 aerial_pass_interception_risk: 0.0,
+                long_aerial_bounds_risk: 0.0,
+                long_aerial_bounds_margin_yards: 0.0,
+                long_aerial_bounds_inward_correction_yards: 0.0,
                 aerial_forward_runner_pass_multiplier: 1.0,
                 ball_position_confidence: 0.0,
                 teammate_position_confidence: 0.0,
@@ -22552,6 +22595,11 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let long_aerial_bounds_risk = best_aerial_pass_quality.long_aerial_bounds_risk;
+        let long_aerial_bounds_margin_yards =
+            best_aerial_pass_quality.long_aerial_bounds_margin_yards;
+        let long_aerial_bounds_inward_correction_yards =
+            best_aerial_pass_quality.long_aerial_bounds_inward_correction_yards;
         let flank_cross_arrival_target =
             self.flank_cross_arrival_target_for(player_id, me.home_position);
         let flank_cross_arrival_distance_yards = flank_cross_arrival_target
@@ -23165,6 +23213,9 @@ impl WorldSnapshot {
             expected_aerial_pass_completion: best_aerial_pass_quality.expected_completion,
             aerial_pass_bypass_score,
             aerial_pass_interception_risk,
+            long_aerial_bounds_risk,
+            long_aerial_bounds_margin_yards,
+            long_aerial_bounds_inward_correction_yards,
             aerial_forward_runner_pass_multiplier,
             ball_position_confidence,
             teammate_position_confidence,
@@ -25283,6 +25334,12 @@ impl WorldSnapshot {
                     pass_point,
                     dist,
                 );
+                let bounds_penalty = pass_quality.long_aerial_bounds_risk
+                    * LONG_AERIAL_BOUNDS_SCORE_PENALTY
+                    + (pass_quality.long_aerial_bounds_inward_correction_yards
+                        / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+                        .clamp(0.0, 1.0)
+                        * 1.2;
                 let score = directional_progress_score
                     + self.space_score_at(pass_point, me.team) * 0.65
                     - dist * 0.018
@@ -25305,6 +25362,7 @@ impl WorldSnapshot {
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
                     - lateral_penalty
+                    - bounds_penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
                     - marked_receiver_penalty
@@ -34809,6 +34867,22 @@ impl WorldSnapshot {
         features.push(pressure.clamp(0.0, 1.0) as f32);
         features.push(receiver_openness.clamp(0.0, 1.0) as f32);
         features.push(if flight.is_aerial() { 1.0 } else { 0.0 });
+        let bounds = long_aerial_bounds_risk_for_target(
+            from,
+            to,
+            self.field_width,
+            self.field_length,
+            flight,
+        );
+        features.push(bounds.risk.clamp(0.0, 1.0) as f32);
+        features.push(
+            (bounds.margin_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+                .clamp(-1.0, 1.0) as f32,
+        );
+        features.push(
+            (bounds.inward_correction_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+                .clamp(0.0, 1.5) as f32,
+        );
         features
     }
 

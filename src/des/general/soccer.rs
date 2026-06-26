@@ -1354,6 +1354,16 @@ const PASS_FORWARD_OUTLET_BAND_CENTER_YARDS: f64 = 24.0;
 // play (touchline / byline margins, robust to launch scatter).
 const PASS_FORWARD_OUTLET_TOUCHLINE_MARGIN_YARDS: f64 = 5.0;
 const PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS: f64 = 7.0;
+const LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS: f64 = 24.0;
+const LONG_AERIAL_BOUNDS_REFERENCE_DISTANCE_YARDS: f64 = 46.0;
+const LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS: f64 =
+    PASS_FORWARD_OUTLET_TOUCHLINE_MARGIN_YARDS;
+const LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS: f64 =
+    PASS_FORWARD_OUTLET_BYLINE_MARGIN_YARDS;
+const LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS: f64 = 8.0;
+const LONG_AERIAL_BOUNDS_COMPLETION_GATE_STRENGTH: f64 = 0.72;
+const LONG_AERIAL_BOUNDS_SCORE_PENALTY: f64 = 6.4;
+const LONG_AERIAL_OUT_OF_PLAY_PASSER_PENALTY_POINTS: f64 = 5.6;
 // A no-target forward ball is only played to a teammate who is genuinely open (nearest opponent
 // far) and down a reasonably clear lane — never straight to a marked man / into a blocked lane.
 const FORWARD_OUTLET_MIN_RECEIVER_OPENNESS: f64 = 0.38;
@@ -3451,6 +3461,10 @@ const SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM: usize = 4;
 /// who should attack a long ball's descending 8ft->5ft control window and how
 /// soon/contested that reception will be.
 const SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = 4;
+/// Append-only long-aerial boundary block. These channels teach the value head
+/// that a lofted target near the touchline/byline is materially different from
+/// the same distance safely in play.
+const SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM: usize = 3;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3483,8 +3497,11 @@ const SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_FIR
     + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM
     + SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
-    + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
+        + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM
+    + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3763,6 +3780,12 @@ const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE + 1;
 const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_RISK: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_MARGIN: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_RISK + 1;
+const SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_MARGIN + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3814,6 +3837,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     182,
     324,
     186,
+    // Full old total before long-aerial boundary-risk channels were appended.
+    SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM,
     // Old base + whole-field motion (6 channels/entity), before belief blocks.
     SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1,
     // Old base + whole-field motion (6 channels/entity) + perception-belief,
@@ -5278,6 +5303,12 @@ pub struct SoccerPomdpObservation {
     pub aerial_pass_bypass_score: f64,
     #[serde(default)]
     pub aerial_pass_interception_risk: f64,
+    #[serde(default)]
+    pub long_aerial_bounds_risk: f64,
+    #[serde(default)]
+    pub long_aerial_bounds_margin_yards: f64,
+    #[serde(default)]
+    pub long_aerial_bounds_inward_correction_yards: f64,
     #[serde(default)]
     pub aerial_forward_runner_pass_multiplier: f64,
     #[serde(default)]
@@ -7807,6 +7838,12 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub aerial_pass_interception_risk_bin: u8,
     #[serde(default)]
+    pub long_aerial_bounds_risk_bin: u8,
+    #[serde(default)]
+    pub long_aerial_bounds_margin_bin: u8,
+    #[serde(default)]
+    pub long_aerial_bounds_correction_bin: u8,
+    #[serde(default)]
     pub aerial_forward_runner_pass_boost_bin: u8,
     #[serde(default)]
     pub ball_position_confidence_bin: u8,
@@ -8268,6 +8305,18 @@ impl SoccerQStateKey {
                 observation.aerial_pass_interception_risk,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            long_aerial_bounds_risk_bin: distance_bucket(
+                observation.long_aerial_bounds_risk,
+                &[0.12, 0.28, 0.50, 0.75],
+            ),
+            long_aerial_bounds_margin_bin: distance_bucket(
+                observation.long_aerial_bounds_margin_yards,
+                &[1.0, 3.0, 5.0, 8.0],
+            ),
+            long_aerial_bounds_correction_bin: distance_bucket(
+                observation.long_aerial_bounds_inward_correction_yards,
+                &[0.5, 1.5, 3.0, 5.0],
+            ),
             aerial_forward_runner_pass_boost_bin: distance_bucket(
                 observation.aerial_forward_runner_pass_multiplier.max(1.0) - 1.0,
                 &[0.05, 0.12, 0.25, 0.42],
@@ -8644,6 +8693,9 @@ impl SoccerQStateKey {
             && self.pass_and_move_run_lane_bin == other.pass_and_move_run_lane_bin
             && self.aerial_pass_bypass_score_bin == other.aerial_pass_bypass_score_bin
             && self.aerial_pass_interception_risk_bin == other.aerial_pass_interception_risk_bin
+            && self.long_aerial_bounds_risk_bin == other.long_aerial_bounds_risk_bin
+            && self.long_aerial_bounds_margin_bin == other.long_aerial_bounds_margin_bin
+            && self.long_aerial_bounds_correction_bin == other.long_aerial_bounds_correction_bin
             && self.aerial_forward_runner_pass_boost_bin
                 == other.aerial_forward_runner_pass_boost_bin
             && self.ball_position_confidence_bin == other.ball_position_confidence_bin
@@ -19278,6 +19330,7 @@ fn soccer_goal_credit_transition_score(
                 + weight_fit * 0.48
                 + stride_fit * 0.42
                 - obs.aerial_pass_interception_risk.clamp(0.0, 1.0) * 0.54
+                - obs.long_aerial_bounds_risk.clamp(0.0, 1.0) * 0.62
                 - backward_penalty
                 + dense_signal
         }
@@ -30932,10 +30985,15 @@ pub struct SoccerPolicyHeadSnapshot {
     pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
 }
 
+/// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
+/// receiver openness, aerial flag.
+pub const SOCCER_PASS_COMPLETION_PASS_FEATURES_V1: usize = 6;
+pub const SOCCER_PASS_COMPLETION_FEATURE_DIM_V1: usize =
+    SOCCER_MOMENT_EMBEDDING_DIM + SOCCER_PASS_COMPLETION_PASS_FEATURES_V1;
 /// Number of pass-specific scalar features appended to the 256-d config embedding for the learned
-/// pass-completion model: distance, forward progress, lateral, passer pressure, receiver openness,
-/// aerial flag.
-pub const SOCCER_PASS_COMPLETION_PASS_FEATURES: usize = 6;
+/// pass-completion model: the legacy six plus long-aerial boundary risk, in-play margin, and
+/// inward correction.
+pub const SOCCER_PASS_COMPLETION_PASS_FEATURES: usize = 9;
 /// Total input width of the learned pass-completion model.
 pub const SOCCER_PASS_COMPLETION_FEATURE_DIM: usize =
     SOCCER_MOMENT_EMBEDDING_DIM + SOCCER_PASS_COMPLETION_PASS_FEATURES;
@@ -30995,12 +31053,8 @@ impl SoccerPassCompletionHead {
 
     /// P(complete) for a captured feature vector, or `None` on malformed input.
     pub(crate) fn predict(&self, features: &[f32]) -> Option<f64> {
-        if features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM
-            || features.iter().any(|v| !v.is_finite())
-        {
-            return None;
-        }
-        let input: Vec<f64> = features.iter().map(|&v| v as f64).collect();
+        let normalized = normalize_pass_completion_features(features)?;
+        let input: Vec<f64> = normalized.iter().map(|&v| v as f64).collect();
         let out = self.network.predict(&input);
         out.first().copied().filter(|p| p.is_finite())
     }
@@ -31011,10 +31065,10 @@ impl SoccerPassCompletionHead {
         let mut total = 0.0;
         let mut applied = 0usize;
         for sample in samples {
-            if sample.features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM {
+            let Some(normalized) = normalize_pass_completion_features(&sample.features) else {
                 continue;
-            }
-            let input: Vec<f64> = sample.features.iter().map(|&v| v as f64).collect();
+            };
+            let input: Vec<f64> = normalized.iter().map(|&v| v as f64).collect();
             let target = [if sample.completed { 1.0 } else { 0.0 }];
             let result = self.network.train_sample_clipped(&input, &target, learning_rate, 4.0);
             if result.applied && result.loss.is_finite() {
@@ -31057,6 +31111,22 @@ impl SoccerPassCompletionHead {
     }
 }
 
+fn normalize_pass_completion_features(features: &[f32]) -> Option<Vec<f32>> {
+    if features.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    match features.len() {
+        SOCCER_PASS_COMPLETION_FEATURE_DIM => Some(features.to_vec()),
+        SOCCER_PASS_COMPLETION_FEATURE_DIM_V1 => {
+            let mut migrated = Vec::with_capacity(SOCCER_PASS_COMPLETION_FEATURE_DIM);
+            migrated.extend_from_slice(features);
+            migrated.resize(SOCCER_PASS_COMPLETION_FEATURE_DIM, 0.0);
+            Some(migrated)
+        }
+        _ => None,
+    }
+}
+
 /// Outcome of training the learned pass-completion head on a corpus loaded from Postgres
 /// (`SoccerStore::load_pass_outcome_samples`). Logged by the learning runner so an operator can
 /// see the persisted training data is actually being loaded and learned from.
@@ -31089,7 +31159,7 @@ pub(crate) fn train_soccer_pass_completion_head(
 ) -> Option<(SoccerPassCompletionHead, SoccerPassCompletionTrainingReport)> {
     let usable = samples
         .iter()
-        .filter(|s| s.features.len() == SOCCER_PASS_COMPLETION_FEATURE_DIM)
+        .filter(|s| normalize_pass_completion_features(&s.features).is_some())
         .count();
     if usable == 0 || epochs == 0 {
         return None;
@@ -35977,6 +36047,17 @@ fn soccer_neural_transition_features_with_action(
     features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE] = soccer_neural_signed_unit(
         obs.long_aerial_control_race_advantage_seconds
             / LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_RISK] =
+        soccer_neural_unit(obs.long_aerial_bounds_risk);
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_MARGIN] = soccer_neural_unit(
+        (obs.long_aerial_bounds_margin_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+            .clamp(0.0, 1.0),
+    );
+    features[SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION] = soccer_neural_unit(
+        (obs.long_aerial_bounds_inward_correction_yards
+            / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
+            .clamp(0.0, 1.0),
     );
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
@@ -49110,7 +49191,8 @@ fn pass_quality_for_patience(observation: &SoccerPomdpObservation, flight: PassF
                     .clamp(0.0, 1.0)
                     * 0.24
                 + observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.20
-                + (1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0)) * 0.10)
+                + (1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0)) * 0.06
+                + (1.0 - observation.long_aerial_bounds_risk.clamp(0.0, 1.0)) * 0.04)
                 .clamp(0.0, 1.0)
         }
     }
@@ -49938,6 +50020,70 @@ pub(crate) struct PassLaneInterceptionRisk {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LongAerialBoundsRisk {
+    pub(crate) risk: f64,
+    pub(crate) margin_yards: f64,
+    pub(crate) inward_correction_yards: f64,
+}
+
+pub(crate) fn long_aerial_safe_in_bounds_target(
+    target: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> Vec2 {
+    let width = field_width.max(1.0);
+    let length = field_length.max(1.0);
+    let touch_margin = LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS.min(width * 0.45);
+    let byline_margin = LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS.min(length * 0.45);
+    Vec2::new(
+        target.x.clamp(touch_margin, width - touch_margin),
+        target.y.clamp(byline_margin, length - byline_margin),
+    )
+}
+
+pub(crate) fn long_aerial_bounds_risk_for_target(
+    origin: Vec2,
+    target: Vec2,
+    field_width: f64,
+    field_length: f64,
+    flight: PassFlight,
+) -> LongAerialBoundsRisk {
+    if !flight.is_aerial() {
+        return LongAerialBoundsRisk::default();
+    }
+    let distance = origin.distance(target);
+    if distance < LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS {
+        return LongAerialBoundsRisk::default();
+    }
+    let width = field_width.max(1.0);
+    let length = field_length.max(1.0);
+    let x_margin = target.x.min(width - target.x);
+    let y_margin = target.y.min(length - target.y);
+    let margin_yards = x_margin.min(y_margin);
+    let safe_target = long_aerial_safe_in_bounds_target(target, width, length);
+    let inward_correction_yards = target.distance(safe_target);
+    let touch_deficit = ((LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS - x_margin)
+        / LONG_AERIAL_BOUNDS_SAFE_TOUCHLINE_MARGIN_YARDS.max(1e-6))
+        .clamp(0.0, 1.0);
+    let byline_deficit = ((LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS - y_margin)
+        / LONG_AERIAL_BOUNDS_SAFE_BYLINE_MARGIN_YARDS.max(1e-6))
+        .clamp(0.0, 1.0);
+    let distance_fit = ((distance - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
+        / (LONG_AERIAL_BOUNDS_REFERENCE_DISTANCE_YARDS - LONG_AERIAL_BOUNDS_MIN_DISTANCE_YARDS)
+            .max(1.0))
+    .clamp(0.0, 1.0);
+    let risk = touch_deficit
+        .max(byline_deficit)
+        .max((inward_correction_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS).clamp(0.0, 1.0))
+        * (0.35 + distance_fit * 0.65);
+    LongAerialBoundsRisk {
+        risk: risk.clamp(0.0, 1.0),
+        margin_yards,
+        inward_correction_yards,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
@@ -49961,6 +50107,9 @@ struct PassTargetQuality {
     mpc_receipt_probability: f64,
     mpc_receipt_race_advantage_seconds: f64,
     mpc_receipt_qp_accel_fit: f64,
+    long_aerial_bounds_risk: f64,
+    long_aerial_bounds_margin_yards: f64,
+    long_aerial_bounds_inward_correction_yards: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -50741,6 +50890,13 @@ fn pass_target_quality_for_snapshot_inner(
     } else {
         initial_anticipated_target
     };
+    let long_aerial_bounds = long_aerial_bounds_risk_for_target(
+        passer_position,
+        anticipated_target,
+        snapshot.field_width,
+        snapshot.field_length,
+        flight,
+    );
     // Learnable pass velocity: sweep the candidate launch speeds and choose the pace to
     // strike this ball at, given the lane to the anticipated reception point. A contested
     // lane that only a driven ball threads is now scored at that driven speed (lower lane
@@ -50889,6 +51045,11 @@ fn pass_target_quality_for_snapshot_inner(
             (1.0 - backward_path_traffic.risk * BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH)
                 .clamp(0.18, 1.0);
     }
+    if long_aerial_bounds.risk > 0.0 {
+        lane_clearance *=
+            (1.0 - long_aerial_bounds.risk * LONG_AERIAL_BOUNDS_COMPLETION_GATE_STRENGTH)
+                .clamp(0.16, 1.0);
+    }
     let distance_fit = if flight.is_aerial() {
         (1.0 - (distance - 32.0).abs() / 58.0).clamp(0.24, 1.0)
     } else {
@@ -50956,6 +51117,9 @@ fn pass_target_quality_for_snapshot_inner(
         mpc_receipt_probability: mpc_receipt.probability,
         mpc_receipt_race_advantage_seconds: mpc_receipt.race_advantage_seconds,
         mpc_receipt_qp_accel_fit: mpc_receipt.qp_accel_fit,
+        long_aerial_bounds_risk: long_aerial_bounds.risk,
+        long_aerial_bounds_margin_yards: long_aerial_bounds.margin_yards,
+        long_aerial_bounds_inward_correction_yards: long_aerial_bounds.inward_correction_yards,
     }
 }
 
