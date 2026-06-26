@@ -4735,6 +4735,103 @@ fn long_backward_pass_penalty_grows_linearly_past_short_reset() {
 }
 
 #[test]
+fn aerial_pass_in_bounds_launch_speed_caps_overcooked_loft_toward_touchline() {
+    let field_width = 80.0;
+    let field_length = 115.0;
+    let origin = Vec2::new(40.0, 60.0);
+    // Aim a long loft toward the right touchline; the receiver is just inside the line.
+    let aim = Vec2::new(76.0, 60.0);
+    let reference_distance = origin.distance(aim);
+    let overcooked_speed = 60.0;
+    let capped = aerial_pass_in_bounds_launch_speed(
+        origin,
+        aim,
+        overcooked_speed,
+        reference_distance,
+        field_width,
+        field_length,
+    );
+    assert!(
+        capped < overcooked_speed,
+        "an over-hit loft toward the touchline must be trimmed: {capped} !< {overcooked_speed}"
+    );
+    // The capped pace must actually land inside the pitch margin along the aim direction.
+    let apex = lofted_pass_apex_yards(reference_distance);
+    let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
+    let carry = capped * hang_time / AERIAL_LAND_AT_TARGET_DRAG_COMP;
+    let landing = origin + (aim - origin).normalized() * carry;
+    assert!(
+        landing.x <= field_width - AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS + 1e-6,
+        "capped loft must land inside the touchline margin: landing.x={}",
+        landing.x
+    );
+}
+
+#[test]
+fn aerial_pass_in_bounds_launch_speed_leaves_safe_central_loft_untouched() {
+    let field_width = 80.0;
+    let field_length = 115.0;
+    let origin = Vec2::new(40.0, 50.0);
+    let aim = Vec2::new(40.0, 78.0); // central, well short of the far byline
+    let reference_distance = origin.distance(aim);
+    let speed = 16.0; // a weighted loft that comfortably lands at the target
+    let result = aerial_pass_in_bounds_launch_speed(
+        origin,
+        aim,
+        speed,
+        reference_distance,
+        field_width,
+        field_length,
+    );
+    assert!(
+        (result - speed).abs() < 1e-9,
+        "a loft that already lands in-field must be unchanged: {result} vs {speed}"
+    );
+}
+
+#[test]
+fn aerial_pass_landing_safety_drops_near_the_touchline() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 7_777,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let central_receiver = 7usize;
+    let wide_receiver = 8usize;
+    park_players_except(&mut sim, &[passer, central_receiver, wide_receiver]);
+
+    let passer_pos = Vec2::new(40.0, 70.0);
+    sim.players[passer].position = passer_pos;
+    sim.players[passer].velocity = Vec2::zero();
+    // One outlet deep in midfield, one hugging the right touchline.
+    let central_pos = Vec2::new(40.0, 45.0);
+    let wide_pos = Vec2::new(sim.config.field_width_yards - 2.0, 45.0);
+    sim.players[central_receiver].position = central_pos;
+    sim.players[central_receiver].velocity = Vec2::zero();
+    sim.players[wide_receiver].position = wide_pos;
+    sim.players[wide_receiver].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = passer_pos;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let central_safety =
+        aerial_pass_landing_safety_for_snapshot(&snapshot, passer_pos, central_receiver);
+    let wide_safety =
+        aerial_pass_landing_safety_for_snapshot(&snapshot, passer_pos, wide_receiver);
+    assert!(
+        wide_safety < central_safety,
+        "a loft to a touchline-hugger must read less safe than one to a central outlet: \
+         wide={wide_safety} central={central_safety}"
+    );
+    assert!(
+        central_safety > 0.9,
+        "a central outlet should read essentially safe: {central_safety}"
+    );
+}
+
+#[test]
 fn backward_pass_path_traffic_prices_floor_and_aerial_retreats() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
