@@ -608,6 +608,36 @@ const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
 const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
+// --- Defensive shepherding / "show one way" (gated, default OFF = byte-identical) ---
+// Real defending of a 1v1 as the carrier drives from ~40 to ~15yd out is not a square
+// retreat: the pressing defender approaches on a CURVED angle so their body sits on the
+// inside (goal-centre) shoulder of the carrier, cutting the central / goal-bound route and
+// SHOWING the carrier toward the nearer touchline (and, all else equal, toward our cover).
+// The carrier is jockeyed wide into less dangerous space instead of being allowed to come
+// straight down the middle. These tune that lateral "shoulder" offset applied to the single
+// nearest presser's engage target. Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
+//
+// Lateral shoulder offset (yards) the presser takes to the inside of the carrier at full
+// engagement. ~2yd ≈ a body-width-plus stance: enough to clearly block the inside cut while
+// staying in contest range, not so far it leaves the carrier a straight lane down the middle.
+const SHEPHERD_SHOULDER_YARDS: f64 = 2.2;
+// Goalward band (yards from our own goal) over which shepherding is active and ramps. The
+// principle is a final-/middle-third behaviour: weight rises from 0 at SHEPHERD_BAND_FAR_YARDS
+// (~40yd out) to full at SHEPHERD_BAND_NEAR_YARDS (~15yd out), then eases back to a holding
+// value right on top of the box (where you square up and deny the shot rather than show wide).
+const SHEPHERD_BAND_FAR_YARDS: f64 = 40.0;
+const SHEPHERD_BAND_NEAR_YARDS: f64 = 15.0;
+// Right on the box edge the shepherd relaxes toward this fraction of full (you stop showing
+// wide and square up to deny the central shot once they are this deep), reached at the
+// six-yard depth `OWN_GOAL_PRESS_FULL_YARDS`.
+const SHEPHERD_BOX_RELAX_FRACTION: f64 = 0.45;
+// Half-width (yards either side of pitch centre) of the central "danger lane". Shepherding is
+// strongest for a carrier in this central channel (most goal threat, clearest case for showing
+// them wide); it tapers to a light touch once the carrier is already wide of it.
+const SHEPHERD_CENTRAL_LANE_HALF_WIDTH_YARDS: f64 = 14.0;
+// A carrier already within this lateral distance of a touchline is effectively pinned wide;
+// don't shove the presser past them into the touchline (no inside lane left to deny).
+const SHEPHERD_TOUCHLINE_MARGIN_YARDS: f64 = 8.0;
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
 /// channel from the ball. Lets receivers balance open space with a direct route

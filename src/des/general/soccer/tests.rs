@@ -62479,6 +62479,132 @@ fn force_wide_channel_pressure_steps_defender_to_inside_shoulder_and_reaches_lea
 }
 
 #[test]
+fn defensive_shepherd_takes_inside_shoulder_to_show_carrier_wide() {
+    // The shepherd transform should bias the presser's engage point toward the carrier's
+    // INSIDE (goal-centre) shoulder, leaving the touchline side open — so the carrier is
+    // shown wide rather than allowed straight down the middle.
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snap = WorldSnapshot::from_match(&sim);
+    let defender = 2; // Home: own goal at y≈0, attacks +y.
+    let me = snap.players.iter().find(|p| p.id == defender).unwrap();
+    let center = snap.field_width * 0.5;
+
+    // Carrier LEFT of centre, in the ~40→15yd shepherding band, with a square goal-side
+    // engage target. Inside shoulder is to the RIGHT (toward centre), so the shift is +x.
+    let carrier_l = Vec2::new(center - 12.0, 24.0);
+    let engage_l = Vec2::new(carrier_l.x, carrier_l.y - 1.0);
+    let shifted_l = snap.shepherd_show_wide_core(me, carrier_l, engage_l);
+    assert!(
+        shifted_l.x > engage_l.x + 0.25,
+        "left carrier: defender should take the inside (right) shoulder: {shifted_l:?}"
+    );
+    assert!(
+        (shifted_l.y - engage_l.y).abs() < 1e-9,
+        "shepherd is a pure lateral shift; goal-side depth must be preserved"
+    );
+    assert!(
+        shifted_l.x <= center + 1e-6,
+        "inside shoulder must not overshoot past the centre of the pitch"
+    );
+
+    // Carrier RIGHT of centre: inside shoulder is to the LEFT, so the shift is -x.
+    let carrier_r = Vec2::new(center + 12.0, 24.0);
+    let engage_r = Vec2::new(carrier_r.x, carrier_r.y - 1.0);
+    let shifted_r = snap.shepherd_show_wide_core(me, carrier_r, engage_r);
+    assert!(
+        shifted_r.x < engage_r.x - 0.25,
+        "right carrier: defender should take the inside (left) shoulder: {shifted_r:?}"
+    );
+
+    // The default-OFF gate makes the wrapper a no-op (byte-identical baseline).
+    let gated = snap.shepherd_show_wide_adjusted_target(me, carrier_l, engage_l);
+    assert_eq!(
+        gated, engage_l,
+        "with DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD unset the wrapper must not move the target"
+    );
+}
+
+#[test]
+fn defensive_shepherd_inactive_outside_band_and_tapers_when_pinned_wide() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snap = WorldSnapshot::from_match(&sim);
+    let defender = 2;
+    let me = snap.players.iter().find(|p| p.id == defender).unwrap();
+    let center = snap.field_width * 0.5;
+
+    // Beyond the far edge of the band (~40yd) the carrier is just contained: no shift.
+    let far_carrier = Vec2::new(center - 12.0, 48.0);
+    let far_engage = Vec2::new(far_carrier.x, far_carrier.y - 1.0);
+    assert_eq!(
+        snap.shepherd_show_wide_core(me, far_carrier, far_engage),
+        far_engage,
+        "outside the shepherding band the engage target is unchanged"
+    );
+
+    // A carrier already pinned against the touchline has little room to be shown wider,
+    // so the shoulder offset tapers well below a half-central carrier's at the same depth.
+    let mid_carrier = Vec2::new(center - 12.0, 22.0);
+    let mid_engage = Vec2::new(mid_carrier.x, mid_carrier.y - 1.0);
+    let mid_shift = (snap.shepherd_show_wide_core(me, mid_carrier, mid_engage).x - mid_engage.x).abs();
+
+    let wide_carrier = Vec2::new(2.0, 22.0);
+    let wide_engage = Vec2::new(wide_carrier.x, wide_carrier.y - 1.0);
+    let wide_shift =
+        (snap.shepherd_show_wide_core(me, wide_carrier, wide_engage).x - wide_engage.x).abs();
+
+    assert!(
+        wide_shift < mid_shift,
+        "a touchline-pinned carrier should be shepherded less than a half-central one: \
+         wide={wide_shift} mid={mid_shift}"
+    );
+}
+
+#[test]
+fn defensive_shepherd_end_to_end_shifts_assignment_inside_when_enabled() {
+    // End-to-end through `defensive_assignment_for`: with the gate ON the nearest presser's
+    // assignment is biased to the carrier's inside shoulder; with it OFF it squares up on the
+    // goal-side line (byte-identical baseline). Run the ON case in isolation with
+    // `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1` so the process-global gate reads true.
+    let enabled = std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for id in 0..=10 {
+        sim.players[id].position = Vec2::new(5.0, 5.0);
+        sim.players[id].home_position = sim.players[id].position;
+    }
+    let center = WorldSnapshot::from_match(&sim).field_width * 0.5;
+    let defender = 2;
+    // Goal-side of the carrier (between it and our goal at y≈0), left of centre.
+    sim.players[defender].position = Vec2::new(center - 12.0, 18.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    let carrier = 17; // Away, fast and goal-bound inside our defensive third, left of centre.
+    sim.players[carrier].position = Vec2::new(center - 12.0, 26.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -6.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let carrier_pos =
+        snap.player_snapshot_position(snap.players.iter().find(|p| p.id == carrier).unwrap());
+    let assignment =
+        snap.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+
+    if enabled {
+        assert!(
+            assignment.x > carrier_pos.x + 0.3,
+            "shepherd ON: a left-side carrier should be shown wide — defender takes the inside \
+             (right) shoulder: assignment={assignment:?} carrier={carrier_pos:?}"
+        );
+    } else {
+        assert!(
+            assignment.x <= carrier_pos.x + CONTAIN_ENGAGE_GOAL_SIDE_YARDS + 0.3,
+            "shepherd OFF: defender squares up on the goal-side line (baseline): \
+             assignment={assignment:?} carrier={carrier_pos:?}"
+        );
+    }
+}
+
+#[test]
 fn close_to_goal_carrier_pulls_nearest_defender_out_of_retreat() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     // No covering defender behind: every other Home outfielder is far upfield, so
