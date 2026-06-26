@@ -2860,6 +2860,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         true,
     )?;
     apply_env_mpc_config(&mut config, &default_config)?;
+    // The neural ACTOR (and MAPPO, which is itself gated on `actor_critic`) was previously left
+    // disabled in standard learning runs: `neural_blend` came straight from `MatchConfig::default()`
+    // where `actor_critic = false`, so a run that asked for Mappo/IndependentActorCritic still only
+    // trained the value head. Tie the actor to the requested MARL algorithm — on whenever an actor
+    // is wanted (anything but `Off`) — with an explicit `SOCCER_ENABLE_ACTOR_CRITIC` override either way.
+    let actor_critic_default = config.neural_learning.marl_algorithm != SoccerMarlAlgorithm::Off;
+    config.neural_blend.actor_critic = env_bool("SOCCER_ENABLE_ACTOR_CRITIC", actor_critic_default)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
         env_value("SOCCER_RUN_DIR").unwrap_or_else(|| format!("out/soccer-learning-runs/{run_id}")),

@@ -3791,14 +3791,17 @@ const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// by advantage policy-gradient from the critic; stable baseline values live here,
 /// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
 const SOCCER_POLICY_ROLE_EMBEDDING_DIM: usize = 4;
-/// GK plus left/central/right archetypes for each outfield role line.
-/// Unlike the actor's current-position channels, this tail is built from the player's
-/// assigned/home slot and therefore survives overlaps, switches, and temporary roaming.
-const SOCCER_POLICY_POSITION_EMBEDDING_DIM: usize = 10;
-const SOCCER_POLICY_FEATURE_DIM: usize =
-    SOCCER_NEURAL_FEATURE_DIM
-        + SOCCER_POLICY_ROLE_EMBEDDING_DIM
-        + SOCCER_POLICY_POSITION_EMBEDDING_DIM;
+/// Exact-position one-hot appended after the broad role one-hot so the shared actor can
+/// specialize per assigned slot (GK / LB / LCB / RCB / RB / DM / CM / AM / LW / RW / ST)
+/// rather than treating all four defenders — or both wide forwards — identically. Always
+/// present in the feature schema; populated only when
+/// `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING` is set (else all-zero ⇒ a clean A/B
+/// against the role-only actor within the same network dimensions). See
+/// [`SoccerAssignedPosition`] and [`soccer_assigned_position_for`].
+const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = 11;
+const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
+    + SOCCER_POLICY_ROLE_EMBEDDING_DIM
+    + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Entropy bonus — keeps the actor from collapsing onto one family too early.
@@ -3816,6 +3819,10 @@ const SOCCER_POLICY_GRAD_CLIP_NORM: f64 = 5.0;
 /// Decision-time weight on the actor's log-probability when it biases action
 /// selection (multiplies `ln π(family|s)` added to each candidate's blend score).
 const SOCCER_POLICY_DECISION_WEIGHT: f64 = 0.6;
+/// Decision-time weight on a **specialist skill head's** log-probability (pass/dribble/shot),
+/// added on top of the joint actor's family log-prob for candidates in that skill group. Kept
+/// below the joint weight so the specialists refine — rather than override — the shared actor.
+const SOCCER_SKILL_POLICY_DECISION_WEIGHT: f64 = 0.4;
 /// Learned **world model** `P̂(s'|s,a)` hyperparameters. The model regresses the
 /// next state's feature vector from the current (state ⊕ action) features,
 /// enabling 1-step model-based value look-ahead (Dyna-style).
@@ -15061,6 +15068,10 @@ pub(crate) enum SoccerRewardEventKind {
     TwoForwardPasses,
     ThreePassForwardNetGain,
     ShotOnTarget,
+    /// A goalkeeper stopped a shot (save/parry/claim/smother). Positive credit scaled by
+    /// the danger of the effort denied (an xG-prevented proxy) — the keeper's direct
+    /// learning signal, complementing the retrospective concede penalty.
+    KeeperSave,
     Goal,
     MatchResult,
 }
@@ -15075,6 +15086,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::KeeperSave
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::MatchResult
         )
@@ -32119,6 +32131,482 @@ impl SoccerPolicyHead {
     }
 }
 
+/// Technical skill groups the specialist actor heads cover. Each maps to a disjoint subset of
+/// [`SOCCER_POLICY_ACTIONS`] (the passing, dribbling, and shooting families respectively).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerSkillGroup {
+    Pass,
+    Dribble,
+    Shot,
+}
+
+const SOCCER_SKILL_PASS_FAMILIES: &[&str] = &[
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "flank-low-cross",
+    "flank-high-cross",
+    "switch-play",
+    "wall-pass",
+    "corner-flag-cross",
+    "surprise-pass",
+    "scoop-pass",
+    "first-time-pass",
+];
+const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
+    "dribble",
+    "carry-forward",
+    "carry-out-left",
+    "carry-out-right",
+    "protect-ball",
+    "side-step",
+    "left-cut",
+    "right-cut",
+    "nutmeg",
+    "fake-left-cut-right",
+    "fake-right-cut-left",
+    "xavi-turn",
+    "round-goalkeeper",
+];
+const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &["shoot", "first-time-shot"];
+
+impl SoccerSkillGroup {
+    const ALL: [SoccerSkillGroup; 3] = [
+        SoccerSkillGroup::Pass,
+        SoccerSkillGroup::Dribble,
+        SoccerSkillGroup::Shot,
+    ];
+
+    fn families(self) -> &'static [&'static str] {
+        match self {
+            SoccerSkillGroup::Pass => SOCCER_SKILL_PASS_FAMILIES,
+            SoccerSkillGroup::Dribble => SOCCER_SKILL_DRIBBLE_FAMILIES,
+            SoccerSkillGroup::Shot => SOCCER_SKILL_SHOT_FAMILIES,
+        }
+    }
+}
+
+/// Resolve a joint-actor family index (into [`SOCCER_POLICY_ACTIONS`]) to its specialist skill
+/// group and the head-local action index within that group, or `None` for families outside the
+/// three technical skills (hold/space/tackle/press/…), which only the joint actor covers.
+fn soccer_policy_skill_group_for_action_index(
+    action_index: usize,
+) -> Option<(SoccerSkillGroup, usize)> {
+    let label = *SOCCER_POLICY_ACTIONS.get(action_index)?;
+    for group in SoccerSkillGroup::ALL {
+        if let Some(local) = group.families().iter().position(|&family| family == label) {
+            return Some((group, local));
+        }
+    }
+    None
+}
+
+/// Which specialist the curriculum is focusing on this training round. A focused phase trains only
+/// that specialist (a focused curriculum); `Joint` trains every head together (self-play fine-tune).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerSpecialistFocus {
+    Pass,
+    Dribble,
+    Shot,
+    Goalkeeper,
+    Joint,
+}
+
+/// Training rounds spent focusing each specialist before the joint phase. Tuned short so the
+/// specialists get a dedicated warm-up, then everything fine-tunes together indefinitely.
+const SOCCER_CURRICULUM_PASS_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_DRIBBLE_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_SHOT_ROUNDS: usize = 40;
+const SOCCER_CURRICULUM_GK_ROUNDS: usize = 40;
+
+/// The specialist focus for a given (0-based) training round under the curriculum: pass → dribble
+/// → shot → goalkeeper focused phases, then `Joint` forever. When the curriculum is disabled the
+/// caller uses `Joint` from the start (every head trains every round, as before).
+fn soccer_specialist_curriculum_focus(round: usize) -> SoccerSpecialistFocus {
+    let pass_end = SOCCER_CURRICULUM_PASS_ROUNDS;
+    let dribble_end = pass_end + SOCCER_CURRICULUM_DRIBBLE_ROUNDS;
+    let shot_end = dribble_end + SOCCER_CURRICULUM_SHOT_ROUNDS;
+    let gk_end = shot_end + SOCCER_CURRICULUM_GK_ROUNDS;
+    if round < pass_end {
+        SoccerSpecialistFocus::Pass
+    } else if round < dribble_end {
+        SoccerSpecialistFocus::Dribble
+    } else if round < shot_end {
+        SoccerSpecialistFocus::Shot
+    } else if round < gk_end {
+        SoccerSpecialistFocus::Goalkeeper
+    } else {
+        SoccerSpecialistFocus::Joint
+    }
+}
+
+/// One specialist policy head: an independent softmax actor over a single skill group's action
+/// families, sharing the actor's engineered feature representation as its input.
+pub(crate) struct SoccerSkillPolicyHead {
+    network: FeedForwardNetwork,
+    group: SoccerSkillGroup,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerSkillPolicyHead {
+    fn new(seed: u32, group: SoccerSkillGroup) -> Self {
+        let salt = match group {
+            SoccerSkillGroup::Pass => 0x1234_5678,
+            SoccerSkillGroup::Dribble => 0x2345_6789,
+            SoccerSkillGroup::Shot => 0x3456_789A,
+        };
+        let mut rng = mulberry32(seed ^ salt);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                output_dim: group.families().len(),
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerSkillPolicyHead {
+            network,
+            group,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    /// `π(sub-action | s)` over just this skill's families, or `None` on a malformed input.
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+            || self.network.output_dim != self.group.families().len()
+        {
+            return None;
+        }
+        if state_features.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let probs = self.network.action_probabilities(&state_features[..]);
+        probs.iter().all(|p| p.is_finite()).then(|| probs.to_vec())
+    }
+
+    /// One advantage policy-gradient pass over a balanced subsample of this skill's samples.
+    /// `bucket` carries the head-local action index alongside each sample. No MAPPO clip: the
+    /// specialists had no behavior-policy old-prob at play time, so plain PG is the correct update.
+    fn train(&mut self, bucket: &[(&SoccerPolicySample, usize)], balanced_n: usize) {
+        if bucket.is_empty() || balanced_n == 0 {
+            return;
+        }
+        // Stride a balanced subsample of `balanced_n` across the bucket so every head trains on an
+        // equal number of samples (no skill dominates the others' separate losses).
+        let stride = (bucket.len() / balanced_n).max(1);
+        let mut loss_sum = 0.0;
+        let mut applied = 0usize;
+        let mut taken = 0usize;
+        let mut i = 0usize;
+        while i < bucket.len() && taken < balanced_n {
+            let (sample, local) = bucket[i];
+            if sample.advantage.is_finite() && local < self.network.output_dim {
+                let result = self.network.train_policy_gradient_sample(
+                    &sample.state_features[..],
+                    local,
+                    sample.advantage,
+                    SOCCER_POLICY_ENTROPY_COEFF,
+                    SOCCER_POLICY_LEARNING_RATE,
+                    SOCCER_POLICY_GRAD_CLIP_NORM,
+                );
+                if result.applied && result.loss.is_finite() {
+                    loss_sum += result.loss;
+                    applied += 1;
+                }
+            }
+            taken += 1;
+            i += stride;
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+    }
+}
+
+/// Per-decision cache of each specialist head's log-probabilities, so a candidate's skill bonus is
+/// a single lookup. Built once from the (shared) state features at decision time.
+pub(crate) struct SoccerSkillLogProbs {
+    pass: Option<Vec<f64>>,
+    dribble: Option<Vec<f64>>,
+    shot: Option<Vec<f64>>,
+}
+
+impl SoccerSkillLogProbs {
+    fn group(&self, group: SoccerSkillGroup) -> Option<&Vec<f64>> {
+        match group {
+            SoccerSkillGroup::Pass => self.pass.as_ref(),
+            SoccerSkillGroup::Dribble => self.dribble.as_ref(),
+            SoccerSkillGroup::Shot => self.shot.as_ref(),
+        }
+    }
+
+    /// Log-probability the relevant specialist head assigns to a joint-actor family index, or
+    /// `None` if the family isn't a technical skill (or the head is cold/degenerate).
+    fn log_prob_for_action_index(&self, action_index: usize) -> Option<f64> {
+        let (group, local) = soccer_policy_skill_group_for_action_index(action_index)?;
+        let prob = self.group(group)?.get(local).copied()?;
+        Some(prob.max(1e-8).ln())
+    }
+}
+
+/// The bundle of independent specialist actors (pass / dribble / shot) over the shared actor
+/// feature representation. Trained on balanced per-skill batches with separate losses so each
+/// technical decision can be learned without one skill's gradients washing out another's.
+pub(crate) struct SoccerSkillPolicyHeads {
+    pass: SoccerSkillPolicyHead,
+    dribble: SoccerSkillPolicyHead,
+    shot: SoccerSkillPolicyHead,
+}
+
+impl SoccerSkillPolicyHeads {
+    fn new(seed: u32) -> Self {
+        SoccerSkillPolicyHeads {
+            pass: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Pass),
+            dribble: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Dribble),
+            shot: SoccerSkillPolicyHead::new(seed, SoccerSkillGroup::Shot),
+        }
+    }
+
+    fn log_probs(&self, state_features: &[f64; SOCCER_POLICY_FEATURE_DIM]) -> SoccerSkillLogProbs {
+        SoccerSkillLogProbs {
+            pass: self.pass.action_distribution(state_features),
+            dribble: self.dribble.action_distribution(state_features),
+            shot: self.shot.action_distribution(state_features),
+        }
+    }
+
+    /// Bucket the actor's policy samples by skill group (with head-local action indices), balance
+    /// the bucket sizes to the smallest non-empty group, and train each specialist on its own loss.
+    fn train(&mut self, samples: &[SoccerPolicySample]) {
+        let mut pass = Vec::new();
+        let mut dribble = Vec::new();
+        let mut shot = Vec::new();
+        for sample in samples {
+            if let Some((group, local)) =
+                soccer_policy_skill_group_for_action_index(sample.action_index)
+            {
+                match group {
+                    SoccerSkillGroup::Pass => pass.push((sample, local)),
+                    SoccerSkillGroup::Dribble => dribble.push((sample, local)),
+                    SoccerSkillGroup::Shot => shot.push((sample, local)),
+                }
+            }
+        }
+        let balanced_n = [pass.len(), dribble.len(), shot.len()]
+            .into_iter()
+            .filter(|&count| count > 0)
+            .min()
+            .unwrap_or(0);
+        if balanced_n == 0 {
+            return;
+        }
+        self.pass.train(&pass, balanced_n);
+        self.dribble.train(&dribble, balanced_n);
+        self.shot.train(&shot, balanced_n);
+    }
+
+    /// Curriculum-aware training: a focused phase trains only the matching specialist, leaving the
+    /// others frozen; `Joint` (and the GK phase, which trains the separate keeper head elsewhere)
+    /// trains all skill heads together. Mirrors [`Self::train`]'s balanced bucketing.
+    fn train_focused(&mut self, samples: &[SoccerPolicySample], focus: SoccerSpecialistFocus) {
+        let mut pass = Vec::new();
+        let mut dribble = Vec::new();
+        let mut shot = Vec::new();
+        for sample in samples {
+            if let Some((group, local)) =
+                soccer_policy_skill_group_for_action_index(sample.action_index)
+            {
+                match group {
+                    SoccerSkillGroup::Pass => pass.push((sample, local)),
+                    SoccerSkillGroup::Dribble => dribble.push((sample, local)),
+                    SoccerSkillGroup::Shot => shot.push((sample, local)),
+                }
+            }
+        }
+        let balanced_n = [pass.len(), dribble.len(), shot.len()]
+            .into_iter()
+            .filter(|&count| count > 0)
+            .min()
+            .unwrap_or(0);
+        if balanced_n == 0 {
+            return;
+        }
+        let train_all = matches!(
+            focus,
+            SoccerSpecialistFocus::Joint | SoccerSpecialistFocus::Goalkeeper
+        );
+        if train_all || focus == SoccerSpecialistFocus::Pass {
+            self.pass.train(&pass, balanced_n);
+        }
+        if train_all || focus == SoccerSpecialistFocus::Dribble {
+            self.dribble.train(&dribble, balanced_n);
+        }
+        if train_all || focus == SoccerSpecialistFocus::Shot {
+            self.shot.train(&shot, balanced_n);
+        }
+    }
+}
+
+/// The dedicated **goalkeeper** action vocabulary. The outfield actor's 38 families are all
+/// outfield-centric, so the keeper had no learnable decisions of its own; this gives the GK head
+/// its own keeping choices (positioning, coming for the ball, shot-stop intent, and distribution).
+const SOCCER_KEEPER_ACTIONS: &[&str] = &[
+    "set",
+    "step-out",
+    "sweep",
+    "claim-cross",
+    "catch",
+    "parry",
+    "dive-left",
+    "dive-right",
+    "dive-center",
+    "distribute-short",
+    "distribute-long",
+];
+
+/// The keeper actions that mean "come off the line / commit" (vs. holding position). Used to read
+/// the GK head's aggression as a single sweep-vs-set preference for the commit decision hook.
+fn soccer_keeper_action_is_commit(index: usize) -> bool {
+    matches!(
+        SOCCER_KEEPER_ACTIONS.get(index).copied(),
+        Some("step-out") | Some("sweep") | Some("claim-cross")
+    )
+}
+
+/// Map a goalkeeper transition's realised action label + geometry to a keeper-vocabulary index, so
+/// the dedicated GK head can be trained on the keeper's own experience. Distribution actions split
+/// short/long by technique; a keeper that has left its line reads as a commit (sweep); otherwise it
+/// is holding its set position. Save micro-actions (catch/parry/dive) are resolved in the shot
+/// physics, not the decision replay, so they are not derived here.
+fn soccer_keeper_action_index_for(action: &str, keeper_left_line: bool) -> Option<usize> {
+    let label = match SoccerActionLabel::classify(action) {
+        Some(SoccerActionLabel::AerialPass)
+        | Some(SoccerActionLabel::RouteOne)
+        | Some(SoccerActionLabel::Clearance) => "distribute-long",
+        Some(SoccerActionLabel::Pass)
+        | Some(SoccerActionLabel::FirstTimePass)
+        | Some(SoccerActionLabel::ScoopPass)
+        | Some(SoccerActionLabel::SwitchPlay) => "distribute-short",
+        _ if keeper_left_line => "sweep",
+        _ => "set",
+    };
+    SOCCER_KEEPER_ACTIONS.iter().position(|&a| a == label)
+}
+
+/// The dedicated goalkeeper actor: `π(keeper-action | s)` over [`SOCCER_KEEPER_ACTIONS`], separate
+/// from the outfield actor so keeping is learned in its own right (against the keeper save reward
+/// and concede penalty) instead of sharing the outfield policy. Same shared feature input.
+pub(crate) struct SoccerKeeperPolicyHead {
+    network: FeedForwardNetwork,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerKeeperPolicyHead {
+    fn new(seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ 0x4B1D_9E3F);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_POLICY_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                output_dim: SOCCER_KEEPER_ACTIONS.len(),
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        SoccerKeeperPolicyHead {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn action_distribution(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<Vec<f64>> {
+        if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
+            || self.network.output_dim != SOCCER_KEEPER_ACTIONS.len()
+        {
+            return None;
+        }
+        if state_features.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let probs = self.network.action_probabilities(&state_features[..]);
+        probs.iter().all(|p| p.is_finite()).then(|| probs.to_vec())
+    }
+
+    /// Net preference `∈ [-1, 1]` for committing off the line (sweep/step/claim) over holding the
+    /// set position: `P(commit) - P(set)`. `None` on a cold/degenerate head.
+    fn commit_preference(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+    ) -> Option<f64> {
+        let dist = self.action_distribution(state_features)?;
+        let commit: f64 = dist
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| soccer_keeper_action_is_commit(*i))
+            .map(|(_, &p)| p)
+            .sum();
+        let set = SOCCER_KEEPER_ACTIONS
+            .iter()
+            .position(|&a| a == "set")
+            .and_then(|i| dist.get(i).copied())
+            .unwrap_or(0.0);
+        Some((commit - set).clamp(-1.0, 1.0))
+    }
+
+    /// One-step advantage policy-gradient pass over the keeper's own transitions. `samples` carry
+    /// the keeper-vocabulary action index and the transition reward (which now includes the keeper
+    /// save reward and concede penalty) as the advantage.
+    fn train(&mut self, samples: &[SoccerKeeperPolicySample]) {
+        let mut loss_sum = 0.0;
+        let mut applied = 0usize;
+        for sample in samples {
+            if !sample.advantage.is_finite() || sample.action_index >= self.network.output_dim {
+                continue;
+            }
+            let result = self.network.train_policy_gradient_sample(
+                &sample.state_features[..],
+                sample.action_index,
+                sample.advantage,
+                SOCCER_POLICY_ENTROPY_COEFF,
+                SOCCER_POLICY_LEARNING_RATE,
+                SOCCER_POLICY_GRAD_CLIP_NORM,
+            );
+            if result.applied && result.loss.is_finite() {
+                loss_sum += result.loss;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+    }
+}
+
+/// A single training sample for the dedicated goalkeeper head.
+struct SoccerKeeperPolicySample {
+    state_features: [f64; SOCCER_POLICY_FEATURE_DIM],
+    action_index: usize,
+    advantage: f64,
+}
+
 /// A learned 1-step **world model** `P̂(s' | s, a)` over the value-head feature
 /// space: an MLP mapping the current `(state ⊕ action)` feature vector to the
 /// *next* state's feature vector. Model-free RL is purely reactive; a transition
@@ -33253,57 +33741,118 @@ fn soccer_policy_role_embedding(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EM
     embedding
 }
 
-fn soccer_policy_position_embedding(
-    role: PlayerRole,
-    assigned_grid: PitchGridAddress,
-) -> [f64; SOCCER_POLICY_POSITION_EMBEDDING_DIM] {
-    let mut embedding = [0.0; SOCCER_POLICY_POSITION_EMBEDDING_DIM];
-    let index = if role == PlayerRole::Goalkeeper {
-        0
-    } else {
-        let cell = assigned_grid.fine;
-        let lane = if cell.columns <= 1 {
-            1
-        } else {
-            let x = cell.x.min(cell.columns - 1) as f64 / (cell.columns - 1) as f64;
-            if x < 1.0 / 3.0 {
-                0
-            } else if x > 2.0 / 3.0 {
-                2
-            } else {
-                1
-            }
-        };
-        match role {
-            PlayerRole::Goalkeeper => 0,
-            PlayerRole::Defender => 1 + lane,
-            PlayerRole::Midfielder => 4 + lane,
-            PlayerRole::Forward => 7 + lane,
+/// Exact assigned position, refining the broad [`PlayerRole`] into the conventional 11 slots.
+/// Ordering is the one-hot index used in the policy feature block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoccerAssignedPosition {
+    Goalkeeper,
+    LeftBack,
+    LeftCentreBack,
+    RightCentreBack,
+    RightBack,
+    DefensiveMidfield,
+    CentreMidfield,
+    AttackingMidfield,
+    LeftWing,
+    RightWing,
+    Striker,
+}
+
+impl SoccerAssignedPosition {
+    fn one_hot_index(self) -> usize {
+        match self {
+            SoccerAssignedPosition::Goalkeeper => 0,
+            SoccerAssignedPosition::LeftBack => 1,
+            SoccerAssignedPosition::LeftCentreBack => 2,
+            SoccerAssignedPosition::RightCentreBack => 3,
+            SoccerAssignedPosition::RightBack => 4,
+            SoccerAssignedPosition::DefensiveMidfield => 5,
+            SoccerAssignedPosition::CentreMidfield => 6,
+            SoccerAssignedPosition::AttackingMidfield => 7,
+            SoccerAssignedPosition::LeftWing => 8,
+            SoccerAssignedPosition::RightWing => 9,
+            SoccerAssignedPosition::Striker => 10,
         }
-    };
-    embedding[index] = 1.0;
+    }
+}
+
+/// Derive the exact assigned position from the player's broad role and its **formation
+/// anchor** (`home_position`, static for the match), team-relative so "left"/"deep" mean the
+/// same thing for both sides. Defenders split L→R into LB/LCB/RCB/RB by lateral quartile;
+/// midfielders split by depth into DM/CM/AM; forwards split L→R into LW/ST/RW. Deterministic,
+/// so the decision-time and training-time feature vectors agree.
+pub(crate) fn soccer_assigned_position_for(
+    role: PlayerRole,
+    home_position: Vec2,
+    field_width_yards: f64,
+    field_length_yards: f64,
+    team: Team,
+) -> SoccerAssignedPosition {
+    // Team-relative lateral fraction (0 = own left touchline, 1 = own right) and forward
+    // depth fraction (0 = own goal line, 1 = opponent goal line).
+    let width = field_width_yards.max(1.0);
+    let length = field_length_yards.max(1.0);
+    let lateral = (home_position.x / width).clamp(0.0, 1.0);
+    let lateral = if team == Team::Home { lateral } else { 1.0 - lateral };
+    let depth = (home_position.y / length).clamp(0.0, 1.0);
+    let depth = if team == Team::Home { depth } else { 1.0 - depth };
+    match role {
+        PlayerRole::Goalkeeper => SoccerAssignedPosition::Goalkeeper,
+        PlayerRole::Defender => {
+            if lateral < 0.25 {
+                SoccerAssignedPosition::LeftBack
+            } else if lateral < 0.5 {
+                SoccerAssignedPosition::LeftCentreBack
+            } else if lateral < 0.75 {
+                SoccerAssignedPosition::RightCentreBack
+            } else {
+                SoccerAssignedPosition::RightBack
+            }
+        }
+        PlayerRole::Midfielder => {
+            if depth < 0.42 {
+                SoccerAssignedPosition::DefensiveMidfield
+            } else if depth < 0.62 {
+                SoccerAssignedPosition::CentreMidfield
+            } else {
+                SoccerAssignedPosition::AttackingMidfield
+            }
+        }
+        PlayerRole::Forward => {
+            if lateral < 0.33 {
+                SoccerAssignedPosition::LeftWing
+            } else if lateral < 0.67 {
+                SoccerAssignedPosition::Striker
+            } else {
+                SoccerAssignedPosition::RightWing
+            }
+        }
+    }
+}
+
+fn soccer_policy_assigned_position_embedding(
+    assigned: Option<SoccerAssignedPosition>,
+) -> [f64; SOCCER_POLICY_ASSIGNED_POSITION_DIM] {
+    let mut embedding = [0.0; SOCCER_POLICY_ASSIGNED_POSITION_DIM];
+    // `None` (gate off) ⇒ all-zero block: the actor sees only the broad role one-hot.
+    if let Some(position) = assigned {
+        embedding[position.one_hot_index()] = 1.0;
+    }
     embedding
 }
 
 fn soccer_policy_features_for_role(
     state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
     role: PlayerRole,
-) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
-    soccer_policy_features_for_role_and_position(state_features, role, PitchGridAddress::default())
-}
-
-fn soccer_policy_features_for_role_and_position(
-    state_features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
-    role: PlayerRole,
-    assigned_grid: PitchGridAddress,
+    assigned: Option<SoccerAssignedPosition>,
 ) -> [f64; SOCCER_POLICY_FEATURE_DIM] {
     let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
     features[..SOCCER_NEURAL_FEATURE_DIM].copy_from_slice(state_features);
     let role_embedding = soccer_policy_role_embedding(role);
     let role_end = SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM;
     features[SOCCER_NEURAL_FEATURE_DIM..role_end].copy_from_slice(&role_embedding);
-    let position_embedding = soccer_policy_position_embedding(role, assigned_grid);
-    features[role_end..].copy_from_slice(&position_embedding);
+    let assigned_embedding = soccer_policy_assigned_position_embedding(assigned);
+    features[role_end..].copy_from_slice(&assigned_embedding);
     features
 }
 
@@ -44550,6 +45099,7 @@ fn tracking_frame_to_world_snapshot(
     let score_diff_home = score_home as i32 - score_away as i32;
     WorldSnapshot {
         tick: frame.tick,
+        keeper_commit_bias: [0.0, 0.0],
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
@@ -46117,6 +46667,46 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
+/// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off ⇒
+/// the block stays all-zero and the actor sees only the broad role one-hot, so the policy
+/// network has identical dimensions either way (a clean A/B for positional specialization).
+fn dd_soccer_enable_assigned_position_embedding() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS=1` to train independent pass/dribble/shot specialist
+/// actors ([`SoccerSkillPolicyHeads`]) alongside the joint actor and let their log-probabilities
+/// refine technical action selection. Default off ⇒ the heads are never constructed/trained and
+/// add nothing to decisions (byte-identical baseline / A/B).
+fn dd_soccer_enable_skill_policy_heads() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD=1` to train a dedicated goalkeeper actor
+/// ([`SoccerKeeperPolicyHead`]) over the keeper action vocabulary and let it bias the keeper's
+/// come-for-the-ball (sweep vs hold) decision. Default off ⇒ the head is never built and the
+/// keeper's heuristics are unchanged (byte-identical baseline / A/B).
+fn dd_soccer_enable_keeper_policy_head() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM=1` to run the specialist heads through focused
+/// pass → dribble → shot → goalkeeper warm-up phases before the joint self-play fine-tune
+/// ([`soccer_specialist_curriculum_focus`]). Default off ⇒ every specialist trains every round
+/// from the start (the plain joint schedule).
+fn dd_soccer_enable_specialist_curriculum() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM").is_ok())
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {
