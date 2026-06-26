@@ -18058,6 +18058,58 @@ fn defensive_line_cushion_allows_parity_inside_own_twenty_yards() {
 }
 
 #[test]
+fn defensive_line_cushion_holds_six_yard_line_in_open_play() {
+    // In open play the back four must NOT retreat onto its own goal-line: the 6-yard line is the
+    // effective end-line. Home defends y=0. Stage the ball in open play just outside the 5-yard
+    // emergency zone (y=15) and the whole back four sunk deep toward the goal-line (y=2). The band
+    // average would otherwise sit on the goal-line; the six-yard floor pulls the line up so the
+    // AVERAGE target settles on the 6-yard line.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let away_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .map(|p| p.id)
+        .unwrap();
+    assert_eq!(home_def.len(), 4, "test needs a back four");
+
+    for &d in &home_def {
+        sim.players[d].position = Vec2::new(30.0, 2.0);
+    }
+    // Opponent holds the ball in open play, outside our 5-yard emergency zone.
+    sim.players[away_id].position = Vec2::new(40.0, 15.0);
+    sim.ball.holder = Some(away_id);
+    sim.ball.position = Vec2::new(40.0, 15.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    // A deep target on the goal-line is pulled UP to the 6-yard line (the line average floor).
+    let deep_target = Vec2::new(30.0, 2.0);
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_target);
+    assert!(
+        adjusted.y >= 5.0 && adjusted.y <= 8.0,
+        "open play: the back four holds the 6-yard line, not the goal-line: target={adjusted:?}"
+    );
+    assert!(
+        adjusted.y > deep_target.y + 2.0,
+        "the deep goal-line target should be pulled forward toward the 6-yard line: \
+         target={adjusted:?} deep={deep_target:?}"
+    );
+}
+
+#[test]
 fn no_target_forward_outlet_avoids_marked_teammate_and_opponents() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

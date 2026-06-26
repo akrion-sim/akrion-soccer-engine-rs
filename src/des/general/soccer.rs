@@ -1731,6 +1731,16 @@ const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
 // the ~3s consistency window (not snapped) so a defender caught out of line jogs back into it; in
 // possession the clamp lifts entirely (centre-backs split, full-backs overlap).
 const BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS: f64 = 2.0;
+// Six-yard-line stickiness (open play only). The back four must not retreat all the way onto
+// its own end-line: in open play the 6-yard line acts as the effective end-line — a soft floor /
+// non-linearity on how DEEP (close to our own goal) the back-four band TARGET may sit. Because
+// this only sets the target and the line eases onto it over the ~3s consistency grace, all four
+// may still be physically inside 0-6yd for under ~3s (chasing a ball, easing back out), but
+// within ~3s their target pulls them back so the line AVERAGE settles on the 6-yard line. Lifted
+// for dead-ball restarts that legitimately drop the line off (corners &c., where the offside law
+// is suspended) and while an opponent is breaking clean through (the line must drop to cover the
+// goal); the own 5-yard emergency zone is already handled by the exempt early-return.
+const BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS: f64 = 6.0;
 // A defender whose current position is more than this far AHEAD of the back-four band (up at the
 // ball pressing or cutting a lane) has stepped out of the line, so it is excluded from the line
 // centre used for the offside-flatness clamp (a cheap position test, no decision re-entry).

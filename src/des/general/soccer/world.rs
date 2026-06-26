@@ -17591,6 +17591,14 @@ fn dd_soccer_disable_defensive_pushup() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DEFENSIVE_PUSHUP").is_ok())
 }
+// Default ON: in open play the back four holds the 6-yard line as its effective end-line instead
+// of retreating onto its own goal-line. Set DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR to disable
+// (byte-identical to the prior behaviour) for A/B comparison.
+fn dd_soccer_disable_six_yard_line_floor() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR").is_ok())
+}
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -29638,7 +29646,26 @@ impl WorldSnapshot {
         // ceiling wins — bulletproof, never panics on lower > upper).
         let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
         let lower = (ball_fwd - max_behind).min(upper);
-        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
+        // Six-yard-line stickiness: in OPEN PLAY the back four's AVERAGE holds the 6-yard line as
+        // its effective end-line rather than sinking onto our own goal-line when the ball is driven
+        // deep (where `lower` reaches the goal-line). Baked into the band so every average the rule
+        // computes is floored; the ~3s consistency grace then settles the line on the 6-yard line
+        // while any one defender may still be inside 0-6yd for under ~3s. Lifted when the offside
+        // law is suspended (a restart legitimately drops the line off) and while an opponent is
+        // breaking clean through (the line must drop to cover the goal). The own 5-yard emergency
+        // zone is already handled by the exempt early-return above.
+        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
+        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
+            && !self.offside_currently_suspended()
+            && self.opponent_breakthrough_ball_carrier(me.team).is_none();
+        let line_band_avg_fwd = |avg: f64| {
+            let banded = avg.clamp(lower, upper);
+            if six_yard_floor_active {
+                banded.max(six_yard_floor_fwd)
+            } else {
+                banded
+            }
+        };
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -34616,6 +34643,28 @@ impl WorldSnapshot {
         // "don't sit level" ceiling wins so the line never overruns the ball.
         let deepest_fwd = deepest_fwd.min(shallowest_fwd);
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
+        // Six-yard-line stickiness: in OPEN PLAY the back four holds the 6-yard line as its
+        // effective end-line rather than retreating onto its own goal-line (the deep-ball case
+        // where the legal band's floor `deepest_fwd` otherwise reaches the goal-line). The floor
+        // is applied to the band TARGET — both this individual clamp and the line centre below —
+        // so the ~3s movement grace lets the line AVERAGE settle on the 6-yard line while any
+        // single defender may still be physically inside 0-6yd for under ~3s. Lifted when the
+        // offside law is suspended (corners &c., where the line legitimately drops off) and while
+        // an opponent is breaking clean through (the line must be free to drop and cover the
+        // goal). `breakthrough_carrier` is computed once here and reused by the leveling clamp.
+        let breakthrough_carrier = self.opponent_breakthrough_ball_carrier(me.team);
+        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
+        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
+            && !offside_suspended
+            && breakthrough_carrier.is_none();
+        let six_yard_floor = |fwd: f64| {
+            if six_yard_floor_active {
+                fwd.max(six_yard_floor_fwd)
+            } else {
+                fwd
+            }
+        };
+        let clamped_fwd = six_yard_floor(clamped_fwd);
         // Offside line flatness: when DEFENDING, no defender may stand AHEAD of the back-four line
         // (toward the attackers) by more than half of BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS — that is
         // what plays attackers onside, so the front of the line is kept flat (≤2yd). The clamp is
@@ -34683,6 +34732,9 @@ impl WorldSnapshot {
                 heuristic_centre_fwd,
             )
             .unwrap_or(heuristic_centre_fwd);
+        // Hold the line centre on the 6-yard line in open play (see `clamped_fwd` above): the
+        // average must not sink onto our own goal-line even when the ball is driven deep.
+        let line_centre_fwd = six_yard_floor(line_centre_fwd);
         let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
         // No defender may sit AHEAD of the line (toward the attackers) — that is what plays runners
         // onside — so the front edge is always capped to the line centre + half-band.
@@ -34691,7 +34743,7 @@ impl WorldSnapshot {
         // breaking through, the line must be free to DROP and cover (a deep recovering defender is
         // never offside-relevant), so the pull-up (lower edge) is suspended during a break and the
         // four re-level once it clears. This is the target only; the player jogs level over ~3s.
-        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
+        let leveled_fwd = if breakthrough_carrier.is_some() {
             clamped_fwd.min(ahead_cap)
         } else {
             clamped_fwd.clamp(line_centre_fwd - level_half_band, ahead_cap)
