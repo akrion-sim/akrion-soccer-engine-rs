@@ -1107,6 +1107,14 @@ const BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD: f64 = 0.5;
 const PRESSURE_RELIEF_PASS_MIN_PRESSURE: f64 = 0.45;
 const PRESSURE_RELIEF_PASS_BONUS: f64 = 5.0;
 const SHORT_BACK_PASS_MAX_YARDS: f64 = 14.0;
+// First-touch escape RETAIN reward (carry analogue of the pressure-relief PASS bonus above): a
+// pressed carrier who moves the ball AWAY from the nearest defender (lateral or, for a deep player,
+// backward) and KEEPS possession made the right call, but the forward-carry reward misses it
+// because there is no forward gain. Credit the cushion gained, scaled by danger. Kept well below
+// the forward-carry reward so forward progress stays strictly the most valuable carry.
+const FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE: f64 = 0.40;
+const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD: f64 = 0.11;
+const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS: f64 = 3.0;
 // Conceding a throw-in/goal-kick/corner by knocking the ball out is a turnover.
 // Penalize the offending player unless they were under heavy pressure (>=8/10),
 // where clearing it out of play is an acceptable last resort.
@@ -19819,6 +19827,26 @@ fn dense_soccer_transition_reward(
                 }
             } else if carry_progress < -1.25 && before_obs.perceived_pressure < 0.30 {
                 reward -= 0.42;
+            }
+            // First-touch escape retain: a pressed carrier with no forward gain who nonetheless
+            // moves the ball away from the nearest defender (lateral / safe backward) and keeps
+            // possession is rewarded for the cushion gained. Gated so OFF is byte-identical.
+            if !dd_soccer_disable_first_touch_escape() && carry_progress <= 1.0 {
+                let danger = before_obs
+                    .perceived_pressure
+                    .max(before_obs.pressure_urgency)
+                    .max(before_obs.immediate_dispossession_risk)
+                    .clamp(0.0, 1.0);
+                if danger >= FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE {
+                    let cushion_gain = (after_obs.nearest_opponent_distance
+                        - before_obs.nearest_opponent_distance)
+                        .clamp(0.0, FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS);
+                    if cushion_gain > 0.0 {
+                        reward += cushion_gain
+                            * FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD
+                            * (0.2 + danger - FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE).clamp(0.0, 1.0);
+                    }
+                }
             }
         }
         if is_dribble_action_label(action) {
@@ -46964,6 +46992,14 @@ fn dd_soccer_disable_dribble_cushion_discipline() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE").is_ok())
+}
+/// Mirror of the world/player first-touch-escape gate for the reward side — same env var so the
+/// escape carry geometry, the shield demotion, and this escape-retain reward toggle together.
+/// Default-off (escape ON); OFF zeroes the extra reward so learning is byte-identical.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on

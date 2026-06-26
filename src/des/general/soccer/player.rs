@@ -18,6 +18,22 @@ const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 10.40;
 // (pressure-damped) dribble base — otherwise the one correct action collapses with the
 // carrier's dribble score and loses to a release-urgency-lifted panic pass into traffic.
 const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
+// First-touch escape (selector side, complements the world.rs carry-geometry of the same name):
+// a pressed receiver with a real lane to carry into should MOVE the ball out of its feet rather
+// than freeze on a static shield. When such a lane exists we damp the fresh-receipt shield boost
+// so the (already escape-lifted) carry-out / side-step outscore the shield. A lane "exists" when
+// the best of the lateral/forward room clears this many yards; otherwise the carrier is boxed in
+// and keeps the full shield (matching the world.rs escape, which returns None → shield when boxed).
+const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
+const FIRST_TOUCH_ESCAPE_FRESH_SHIELD_DAMP: f64 = 0.25;
+/// Mirror of `world::dd_soccer_disable_first_touch_escape` for the selector side — same env var so
+/// the whole first-touch-escape behaviour (carry geometry + shield demotion) toggles together.
+/// Default-off (escape ON); OFF restores the prior fresh-receipt shield boost byte-for-byte.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
+}
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -3554,9 +3570,23 @@ impl PlayerAgent {
         // Just received the ball with a defender closing — shield with the body to
         // secure it instead of knocking it in front of them to be stolen. Gated to
         // genuine pressure so receiving in space still plays out normally.
-        let fresh_receipt_shield = (1.0 - observation.perceived_time_on_ball_seconds / 1.5)
+        let fresh_receipt_shield_raw = (1.0 - observation.perceived_time_on_ball_seconds / 1.5)
             .clamp(0.0, 1.0)
             * pressure_urgency.max(pressure);
+        // First-touch escape: with a real lane to carry into, a pressed receiver should move the
+        // ball out of its feet rather than freeze. Damp the fresh-receipt shield boost so the
+        // (escape-lifted) carry-out / side-step outscore the static shield. Boxed in (no lane) or
+        // gate-off ⇒ full shield retained, byte-identical to the prior behaviour.
+        let first_touch_escape_lane_room = left_room
+            .max(right_room)
+            .max(observation.forward_dribble_space_yards);
+        let fresh_receipt_shield = if !dd_soccer_disable_first_touch_escape()
+            && first_touch_escape_lane_room >= FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS
+        {
+            fresh_receipt_shield_raw * FIRST_TOUCH_ESCAPE_FRESH_SHIELD_DAMP
+        } else {
+            fresh_receipt_shield_raw
+        };
         let own_half_retention = if own_half { 0.30 } else { 0.0 };
         // Sustained pressure with NO good outlet: shield to keep the ball rather than
         // force a low-percentage pass into traffic. This is what stops the "dwell under
