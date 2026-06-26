@@ -1252,6 +1252,45 @@ struct MpcExecutionEstimate {
     recommended_curve: &'static str,
     horizon_seconds: f64,
     reselect_reason: &'static str,
+    /// MPC shot foot choice: which foot the strike is taken with ("right"/"left"), and
+    /// that foot's power rating. Empty / `0.0` for non-shot actions or when the foot-choice
+    /// MPC is disabled (`DD_SOCCER_DISABLE_SHOT_FOOT_MPC`).
+    recommended_foot: &'static str,
+    recommended_foot_power: f64,
+}
+
+/// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
+const WEAK_FOOT_EXECUTION_DAMP: f64 = 0.88;
+
+/// MPC shot foot choice: pick which foot to strike with from the ball-vs-body geometry
+/// and the per-foot power. The ball sitting on a given side of the body, and a target
+/// swept toward that side, both favor the same-side foot; the choice is then weighted by
+/// each foot's power so a player swivels onto a stronger foot when geometry is neutral.
+/// Returns `(foot, power, weak_foot)` where `weak_foot` is true when forced onto the
+/// weaker foot (used to damp execution probability).
+fn shot_foot_choice(
+    skills: &SkillProfile,
+    ball_lateral_offset: f64,
+    target_lateral_sweep: f64,
+) -> (&'static str, f64, bool) {
+    let right_power = skills.right_foot_shot_power.max(0.0);
+    let left_power = skills.left_foot_shot_power.max(0.0);
+    // Geometry score: positive ⇒ right foot is naturally placed, negative ⇒ left. The ball
+    // on the right of the body (+x offset) and a strike swept to the right both favor right.
+    let geometry = ball_lateral_offset * 0.7 + target_lateral_sweep * 0.3;
+    // Power asymmetry (normalized): how much stronger the right foot is than the left.
+    let power_bias = (right_power - left_power) / 10.0;
+    // Combine: geometry dominates when pronounced, power breaks a near-neutral stance.
+    let decision = geometry + power_bias * 2.0;
+    let strong_foot_power = right_power.max(left_power);
+    let (foot, power) = if decision >= 0.0 {
+        ("right", right_power)
+    } else {
+        ("left", left_power)
+    };
+    // Weak foot = the chosen foot is materially weaker than the player's strong foot.
+    let weak_foot = power + 1.0 < strong_foot_power;
+    (foot, power, weak_foot)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1602,15 +1641,32 @@ fn mpc_execution_estimate_for_action(
     if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
         let observation = snapshot.observation_for(player.id);
         let first_time = matches!(label, "first-time-shot" | "first-time-header");
+        // MPC shot foot choice (default-ON; kill-switch `DD_SOCCER_DISABLE_SHOT_FOOT_MPC`).
+        // A header has no foot; otherwise pick the foot from ball-vs-body geometry and the
+        // per-foot power, instead of blindly taking the stronger foot's power. Disabled ⇒
+        // `None` ⇒ the legacy `.max()` power ⇒ byte-identical.
+        let foot_choice = if shot_foot_mpc_enabled() && label != "first-time-header" {
+            let attack_dir = player.team.attack_dir();
+            let ball_lateral_offset = (snapshot.ball.position.x - current.x) * attack_dir;
+            let target_lateral_sweep = (snapshot.field_width * 0.5 - current.x) * attack_dir;
+            Some(shot_foot_choice(
+                &player.skills,
+                ball_lateral_offset,
+                target_lateral_sweep,
+            ))
+        } else {
+            None
+        };
+        let chosen_foot_power = foot_choice.map(|(_, power, _)| power).unwrap_or_else(|| {
+            player
+                .skills
+                .right_foot_shot_power
+                .max(player.skills.left_foot_shot_power)
+        });
         let finish_skill = if label == "first-time-header" {
             aerial_duel_skill_from_agent(player)
         } else {
-            (ability01(
-                player
-                    .skills
-                    .right_foot_shot_power
-                    .max(player.skills.left_foot_shot_power),
-            ) * 0.62
+            (ability01(chosen_foot_power) * 0.62
                 + ability01(player.skills.shooting) * 0.26
                 + ability01(player.skills.first_touch) * 0.12)
                 .clamp(0.0, 1.0)
@@ -1664,6 +1720,16 @@ fn mpc_execution_estimate_for_action(
             + first_touch_fit * 0.10)
             * body_fit)
             .clamp(0.0, 0.99);
+        // Record the MPC foot choice and damp execution when geometry forces the weaker
+        // foot (a less reliable strike). Skipped when the foot-choice MPC is off (parity).
+        if let Some((foot, power, weak_foot)) = foot_choice {
+            estimate.recommended_foot = foot;
+            estimate.recommended_foot_power = power;
+            if weak_foot {
+                estimate.execution_probability =
+                    (estimate.execution_probability * WEAK_FOOT_EXECUTION_DAMP).clamp(0.0, 0.99);
+            }
+        }
         estimate.recommended_speed_yps = shot_speed;
         let shot_target_delta = shot_mpc.target_point - current;
         if shot_target_delta.len() > 1e-6 {
@@ -3130,7 +3196,7 @@ impl PlayerAgent {
             .max(goal_proximity_shot_pressure)
             .max(decisive_goal_pressure * 0.72)
             .clamp(0.0, 1.0);
-        let shot_score = (self.preferences.shoot_bias
+        let shot_score_base = (self.preferences.shoot_bias
             * (0.52 + shooting * 0.62)
             * (1.0 + directive.risk_tolerance * 0.35)
             * (0.78 + (observation.opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0) * 0.44)
@@ -3188,6 +3254,30 @@ impl PlayerAgent {
             } else {
                 0.0
             });
+        // Learnable shot-trigger MDP/POMDP: scale the whole shot score (floors included)
+        // by the value of shooting NOW. This is what fixes "shoots from 25 when he should
+        // work it to 20/15": a far, covered, low-value chance is suppressed toward ~0.2×
+        // while a close, open, high-value one is lifted toward ~1.35×. Default-ON; the
+        // kill-switch (`DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP`) skips this entirely ⇒
+        // byte-identical. The MPC then still re-checks executability and can veto/reselect.
+        let shot_score = if shot_trigger_mdp_enabled() {
+            let mdp_value = if observation.shot_trigger_mdp_value >= 0.0 {
+                // Populated by the snapshot seam (trained head or analytic seed).
+                observation.shot_trigger_mdp_value
+            } else {
+                // Observation built without the snapshot seam (e.g. a direct unit test):
+                // recompute the analytic seed so the discipline still applies.
+                analytic_shot_trigger_value(&ShotTriggerInputs::from_observation(
+                    observation,
+                    self.role,
+                    shooting,
+                    1.0,
+                ))
+            };
+            shot_score_base * shot_trigger_score_multiplier(mdp_value)
+        } else {
+            shot_score_base
+        };
         let fatigue_dribble = fatigue_dribble_multiplier(observation);
         let shot_creation_carry = shot_creation_carry_multiplier(observation);
         let patience_factor = low_pressure_patience_factor(observation);
@@ -11469,5 +11559,43 @@ mod decision_refractory_tests {
             }
         }
         assert_eq!(allowed, vec![1, 4, 8]);
+    }
+}
+
+#[cfg(test)]
+mod shot_foot_choice_tests {
+    use super::{shot_foot_choice, WEAK_FOOT_EXECUTION_DAMP};
+    use crate::des::general::soccer::SkillProfile;
+
+    fn right_footed() -> SkillProfile {
+        let mut s = SkillProfile::default();
+        s.right_foot_shot_power = 9.0;
+        s.left_foot_shot_power = 4.0;
+        s
+    }
+
+    #[test]
+    fn neutral_geometry_picks_the_stronger_foot() {
+        let skills = right_footed();
+        // Ball centred on the body, no sweep ⇒ the power bias should win → right.
+        let (foot, power, weak) = shot_foot_choice(&skills, 0.0, 0.0);
+        assert_eq!(foot, "right");
+        assert!((power - 9.0).abs() < 1e-9);
+        assert!(!weak, "strong foot is never the weak foot");
+    }
+
+    #[test]
+    fn ball_far_on_the_weak_side_forces_the_weak_foot_and_flags_it() {
+        let skills = right_footed();
+        // Ball a long way to the left of the body overrides the modest power bias.
+        let (foot, power, weak) = shot_foot_choice(&skills, -20.0, -5.0);
+        assert_eq!(foot, "left");
+        assert!((power - 4.0).abs() < 1e-9);
+        assert!(weak, "a forced weaker foot should be flagged for the execution damp");
+    }
+
+    #[test]
+    fn weak_foot_damp_is_a_reduction() {
+        assert!(WEAK_FOOT_EXECUTION_DAMP > 0.0 && WEAK_FOOT_EXECUTION_DAMP < 1.0);
     }
 }

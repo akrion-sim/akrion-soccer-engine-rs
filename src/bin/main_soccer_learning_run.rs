@@ -23,6 +23,7 @@ use soccer_engine::des::general::soccer::{
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -1900,6 +1901,12 @@ static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletio
 static CARRIED_ATTACK_SPACING_HEAD: std::sync::Mutex<Option<AttackSpacingHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory shot-trigger value head (when to pull the trigger on a shot), carried +
+/// trained across games WITHIN a learner process, then installed into the next game so
+/// the shot decision consumes what was learned. Mirrors `CARRIED_LINE_DEPTH_HEAD`.
+static CARRIED_SHOT_TRIGGER_HEAD: std::sync::Mutex<Option<ShotTriggerHead>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -1947,6 +1954,12 @@ fn run_game(
     // formation LP consume the learned spacing band once trained.
     if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
         sim.set_attack_spacing_head(head.clone());
+    }
+    // Install the carried shot-trigger head so the shot decision consumes it live once
+    // trained. Default-ON model; no-op unless DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP is unset
+    // (the head still trains regardless so it stays warm).
+    if let Some(head) = CARRIED_SHOT_TRIGGER_HEAD.lock().unwrap().as_ref() {
+        sim.set_shot_trigger_head(head.clone());
     }
 
     for tick_idx in 0..total_ticks {
@@ -2030,6 +2043,26 @@ fn run_game(
             attack_spacing_samples.len(),
             head.training_steps(),
             head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED shot-trigger head on this game's reward-weighted RL corpus (the
+    // shot-decision state + shoot/held action + windowed reward) and install it into the
+    // next game so the shot decision consumes what was learned once warm. Empty + skipped
+    // unless the model is enabled (default-ON; off under DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP).
+    let shot_trigger_samples = sim.drain_shot_trigger_samples();
+    if !shot_trigger_samples.is_empty() {
+        let mut guard = CARRIED_SHOT_TRIGGER_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| ShotTriggerHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&shot_trigger_samples, 0.02);
+        }
+        eprintln!(
+            "shot_trigger_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            shot_trigger_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }

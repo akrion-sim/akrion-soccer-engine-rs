@@ -78387,7 +78387,7 @@ fn audit_defender_goalside_in_lane() {
                 }
                 let lane_dev = (p.position.x - p.home_position.x).abs();
                 // own-goal depth of the defender (how deep he is)
-                let own_goal_y = defending.other().goal_y(m.field_length);
+                let own_goal_y = defending.other().goal_y(m.config.field_length_yards);
                 let depth = (p.position.y - own_goal_y).abs();
                 if lane_dev <= LANE_TOL {
                     acc.viol_in_lane += 1;
@@ -78424,4 +78424,106 @@ fn audit_defender_goalside_in_lane() {
             );
         }
     }
+}
+
+/// The learnable shot-trigger MDP/POMDP (default-ON) disciplines the *when*: a far,
+/// keeper-covered chance carries a much lower trigger value than a close, clear one, and
+/// that flows through to the live `shoot` action score — the "shoots from 25 when he
+/// should work it to 20/15" fix. (Parity with the model off is verified by running the
+/// suite with `DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP=1`, which skips the seam entirely.)
+#[test]
+fn shot_trigger_mdp_disciplines_far_covered_shots_vs_close_clear() {
+    // This test asserts the model's live effect; skip it cleanly when the kill-switch is
+    // set (a parity run) so disabling the feature reproduces the legacy red/green set.
+    if !shot_trigger_mdp_enabled() {
+        return;
+    }
+    let build = |attacker_y: f64, keeper_y: f64| -> SoccerMatch {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 41_207,
+            ..Default::default()
+        });
+        let attacker = 9;
+        let keeper = 11;
+        park_players_except(&mut sim, &[attacker, keeper]);
+        sim.players[attacker].role = PlayerRole::Forward;
+        sim.players[attacker].position = Vec2::new(40.0, attacker_y);
+        sim.players[attacker].velocity = Vec2::zero();
+        sim.players[attacker].skills.shooting = 8.0;
+        sim.players[attacker].skills.right_foot_shot_power = 8.5;
+        sim.players[attacker].skills.left_foot_shot_power = 7.0;
+        sim.players[attacker].skills.decision_noise = 0.0;
+        sim.players[attacker].preferences.shoot_bias = 0.80;
+        // Keeper planted on his line, centred — covers the net for the far shot.
+        sim.players[keeper].position = Vec2::new(40.0, keeper_y);
+        sim.players[keeper].skills.goalkeeping = 8.0;
+        sim.ball.holder = Some(attacker);
+        sim.ball.position = sim.players[attacker].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim
+    };
+
+    // Close, clear: ~14yd from goal (y=106, goal line y=120).
+    let close_sim = build(106.0, 119.0);
+    let close_snapshot = WorldSnapshot::from_match(&close_sim);
+    let close_obs = close_snapshot.observation_for(9);
+    // Far, keeper-covered: ~25yd from goal (y=95), keeper set on his line.
+    let far_sim = build(95.0, 118.0);
+    let far_snapshot = WorldSnapshot::from_match(&far_sim);
+    let far_obs = far_snapshot.observation_for(9);
+
+    // The live seam populated the trigger value (model is ON by default).
+    assert!(
+        close_obs.shot_trigger_mdp_value >= 0.0 && far_obs.shot_trigger_mdp_value >= 0.0,
+        "the shot-trigger seam should populate the observation when the model is on"
+    );
+    assert!(
+        close_obs.shot_trigger_mdp_value > far_obs.shot_trigger_mdp_value,
+        "a close clear chance must out-value a far covered one: close={} far={}",
+        close_obs.shot_trigger_mdp_value,
+        far_obs.shot_trigger_mdp_value
+    );
+    assert!(
+        far_obs.shot_trigger_mdp_value < 0.5,
+        "a 25yd covered shot should be a low-value trigger, got {}",
+        far_obs.shot_trigger_mdp_value
+    );
+
+    // And it flows through to the live shoot action score.
+    let close_directive = close_snapshot.tactical_directive(Team::Home);
+    let close_shoot = close_sim.players[9]
+        .possession_action_options(
+            &close_obs,
+            &close_directive,
+            0,
+            0,
+            false,
+            close_sim.config.dt_seconds,
+            close_snapshot.field_width,
+        )
+        .into_iter()
+        .find(|o| o.label == "shoot")
+        .expect("close shoot option");
+    let far_directive = far_snapshot.tactical_directive(Team::Home);
+    let far_shoot = far_sim.players[9]
+        .possession_action_options(
+            &far_obs,
+            &far_directive,
+            0,
+            0,
+            false,
+            far_sim.config.dt_seconds,
+            far_snapshot.field_width,
+        )
+        .into_iter()
+        .find(|o| o.label == "shoot")
+        .expect("far shoot option");
+    assert!(
+        close_shoot.probability > far_shoot.probability,
+        "the close clear shot should be preferred over the far covered one: close={:?} far={:?}",
+        close_shoot,
+        far_shoot
+    );
 }
