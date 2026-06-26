@@ -18,6 +18,20 @@ const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 10.40;
 // (pressure-damped) dribble base — otherwise the one correct action collapses with the
 // carrier's dribble score and loses to a release-urgency-lifted panic pass into traffic.
 const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
+// First-touch escape (selector side): a pressed receiver with a real, DEFENDER-AWARE lateral lane
+// (observation `pressured_escape_lane_yards`, not pitch-edge room) should break contact with the
+// dedicated evade rather than dwell on a static shield. A full lane is this many yards.
+const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
+// Floor lift for the side-step escape (analogue of PINNED_SHIELD_FLOOR_LIFT): sized so a strong
+// fresh-receipt-escape signal floors the evade above the pinned no-outlet shield.
+const FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT: f64 = 2.7;
+/// Selector-side mirror of the first-touch-escape gate (same env var so the whole behaviour toggles
+/// together). Default-off (escape ON); OFF zeroes the lift so the side-step score is byte-identical.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
+}
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -3632,17 +3646,43 @@ impl PlayerAgent {
             .clamp(CALM_PASS_FOCUS_FLOOR, 1.0);
         let side_step_legal =
             observation.nearest_opponent_distance <= 4.6 && pressure_urgency.max(pressure) >= 0.28;
+        // First-touch escape: a player who just received under pressure WITH a defender-aware
+        // lateral lane open should break contact with the side-step now instead of freezing on the
+        // shield. Collapses to 0 when boxed in (lane ~0), in open play, off fresh receipt, or when
+        // the gate is disabled — so it only fires in exactly the "freeze on receipt" picture.
+        let first_touch_escape_signal = if dd_soccer_disable_first_touch_escape() {
+            0.0
+        } else {
+            (1.0 - observation.perceived_time_on_ball_seconds / 1.5).clamp(0.0, 1.0)
+                * pressure_urgency.max(pressure)
+                * (observation.pressured_escape_lane_yards / FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS)
+                    .clamp(0.0, 1.0)
+        };
         // The side-step is the dedicated evade — knock the ball away from the
         // defender and step past. Under escape pressure it gets a real urgency boost
         // (and a lifted ceiling) so a pinned holder breaks contact instead of dwelling.
+        let side_step_ceiling =
+            (0.82 + steal_escape_urgency * 0.52 + first_touch_escape_signal * 0.42).clamp(0.82, 1.40);
+        // Escape FLOOR (analogue of pinned_shield_floor): under pressure the dribble base is damped
+        // to ~0, so a multiplier alone can't lift the evade above the floored shield. Skill-gate it
+        // (as the shield/hold gates do) so an elite dribbler keeps his better moves (xavi-turn/cuts)
+        // and only the mid/low-skill carrier — who would otherwise just freeze — gets floored.
+        let skilled_escape_relief =
+            ((dribbling - (NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF - 0.28)) / 0.28).clamp(0.0, 1.0);
+        let side_step_escape_floor = (first_touch_escape_signal
+            * FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT
+            * (1.0 - skilled_escape_relief))
+            .clamp(0.0, side_step_ceiling);
         let side_step_score = (dribble_score
             * (0.30 + pressure_urgency.max(pressure) * 0.88)
             * (1.0
                 + (1.0 - observation.forward_dribble_space_yards / 14.0).clamp(0.0, 1.0) * 0.24
-                + steal_escape_urgency * 1.02)
+                + steal_escape_urgency * 1.02
+                + first_touch_escape_signal * 1.20)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, (0.82 + steal_escape_urgency * 0.52).clamp(0.82, 1.34));
+            .clamp(0.01, side_step_ceiling)
+            .max(side_step_escape_floor);
         let technical_escape_pressure = pressure_urgency
             .max(pressure)
             .max(observation.immediate_dispossession_risk.clamp(0.0, 1.0))
