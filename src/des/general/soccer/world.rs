@@ -14,6 +14,13 @@ const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const SOCCER_POLICY_TOP_RANK_LIMIT: usize = 3;
+const SOCCER_POLICY_TOP_RANK_WEIGHTS: [f64; SOCCER_POLICY_TOP_RANK_LIMIT] = [0.70, 0.20, 0.10];
+const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
+const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
+const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
+const SOCCER_POLICY_RANK_SALT_SHARED_NEURAL: u64 = 0x5348_4152_4e45_5552;
+const SOCCER_POLICY_RANK_SALT_EXPLORATION: u64 = 0x4558_504c_4f52_4552;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
@@ -805,9 +812,227 @@ impl SoccerNeuralMctsNode {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SoccerPolicyActionChoice {
+    label: String,
+    behavior_probability: f64,
+}
+
+#[derive(Clone, Debug)]
+struct SoccerLearnedDecisionPlan {
+    plan: SoccerLearnedPlan,
+    behavior_probability: f64,
+}
+
+fn soccer_policy_rank_draw(seed: u32, tick: u64, player_id: usize, salt: u64) -> f64 {
+    let mut x = u64::from(seed)
+        ^ tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (player_id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ salt;
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn soccer_policy_rank_probability(candidate_count: usize, rank: usize) -> f64 {
+    let candidate_count = candidate_count.min(SOCCER_POLICY_TOP_RANK_LIMIT);
+    if candidate_count == 0 || rank >= candidate_count {
+        return 0.0;
+    }
+    let total: f64 = SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
+        .iter()
+        .sum();
+    if !total.is_finite() || total <= 1e-9 {
+        return 1.0 / candidate_count as f64;
+    }
+    (SOCCER_POLICY_TOP_RANK_WEIGHTS[rank] / total).clamp(0.0, 1.0)
+}
+
+fn soccer_policy_weighted_rank_index(candidate_count: usize, draw: f64) -> usize {
+    let candidate_count = candidate_count.min(SOCCER_POLICY_TOP_RANK_LIMIT);
+    if candidate_count <= 1 {
+        return 0;
+    }
+    let total: f64 = SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
+        .iter()
+        .sum();
+    let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
+    for (index, weight) in SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
+        .iter()
+        .enumerate()
+    {
+        if threshold < *weight {
+            return index;
+        }
+        threshold -= *weight;
+    }
+    candidate_count - 1
+}
+
+fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
+    let label = normalize_soccer_action_label(action);
+    pass_like_action_flight(label).is_some()
+        || dribble_move_kind_for_action_label(label).is_some()
+        || matches!(
+            label,
+            "shoot"
+                | "first-time-shot"
+                | "first-time-header"
+                | "clearance"
+                | "route-one"
+                | "hold"
+                | "space"
+                | "control-touch"
+                | "defend"
+                | "press-cover"
+                | "recover"
+                | "tackle"
+                | "vacate-space"
+                | "support-shape"
+                | "support-roam"
+                | "support-screen"
+                | "check-to-ball"
+                | "run-in-behind"
+                | "exploit-space-run"
+                | "wide-outlet"
+                | "shot-creation-run"
+                | "overlap-run"
+                | "set-play-run"
+                | "keeper-survey-hands"
+                | "keeper-foot-control-outside-box"
+                | "keeper-mpc-floor-pass"
+                | "keeper-mpc-aerial-pass"
+                | "keeper-mpc-clearance"
+                | "keeper-position"
+                | "keeper-save"
+        )
+}
+
+fn soccer_behavior_old_action_probability(
+    behavior_probability: Option<f64>,
+    actor_probability: Option<f64>,
+) -> Option<f64> {
+    if let Some(behavior_probability) = behavior_probability {
+        let behavior_probability = finite_unit_interval(behavior_probability);
+        if behavior_probability > 0.0 {
+            return Some(behavior_probability);
+        }
+    }
+    actor_probability
+        .map(finite_unit_interval)
+        .filter(|probability| *probability > 0.0)
+}
+
+fn stamp_learned_policy_behavior_probability_on_decision(
+    decision: &mut AgentDecisionTrace,
+    behavior_probability: f64,
+) {
+    let probability = finite_unit_interval(behavior_probability);
+    if probability <= 0.0 {
+        return;
+    }
+    if decision.operation_order.first().map(|entry| entry.as_str()) != Some("learned-policy") {
+        return;
+    }
+    decision.behavior_policy_probability = Some(probability);
+    decision.action_options = vec![AgentActionOptionTrace {
+        label: decision.action.clone(),
+        score: probability,
+        probability,
+        tick_probability: probability,
+        legal: true,
+    }];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_weighted_rank_selector_uses_top_three_split() {
+        assert_eq!(soccer_policy_weighted_rank_index(3, 0.0), 0);
+        assert_eq!(soccer_policy_weighted_rank_index(3, 0.699_999), 0);
+        assert_eq!(soccer_policy_weighted_rank_index(3, 0.700_001), 1);
+        assert_eq!(soccer_policy_weighted_rank_index(3, 0.899_999), 1);
+        assert_eq!(soccer_policy_weighted_rank_index(3, 0.900_001), 2);
+        assert!((soccer_policy_rank_probability(3, 0) - 0.70).abs() < 1e-9);
+        assert!((soccer_policy_rank_probability(3, 1) - 0.20).abs() < 1e-9);
+        assert!((soccer_policy_rank_probability(3, 2) - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_weighted_rank_selector_normalizes_when_only_two_actions_exist() {
+        assert_eq!(soccer_policy_weighted_rank_index(2, 0.777_777), 0);
+        assert_eq!(soccer_policy_weighted_rank_index(2, 0.777_779), 1);
+        assert!((soccer_policy_rank_probability(2, 0) - (0.70 / 0.90)).abs() < 1e-9);
+        assert!((soccer_policy_rank_probability(2, 1) - (0.20 / 0.90)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn behavior_old_action_probability_prefers_rank_mix_over_actor_softmax() {
+        assert_eq!(
+            soccer_behavior_old_action_probability(Some(0.20), Some(0.83)),
+            Some(0.20)
+        );
+        assert_eq!(
+            soccer_behavior_old_action_probability(Some(0.0), Some(0.83)),
+            Some(0.83)
+        );
+        assert_eq!(
+            soccer_behavior_old_action_probability(Some(f64::NAN), Some(0.83)),
+            Some(0.83)
+        );
+        assert_eq!(soccer_behavior_old_action_probability(None, None), None);
+    }
+
+    #[test]
+    fn learned_policy_behavior_probability_stamps_trace_action_options() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = &sim.players[0];
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let belief = belief_from_observation(&observation);
+        let mut decision = AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "pass".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("pass"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            action: "pass".to_string(),
+        };
+
+        stamp_learned_policy_behavior_probability_on_decision(&mut decision, 0.20);
+        let option_context =
+            soccer_action_option_learning_context(&decision.action, &decision.action_options);
+        assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+        assert_eq!(decision.behavior_policy_probability, Some(0.20));
+        assert_eq!(decision.action_options.len(), 1);
+        assert!((decision.action_options[0].probability - 0.20).abs() < 1e-9);
+
+        decision.operation_order = vec!["human-input".to_string()];
+        stamp_learned_policy_behavior_probability_on_decision(&mut decision, 0.70);
+        let option_context =
+            soccer_action_option_learning_context(&decision.action, &decision.action_options);
+        assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn learned_policy_action_mpc_definition_covers_policy_head_vocabulary() {
+        for action in SOCCER_POLICY_ACTIONS {
+            assert!(
+                learned_policy_action_has_mpc_definition(action),
+                "{action} must have an MPC execution definition"
+            );
+        }
+    }
 
     fn corridor_obstacle(pos: Vec2, vel: Vec2, acc: Vec2) -> CorridorObstacle {
         CorridorObstacle { pos, vel, acc }
@@ -1173,15 +1398,120 @@ mod tests {
             .find(|transition| normalize_soccer_action_label(&transition.action) == "hold")
             .expect("realized replacement transition");
         assert!(!learned_mpc_rejected_action_counterexample(realized));
+        assert!(
+            !soccer_actor_policy_sample_allowed(realized),
+            "MPC fallback replacement was not sampled by the actor policy"
+        );
         let rejected = player_transitions
             .iter()
             .find(|transition| normalize_soccer_action_label(&transition.action) == "pass")
             .expect("rejected original action transition");
         assert!(learned_mpc_rejected_action_counterexample(rejected));
+        assert!(
+            soccer_actor_policy_sample_allowed(rejected),
+            "rejected original action should train the actor away from the bad choice"
+        );
         assert!(rejected.action_target.is_none());
         assert!(rejected.done);
         assert!(
             rejected.reward < 0.0 && rejected.reward >= -LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS
+        );
+    }
+
+    #[test]
+    fn keeper_policy_samples_skip_realized_mpc_fallback_replacements() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let keeper = sim
+            .players
+            .iter()
+            .find(|player| player.role == PlayerRole::Goalkeeper)
+            .expect("keeper");
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mdp_state = snapshot.mdp_state_for_player(keeper.id);
+        let observation = snapshot.observation_for(keeper.id);
+        let mut realized = sim.neural_decision_transition(
+            &snapshot,
+            keeper.id,
+            keeper.team,
+            keeper.role,
+            &mdp_state,
+            &observation,
+        );
+        realized.action = "keeper-position".to_string();
+        realized.reward = 0.4;
+        realized.decision_context.learned_mpc_replanned = true;
+        realized.decision_context.learned_mpc_original_action = Some("pass".to_string());
+        realized.decision_context.learned_mpc_replacement_action =
+            Some("keeper-position".to_string());
+
+        let mut rejected = realized.clone();
+        rejected.action = "pass".to_string();
+        rejected.reward = -0.7;
+
+        let samples = sim.neural_keeper_policy_training_samples(&[realized, rejected]);
+        assert_eq!(
+            samples.len(),
+            1,
+            "keeper head must not imitate the realized MPC fallback replacement"
+        );
+        let distribute_short = SOCCER_KEEPER_ACTIONS
+            .iter()
+            .position(|&action| action == "distribute-short")
+            .expect("keeper short distribution action");
+        assert_eq!(samples[0].action_index, distribute_short);
+        assert!(samples[0].advantage < 0.0);
+    }
+
+    #[test]
+    fn actor_advantage_marl_tick_rewards_exclude_rejected_mpc_counterexamples() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let player = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = sim.neural_decision_transition(
+            &snapshot,
+            player.id,
+            player.team,
+            player.role,
+            &mdp_state,
+            &observation,
+        );
+        realized.tick = 77;
+        realized.action = "hold".to_string();
+        realized.reward = 1.0;
+
+        let mut rejected = realized.clone();
+        rejected.action = "pass".to_string();
+        rejected.reward = -2.5;
+        rejected.decision_context.learned_mpc_replanned = true;
+        rejected.decision_context.learned_mpc_original_action = Some("pass".to_string());
+        rejected.decision_context.learned_mpc_replacement_action = Some("hold".to_string());
+
+        let tick_rewards =
+            soccer_actor_advantage_tick_rewards(&[realized.clone(), rejected.clone()]);
+        let tick_reward = tick_rewards.get(&77).copied().expect("tick reward");
+        assert!((tick_reward.average_for(Team::Home) - 1.0).abs() < 1e-9);
+
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            marl_algorithm: SoccerMarlAlgorithm::Mappo,
+            mappo_team_reward_share: 1.0,
+            marl_team_reward_weight: 0.0,
+            marl_intermediate_reward_weight: 1.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        assert_eq!(
+            soccer_actor_advantage_reward(&realized, &tick_rewards, &config),
+            1.0
+        );
+        assert_eq!(
+            soccer_actor_advantage_reward(&rejected, &tick_rewards, &config),
+            -2.5
         );
     }
 
@@ -1339,7 +1669,9 @@ mod tests {
         ];
 
         assert_eq!(
-            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates).as_deref(),
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
             Some("pass")
         );
     }
@@ -1368,7 +1700,9 @@ mod tests {
         ];
 
         assert_eq!(
-            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates).as_deref(),
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
             Some("pass")
         );
     }
@@ -1662,6 +1996,45 @@ fn learned_mpc_rejected_action_counterexample(transition: &SoccerLearningTransit
     };
     normalize_soccer_action_label(&transition.action)
         == normalize_soccer_action_label(original_action)
+}
+
+fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
+    !transition.decision_context.learned_mpc_replanned
+        || learned_mpc_rejected_action_counterexample(transition)
+}
+
+fn soccer_actor_advantage_tick_rewards(
+    transitions: &[SoccerLearningTransition],
+) -> HashMap<u64, SoccerMarlTickReward> {
+    let mut tick_rewards = HashMap::new();
+    for transition in transitions
+        .iter()
+        .filter(|transition| !learned_mpc_rejected_action_counterexample(transition))
+    {
+        tick_rewards
+            .entry(transition.tick)
+            .or_insert_with(SoccerMarlTickReward::default)
+            .record(
+                transition.team,
+                transition.reward,
+                transition
+                    .observation
+                    .neural_extended
+                    .energy_waste_pressure,
+            );
+    }
+    tick_rewards
+}
+
+fn soccer_actor_advantage_reward(
+    transition: &SoccerLearningTransition,
+    tick_rewards: &HashMap<u64, SoccerMarlTickReward>,
+    config: &SoccerNeuralLearningConfig,
+) -> f64 {
+    if learned_mpc_rejected_action_counterexample(transition) {
+        return finite_metric(transition.reward);
+    }
+    soccer_marl_adjusted_reward(transition, tick_rewards, config)
 }
 
 fn learned_mpc_rejected_action_reward(rejected_execution_probability: f64) -> f64 {
@@ -3417,6 +3790,110 @@ impl SoccerMatch {
         let mdp_state = snapshot.mdp_state_for_player(player_id);
         let observation = snapshot.observation_for(player_id);
         self.learned_action_for_player_with_context(snapshot, player_id, &mdp_state, &observation)
+            .map(|decision| decision.plan)
+    }
+
+    fn policy_rank_selection_draw(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        salt: u64,
+    ) -> f64 {
+        soccer_policy_rank_draw(self.config.seed, snapshot.tick, player_id, salt)
+    }
+
+    fn weighted_ranked_action_choice(
+        ranked: &[SoccerLearnedActionTrace],
+        draw: f64,
+    ) -> Option<SoccerPolicyActionChoice> {
+        let candidate_count = ranked
+            .iter()
+            .filter(|action| action.legal)
+            .take(SOCCER_POLICY_TOP_RANK_LIMIT)
+            .count();
+        if candidate_count == 0 {
+            return None;
+        }
+        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
+        ranked
+            .iter()
+            .filter(|action| action.legal)
+            .nth(selected_rank)
+            .map(|action| SoccerPolicyActionChoice {
+                label: action.label.clone(),
+                behavior_probability: soccer_policy_rank_probability(
+                    candidate_count,
+                    selected_rank,
+                ),
+            })
+    }
+
+    fn weighted_scored_candidate_choice(
+        candidates: &[SoccerNeuralMctsCandidate],
+        draw: f64,
+    ) -> Option<SoccerPolicyActionChoice> {
+        let candidate_count = candidates.len().min(SOCCER_POLICY_TOP_RANK_LIMIT);
+        if candidate_count == 0 {
+            return None;
+        }
+        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
+        candidates
+            .get(selected_rank)
+            .map(|candidate| SoccerPolicyActionChoice {
+                label: candidate.label.clone(),
+                behavior_probability: soccer_policy_rank_probability(
+                    candidate_count,
+                    selected_rank,
+                ),
+            })
+    }
+
+    fn weighted_policy_action_for_player(
+        &self,
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+        salt: u64,
+    ) -> Option<SoccerPolicyActionChoice> {
+        let draw = self.policy_rank_selection_draw(snapshot, player_id, salt);
+        let (_, mut ranked) = policy.ranked_action_values_for_snapshot(
+            snapshot,
+            player_id,
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(SOCCER_POLICY_TOP_RANK_LIMIT),
+        )?;
+        if let Some((prior, weight)) = retrieval_prior.filter(|(p, w)| !p.is_empty() && *w != 0.0) {
+            for candidate in ranked.iter_mut().filter(|candidate| candidate.legal) {
+                candidate.value += weight
+                    * prior
+                        .get(normalize_soccer_action_label(&candidate.label))
+                        .copied()
+                        .unwrap_or(0.0);
+            }
+            ranked.sort_by(|a, b| {
+                b.legal
+                    .cmp(&a.legal)
+                    .then_with(|| b.value.total_cmp(&a.value))
+                    .then_with(|| b.visits.cmp(&a.visits))
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+        }
+        Self::weighted_ranked_action_choice(&ranked, draw).or_else(|| {
+            policy
+                .best_action_for_state_observation_with_prior(
+                    snapshot,
+                    player_id,
+                    mdp_state,
+                    observation,
+                    retrieval_prior,
+                )
+                .map(|label| SoccerPolicyActionChoice {
+                    label,
+                    behavior_probability: 1.0,
+                })
+        })
     }
 
     fn learned_action_for_player_with_context(
@@ -3425,7 +3902,7 @@ impl SoccerMatch {
         player_id: usize,
         mdp_state: &SoccerMdpState,
         observation: &SoccerPomdpObservation,
-    ) -> Option<SoccerLearnedPlan> {
+    ) -> Option<SoccerLearnedDecisionPlan> {
         let player = snapshot.players.iter().find(|p| p.id == player_id)?;
         // Retrieval action prior for this player's team (empty/None unless the
         // consumer installed one and `decision_prior_enabled`). `Option<(&map, w)>`
@@ -3440,64 +3917,83 @@ impl SoccerMatch {
         };
         if let Some(team_policies) = &self.team_policies {
             let policy = team_policies.policy(player.team);
-            if let Some(action) = self
-                .exploration_action_for_player(policy, snapshot, player_id)
-                .or_else(|| {
-                    self.neural_blended_action(
-                        policy,
-                        snapshot,
-                        player_id,
-                        mdp_state,
-                        observation,
-                        player.team,
-                        player.role,
-                    )
-                })
-                .or_else(|| {
-                    policy.best_action_for_state_observation_with_prior(
-                        snapshot,
-                        player_id,
-                        mdp_state,
-                        observation,
-                        retrieval_prior,
-                    )
-                })
-            {
-                return Some(Self::mpc_reconciled_learned_plan_for_policy(
-                    policy, snapshot, player_id, action,
-                ));
-            }
-        }
-        let learned_policy = self.learned_policy.as_ref()?;
-        self.exploration_action_for_player(learned_policy, snapshot, player_id)
-            .or_else(|| {
-                self.neural_blended_action(
-                    learned_policy,
+            if let Some(choice) = self
+                .neural_blended_action(
+                    policy,
                     snapshot,
                     player_id,
                     mdp_state,
                     observation,
                     player.team,
                     player.role,
+                    SOCCER_POLICY_RANK_SALT_TEAM_NEURAL,
                 )
-            })
-            .or_else(|| {
-                learned_policy.best_action_for_state_observation_with_prior(
-                    snapshot,
-                    player_id,
-                    mdp_state,
-                    observation,
-                    retrieval_prior,
-                )
-            })
-            .map(|action| {
-                Self::mpc_reconciled_learned_plan_for_policy(
-                    learned_policy,
-                    snapshot,
-                    player_id,
-                    action,
-                )
-            })
+                .or_else(|| self.exploration_action_for_player(policy, snapshot, player_id))
+                .or_else(|| {
+                    self.weighted_policy_action_for_player(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                        SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+                    )
+                })
+            {
+                return Some(SoccerLearnedDecisionPlan {
+                    plan: Self::mpc_reconciled_learned_plan_for_policy(
+                        policy,
+                        snapshot,
+                        player_id,
+                        choice.label,
+                    ),
+                    behavior_probability: choice.behavior_probability,
+                });
+            }
+        }
+        let learned_policy = self.learned_policy.as_ref()?;
+        self.neural_blended_action(
+            learned_policy,
+            snapshot,
+            player_id,
+            mdp_state,
+            observation,
+            player.team,
+            player.role,
+            SOCCER_POLICY_RANK_SALT_SHARED_NEURAL,
+        )
+        .or_else(|| self.exploration_action_for_player(learned_policy, snapshot, player_id))
+        .or_else(|| {
+            self.weighted_policy_action_for_player(
+                learned_policy,
+                snapshot,
+                player_id,
+                mdp_state,
+                observation,
+                retrieval_prior,
+                SOCCER_POLICY_RANK_SALT_SHARED_TABULAR,
+            )
+        })
+        .map(|choice| SoccerLearnedDecisionPlan {
+            plan: Self::mpc_reconciled_learned_plan_for_policy(
+                learned_policy,
+                snapshot,
+                player_id,
+                choice.label,
+            ),
+            behavior_probability: choice.behavior_probability,
+        })
+    }
+
+    fn stamp_learned_policy_behavior_probability(
+        player: &mut PlayerAgent,
+        behavior_probability: f64,
+    ) {
+        let Some(decision) = player.last_decision.as_mut() else {
+            return;
+        };
+        stamp_learned_policy_behavior_probability_on_decision(decision, behavior_probability);
     }
 
     /// Build a feature-only decision-time transition: the player's real
@@ -3544,7 +4040,8 @@ impl SoccerMatch {
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
-    ) -> Option<String> {
+        draw: f64,
+    ) -> Option<SoccerPolicyActionChoice> {
         if !blend.mcts_enabled {
             return None;
         }
@@ -3635,16 +4132,28 @@ impl SoccerMatch {
             nodes[best_index].search_visits = nodes[best_index].search_visits.saturating_add(1);
         }
 
+        nodes.sort_by(|a, b| {
+            b.search_visits
+                .cmp(&a.search_visits)
+                .then_with(|| b.mean_value().total_cmp(&a.mean_value()))
+                .then_with(|| b.raw_score.total_cmp(&a.raw_score))
+                .then_with(|| a.q_visits.cmp(&b.q_visits))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        let candidate_count = nodes.len().min(SOCCER_POLICY_TOP_RANK_LIMIT);
+        if candidate_count == 0 {
+            return None;
+        }
+        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
         nodes
-            .into_iter()
-            .max_by(|a, b| {
-                a.search_visits
-                    .cmp(&b.search_visits)
-                    .then_with(|| a.mean_value().total_cmp(&b.mean_value()))
-                    .then_with(|| a.raw_score.total_cmp(&b.raw_score))
-                    .then_with(|| b.q_visits.cmp(&a.q_visits))
+            .get(selected_rank)
+            .map(|node| SoccerPolicyActionChoice {
+                label: node.label.clone(),
+                behavior_probability: soccer_policy_rank_probability(
+                    candidate_count,
+                    selected_rank,
+                ),
             })
-            .map(|node| node.label)
     }
 
     fn neural_mcts_model_rollout_value(
@@ -3701,7 +4210,8 @@ impl SoccerMatch {
         observation: &SoccerPomdpObservation,
         team: Team,
         role: PlayerRole,
-    ) -> Option<String> {
+        rank_salt: u64,
+    ) -> Option<SoccerPolicyActionChoice> {
         let blend = self.neural_blend;
         let value_active = blend.mode != SoccerNeuralBlendMode::Off;
         let actor_requested = blend.actor_critic && self.policy_head.is_some();
@@ -3933,14 +4443,13 @@ impl SoccerMatch {
                 .then_with(|| a.q_visits.cmp(&b.q_visits))
                 .then_with(|| a.label.cmp(&b.label))
         });
+        let rank_draw = self.policy_rank_selection_draw(snapshot, player_id, rank_salt);
         if let Some(mcts_label) =
-            Self::neural_mcts_action_from_candidates(blend, &scored_candidates)
+            Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
         {
             return Some(mcts_label);
         }
-        scored_candidates
-            .first()
-            .map(|candidate| candidate.label.clone())
+        Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
@@ -4018,9 +4527,9 @@ impl SoccerMatch {
         intent
     }
 
-    /// Opt-in exploration for the decision path. Returns the lowest-confidence
-    /// legal action only when it is close enough to the greedy value and materially
-    /// less visited; otherwise `None` so the caller falls back to greedy selection.
+    /// Opt-in exploration for the decision path. When a learning run explicitly enables ε,
+    /// choose among the ranked legal policy actions with the same top-rank distribution used by
+    /// live MDP/POMDP decisions: rank 1/2/3 at 70/20/10 when all three exist.
     ///
     /// Gating, by design:
     /// - Only active while `learning_enabled` is true. Realtime/4-controller
@@ -4029,13 +4538,13 @@ impl SoccerMatch {
     ///   and reproducible there).
     /// - ε defaults to 0 (`SoccerQPolicyOptions::exploration_epsilon`), so even
     ///   during a learning run nothing changes unless the run opts in. When enabled,
-    ///   ε widens the accepted value gap; it does not trigger random action draws.
+    ///   it uses the deterministic match-seeded rank draw, keeping replays stable.
     fn exploration_action_for_player(
         &self,
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
         player_id: usize,
-    ) -> Option<String> {
+    ) -> Option<SoccerPolicyActionChoice> {
         if !self.config.learning_enabled {
             return None;
         }
@@ -4048,31 +4557,12 @@ impl SoccerMatch {
             player_id,
             SOCCER_Q_EXPLORATION_CANDIDATES,
         )?;
-        let best_legal = ranked.iter().filter(|action| action.legal).max_by(|a, b| {
-            a.value
-                .total_cmp(&b.value)
-                .then_with(|| b.visits.cmp(&a.visits))
-                .then_with(|| b.label.cmp(&a.label))
-        })?;
-        let value_gap_budget = 0.04 + epsilon * 0.36;
-        let visit_gap_required = ((1.0 - epsilon).clamp(0.0, 1.0) * 4.0).ceil() as u32;
-        let candidate = ranked
-            .iter()
-            .filter(|action| action.legal)
-            .filter(|action| best_legal.value - action.value <= value_gap_budget)
-            .min_by(|a, b| {
-                a.visits
-                    .cmp(&b.visits)
-                    .then_with(|| b.value.total_cmp(&a.value))
-                    .then_with(|| a.label.cmp(&b.label))
-            })?;
-        if candidate.label == best_legal.label {
-            return None;
-        }
-        if best_legal.visits.saturating_sub(candidate.visits) < visit_gap_required.max(1) {
-            return None;
-        }
-        Some(candidate.label.clone())
+        let draw = self.policy_rank_selection_draw(
+            snapshot,
+            player_id,
+            SOCCER_POLICY_RANK_SALT_EXPLORATION,
+        );
+        Self::weighted_ranked_action_choice(&ranked, draw)
     }
 
     fn learned_policy_trace_for_player(
@@ -4165,6 +4655,57 @@ impl SoccerMatch {
             plan.target_point = plan
                 .target_player
                 .and_then(|target| snapshot.player_position(target));
+        } else if matches!(normalized_action.as_str(), "clearance" | "route-one") {
+            if let Some(player) = snapshot
+                .players
+                .iter()
+                .find(|player| player.id == player_id)
+            {
+                plan.target_point = if normalized_action == "route-one" {
+                    snapshot.route_one_target_for(player_id).or_else(|| {
+                        Some(route_one_target_for_actor(
+                            player.team,
+                            snapshot.player_snapshot_position(player),
+                            snapshot.field_width,
+                            snapshot.field_length,
+                            player.role,
+                        ))
+                    })
+                } else {
+                    snapshot
+                        .pressure_clearance_target_for(player_id)
+                        .or_else(|| {
+                            Some(clearance_target_for_player(
+                                player.team,
+                                snapshot.player_snapshot_position(player),
+                                snapshot.field_width,
+                                snapshot.field_length,
+                            ))
+                        })
+                };
+            }
+        } else if matches!(
+            normalized_action.as_str(),
+            "keeper-mpc-floor-pass" | "keeper-mpc-aerial-pass" | "keeper-mpc-clearance"
+        ) {
+            if let Some(keeper_plan) = snapshot.goalkeeper_mpc_play_out_plan(player_id, None) {
+                let matches_requested = match normalized_action.as_str() {
+                    "keeper-mpc-floor-pass" => {
+                        keeper_plan.target_player.is_some()
+                            && keeper_plan.flight == PassFlight::Floor
+                    }
+                    "keeper-mpc-aerial-pass" => {
+                        keeper_plan.target_player.is_some()
+                            && keeper_plan.flight != PassFlight::Floor
+                    }
+                    "keeper-mpc-clearance" => keeper_plan.target_player.is_none(),
+                    _ => false,
+                };
+                if matches_requested {
+                    plan.target_player = keeper_plan.target_player;
+                    plan.target_point = Some(keeper_plan.target);
+                }
+            }
         }
         plan
     }
@@ -4241,6 +4782,14 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> Option<f64> {
         let label = normalize_soccer_action_label(&plan.action);
+        if matches!(
+            label,
+            "keeper-mpc-floor-pass" | "keeper-mpc-aerial-pass" | "keeper-mpc-clearance"
+        ) {
+            return Some(Self::learned_keeper_mpc_execution_probability(
+                snapshot, player_id, plan, label,
+            ));
+        }
         if let Some(flight) = pass_like_action_flight(label) {
             return Some(Self::learned_pass_mpc_execution_probability(
                 snapshot, player_id, plan, flight,
@@ -4256,7 +4805,73 @@ impl SoccerMatch {
                 snapshot, player_id, label,
             ));
         }
+        if matches!(label, "clearance" | "route-one") {
+            return Some(Self::learned_clearance_mpc_execution_probability(
+                snapshot, player_id, plan, label,
+            ));
+        }
+        if learned_policy_action_has_mpc_definition(label) {
+            return Some(Self::learned_movement_mpc_execution_probability(
+                snapshot, player_id, plan, label,
+            ));
+        }
         None
+    }
+
+    fn learned_keeper_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        label: &str,
+    ) -> f64 {
+        let preferred_target = plan.target_player;
+        let Some(keeper_plan) = snapshot.goalkeeper_mpc_play_out_plan(player_id, preferred_target)
+        else {
+            return 0.0;
+        };
+        let matches_requested = match label {
+            "keeper-mpc-floor-pass" => {
+                keeper_plan.target_player.is_some() && keeper_plan.flight == PassFlight::Floor
+            }
+            "keeper-mpc-aerial-pass" => {
+                keeper_plan.target_player.is_some() && keeper_plan.flight != PassFlight::Floor
+            }
+            "keeper-mpc-clearance" => keeper_plan.target_player.is_none(),
+            _ => false,
+        };
+        if !matches_requested {
+            return 0.0;
+        }
+        if keeper_plan.target_player.is_some() {
+            let keeper_pass_plan = SoccerLearnedPlan {
+                action: if keeper_plan.flight == PassFlight::Floor {
+                    "pass".to_string()
+                } else {
+                    "aerial-pass".to_string()
+                },
+                target_player: keeper_plan.target_player,
+                target_point: Some(keeper_plan.target),
+                mpc_replan: None,
+            };
+            return Self::learned_pass_mpc_execution_probability(
+                snapshot,
+                player_id,
+                &keeper_pass_plan,
+                keeper_plan.flight,
+            );
+        }
+        let keeper_clearance_plan = SoccerLearnedPlan {
+            action: "clearance".to_string(),
+            target_player: None,
+            target_point: Some(keeper_plan.target),
+            mpc_replan: None,
+        };
+        Self::learned_clearance_mpc_execution_probability(
+            snapshot,
+            player_id,
+            &keeper_clearance_plan,
+            "clearance",
+        )
     }
 
     fn learned_pass_mpc_execution_probability(
@@ -4404,6 +5019,216 @@ impl SoccerMatch {
         )
         .accuracy_probability
         .clamp(0.0, 1.0)
+    }
+
+    fn learned_clearance_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        label: &str,
+    ) -> f64 {
+        let Some(player) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+        else {
+            return 0.0;
+        };
+        let position = snapshot
+            .player_position(player_id)
+            .unwrap_or(player.position);
+        let target = plan.target_point.unwrap_or_else(|| {
+            if label == "route-one" {
+                snapshot.route_one_target_for(player_id).unwrap_or_else(|| {
+                    route_one_target_for_actor(
+                        player.team,
+                        position,
+                        snapshot.field_width,
+                        snapshot.field_length,
+                        player.role,
+                    )
+                })
+            } else {
+                snapshot
+                    .pressure_clearance_target_for(player_id)
+                    .unwrap_or_else(|| {
+                        clearance_target_for_player(
+                            player.team,
+                            position,
+                            snapshot.field_width,
+                            snapshot.field_length,
+                        )
+                    })
+            }
+        });
+        let distance = position.distance(target).clamp(0.0, 120.0);
+        let observation = snapshot.observation_for(player_id);
+        let launch_skill = (ability01(player.skills.passing_completion_rate) * 0.30
+            + ability01(player.skills.vision) * 0.18
+            + ability01(
+                player
+                    .skills
+                    .right_foot_shot_power
+                    .max(player.skills.left_foot_shot_power),
+            ) * 0.30
+            + ability01(player.skills.first_touch) * 0.22)
+            .clamp(0.0, 1.0);
+        let target_fit = if label == "route-one" {
+            (1.0 - ((distance - 46.0).abs() / 58.0)).clamp(0.34, 1.0)
+        } else {
+            (0.72 + (distance / 70.0).clamp(0.0, 1.0) * 0.28).clamp(0.0, 1.0)
+        };
+        let pressure_fit =
+            (1.0 - observation.perceived_pressure.clamp(0.0, 1.0) * 0.16).clamp(0.72, 1.0);
+        let decision_confidence = player_decision_confidence(&observation, &player.skills);
+        (0.08 + launch_skill * 0.42 + target_fit * 0.24 + decision_confidence * 0.26)
+            .clamp(0.0, 0.99)
+            * pressure_fit
+    }
+
+    fn learned_movement_mpc_target(
+        snapshot: &WorldSnapshot,
+        player: &PlayerSnapshot,
+        plan: &SoccerLearnedPlan,
+        label: &str,
+    ) -> Vec2 {
+        if let Some(target) = plan.target_point {
+            return target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        }
+        let current = snapshot.player_snapshot_position(player);
+        let target = match label {
+            "tackle" => snapshot
+                .ball
+                .holder
+                .and_then(|holder| snapshot.player_position(holder)),
+            "defend" | "press-cover" => {
+                Some(snapshot.defensive_assignment_for(player.id, player.home_position, false))
+            }
+            "keeper-position" | "keeper-save" => {
+                Some(snapshot.goalkeeper_ball_goal_tracking_target(player.team))
+            }
+            "hold" if player.role == PlayerRole::Goalkeeper => {
+                Some(snapshot.goalkeeper_ball_goal_tracking_target(player.team))
+            }
+            "hold" => Some(player.home_position),
+            "space" => {
+                if snapshot.controlled_possession_team() == Some(player.team) {
+                    if player.role == PlayerRole::Goalkeeper {
+                        Some(snapshot.goalkeeper_ball_goal_tracking_target(player.team))
+                    } else {
+                        Some(snapshot.positional_open_space_for(
+                            player.id,
+                            player.home_position,
+                            false,
+                        ))
+                    }
+                } else if snapshot.controlled_possession_team() == Some(player.team.other()) {
+                    Some(snapshot.defensive_assignment_for(player.id, player.home_position, false))
+                } else {
+                    Some(snapshot.defensive_shape_for(player.id, player.home_position))
+                }
+            }
+            "keeper-survey-hands" | "keeper-foot-control-outside-box" | "control-touch" => {
+                Some(current)
+            }
+            _ => snapshot
+                .formation_lp_guidance_for(player.id)
+                .map(|guidance| guidance.target),
+        };
+        target
+            .or_else(|| {
+                snapshot
+                    .formation_lp_guidance_for(player.id)
+                    .map(|guidance| guidance.target)
+            })
+            .unwrap_or(current)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+    }
+
+    fn learned_movement_mpc_execution_probability(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        label: &str,
+    ) -> f64 {
+        let Some(player) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+        else {
+            return 0.0;
+        };
+        let current = snapshot
+            .player_position(player_id)
+            .unwrap_or(player.position)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let target = Self::learned_movement_mpc_target(snapshot, player, plan, label);
+        let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        let horizon = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+        let velocity = snapshot
+            .player_velocity(player_id)
+            .unwrap_or(player.velocity);
+        let execution_skill = match label {
+            "tackle" | "defend" | "press-cover" | "keeper-save" => {
+                ability01(player.skills.defending) * 0.48
+                    + ability01(player.skills.acceleration) * 0.22
+                    + ability01(player.skills.strength) * 0.18
+                    + ability01(player.skills.aggression) * 0.12
+            }
+            "keeper-position" | "keeper-survey-hands" | "keeper-foot-control-outside-box" => {
+                ability01(player.skills.goalkeeping) * 0.50
+                    + ability01(player.skills.acceleration) * 0.22
+                    + ability01(player.skills.first_touch) * 0.16
+                    + ability01(player.skills.vision) * 0.12
+            }
+            "control-touch" => {
+                ability01(player.skills.first_touch) * 0.48
+                    + ability01(player.skills.dribbling) * 0.24
+                    + ability01(player.skills.strength) * 0.16
+                    + ability01(player.skills.acceleration) * 0.12
+            }
+            _ => {
+                ability01(player.skills.acceleration) * 0.42
+                    + ability01(player.skills.top_speed) * 0.34
+                    + ability01(player.skills.dribbling) * 0.24
+            }
+        }
+        .clamp(0.0, 1.0);
+        let reachable_delta_yards = (velocity.len() * horizon
+            + 0.5 * acceleration_yps2_from_score(player.skills.acceleration) * horizon * horizon
+            + execution_skill * 1.6)
+            .max(0.75);
+        let distance = current.distance(target);
+        let distance_fit = if distance <= reachable_delta_yards {
+            1.0
+        } else {
+            (1.0 - (distance - reachable_delta_yards)
+                / tunables()
+                    .decision_mpc
+                    .reselect_max_target_delta_yards
+                    .max(1.0))
+            .clamp(0.0, 1.0)
+        };
+        let lp_alignment = snapshot
+            .formation_lp_guidance_for(player_id)
+            .map(|guidance| {
+                (1.0 - target.distance(guidance.target) / 16.0)
+                    .clamp(0.0, 1.0)
+                    .max(if guidance.local_mpc_guidance {
+                        0.35
+                    } else {
+                        0.0
+                    })
+            })
+            .unwrap_or(0.72);
+        let observation = snapshot.observation_for(player_id);
+        let decision_confidence = player_decision_confidence(&observation, &player.skills);
+        (0.08
+            + distance_fit * 0.40
+            + execution_skill * 0.26
+            + decision_confidence * 0.18
+            + lp_alignment * 0.08)
+            .clamp(0.0, 0.99)
     }
 
     fn ensure_neural_learner(&mut self) {
@@ -4787,8 +5612,11 @@ impl SoccerMatch {
                 .unwrap_or_else(|| soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma))
         };
 
-        // Per-tick team reward aggregation for centralized MARL shaping.
-        let tick_rewards = soccer_marl_tick_rewards(replay);
+        // Per-tick team reward aggregation for centralized MARL shaping. Synthetic
+        // learned-MPC rejected-action rows are actor counterexamples, not events
+        // the team actually produced on the pitch, so they stay out of the team
+        // mean and keep their own direct penalty below.
+        let tick_rewards = soccer_actor_advantage_tick_rewards(replay);
 
         // Per-transition row: the MARL-adjusted reward (critic value in reward units), terminal
         // flag, action index, and state features. Both convergent cooperative-MARL shapings are
@@ -4799,7 +5627,11 @@ impl SoccerMatch {
         let reward_adv: Vec<f64> = replay
             .iter()
             .map(|transition| {
-                soccer_marl_adjusted_reward(transition, &tick_rewards, &self.config.neural_learning)
+                soccer_actor_advantage_reward(
+                    transition,
+                    &tick_rewards,
+                    &self.config.neural_learning,
+                )
             })
             .collect();
         let values: Vec<f64> = replay
@@ -4863,31 +5695,29 @@ impl SoccerMatch {
             .iter()
             .enumerate()
             .filter_map(|(index, transition)| {
+                let rejected_counterexample =
+                    learned_mpc_rejected_action_counterexample(transition);
+                if !soccer_actor_policy_sample_allowed(transition) {
+                    return None;
+                }
                 let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if learned_mpc_rejected_action_counterexample(transition) {
+                let advantage = if rejected_counterexample {
                     reward_adv[index] - values[index]
                 } else {
                     advantages[index]
                 };
                 let state_features = self.policy_state_features(transition);
-                // Behaviour-policy probability for PPO/MAPPO importance weighting. When
-                // stochastic top-k selection was the behaviour policy this tick, the
-                // action was drawn from the rank mix (70/20/10), NOT the actor head's
-                // softmax — so the recorded rank-weight is the honest behaviour
-                // probability. Falls back to recomputing the head distribution (the
-                // historical path) whenever no rank-mix probability was recorded, i.e.
-                // for every transition produced with the gate off ⇒ byte-identical.
-                let old_action_probability = transition
-                    .decision_context
-                    .behavior_policy_probability
-                    .filter(|probability| probability.is_finite() && *probability > 0.0)
-                    .or_else(|| {
-                        self.policy_head
-                            .as_ref()
-                            .and_then(|head| head.action_distribution(&state_features))
-                            .and_then(|probs| probs.get(action_index).copied())
-                            .filter(|probability| probability.is_finite() && *probability > 0.0)
-                    });
+                let actor_probability = self
+                    .policy_head
+                    .as_ref()
+                    .and_then(|head| head.action_distribution(&state_features))
+                    .and_then(|probs| probs.get(action_index).copied());
+                // Stochastic top-k selection records the true behavior policy;
+                // older/deterministic rows fall back to the actor head.
+                let old_action_probability = soccer_behavior_old_action_probability(
+                    transition.decision_context.behavior_policy_probability,
+                    actor_probability,
+                );
                 advantage.is_finite().then(|| SoccerPolicySample {
                     state_features,
                     action_index,
@@ -4980,6 +5810,7 @@ impl SoccerMatch {
         replay
             .iter()
             .filter(|transition| transition.role == PlayerRole::Goalkeeper)
+            .filter(|transition| soccer_actor_policy_sample_allowed(transition))
             .filter_map(|transition| {
                 // A keeper sitting near its own goal line is holding; one well off it has come out.
                 let own_goal_y = match transition.team {
@@ -6419,7 +7250,7 @@ impl SoccerMatch {
                         observation.human_input_queue_age_ms =
                             Some(input_frame.queue_age_ms.min(60_000));
                     }
-                    let learned_plan = if self.learned_policy_inference_enabled() {
+                    let learned_decision = if self.learned_policy_inference_enabled() {
                         self.learned_action_for_player_with_context(
                             &snapshot,
                             scheduled.id,
@@ -6434,9 +7265,15 @@ impl SoccerMatch {
                         mdp_state,
                         observation,
                         input_frame.as_ref().map(|frame| &frame.input),
-                        learned_plan.as_ref(),
+                        learned_decision.as_ref().map(|decision| &decision.plan),
                         &mut self.rng,
                     );
+                    if let Some(learned_decision) = learned_decision.as_ref() {
+                        Self::stamp_learned_policy_behavior_probability(
+                            &mut self.players[actor],
+                            learned_decision.behavior_probability,
+                        );
+                    }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
                     let player_decision_elapsed = phase_started.elapsed();
