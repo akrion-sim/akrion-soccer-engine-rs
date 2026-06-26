@@ -7169,10 +7169,11 @@ impl SoccerMatch {
         if !dd_soccer_enable_overload_weighted_progression() {
             return 0.0;
         }
-        self.central_brain
-            .directive_for(team)
-            .attacking_overload_score
-            .clamp(0.0, 1.0)
+        let score = self.central_brain.directive_for(team).attacking_overload_score;
+        if !score.is_finite() {
+            return 0.0;
+        }
+        score.clamp(0.0, 1.0)
     }
 
     /// Additive reward for a completed forward pass that carried the ball forward into a numbers
@@ -17616,6 +17617,24 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1" || raw.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only
+/// one team logged a sample, so the opponent mean is undefined and the "zero-sum" term degenerates
+/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). OFF by default so the default
+/// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
+/// Read once per process.
+pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
             .map(|raw| {
                 let raw = raw.trim();
                 raw == "1" || raw.eq_ignore_ascii_case("true")

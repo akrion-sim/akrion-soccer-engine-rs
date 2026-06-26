@@ -10414,6 +10414,14 @@ impl SoccerMarlTickReward {
             _ => 0.0,
         }
     }
+
+    /// Whether BOTH teams contributed at least one sample this tick. The centralized zero-sum team
+    /// component (own mean − opponent mean) is only well-defined when both means exist; with only
+    /// one team present `average_for(opponent)` silently returns 0.0, turning the "zero-sum" term
+    /// into a one-sided bonus/penalty. See [`soccer_marl_adjusted_reward`].
+    fn has_both_teams(self) -> bool {
+        self.home_count > 0 && self.away_count > 0
+    }
 }
 
 pub(crate) fn soccer_marl_tick_rewards(
@@ -10454,16 +10462,36 @@ pub(crate) fn soccer_marl_adjusted_reward(
     let Some(tick_reward) = tick_reward else {
         return intermediate;
     };
-    let own_average = tick_reward.average_for(transition.team);
-    let opponent_average = tick_reward.average_for(transition.team.other());
-    // The cooperative-credit SHARE is already folded into `intermediate` above (the
-    // `shared` blend toward `own_avg`). Re-blending `intermediate` toward `own_average` a
-    // second time would double-count the team-reward share — its effect would grow roughly
-    // quadratically in `share` — a merge artifact of stacking the two convergent shapings.
-    // "Theirs" is purely the zero-sum centralized component below, so add it to
-    // `intermediate` directly. At `share = 0` (the default) this is byte-identical.
-    let team_component = own_average - opponent_average;
+    // The "zero-sum" team component is only balanced when BOTH teams logged a sample this tick.
+    // In the ONLINE training path, drained deferred reward transitions (goal/shot/chain/turnover
+    // credit, re-queued at their ORIGINAL tick) are trained in a batch SEPARATE from their tick's
+    // 22-player cohort, so that tick often carries only the scoring team. The opponent mean then
+    // defaults to 0.0 and the term degenerates into a one-sided amplification of the sparse event
+    // reward (e.g. a +30 chain credit becomes +30·team_weight extra) — and inconsistently with the
+    // full-game-replay path, where the same transition IS grouped with its cohort. When the
+    // balanced gate is on, the team component is suppressed on such single-team ticks so the
+    // centralized signal stays genuinely zero-sum. Gate OFF (default) => byte-identical.
+    let team_component = soccer_marl_team_component(
+        tick_reward,
+        transition.team,
+        dd_soccer_enable_marl_balanced_team_component(),
+    );
     intermediate + team_component * config.sanitized_marl_team_reward_weight()
+}
+
+/// Centralized zero-sum team component for the MAPPO advantage: `own_mean − opponent_mean` over the
+/// tick. When `balanced` is set and only one team logged a sample this tick, the opponent mean is
+/// undefined (it would silently read 0.0 and make the term one-sided), so the component is 0.0 — see
+/// [`soccer_marl_adjusted_reward`]. `balanced == false` reproduces the prior (byte-identical) term.
+fn soccer_marl_team_component(
+    tick_reward: SoccerMarlTickReward,
+    team: Team,
+    balanced: bool,
+) -> f64 {
+    if balanced && !tick_reward.has_both_teams() {
+        return 0.0;
+    }
+    tick_reward.average_for(team) - tick_reward.average_for(team.other())
 }
 
 fn soccer_full_game_replay_transitions(

@@ -77005,3 +77005,50 @@ fn overload_pass_chain_event_multiplier_is_identity_without_overload() {
     assert!((overload_pass_chain_event_multiplier_for(1.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
     assert!((overload_pass_chain_event_multiplier_for(2.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
 }
+
+#[test]
+fn marl_balanced_team_component_default_gate_off() {
+    // The balanced-team-component fix must be opt-in so the default training run is byte-identical.
+    assert!(
+        !dd_soccer_enable_marl_balanced_team_component(),
+        "DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT must default OFF"
+    );
+}
+
+#[test]
+fn marl_team_component_balanced_only_suppresses_single_team_ticks() {
+    // A single-team tick: only the home team logged a sample (e.g. a drained deferred goal-chain
+    // credit trained apart from its 22-player cohort). The opponent mean is undefined.
+    let mut home_only = SoccerMarlTickReward::default();
+    home_only.record(Team::Home, 30.0);
+
+    // Legacy (unbalanced) behaviour: opponent mean defaults to 0.0, so the "zero-sum" term leaks
+    // the full one-sided reward — this is the bias being hardened against.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false),
+        30.0,
+        "unbalanced term leaks own reward when the opponent is absent"
+    );
+    // Balanced: a single-team tick contributes no centralized team component.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, true),
+        0.0,
+        "balanced term suppresses single-team ticks"
+    );
+}
+
+#[test]
+fn marl_team_component_unchanged_when_both_teams_present() {
+    // Both teams logged samples this tick: the team component is the genuine zero-sum difference and
+    // the balanced flag must NOT change it.
+    let mut both = SoccerMarlTickReward::default();
+    both.record(Team::Home, 4.0);
+    both.record(Team::Home, 2.0); // home mean 3.0
+    both.record(Team::Away, 1.0); // away mean 1.0
+    let unbalanced = soccer_marl_team_component(both, Team::Home, false);
+    let balanced = soccer_marl_team_component(both, Team::Home, true);
+    assert!((unbalanced - 2.0).abs() < 1e-9, "home_mean - away_mean = 3 - 1");
+    assert_eq!(unbalanced, balanced, "balanced flag is a no-op when both teams are present");
+    // Antisymmetric across teams (genuinely zero-sum) when both are present.
+    assert!((soccer_marl_team_component(both, Team::Away, true) + balanced).abs() < 1e-9);
+}
