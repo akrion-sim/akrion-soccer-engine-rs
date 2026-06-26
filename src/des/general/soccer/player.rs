@@ -2471,6 +2471,26 @@ impl PlayerAgent {
         (a1 - a0) / dt_seconds
     }
 
+    /// THE single point where additive per-tick aerobic `fatigue` is applied: one clamp
+    /// policy, one place to audit and tune the whole fatigue budget. Every additive
+    /// contributor funnels through here (this resolves audit finding #2 — fatigue was written
+    /// from five scattered sites with independent clamps and no overview):
+    ///   • locomotion gait cost — `MovementGait::fatigue_delta`, charged on the movement tick
+    ///     in `SoccerMatch::move_player_towards`. Run/sprint deplete; walk/stand RECOVER, so
+    ///     `delta` is signed (can be negative).
+    ///   • rotation cost — `actual_turn * YAW_ENERGY_FATIGUE_PER_RAD` (this fn).
+    ///   • ball-involvement cost — `BALL_INVOLVEMENT_FATIGUE_PER_SECOND` within the 12yd ball
+    ///     radius, scaled by gait intensity (this fn).
+    ///   • supra-CP aerobic bleed — the slice of above-critical-power work (this fn).
+    ///   • extra chase load — `SoccerMatch::add_extra_chase_fatigue` (event-driven).
+    ///   • period-break recovery — `SoccerMatch::start_new_period` (negative `Stand` delta).
+    /// (Half-time recovery is a MULTIPLICATIVE reset, not an additive delta, so it stays inline
+    /// in `SoccerMatch`.) `fatigue` is the slow aerobic channel; the fast anaerobic W′ battery
+    /// (`anaerobic_load`) is the SEPARATE channel updated only below in this function.
+    pub(crate) fn add_fatigue(&mut self, delta: f64) {
+        self.fatigue = (self.fatigue + delta).clamp(0.0, 1.0);
+    }
+
     pub(crate) fn update_body_orientation_dizziness_energy(
         &mut self,
         dt_seconds: f64,
@@ -2596,7 +2616,7 @@ impl PlayerAgent {
             } else {
                 0.0
             };
-        self.fatigue = (self.fatigue + rotation_fatigue + involvement_fatigue).clamp(0.0, 1.0);
+        self.add_fatigue(rotation_fatigue + involvement_fatigue);
 
         // Per-tick locomotion metabolic cost (J) for the wasted-energy reward. Computed
         // every tick from the same speed/forward-accel running model the W′ branch uses,
@@ -2638,8 +2658,7 @@ impl PlayerAgent {
                 let overshoot = demand - cp;
                 w_prime -= overshoot * dt;
                 let supra_cp_kj = overshoot * dt / 1000.0;
-                self.fatigue =
-                    (self.fatigue + supra_cp_kj * SUPRA_CP_AEROBIC_FATIGUE_PER_KJ).clamp(0.0, 1.0);
+                self.add_fatigue(supra_cp_kj * SUPRA_CP_AEROBIC_FATIGUE_PER_KJ);
             } else {
                 let mass_kg = player_weight_pounds(self.skills.weight_pounds) * KG_PER_POUND;
                 let restore = ((cp - demand) * ANAEROBIC_RECOVERY_GAIN)

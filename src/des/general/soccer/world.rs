@@ -3148,9 +3148,9 @@ impl SoccerMatch {
         let recovery_seconds = self.config.period_break_recovery_seconds.max(0.0);
         if recovery_seconds > 0.0 {
             for player in &mut self.players {
-                player.fatigue = (player.fatigue
-                    + MovementGait::Stand.fatigue_delta(player.skills.stamina, recovery_seconds))
-                .clamp(0.0, 1.0);
+                let recovery =
+                    MovementGait::Stand.fatigue_delta(player.skills.stamina, recovery_seconds);
+                player.add_fatigue(recovery);
             }
         }
         self.events.push(MatchEvent {
@@ -8940,7 +8940,7 @@ impl SoccerMatch {
         let reward_delta = reward_cost.max(0.0) * 0.001;
         let delta = ((load_delta + reward_delta) * stamina_resistance * fatigue_multiplier)
             .clamp(0.0, 0.003);
-        player.fatigue = (player.fatigue + delta).clamp(0.0, 1.0);
+        player.add_fatigue(delta);
     }
 
     fn record_possession_chase_stats(
@@ -12063,9 +12063,14 @@ impl SoccerMatch {
         // bypasses the heading-reversal lock so the change of direction is never
         // delayed; ordinary play keeps its directional momentum.
         let heading_emergency = chased || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD;
-        let fatigue_factor = fatigue_speed_factor(
+        // This is the ONLY site that also applies `anaerobic_speed_ceiling`, so under the
+        // aerobic/anaerobic split the W′-empty cliff is dropped from the fatigue factor here
+        // (it would otherwise double-count with the ceiling); the aerobic taper remains. OFF =
+        // the historical full factor. See `dd_soccer_enable_aerobic_anaerobic_speed_split`.
+        let fatigue_factor = fatigue_speed_factor_inner(
             self.players[player_id].skills.stamina,
             self.players[player_id].fatigue,
+            dd_soccer_enable_aerobic_anaerobic_speed_split(),
         );
         // Hard ceiling: a spent anaerobic battery (W′) sharply caps top-end
         // burst — when the reserve empties, the player simply can't reach top
@@ -12172,7 +12177,8 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
-        p.fatigue = (p.fatigue + gait.fatigue_delta(p.skills.stamina, dt)).clamp(0.0, 1.0);
+        let gait_fatigue = gait.fatigue_delta(p.skills.stamina, dt);
+        p.add_fatigue(gait_fatigue);
     }
 
     pub(crate) fn sync_held_ball_to_holder(&mut self) {

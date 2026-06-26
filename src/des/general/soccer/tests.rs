@@ -20631,6 +20631,48 @@ fn power_duration_ceiling_bounds_aerobic_and_anaerobic_ability() {
 }
 
 #[test]
+fn aerobic_anaerobic_speed_split_removes_the_duplicated_w_prime_cliff() {
+    // Below the old 0.78 knee the two branches are identical (the cliff is inert there): the
+    // gated change is byte-identical in normal play.
+    for &fatigue in &[0.0_f64, 0.3, 0.5, 0.77] {
+        let off = fatigue_speed_factor_inner(7.0, fatigue, false);
+        let on = fatigue_speed_factor_inner(7.0, fatigue, true);
+        assert!(
+            (off - on).abs() < 1e-12,
+            "below the knee the split must not change the factor: f={fatigue} off={off} on={on}"
+        );
+    }
+    // Past the knee, OFF carries the extra quadratic cliff; ON keeps only the aerobic taper,
+    // so ON is strictly faster (the cliff is gone) and stays a smooth linear taper.
+    let off_gassed = fatigue_speed_factor_inner(7.0, 1.0, false);
+    let on_gassed = fatigue_speed_factor_inner(7.0, 1.0, true);
+    assert!(
+        on_gassed > off_gassed,
+        "removing the cliff should not slow a deep-fatigue player further: on={on_gassed} off={off_gassed}"
+    );
+    // ON is a pure linear taper: the drop 0.5→0.77 equals 0.77→(0.77+0.27) by linearity.
+    let d_low = fatigue_speed_factor_inner(7.0, 0.50, true) - fatigue_speed_factor_inner(7.0, 0.77, true);
+    let d_high = fatigue_speed_factor_inner(7.0, 0.73, true) - fatigue_speed_factor_inner(7.0, 1.0, true);
+    assert!((d_low - d_high).abs() < 1e-9, "ON must be a single linear slope: {d_low} vs {d_high}");
+    // The W′-empty burst loss still exists — it just lives solely in `anaerobic_speed_ceiling`.
+    assert!(anaerobic_speed_ceiling(1.0) < 0.55);
+}
+
+#[test]
+fn add_fatigue_is_the_clamped_additive_chokepoint() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let p = &mut sim.players[0];
+    p.fatigue = 0.40;
+    p.add_fatigue(0.25);
+    assert!((p.fatigue - 0.65).abs() < 1e-12);
+    // Recovery (negative delta) is honoured; the result clamps at the [0,1] floor/ceiling.
+    p.add_fatigue(-1.0);
+    assert_eq!(p.fatigue, 0.0);
+    p.add_fatigue(5.0);
+    assert_eq!(p.fatigue, 1.0);
+}
+
+#[test]
 fn metabolic_power_converts_acceleration_to_metric_before_metric_cap() {
     let skills = SkillProfile {
         weight_pounds: 165.0,

@@ -56412,16 +56412,52 @@ fn loose_ball_time_advantage_bucket(value: f64) -> u8 {
     )
 }
 
+/// De-duplicate the W′-exhaustion speed cliff at the one site it actually double-counts. The
+/// quadratic "burst tank empty" cliff in `fatigue_speed_factor` (keyed off the slow aerobic
+/// `fatigue`) overlaps [`anaerobic_speed_ceiling`] (keyed off the W′ battery `anaerobic_load`)
+/// — but the two are MULTIPLIED only at the executed-speed site (`move_player_towards`), which
+/// is also the sole consumer of `anaerobic_speed_ceiling`. There a gassed player is slowed
+/// twice for one exhausted state. ON: that site drops the cliff (via `split == true`) so the
+/// W′-empty loss is applied ONCE, by `anaerobic_speed_ceiling`, leaving `fatigue_speed_factor`
+/// to contribute only its aerobic taper. The ~40 OTHER callers are opponent/teammate speed
+/// ESTIMATORS with no separate W′ term, so for them the cliff is a legitimate fatigue proxy
+/// (not a duplicate) and is left intact. `DD_SOCCER_ENABLE_AEROBIC_ANAEROBIC_SPEED_SPLIT=1`
+/// to enable; OFF is byte-identical. See the audit (finding #1).
+pub(crate) fn dd_soccer_enable_aerobic_anaerobic_speed_split() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AEROBIC_ANAEROBIC_SPEED_SPLIT").is_ok())
+}
+
+/// The full historical factor (aerobic taper + the deep-fatigue cliff), used everywhere except
+/// the executed-speed site. Estimators have no separate `anaerobic_speed_ceiling` term, so they
+/// keep the cliff as their sole gassed-proxy.
 fn fatigue_speed_factor(stamina: f64, fatigue: f64) -> f64 {
+    fatigue_speed_factor_inner(stamina, fatigue, false)
+}
+
+/// `split == false` is the historical factor (aerobic taper + the W′-mislabeled cliff).
+/// `split == true` keeps only the aerobic taper, leaving the W′-empty burst loss solely to
+/// [`anaerobic_speed_ceiling`] — used at the executed-speed site, which applies that ceiling.
+/// Pure (no env read) so both branches are directly testable.
+fn fatigue_speed_factor_inner(stamina: f64, fatigue: f64, split: bool) -> f64 {
     let cardio = ability01(stamina);
     let fatigue = fatigue.clamp(0.0, 1.0);
     // Aerobic taper: a gentle linear loss of pace as the player tires (the "all match"
     // critical-power regime).
     let base = 0.78 + 0.22 * cardio - fatigue * (0.18 + (1.0 - cardio) * 0.20);
+    if split {
+        // Executed-speed site only: `anaerobic_speed_ceiling` (keyed off the real W′ reserve)
+        // supplies the burst-empty cliff here, so applying it again off `fatigue` would
+        // double-count. Keep just the aerobic taper.
+        return base.clamp(0.30, 1.05);
+    }
     // Anaerobic reserve (W') exhaustion: past a high-fatigue knee the burst tank is empty,
     // so the player simply CANNOT reach top speed — a sharp drop (quadratic past the knee),
     // not the gentle aerobic taper. This is the hard ceiling, a player "hitting the wall";
     // a higher-stamina engine empties a touch later. Below the knee this is inert.
+    // NOTE: this duplicates the W′ ceiling in `anaerobic_speed_ceiling` but keyed off the
+    // wrong (aerobic) scalar — removed by `dd_soccer_enable_aerobic_anaerobic_speed_split`.
     let knee = ANAEROBIC_DEPLETION_KNEE + cardio * 0.06;
     let over_knee = ((fatigue - knee) / (1.0 - knee).max(1e-6)).clamp(0.0, 1.0);
     let depletion_drop = over_knee * over_knee * ANAEROBIC_DEPLETION_MAX_DROP;
