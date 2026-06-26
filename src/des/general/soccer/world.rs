@@ -33883,6 +33883,18 @@ impl WorldSnapshot {
         };
         let mut best = base.clamp_to_pitch(self.field_width, self.field_length);
         let mut best_score = f64::NEG_INFINITY;
+        // Multimodal run prediction (gated; OFF ⇒ never collects, argmax stands so
+        // the destination is byte-identical). When on, the scored candidate surface
+        // is captured so the chosen target can be a softmax blend of the argmax's
+        // spatial cluster (sub-grid smoothing that kills the grid-snap jitter)
+        // rather than the bare argmax cell — replacing the hard argmax with a
+        // weighted hypothesis set. Distinct alternative runs are preserved for
+        // cross-agent consumers via `run_hypotheses`.
+        let collect_run_modes = possession
+            && me.role != PlayerRole::Goalkeeper
+            && self.ball.holder != Some(player_id)
+            && multimodal_run_prediction_enabled();
+        let mut scored_candidates: Vec<(Vec2, f64)> = Vec::new();
         // Final-third directness: when the ball is advanced into the attacking
         // third, off-ball runners balance open space with a direct route to goal
         // (a receivable slip/channel), not just space and time on the ball.
@@ -34186,11 +34198,20 @@ impl WorldSnapshot {
                     - lane_position_penalty
                     - teammate_occupation_penalty
                     - line_shape_penalty;
+                if collect_run_modes && score.is_finite() {
+                    scored_candidates.push((p, score));
+                }
                 if score > best_score {
                     best = p;
                     best_score = score;
                 }
             }
+        }
+        // Multimodal blend (gated): smooth the argmax to sub-grid resolution over
+        // its own spatial cluster. No-op when off (empty `scored_candidates`) or
+        // when the argmax sits alone ⇒ byte-identical to the bare argmax.
+        if collect_run_modes {
+            best = blended_argmax_destination(&scored_candidates, best);
         }
         // Final safety: hold attacking players onside (forwards/mids, in
         // possession, not on a sanctioned in-behind run) so they never camp
