@@ -196,7 +196,8 @@ impl AttackSpacingTarget {
         } else {
             DEFAULT_ATTACK_SPACING_IDEAL_YARDS
         };
-        let min = (ideal - ATTACK_SPACING_BAND_MARGIN_YARDS).max(ATTACK_SPACING_ABS_MIN_YARDS - 0.5);
+        let min =
+            (ideal - ATTACK_SPACING_BAND_MARGIN_YARDS).max(ATTACK_SPACING_ABS_MIN_YARDS - 0.5);
         let max = ideal + ATTACK_SPACING_BAND_MARGIN_YARDS;
         AttackSpacingTarget { min, ideal, max }
     }
@@ -252,8 +253,8 @@ pub fn analytic_target_spacing(ctx: &AttackSpacingContext) -> f64 {
     // Compact, deep block ⇒ widen to stretch it. `def_spread` small and the block not
     // pressing high (centroid near/behind the ball) is the classic low block.
     let block_compactness = (1.0 - ctx.def_spread_yards / REF_SPREAD_YARDS).clamp(0.0, 1.0);
-    let block_deep = (1.0 - (ctx.def_centroid_fwd_from_ball / REF_FWD_YARDS).clamp(0.0, 1.0))
-        .clamp(0.0, 1.0);
+    let block_deep =
+        (1.0 - (ctx.def_centroid_fwd_from_ball / REF_FWD_YARDS).clamp(0.0, 1.0)).clamp(0.0, 1.0);
     ideal += block_compactness * block_deep * 1.2;
 
     // Locally crowded ⇒ widen the target so the crowded player vacates into space.
@@ -380,23 +381,31 @@ impl AttackSpacingHead {
             let (target_spacing, weight) = if s.reward > 0.0 {
                 (s.held_spacing_yards, s.reward.min(4.0))
             } else {
-                (DEFAULT_ATTACK_SPACING_IDEAL_YARDS, (-s.reward).min(4.0) * 0.25)
+                (
+                    DEFAULT_ATTACK_SPACING_IDEAL_YARDS,
+                    (-s.reward).min(4.0) * 0.25,
+                )
             };
             if weight <= 0.0 {
                 continue;
             }
-            let target = [target_spacing
-                .clamp(ATTACK_SPACING_ABS_MIN_YARDS, ATTACK_SPACING_ABS_MAX_YARDS)];
-            let result = self
-                .network
-                .train_sample_clipped(&x[..], &target, learning_rate * weight, 4.0);
+            let target = [
+                target_spacing.clamp(ATTACK_SPACING_ABS_MIN_YARDS, ATTACK_SPACING_ABS_MAX_YARDS)
+            ];
+            let result =
+                self.network
+                    .train_sample_clipped(&x[..], &target, learning_rate * weight, 4.0);
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -506,13 +515,14 @@ impl SoccerMatch {
                 if let Some((context, held)) = snapshot.attack_spacing_team_context(team) {
                     let territorial = territorial_advantage(snapshot, team);
                     if held.is_finite() && territorial.is_finite() {
-                        self.pending_attack_spacing.push(PendingAttackSpacingDecision {
-                            team,
-                            context,
-                            held_spacing_yards: held,
-                            decision_territorial: territorial,
-                            due_tick: tick + ATTACK_SPACING_REWARD_WINDOW_TICKS,
-                        });
+                        self.pending_attack_spacing
+                            .push(PendingAttackSpacingDecision {
+                                team,
+                                context,
+                                held_spacing_yards: held,
+                                decision_territorial: territorial,
+                                due_tick: tick + ATTACK_SPACING_REWARD_WINDOW_TICKS,
+                            });
                     }
                 }
             }
@@ -566,8 +576,16 @@ mod tests {
             "neutral seed ideal should be the 6.5yd default, got {ideal}"
         );
         let band = AttackSpacingTarget::from_ideal(ideal);
-        assert!((band.min - 5.0).abs() < 1e-9, "min should be 5, got {}", band.min);
-        assert!((band.max - 8.0).abs() < 1e-9, "max should be 8, got {}", band.max);
+        assert!(
+            (band.min - 5.0).abs() < 1e-9,
+            "min should be 5, got {}",
+            band.min
+        );
+        assert!(
+            (band.max - 8.0).abs() < 1e-9,
+            "max should be 8, got {}",
+            band.max
+        );
         assert_eq!(ctx.to_features().len(), ATTACK_SPACING_FEATURE_DIM);
     }
 
@@ -607,10 +625,22 @@ mod tests {
     #[test]
     fn spacing_score_rewards_in_band_and_punishes_crowd_and_isolation() {
         let band = AttackSpacingTarget::default_band(); // [5, 6.5, 8]
-        assert!((band.spacing_score(6.0) - 1.0).abs() < 1e-9, "in [min, ideal] is full reward");
-        assert!(band.spacing_score(7.5) > 0.5 && band.spacing_score(7.5) < 1.0, "tapers above ideal");
-        assert!(band.spacing_score(2.0) < 0.0, "crowding (occupying the same space) is punished");
-        assert!(band.spacing_score(20.0) < 0.0, "isolation (an unfilled hole) is punished");
+        assert!(
+            (band.spacing_score(6.0) - 1.0).abs() < 1e-9,
+            "in [min, ideal] is full reward"
+        );
+        assert!(
+            band.spacing_score(7.5) > 0.5 && band.spacing_score(7.5) < 1.0,
+            "tapers above ideal"
+        );
+        assert!(
+            band.spacing_score(2.0) < 0.0,
+            "crowding (occupying the same space) is punished"
+        );
+        assert!(
+            band.spacing_score(20.0) < 0.0,
+            "isolation (an unfilled hole) is punished"
+        );
         assert!(
             band.spacing_score(2.0) < band.spacing_score(4.5),
             "the closer the crowd, the worse"
@@ -628,7 +658,8 @@ mod tests {
         let with_head = resolve_attack_spacing_target(&ctx, Some(&head));
         // A seeded (untrained) head still yields a finite, in-range band.
         assert!(
-            (ATTACK_SPACING_ABS_MIN_YARDS..=ATTACK_SPACING_ABS_MAX_YARDS).contains(&with_head.ideal)
+            (ATTACK_SPACING_ABS_MIN_YARDS..=ATTACK_SPACING_ABS_MAX_YARDS)
+                .contains(&with_head.ideal)
         );
     }
 
@@ -636,7 +667,10 @@ mod tests {
     fn head_trains_toward_rewarded_spacing() {
         let head = AttackSpacingHead::new(7);
         let ctx = neutral_context();
-        assert!(head.predict(&ctx).is_some(), "a seeded head predicts a finite value");
+        assert!(
+            head.predict(&ctx).is_some(),
+            "a seeded head predicts a finite value"
+        );
 
         // A separable corpus: in this context, holding ~9yd earned territory (positive
         // reward); holding ~5yd lost it (negative). After training the head should pull
@@ -645,9 +679,17 @@ mod tests {
         let samples: Vec<AttackSpacingSample> = (0..96)
             .map(|i| {
                 if i % 2 == 0 {
-                    AttackSpacingSample { context: ctx, held_spacing_yards: 9.0, reward: 1.0 }
+                    AttackSpacingSample {
+                        context: ctx,
+                        held_spacing_yards: 9.0,
+                        reward: 1.0,
+                    }
                 } else {
-                    AttackSpacingSample { context: ctx, held_spacing_yards: 5.0, reward: -1.0 }
+                    AttackSpacingSample {
+                        context: ctx,
+                        held_spacing_yards: 5.0,
+                        reward: -1.0,
+                    }
                 }
             })
             .collect();

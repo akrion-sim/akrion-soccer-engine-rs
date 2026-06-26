@@ -231,9 +231,11 @@ fn open_pass_lane_situation_for_target(
     lane_blocker_signal: f64,
 ) -> OpenPassLaneSituation {
     let pressure = open_pass_lane_pressure_signal(observation)
-        .max(pressure_from_nearest_distance(
-            snapshot.nearest_opponent_distance_at(player.team, current),
-        ) * 0.88)
+        .max(
+            pressure_from_nearest_distance(
+                snapshot.nearest_opponent_distance_at(player.team, current),
+            ) * 0.88,
+        )
         .clamp(0.0, 1.0);
     let tracking = open_pass_lane_tracking_signal(snapshot, player.team, current, target);
     let extension = pressure
@@ -828,8 +830,7 @@ impl SkillProfile {
         } else {
             (weak_foot, strong_foot)
         };
-        let crossing_left =
-            (passing * 0.72 + first_touch * 0.18 + jitter(8, 0.9)).clamp(1.0, 10.0);
+        let crossing_left = (passing * 0.72 + first_touch * 0.18 + jitter(8, 0.9)).clamp(1.0, 10.0);
         let crossing_right =
             (passing * 0.76 + first_touch * 0.16 + jitter(9, 0.9)).clamp(1.0, 10.0);
         let strength = (role_bias.2 + jitter(10, 0.9)).clamp(1.0, 10.0);
@@ -848,8 +849,7 @@ impl SkillProfile {
             passing,
             passing_completion_rate: (passing * 0.86 + first_touch * 0.12 + jitter(15, 0.45))
                 .clamp(1.0, 10.0),
-            flair_passing: (passing * 0.58 + dribbling * 0.30 + jitter(16, 0.9))
-                .clamp(1.0, 10.0),
+            flair_passing: (passing * 0.58 + dribbling * 0.30 + jitter(16, 0.9)).clamp(1.0, 10.0),
             crossing_left,
             crossing_right,
             dribbling,
@@ -1179,7 +1179,12 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
 fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
     match label {
         "corner-flag-cross" | "flank-low-cross" | "flank-high-cross" => {
-            ability01(player.skills.crossing_left.max(player.skills.crossing_right)) * 0.58
+            ability01(
+                player
+                    .skills
+                    .crossing_left
+                    .max(player.skills.crossing_right),
+            ) * 0.58
                 + ability01(player.skills.passing_completion_rate) * 0.28
                 + ability01(player.skills.vision) * 0.14
         }
@@ -1188,15 +1193,8 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
                 + ability01(player.skills.first_touch) * 0.34
                 + ability01(player.skills.passing_completion_rate) * 0.24
         }
-        "wall-pass"
-        | "pass"
-        | "pass1"
-        | "first-time-pass"
-        | "killer-pass"
-        | "switch-play"
-        | "recycle-reset"
-        | "aerial-pass"
-        | "aerial-pass1" => {
+        "wall-pass" | "pass" | "pass1" | "first-time-pass" | "killer-pass" | "switch-play"
+        | "recycle-reset" | "aerial-pass" | "aerial-pass1" => {
             ability01(player.skills.passing_completion_rate) * 0.56
                 + ability01(player.skills.vision) * 0.28
                 + ability01(player.skills.first_touch) * 0.16
@@ -1237,12 +1235,14 @@ fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
     } else if distance <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
         1.0
     } else {
-        (1.0
-            - (distance - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
-                / SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS)
+        (1.0 - (distance - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
+            / SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS)
             .clamp(0.0, 1.0)
     };
-    let outlet_fit = (observation.best_forward_pass_receiver_openness.clamp(0.0, 1.0) * 0.38
+    let outlet_fit = (observation
+        .best_forward_pass_receiver_openness
+        .clamp(0.0, 1.0)
+        * 0.38
         + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.30
         + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.32)
         .clamp(0.0, 1.0);
@@ -1448,29 +1448,42 @@ fn mpc_execution_estimate_for_action(
         );
         let power = match label {
             "wall-pass" => WALL_PASS_GIVE_POWER + 0.20 * ability01(player.skills.passing),
-            "killer-pass" => 0.66
-                + 0.24
+            "killer-pass" => {
+                0.66 + 0.24
                     * ability01(player.skills.passing_completion_rate)
-                        .max(ability01(player.skills.vision)),
-            "switch-play" => 0.62
-                + 0.24
+                        .max(ability01(player.skills.vision))
+            }
+            "switch-play" => {
+                0.62 + 0.24
                     * ability01(player.skills.passing_completion_rate)
-                        .max(ability01(player.skills.flair_passing)),
+                        .max(ability01(player.skills.flair_passing))
+            }
             "recycle-reset" => 0.46 + 0.22 * ability01(player.skills.passing_completion_rate),
             "flank-low-cross" | "corner-flag-cross" => {
                 0.60 + 0.28
-                    * ability01(player.skills.crossing_left.max(player.skills.crossing_right))
-                        .max(ability01(player.skills.passing_completion_rate))
+                    * ability01(
+                        player
+                            .skills
+                            .crossing_left
+                            .max(player.skills.crossing_right),
+                    )
+                    .max(ability01(player.skills.passing_completion_rate))
             }
             "flank-high-cross" | "flick-on" => {
                 0.64 + 0.28
-                    * ability01(player.skills.crossing_left.max(player.skills.crossing_right))
-                        .max(ability01(player.skills.passing_completion_rate))
+                    * ability01(
+                        player
+                            .skills
+                            .crossing_left
+                            .max(player.skills.crossing_right),
+                    )
+                    .max(ability01(player.skills.passing_completion_rate))
             }
-            "surprise-pass" => 0.50
-                + 0.22
+            "surprise-pass" => {
+                0.50 + 0.22
                     * ability01(player.skills.passing_completion_rate)
-                        .max(ability01(player.skills.flair_passing)),
+                        .max(ability01(player.skills.flair_passing))
+            }
             _ => 0.58 + 0.32 * ability01(player.skills.passing_completion_rate),
         }
         .clamp(0.25, 1.0);
@@ -1531,7 +1544,10 @@ fn mpc_execution_estimate_for_action(
                 let moving_target_bonus = snapshot
                     .player_velocity(id)
                     .map(|velocity| {
-                        (velocity.y * player.team.attack_dir()).max(0.0).clamp(0.0, 7.0) / 7.0
+                        (velocity.y * player.team.attack_dir())
+                            .max(0.0)
+                            .clamp(0.0, 7.0)
+                            / 7.0
                     })
                     .unwrap_or(0.0);
                 (0.50
@@ -1667,8 +1683,7 @@ fn mpc_execution_estimate_for_action(
         } else {
             (0.72 + ball_context.body_mechanics_fit * 0.28).clamp(0.0, 1.0)
         };
-        let body_fit =
-            mechanics_fit * (0.76 + shot_mpc.qp_target_fit * 0.24).clamp(0.55, 1.0);
+        let body_fit = mechanics_fit * (0.76 + shot_mpc.qp_target_fit * 0.24).clamp(0.55, 1.0);
         estimate.execution_probability = ((0.04
             + frame_fit * 0.26
             + keeper_fit * 0.22
@@ -1698,32 +1713,33 @@ fn mpc_execution_estimate_for_action(
         } else {
             (0.45 + observation.yards_to_goal / 28.0).clamp(0.45, 2.2)
         };
-        estimate.recommended_spin_rps =
-            (estimate.recommended_curve_bend_yards / observation.yards_to_goal.max(1.0)
-                * shot_speed.max(1.0)
-                * 0.38)
-                .clamp(0.0, 8.0);
-        estimate.reselect_reason =
-            if first_time && ball_context.urgency >= 0.50 && ball_context.body_mechanics_fit <= 0.60
-            {
-                "mpc-ball-touch-window-closing"
-            } else if first_time && observation.first_time_shot_score < 0.20 {
-                "mpc-first-time-shot-low-contact"
-            } else if shot_mpc.qp_target_fit < 0.22 {
-                "mpc-shot-target-uncontrolled"
-            } else if observation.shot_block_probability
-                >= tunables().shooting.shot_block_bailout_max_probability
-            {
-                "mpc-shot-blocked"
-            } else if estimate.execution_probability
-                < tunables()
-                    .decision_mpc
-                    .reselect_min_ball_execution_probability
-            {
-                "mpc-shot-low-execution"
-            } else {
-                ""
-            };
+        estimate.recommended_spin_rps = (estimate.recommended_curve_bend_yards
+            / observation.yards_to_goal.max(1.0)
+            * shot_speed.max(1.0)
+            * 0.38)
+            .clamp(0.0, 8.0);
+        estimate.reselect_reason = if first_time
+            && ball_context.urgency >= 0.50
+            && ball_context.body_mechanics_fit <= 0.60
+        {
+            "mpc-ball-touch-window-closing"
+        } else if first_time && observation.first_time_shot_score < 0.20 {
+            "mpc-first-time-shot-low-contact"
+        } else if shot_mpc.qp_target_fit < 0.22 {
+            "mpc-shot-target-uncontrolled"
+        } else if observation.shot_block_probability
+            >= tunables().shooting.shot_block_bailout_max_probability
+        {
+            "mpc-shot-blocked"
+        } else if estimate.execution_probability
+            < tunables()
+                .decision_mpc
+                .reselect_min_ball_execution_probability
+        {
+            "mpc-shot-low-execution"
+        } else {
+            ""
+        };
         return estimate;
     }
 
@@ -2167,9 +2183,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
             execution_estimate.dribble_right_success_probability,
         ),
         mpc_recommended_speed_yps: finite_metric(execution_estimate.recommended_speed_yps),
-        mpc_recommended_angle_degrees: finite_metric(
-            execution_estimate.recommended_angle_degrees,
-        ),
+        mpc_recommended_angle_degrees: finite_metric(execution_estimate.recommended_angle_degrees),
         mpc_recommended_curve_bend_yards: finite_metric(
             execution_estimate.recommended_curve_bend_yards,
         ),
@@ -2424,9 +2438,7 @@ impl PlayerAgent {
                         clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2)
                     }
                     MovementGait::Run => clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2 * 0.80),
-                    MovementGait::Sprint => {
-                        clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2 * 0.55)
-                    }
+                    MovementGait::Sprint => clamp_dir_to_cone(ball_dir, move_dir, FRAC_PI_2 * 0.55),
                     MovementGait::BackWalk | MovementGait::BackJog | MovementGait::BackSkip => {
                         clamp_dir_to_cone(ball_dir, move_dir * -1.0, FRAC_PI_2)
                     }
@@ -2452,14 +2464,18 @@ impl PlayerAgent {
         let speed_frac = (self.velocity.len() / top_speed).clamp(0.0, 1.0);
         let max_yaw_rate = if ball_holder == Some(self.id) {
             POSSESSION_MAX_YAW_RATE_SLOW_RAD_S
-                - speed_frac * (POSSESSION_MAX_YAW_RATE_SLOW_RAD_S - POSSESSION_MAX_YAW_RATE_FAST_RAD_S)
+                - speed_frac
+                    * (POSSESSION_MAX_YAW_RATE_SLOW_RAD_S - POSSESSION_MAX_YAW_RATE_FAST_RAD_S)
         } else {
             OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S
                 - speed_frac * (OFF_BALL_MAX_YAW_RATE_SLOW_RAD_S - OFF_BALL_MAX_YAW_RATE_FAST_RAD_S)
         };
         let stopping_rate = (2.0 * MAX_BODY_YAW_ACCEL_RAD_S2 * delta.abs()).sqrt() * delta.signum();
         let target_rate = stopping_rate.clamp(-max_yaw_rate, max_yaw_rate);
-        let new_rate = target_rate.clamp(self.yaw_rate - max_rate_change, self.yaw_rate + max_rate_change);
+        let new_rate = target_rate.clamp(
+            self.yaw_rate - max_rate_change,
+            self.yaw_rate + max_rate_change,
+        );
         self.yaw_rate = new_rate;
         let proposed_turn = (new_rate * dt).clamp(
             -MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD,
@@ -2480,21 +2496,22 @@ impl PlayerAgent {
 
         let turn_rate = actual_turn.abs() / dt;
         let accrual = (turn_rate - COMFORT_YAW_RATE_RAD_S).max(0.0) * DIZZINESS_GAIN_PER_RAD * dt;
-        self.dizziness =
-            ((self.dizziness + accrual) * (1.0 - DIZZINESS_RECOVERY_PER_SECOND * dt).max(0.0))
-                .clamp(0.0, DIZZINESS_MAX);
+        self.dizziness = ((self.dizziness + accrual)
+            * (1.0 - DIZZINESS_RECOVERY_PER_SECOND * dt).max(0.0))
+        .clamp(0.0, DIZZINESS_MAX);
 
         let rotation_fatigue = actual_turn.abs() * YAW_ENERGY_FATIGUE_PER_RAD;
-        let involvement_fatigue = if self.position.distance(ball_position) <= BALL_INVOLVEMENT_RADIUS_YARDS {
-            let intensity = match self.movement_gait {
-                MovementGait::Sprint => 1.0,
-                MovementGait::Run => 0.7,
-                _ => 0.35,
+        let involvement_fatigue =
+            if self.position.distance(ball_position) <= BALL_INVOLVEMENT_RADIUS_YARDS {
+                let intensity = match self.movement_gait {
+                    MovementGait::Sprint => 1.0,
+                    MovementGait::Run => 0.7,
+                    _ => 0.35,
+                };
+                BALL_INVOLVEMENT_FATIGUE_PER_SECOND * intensity * dt
+            } else {
+                0.0
             };
-            BALL_INVOLVEMENT_FATIGUE_PER_SECOND * intensity * dt
-        } else {
-            0.0
-        };
         self.fatigue = (self.fatigue + rotation_fatigue + involvement_fatigue).clamp(0.0, 1.0);
 
         if dd_soccer_disable_power_duration_ceiling() {
@@ -2504,9 +2521,9 @@ impl PlayerAgent {
                 _ => 0.0,
             } * dt
                 + self.acceleration.len() * ANAEROBIC_ACCEL_LOAD_PER_YPS2 * dt;
-            self.anaerobic_load =
-                (self.anaerobic_load + burst_load - ANAEROBIC_RECOVERY_PER_SECOND * dt)
-                    .clamp(0.0, 1.0);
+            self.anaerobic_load = (self.anaerobic_load + burst_load
+                - ANAEROBIC_RECOVERY_PER_SECOND * dt)
+                .clamp(0.0, 1.0);
         } else {
             let cp = player_critical_power_w(&self.skills);
             let w_prime_max = player_anaerobic_capacity_j(&self.skills);
@@ -2693,8 +2710,7 @@ impl PlayerAgent {
                     let candidate =
                         raw_candidate.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
                     let actual_distance = current.distance(candidate);
-                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS
-                        ..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
+                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
                         .contains(&actual_distance)
                     {
                         continue;
@@ -2715,7 +2731,8 @@ impl PlayerAgent {
                     if carrier_step_forward < -OPEN_PASS_LANE_MAX_BACKWARD_STEP_YARDS {
                         continue;
                     }
-                    let opponent_space = snapshot.nearest_opponent_distance_at(self.team, candidate);
+                    let opponent_space =
+                        snapshot.nearest_opponent_distance_at(self.team, candidate);
                     if opponent_space < OPEN_PASS_LANE_MIN_CANDIDATE_OPPONENT_SPACE {
                         continue;
                     }
@@ -2737,8 +2754,10 @@ impl PlayerAgent {
                     let completion_gain =
                         candidate_eval.expected_completion - current_eval.expected_completion;
                     let risk_drop = current_eval.risk - candidate_eval.risk;
-                    let blocker_drop =
-                        current_eval.blockers.saturating_sub(candidate_eval.blockers) as f64;
+                    let blocker_drop = current_eval
+                        .blockers
+                        .saturating_sub(candidate_eval.blockers)
+                        as f64;
                     let materially_opens = candidate_eval.clear_now
                         && (!current_eval.clear_now
                             || blocker_drop >= 1.0
@@ -2756,24 +2775,23 @@ impl PlayerAgent {
                         continue;
                     }
 
-                    let distance_fit =
-                        if actual_distance <= OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS {
-                            (1.0 - (actual_distance - 2.4).abs() / 2.3).clamp(0.42, 1.0)
-                        } else {
-                            let extra = ((actual_distance - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
-                                / (OPEN_PASS_LANE_MAX_DRIBBLE_YARDS
-                                    - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
-                                    .max(1e-6))
-                            .clamp(0.0, 1.0);
-                            ((0.92 - extra * 0.20) * (0.70 + situation.extension * 0.36))
-                                .clamp(0.38, 0.98)
-                        };
+                    let distance_fit = if actual_distance <= OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS {
+                        (1.0 - (actual_distance - 2.4).abs() / 2.3).clamp(0.42, 1.0)
+                    } else {
+                        let extra = ((actual_distance - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                            / (OPEN_PASS_LANE_MAX_DRIBBLE_YARDS
+                                - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS)
+                                .max(1e-6))
+                        .clamp(0.0, 1.0);
+                        ((0.92 - extra * 0.20) * (0.70 + situation.extension * 0.36))
+                            .clamp(0.38, 0.98)
+                    };
                     let space_fit = (opponent_space / 7.0).clamp(0.0, 1.0);
                     let receiver_forward_fit = (receiver_forward / 26.0).clamp(0.0, 1.0);
-                    let receiver_backward_penalty =
-                        ((-receiver_forward).max(0.0) / OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS)
-                            .clamp(0.0, 1.0)
-                            * 0.08;
+                    let receiver_backward_penalty = ((-receiver_forward).max(0.0)
+                        / OPEN_PASS_LANE_MAX_BACKFIELD_RECEIVER_YARDS)
+                        .clamp(0.0, 1.0)
+                        * 0.08;
                     let long_touch_penalty =
                         (actual_distance - OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS).max(0.0)
                             * 0.055
@@ -2887,7 +2905,11 @@ impl PlayerAgent {
             .shooting_window_score_at(me_snapshot, current)
             .clamp(0.0, 1.0);
         let side_preference = if (current.x - keeper_position.x).abs() <= 0.75 {
-            if self.id % 2 == 0 { -1.0 } else { 1.0 }
+            if self.id % 2 == 0 {
+                -1.0
+            } else {
+                1.0
+            }
         } else {
             (current.x - keeper_position.x).signum()
         };
@@ -2938,7 +2960,8 @@ impl PlayerAgent {
                     if path_keeper_gap < ROUND_GOALKEEPER_MIN_PATH_KEEPER_GAP_YARDS {
                         continue;
                     }
-                    let opponent_space = snapshot.nearest_opponent_distance_at(self.team, candidate);
+                    let opponent_space =
+                        snapshot.nearest_opponent_distance_at(self.team, candidate);
                     if opponent_space < ROUND_GOALKEEPER_MIN_CANDIDATE_OPPONENT_SPACE {
                         continue;
                     }
@@ -2968,18 +2991,16 @@ impl PlayerAgent {
                         continue;
                     }
 
-                    let distance_fit =
-                        (1.0 - (actual_distance - 4.8).abs() / 4.8).clamp(0.38, 1.0);
-                    let depth_gain = (goalward_gain / ROUND_GOALKEEPER_MAX_DRIBBLE_YARDS)
-                        .clamp(0.0, 1.0);
+                    let distance_fit = (1.0 - (actual_distance - 4.8).abs() / 4.8).clamp(0.38, 1.0);
+                    let depth_gain =
+                        (goalward_gain / ROUND_GOALKEEPER_MAX_DRIBBLE_YARDS).clamp(0.0, 1.0);
                     let space_fit = (opponent_space / 7.0).clamp(0.0, 1.0);
                     let skill_fit = (ability01(self.skills.dribbling) * 0.64
                         + ability01(self.skills.first_touch) * 0.20
                         + ability01(self.skills.acceleration) * 0.16)
                         .clamp(0.0, 1.0);
                     let round_keeper_fit =
-                        (1.0 - (target_yards_to_goal - keeper_depth).abs() / 8.0)
-                            .clamp(0.0, 1.0);
+                        (1.0 - (target_yards_to_goal - keeper_depth).abs() / 8.0).clamp(0.0, 1.0);
                     let lane_clear_bonus =
                         if snapshot.clear_line(candidate, goal_center, self.team.other(), 1.35) {
                             0.06
@@ -3001,9 +3022,7 @@ impl PlayerAgent {
                         - teammate_penalty * 0.18
                         - (actual_distance - 6.0).max(0.0) * 0.018)
                         * distance_fit;
-                    if yards_to_goal >= ROUND_GOALKEEPER_LONG_SHOT_YARDS
-                        && window_gain >= 0.02
-                    {
+                    if yards_to_goal >= ROUND_GOALKEEPER_LONG_SHOT_YARDS && window_gain >= 0.02 {
                         score = score.max(0.88 + long_shot_need * 0.08);
                     }
                     if goal_attack_shot_blocks_alternatives(observation, self.role)
@@ -3016,7 +3035,8 @@ impl PlayerAgent {
                     if score <= 0.0 {
                         continue;
                     }
-                    let Some(touch) = open_pass_lane_touch_for_target(self.team, current, candidate)
+                    let Some(touch) =
+                        open_pass_lane_touch_for_target(self.team, current, candidate)
                     else {
                         continue;
                     };
@@ -3176,26 +3196,22 @@ impl PlayerAgent {
                     * shot_choice_learning.clamp(0.82, 1.24),
             )
             .max(close_shot_attempt * shot_choice_learning.clamp(0.88, 1.16))
-            .max(goal_proximity_shot_pressure_floor(
-                observation,
-                self.role,
-                shooting,
-            ) * shot_choice_learning.clamp(0.88, 1.16))
-            .max(attacking_goal_pressure_shot_attempt_probability(
-                observation,
-                self.role,
-                shooting,
-            ) * shot_choice_learning.clamp(0.88, 1.16))
-            .max(speculative_long_shot_attempt_probability(
-                observation,
-                self.role,
-                shooting,
-            ) * shot_choice_learning)
-            .max(contested_final_third_shot_attempt_probability(
-                observation,
-                self.role,
-                shooting,
-            ) * shot_choice_learning)
+            .max(
+                goal_proximity_shot_pressure_floor(observation, self.role, shooting)
+                    * shot_choice_learning.clamp(0.88, 1.16),
+            )
+            .max(
+                attacking_goal_pressure_shot_attempt_probability(observation, self.role, shooting)
+                    * shot_choice_learning.clamp(0.88, 1.16),
+            )
+            .max(
+                speculative_long_shot_attempt_probability(observation, self.role, shooting)
+                    * shot_choice_learning,
+            )
+            .max(
+                contested_final_third_shot_attempt_probability(observation, self.role, shooting)
+                    * shot_choice_learning,
+            )
             .max(striker_shot_bonus * shot_choice_learning.clamp(0.88, 1.16))
             .max(if goal_attack_shot_blocks_alternatives {
                 0.99 * shot_choice_learning.clamp(0.90, 1.10)
@@ -3303,8 +3319,7 @@ impl PlayerAgent {
             .max(open_support_fit * 0.72)
             .clamp(0.0, 1.0);
         let bad_escape_outlet_fit = (1.0 - good_escape_outlet_fit).clamp(0.0, 1.0);
-        let steal_risk_escape_lift =
-            (steal_pressure * bad_escape_outlet_fit).clamp(0.0, 1.0);
+        let steal_risk_escape_lift = (steal_pressure * bad_escape_outlet_fit).clamp(0.0, 1.0);
         let steal_risk_good_outlet_pass_lift = (1.0
             + steal_pressure * good_escape_outlet_fit * STEAL_RISK_GOOD_OUTLET_PASS_LIFT)
             .clamp(1.0, 1.90);
@@ -3334,7 +3349,9 @@ impl PlayerAgent {
         let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(observation.teammates_ahead);
         // How risky a dribble is right now: real pressure, a defender on top of the ball, or
         // a live chance of being dispossessed.
-        let dribble_risk = steal_pressure.max(observation.perceived_pressure).clamp(0.0, 1.0);
+        let dribble_risk = steal_pressure
+            .max(observation.perceived_pressure)
+            .clamp(0.0, 1.0);
         // Deep carriers pay an escalating penalty for dribbling while at risk; the three
         // most-forward players keep their full take-on appetite (fit = 1 ⇒ no damp).
         let deep_pressure_dribble_damp =
@@ -3444,7 +3461,7 @@ impl PlayerAgent {
                 + forward_space_fit * 0.26
                 + offensive_urgency * 0.16)
             * (1.0 + ability01(self.skills.acceleration) * 0.24))
-        .clamp(0.01, 1.60);
+            .clamp(0.01, 1.60);
         let carry_out_legal = observation.forward_dribble_space_yards >= 0.8
             && !goal_attack_shot_blocks_alternatives
             && !goalmouth_carry_forced;
@@ -3597,8 +3614,7 @@ impl PlayerAgent {
         // This keeps the one correct action (protect possession) above a panic pass into
         // traffic instead of collapsing with the carrier's dribble score. Collapses to ~0 in
         // open play (no steal risk / a real outlet), so normal possession is unaffected.
-        let pinned_shield_floor = (pressured_no_outlet_shield
-            .max(steal_risk_escape_lift)
+        let pinned_shield_floor = (pressured_no_outlet_shield.max(steal_risk_escape_lift)
             * PINNED_SHIELD_FLOOR_LIFT)
             .clamp(0.0, protect_ball_ceiling);
         let protect_ball_score = (dribble_score
@@ -3690,9 +3706,8 @@ impl PlayerAgent {
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, (0.66 + steal_escape_urgency * 0.32).clamp(0.66, 0.98));
-        let left_cut_score = (cut_score_base
-            * (0.82 + (left_room / 12.0).clamp(0.0, 1.0) * 0.28))
-            .clamp(0.01, 1.02);
+        let left_cut_score =
+            (cut_score_base * (0.82 + (left_room / 12.0).clamp(0.0, 1.0) * 0.28)).clamp(0.01, 1.02);
         let right_cut_score = (cut_score_base
             * (0.82 + (right_room / 12.0).clamp(0.0, 1.0) * 0.28))
             .clamp(0.01, 1.02);
@@ -3711,7 +3726,10 @@ impl PlayerAgent {
             * (0.52 + dribbling * 0.34 + flair * 0.30 + ability01(self.skills.first_touch) * 0.14)
             * calm_pass_focus
             * keeper_carry_under_pressure_damp)
-            .clamp(0.01, (0.42 + steal_escape_urgency * 0.24 + flair * 0.18).clamp(0.42, 0.84));
+            .clamp(
+                0.01,
+                (0.42 + steal_escape_urgency * 0.24 + flair * 0.18).clamp(0.42, 0.84),
+            );
         let feint_legal =
             observation.nearest_opponent_distance <= 5.2 && pressure_urgency.max(pressure) >= 0.34;
         // Feints are already pressure-gated (feint_legal). Keep the ceiling low so a
@@ -3942,13 +3960,13 @@ impl PlayerAgent {
             * pressured_release_multiplier
             * low_cross_multiplier)
             .clamp(0.01, 0.86)
-            .max(if byline_cross_release
-                && directive.flank_attack_policy.prefers_low_cross()
-            {
-                (0.90 + crossing * 0.08).clamp(0.90, 0.98)
-            } else {
-                0.0
-            });
+            .max(
+                if byline_cross_release && directive.flank_attack_policy.prefers_low_cross() {
+                    (0.90 + crossing * 0.08).clamp(0.90, 0.98)
+                } else {
+                    0.0
+                },
+            );
         options.push(AgentActionOptionTrace::new(
             "flank-low-cross",
             low_cross_score,
@@ -3982,13 +4000,13 @@ impl PlayerAgent {
             * pressured_release_multiplier
             * high_cross_multiplier)
             .clamp(0.01, 0.78)
-            .max(if byline_cross_release
-                && directive.flank_attack_policy.prefers_high_cross()
-            {
-                (0.90 + crossing * 0.08).clamp(0.90, 0.98)
-            } else {
-                0.0
-            });
+            .max(
+                if byline_cross_release && directive.flank_attack_policy.prefers_high_cross() {
+                    (0.90 + crossing * 0.08).clamp(0.90, 0.98)
+                } else {
+                    0.0
+                },
+            );
         options.push(AgentActionOptionTrace::new(
             "flank-high-cross",
             high_cross_score,
@@ -4000,7 +4018,7 @@ impl PlayerAgent {
                 + flank_lane_fit * 0.18
                 + goal_attack * 0.12
                 + directive.flank_overlap_run_probability * 0.10))
-        .clamp(0.01, 0.96);
+            .clamp(0.01, 0.96);
         options.push(AgentActionOptionTrace::new(
             "corner-flag-cross",
             corner_flag_cross_score,
@@ -4019,7 +4037,7 @@ impl PlayerAgent {
             * floor_pass_patience_multiplier
             * hold_release_multiplier
             * pressured_release_multiplier)
-        .clamp(0.01, 0.84);
+            .clamp(0.01, 0.84);
         options.push(AgentActionOptionTrace::new(
             "surprise-pass",
             surprise_pass_score,
@@ -4041,12 +4059,18 @@ impl PlayerAgent {
                 + aerial_duel_skill_from_agent(self) * 0.22)
             * (0.72
                 + observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.18
-                + observation.best_aerial_pass_receiver_openness.clamp(0.0, 1.0) * 0.18
-                + observation.aerial_forward_runner_pass_multiplier.clamp(1.0, 1.50) * 0.10)
+                + observation
+                    .best_aerial_pass_receiver_openness
+                    .clamp(0.0, 1.0)
+                    * 0.18
+                + observation
+                    .aerial_forward_runner_pass_multiplier
+                    .clamp(1.0, 1.50)
+                    * 0.10)
             * aerial_pass_patience_multiplier
             * aerial_forward_runner_multiplier
             * pressured_release_multiplier)
-        .clamp(0.01, 0.88);
+            .clamp(0.01, 0.88);
         options.push(AgentActionOptionTrace::new(
             "flick-on",
             flick_on_score,
@@ -4114,7 +4138,7 @@ impl PlayerAgent {
             * hold_release_multiplier
             * crowded_pass_lift
             * pressured_release_multiplier)
-        .clamp(0.01, 1.68 * goal_entry_pass_learning.clamp(0.86, 1.20));
+            .clamp(0.01, 1.68 * goal_entry_pass_learning.clamp(0.86, 1.20));
         options.push(AgentActionOptionTrace::new(
             "killer-pass",
             killer_pass_score,
@@ -4125,10 +4149,7 @@ impl PlayerAgent {
                 .pass_and_move_forward_opportunity
                 .clamp(0.0, 1.0)
                 * 0.24
-            + observation
-                .pass_and_move_numbers_advantage
-                .clamp(0.0, 1.0)
-                * 0.16
+            + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.16
             + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.10)
             .clamp(1.0, 1.50);
         for rank in 0..pass_target_count.min(3) {
@@ -4182,12 +4203,14 @@ impl PlayerAgent {
         }
         // An over-the-top flick-on is the committed maneuver — actively prize the early
         // aerial ball into the target man so he can flick it on to the runner beyond.
-        let aerial_flick_strategy_multiplier =
-            if matches!(directive.attack_strategy, TeamAttackStrategy::AerialFlickOnRelease) {
-                1.35
-            } else {
-                1.0
-            };
+        let aerial_flick_strategy_multiplier = if matches!(
+            directive.attack_strategy,
+            TeamAttackStrategy::AerialFlickOnRelease
+        ) {
+            1.35
+        } else {
+            1.0
+        };
         for rank in 0..aerial_pass_target_count.min(3) {
             let rank_weight = match rank {
                 0 => 0.82,
@@ -4325,11 +4348,7 @@ impl PlayerAgent {
                 + pressured_release_signal * 0.10
                 + open_forward_outlet * 0.08)
                 .clamp(0.34, 0.76);
-            ensure_min_legal_option_probability(
-                &mut options,
-                "pass1",
-                short_forward_release_floor,
-            );
+            ensure_min_legal_option_probability(&mut options, "pass1", short_forward_release_floor);
         }
         if pass_target_count > 0
             && observation.pass_and_move_forward_opportunity >= 0.35
@@ -4340,10 +4359,7 @@ impl PlayerAgent {
                     .pass_and_move_forward_opportunity
                     .clamp(0.0, 1.0)
                     * 0.32
-                + observation
-                    .pass_and_move_numbers_advantage
-                    .clamp(0.0, 1.0)
-                    * 0.16
+                + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.16
                 + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.10)
                 .clamp(0.34, 0.74);
             ensure_min_legal_option_probability(&mut options, "pass1", pass_and_move_floor);
@@ -4426,8 +4442,7 @@ impl PlayerAgent {
                 + offensive_urgency * 0.06
                 + goal_attack * 0.05)
                 * release_pressure_carry_fit
-                * pressure_escape_progression_lift
-                .clamp(0.0, 0.54);
+                * pressure_escape_progression_lift.clamp(0.0, 0.54);
             ensure_min_legal_option_probability(&mut options, "carry-forward", progression_floor);
         }
         // Won the ball with clear space ahead: DRIVE into it. MDP/POMDP elects the forward-drive
@@ -4600,8 +4615,12 @@ impl PlayerAgent {
         let one_touch_pass_blocked = pass_feasibility < ONE_TOUCH_VETO_FEASIBILITY;
         //  (2) FIELD-CONFIGURATION fit — does the whole-field shape (vector/embeddings/LP)
         //      support a first-time pass/shot here, vs. settling first? A softer multiplier.
-        let pass_field_fit = observation.first_time_pass_field_feasibility.clamp(0.0, 1.0);
-        let shot_field_fit = observation.first_time_shot_field_feasibility.clamp(0.0, 1.0);
+        let pass_field_fit = observation
+            .first_time_pass_field_feasibility
+            .clamp(0.0, 1.0);
+        let shot_field_fit = observation
+            .first_time_shot_field_feasibility
+            .clamp(0.0, 1.0);
         let shape_prior = observation.first_touch_shape_prior.clamp(0.0, 1.0);
         let pass_field_multiplier =
             (0.72 + pass_field_fit * 0.30 + shape_prior * 0.08).clamp(0.46, 1.10);
@@ -4611,8 +4630,7 @@ impl PlayerAgent {
             (1.0 + (1.0 - pass_field_fit.max(shot_field_fit)) * 0.18).clamp(1.0, 1.18);
         let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
         let first_time_forward_pass_multiplier =
-            (1.0 + short_upfield_ground_pass_fit * (0.26 + pass_field_fit * 0.20))
-                .clamp(1.0, 1.46);
+            (1.0 + short_upfield_ground_pass_fit * (0.26 + pass_field_fit * 0.20)).clamp(1.0, 1.46);
         let killer_pressure = observation
             .killer_pass_goal_pressure
             .max(killer_pass_goal_pressure_score(observation))
@@ -4675,7 +4693,7 @@ impl PlayerAgent {
                         + ability01(self.skills.flair_passing) * 0.18
                         + aerial_duel_skill_from_agent(self) * 0.18)
                     * pass_feasibility_gate)
-                .clamp(0.0, 0.82),
+                    .clamp(0.0, 0.82),
                 flick_on_legal,
             ),
             AgentActionOptionTrace::new(
@@ -4826,7 +4844,10 @@ impl PlayerAgent {
             if holder_id == self.id {
                 return None;
             }
-            let holder = snapshot.players.iter().find(|player| player.id == holder_id)?;
+            let holder = snapshot
+                .players
+                .iter()
+                .find(|player| player.id == holder_id)?;
             if holder.team != self.team || !snapshot.player_can_see_player(self.id, holder.id) {
                 return None;
             }
@@ -4841,9 +4862,9 @@ impl PlayerAgent {
                 let distance_fit = ((distance - SUPPORT_HOLDER_CLEAR_LANE_START_DISTANCE_YARDS)
                     / 10.0)
                     .clamp(0.0, 1.0);
-                let pressure_relief =
-                    (1.0 - holder_pressure_urgency / PRESSURED_SUPPORT_SPRINT_URGENCY.max(1e-6))
-                        .clamp(0.0, 1.0);
+                let pressure_relief = (1.0
+                    - holder_pressure_urgency / PRESSURED_SUPPORT_SPRINT_URGENCY.max(1e-6))
+                .clamp(0.0, 1.0);
                 distance_fit * pressure_relief
             })
             .unwrap_or(0.0);
@@ -4913,8 +4934,13 @@ impl PlayerAgent {
             ));
         }
         if let Some(target) = special_targets.in_behind {
-            let target =
-                snapshot.shape_guarded_support_point(self.id, target, &[], self.home_position, false);
+            let target = snapshot.shape_guarded_support_point(
+                self.id,
+                target,
+                &[],
+                self.home_position,
+                false,
+            );
             options.push(AgentActionOptionTrace::new(
                 "run-in-behind",
                 special_score(
@@ -5110,7 +5136,7 @@ impl PlayerAgent {
                 }
                 + directive.flank_overlap_run_probability * 0.12
                 + holder_pressure_urgency * 0.08)
-            .clamp(0.42, 0.68);
+                .clamp(0.42, 0.68);
             if self.role == PlayerRole::Forward {
                 scale_legal_option_score(&mut options, "overlap-run", 0.34);
             }
@@ -5129,7 +5155,14 @@ impl PlayerAgent {
                 + strategy_floor
                 + shape_support_urgency * 0.10
                 + holder_pressure_urgency * 0.12)
-                .clamp(0.26, if exploit_space_strategy_active { 0.66 } else { 0.54 });
+                .clamp(
+                    0.26,
+                    if exploit_space_strategy_active {
+                        0.66
+                    } else {
+                        0.54
+                    },
+                );
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", exploit_floor);
         }
         if options
@@ -5144,12 +5177,12 @@ impl PlayerAgent {
             .clamp(0.18, 0.50);
             ensure_min_legal_option_probability(&mut options, "wide-outlet", wide_floor);
             if width_shortage > 0.0 {
-                let support_shape_multiplier =
-                    (1.0 - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING)
-                        .clamp(0.76, 1.0);
-                let support_roam_multiplier =
-                    (1.0 - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING * 0.55)
-                        .clamp(0.84, 1.0);
+                let support_shape_multiplier = (1.0
+                    - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING)
+                    .clamp(0.76, 1.0);
+                let support_roam_multiplier = (1.0
+                    - width_shortage * WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING * 0.55)
+                    .clamp(0.84, 1.0);
                 scale_legal_option_score(&mut options, "support-shape", support_shape_multiplier);
                 scale_legal_option_score(&mut options, "support-roam", support_roam_multiplier);
             }
@@ -5261,7 +5294,10 @@ impl PlayerAgent {
                 }
                 SupportSummonKind::AssumePosition => {
                     // "Take up your position" — find the open passing lane / settle into the slot.
-                    if options.iter().any(|o| o.legal && o.label == "check-to-ball") {
+                    if options
+                        .iter()
+                        .any(|o| o.legal && o.label == "check-to-ball")
+                    {
                         ensure_min_legal_option_probability(
                             &mut options,
                             "check-to-ball",
@@ -5441,18 +5477,17 @@ impl PlayerAgent {
         if urgency < SLIDE_TACKLE_MIN_COMMIT_URGENCY {
             return None;
         }
-        let commit01 =
-            ((urgency - SLIDE_TACKLE_MIN_COMMIT_URGENCY) / CARRIER_ADVANCE_STEAL_BOOST).clamp(0.0, 1.0);
+        let commit01 = ((urgency - SLIDE_TACKLE_MIN_COMMIT_URGENCY) / CARRIER_ADVANCE_STEAL_BOOST)
+            .clamp(0.0, 1.0);
         if commit01 <= 0.0 {
             return None;
         }
         let defending = ability01(self.skills.defending);
         let aggression = ability01(self.skills.aggression);
         let directive = snapshot.tactical_directive(self.team);
-        let appetite = ((defending * 0.34 + aggression * 0.50)
-            * directive.press_intensity
-            * commit01)
-            .clamp(0.0, SLIDE_TACKLE_MAX_DECISION_PROBABILITY);
+        let appetite =
+            ((defending * 0.34 + aggression * 0.50) * directive.press_intensity * commit01)
+                .clamp(0.0, SLIDE_TACKLE_MAX_DECISION_PROBABILITY);
         (appetite > 0.0).then_some((holder_id, appetite))
     }
 
@@ -5907,7 +5942,8 @@ impl PlayerAgent {
         };
         let left_room_fit = (left_room / 16.0).clamp(0.0, 1.0);
         let right_room_fit = (right_room / 16.0).clamp(0.0, 1.0);
-        let nearest_pressure = pressure_from_nearest_distance(observation.nearest_opponent_distance);
+        let nearest_pressure =
+            pressure_from_nearest_distance(observation.nearest_opponent_distance);
         let pressure = observation
             .perceived_pressure
             .max(observation.pressure_urgency)
@@ -6220,7 +6256,9 @@ impl PlayerAgent {
     ) -> PlayerIntent {
         if let SoccerAction::MoveTo(target) = intent.action {
             let distance = self.position.distance(target);
-            let lane_interceptor = snapshot.on_path_ball_intercept_target_for(self.id).is_some();
+            let lane_interceptor = snapshot
+                .on_path_ball_intercept_target_for(self.id)
+                .is_some();
             let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
             let moving_ball_to_attack =
                 snapshot.ball.velocity.len() >= COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS;
@@ -6242,11 +6280,7 @@ impl PlayerAgent {
         intent
     }
 
-    fn rolling_ball_arrival_time_to_target(
-        &self,
-        snapshot: &WorldSnapshot,
-        target: Vec2,
-    ) -> f64 {
+    fn rolling_ball_arrival_time_to_target(&self, snapshot: &WorldSnapshot, target: Vec2) -> f64 {
         let speed = snapshot.ball.velocity.len();
         if speed <= REACTIVE_GROUND_PASS_NUMERIC_EPSILON {
             return f64::INFINITY;
@@ -6288,12 +6322,12 @@ impl PlayerAgent {
         let run_on_target = snapshot
             .projected_loose_ball_target()
             .unwrap_or(early_control_target);
-        if run_on_target.distance(early_control_target) <= POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS
+        if run_on_target.distance(early_control_target)
+            <= POMDP_BALL_CONTROL_LET_RUN_MIN_AHEAD_YARDS
         {
             return early_control_target;
         }
-        let ball_arrival =
-            self.rolling_ball_arrival_time_to_target(snapshot, early_control_target);
+        let ball_arrival = self.rolling_ball_arrival_time_to_target(snapshot, early_control_target);
         if !ball_arrival.is_finite() {
             return early_control_target;
         }
@@ -6349,7 +6383,8 @@ impl PlayerAgent {
         }
 
         let intent = self.committed_chaser_sprint_guarantee(snapshot, intent);
-        let live_ball_attacker = snapshot.is_live_ball_attacker_for_movement_guards(intent.player_id);
+        let live_ball_attacker =
+            snapshot.is_live_ball_attacker_for_movement_guards(intent.player_id);
 
         let mut intent = intent;
         if !dd_soccer_disable_anti_bunch() {
@@ -6779,7 +6814,8 @@ impl PlayerAgent {
                 let to_me = self.position - snapshot.ball.position;
                 let d = to_me.len();
                 d > 1e-6
-                    && snapshot.ball.velocity.dot(to_me * (1.0 / d)) >= LOOSE_BALL_POUNCE_CLOSING_YPS
+                    && snapshot.ball.velocity.dot(to_me * (1.0 / d))
+                        >= LOOSE_BALL_POUNCE_CLOSING_YPS
             };
             let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
             if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS || approaching || fifty_fifty_duel)
@@ -6798,8 +6834,13 @@ impl PlayerAgent {
                         delta.dot(delta) < my_distance_sq
                     })
                     .count();
-                let options =
-                    self.loose_ball_action_options(my_distance, closer_teammates, true, fifty_fifty_duel, true);
+                let options = self.loose_ball_action_options(
+                    my_distance,
+                    closer_teammates,
+                    true,
+                    fifty_fifty_duel,
+                    true,
+                );
                 // The decision LABEL stays "recover" (the loose-ball recovery move), but the
                 // leading operation reflects the contest type — an explicit "fifty-fifty-duel"
                 // when both teams are right on it, else the ordinary "recover" pursuit.
@@ -6868,8 +6909,8 @@ impl PlayerAgent {
                 let handling_held_seconds = snapshot.keeper_handling_held_seconds(self.id);
                 let handling_hold_window =
                     handling_held_seconds.is_some_and(|held| held < GK_HANDLING_HOLD_LIMIT_SECONDS);
-                let handling_clock_expired =
-                    handling_held_seconds.is_some_and(|held| held >= GK_HANDLING_HOLD_LIMIT_SECONDS);
+                let handling_clock_expired = handling_held_seconds
+                    .is_some_and(|held| held >= GK_HANDLING_HOLD_LIMIT_SECONDS);
                 let under_urgent_pressure = observation.nearest_opponent_distance.is_finite()
                     && observation.nearest_opponent_distance
                         <= GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS;
@@ -6913,11 +6954,10 @@ impl PlayerAgent {
                                 | "recycle-reset"
                         )
                     ) && release_intelligent;
-                    let learned_keeper_hold_requested = matches!(
-                        learned_action_label,
-                        Some("keeper-survey-hands")
-                    ) && can_use_hands_here
-                        && !handling_clock_expired;
+                    let learned_keeper_hold_requested =
+                        matches!(learned_action_label, Some("keeper-survey-hands"))
+                            && can_use_hands_here
+                            && !handling_clock_expired;
                     if !learned_keeper_hold_requested
                         && (outside_box_release
                             || in_box_pass_release
@@ -7166,9 +7206,7 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
-                            order_names.push(format!(
-                                "first-touch-mpc-reselect:{candidate_label}"
-                            ));
+                            order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
                         chosen = Some((candidate_action, candidate_label));
@@ -7191,9 +7229,8 @@ impl PlayerAgent {
                                 &candidate_action,
                                 &candidate_label,
                             ) {
-                                order_names.push(format!(
-                                    "first-touch-mpc-reselect:{candidate_label}"
-                                ));
+                                order_names
+                                    .push(format!("first-touch-mpc-reselect:{candidate_label}"));
                                 continue;
                             }
                             chosen = Some((candidate_action, candidate_label));
@@ -7214,9 +7251,7 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
-                            order_names.push(format!(
-                                "first-touch-mpc-reselect:{candidate_label}"
-                            ));
+                            order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
                         chosen = Some((candidate_action, candidate_label));
@@ -7239,9 +7274,7 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
-                            order_names.push(format!(
-                                "first-touch-mpc-reselect:{candidate_label}"
-                            ));
+                            order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
                         chosen = Some((candidate_action, candidate_label));
@@ -7411,8 +7444,14 @@ impl PlayerAgent {
             if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
                 let outside_mid_takeon = observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
                 let outside_mid_attack_defender = outside_mid_takeon >= 0.55;
-                let appetite = (0.15 + 0.60 * plan.quality + 0.24 * outside_mid_takeon)
-                    .clamp(0.05, if outside_mid_attack_defender { 0.96 } else { 0.85 });
+                let appetite = (0.15 + 0.60 * plan.quality + 0.24 * outside_mid_takeon).clamp(
+                    0.05,
+                    if outside_mid_attack_defender {
+                        0.96
+                    } else {
+                        0.85
+                    },
+                );
                 if soccer_force_runaround_commit()
                     || agentic_action_commitment(
                         appetite,
@@ -7566,7 +7605,8 @@ impl PlayerAgent {
         }
 
         if !has_ball {
-            if let Some((target, sprint)) = snapshot.controllable_ground_pass_trajectory_for(self.id)
+            if let Some((target, sprint)) =
+                snapshot.controllable_ground_pass_trajectory_for(self.id)
             {
                 let action = SoccerAction::MoveTo(target);
                 self.last_decision = Some(self.decision_trace(
@@ -7872,17 +7912,29 @@ impl PlayerAgent {
                     true,
                 ));
             }
-            let runaround_dribble_option = snapshot.runaround_dribble_option_for(self.id).map(|plan| {
-                let outside_mid_takeon = observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
-                let appetite = (0.18 + plan.quality * 0.58 + outside_mid_takeon * 0.28)
-                    .clamp(0.05, if outside_mid_takeon >= 0.55 { 0.97 } else { 0.86 });
-                let strategy_commits = outside_mid_takeon >= 0.75 && plan.quality >= 0.60;
-                (plan, appetite, strategy_commits)
-            });
+            let runaround_dribble_option =
+                snapshot.runaround_dribble_option_for(self.id).map(|plan| {
+                    let outside_mid_takeon =
+                        observation.outside_mid_takeon_isolation.clamp(0.0, 1.0);
+                    let appetite = (0.18 + plan.quality * 0.58 + outside_mid_takeon * 0.28).clamp(
+                        0.05,
+                        if outside_mid_takeon >= 0.55 {
+                            0.97
+                        } else {
+                            0.86
+                        },
+                    );
+                    let strategy_commits = outside_mid_takeon >= 0.75 && plan.quality >= 0.60;
+                    (plan, appetite, strategy_commits)
+                });
             if let Some((_, appetite, strategy_commits)) = runaround_dribble_option {
                 action_options.push(AgentActionOptionTrace::new(
                     "runaround-dribble",
-                    if strategy_commits { appetite.max(1.0) } else { appetite },
+                    if strategy_commits {
+                        appetite.max(1.0)
+                    } else {
+                        appetite
+                    },
                     true,
                 ));
             }
@@ -7988,7 +8040,9 @@ impl PlayerAgent {
                 if !decisive_on {
                     let patience = low_pressure_patience_factor(&observation);
                     let calm = ((1.0
-                        - observation.pressure_urgency.max(observation.perceived_pressure))
+                        - observation
+                            .pressure_urgency
+                            .max(observation.perceived_pressure))
                         * (1.0 - pressure_rising_signal(&observation)))
                     .clamp(0.0, 1.0);
                     let appetite = (HOLD_FOR_SUPPORT_BASE_APPETITE
@@ -8387,10 +8441,7 @@ impl PlayerAgent {
                             break;
                         }
                     }
-                    "carry-forward"
-                    | "carry-out-left"
-                    | "carry-out-right"
-                    | "protect-ball" => {
+                    "carry-forward" | "carry-out-left" | "carry-out-right" | "protect-ball" => {
                         let kind = match op.as_str() {
                             "carry-forward" => DribbleMoveKind::CarryForward,
                             "carry-out-left" => DribbleMoveKind::CarryOutLeft,
@@ -8777,7 +8828,8 @@ impl PlayerAgent {
                                         power: 0.66
                                             + 0.24
                                                 * passing_skill.max(ability01(self.skills.vision)),
-                                        flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
+                                        flight: snapshot
+                                            .killer_pass_flight_for(self.id, &pass_targets),
                                     },
                                     "killer-pass".to_string(),
                                 ));
@@ -8860,8 +8912,7 @@ impl PlayerAgent {
                     }
                     "surprise-pass" => {
                         order_names.push("surprise-pass".to_string());
-                        let surprise_chance =
-                            action_option_score(&action_options, "surprise-pass");
+                        let surprise_chance = action_option_score(&action_options, "surprise-pass");
                         if let Some(target) = pass_targets.first().copied() {
                             if agentic_action_commitment(
                                 surprise_chance,
@@ -8940,8 +8991,7 @@ impl PlayerAgent {
                     "wait-for-support" => {
                         order_names.push("wait-for-support".to_string());
                         if let Some(plan) = hold_for_support_option.as_ref() {
-                            let chance =
-                                action_option_score(&action_options, "wait-for-support");
+                            let chance = action_option_score(&action_options, "wait-for-support");
                             if agentic_action_commitment(
                                 chance,
                                 snapshot.dt_seconds,
@@ -9351,7 +9401,8 @@ impl PlayerAgent {
                                                 + 0.24
                                                     * passing_skill
                                                         .max(ability01(self.skills.vision)),
-                                            flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
+                                            flight: snapshot
+                                                .killer_pass_flight_for(self.id, &pass_targets),
                                         },
                                         "killer-pass".to_string(),
                                     )
@@ -9454,22 +9505,19 @@ impl PlayerAgent {
                                     "scoop-pass".to_string(),
                                 )
                             }),
-                            "surprise-pass" => pass_targets
-                                .first()
-                                .copied()
-                                .map(|target| {
-                                    (
-                                        SoccerAction::Pass {
-                                            target_player: Some(target),
-                                            power: 0.50
-                                                + 0.22
-                                                    * passing_skill
-                                                        .max(ability01(self.skills.flair_passing)),
-                                            flight: PassFlight::Floor,
-                                        },
-                                        "surprise-pass".to_string(),
-                                    )
-                                }),
+                            "surprise-pass" => pass_targets.first().copied().map(|target| {
+                                (
+                                    SoccerAction::Pass {
+                                        target_player: Some(target),
+                                        power: 0.50
+                                            + 0.22
+                                                * passing_skill
+                                                    .max(ability01(self.skills.flair_passing)),
+                                        flight: PassFlight::Floor,
+                                    },
+                                    "surprise-pass".to_string(),
+                                )
+                            }),
                             "flick-on" => aerial_pass_targets.first().copied().map(|target| {
                                 (
                                     SoccerAction::Pass {
@@ -9485,8 +9533,8 @@ impl PlayerAgent {
                             }),
                             "vertical-attack" | "turnover-burst" => {
                                 let kind = DribbleMoveKind::CarryForward;
-                                let touch =
-                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
                                 Some((
                                     SoccerAction::DribbleMove {
                                         target: snapshot.dribble_move_target_for_touch(
@@ -9528,8 +9576,8 @@ impl PlayerAgent {
                                     false,
                                     true,
                                 );
-                                let touch =
-                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
                                 Some((
                                     SoccerAction::DribbleMove {
                                         target: snapshot.dribble_move_target_for_touch(
@@ -9555,8 +9603,8 @@ impl PlayerAgent {
                                 };
                                 let kind =
                                     goal_approach_dribble_kind(kind, &observation, self.role);
-                                let touch =
-                                    snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                                let touch = snapshot
+                                    .deterministic_dribble_touch_decision_for(self.id, kind);
                                 Some((
                                     SoccerAction::DribbleMove {
                                         target: snapshot.dribble_move_target_for_touch(
@@ -9765,12 +9813,14 @@ impl PlayerAgent {
                             action_label: "run-in-behind",
                         }
                     }),
-                    "exploit-space-run" => support_context.special_targets.exploit_space.map(|point| {
-                        SupportMovementTarget {
-                            point: guarded_support_special(point),
-                            action_label: "exploit-space-run",
-                        }
-                    }),
+                    "exploit-space-run" => {
+                        support_context.special_targets.exploit_space.map(|point| {
+                            SupportMovementTarget {
+                                point: guarded_support_special(point),
+                                action_label: "exploit-space-run",
+                            }
+                        })
+                    }
                     "wide-outlet" => support_context.special_targets.wide_outlet.map(|point| {
                         SupportMovementTarget {
                             point: guarded_support_special(point),
@@ -9849,7 +9899,10 @@ impl PlayerAgent {
             action_options =
                 self.defensive_action_options(snapshot, &directive, snapshot.dt_seconds);
             let mut defensive_weighted_ops = vec![
-                ("tackle".to_string(), action_option_score(&action_options, "tackle")),
+                (
+                    "tackle".to_string(),
+                    action_option_score(&action_options, "tackle"),
+                ),
                 (
                     "defend-shape".to_string(),
                     action_option_score(&action_options, "defend-shape"),
@@ -9998,7 +10051,10 @@ impl PlayerAgent {
                 closer_teammates,
                 goalkeeper_can_recover,
                 fifty_fifty_duel,
-                snapshot.loose_ball_attack_profile_for(self.id).attack_candidate >= 0.65,
+                snapshot
+                    .loose_ball_attack_profile_for(self.id)
+                    .attack_candidate
+                    >= 0.65,
             );
             let loose_order = agentic_action_order(
                 loose_options
@@ -10017,10 +10073,15 @@ impl PlayerAgent {
             // 1–3yd off the lane while it deferred to a team-mate and held shape. `loose_ball_target`
             // already resolves to the lane cut-point for such a player.
             let lane_interceptor = self.role != PlayerRole::Goalkeeper
-                && snapshot.on_path_ball_intercept_target_for(self.id).is_some();
+                && snapshot
+                    .on_path_ball_intercept_target_for(self.id)
+                    .is_some();
             let should_recover = lane_interceptor
                 || fifty_fifty_duel
-                || snapshot.loose_ball_attack_profile_for(self.id).attack_candidate >= 0.65
+                || snapshot
+                    .loose_ball_attack_profile_for(self.id)
+                    .attack_candidate
+                    >= 0.65
                 || action_option_score(&loose_options, "recover") > 0.0;
             if should_recover {
                 action_options = loose_options;
@@ -10044,10 +10105,7 @@ impl PlayerAgent {
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
                             <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
-                (
-                    SoccerAction::MoveTo(movement_target),
-                    "recover".to_string(),
-                )
+                (SoccerAction::MoveTo(movement_target), "recover".to_string())
             } else if let Some((support_target, sprint)) =
                 snapshot.aerial_attacking_support_intent_for(self.id, self.home_position)
             {
@@ -10223,9 +10281,8 @@ impl PlayerAgent {
                                 target_player: Some(target),
                                 power: 0.62
                                     + 0.28
-                                        * crossing.max(ability01(
-                                            self.skills.passing_completion_rate,
-                                        )),
+                                        * crossing
+                                            .max(ability01(self.skills.passing_completion_rate)),
                                 flight: PassFlight::Floor,
                             },
                             "corner-flag-cross".to_string(),
@@ -10688,8 +10745,7 @@ impl PlayerAgent {
                         0.0,
                     );
                     let dynamic_max_yards = open_pass_lane_dynamic_max_dribble_yards(situation);
-                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS
-                        ..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
+                    if !(OPEN_PASS_LANE_MIN_DRIBBLE_YARDS..=OPEN_PASS_LANE_MAX_DRIBBLE_YARDS + 1e-6)
                         .contains(&step_distance)
                         || step_distance > dynamic_max_yards + 1e-6
                         || forward < -OPEN_PASS_LANE_MAX_BACKWARD_STEP_YARDS
@@ -10865,12 +10921,12 @@ impl PlayerAgent {
                 )
             }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
-                let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, true);
+                let assignment =
+                    snapshot.defensive_assignment_for(self.id, self.home_position, true);
                 Some((
-                    SoccerAction::MoveTo(snapshot.goal_side_defensive_target_for(
-                        self.id,
-                        assignment,
-                    )),
+                    SoccerAction::MoveTo(
+                        snapshot.goal_side_defensive_target_for(self.id, assignment),
+                    ),
                     "press-cover".to_string(),
                 ))
             }
@@ -11021,8 +11077,7 @@ impl PlayerAgent {
                 return None;
             }
             let backward_yards = (-forward).max(0.0);
-            let short_reset_fit =
-                (1.0 - (backward_yards - 4.0).abs() / 4.0).clamp(0.0, 1.0);
+            let short_reset_fit = (1.0 - (backward_yards - 4.0).abs() / 4.0).clamp(0.0, 1.0);
             Some(short_reset_fit + (1.0 - distance / 10.0).clamp(0.0, 1.0) * 0.35)
         };
         if preferred.is_some_and(|target| score(target).is_some()) {
