@@ -414,6 +414,7 @@ fn pomdp_observation_carries_previous_tick_decision_state() {
     let observation = after.observation_for(player_id);
     let carryover = observation
         .previous_tick_carryover
+        .as_ref()
         .expect("previous run_time_step decision should be visible");
     let decision = sim.players[player_id]
         .last_decision
@@ -441,6 +442,42 @@ fn pomdp_observation_carries_previous_tick_decision_state() {
     assert_eq!(
         carryover.chosen_action_mpc_feasibility, 1.0,
         "no MPC comparison should be neutral, not an infeasibility signal"
+    );
+    assert_eq!(carryover.commitment_ticks.last().copied(), Some(carryover.decision_tick));
+    assert_eq!(carryover.recent_commitment_count_7_ticks, 1);
+    assert_eq!(carryover.ticks_since_commitment, carryover.age_ticks);
+    assert!(
+        carryover.decision_cadence_switch_locked,
+        "the next observation should know a fresh commitment is still inside the 3-tick reaction lock"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: after.tick,
+        player_id,
+        team: sim.players[player_id].team,
+        role: sim.players[player_id].role,
+        state: decision.mdp_state.clone(),
+        observation: observation.clone(),
+        belief: decision.belief.clone(),
+        action: decision.action.clone(),
+        action_target: decision.action_target.clone(),
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: after.mdp_state_for_player(player_id),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE],
+        0.5,
+        "one recent commitment should occupy half of the two-in-seven-ticks cadence budget"
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED],
+        1.0,
+        "neural learners should see that a strategy switch is currently cadence-locked"
     );
 }
 
@@ -477,6 +514,10 @@ fn player_tick_carryover_marks_stale_decisions_and_clears_on_restart_reset() {
     assert!(
         stale.age_ticks > first.age_ticks,
         "age_ticks should reveal that the carried decision is stale"
+    );
+    assert!(
+        stale.ticks_since_commitment > first.ticks_since_commitment,
+        "skipped players should still age their active decision commitment"
     );
 
     sim.start_new_period(2, Team::Away);
@@ -18026,57 +18067,7 @@ fn defensive_line_cushion_suspends_band_inside_own_twenty_yards() {
 }
 
 #[test]
-fn defensive_line_cushion_holds_six_yard_line_inside_emergency_zone_in_open_play() {
-    // Even with the ball deep inside our own 5-yard emergency zone, in OPEN PLAY with a COLLECTABLE
-    // (loose, grounded) ball the back four no longer sinks to parity on the goal-line: one team-mate
-    // collects the ball while the rest hold the 6-yard line as a flat offside trap. Here the back
-    // four sits on the goal-line (y=1) with a loose ball at y=4; the nearest defender collects, and
-    // a FAR defender's target is pulled UP to the 6-yard line. (A ball the OPPONENT controls / a
-    // cross in flight is NOT collectable and is covered by a separate drop-and-defend path.)
-    let mut sim = SoccerMatch::default_11v11(MatchConfig {
-        duration_seconds: 0.1,
-        seed: 22,
-        ..Default::default()
-    });
-    let home_def: Vec<usize> = sim
-        .players
-        .iter()
-        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
-        .map(|p| p.id)
-        .collect();
-    assert_eq!(home_def.len(), 4, "test needs a back four");
-
-    for &d in &home_def {
-        sim.players[d].position = Vec2::new(30.0, 1.0);
-    }
-    // The nearest defender to the loose ball is the collector (exempt); the tested defender sits
-    // far across the pitch so it is purely a line-holder.
-    sim.players[home_def[0]].position = Vec2::new(52.0, 1.0);
-    sim.players[home_def[1]].position = Vec2::new(8.0, 1.0);
-    // Loose, grounded ball deep in our box — no holder (collectable open play).
-    sim.ball.holder = None;
-    sim.ball.position = Vec2::new(55.0, 4.0);
-    sim.ball.velocity = Vec2::zero();
-    sim.ball.altitude_yards = 0.0;
-    sim.ball.last_touch_team = Some(Team::Away);
-
-    let snap = WorldSnapshot::from_match(&sim);
-    let deep_target = Vec2::new(sim.players[home_def[1]].position.x, 1.0);
-    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_target);
-    assert!(
-        adjusted.y >= 5.0 && adjusted.y <= 8.0,
-        "open play in the emergency zone with a collectable ball: hold the 6-yard line, not parity \
-         on the goal-line: target={adjusted:?}"
-    );
-}
-
-#[test]
-fn defensive_line_cushion_holds_six_yard_line_in_open_play() {
-    // In open play the back four must NOT retreat onto its own goal-line: the 6-yard line is the
-    // effective end-line. Home defends y=0. Stage the ball in open play just outside the 5-yard
-    // emergency zone (y=15) and the whole back four sunk deep toward the goal-line (y=2). The band
-    // average would otherwise sit on the goal-line; the six-yard floor pulls the line up so the
-    // AVERAGE target settles on the 6-yard line.
+fn defensive_line_cushion_pulls_open_play_average_to_six_yards_inside_goal_line_zone() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 22,
@@ -18097,28 +18088,38 @@ fn defensive_line_cushion_holds_six_yard_line_in_open_play() {
     assert_eq!(home_def.len(), 4, "test needs a back four");
 
     for &d in &home_def {
-        sim.players[d].position = Vec2::new(30.0, 2.0);
+        sim.players[d].position = Vec2::new(30.0, 4.0);
     }
-    // Opponent holds the ball in open play, outside our 5-yard emergency zone.
-    sim.players[away_id].position = Vec2::new(40.0, 15.0);
+    sim.players[away_id].position = Vec2::new(40.0, 4.0);
     sim.ball.holder = Some(away_id);
-    sim.ball.position = Vec2::new(40.0, 15.0);
+    sim.ball.position = sim.players[away_id].position;
     sim.ball.velocity = Vec2::zero();
     sim.ball.altitude_yards = 0.0;
     sim.ball.last_touch_team = Some(Team::Away);
 
     let snap = WorldSnapshot::from_match(&sim);
-    // A deep target on the goal-line is pulled UP to the 6-yard line (the line average floor).
-    let deep_target = Vec2::new(30.0, 2.0);
-    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], deep_target);
+    let parity = Vec2::new(sim.players[home_def[1]].position.x, sim.ball.position.y);
+    let adjusted = snap.defensive_line_cushion_adjusted_target(home_def[1], parity);
+    let adjusted_average_depth = home_def
+        .iter()
+        .map(|&defender| {
+            let parity = Vec2::new(sim.players[defender].position.x, sim.ball.position.y);
+            let target = snap.defensive_line_cushion_adjusted_target(defender, parity);
+            snap.depth_from_own_goal_y(Team::Home, target.y)
+        })
+        .sum::<f64>()
+        / home_def.len() as f64;
     assert!(
-        adjusted.y >= 5.0 && adjusted.y <= 8.0,
-        "open play: the back four holds the 6-yard line, not the goal-line: target={adjusted:?}"
+        adjusted.y > parity.y + 0.25,
+        "open-play back four should begin moving away from the endline toward the six-yard average: target={adjusted:?} parity={parity:?}"
     );
     assert!(
-        adjusted.y > deep_target.y + 2.0,
-        "the deep goal-line target should be pulled forward toward the 6-yard line: \
-         target={adjusted:?} deep={deep_target:?}"
+        adjusted_average_depth >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
+        "open-play back-four target average should reach the six-yard line: average_depth={adjusted_average_depth}"
+    );
+    assert!(
+        adjusted_average_depth <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS + 1e-9,
+        "six-yard stickiness should preserve the unit average without over-retreat: average_depth={adjusted_average_depth}"
     );
 }
 
@@ -42475,9 +42476,14 @@ fn defenders_cover_flank_cross_arrival_lanes_goal_side() {
             "defensive assignment should carry the cross coverage through role clamps: assignment={assignment:?} zone={zone:?} arrival={arrival:?}"
         );
     assert!(
-            assignment.y > zone.y,
-            "defender should drop goal-side toward the cross lane when the ball is at the endline: assignment={assignment:?} zone={zone:?}"
-        );
+        snapshot.depth_from_own_goal_y(Team::Away, assignment.y)
+            >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
+        "open-play cross coverage should still respect the six-yard defensive line: assignment={assignment:?}"
+    );
+    assert!(
+        assignment.y <= zone.y + 1e-9,
+        "open-play cross coverage should not retreat past the six-yard line toward the endline: assignment={assignment:?} zone={zone:?}"
+    );
 }
 
 #[test]
@@ -50671,7 +50677,7 @@ fn midfielders_only_sometimes_drop_to_ten_yards_when_ball_is_inside_fifteen() {
 }
 
 #[test]
-fn defenders_can_collapse_to_goal_line_when_ball_is_inside_six_yards() {
+fn defenders_target_six_yard_line_in_open_play_when_ball_is_inside_six_yards() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
     let holder = 17;
@@ -50688,9 +50694,93 @@ fn defenders_can_collapse_to_goal_line_when_ball_is_inside_six_yards() {
         snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
 
     assert!(
-            target.y <= 0.25,
-            "defenders should be allowed all the way onto the goal line when the ball is inside six yards: target={target:?}"
+            target.y >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
+            "open-play defenders should target the six-yard line instead of the endline when the ball is inside six yards: target={target:?}"
         );
+    assert!(
+        target.y <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS + 1.25,
+        "open-play six-yard stickiness should settle near the six-yard line: target={target:?}"
+    );
+}
+
+#[test]
+fn back_four_target_average_stays_on_six_yard_line_when_one_defender_collects() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defenders = [1usize, 2, 3, 4];
+    let holder = 17;
+    park_players_except(&mut sim, &[1, 2, 3, 4, holder]);
+    for (rank, defender) in defenders.iter().copied().enumerate() {
+        let position = Vec2::new(24.0 + rank as f64 * 10.0, 1.0);
+        sim.players[defender].position = position;
+        sim.players[defender].home_position = position;
+        sim.players[defender].velocity = Vec2::zero();
+        sim.players[defender].acceleration = Vec2::zero();
+    }
+    sim.players[holder].position = Vec2::new(42.0, 3.25);
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[holder].acceleration = Vec2::zero();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let targets: Vec<Vec2> = defenders
+        .iter()
+        .map(|&defender| {
+            snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false)
+        })
+        .collect();
+    let average_depth = targets
+        .iter()
+        .map(|target| snapshot.depth_from_own_goal_y(Team::Home, target.y))
+        .sum::<f64>()
+        / targets.len() as f64;
+
+    assert!(
+        average_depth >= DEFENSIVE_GOAL_LINE_BUFFER_YARDS - 1e-9,
+        "open-play back-four target average should recover to the six-yard line even if one defender collects: average_depth={average_depth} targets={targets:?}"
+    );
+    assert!(
+        average_depth <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS + 1.25,
+        "six-yard stickiness should not turn into a large over-retreat: average_depth={average_depth} targets={targets:?}"
+    );
+}
+
+#[test]
+fn set_play_defenders_can_still_collapse_to_goal_line_when_ball_is_inside_six_yards() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let holder = 17;
+    park_players_except(&mut sim, &[defender, holder]);
+    sim.players[defender].position = Vec2::new(48.0, 24.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.players[holder].position = Vec2::new(36.0, 5.5);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+    sim.active_set_play = Some(SoccerSetPlayCall {
+        team: Team::Away,
+        restart: "corner-kick".to_string(),
+        routine: SoccerSetPlayRoutineKind::CornerFarPost,
+        started_tick: 0,
+        started_clock_seconds: 0.0,
+        expires_tick: 180,
+        expires_clock_seconds: 18.0,
+        assignments: Vec::new(),
+        release_kind: SoccerSetPlayReleaseKind::Pass,
+        release_player: None,
+        release_power: 0.0,
+        vector_hint: None,
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let target = snapshot.goal_side_defensive_target_for(defender, Vec2::new(60.0, 0.5));
+
+    assert!(
+        target.y <= 0.25,
+        "set-play defending may still collapse onto the true goal line: target={target:?}"
+    );
 }
 
 #[test]
@@ -60855,6 +60945,65 @@ fn pressured_attacker_escape_prioritizes_forward_lane_when_safe() {
     assert!(
         target.distance(marker_position) > origin.distance(marker_position) + 2.0,
         "forward escape must still accelerate away from the closest defender: origin={origin:?} target={target:?} marker={marker_position:?}"
+    );
+}
+
+#[test]
+fn stationary_unpressured_holder_carries_upfield_into_open_space() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[holder].skills.dribbling = 7.8;
+    sim.players[holder].skills.first_touch = 7.8;
+    sim.players[holder].skills.acceleration = 8.2;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let touch = DribbleTouchDecision::new(0, 1.0);
+    assert!(
+        snapshot.forward_dribble_space_yards(holder) >= WON_BALL_DRIVE_MIN_SPACE_YARDS,
+        "test setup should leave open grass in front of the carrier"
+    );
+    let corrected = snapshot
+        .stationary_holder_open_space_carry_target_for(
+            holder,
+            origin,
+            Some(DribbleMoveKind::ProtectBall),
+            Some(touch),
+        )
+        .expect("a stationary, calm holder with open grass should get an upfield carry target");
+    assert!(
+        (corrected.y - origin.y) * Team::Home.attack_dir() >= 2.0,
+        "corrected target should turn a static shield into a real upfield carry: origin={origin:?} target={corrected:?}"
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: holder,
+        action: SoccerAction::DribbleMove {
+            target: origin,
+            kind: DribbleMoveKind::ProtectBall,
+            touch,
+        },
+        sprint: false,
+    });
+
+    assert!(
+        (sim.players[holder].position.y - origin.y) * Team::Home.attack_dir() > 0.0,
+        "holder body should start moving upfield instead of standing on the ball: before={origin:?} after={:?}",
+        sim.players[holder].position
+    );
+    assert!(
+        (sim.ball.position.y - origin.y) * Team::Home.attack_dir() > 0.5,
+        "carried ball should be led into space, not left dead at the feet: before={origin:?} ball={:?}",
+        sim.ball.position
     );
 }
 

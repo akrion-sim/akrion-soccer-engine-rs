@@ -23,6 +23,10 @@ const TEAMMATE_LANE_GUARD_LATERAL_CLEARANCE_MARGIN_YARDS: f64 = 0.75;
 const TEAMMATE_LANE_GUARD_MARKING_RELIEF: f64 = 0.28;
 const TEAMMATE_LANE_GUARD_ONE_TWO_TARGET_EPSILON_YARDS: f64 = 1.0;
 const QUICK_HANDOFF_RELIEF_RADIUS_YARDS: f64 = 4.75;
+const STATIONARY_HOLDER_TARGET_EPSILON_YARDS: f64 = 0.72;
+const STATIONARY_HOLDER_CARRY_MAX_PRESSURE: f64 = 0.34;
+const STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS: f64 = 2.25;
+const STATIONARY_HOLDER_CARRY_TARGET_YARDS: f64 = 4.2;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -5672,9 +5676,8 @@ impl SoccerMatch {
             let Some(decision) = player.last_decision.as_ref() else {
                 continue;
             };
-            let same_action_ticks = self
-                .player_tick_carryover
-                .get(&player.id)
+            let previous_carryover = self.player_tick_carryover.get(&player.id);
+            let same_action_ticks = previous_carryover
                 .filter(|previous| {
                     normalize_soccer_action_label(&previous.action)
                         == normalize_soccer_action_label(&decision.action)
@@ -5682,51 +5685,59 @@ impl SoccerMatch {
                 .map(|previous| previous.same_action_ticks.saturating_add(1))
                 .unwrap_or(1);
             let decision_tick = decision.mdp_state.tick;
-            let observation = &decision.observation;
-            self.player_tick_carryover.insert(
-                player.id,
-                SoccerPlayerTickCarryover {
-                    player_id: player.id,
-                    decision_tick,
-                    observed_at_tick: self.tick,
-                    age_ticks: self.tick.saturating_sub(decision_tick),
-                    clock_seconds: self.clock_seconds,
-                    action: decision.action.clone(),
-                    action_target: decision.action_target.clone(),
-                    mdp_phase: decision.mdp_state.phase,
-                    mdp_ball_grid: decision.mdp_state.ball_grid,
-                    mdp_player_grid: decision.mdp_state.player_grid,
-                    mdp_receive_facing: decision.mdp_state.receive_facing,
-                    mdp_action_facing: decision.mdp_state.action_facing,
-                    pomdp_visible_ball: observation.visible_ball,
-                    pomdp_visible_teammates: observation.visible_teammates,
-                    pomdp_visible_opponents: observation.visible_opponents,
-                    pomdp_ball_position_confidence: finite_unit_interval(
-                        observation.ball_position_confidence,
-                    ),
-                    pomdp_teammate_position_confidence: finite_unit_interval(
-                        observation.teammate_position_confidence,
-                    ),
-                    pomdp_opponent_position_confidence: finite_unit_interval(
-                        observation.opponent_position_confidence,
-                    ),
-                    pomdp_perceived_pressure: finite_unit_interval(observation.perceived_pressure),
-                    pomdp_decision_urgency: finite_unit_interval(observation.decision_urgency),
-                    decision_confidence: finite_unit_interval(player.decision_confidence),
-                    mpc_guidance_present: decision.mdp_mpc_comparison.is_some(),
-                    chosen_action_mpc_feasibility: decision
-                        .mdp_mpc_comparison
-                        .as_ref()
-                        .map(|comparison| finite_unit_interval(comparison.mpc_execution_probability))
-                        .unwrap_or(1.0),
-                    mpc_comparison: decision.mdp_mpc_comparison.clone(),
-                    executed_position: player.position,
-                    executed_velocity: player.velocity,
-                    executed_acceleration: player.acceleration,
-                    has_ball_after_action: self.ball.holder == Some(player.id),
-                    same_action_ticks,
-                },
+            let commitment_ticks = soccer_decision_commitment_history_after_decision(
+                previous_carryover,
+                &decision.action,
+                decision_tick,
             );
+            let observation = &decision.observation;
+            let mut carryover = SoccerPlayerTickCarryover {
+                player_id: player.id,
+                decision_tick,
+                observed_at_tick: self.tick,
+                age_ticks: self.tick.saturating_sub(decision_tick),
+                clock_seconds: self.clock_seconds,
+                action: decision.action.clone(),
+                action_target: decision.action_target.clone(),
+                mdp_phase: decision.mdp_state.phase,
+                mdp_ball_grid: decision.mdp_state.ball_grid,
+                mdp_player_grid: decision.mdp_state.player_grid,
+                mdp_receive_facing: decision.mdp_state.receive_facing,
+                mdp_action_facing: decision.mdp_state.action_facing,
+                pomdp_visible_ball: observation.visible_ball,
+                pomdp_visible_teammates: observation.visible_teammates,
+                pomdp_visible_opponents: observation.visible_opponents,
+                pomdp_ball_position_confidence: finite_unit_interval(
+                    observation.ball_position_confidence,
+                ),
+                pomdp_teammate_position_confidence: finite_unit_interval(
+                    observation.teammate_position_confidence,
+                ),
+                pomdp_opponent_position_confidence: finite_unit_interval(
+                    observation.opponent_position_confidence,
+                ),
+                pomdp_perceived_pressure: finite_unit_interval(observation.perceived_pressure),
+                pomdp_decision_urgency: finite_unit_interval(observation.decision_urgency),
+                decision_confidence: finite_unit_interval(player.decision_confidence),
+                mpc_guidance_present: decision.mdp_mpc_comparison.is_some(),
+                chosen_action_mpc_feasibility: decision
+                    .mdp_mpc_comparison
+                    .as_ref()
+                    .map(|comparison| finite_unit_interval(comparison.mpc_execution_probability))
+                    .unwrap_or(1.0),
+                mpc_comparison: decision.mdp_mpc_comparison.clone(),
+                executed_position: player.position,
+                executed_velocity: player.velocity,
+                executed_acceleration: player.acceleration,
+                has_ball_after_action: self.ball.holder == Some(player.id),
+                same_action_ticks,
+                commitment_ticks,
+                ticks_since_commitment: 0,
+                recent_commitment_count_7_ticks: 0,
+                decision_cadence_switch_locked: false,
+            };
+            soccer_refresh_decision_commitment_cadence(&mut carryover, self.tick);
+            self.player_tick_carryover.insert(player.id, carryover);
         }
     }
 
@@ -8886,6 +8897,9 @@ impl SoccerMatch {
             .fold(f64::INFINITY, f64::min);
         let pressure = pressure_from_observation(&observation)
             .max(pressure_from_nearest_distance(nearest_pressure));
+        let target = snapshot
+            .stationary_holder_open_space_carry_target_for(player_id, target, kind, touch)
+            .unwrap_or(target);
         let dribble_dir = (target - player_pos).normalized();
         self.move_player_towards(player_id, target, sprint);
         if self.ball.holder == Some(player_id) {
@@ -20591,6 +20605,68 @@ impl WorldSnapshot {
         (self.ball.position.y - self.own_goal_y_for(team)).abs() <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS
     }
 
+    fn back_four_six_yard_line_sticky_active(&self, team: Team) -> bool {
+        self.active_set_play.is_none()
+            && self.controlled_possession_team() != Some(team)
+            && self.depth_from_own_goal_y(team, self.ball.position.y)
+                <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS
+    }
+
+    fn back_four_six_yard_line_collector_deficit_depth(&self, team: Team) -> (f64, usize) {
+        let mut deficit = 0.0;
+        let mut line_defenders = 0usize;
+        for defender in self
+            .players
+            .iter()
+            .filter(|player| player.team == team && player.role == PlayerRole::Defender)
+        {
+            let collector = self.ball.holder == Some(defender.id)
+                || self.is_live_ball_attacker_for_movement_guards(defender.id)
+                || self.defender_is_designated_ball_presser(defender);
+            if collector {
+                let depth =
+                    self.depth_from_own_goal_y(team, self.player_snapshot_position(defender).y);
+                deficit += (DEFENSIVE_GOAL_LINE_BUFFER_YARDS - depth).max(0.0);
+            } else {
+                line_defenders += 1;
+            }
+        }
+        (deficit, line_defenders)
+    }
+
+    fn back_four_six_yard_line_target_depth(&self, team: Team) -> f64 {
+        let (collector_deficit, line_defenders) =
+            self.back_four_six_yard_line_collector_deficit_depth(team);
+        if line_defenders == 0 {
+            DEFENSIVE_GOAL_LINE_BUFFER_YARDS
+        } else {
+            DEFENSIVE_GOAL_LINE_BUFFER_YARDS + collector_deficit / line_defenders as f64
+        }
+    }
+
+    fn back_four_six_yard_line_sticky_adjusted_y(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        baseline_seconds: f64,
+    ) -> Option<f64> {
+        if player.role != PlayerRole::Defender
+            || !self.back_four_six_yard_line_sticky_active(player.team)
+            || self.ball.holder == Some(player.id)
+            || self.is_live_ball_attacker_for_movement_guards(player.id)
+            || self.defender_is_designated_ball_presser(player)
+        {
+            return None;
+        }
+        let sticky_depth = self.back_four_six_yard_line_target_depth(player.team);
+        let six_y = self.y_from_own_goal_depth(player.team, sticky_depth);
+        let target = Vec2::new(target.x, target.y.clamp(0.0, self.field_length));
+        let six_target = Vec2::new(target.x, six_y);
+        let gain =
+            self.shape_consistency_gain_for_player_target(player, six_target, baseline_seconds);
+        Some((target.y + (six_y - target.y) * gain).clamp(0.0, self.field_length))
+    }
+
     pub(crate) fn depth_from_own_goal_y(&self, team: Team, y: f64) -> f64 {
         ((y - self.own_goal_y_for(team)) * team.attack_dir()).clamp(0.0, self.field_length)
     }
@@ -20687,8 +20763,13 @@ impl WorldSnapshot {
         match player.role {
             PlayerRole::Goalkeeper => 0.0,
             PlayerRole::Defender => {
-                if ball_depth <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS {
-                    // Ball is on the goal line / behind them — drop in to defend it.
+                if self.back_four_six_yard_line_sticky_active(player.team) {
+                    // In open play the six-yard line is the deepest steady-state back-four line:
+                    // the actual players may be inside it briefly, but targets pull them out over
+                    // the 3s consistency window.
+                    DEFENSIVE_GOAL_LINE_BUFFER_YARDS
+                } else if ball_depth <= DEFENSIVE_GOAL_LINE_BUFFER_YARDS {
+                    // Set plays can still drag defenders onto the true goal line.
                     0.0
                 } else if ball_depth <= DEFENDER_PREFERRED_DEPTH_BALL_CUTOFF_YARDS {
                     // Ball still a threat in the defensive third: the 6-yard line is as
@@ -21550,7 +21631,7 @@ impl WorldSnapshot {
         if !target_y.is_finite() {
             return own_goal_y;
         }
-        if !self.ball_near_own_goal_line(team) {
+        if !self.ball_near_own_goal_line(team) || self.back_four_six_yard_line_sticky_active(team) {
             if own_goal_y <= self.field_length * 0.5 {
                 target_y.max(own_goal_y + DEFENSIVE_GOAL_LINE_BUFFER_YARDS)
             } else {
@@ -21644,7 +21725,7 @@ impl WorldSnapshot {
     ) -> Vec2 {
         let dir = team.attack_dir();
         let own_goal_y = self.own_goal_y_for(team);
-        if !self.ball_near_own_goal_line(team) {
+        if !self.ball_near_own_goal_line(team) || self.back_four_six_yard_line_sticky_active(team) {
             if own_goal_y <= self.field_length * 0.5 {
                 target.y = target.y.max(own_goal_y + DEFENSIVE_GOAL_LINE_BUFFER_YARDS);
             } else {
@@ -21953,6 +22034,7 @@ impl WorldSnapshot {
                 .map(|mut carryover| {
                     carryover.observed_at_tick = self.tick;
                     carryover.age_ticks = self.tick.saturating_sub(carryover.decision_tick);
+                    soccer_refresh_decision_commitment_cadence(&mut carryover, self.tick);
                     carryover
                 });
         let observation_started = Instant::now();
@@ -29599,29 +29681,35 @@ impl WorldSnapshot {
         let ball_fwd = fwd(self.ball.position);
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack_dir;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
-        // Six-yard-line stickiness: in OPEN PLAY the back four's AVERAGE holds the 6-yard line as
-        // its effective end-line rather than sinking onto our own goal-line. Lifted when the offside
-        // law is suspended (a restart legitimately drops the line off — corners &c.) and while an
-        // opponent is breaking clean through (the line must drop to cover the goal). Computed up
-        // front because it also governs the own-goal emergency-zone exemption below.
-        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
-        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
-            && !self.offside_currently_suspended()
-            && self.opponent_breakthrough_ball_carrier(me.team).is_none();
-        // Inside our own 5-yard emergency zone the deep-ball band is normally suspended (parity
-        // with the ball is fine; forcing 10yd behind would shove the line off the end-line). When
-        // the six-yard floor is active (open play) the back four STILL holds the 6-yard line as a
-        // flat offside trap even with the ball in the box — but ONLY for a COLLECTABLE ball (loose
-        // or ours, and on the ground): a single team-mate (the GK, or the ball-holder / live-ball
-        // collector already returned above) goes to the ball while the rest of the line settles on
-        // the 6-yard line within the ~3s grace. If the OPPONENT controls the ball in the box or a
-        // CROSS is in flight into it, stepping up to a trap would abandon coverage — the line must
-        // drop and defend, so the emergency suspension still fires (as for a restart / breakthrough
-        // / gate off).
-        let collectable_box_ball = six_yard_floor_active
-            && self.controlled_possession_team() != Some(me.team.other())
-            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS;
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !collectable_box_ball {
+        if let Some(sticky_y) = self.back_four_six_yard_line_sticky_adjusted_y(
+            me,
+            target,
+            DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
+        ) {
+            let in_possession = self
+                .controlled_possession_team()
+                .or_else(|| self.possession_team())
+                == Some(me.team);
+            let adjusted_x = vertical_lane_clamped_x_for_role(
+                me.role,
+                me.home_position.x,
+                target.x,
+                self.field_width,
+                in_possession,
+            );
+            let adjusted_x = self
+                .back_four_horizontal_gap_adjusted_x(me, adjusted_x, exempt_defender)
+                .unwrap_or(adjusted_x);
+            let adjusted_x = self
+                .wingback_defensive_pinch_adjusted_x(me, adjusted_x)
+                .unwrap_or(adjusted_x);
+            return Vec2::new(adjusted_x, sticky_y);
+        }
+        // The band is suspended only inside THIS team's own 20-yard emergency zone
+        // (parity with the ball is fine there; forcing 10yd behind can shove the
+        // line off the end-line). Otherwise it applies even when the line has
+        // drifted ahead of the ball: that is exactly what this pull fixes.
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return target;
         }
         // THE RULE (simple, no regimes): the back four's AVERAGE sits 10-30yd behind
@@ -29658,18 +29746,7 @@ impl WorldSnapshot {
         // ceiling wins — bulletproof, never panics on lower > upper).
         let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
         let lower = (ball_fwd - max_behind).min(upper);
-        // Bake the six-yard floor (computed above) into the band so every AVERAGE the rule computes
-        // is floored at the 6-yard line in open play, even when `lower` would otherwise reach the
-        // goal-line (a deep ball). The ~3s consistency grace then settles the flat line on the
-        // 6-yard line while any one defender may still be inside 0-6yd transiently.
-        let line_band_avg_fwd = |avg: f64| {
-            let banded = avg.clamp(lower, upper);
-            if six_yard_floor_active {
-                banded.max(six_yard_floor_fwd)
-            } else {
-                banded
-            }
-        };
+        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -30052,7 +30129,14 @@ impl WorldSnapshot {
                 target,
                 BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS,
             );
-        let flat_fwd = fwd(target) + (avg_fwd - me_fwd) * flatten_gain;
+        let mut flat_fwd = fwd(target) + (avg_fwd - me_fwd) * flatten_gain;
+        if let Some(sticky_y) = self.back_four_six_yard_line_sticky_adjusted_y(
+            me,
+            Vec2::new(pulled_x, flat_fwd * attack_dir),
+            BACK_FOUR_HORIZONTAL_CONSISTENCY_TARGET_SECONDS,
+        ) {
+            flat_fwd = fwd(Vec2::new(pulled_x, sticky_y));
+        }
         let adjusted_y = (flat_fwd * attack_dir).clamp(0.0, self.field_length);
         Vec2::new(pulled_x, adjusted_y)
     }
@@ -33344,6 +33428,88 @@ impl WorldSnapshot {
         (straight * (1.0 - goal_blend) + to_goal * goal_blend).normalized()
     }
 
+    pub(crate) fn stationary_holder_open_space_carry_target_for(
+        &self,
+        player_id: usize,
+        requested_target: Vec2,
+        kind: Option<DribbleMoveKind>,
+        touch: Option<DribbleTouchDecision>,
+    ) -> Option<Vec2> {
+        if matches!(kind, Some(DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn)) {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(me.team)
+            || me.role == PlayerRole::Goalkeeper
+            || !requested_target.x.is_finite()
+            || !requested_target.y.is_finite()
+        {
+            return None;
+        }
+        let current = self.player_snapshot_position(me);
+        if current.distance(requested_target) > STATIONARY_HOLDER_TARGET_EPSILON_YARDS {
+            return None;
+        }
+        let nearest_opponent = self
+            .nearest_opponent_at(me.team, current)
+            .map(|(_, _, distance)| distance)
+            .unwrap_or(f64::INFINITY);
+        if pressure_from_nearest_distance(nearest_opponent) > STATIONARY_HOLDER_CARRY_MAX_PRESSURE {
+            return None;
+        }
+        let forward_space = self.forward_dribble_space_yards(player_id);
+        if forward_space < WON_BALL_DRIVE_MIN_SPACE_YARDS {
+            return None;
+        }
+        let desired_step = touch
+            .map(|touch| touch.distance_yards)
+            .unwrap_or(STATIONARY_HOLDER_CARRY_TARGET_YARDS)
+            .max(STATIONARY_HOLDER_CARRY_TARGET_YARDS);
+        let step = desired_step
+            .min(DRIBBLE_MAX_TOUCH_YARDS)
+            .min(forward_space)
+            .max(STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS);
+        if step > forward_space + PLAYER_CONTROL_RADIUS_YARDS {
+            return None;
+        }
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        let center_x = self.field_width * 0.5;
+        let center_sign = if (center_x - current.x).abs() <= 1.0 {
+            0.0
+        } else {
+            (center_x - current.x).signum()
+        };
+        let candidates = [
+            forward,
+            Vec2::new(center_sign * 0.24, attack_dir).normalized(),
+            Vec2::new(-center_sign * 0.24, attack_dir).normalized(),
+            Vec2::new(0.34, attack_dir).normalized(),
+            Vec2::new(-0.34, attack_dir).normalized(),
+        ];
+        candidates
+            .into_iter()
+            .filter(|direction| direction.len() > 1e-6)
+            .filter_map(|direction| {
+                let raw = current + direction * step;
+                let candidate = raw.clamp_to_pitch(self.field_width, self.field_length);
+                let forward_gain = (candidate.y - current.y) * attack_dir;
+                if forward_gain < STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS * 0.55 {
+                    return None;
+                }
+                let occupancy = self.candidate_occupancy_at(me.team, candidate, Some(player_id));
+                let pitch_loss = raw.distance(candidate);
+                let score = forward_gain * 0.60
+                    + occupancy.open_space_score * 0.22
+                    - occupancy.teammate_occupied_space_penalty(0.0) * 0.55
+                    - pitch_loss * 0.70;
+                Some((candidate, score))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(candidate, _)| candidate)
+    }
+
     pub fn dribble_move_target_for_touch(
         &self,
         player_id: usize,
@@ -34685,46 +34851,27 @@ impl WorldSnapshot {
         let ball_fwd = self.ball.position.y * attack;
         let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
         let ball_from_own_goal = (ball_fwd - own_goal_fwd).max(0.0);
+        // The designated presser steps onto the ball out of the line — don't pull it back.
+        if self.defender_is_designated_ball_presser(me) {
+            return compact_y;
+        }
+        if let Some(sticky_y) = self.back_four_six_yard_line_sticky_adjusted_y(
+            me,
+            Vec2::new(self.player_snapshot_position(me).x, compact_y),
+            DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
+        ) {
+            return sticky_y;
+        }
+        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
+            return compact_y;
+        }
+        let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         // No offside in force (the ball is being played directly from a throw-in &c.): the line
         // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
         // into a deep block, sitting at least NO_OFFSIDE_RESTART_DROP_OFF_YARDS behind the ball
         // (capped by the max gap and by room to our own goal). The flat-line trap clamp below is
         // likewise meaningless and is lifted for the window.
         let offside_suspended = self.offside_currently_suspended();
-        // Six-yard-line stickiness (computed up front because it governs the emergency-zone
-        // exemption too): in OPEN PLAY the back four holds the 6-yard line as its effective
-        // end-line. Lifted when offside is suspended (a restart legitimately drops the line off)
-        // and while an opponent is breaking clean through (the line must drop to cover the goal).
-        // `breakthrough_carrier` is reused by the leveling clamp below.
-        let breakthrough_carrier = self.opponent_breakthrough_ball_carrier(me.team);
-        let six_yard_floor_fwd = own_goal_fwd + BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS;
-        let six_yard_floor_active = !dd_soccer_disable_six_yard_line_floor()
-            && !offside_suspended
-            && breakthrough_carrier.is_none();
-        let six_yard_floor = |fwd: f64| {
-            if six_yard_floor_active {
-                fwd.max(six_yard_floor_fwd)
-            } else {
-                fwd
-            }
-        };
-        // Inside our own 5-yard emergency zone the deep-ball band is normally fully suspended — but
-        // when the six-yard floor is active (open play) the back four STILL holds the 6-yard line
-        // even with the ball in the box, ONLY for a COLLECTABLE ball (loose or ours, on the ground):
-        // the designated presser below collects it while the rest hold the trap. If the OPPONENT
-        // controls the ball in the box or a CROSS is in flight into it, the line must drop and
-        // defend, so the emergency suspension still fires (as for a restart / breakthrough / off).
-        let collectable_box_ball = six_yard_floor_active
-            && self.controlled_possession_team() != Some(me.team.other())
-            && self.ball.altitude_yards <= BALL_ROLLING_ALTITUDE_YARDS;
-        if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS && !collectable_box_ball {
-            return compact_y;
-        }
-        // The designated presser steps onto the ball out of the line — don't pull it back.
-        if self.defender_is_designated_ball_presser(me) {
-            return compact_y;
-        }
-        let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
         // 10yd off the ball); the max still applies.
         let min_gap = if offside_suspended {
@@ -34751,11 +34898,6 @@ impl WorldSnapshot {
         // "don't sit level" ceiling wins so the line never overruns the ball.
         let deepest_fwd = deepest_fwd.min(shallowest_fwd);
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
-        // Six-yard-line stickiness (gate computed at the top of the fn): the floor is applied to the
-        // band TARGET — both this individual clamp and the line centre below — so the ~3s movement
-        // grace lets the line AVERAGE settle on the 6-yard line while any single defender may still
-        // be physically inside 0-6yd for under ~3s.
-        let clamped_fwd = six_yard_floor(clamped_fwd);
         // Offside line flatness: when DEFENDING, no defender may stand AHEAD of the back-four line
         // (toward the attackers) by more than half of BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS — that is
         // what plays attackers onside, so the front of the line is kept flat (≤2yd). The clamp is
@@ -34823,9 +34965,6 @@ impl WorldSnapshot {
                 heuristic_centre_fwd,
             )
             .unwrap_or(heuristic_centre_fwd);
-        // Hold the line centre on the 6-yard line in open play (see `clamped_fwd` above): the
-        // average must not sink onto our own goal-line even when the ball is driven deep.
-        let line_centre_fwd = six_yard_floor(line_centre_fwd);
         let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
         // No defender may sit AHEAD of the line (toward the attackers) — that is what plays runners
         // onside — so the front edge is always capped to the line centre + half-band.
@@ -34834,7 +34973,7 @@ impl WorldSnapshot {
         // breaking through, the line must be free to DROP and cover (a deep recovering defender is
         // never offside-relevant), so the pull-up (lower edge) is suspended during a break and the
         // four re-level once it clears. This is the target only; the player jogs level over ~3s.
-        let leveled_fwd = if breakthrough_carrier.is_some() {
+        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
             clamped_fwd.min(ahead_cap)
         } else {
             clamped_fwd.clamp(line_centre_fwd - level_half_band, ahead_cap)
@@ -34966,7 +35105,9 @@ impl WorldSnapshot {
             Vec2::new(compact_x, compact_y).clamp_to_pitch(self.field_width, self.field_length);
         if self.possession_team() == Some(me.team.other()) && me.role != PlayerRole::Goalkeeper {
             let own_goal_y = self.own_goal_y_for(me.team);
-            let buffer = if self.ball_near_own_goal_line(me.team) {
+            let buffer = if self.back_four_six_yard_line_sticky_active(me.team) {
+                DEFENSIVE_GOAL_LINE_BUFFER_YARDS
+            } else if self.ball_near_own_goal_line(me.team) {
                 1.25
             } else {
                 DEFENSIVE_GOAL_LINE_BUFFER_YARDS
