@@ -38,6 +38,15 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
+/// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
+/// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
+/// from the nearest presser into the open lane instead of settling into a shield/recycle. Set
+/// `DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE=1` to disable (byte-identical to baseline).
+fn dd_soccer_disable_won_ball_pressure_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE").is_ok())
+}
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
 const MAX_PLAYER_BODY_YAW_TURN_PER_TICK_RAD: f64 = std::f64::consts::PI / 6.0;
@@ -1285,20 +1294,20 @@ struct MpcExecutionEstimate {
     recommended_foot_power: f64,
 }
 
-/// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
-const WEAK_FOOT_EXECUTION_DAMP: f64 = 0.88;
+// Shot-trigger discipline + MPC foot-choice thresholds are centralized in the runtime
+// config: `tunables().shooting.{shot_trigger_long_range_yards, shot_trigger_long_range_min_value,
+// shot_trigger_volunteer_floor, shot_foot_weak_foot_execution_damp}` (see tunables.rs).
 
-/// Beyond this distance a shot is only a legal *volunteer* when the shot-trigger MDP
-/// value clears [`SHOT_TRIGGER_LONG_RANGE_MIN_VALUE`]. Inside it, legacy legality stands.
-/// This is the hard half of the "work it to 20/15, don't hammer it from 25" discipline.
-const SHOT_TRIGGER_LONG_RANGE_YARDS: f64 = 22.0;
-/// Minimum shot-trigger value for a >22yd shot to be a legal volunteer (open net /
-/// stranded keeper / live rebound clears it; a covered long shot does not).
-const SHOT_TRIGGER_LONG_RANGE_MIN_VALUE: f64 = 0.25;
-/// Score a vetoed long shot is crushed to in the possession ranker: tiny but non-zero so
-/// it ranks below carrying/passing alternatives (the carrier works it closer) while staying
-/// a LEGAL, selectable option.
-const SHOT_TRIGGER_VOLUNTEER_FLOOR: f64 = 0.002;
+/// Weight on the ball-vs-body offset (vs the target sweep) in the foot-choice geometry score.
+const SHOT_FOOT_BALL_OFFSET_WEIGHT: f64 = 0.7;
+/// Weight on the strike's lateral sweep in the foot-choice geometry score.
+const SHOT_FOOT_TARGET_SWEEP_WEIGHT: f64 = 0.3;
+/// Max skill rating, used to normalize the per-foot power asymmetry to `[-1, 1]`.
+const SHOT_FOOT_MAX_SKILL: f64 = 10.0;
+/// How strongly the normalized power asymmetry tilts the geometry-vs-power decision.
+const SHOT_FOOT_POWER_BIAS_WEIGHT: f64 = 2.0;
+/// Power margin (rating points) below the strong foot that flags the chosen foot as "weak".
+const SHOT_FOOT_WEAK_MARGIN: f64 = 1.0;
 
 /// MPC shot foot choice: pick which foot to strike with from the ball-vs-body geometry
 /// and the per-foot power. The ball sitting on a given side of the body, and a target
@@ -1315,11 +1324,12 @@ fn shot_foot_choice(
     let left_power = skills.left_foot_shot_power.max(0.0);
     // Geometry score: positive ⇒ right foot is naturally placed, negative ⇒ left. The ball
     // on the right of the body (+x offset) and a strike swept to the right both favor right.
-    let geometry = ball_lateral_offset * 0.7 + target_lateral_sweep * 0.3;
+    let geometry = ball_lateral_offset * SHOT_FOOT_BALL_OFFSET_WEIGHT
+        + target_lateral_sweep * SHOT_FOOT_TARGET_SWEEP_WEIGHT;
     // Power asymmetry (normalized): how much stronger the right foot is than the left.
-    let power_bias = (right_power - left_power) / 10.0;
+    let power_bias = (right_power - left_power) / SHOT_FOOT_MAX_SKILL;
     // Combine: geometry dominates when pronounced, power breaks a near-neutral stance.
-    let decision = geometry + power_bias * 2.0;
+    let decision = geometry + power_bias * SHOT_FOOT_POWER_BIAS_WEIGHT;
     let strong_foot_power = right_power.max(left_power);
     let (foot, power) = if decision >= 0.0 {
         ("right", right_power)
@@ -1327,7 +1337,7 @@ fn shot_foot_choice(
         ("left", left_power)
     };
     // Weak foot = the chosen foot is materially weaker than the player's strong foot.
-    let weak_foot = power + 1.0 < strong_foot_power;
+    let weak_foot = power + SHOT_FOOT_WEAK_MARGIN < strong_foot_power;
     (foot, power, weak_foot)
 }
 
@@ -1780,7 +1790,9 @@ fn mpc_execution_estimate_for_action(
             estimate.recommended_foot_power = power;
             if weak_foot {
                 estimate.execution_probability =
-                    (estimate.execution_probability * WEAK_FOOT_EXECUTION_DAMP).clamp(0.0, 0.99);
+                    (estimate.execution_probability
+                        * tunables().shooting.shot_foot_weak_foot_execution_damp)
+                        .clamp(0.0, 0.99);
             }
         }
         estimate.recommended_speed_yps = shot_speed;
@@ -3384,15 +3396,18 @@ impl PlayerAgent {
         // The shot stays a LEGAL option from range (a human / genuine speculative chance can
         // still take it) — the discipline is to make the AI not *volunteer* low-value long
         // shots. Inside range, a mild value-scaled demotion; beyond
-        // `SHOT_TRIGGER_LONG_RANGE_YARDS` with a low MDP value (a covered long shot), the
+        // `shooting.shot_trigger_long_range_yards` with a low MDP value (a covered long shot), the
         // score is crushed below the carrying/passing alternatives so the carrier works it
         // closer — but `shot_legal` is untouched, so it stays a selectable option.
+        let shot_trigger_long_range_yards = tunables().shooting.shot_trigger_long_range_yards;
+        let shot_trigger_long_range_min_value =
+            tunables().shooting.shot_trigger_long_range_min_value;
         let shot_score = match shot_trigger_value {
             Some(v)
-                if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
-                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE =>
+                if observation.yards_to_goal > shot_trigger_long_range_yards
+                    && v < shot_trigger_long_range_min_value =>
             {
-                shot_score_base.min(SHOT_TRIGGER_VOLUNTEER_FLOOR)
+                shot_score_base.min(tunables().shooting.shot_trigger_volunteer_floor)
             }
             Some(v) => shot_score_base * shot_trigger_score_multiplier(v),
             None => shot_score_base,
@@ -3402,8 +3417,8 @@ impl PlayerAgent {
         // the crush and defeat the discipline). `false` when the kill-switch is set.
         let shot_trigger_long_range_veto = matches!(
             shot_trigger_value,
-            Some(v) if observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
-                && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+            Some(v) if observation.yards_to_goal > shot_trigger_long_range_yards
+                && v < shot_trigger_long_range_min_value
         );
         let fatigue_dribble = fatigue_dribble_multiplier(observation);
         let shot_creation_carry = shot_creation_carry_multiplier(observation);
@@ -4762,6 +4777,64 @@ impl PlayerAgent {
                 &["turnover-burst", "carry-forward", "vertical-attack"],
                 drive_floor,
             );
+        }
+        // Won the ball in a CROWD under pressure: BREAK AWAY into space. The forward-drive floor
+        // above only fires with clear grass ahead and little pressure (using
+        // `fresh_escape.min_forward_space_yards`) — precisely the situation a
+        // freshly-won ball in traffic is NOT in, so nothing currently turns the genuine win moment
+        // into an explosive break. There the real-soccer move is to accelerate the ball AWAY from
+        // the nearest presser into whatever lane exists (usually lateral/diagonal, rarely straight
+        // ahead) rather than settle into a shield and recycle. This is the pressured complement of
+        // the drive block: same fresh-win trigger (`just_won_fit`, off the genuine elapsed
+        // possession time — NOT the pressure-proxy perceived time the steady-state escape signals
+        // use), but it fires UNDER pressure and routes the floor onto the break-into-space family
+        // (turnover-burst / carry-out-left|right / side-step), whose execution already steers the
+        // ball into the best escape lane (`first_touch_escape_carry_target_for`). Scaled by
+        // acceleration skill so it reads as an explosive break, by the escape-lane room so it stands
+        // its ground when truly boxed in (lane ~0), and by pressure so it collapses to nothing in
+        // calm possession. Default-ON; `DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE` restores parity.
+        if self.role != PlayerRole::Goalkeeper
+            && !dd_soccer_disable_won_ball_pressure_escape()
+            && just_won_fit > 0.0
+            && escape_lane_fit > 0.0
+            && !goalmouth_carry_forced
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let crowd_pressure = pressure_urgency
+                .max(pressure)
+                .max(pressure_from_nearest_distance(
+                    observation.nearest_opponent_distance,
+                ))
+                .clamp(0.0, 1.0);
+            if crowd_pressure >= WON_BALL_PRESSURE_ESCAPE_MIN_PRESSURE {
+                let role_floor = match self.role {
+                    PlayerRole::Forward => 0.40,
+                    PlayerRole::Midfielder => 0.36,
+                    PlayerRole::Defender => 0.24,
+                    PlayerRole::Goalkeeper => 0.0,
+                };
+                let accel_fit = 0.70 + ability01(self.skills.acceleration) * 0.30;
+                // Only when there is no easy way out: an open, makeable outlet means the carrier can
+                // lay it off, so don't force a break into the crowd. `bad_outlet_escape_fit` collapses
+                // to ~0 with a good pass available and ~1 when the carrier is genuinely trapped.
+                let escape_floor = (role_floor
+                    * just_won_fit
+                    * escape_lane_fit
+                    * crowd_pressure
+                    * accel_fit
+                    * bad_outlet_escape_fit)
+                    .clamp(0.0, 0.50);
+                ensure_min_legal_option_family_probability(
+                    &mut options,
+                    &[
+                        "turnover-burst",
+                        "carry-out-left",
+                        "carry-out-right",
+                        "side-step",
+                    ],
+                    escape_floor,
+                );
+            }
         }
         if decisive_goal_pressure >= 0.12 && (shot_legal || killer_pass_legal) {
             let recycle_multiplier = (1.0
@@ -7666,15 +7739,15 @@ impl PlayerAgent {
         } else {
             None
         };
-        // Stop-volunteering discipline: beyond `SHOT_TRIGGER_LONG_RANGE_YARDS` a *forced*
+        // Stop-volunteering discipline: beyond `shooting.shot_trigger_long_range_yards` a *forced*
         // shot needs a real MDP justification (open net / stranded keeper / live rebound),
         // otherwise the rule paths below are skipped and the carrier works it closer. Inside
         // that range the forced paths fire exactly as before (a clean 18-22yd must-shoot is
         // untouched). `None` (kill-switch) ⇒ no veto ⇒ byte-identical.
         let shot_trigger_long_range_veto = match shot_trigger_value {
             Some(v) => {
-                observation.yards_to_goal > SHOT_TRIGGER_LONG_RANGE_YARDS
-                    && v < SHOT_TRIGGER_LONG_RANGE_MIN_VALUE
+                observation.yards_to_goal > tunables().shooting.shot_trigger_long_range_yards
+                    && v < tunables().shooting.shot_trigger_long_range_min_value
             }
             None => false,
         };
@@ -12122,8 +12195,8 @@ mod decision_refractory_tests {
 
 #[cfg(test)]
 mod shot_foot_choice_tests {
-    use super::{shot_foot_choice, WEAK_FOOT_EXECUTION_DAMP};
-    use crate::des::general::soccer::SkillProfile;
+    use super::shot_foot_choice;
+    use crate::des::general::soccer::{tunables, SkillProfile};
 
     fn right_footed() -> SkillProfile {
         let mut s = SkillProfile::default();
@@ -12154,6 +12227,7 @@ mod shot_foot_choice_tests {
 
     #[test]
     fn weak_foot_damp_is_a_reduction() {
-        assert!(WEAK_FOOT_EXECUTION_DAMP > 0.0 && WEAK_FOOT_EXECUTION_DAMP < 1.0);
+        let damp = tunables().shooting.shot_foot_weak_foot_execution_damp;
+        assert!(damp > 0.0 && damp < 1.0);
     }
 }

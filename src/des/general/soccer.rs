@@ -1327,6 +1327,11 @@ const EXCESSIVE_HOLD_RAMP_SPAN_SECONDS: f64 = 3.0;
 // third, where taking a man on is worth the risk.
 const DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_FINAL_THIRD_YARDS_TO_GOAL: f64 = 36.0;
+/// Minimum (proximity/closing) pressure for the CROWDED won-ball escape floor to fire. Below it the
+/// freshly-won carrier is in traffic and should accelerate AWAY into the open lane instead of
+/// settling into a shield. Sits just under the forward-drive block's pressure cutoff so the calm
+/// `tunables().fresh_possession_escape` floor and the crowded escape floor stay complementary.
+const WON_BALL_PRESSURE_ESCAPE_MIN_PRESSURE: f64 = 0.45;
 // "There's an open man — play it." When the learned policy proposes a dribble
 // but a teammate is this open with at least this expected completion, release
 // the ball to them rather than carrying on into traffic. Closes the hole where
@@ -22678,22 +22683,32 @@ fn goalkeeper_ball_goal_line_alignment_score(
         snapshot.field_width * 0.5,
         team.other().goal_y(snapshot.field_length),
     );
+    let gk = &tunables().goalkeeper;
     let ball = snapshot.ball.position;
     let ball_goal_distance = goal.distance(ball);
-    if ball_goal_distance <= 1e-9 {
+    // Non-finite (NaN) or degenerate ball: treat as perfectly aligned rather than emitting a
+    // NaN score that would corrupt the line-recovery decision downstream.
+    if !ball_goal_distance.is_finite() || ball_goal_distance <= 1e-9 {
         return 1.0;
     }
     let line_distance = segment_distance_to_point(goal, ball, player_position);
     let projection = segment_projection_factor(goal, ball, player_position);
-    let line_score = (1.0 - line_distance / 1.0).clamp(-1.0, 1.0);
+    let line_score =
+        (1.0 - line_distance / gk.alignment_line_distance_reference_yards).clamp(-1.0, 1.0);
     let projection_score = if (0.0..=1.0).contains(&projection) {
         1.0
     } else {
-        (1.0 - projection.min(0.0).abs().max((projection - 1.0).max(0.0)) / 0.35).clamp(-1.0, 1.0)
+        (1.0 - projection.min(0.0).abs().max((projection - 1.0).max(0.0))
+            / gk.alignment_projection_reference)
+            .clamp(-1.0, 1.0)
     };
     let ideal = snapshot.goalkeeper_ball_goal_tracking_target(team);
-    let depth_score = (1.0 - player_position.distance(ideal) / 4.5).clamp(-1.0, 1.0);
-    (line_score * 0.82 + projection_score * 0.08 + depth_score * 0.10).clamp(-1.0, 1.0)
+    let depth_score = (1.0 - player_position.distance(ideal) / gk.alignment_depth_reference_yards)
+        .clamp(-1.0, 1.0);
+    (line_score * gk.alignment_line_weight
+        + projection_score * gk.alignment_projection_weight
+        + depth_score * gk.alignment_depth_weight)
+        .clamp(-1.0, 1.0)
 }
 
 fn defensive_endline_depth_yards(
@@ -49882,7 +49897,6 @@ fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
         && observation.shot_on_frame_probability >= 0.18
         && observation.shot_beat_goalkeeper_probability >= 0.12;
     (quality_shot || pressure_bailout || goal_urgency_bailout)
-        && shot_trigger_timing_allows_shot(observation, PlayerRole::Forward)
 }
 
 fn shot_decision_is_qualified_for_role(
@@ -49902,7 +49916,6 @@ fn shot_decision_is_qualified_for_role(
         || clean_twenty_yard_shot_is_qualified(observation, role)
         || teammate_near_goal_shot_is_qualified(observation, role)
         || striker_shot_window_is_qualified(observation, role))
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_is_qualified(
@@ -49920,7 +49933,6 @@ fn attacking_goal_pressure_shot_is_qualified(
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && observation.opponent_goal_angle_degrees >= 8.0
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_attempt_probability(
@@ -50197,7 +50209,6 @@ fn clean_twenty_yard_shot_is_qualified(
         && observation.shot_beat_goalkeeper_probability >= CLEAN_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && (observation.forward_dribble_space_yards >= 1.5
             || observation.shot_block_probability <= CLEAN_SHOT_MAX_BLOCK_PROBABILITY * 0.52)
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn teammate_near_goal_shot_is_qualified(
@@ -50211,7 +50222,6 @@ fn teammate_near_goal_shot_is_qualified(
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn striker_shot_window_is_qualified(
@@ -50234,7 +50244,6 @@ fn striker_shot_window_is_qualified(
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn shot_observation_body_mechanics_fit(observation: &SoccerPomdpObservation) -> f64 {

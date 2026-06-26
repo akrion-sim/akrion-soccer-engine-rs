@@ -6702,6 +6702,86 @@ fn possession_action_options_expose_dt_scaled_tick_probabilities() {
 }
 
 #[test]
+fn just_won_ball_in_a_crowd_breaks_away_into_space() {
+    // Winning the ball in TRAFFIC — a tight presser, no clear grass straight ahead, but a lateral
+    // escape lane open — must give a real probability to the break-into-space family (turnover-burst
+    // / carry-out-left|right / side-step) so the carrier accelerates AWAY from pressure rather than
+    // settling into a shield. Keyed on REAL elapsed possession time (just won), and only when a lane
+    // actually exists — boxed in, or once the ball has been held a while, the floor must not apply.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        seed: 151,
+        ..Default::default()
+    });
+    let holder = 6;
+    park_players_except(&mut sim, &[holder]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 55.0); // midfield, Home attacks +y
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let directive = snapshot.tactical_directive(Team::Home);
+    let break_family = [
+        "turnover-burst",
+        "carry-out-left",
+        "carry-out-right",
+        "side-step",
+    ];
+    let family_prob = |opts: &[AgentActionOptionTrace]| -> f64 {
+        let legal_total: f64 = opts
+            .iter()
+            .filter(|o| o.legal)
+            .map(|o| o.score.max(0.0))
+            .sum();
+        let fam: f64 = opts
+            .iter()
+            .filter(|o| o.legal && break_family.contains(&o.label.as_str()))
+            .map(|o| o.score.max(0.0))
+            .sum();
+        if legal_total > 0.0 {
+            fam / legal_total
+        } else {
+            0.0
+        }
+    };
+    // Crowded picture: tight defender, forward lane choked, but a real lateral escape lane open.
+    let opts_for = |secs: f64, lane_yards: f64| {
+        let mut obs = snapshot.observation_for(holder);
+        obs.actual_time_on_ball_seconds = secs;
+        obs.forward_dribble_space_yards = 1.4; // forward choked (won't trip the clear-grass drive)
+        obs.perceived_pressure = 0.8;
+        obs.pressure_urgency = 0.8;
+        obs.nearest_opponent_distance = 2.0; // a man right on top of the carrier
+        obs.pressured_escape_lane_yards = lane_yards;
+        sim.players[holder].possession_action_options(
+            &obs,
+            &directive,
+            2,
+            1,
+            false,
+            snapshot.dt_seconds,
+            snapshot.field_width,
+        )
+    };
+    let fresh_p = family_prob(&opts_for(0.1, 8.0)); // just won, lane open
+    let held_p = family_prob(&opts_for(5.0, 8.0)); // had it a while — floor gone
+    let boxed_p = family_prob(&opts_for(0.1, 0.0)); // just won but boxed in — no lane
+    assert!(
+        fresh_p > 0.18,
+        "a just-won ball in a crowd with a lateral lane must give a real break-into-space probability: {fresh_p}"
+    );
+    assert!(
+        fresh_p > held_p + 1e-3,
+        "winning the ball in traffic must break away MORE than holding it a while: fresh={fresh_p} held={held_p}"
+    );
+    assert!(
+        fresh_p > boxed_p + 1e-3,
+        "the escape floor must only fire when a lane exists, not when boxed in: fresh={fresh_p} boxed={boxed_p}"
+    );
+}
+
+#[test]
 fn just_won_ball_with_space_drives_forward_into_it() {
     // Winning the ball with clear grass ahead and little pressure must give a real probability to
     // the forward-drive family (carry-forward / vertical-attack / turnover-burst) so the carrier
@@ -54286,6 +54366,102 @@ fn goalkeeper_holds_buildup_shape_for_our_pass_in_flight() {
     assert!(
         shape.distance(line_target) > 1e-6,
         "keeper should keep its buildup shape (not snap to the bare line) while we still control: shape={shape:?} line_target={line_target:?}"
+    );
+}
+
+#[test]
+fn goalkeeper_tunables_defaults_reproduce_historical_literals() {
+    // The GoalkeeperTunables defaults MUST equal the historical inline literals so an
+    // unconfigured process is byte-identical to before the positioning knobs were centralized.
+    let gk = GoalkeeperTunables::default();
+    assert_eq!(gk.tracking_ball_pressure_reference_yards, 72.0);
+    assert_eq!(gk.tracking_holder_pressure_reference_yards, 42.0);
+    assert_eq!(gk.tracking_resting_depth_yards, 3.0);
+    assert_eq!(gk.tracking_ball_pressure_depth_gain_yards, 3.0);
+    assert_eq!(gk.tracking_holder_pressure_depth_gain_yards, 1.2);
+    assert_eq!(gk.tracking_min_depth_yards, 2.0);
+    assert_eq!(gk.tracking_line_height_depth_span_yards, 2.0);
+    assert_eq!(gk.tracking_line_height_min_depth_yards, 1.5);
+    assert_eq!(gk.tracking_ball_standoff_yards, 0.85);
+    assert_eq!(gk.alignment_line_distance_reference_yards, 1.0);
+    assert_eq!(gk.alignment_projection_reference, 0.35);
+    assert_eq!(gk.alignment_depth_reference_yards, 4.5);
+    assert_eq!(gk.alignment_line_weight, 0.82);
+    assert_eq!(gk.alignment_projection_weight, 0.08);
+    assert_eq!(gk.alignment_depth_weight, 0.10);
+    assert_eq!(gk.buildup_wide_defender_depth_yards, 24.0);
+    assert_eq!(gk.buildup_central_defender_depth_yards, 18.0);
+    assert_eq!(gk.buildup_lane_probe_offset_yards, 4.0);
+    assert_eq!(gk.leave_confidence_goalkeeping_weight, 0.72);
+    assert_eq!(gk.leave_confidence_acceleration_weight, 0.18);
+    assert_eq!(gk.leave_confidence_perception_weight, 0.10);
+    assert_eq!(gk.leave_confidence_dominance_weight, 0.90);
+    assert_eq!(gk.leave_confidence_tool_weight, 0.10);
+    assert_eq!(gk.backpass_commit_opponent_time_fraction, 0.65);
+    assert_eq!(gk.backpass_commit_teammate_margin_seconds, 0.5);
+}
+
+#[test]
+fn goalkeeper_tracking_target_matches_historical_formula_under_default_tunables() {
+    // Reconstruct the pre-centralization inline formula from the bare literals and assert the
+    // (now tunable-driven) function reproduces it exactly for a spread of ball positions.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for &(bx, by) in &[(40.0, 40.0), (20.0, 12.0), (60.0, 80.0), (5.0, 4.0)] {
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(bx, by);
+        let snap = WorldSnapshot::from_match(&sim);
+        let got = snap.goalkeeper_ball_goal_tracking_target(Team::Home);
+
+        let goal = Vec2::new(snap.field_width * 0.5, snap.own_goal_y_for(Team::Home));
+        let to_ball = snap.ball.position - goal;
+        let ball_distance = to_ball.len();
+        let expected = if ball_distance <= 1e-9 {
+            goal.clamp_to_pitch(snap.field_width, snap.field_length)
+        } else {
+            let ball_pressure = (1.0 - ball_distance / 72.0).clamp(0.0, 1.0);
+            let raw_depth = (3.0 + ball_pressure * 3.0)
+                .clamp(2.0, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
+            let line_height = snap.genome_for(Team::Home).gk_line_height;
+            let raw_depth = (raw_depth + (line_height - 0.5) * 2.0)
+                .clamp(1.5, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
+            let depth = raw_depth.min((ball_distance - 0.85).max(0.0));
+            let target = goal + to_ball.normalized() * depth;
+            let center_x = snap.field_width * 0.5;
+            let six = (snap.goal_width * 0.5 + SIX_YARD_BOX_POST_EXTENSION_YARDS)
+                .clamp(0.0, GOALKEEPER_BOX_STAY_HALF_WIDTH_YARDS);
+            Vec2::new(target.x.clamp(center_x - six, center_x + six), target.y)
+                .clamp_to_pitch(snap.field_width, snap.field_length)
+        };
+        assert!(
+            got.distance(expected) < 1e-9,
+            "default-tunable tracking target must equal the historical formula at ({bx},{by}): got={got:?} expected={expected:?}"
+        );
+    }
+}
+
+#[test]
+fn goalkeeper_positioning_survives_non_finite_ball() {
+    // A NaN ball position (e.g. a bad physics step) must not propagate NaN out of the keeper
+    // positioning / alignment scoring.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(f64::NAN, f64::NAN);
+    let snap = WorldSnapshot::from_match(&sim);
+
+    let target = snap.goalkeeper_ball_goal_tracking_target(Team::Home);
+    assert!(
+        target.x.is_finite() && target.y.is_finite(),
+        "tracking target must stay finite on a NaN ball: {target:?}"
+    );
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let score = goalkeeper_ball_goal_line_alignment_score(
+        Team::Home,
+        sim.players[keeper].position,
+        &snap,
+    );
+    assert!(
+        score.is_finite(),
+        "alignment score must stay finite on a NaN ball: {score}"
     );
 }
 

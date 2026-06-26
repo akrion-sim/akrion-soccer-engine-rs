@@ -21870,12 +21870,13 @@ impl WorldSnapshot {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
         };
+        let gk = &tunables().goalkeeper;
         let attack_dir = me.team.attack_dir();
         let own_goal_y = self.own_goal_y_for(me.team);
         let depth = if self.is_wide_defender(me) {
-            24.0
+            gk.buildup_wide_defender_depth_yards
         } else {
-            18.0
+            gk.buildup_central_defender_depth_yards
         };
         let base_y = own_goal_y + attack_dir * depth;
         let lane_x = vertical_lane_clamped_x_for_role(
@@ -21888,7 +21889,8 @@ impl WorldSnapshot {
         let mut best =
             Vec2::new(lane_x, base_y).clamp_to_pitch(self.field_width, self.field_length);
         let mut best_open = f64::NEG_INFINITY;
-        for dx in [-4.0_f64, 0.0, 4.0] {
+        let probe = gk.buildup_lane_probe_offset_yards;
+        for dx in [-probe, 0.0, probe] {
             let x = vertical_lane_clamped_x_for_role(
                 me.role,
                 me.home_position.x,
@@ -22911,11 +22913,15 @@ impl WorldSnapshot {
             .player_position_confidence_for_point(keeper.id, target)
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
-        let keeper_tool = (ability01(keeper.skills.goalkeeping) * 0.72
-            + ability01(keeper.skills.acceleration) * 0.18
-            + perception_confidence * 0.10)
+        let gk = &tunables().goalkeeper;
+        let keeper_tool = (ability01(keeper.skills.goalkeeping)
+            * gk.leave_confidence_goalkeeping_weight
+            + ability01(keeper.skills.acceleration) * gk.leave_confidence_acceleration_weight
+            + perception_confidence * gk.leave_confidence_perception_weight)
             .clamp(0.0, 1.0);
-        (dominance * 0.90 + keeper_tool * 0.10).clamp(0.0, 1.0)
+        (dominance * gk.leave_confidence_dominance_weight
+            + keeper_tool * gk.leave_confidence_tool_weight)
+            .clamp(0.0, 1.0)
     }
 
     pub(crate) fn goalkeeper_leave_six_yard_box_confidences(
@@ -23002,13 +23008,18 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn goalkeeper_ball_goal_tracking_target(&self, team: Team) -> Vec2 {
+        let gk = &tunables().goalkeeper;
         let goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(team));
         let to_ball = self.ball.position - goal;
         let ball_distance = to_ball.len();
-        if ball_distance <= 1e-9 {
+        // Degenerate / non-finite ball position (e.g. a NaN leaking in from a bad physics
+        // step): fall back to hugging the goal centre rather than propagating NaN out into the
+        // keeper's movement target (and the alignment score that reads this point).
+        if !ball_distance.is_finite() || ball_distance <= 1e-9 {
             return goal.clamp_to_pitch(self.field_width, self.field_length);
         }
-        let ball_pressure = (1.0 - ball_distance / 72.0).clamp(0.0, 1.0);
+        let ball_pressure =
+            (1.0 - ball_distance / gk.tracking_ball_pressure_reference_yards).clamp(0.0, 1.0);
         let holder_pressure = self
             .ball
             .holder
@@ -23017,21 +23028,27 @@ impl WorldSnapshot {
             .map(|holder| {
                 let holder_position = self.player_snapshot_position(holder);
                 let line_gap = (holder_position.y - goal.y).abs();
-                (1.0 - line_gap / 42.0).clamp(0.0, 1.0)
+                (1.0 - line_gap / gk.tracking_holder_pressure_reference_yards).clamp(0.0, 1.0)
             })
             .unwrap_or(0.0);
         // Cap how far off the line the keeper drifts so its ordinary line/angle tracking stays
         // inside the 6-yard box. Leaving that box is handled only by the explicit
         // POMDP+MPC high-confidence loose-ball/sweeper gate below.
-        let raw_depth = (3.0 + ball_pressure * 3.0 + holder_pressure * 1.2)
-            .clamp(2.0, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
+        let raw_depth = (gk.tracking_resting_depth_yards
+            + ball_pressure * gk.tracking_ball_pressure_depth_gain_yards
+            + holder_pressure * gk.tracking_holder_pressure_depth_gain_yards)
+            .clamp(gk.tracking_min_depth_yards, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
         // Genome `gk_line_height` shifts the resting line ±~4yd around the default
         // (0 = hug the goal-line for max reaction, 0.5 = neutral, 1 = a high sweeper
         // line); the neutral default leaves it unchanged.
         let line_height = self.genome_for(team).gk_line_height;
-        let raw_depth = (raw_depth + (line_height - 0.5) * 2.0)
-            .clamp(1.5, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
-        let depth = raw_depth.min((ball_distance - 0.85).max(0.0));
+        let raw_depth = (raw_depth
+            + (line_height - 0.5) * gk.tracking_line_height_depth_span_yards)
+            .clamp(
+                gk.tracking_line_height_min_depth_yards,
+                GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS,
+            );
+        let depth = raw_depth.min((ball_distance - gk.tracking_ball_standoff_yards).max(0.0));
         let target = goal + to_ball.normalized() * depth;
         // Keep it laterally within the 6-yard box too — it shouldn't follow a wide ball
         // out past the box. A genuine pressing need to leave is handled by the gated
@@ -30203,7 +30220,9 @@ impl WorldSnapshot {
                 .last_touch_team
                 .map_or(true, |last| last != gk.team);
             if !keeper_can_handle {
-                return gk_time <= opponent_time * 0.65 && gk_time + 0.5 <= teammate_time;
+                let gk_cfg = &tunables().goalkeeper;
+                return gk_time <= opponent_time * gk_cfg.backpass_commit_opponent_time_fraction
+                    && gk_time + gk_cfg.backpass_commit_teammate_margin_seconds <= teammate_time;
             }
             // In his own box the keeper may come for an opponent-touched loose ball
             // and use his hands, BUT must NOT charge through a covering teammate who

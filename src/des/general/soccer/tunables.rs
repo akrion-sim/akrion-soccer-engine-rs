@@ -55,6 +55,9 @@ pub struct Tunables {
     pub carrier_keep_rolling: CarrierKeepRollingTunables,
     /// Freshly-won possession escape burst thresholds.
     pub fresh_possession_escape: FreshPossessionEscapeTunables,
+    /// Goalkeeper positioning shaping (resting line, alignment score, buildup
+    /// fan-out, loose-ball commit). See [`GoalkeeperTunables`].
+    pub goalkeeper: GoalkeeperTunables,
     /// Fine-grid lane/row affinity used by formation, support, and retrieval.
     pub lane_affinity: LaneAffinityTunables,
     /// Centralized lane-discipline weights (12-lane grid). Read only when
@@ -74,6 +77,7 @@ impl Default for Tunables {
             defensive_shape: DefensiveShapeTunables::default(),
             carrier_keep_rolling: CarrierKeepRollingTunables::default(),
             fresh_possession_escape: FreshPossessionEscapeTunables::default(),
+            goalkeeper: GoalkeeperTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
         }
@@ -309,6 +313,20 @@ pub struct ShootingTunables {
     pub shot_block_bailout_max_probability: f64,
     pub goal_approach_carry_yards: f64,
     pub striker_hold_up_min_goal_distance_yards: f64,
+    /// Shot-trigger MDP/POMDP discipline: beyond this distance a shot is only
+    /// *volunteered* by the AI when the trigger value clears
+    /// [`Self::shot_trigger_long_range_min_value`] (an open net / stranded keeper /
+    /// live rebound). Inside it, the legacy near-goal shoot logic stands. See
+    /// `shot_decision.rs`.
+    pub shot_trigger_long_range_yards: f64,
+    /// Minimum shot-trigger value `[0,1]` for a long (`> shot_trigger_long_range_yards`)
+    /// shot to be volunteered. A covered long shot falls below it and is worked closer.
+    pub shot_trigger_long_range_min_value: f64,
+    /// Score a vetoed long shot is crushed to in the possession ranker: tiny but
+    /// non-zero so it ranks below carrying/passing while staying a LEGAL option.
+    pub shot_trigger_volunteer_floor: f64,
+    /// Execution-probability damp applied when the MPC foot choice forces the weaker foot.
+    pub shot_foot_weak_foot_execution_damp: f64,
 }
 
 impl Default for ShootingTunables {
@@ -319,6 +337,10 @@ impl Default for ShootingTunables {
             shot_block_bailout_max_probability: 0.86,
             goal_approach_carry_yards: 45.0,
             striker_hold_up_min_goal_distance_yards: 45.0,
+            shot_trigger_long_range_yards: 22.0,
+            shot_trigger_long_range_min_value: 0.25,
+            shot_trigger_volunteer_floor: 0.002,
+            shot_foot_weak_foot_execution_damp: 0.88,
         }
     }
 }
@@ -417,6 +439,115 @@ impl Default for FreshPossessionEscapeTunables {
             min_landing_clearance_yards: 2.2,
             initial_push_yps: 1.45,
             decision_floor_max_probability: 0.56,
+        }
+    }
+}
+
+/// **Goalkeeper positioning** knobs — the shaping numbers behind where the keeper
+/// rests on its ball↔goal tracking line, how its line alignment is scored, how it
+/// fans defenders out for buildup, and how confidently it commits to a loose ball.
+///
+/// These were previously bare numeric literals inside the keeper positioning
+/// functions in `world.rs` / `soccer.rs`. The defaults reproduce those historical
+/// literals exactly, so an unconfigured process is byte-identical to before this
+/// group existed; override per-field via `DD_SOCCER_TUNABLE__goalkeeper.<field>` or
+/// the Postgres tuning overlay. Hard geometry (six-yard box depth/width, leave-box
+/// confidence thresholds, line-recovery deviations) stays in the named `const`
+/// block in `soccer.rs`; this group is only the soft behavioral shaping.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalkeeperTunables {
+    // --- resting line on the ball↔goal segment (goalkeeper_ball_goal_tracking_target) ---
+    /// Ball→goal distance (yds) at which an advancing ball reaches full "ball
+    /// pressure" (keeper pushed to its max forward depth). 0 at this range, 1 at the goal.
+    pub tracking_ball_pressure_reference_yards: f64,
+    /// Holder→goal-line distance (yds) at which holder pressure saturates.
+    pub tracking_holder_pressure_reference_yards: f64,
+    /// Resting depth off the goal line (yds) with no pressure.
+    pub tracking_resting_depth_yards: f64,
+    /// Extra depth (yds) added at full ball pressure.
+    pub tracking_ball_pressure_depth_gain_yards: f64,
+    /// Extra depth (yds) added at full holder pressure.
+    pub tracking_holder_pressure_depth_gain_yards: f64,
+    /// Minimum resting depth (yds) before the genome line-height shift.
+    pub tracking_min_depth_yards: f64,
+    /// Full ± span (yds) the `gk_line_height` genome shifts the resting line (0/1 vs 0.5).
+    pub tracking_line_height_depth_span_yards: f64,
+    /// Minimum resting depth (yds) after the line-height shift.
+    pub tracking_line_height_min_depth_yards: f64,
+    /// Standoff (yds) kept short of the ball so the keeper never overruns it.
+    pub tracking_ball_standoff_yards: f64,
+
+    // --- ball↔goal line ALIGNMENT score (goalkeeper_ball_goal_line_alignment_score) ---
+    /// Perpendicular off-line distance (yds) that drops the line-alignment score by 1.0.
+    pub alignment_line_distance_reference_yards: f64,
+    /// Projection overshoot past the goal/ball endpoints that drops the projection score by 1.0.
+    pub alignment_projection_reference: f64,
+    /// Distance (yds) from the ideal tracking point that drops the depth score by 1.0.
+    pub alignment_depth_reference_yards: f64,
+    /// Weight of the on-line term in the blended alignment score.
+    pub alignment_line_weight: f64,
+    /// Weight of the projection (between-the-endpoints) term.
+    pub alignment_projection_weight: f64,
+    /// Weight of the depth (distance-to-ideal) term.
+    pub alignment_depth_weight: f64,
+
+    // --- buildup fan-out lane target (goalkeeper_buildup_lane_target_for) ---
+    /// Depth (yds) off the own goal line a WIDE defender fans out to receive a short pass.
+    pub buildup_wide_defender_depth_yards: f64,
+    /// Depth (yds) off the own goal line a CENTRAL defender fans out to.
+    pub buildup_central_defender_depth_yards: f64,
+    /// Lateral probe offset (yds) used to pick the most-open in-lane buildup spot (±this, and 0).
+    pub buildup_lane_probe_offset_yards: f64,
+
+    // --- leave-six-yard confidence blend (goalkeeper_leave_six_yard_confidence_from_times) ---
+    /// Weight of goalkeeping ability in the keeper's sweep "tool" term.
+    pub leave_confidence_goalkeeping_weight: f64,
+    /// Weight of acceleration ability in the sweep tool term.
+    pub leave_confidence_acceleration_weight: f64,
+    /// Weight of perceived-position confidence in the sweep tool term.
+    pub leave_confidence_perception_weight: f64,
+    /// Weight of the race-dominance term in the overall leave confidence.
+    pub leave_confidence_dominance_weight: f64,
+    /// Weight of the keeper-tool term in the overall leave confidence.
+    pub leave_confidence_tool_weight: f64,
+
+    // --- loose-ball commit, own-ball backpass case (goalkeeper_should_commit_to_loose_ball) ---
+    /// On a ball WE last touched (can't handle), the keeper only charges out if it beats the
+    /// nearest opponent to the ball by this fraction of the opponent's arrival time.
+    pub backpass_commit_opponent_time_fraction: f64,
+    /// ...and additionally reaches it at least this many seconds before the nearest teammate.
+    pub backpass_commit_teammate_margin_seconds: f64,
+}
+
+impl Default for GoalkeeperTunables {
+    fn default() -> Self {
+        GoalkeeperTunables {
+            tracking_ball_pressure_reference_yards: 72.0,
+            tracking_holder_pressure_reference_yards: 42.0,
+            tracking_resting_depth_yards: 3.0,
+            tracking_ball_pressure_depth_gain_yards: 3.0,
+            tracking_holder_pressure_depth_gain_yards: 1.2,
+            tracking_min_depth_yards: 2.0,
+            tracking_line_height_depth_span_yards: 2.0,
+            tracking_line_height_min_depth_yards: 1.5,
+            tracking_ball_standoff_yards: 0.85,
+            alignment_line_distance_reference_yards: 1.0,
+            alignment_projection_reference: 0.35,
+            alignment_depth_reference_yards: 4.5,
+            alignment_line_weight: 0.82,
+            alignment_projection_weight: 0.08,
+            alignment_depth_weight: 0.10,
+            buildup_wide_defender_depth_yards: 24.0,
+            buildup_central_defender_depth_yards: 18.0,
+            buildup_lane_probe_offset_yards: 4.0,
+            leave_confidence_goalkeeping_weight: 0.72,
+            leave_confidence_acceleration_weight: 0.18,
+            leave_confidence_perception_weight: 0.10,
+            leave_confidence_dominance_weight: 0.90,
+            leave_confidence_tool_weight: 0.10,
+            backpass_commit_opponent_time_fraction: 0.65,
+            backpass_commit_teammate_margin_seconds: 0.5,
         }
     }
 }
@@ -2135,6 +2266,42 @@ impl ShootingTunables {
             15.0,
             80.0,
         );
+        sanitize_f64(
+            "shooting.shot_trigger_long_range_yards",
+            &mut self.shot_trigger_long_range_yards,
+            default.shot_trigger_long_range_yards,
+            1.0,
+            40.0,
+            12.0,
+            35.0,
+        );
+        sanitize_f64(
+            "shooting.shot_trigger_long_range_min_value",
+            &mut self.shot_trigger_long_range_min_value,
+            default.shot_trigger_long_range_min_value,
+            0.0,
+            1.0,
+            0.0,
+            0.9,
+        );
+        sanitize_f64(
+            "shooting.shot_trigger_volunteer_floor",
+            &mut self.shot_trigger_volunteer_floor,
+            default.shot_trigger_volunteer_floor,
+            0.0,
+            1.0,
+            0.0,
+            0.5,
+        );
+        sanitize_f64(
+            "shooting.shot_foot_weak_foot_execution_damp",
+            &mut self.shot_foot_weak_foot_execution_damp,
+            default.shot_foot_weak_foot_execution_damp,
+            0.0,
+            1.0,
+            0.5,
+            1.0,
+        );
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
@@ -2176,6 +2343,38 @@ impl ShootingTunables {
             self.striker_hold_up_min_goal_distance_yards,
             1.0,
             120.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_long_range_yards",
+            self.shot_trigger_long_range_yards,
+            1.0,
+            40.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_long_range_min_value",
+            self.shot_trigger_long_range_min_value,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_trigger_volunteer_floor",
+            self.shot_trigger_volunteer_floor,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "shot_foot_weak_foot_execution_damp",
+            self.shot_foot_weak_foot_execution_damp,
+            0.0,
+            1.0,
             errors,
         );
     }
