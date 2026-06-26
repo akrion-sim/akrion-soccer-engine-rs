@@ -819,6 +819,12 @@ const TEAMMATE_MUST_SHOOT_YARDS: f64 = 25.0;
 const STRIKER_MUST_SHOOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const ATTACKING_GOAL_PRESSURE_SHOT_YARDS: f64 = TEAMMATE_MUST_SHOOT_YARDS;
 const CLEAN_SHOT_MUST_SHOOT_YARDS: f64 = 20.0;
+const SHOT_TRIGGER_IDEAL_YARDS: f64 = 15.0;
+const SHOT_TRIGGER_PATIENCE_REFERENCE_YARDS: f64 = 10.0;
+const SHOT_TRIGGER_MIN_WINDOW_SCORE: f64 = 0.46;
+const SHOT_TRIGGER_MAX_EARLY_RISK_FOR_VOLUNTARY: f64 = 0.42;
+const SHOT_TRIGGER_MPC_MIN_BODY_FIT: f64 = 0.42;
+const SHOT_TRIGGER_MPC_HARD_VETO_FIT: f64 = 0.28;
 const CLEAN_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.34;
 const CLEAN_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.32;
 const CLEAN_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.08;
@@ -1070,6 +1076,9 @@ const SHOT_DISTANCE_REWARD_PIVOT_YARDS: f64 = 20.0;
 const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
+const SHOT_TRIGGER_EARLY_RISK_PENALTY_POINTS: f64 = 5.8;
+const SHOT_TRIGGER_BODY_MISMATCH_PENALTY_POINTS: f64 = 3.2;
+const SHOT_TRIGGER_WINDOW_REWARD_POINTS: f64 = 1.4;
 // FLANK / WING usage reward (#8): credit the on-ball player for working the ball in a WIDE channel
 // (toward a touchline), scaled UP when the team is in its OWN half — get it out of the congested
 // central area in front of our own goal and down the wings. Wideness 0 = central spine, 1 =
@@ -3547,6 +3556,10 @@ const SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = 4;
 /// that a lofted target near the touchline/byline is materially different from
 /// the same distance safely in play.
 const SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM: usize = 3;
+/// Append-only shot-trigger block. These channels expose the POMDP shot timing
+/// inputs and the individual MPC strike-fit veto/replan signal to learned value
+/// heads without reshuffling older feature indices.
+const SOCCER_NEURAL_SHOT_TRIGGER_FEATURE_DIM: usize = 11;
 /// Old nets trained at `SOCCER_NEURAL_BASE_FEATURE_DIM` (or any earlier total — see
 /// `SOCCER_NEURAL_LEGACY_FEATURE_DIMS`) migrate by zero-padding appended tail blocks.
 /// Six-channel whole-field motion snapshots are structurally migrated so
@@ -3583,8 +3596,10 @@ const SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM: usize =
 const SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
         + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM + SOCCER_NEURAL_SHOT_TRIGGER_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3867,6 +3882,28 @@ const SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_MARGIN: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_RISK + 1;
 const SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_MARGIN + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_KEEPER_NET_AVAILABLE: usize =
+    SOCCER_NEURAL_FEATURE_LONG_AERIAL_BOUNDS_CORRECTION + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_REBOUND_SECOND_CHANCE: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_KEEPER_NET_AVAILABLE + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_WINDOW: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_REBOUND_SECOND_CHANCE + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_PATIENCE: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_WINDOW + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_TOO_EARLY: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_PATIENCE + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_BALL_X_FRACTION: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_TOO_EARLY + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_BALL_Y_FRACTION: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_BALL_X_FRACTION + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_VELOCITY: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_BALL_Y_FRACTION + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_ACCELERATION: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_VELOCITY + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_ACCELERATION + 1;
+const SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT: usize =
+    SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3920,6 +3957,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     186,
     // Full old total before long-aerial boundary-risk channels were appended.
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM,
+    // Full old total before shot-trigger timing/MPC channels were appended.
+    SOCCER_NEURAL_PRE_SHOT_TRIGGER_FEATURE_DIM,
     // Old base + whole-field motion (6 channels/entity), before belief blocks.
     SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1,
     // Old base + whole-field motion (6 channels/entity) + perception-belief,
@@ -4138,6 +4177,10 @@ fn default_live_policy_autoload_max_bytes() -> u64 {
 
 fn default_live_http_worker_threads() -> usize {
     4
+}
+
+fn default_live_http_simulation_step_model() -> String {
+    "per-game-session-mutex".to_string()
 }
 
 const MAX_LIVE_HTTP_WORKER_THREADS: usize = 32;
@@ -5632,6 +5675,39 @@ pub struct SoccerPomdpObservation {
     pub shot_beat_goalkeeper_probability: f64,
     #[serde(default)]
     pub shot_curl_probability: f64,
+    /// Estimated open-net fraction after accounting for the keeper's goal-line
+    /// coverage and the chosen goalmouth target.
+    #[serde(default)]
+    pub shot_keeper_net_available: f64,
+    /// Perceived chance a keeper save spills into a forced-error rebound for a
+    /// second shot, not just a clean catch.
+    #[serde(default)]
+    pub shot_rebound_second_chance_probability: f64,
+    /// POMDP shot timing score from range, keeper/net, angle, blocks, rebound,
+    /// ball motion, and MPC body mechanics.
+    #[serde(default)]
+    pub shot_trigger_window_score: f64,
+    /// Extra yards the carrier should prefer to advance before shooting when
+    /// pressure is low and the MPC/body picture is not urgent.
+    #[serde(default)]
+    pub shot_trigger_patience_yards: f64,
+    /// Risk that this is a premature shot that should be recycled/carry-advanced
+    /// into a better tick.
+    #[serde(default)]
+    pub shot_trigger_too_early_risk: f64,
+    #[serde(default)]
+    pub shot_ball_x_fraction: f64,
+    #[serde(default)]
+    pub shot_ball_y_fraction: f64,
+    #[serde(default)]
+    pub shot_ball_goalward_velocity_yps: f64,
+    #[serde(default)]
+    pub shot_ball_goalward_acceleration_yps2: f64,
+    /// Individual MPC strike feasibility for the current body/foot/velocity shape.
+    #[serde(default)]
+    pub shot_mpc_body_mechanics_fit: f64,
+    #[serde(default)]
+    pub shot_mpc_preferred_foot_fit: f64,
     #[serde(default)]
     pub pass_curl_probability: f64,
     #[serde(default)]
@@ -7847,6 +7923,20 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub shot_curl_probability_bin: u8,
     #[serde(default)]
+    pub shot_keeper_net_available_bin: u8,
+    #[serde(default)]
+    pub shot_rebound_second_chance_bin: u8,
+    #[serde(default)]
+    pub shot_trigger_window_bin: u8,
+    #[serde(default)]
+    pub shot_trigger_patience_bin: u8,
+    #[serde(default)]
+    pub shot_trigger_too_early_bin: u8,
+    #[serde(default)]
+    pub shot_mpc_body_mechanics_bin: u8,
+    #[serde(default)]
+    pub shot_mpc_preferred_foot_bin: u8,
+    #[serde(default)]
     pub pass_curl_probability_bin: u8,
     #[serde(default)]
     pub immediate_dispossession_risk_bin: u8,
@@ -8270,6 +8360,34 @@ impl SoccerQStateKey {
             shot_curl_probability_bin: distance_bucket(
                 observation.shot_curl_probability,
                 &[0.10, 0.24, 0.42, 0.62],
+            ),
+            shot_keeper_net_available_bin: distance_bucket(
+                observation.shot_keeper_net_available,
+                &[0.18, 0.34, 0.52, 0.70],
+            ),
+            shot_rebound_second_chance_bin: distance_bucket(
+                observation.shot_rebound_second_chance_probability,
+                &[0.06, 0.14, 0.24, 0.38],
+            ),
+            shot_trigger_window_bin: distance_bucket(
+                observation.shot_trigger_window_score,
+                &[0.22, 0.40, 0.58, 0.74],
+            ),
+            shot_trigger_patience_bin: distance_bucket(
+                observation.shot_trigger_patience_yards,
+                &[1.5, 3.5, 6.0, 8.5],
+            ),
+            shot_trigger_too_early_bin: distance_bucket(
+                observation.shot_trigger_too_early_risk,
+                &[0.14, 0.30, 0.48, 0.66],
+            ),
+            shot_mpc_body_mechanics_bin: distance_bucket(
+                shot_observation_body_mechanics_fit(observation),
+                &[0.25, 0.42, 0.60, 0.78],
+            ),
+            shot_mpc_preferred_foot_bin: distance_bucket(
+                shot_observation_preferred_foot_fit(observation),
+                &[0.25, 0.42, 0.60, 0.78],
             ),
             pass_curl_probability_bin: distance_bucket(
                 observation.pass_curl_probability,
@@ -8727,6 +8845,13 @@ impl SoccerQStateKey {
             && self.shot_block_probability_bin == other.shot_block_probability_bin
             && self.shot_blocker_distance_bin == other.shot_blocker_distance_bin
             && self.shot_curl_probability_bin == other.shot_curl_probability_bin
+            && self.shot_keeper_net_available_bin == other.shot_keeper_net_available_bin
+            && self.shot_rebound_second_chance_bin == other.shot_rebound_second_chance_bin
+            && self.shot_trigger_window_bin == other.shot_trigger_window_bin
+            && self.shot_trigger_patience_bin == other.shot_trigger_patience_bin
+            && self.shot_trigger_too_early_bin == other.shot_trigger_too_early_bin
+            && self.shot_mpc_body_mechanics_bin == other.shot_mpc_body_mechanics_bin
+            && self.shot_mpc_preferred_foot_bin == other.shot_mpc_preferred_foot_bin
             && self.pass_curl_probability_bin == other.pass_curl_probability_bin
             && self.immediate_dispossession_risk_bin == other.immediate_dispossession_risk_bin
             && self.visible_pass_options_bin == other.visible_pass_options_bin
@@ -17335,9 +17460,15 @@ fn belief_from_observation(obs: &SoccerPomdpObservation) -> BeliefState {
         && obs.shot_block_probability <= tunables().shooting.shot_block_bailout_max_probability
     {
         let block_factor = (1.0 - obs.shot_block_probability * 0.55).clamp(0.25, 1.0);
+        let trigger_profile = shot_trigger_profile_for_observation(obs, PlayerRole::Forward);
+        let mpc_fit = shot_observation_body_mechanics_fit(obs);
         ((obs.shot_on_frame_probability * 0.64
             + obs.shot_beat_goalkeeper_probability * 0.30
             + obs.shot_curl_probability * 0.08
+            + obs.shot_keeper_net_available.clamp(0.0, 1.0) * 0.09
+            + obs.shot_rebound_second_chance_probability.clamp(0.0, 1.0) * 0.07
+            + trigger_profile.window_score * 0.12
+            + mpc_fit * 0.10
             + (1.0 - obs.immediate_dispossession_risk) * 0.06)
             * block_factor)
             .clamp(0.0, 1.0)
@@ -20428,6 +20559,17 @@ fn dense_soccer_transition_reward(
         // policy to work the ball into ~20yd before pulling the trigger instead of blazing away.
         if action == "shoot" {
             let yards = before_obs.yards_to_goal.max(0.0);
+            reward += before_obs
+                .shot_trigger_window_score
+                .clamp(0.0, 1.0)
+                * SHOT_TRIGGER_WINDOW_REWARD_POINTS;
+            reward -= before_obs
+                .shot_trigger_too_early_risk
+                .clamp(0.0, 1.0)
+                * SHOT_TRIGGER_EARLY_RISK_PENALTY_POINTS;
+            reward -= (1.0 - shot_observation_body_mechanics_fit(before_obs))
+                .clamp(0.0, 1.0)
+                * SHOT_TRIGGER_BODY_MISMATCH_PENALTY_POINTS;
             if yards <= SHOT_DISTANCE_REWARD_PIVOT_YARDS {
                 reward += ((SHOT_DISTANCE_REWARD_PIVOT_YARDS - yards) * SHOT_CLOSE_REWARD_PER_YARD)
                     .min(SHOT_DISTANCE_REWARD_MAX_POINTS);
@@ -31655,6 +31797,16 @@ pub struct SoccerLiveHttpStatus {
     pub reuses_workers: bool,
     pub spawns_per_request: bool,
     pub batches_step_ticks: bool,
+    #[serde(default = "default_live_http_simulation_step_model")]
+    pub simulation_step_model: String,
+    #[serde(default = "default_true")]
+    pub game_ticks_single_threaded_per_session: bool,
+    #[serde(default = "default_true")]
+    pub concurrent_step_requests_serialized: bool,
+    #[serde(default = "default_true")]
+    pub named_games_have_independent_sessions: bool,
+    #[serde(default = "default_true")]
+    pub named_games_may_step_in_parallel: bool,
 }
 
 impl SoccerLiveHttpStatus {
@@ -31668,6 +31820,11 @@ impl SoccerLiveHttpStatus {
             reuses_workers: true,
             spawns_per_request: false,
             batches_step_ticks: true,
+            simulation_step_model: default_live_http_simulation_step_model(),
+            game_ticks_single_threaded_per_session: true,
+            concurrent_step_requests_serialized: true,
+            named_games_have_independent_sessions: true,
+            named_games_may_step_in_parallel: true,
         }
     }
 }
@@ -36470,6 +36627,29 @@ fn soccer_neural_transition_features_with_action(
             / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
             .clamp(0.0, 1.0),
     );
+    features[SOCCER_NEURAL_FEATURE_SHOT_KEEPER_NET_AVAILABLE] =
+        soccer_neural_unit(obs.shot_keeper_net_available);
+    features[SOCCER_NEURAL_FEATURE_SHOT_REBOUND_SECOND_CHANCE] =
+        soccer_neural_unit(obs.shot_rebound_second_chance_probability);
+    features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_WINDOW] =
+        soccer_neural_unit(obs.shot_trigger_window_score);
+    features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_PATIENCE] = soccer_neural_unit(
+        (obs.shot_trigger_patience_yards / SHOT_TRIGGER_PATIENCE_REFERENCE_YARDS).clamp(0.0, 1.0),
+    );
+    features[SOCCER_NEURAL_FEATURE_SHOT_TRIGGER_TOO_EARLY] =
+        soccer_neural_unit(obs.shot_trigger_too_early_risk);
+    features[SOCCER_NEURAL_FEATURE_SHOT_BALL_X_FRACTION] =
+        soccer_neural_unit(obs.shot_ball_x_fraction);
+    features[SOCCER_NEURAL_FEATURE_SHOT_BALL_Y_FRACTION] =
+        soccer_neural_unit(obs.shot_ball_y_fraction);
+    features[SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_VELOCITY] =
+        soccer_neural_signed_unit(obs.shot_ball_goalward_velocity_yps / 24.0);
+    features[SOCCER_NEURAL_FEATURE_SHOT_BALL_GOALWARD_ACCELERATION] =
+        soccer_neural_signed_unit(obs.shot_ball_goalward_acceleration_yps2 / 18.0);
+    features[SOCCER_NEURAL_FEATURE_SHOT_MPC_BODY_MECHANICS] =
+        soccer_neural_unit(shot_observation_body_mechanics_fit(obs));
+    features[SOCCER_NEURAL_FEATURE_SHOT_MPC_PREFERRED_FOOT] =
+        soccer_neural_unit(shot_observation_preferred_foot_fit(obs));
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -48699,7 +48879,8 @@ fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
         && block_risk <= 0.62
         && observation.shot_on_frame_probability >= 0.18
         && observation.shot_beat_goalkeeper_probability >= 0.12;
-    quality_shot || pressure_bailout || goal_urgency_bailout
+    (quality_shot || pressure_bailout || goal_urgency_bailout)
+        && shot_trigger_timing_allows_shot(observation, PlayerRole::Forward)
 }
 
 fn shot_decision_is_qualified_for_role(
@@ -48714,11 +48895,12 @@ fn shot_decision_is_qualified_for_role(
     if observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
         return false;
     }
-    shot_decision_is_qualified(observation)
+    (shot_decision_is_qualified(observation)
         || attacking_goal_pressure_shot_is_qualified(observation, role)
         || clean_twenty_yard_shot_is_qualified(observation, role)
         || teammate_near_goal_shot_is_qualified(observation, role)
-        || striker_shot_window_is_qualified(observation, role)
+        || striker_shot_window_is_qualified(observation, role))
+        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_is_qualified(
@@ -48736,6 +48918,7 @@ fn attacking_goal_pressure_shot_is_qualified(
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && observation.opponent_goal_angle_degrees >= 8.0
+        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_attempt_probability(
@@ -49012,6 +49195,7 @@ fn clean_twenty_yard_shot_is_qualified(
         && observation.shot_beat_goalkeeper_probability >= CLEAN_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && (observation.forward_dribble_space_yards >= 1.5
             || observation.shot_block_probability <= CLEAN_SHOT_MAX_BLOCK_PROBABILITY * 0.52)
+        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn teammate_near_goal_shot_is_qualified(
@@ -49025,6 +49209,7 @@ fn teammate_near_goal_shot_is_qualified(
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
+        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn striker_shot_window_is_qualified(
@@ -49039,14 +49224,229 @@ fn striker_shot_window_is_qualified(
         .shooting
         .striker_shot_window_yards
         .min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
-    // A striker may attempt anywhere inside his shot window up to the hard 30yd cap (already folded
-    // into `striker_window_yards`); the 20-30yd range is legal but reward-penalised (item-5), not
-    // keeper-gated like a generic speculative shot — a striker backs himself.
+    // A striker may attempt inside his hard shot window only when the timing model
+    // agrees. The 20-30yd range stays legal for forced/human shots, but the AI no
+    // longer volunteers it when it can carry into a better 20/15yd window.
     observation.yards_to_goal <= striker_window_yards
         && observation.shot_lane_open
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
+        && shot_trigger_timing_allows_shot(observation, role)
+}
+
+fn shot_observation_body_mechanics_fit(observation: &SoccerPomdpObservation) -> f64 {
+    if observation.shot_mpc_body_mechanics_fit > 0.0
+        || observation.shot_mpc_preferred_foot_fit > 0.0
+    {
+        observation.shot_mpc_body_mechanics_fit.clamp(0.0, 1.0)
+    } else {
+        0.68
+    }
+}
+
+fn shot_observation_preferred_foot_fit(observation: &SoccerPomdpObservation) -> f64 {
+    if observation.shot_mpc_preferred_foot_fit > 0.0
+        || observation.shot_mpc_body_mechanics_fit > 0.0
+    {
+        observation.shot_mpc_preferred_foot_fit.clamp(0.0, 1.0)
+    } else {
+        0.68
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShotTriggerProfile {
+    pub window_score: f64,
+    pub patience_yards: f64,
+    pub too_early_risk: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shot_trigger_profile_from_inputs(
+    role: PlayerRole,
+    has_ball: bool,
+    yards_to_goal: f64,
+    shot_lane_open: bool,
+    shot_block_probability: f64,
+    shot_on_frame_probability: f64,
+    shot_beat_goalkeeper_probability: f64,
+    shot_curl_probability: f64,
+    shot_keeper_net_available: f64,
+    shot_rebound_second_chance_probability: f64,
+    opponent_goal_angle_degrees: f64,
+    opposing_goalkeeper_out_of_position: f64,
+    forward_dribble_space_yards: f64,
+    perceived_pressure: f64,
+    pressure_urgency: f64,
+    immediate_dispossession_risk: f64,
+    offensive_urgency: f64,
+    goal_attack_window_score: f64,
+    shot_ball_goalward_velocity_yps: f64,
+    shot_ball_goalward_acceleration_yps2: f64,
+    shot_mpc_body_mechanics_fit: f64,
+    shot_mpc_preferred_foot_fit: f64,
+) -> ShotTriggerProfile {
+    if role == PlayerRole::Goalkeeper || !has_ball {
+        return ShotTriggerProfile::default();
+    }
+    let yards = yards_to_goal.max(0.0);
+    let block = shot_block_probability.clamp(0.0, 1.0);
+    let lane_fit = if shot_lane_open {
+        ((1.0 - block) * 0.34
+            + shot_on_frame_probability.clamp(0.0, 1.0) * 0.26
+            + shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.18
+            + shot_curl_probability.clamp(0.0, 1.0) * 0.06
+            + (opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0) * 0.16)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let near_fit = ((TEAMMATE_MUST_SHOOT_YARDS - yards)
+        / (TEAMMATE_MUST_SHOOT_YARDS - SHOT_TRIGGER_IDEAL_YARDS).max(1.0))
+    .clamp(0.0, 1.0);
+    let keeper_fit = (shot_keeper_net_available.clamp(0.0, 1.0) * 0.52
+        + opposing_goalkeeper_out_of_position.clamp(0.0, 1.0) * 0.26
+        + shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.22)
+        .clamp(0.0, 1.0);
+    let ball_drive_fit = (0.50
+        + shot_ball_goalward_velocity_yps.clamp(-18.0, 24.0) / 24.0 * 0.30
+        + shot_ball_goalward_acceleration_yps2.clamp(-18.0, 18.0) / 18.0 * 0.20)
+        .clamp(0.0, 1.0);
+    let body_fit = shot_mpc_body_mechanics_fit.clamp(0.0, 1.0);
+    let foot_fit = shot_mpc_preferred_foot_fit.clamp(0.0, 1.0);
+    let mechanics_fit = (body_fit * 0.72 + foot_fit * 0.28).clamp(0.0, 1.0);
+    let role_fit = match role {
+        PlayerRole::Forward => 1.08,
+        PlayerRole::Midfielder => 0.98,
+        PlayerRole::Defender => 0.74,
+        PlayerRole::Goalkeeper => 0.0,
+    };
+    let window_score = ((lane_fit * 0.25
+        + near_fit * 0.18
+        + keeper_fit * 0.15
+        + shot_rebound_second_chance_probability.clamp(0.0, 1.0) * 0.10
+        + ball_drive_fit * 0.08
+        + mechanics_fit * 0.17
+        + goal_attack_window_score.clamp(0.0, 1.0) * 0.07)
+        * role_fit)
+        .clamp(0.0, 1.0);
+    let urgency = perceived_pressure
+        .max(pressure_urgency)
+        .max(immediate_dispossession_risk)
+        .max(offensive_urgency * 0.82)
+        .clamp(0.0, 1.0);
+    let low_pressure = (1.0 - urgency).clamp(0.0, 1.0);
+    let carry_fit =
+        (forward_dribble_space_yards / SHOT_TRIGGER_PATIENCE_REFERENCE_YARDS).clamp(0.0, 1.0);
+    let patience_yards = ((yards - SHOT_TRIGGER_IDEAL_YARDS).max(0.0)
+        * low_pressure
+        * carry_fit
+        * (1.0 - keeper_fit * 0.48))
+        .clamp(0.0, SHOT_TRIGGER_PATIENCE_REFERENCE_YARDS);
+    let early_range = ((yards - CLEAN_SHOT_MUST_SHOOT_YARDS)
+        / (SPECULATIVE_LONG_SHOT_MAX_YARDS - CLEAN_SHOT_MUST_SHOOT_YARDS).max(1.0))
+    .clamp(0.0, 1.0);
+    let weak_window = ((SHOT_TRIGGER_MIN_WINDOW_SCORE - window_score)
+        / SHOT_TRIGGER_MIN_WINDOW_SCORE)
+        .clamp(0.0, 1.0);
+    let raw_early_risk = (early_range * 0.30
+        + low_pressure * carry_fit * 0.24
+        + (1.0 - keeper_fit) * 0.13
+        + (1.0 - mechanics_fit) * 0.14
+        + weak_window * 0.15
+        + block * 0.04)
+        .clamp(0.0, 1.0);
+    let too_early_risk = if yards <= CLEAN_SHOT_MUST_SHOOT_YARDS {
+        (raw_early_risk * 0.24).clamp(0.0, 1.0)
+    } else if urgency >= 0.74 {
+        (raw_early_risk * 0.58).clamp(0.0, 1.0)
+    } else {
+        raw_early_risk
+    };
+    ShotTriggerProfile {
+        window_score,
+        patience_yards,
+        too_early_risk,
+    }
+}
+
+fn shot_trigger_profile_for_observation(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+) -> ShotTriggerProfile {
+    shot_trigger_profile_from_inputs(
+        role,
+        observation.has_ball,
+        observation.yards_to_goal,
+        observation.shot_lane_open,
+        observation.shot_block_probability,
+        observation.shot_on_frame_probability,
+        observation.shot_beat_goalkeeper_probability,
+        observation.shot_curl_probability,
+        observation.shot_keeper_net_available,
+        observation.shot_rebound_second_chance_probability,
+        observation.opponent_goal_angle_degrees,
+        observation.opposing_goalkeeper_out_of_position,
+        observation.forward_dribble_space_yards,
+        observation.perceived_pressure,
+        observation.pressure_urgency,
+        observation.immediate_dispossession_risk,
+        observation.offensive_urgency,
+        observation.goal_attack_window_score,
+        observation.shot_ball_goalward_velocity_yps,
+        observation.shot_ball_goalward_acceleration_yps2,
+        shot_observation_body_mechanics_fit(observation),
+        shot_observation_preferred_foot_fit(observation),
+    )
+}
+
+fn shot_trigger_timing_allows_shot(observation: &SoccerPomdpObservation, role: PlayerRole) -> bool {
+    if role == PlayerRole::Goalkeeper || !observation.has_ball || !observation.shot_lane_open {
+        return false;
+    }
+    if observation.yards_to_goal > SPECULATIVE_LONG_SHOT_MAX_YARDS {
+        return false;
+    }
+    let profile = shot_trigger_profile_for_observation(observation, role);
+    let body_fit = shot_observation_body_mechanics_fit(observation);
+    let foot_fit = shot_observation_preferred_foot_fit(observation);
+    let mechanics_ready = body_fit.max(foot_fit) >= SHOT_TRIGGER_MPC_MIN_BODY_FIT;
+    let urgent_bailout = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.offensive_urgency)
+        >= 0.76;
+    if body_fit < SHOT_TRIGGER_MPC_HARD_VETO_FIT && !urgent_bailout {
+        return false;
+    }
+    if observation.yards_to_goal <= CLEAN_SHOT_MUST_SHOOT_YARDS {
+        return mechanics_ready || urgent_bailout || profile.window_score >= 0.52;
+    }
+    let keeper_stranded = observation
+        .opposing_goalkeeper_out_of_position
+        .clamp(0.0, 1.0)
+        >= LONG_SHOT_GK_TOTALLY_OUT
+        && observation.shot_keeper_net_available.clamp(0.0, 1.0) >= 0.52;
+    let rebound_pressure = observation
+        .shot_rebound_second_chance_probability
+        .clamp(0.0, 1.0)
+        >= 0.34
+        && observation.open_support_outlets > 0;
+    if (keeper_stranded || rebound_pressure) && body_fit >= 0.34 {
+        return true;
+    }
+    if urgent_bailout
+        && observation.shot_on_frame_probability >= SHOT_BAILOUT_ON_FRAME_PROBABILITY
+        && observation.shot_block_probability.clamp(0.0, 1.0)
+            <= tunables().shooting.shot_block_bailout_max_probability
+    {
+        return true;
+    }
+    profile.window_score >= SHOT_TRIGGER_MIN_WINDOW_SCORE
+        && profile.too_early_risk <= SHOT_TRIGGER_MAX_EARLY_RISK_FOR_VOLUNTARY
+        && mechanics_ready
 }
 
 fn striker_must_shoot(observation: &SoccerPomdpObservation, role: PlayerRole) -> bool {
@@ -53207,6 +53607,78 @@ struct ShotMpcAccuracyEstimate {
     goal_probability: f64,
     goalkeeper_reach_pressure: f64,
     block_probability: f64,
+    preferred_right_foot: bool,
+    foot_mechanics_fit: f64,
+    body_mechanics_fit: f64,
+    keeper_net_available: f64,
+    rebound_second_chance_probability: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ShotMpcFootSelection {
+    right_foot: bool,
+    power: f64,
+    mechanics_fit: f64,
+}
+
+fn shot_mpc_foot_selection(
+    skills: &SkillProfile,
+    fatigue: f64,
+    pressure: f64,
+    player_position: Vec2,
+    player_velocity: Vec2,
+    target_point: Vec2,
+) -> ShotMpcFootSelection {
+    let to_target = target_point - player_position;
+    let target_dir = if to_target.len() > 1e-6 {
+        to_target.normalized()
+    } else {
+        Vec2::new(0.0, 1.0)
+    };
+    let velocity_fit = if player_velocity.len() > 0.25 {
+        ((dot(player_velocity.normalized(), target_dir) + 1.0) * 0.5).clamp(0.0, 1.0)
+    } else {
+        0.64
+    };
+    let lateral = to_target.x;
+    let body_control = (ability01(skills.first_touch) * 0.28
+        + ability01(skills.strength) * 0.22
+        + ability01(skills.acceleration) * 0.18
+        + ability01(skills.shooting) * 0.20
+        + (1.0 - fatigue.clamp(0.0, 1.0)) * 0.12)
+        .clamp(0.0, 1.0);
+    let fit_for = |right_foot: bool, power_score: f64| {
+        let across_body_fit = if right_foot {
+            if lateral <= 0.0 {
+                1.0
+            } else {
+                0.88
+            }
+        } else if lateral >= 0.0 {
+            1.0
+        } else {
+            0.88
+        };
+        let power = ability01(power_score);
+        let pressure_drag = pressure.clamp(0.0, 1.0) * 0.15;
+        (body_control * 0.56 + power * 0.24 + velocity_fit * 0.20 - pressure_drag).clamp(0.0, 1.0)
+            * across_body_fit
+    };
+    let right_fit = fit_for(true, skills.right_foot_shot_power);
+    let left_fit = fit_for(false, skills.left_foot_shot_power);
+    if right_fit >= left_fit {
+        ShotMpcFootSelection {
+            right_foot: true,
+            power: ability01(skills.right_foot_shot_power),
+            mechanics_fit: right_fit.clamp(0.0, 1.0),
+        }
+    } else {
+        ShotMpcFootSelection {
+            right_foot: false,
+            power: ability01(skills.left_foot_shot_power),
+            mechanics_fit: left_fit.clamp(0.0, 1.0),
+        }
+    }
 }
 
 fn shot_mpc_accuracy_estimate_for_snapshot(
@@ -53270,7 +53742,7 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
         goal_center_x - half_width * 0.42
     };
     let shooting_skill = ability01(skills.shooting);
-    let foot_power = ability01(
+    let best_foot_power = ability01(
         skills
             .right_foot_shot_power
             .max(skills.left_foot_shot_power),
@@ -53281,7 +53753,7 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
         + shooting_skill * 0.24)
         .clamp(0.0, 1.0);
     let shot_skill =
-        (shooting_skill * 0.58 + foot_power * 0.22 + body_control * 0.20).clamp(0.0, 1.0);
+        (shooting_skill * 0.58 + best_foot_power * 0.22 + body_control * 0.20).clamp(0.0, 1.0);
     let target_weight = 0.82 + shot_skill * 0.72;
     let keeper_weight = 0.56 + (1.0 - pressure) * 0.24;
     let blocker_weight = 0.58 + least_block_probability.clamp(0.0, 1.0) * 0.42;
@@ -53320,6 +53792,17 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
     }
     .clamp(left_post_x, right_post_x);
     let target_point = Vec2::new(target_x, goal_y);
+    let foot_selection = shot_mpc_foot_selection(
+        skills,
+        fatigue,
+        pressure,
+        player_position,
+        player_velocity,
+        target_point,
+    );
+    let final_shot_skill =
+        (shooting_skill * 0.56 + foot_selection.power * 0.22 + foot_selection.mechanics_fit * 0.22)
+            .clamp(0.0, 1.0);
     let bounded_preference = unbounded_preference.clamp(left_post_x, right_post_x);
     let bound_residual = (target_x - bounded_preference).abs();
     let distance = player_position.distance(target_point);
@@ -53347,14 +53830,15 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
         chosen_block_probability,
     );
     let shot_time = distance / shot_speed_yps.max(1.0);
-    let body_fit =
-        (0.48 + shot_skill * 0.30 + body_control * 0.22 - fatigue_penalty).clamp(0.22, 1.0);
+    let body_fit = (0.42 + final_shot_skill * 0.30 + foot_selection.mechanics_fit * 0.28
+        - fatigue_penalty)
+        .clamp(0.16, 1.0);
     let target_fit = (1.0 - bound_residual / (half_width * 1.35).max(0.25)).clamp(0.0, 1.0);
     let time_fit = (1.0 - (shot_time - 1.05).max(0.0) / 2.6).clamp(0.35, 1.0);
     let qp_target_fit =
         (target_fit * 0.46 + body_fit * 0.30 + time_fit * 0.14 + (1.0 - pressure) * 0.10)
             .clamp(0.0, 1.0);
-    let save_probability = snapshot
+    let keeper_snapshot = snapshot
         .goalkeeper_for(attacking_team.other())
         .and_then(|keeper_id| {
             snapshot
@@ -53368,21 +53852,57 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
                     let keeper_velocity = snapshot
                         .player_velocity(keeper_id)
                         .unwrap_or(keeper.velocity);
-                    goalkeeper_save_probability_from_traits(
-                        &keeper.skills,
-                        keeper_position,
-                        keeper_velocity,
-                        keeper.fatigue,
-                        player_position,
-                        target_point,
-                        shot_speed_yps,
-                        snapshot.goal_width,
-                        chosen_block_probability,
-                    )
+                    (keeper, keeper_position, keeper_velocity)
                 })
+        });
+    let save_probability = keeper_snapshot
+        .map(|(keeper, keeper_position, keeper_velocity)| {
+            goalkeeper_save_probability_from_traits(
+                &keeper.skills,
+                keeper_position,
+                keeper_velocity,
+                keeper.fatigue,
+                player_position,
+                target_point,
+                shot_speed_yps,
+                snapshot.goal_width,
+                chosen_block_probability,
+            )
         })
         .unwrap_or(0.65)
         .clamp(0.0, 0.995);
+    let keeper_net_available = {
+        let lateral_gap =
+            ((target_point.x - keeper_position.x).abs() / half_width.max(0.5)).clamp(0.0, 1.0);
+        let depth_gap = ((keeper_position.y - goal_y).abs() / 12.0).clamp(0.0, 1.0);
+        let corner_fit =
+            ((target_point.x - goal_center_x).abs() / half_width.max(0.5)).clamp(0.0, 1.0);
+        (lateral_gap * 0.54
+            + depth_gap * 0.18
+            + corner_fit * 0.16
+            + (1.0 - save_probability) * 0.12)
+            .clamp(0.0, 1.0)
+    };
+    let rebound_second_chance_probability = keeper_snapshot
+        .map(|(keeper, _, _)| {
+            let handling = (ability01(keeper.skills.goalkeeping) * 0.58
+                + ability01(keeper.skills.first_touch) * 0.42)
+                .clamp(0.0, 1.0);
+            let clean_sightline = 1.0 - chosen_block_probability;
+            let distance_fit = ((distance - 10.0) / 22.0).clamp(0.0, 1.0);
+            let hot_shot_fit = (shot_speed_yps / mph_to_yps(60.0)).clamp(0.0, 1.0);
+            let catch_probability =
+                (0.18 + handling * 0.32 + clean_sightline * 0.16 + distance_fit * 0.18
+                    - hot_shot_fit * 0.16
+                    - keeper_net_available * 0.08)
+                    .clamp(0.08, 0.92);
+            (save_probability
+                * (1.0 - catch_probability)
+                * (0.34 + hot_shot_fit * 0.22 + keeper_net_available * 0.18)
+                * (1.0 - chosen_block_probability * 0.42).clamp(0.20, 1.0))
+            .clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0);
     let accuracy_probability =
         (base_on_frame * (0.70 + qp_target_fit * 0.30) * (0.88 + body_fit * 0.12)).clamp(0.0, 1.0);
     let goal_probability = (accuracy_probability
@@ -53396,6 +53916,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
         goal_probability,
         goalkeeper_reach_pressure: save_probability,
         block_probability: chosen_block_probability,
+        preferred_right_foot: foot_selection.right_foot,
+        foot_mechanics_fit: foot_selection.mechanics_fit,
+        body_mechanics_fit: body_fit,
+        keeper_net_available,
+        rebound_second_chance_probability,
     }
 }
 
