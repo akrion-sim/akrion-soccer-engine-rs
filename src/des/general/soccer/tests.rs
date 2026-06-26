@@ -52515,6 +52515,78 @@ fn goalkeeper_support_shape_still_tracks_ball_goal_line() {
 }
 
 #[test]
+fn goalkeeper_drops_goalside_on_a_loose_ball_we_only_last_touched() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    // The keeper has pushed up as a buildup outlet.
+    sim.players[keeper].position = Vec2::new(30.0, 40.0);
+    // A loose ball in our half that we merely last touched (a cleared / deflected ball), with an
+    // opponent sitting on it as the favourite to win it.
+    let away_outfielder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 25.0);
+    sim.players[away_outfielder].position = sim.ball.position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // possession_team() still reports Home via the last-touch fallback ...
+    assert_eq!(snapshot.possession_team(), Some(Team::Home));
+    // ... but the keeper is NOT entitled to the upfield buildup shape: an opponent is the
+    // favourite to the loose ball.
+    assert_ne!(
+        snapshot.goalkeeper_buildup_possession_team(),
+        Some(Team::Home)
+    );
+
+    let line_target = snapshot.goalkeeper_ball_goal_tracking_target(Team::Home);
+    let shape = snapshot.defensive_shape_for(keeper, sim.players[keeper].home_position);
+    assert!(
+        shape.distance(line_target) < 1e-9,
+        "keeper should drop onto its ball-goal tracking line for a loose ball: shape={shape:?} line_target={line_target:?}"
+    );
+    let goal = Vec2::new(
+        snapshot.field_width * 0.5,
+        snapshot.own_goal_y_for(Team::Home),
+    );
+    let line_distance = segment_distance_to_point(goal, snapshot.ball.position, shape);
+    let projection = segment_projection_factor(goal, snapshot.ball.position, shape);
+    assert!(
+        line_distance < 1e-9 && (0.0..=1.0).contains(&projection),
+        "keeper target should sit between the goal centre and the ball: line_distance={line_distance} projection={projection}"
+    );
+}
+
+#[test]
+fn goalkeeper_holds_buildup_shape_for_our_pass_in_flight() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let teammate = 6;
+    // Our pass is in flight (no holder) but a teammate is the favourite to receive it, so the
+    // keeper must NOT yo-yo back onto its bare line — it keeps the buildup outlet shape.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 30.0);
+    sim.players[teammate].position = sim.ball.position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.goalkeeper_buildup_possession_team(),
+        Some(Team::Home)
+    );
+    let line_target = snapshot.goalkeeper_ball_goal_tracking_target(Team::Home);
+    let shape = snapshot.defensive_shape_for(keeper, sim.players[keeper].home_position);
+    assert!(
+        shape.distance(line_target) > 1e-6,
+        "keeper should keep its buildup shape (not snap to the bare line) while we still control: shape={shape:?} line_target={line_target:?}"
+    );
+}
+
+#[test]
 fn goalkeeper_runtime_support_ignores_off_line_lp_guidance() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");

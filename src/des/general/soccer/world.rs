@@ -17895,6 +17895,19 @@ fn dd_soccer_disable_winger_byline_option() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
 }
+/// Keeper goalside guard. ON by default: the goalkeeper only abandons its goalside ball↔goal
+/// tracking line to push up into the buildup-outlet shape when our team GENUINELY controls the
+/// ball — it is held by a teammate, or one of our passes is in flight with a teammate the
+/// favourite to receive it. Previously the keeper's "in possession" test fell back to
+/// `last_touch_team`, so a LOOSE ball we last touched (a deflection, a popped-loose tackle, a
+/// cleared ball an opponent is about to win) kept the keeper upfield instead of dropping between
+/// the centre of its goal and the ball. Set `DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD=1` to restore the
+/// prior last-touch behaviour (byte-identical, A/B / parity). See `goalkeeper_buildup_possession_team`.
+fn dd_soccer_disable_gk_goalside_guard() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD").is_ok())
+}
 /// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
 /// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
 /// the carrier reliably HAS a teammate to play to — instead of being left to thump it to nobody or
@@ -18801,6 +18814,43 @@ impl WorldSnapshot {
             .holder
             .and_then(|id| self.players.iter().find(|p| p.id == id))
             .map(|p| p.team)
+    }
+
+    /// The team (if any) whose keeper is entitled to leave its goalside ball↔goal tracking line and
+    /// push up into the buildup-outlet shape. Unlike `possession_team()`, a bare `last_touch_team`
+    /// is NOT enough: a genuinely loose ball must keep the keeper goalside. We count it as "ours for
+    /// buildup" only when a teammate actually HOLDS the ball, or — for an in-flight ball with no
+    /// holder — when we last touched it AND our nearest outfield player is the favourite to reach it
+    /// (so an ordinary pass between our players doesn't yo-yo the keeper off its line, but a loose
+    /// ball an opponent is winning drops the keeper goalside).
+    pub(crate) fn goalkeeper_buildup_possession_team(&self) -> Option<Team> {
+        if let Some(team) = self.controlled_possession_team() {
+            return Some(team);
+        }
+        // No holder: the ball is in flight or loose. Retain buildup possession only if we last
+        // touched it and our team is the favourite to the ball.
+        let last_touch = self.ball.last_touch_team?;
+        let nearest_team = self
+            .players
+            .iter()
+            .filter(|p| p.role != PlayerRole::Goalkeeper)
+            .min_by(|a, b| {
+                self.player_snapshot_position(a)
+                    .distance(self.ball.position)
+                    .partial_cmp(
+                        &self
+                            .player_snapshot_position(b)
+                            .distance(self.ball.position),
+                    )
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.id.cmp(&b.id))
+            })
+            .map(|p| p.team);
+        if nearest_team == Some(last_touch) {
+            Some(last_touch)
+        } else {
+            None
+        }
     }
 
     fn possession_team_for_ball_sample(&self, sample: &BallPositionSample) -> Option<Team> {
@@ -36250,13 +36300,21 @@ impl WorldSnapshot {
         };
         let ball_y = self.ball.position.y;
         let directive = self.tactical_directive(me.team);
-        if me.role == PlayerRole::Goalkeeper
-            && self
-                .controlled_possession_team()
-                .or_else(|| self.possession_team())
-                != Some(me.team)
-        {
-            return self.goalkeeper_ball_goal_tracking_target(me.team);
+        if me.role == PlayerRole::Goalkeeper {
+            // The keeper only leaves its goalside ball↔goal tracking line for the upfield buildup
+            // shape when our team genuinely controls the ball. Default-on guard: a bare last-touch
+            // (a loose / contested ball we merely deflected last) no longer keeps the keeper
+            // upfield — it drops goalside. Disable with DD_SOCCER_DISABLE_GK_GOALSIDE_GUARD for the
+            // prior last-touch behaviour (byte-identical).
+            let buildup_possession = if dd_soccer_disable_gk_goalside_guard() {
+                self.controlled_possession_team()
+                    .or_else(|| self.possession_team())
+            } else {
+                self.goalkeeper_buildup_possession_team()
+            };
+            if buildup_possession != Some(me.team) {
+                return self.goalkeeper_ball_goal_tracking_target(me.team);
+            }
         }
         let role_line_bias = match me.role {
             PlayerRole::Goalkeeper => 0.10,
