@@ -26647,7 +26647,9 @@ impl WorldSnapshot {
         pass: &PendingPassSnapshot,
         current: Vec2,
     ) -> Option<(AerialDescentPlan, AerialReceptionInputs, AerialReceptionPlan)> {
-        if !pass.flight.is_aerial() {
+        if !pass.flight.is_aerial() || me.role == PlayerRole::Goalkeeper {
+            // Keepers claim crosses with the hands on a separate model; this is outfield
+            // chest/head/foot reception.
             return None;
         }
         // Only anticipate while the ball is still genuinely above the control band and
@@ -26657,12 +26659,14 @@ impl WorldSnapshot {
         }
         let apex = pending_pass_snapshot_apex_yards(pass);
         let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        // Project the descent from the CURRENT ball state (drag-aware to date), not the
+        // launch pace — a long aerial bleeds real horizontal pace in flight.
         let descent = aerial_descent_plan(
             apex,
-            pass.launch_speed_yps,
-            pass.origin,
-            pass.intended_target,
             time_aloft,
+            self.ball.position,
+            self.ball.velocity,
+            pass.intended_target,
             self.field_width,
             self.field_length,
         )?;
