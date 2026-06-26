@@ -7180,21 +7180,21 @@ impl SoccerMatch {
     /// 0.0 when the gate is off, when there is no overload, or when the ball did not go forward.
     fn overload_forward_pass_progression_bonus(&self, pass: &PendingPass, end: Vec2) -> f64 {
         let overload = self.overload_progression_weight(pass.team);
-        if overload <= 0.0 {
-            return 0.0;
-        }
-        let forward_yards = ((end.y - pass.origin.y) * pass.team.attack_dir())
-            .clamp(0.0, OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS);
-        if forward_yards <= 0.0 {
-            return 0.0;
-        }
-        forward_yards * overload_forward_pass_progression_reward_per_yard() * overload
+        let forward_yards = (end.y - pass.origin.y) * pass.team.attack_dir();
+        overload_forward_pass_progression_points(
+            forward_yards,
+            overload,
+            overload_forward_pass_progression_reward_per_yard(),
+        )
     }
 
     /// Multiplier applied to a forward pass-chain event reward, uplifting it when the chain was
     /// played into a numbers advantage. 1.0 (no change) when the gate is off or there is no overload.
     fn overload_pass_chain_event_multiplier(&self, team: Team) -> f64 {
-        1.0 + self.overload_progression_weight(team) * overload_pass_chain_event_bonus_fraction()
+        overload_pass_chain_event_multiplier_for(
+            self.overload_progression_weight(team),
+            overload_pass_chain_event_bonus_fraction(),
+        )
     }
 
     pub(crate) fn record_completed_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {

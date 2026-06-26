@@ -15986,6 +15986,31 @@ pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
     })
 }
 
+/// Pure math for the overload-weighted forward-pass bonus: the reception's forward yardage capped
+/// at [`OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS`] and scaled by the attacking overload
+/// score [0,1] and `per_yard`. 0.0 when there is no overload or no forward progress.
+pub(crate) fn overload_forward_pass_progression_points(
+    forward_yards: f64,
+    overload: f64,
+    per_yard: f64,
+) -> f64 {
+    let overload = overload.clamp(0.0, 1.0);
+    if overload <= 0.0 {
+        return 0.0;
+    }
+    let forward = forward_yards.clamp(0.0, OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS);
+    if forward <= 0.0 {
+        return 0.0;
+    }
+    forward * per_yard * overload
+}
+
+/// Pure math for the overload pass-chain event multiplier: `1 + overload * fraction`. Returns 1.0
+/// (no change) when `overload` is 0, keeping the gated-off reward path byte-identical.
+pub(crate) fn overload_pass_chain_event_multiplier_for(overload: f64, fraction: f64) -> f64 {
+    1.0 + overload.clamp(0.0, 1.0) * fraction
+}
+
 /// End-line depth at which the "outside mid attack defender" play releases its cross (see
 /// [`OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT`]). Learner/operator override via
 /// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 14-34yd window).

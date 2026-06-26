@@ -76954,3 +76954,54 @@ fn neural_snapshot_carries_progress_so_loaded_net_is_warm() {
         "loaded net must restore training progress so the value blend treats it as warm"
     );
 }
+
+#[test]
+fn overload_weighted_progression_gate_defaults_off() {
+    // The whole feature must be opt-in: with the env unset the gate is off so the reward path is
+    // byte-identical to the prior behaviour. (No other test in this binary sets the env.)
+    assert!(
+        !dd_soccer_enable_overload_weighted_progression(),
+        "DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION must default OFF"
+    );
+}
+
+#[test]
+fn overload_forward_pass_progression_points_zero_without_overload() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    // No overload (the gated-off weight) => no bonus, regardless of forward yards.
+    assert_eq!(overload_forward_pass_progression_points(20.0, 0.0, per_yard), 0.0);
+    // Overload but the ball did not go forward => no bonus (we only reward forward progression).
+    assert_eq!(overload_forward_pass_progression_points(-5.0, 1.0, per_yard), 0.0);
+    assert_eq!(overload_forward_pass_progression_points(0.0, 1.0, per_yard), 0.0);
+}
+
+#[test]
+fn overload_forward_pass_progression_points_scales_with_overload_and_caps() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    let half = overload_forward_pass_progression_points(10.0, 0.5, per_yard);
+    let full = overload_forward_pass_progression_points(10.0, 1.0, per_yard);
+    assert!((full - 10.0 * per_yard).abs() < 1e-9, "full overload => yards*per_yard");
+    assert!((half - full * 0.5).abs() < 1e-9, "bonus scales linearly in overload");
+    // Forward yardage is capped, so beyond the cap the bonus does not keep growing.
+    let at_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS,
+        1.0,
+        per_yard,
+    );
+    let beyond_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS + 25.0,
+        1.0,
+        per_yard,
+    );
+    assert!((at_cap - beyond_cap).abs() < 1e-9, "forward yardage is capped");
+}
+
+#[test]
+fn overload_pass_chain_event_multiplier_is_identity_without_overload() {
+    let fraction = OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT;
+    // Gated-off weight (overload 0) => multiplier 1.0 => the chain event reward is unchanged.
+    assert_eq!(overload_pass_chain_event_multiplier_for(0.0, fraction), 1.0);
+    // Full overload => 1 + fraction; clamped overload keeps it bounded.
+    assert!((overload_pass_chain_event_multiplier_for(1.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+    assert!((overload_pass_chain_event_multiplier_for(2.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+}
