@@ -7196,6 +7196,42 @@ impl SoccerMatch {
         }
     }
 
+    /// Attacking-overload score [0,1] for `team` from its current tactical directive — how big a
+    /// numbers advantage the team holds in the threat lane right now. Forced to 0.0 when the
+    /// overload-weighted-progression gate is OFF, so callers stay byte-identical by default.
+    fn overload_progression_weight(&self, team: Team) -> f64 {
+        if !dd_soccer_enable_overload_weighted_progression() {
+            return 0.0;
+        }
+        let score = self.central_brain.directive_for(team).attacking_overload_score;
+        if !score.is_finite() {
+            return 0.0;
+        }
+        score.clamp(0.0, 1.0)
+    }
+
+    /// Additive reward for a completed forward pass that carried the ball forward into a numbers
+    /// advantage — the forward yardage of the reception, capped, scaled by the attacking overload.
+    /// 0.0 when the gate is off, when there is no overload, or when the ball did not go forward.
+    fn overload_forward_pass_progression_bonus(&self, pass: &PendingPass, end: Vec2) -> f64 {
+        let overload = self.overload_progression_weight(pass.team);
+        let forward_yards = (end.y - pass.origin.y) * pass.team.attack_dir();
+        overload_forward_pass_progression_points(
+            forward_yards,
+            overload,
+            overload_forward_pass_progression_reward_per_yard(),
+        )
+    }
+
+    /// Multiplier applied to a forward pass-chain event reward, uplifting it when the chain was
+    /// played into a numbers advantage. 1.0 (no change) when the gate is off or there is no overload.
+    fn overload_pass_chain_event_multiplier(&self, team: Team) -> f64 {
+        overload_pass_chain_event_multiplier_for(
+            self.overload_progression_weight(team),
+            overload_pass_chain_event_bonus_fraction(),
+        )
+    }
+
     pub(crate) fn record_completed_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {
         let Some(passer) = self.players.get(pass.from) else {
             return;
@@ -7228,7 +7264,8 @@ impl SoccerMatch {
             )
             + killer_pass_reward
             + self.completed_pass_and_move_forward_reward(pass)
-            + progressive_pass_escape_reward(pass, self.ball.position);
+            + progressive_pass_escape_reward(pass, self.ball.position)
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
         if pass.is_cross {
             match pass.team {
@@ -7581,7 +7618,8 @@ impl SoccerMatch {
         {
             self.record_significant_pass_chain_rewards(
                 &chain[..2],
-                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS
+                    * self.overload_pass_chain_event_multiplier(pass.team),
                 SoccerRewardEventKind::TwoForwardPasses,
             );
         }
@@ -7590,7 +7628,8 @@ impl SoccerMatch {
             if net_forward_yards >= PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS {
                 self.record_significant_pass_chain_rewards(
                     &chain[..3],
-                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS,
+                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS
+                        * self.overload_pass_chain_event_multiplier(pass.team),
                     SoccerRewardEventKind::ThreePassForwardNetGain,
                 );
             }
@@ -17741,6 +17780,24 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1" || raw.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only
+/// one team logged a sample, so the opponent mean is undefined and the "zero-sum" term degenerates
+/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). OFF by default so the default
+/// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
+/// Read once per process.
+pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
             .map(|raw| {
                 let raw = raw.trim();
                 raw == "1" || raw.eq_ignore_ascii_case("true")

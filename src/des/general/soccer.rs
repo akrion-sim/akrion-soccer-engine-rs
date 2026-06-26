@@ -1733,6 +1733,16 @@ const PASS_AND_MOVE_NUMBERS_ADVANTAGE_REFERENCE: f64 = 3.0;
 const PASS_AND_MOVE_RUN_LANE_REFERENCE_YARDS: f64 = 14.0;
 const PASS_AND_MOVE_FORWARD_REWARD_POINTS: f64 = 6.0;
 const PASS_AND_MOVE_FORWARD_REWARD_CAP_POINTS: f64 = 8.0;
+// --- Overload-weighted progression (gated DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION) ---
+// A forward pass / forward pass-chain played while the attacking team holds a numbers advantage in
+// the threat lane (`attacking_overload_score`, see `attacking_overload_profile`) is reinforced MORE
+// than the same ball into a packed defence — teaching the policy to combine forward INTO the
+// overload (the "biggest numbers advantage" objective) rather than away from it. Every term gated
+// below is multiplied by an overload weight that is forced to 0.0 when the gate is OFF, so the
+// default path is byte-identical to the prior reward. Weights are env-overridable for PG learning.
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT: f64 = 0.10;
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS: f64 = 24.0;
+const OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT: f64 = 0.50;
 // --- Sterile vs. progressive passing WITHIN a retained possession (no turnover) ---
 // A handoff of the ball has a cost and every pass carries interception risk. A run of
 // STAGNANT_PASS_MIN_RUN+ completed passes whose ball travel never escapes this radius is
@@ -10710,6 +10720,14 @@ impl SoccerMarlTickReward {
             _ => 0.0,
         }
     }
+
+    /// Whether BOTH teams contributed at least one sample this tick. The centralized zero-sum team
+    /// component (own mean − opponent mean) is only well-defined when both means exist; with only
+    /// one team present `average_for(opponent)` silently returns 0.0, turning the "zero-sum" term
+    /// into a one-sided bonus/penalty. See [`soccer_marl_adjusted_reward`].
+    fn has_both_teams(self) -> bool {
+        self.home_count > 0 && self.away_count > 0
+    }
 }
 
 pub(crate) fn soccer_marl_tick_rewards(
@@ -10750,16 +10768,36 @@ pub(crate) fn soccer_marl_adjusted_reward(
     let Some(tick_reward) = tick_reward else {
         return intermediate;
     };
-    let own_average = tick_reward.average_for(transition.team);
-    let opponent_average = tick_reward.average_for(transition.team.other());
-    // The cooperative-credit SHARE is already folded into `intermediate` above (the
-    // `shared` blend toward `own_avg`). Re-blending `intermediate` toward `own_average` a
-    // second time would double-count the team-reward share — its effect would grow roughly
-    // quadratically in `share` — a merge artifact of stacking the two convergent shapings.
-    // "Theirs" is purely the zero-sum centralized component below, so add it to
-    // `intermediate` directly. At `share = 0` (the default) this is byte-identical.
-    let team_component = own_average - opponent_average;
+    // The "zero-sum" team component is only balanced when BOTH teams logged a sample this tick.
+    // In the ONLINE training path, drained deferred reward transitions (goal/shot/chain/turnover
+    // credit, re-queued at their ORIGINAL tick) are trained in a batch SEPARATE from their tick's
+    // 22-player cohort, so that tick often carries only the scoring team. The opponent mean then
+    // defaults to 0.0 and the term degenerates into a one-sided amplification of the sparse event
+    // reward (e.g. a +30 chain credit becomes +30·team_weight extra) — and inconsistently with the
+    // full-game-replay path, where the same transition IS grouped with its cohort. When the
+    // balanced gate is on, the team component is suppressed on such single-team ticks so the
+    // centralized signal stays genuinely zero-sum. Gate OFF (default) => byte-identical.
+    let team_component = soccer_marl_team_component(
+        tick_reward,
+        transition.team,
+        dd_soccer_enable_marl_balanced_team_component(),
+    );
     intermediate + team_component * config.sanitized_marl_team_reward_weight()
+}
+
+/// Centralized zero-sum team component for the MAPPO advantage: `own_mean − opponent_mean` over the
+/// tick. When `balanced` is set and only one team logged a sample this tick, the opponent mean is
+/// undefined (it would silently read 0.0 and make the term one-sided), so the component is 0.0 — see
+/// [`soccer_marl_adjusted_reward`]. `balanced == false` reproduces the prior (byte-identical) term.
+fn soccer_marl_team_component(
+    tick_reward: SoccerMarlTickReward,
+    team: Team,
+    balanced: bool,
+) -> f64 {
+    if balanced && !tick_reward.has_both_teams() {
+        return 0.0;
+    }
+    tick_reward.average_for(team) - tick_reward.average_for(team.other())
 }
 
 fn soccer_full_game_replay_transitions(
@@ -16239,6 +16277,70 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+}
+
+/// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
+/// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
+pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION").is_ok())
+}
+
+/// Per-yard reward for forward progress carried into a numbers advantage, scaled by the attacking
+/// overload score. Learner/operator override via `DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD`
+/// (clamped to a sane 0.0-0.5 window).
+pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 0.5))
+            .unwrap_or(OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT)
+    })
+}
+
+/// Fraction by which a forward pass-chain event reward is uplifted at full attacking overload.
+/// Learner/operator override via `DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION` (clamped 0.0-2.0).
+pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT)
+    })
+}
+
+/// Pure math for the overload-weighted forward-pass bonus: the reception's forward yardage capped
+/// at [`OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS`] and scaled by the attacking overload
+/// score [0,1] and `per_yard`. 0.0 when there is no overload or no forward progress.
+pub(crate) fn overload_forward_pass_progression_points(
+    forward_yards: f64,
+    overload: f64,
+    per_yard: f64,
+) -> f64 {
+    let overload = overload.clamp(0.0, 1.0);
+    if overload <= 0.0 {
+        return 0.0;
+    }
+    let forward = forward_yards.clamp(0.0, OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS);
+    if forward <= 0.0 {
+        return 0.0;
+    }
+    forward * per_yard * overload
+}
+
+/// Pure math for the overload pass-chain event multiplier: `1 + overload * fraction`. Returns 1.0
+/// (no change) when `overload` is 0, keeping the gated-off reward path byte-identical.
+pub(crate) fn overload_pass_chain_event_multiplier_for(overload: f64, fraction: f64) -> f64 {
+    1.0 + overload.clamp(0.0, 1.0) * fraction
 }
 
 /// End-line depth at which the "outside mid attack defender" play releases its cross (see

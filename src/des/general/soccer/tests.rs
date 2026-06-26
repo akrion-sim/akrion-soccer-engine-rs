@@ -78142,3 +78142,101 @@ fn neural_snapshot_carries_progress_so_loaded_net_is_warm() {
         "loaded net must restore training progress so the value blend treats it as warm"
     );
 }
+
+#[test]
+fn overload_weighted_progression_gate_defaults_off() {
+    // The whole feature must be opt-in: with the env unset the gate is off so the reward path is
+    // byte-identical to the prior behaviour. (No other test in this binary sets the env.)
+    assert!(
+        !dd_soccer_enable_overload_weighted_progression(),
+        "DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION must default OFF"
+    );
+}
+
+#[test]
+fn overload_forward_pass_progression_points_zero_without_overload() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    // No overload (the gated-off weight) => no bonus, regardless of forward yards.
+    assert_eq!(overload_forward_pass_progression_points(20.0, 0.0, per_yard), 0.0);
+    // Overload but the ball did not go forward => no bonus (we only reward forward progression).
+    assert_eq!(overload_forward_pass_progression_points(-5.0, 1.0, per_yard), 0.0);
+    assert_eq!(overload_forward_pass_progression_points(0.0, 1.0, per_yard), 0.0);
+}
+
+#[test]
+fn overload_forward_pass_progression_points_scales_with_overload_and_caps() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    let half = overload_forward_pass_progression_points(10.0, 0.5, per_yard);
+    let full = overload_forward_pass_progression_points(10.0, 1.0, per_yard);
+    assert!((full - 10.0 * per_yard).abs() < 1e-9, "full overload => yards*per_yard");
+    assert!((half - full * 0.5).abs() < 1e-9, "bonus scales linearly in overload");
+    // Forward yardage is capped, so beyond the cap the bonus does not keep growing.
+    let at_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS,
+        1.0,
+        per_yard,
+    );
+    let beyond_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS + 25.0,
+        1.0,
+        per_yard,
+    );
+    assert!((at_cap - beyond_cap).abs() < 1e-9, "forward yardage is capped");
+}
+
+#[test]
+fn overload_pass_chain_event_multiplier_is_identity_without_overload() {
+    let fraction = OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT;
+    // Gated-off weight (overload 0) => multiplier 1.0 => the chain event reward is unchanged.
+    assert_eq!(overload_pass_chain_event_multiplier_for(0.0, fraction), 1.0);
+    // Full overload => 1 + fraction; clamped overload keeps it bounded.
+    assert!((overload_pass_chain_event_multiplier_for(1.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+    assert!((overload_pass_chain_event_multiplier_for(2.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+}
+
+#[test]
+fn marl_balanced_team_component_default_gate_off() {
+    // The balanced-team-component fix must be opt-in so the default training run is byte-identical.
+    assert!(
+        !dd_soccer_enable_marl_balanced_team_component(),
+        "DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT must default OFF"
+    );
+}
+
+#[test]
+fn marl_team_component_balanced_only_suppresses_single_team_ticks() {
+    // A single-team tick: only the home team logged a sample (e.g. a drained deferred goal-chain
+    // credit trained apart from its 22-player cohort). The opponent mean is undefined.
+    let mut home_only = SoccerMarlTickReward::default();
+    home_only.record(Team::Home, 30.0);
+
+    // Legacy (unbalanced) behaviour: opponent mean defaults to 0.0, so the "zero-sum" term leaks
+    // the full one-sided reward — this is the bias being hardened against.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false),
+        30.0,
+        "unbalanced term leaks own reward when the opponent is absent"
+    );
+    // Balanced: a single-team tick contributes no centralized team component.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, true),
+        0.0,
+        "balanced term suppresses single-team ticks"
+    );
+}
+
+#[test]
+fn marl_team_component_unchanged_when_both_teams_present() {
+    // Both teams logged samples this tick: the team component is the genuine zero-sum difference and
+    // the balanced flag must NOT change it.
+    let mut both = SoccerMarlTickReward::default();
+    both.record(Team::Home, 4.0);
+    both.record(Team::Home, 2.0); // home mean 3.0
+    both.record(Team::Away, 1.0); // away mean 1.0
+    let unbalanced = soccer_marl_team_component(both, Team::Home, false);
+    let balanced = soccer_marl_team_component(both, Team::Home, true);
+    assert!((unbalanced - 2.0).abs() < 1e-9, "home_mean - away_mean = 3 - 1");
+    assert_eq!(unbalanced, balanced, "balanced flag is a no-op when both teams are present");
+    // Antisymmetric across teams (genuinely zero-sum) when both are present.
+    assert!((soccer_marl_team_component(both, Team::Away, true) + balanced).abs() < 1e-9);
+}
