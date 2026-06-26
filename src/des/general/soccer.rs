@@ -3006,6 +3006,12 @@ const HOLD_FOR_SUPPORT_MIN_SPACE_YARDS: f64 = 4.5;
 /// A teammate already ahead with a clean lane and at least this much space is a forward
 /// outlet NOW — so there is nothing to wait for and the gate declines (the carrier passes).
 const HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS: f64 = 3.0;
+/// ...and likewise there is nothing to WAIT for when the carrier has clear grass straight
+/// ahead to dribble into: an unpressured carrier with at least this much open forward lane
+/// drives into the space himself rather than standing on the ball to summon support (which
+/// is what made calm carriers freeze with the ball at their feet). Real carriers attack open
+/// space; the wait is for a genuinely blocked picture, not for when the road ahead is open.
+const HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS: f64 = 6.0;
 /// A summoned forward run must net at least this much ground toward goal to be worth waiting
 /// for (otherwise it is not a meaningful improvement on the current picture).
 const HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS: f64 = 5.0;

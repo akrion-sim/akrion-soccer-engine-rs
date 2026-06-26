@@ -17867,6 +17867,14 @@ fn dd_soccer_disable_hold_for_support() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT").is_ok())
 }
+/// Disables the "drive into open space instead of waiting" guard, restoring the prior
+/// hold-for-support gate (which let a calm carrier stand on the ball even with clear grass
+/// ahead). Default-off: the guard is ON so unpressured carriers attack the space.
+fn dd_soccer_disable_hold_drive_into_space() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE").is_ok())
+}
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
 /// from the real receiver controller, so moving the aim/speed off the analytic misses). Enable for
@@ -26289,6 +26297,17 @@ impl WorldSnapshot {
                 && self.pending_offside_for_pass(carrier_id, t.id).is_none()
         });
         if forward_outlet_now {
+            return None;
+        }
+        // Open road ahead? An unpressured carrier (the calm gate above already cleared any
+        // proximate defender) with clear grass straight in front should DRIVE into it, not stand
+        // on the ball to summon support. Standing still with open space ahead is exactly the
+        // freeze the user flagged — real carriers attack the space. The wait is reserved for a
+        // blocked picture (no forward lane to carry into AND no clean outlet). Gated so the prior
+        // behaviour can be restored for A/B with `DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE=1`.
+        if !dd_soccer_disable_hold_drive_into_space()
+            && self.forward_dribble_space_yards(carrier_id) >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS
+        {
             return None;
         }
         // No forward outlet now: which teammates could BECOME one with a short run / reposition?
