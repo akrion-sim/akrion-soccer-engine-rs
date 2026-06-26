@@ -39,6 +39,8 @@ const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
 // ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
 // first touch lands in real space, not under a second defender.
 const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
+// Probe cap for the defender-aware escape-lane clearance exposed on the observation.
+const FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS: f64 = 8.0;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -22019,6 +22021,7 @@ impl WorldSnapshot {
                 opposing_goalkeeper_angle_degrees: 0.0,
                 opposing_goalkeeper_out_of_position: 0.0,
                 forward_dribble_space_yards: 0.0,
+                pressured_escape_lane_yards: 0.0,
                 real_pressure: 0.0,
                 perceived_pressure: 0.0,
                 pressure_urgency: 0.0,
@@ -22737,6 +22740,11 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let pressured_escape_lane_yards = if has_ball {
+            self.pressured_escape_lane_yards(player_id)
+        } else {
+            0.0
+        };
         let aerial_forward_runner_pass_multiplier = if has_ball {
             self.aerial_forward_runner_pass_multiplier(player_id)
         } else {
@@ -23088,6 +23096,7 @@ impl WorldSnapshot {
                 .unwrap_or(0.0),
             opposing_goalkeeper_out_of_position,
             forward_dribble_space_yards,
+            pressured_escape_lane_yards,
             real_pressure,
             perceived_pressure,
             pressure_urgency,
@@ -34647,6 +34656,67 @@ impl WorldSnapshot {
             }
         }
         nearest_block
+    }
+
+    /// Defender-aware best escape-lane clearance (yards) for a pressed carrier: the largest
+    /// corridor clearance among the forward and lateral directions that lead AWAY from the nearest
+    /// opponent. Unlike the selector's pitch-edge `left_room`/`right_room`, this keys on real
+    /// opponent geometry, so it is 0 when the carrier is genuinely boxed in and large when a turn
+    /// into space is on. Exposed on the observation as `pressured_escape_lane_yards` so the decision
+    /// layer can tell "freeze (no lane)" from "move out of the feet (lane open)". No opponent within
+    /// range ⇒ wide open (returns the probe cap).
+    pub fn pressured_escape_lane_yards(&self, player_id: usize) -> f64 {
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return 0.0;
+        };
+        let opp = me.team.other();
+        let current = self.player_snapshot_position(me);
+        let Some((_, defender_pos, _)) = self.nearest_opponent_at(me.team, current) else {
+            return FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+        };
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        let away = {
+            let v = current - defender_pos;
+            if v.len() < 1e-6 {
+                forward
+            } else {
+                v.normalized()
+            }
+        };
+        let lateral_away = if away.x.abs() < 1e-6 {
+            away
+        } else {
+            Vec2::new(away.x.signum(), 0.0)
+        };
+        let dir_space = |dir: Vec2| -> f64 {
+            let cap = FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS;
+            let mut nearest = cap;
+            for o in self.players.iter().filter(|p| p.team == opp) {
+                let to = self.player_snapshot_position(o) - current;
+                let along = to.dot(dir);
+                if along <= 0.0 || along > cap {
+                    continue;
+                }
+                let lateral = (to - dir * along).len();
+                if lateral <= FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        [
+            forward,
+            (forward + lateral_away * 0.7).normalized(),
+            (forward * 0.6 + away).normalized(),
+            lateral_away,
+            away,
+        ]
+        .into_iter()
+        // Only directions that genuinely lead away from the presser count as an escape lane.
+        .filter(|dir| dir.len() > 1e-6 && dir.dot(away) > 0.0)
+        .map(dir_space)
+        .fold(0.0_f64, f64::max)
     }
 
     pub fn goal_angle_degrees(&self, position: Vec2, attacking_team: Team) -> f64 {

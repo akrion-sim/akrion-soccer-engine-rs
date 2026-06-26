@@ -5469,6 +5469,11 @@ pub struct SoccerPomdpObservation {
     pub opposing_goalkeeper_out_of_position: f64,
     #[serde(default)]
     pub forward_dribble_space_yards: f64,
+    /// Defender-aware best escape-lane clearance (yards) among the away-from-presser directions.
+    /// Distinguishes "freeze (boxed in, ~0)" from "move out of the feet (lane open)" — see
+    /// `WorldSnapshot::pressured_escape_lane_yards`. Heuristic-only (not a neural feature).
+    #[serde(default)]
+    pub pressured_escape_lane_yards: f64,
     #[serde(default)]
     pub real_pressure: f64,
     #[serde(default)]
