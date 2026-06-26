@@ -51,6 +51,9 @@ pub struct Tunables {
     pub shooting: ShootingTunables,
     /// Defensive line and back-four shape thresholds.
     pub defensive_shape: DefensiveShapeTunables,
+    /// Goalkeeper positioning shaping (resting line, alignment score, buildup
+    /// fan-out, loose-ball commit). See [`GoalkeeperTunables`].
+    pub goalkeeper: GoalkeeperTunables,
     /// Fine-grid lane/row affinity used by formation, support, and retrieval.
     pub lane_affinity: LaneAffinityTunables,
     /// Centralized lane-discipline weights (12-lane grid). Read only when
@@ -68,6 +71,7 @@ impl Default for Tunables {
             decision_mpc: DecisionMpcTunables::default(),
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
+            goalkeeper: GoalkeeperTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
         }
@@ -342,6 +346,115 @@ impl Default for DefensiveShapeTunables {
             wingback_defensive_pinch_target_seconds: 3.0,
             wingback_defensive_pinch_opponent_half_margin_yards: 8.0,
             defensive_goal_side_min_yards: 1.5,
+        }
+    }
+}
+
+/// **Goalkeeper positioning** knobs — the shaping numbers behind where the keeper
+/// rests on its ball↔goal tracking line, how its line alignment is scored, how it
+/// fans defenders out for buildup, and how confidently it commits to a loose ball.
+///
+/// These were previously bare numeric literals inside the keeper positioning
+/// functions in `world.rs` / `soccer.rs`. The defaults reproduce those historical
+/// literals exactly, so an unconfigured process is byte-identical to before this
+/// group existed; override per-field via `DD_SOCCER_TUNABLE__goalkeeper.<field>` or
+/// the Postgres tuning overlay. Hard geometry (six-yard box depth/width, leave-box
+/// confidence thresholds, line-recovery deviations) stays in the named `const`
+/// block in `soccer.rs`; this group is only the soft behavioral shaping.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalkeeperTunables {
+    // --- resting line on the ball↔goal segment (goalkeeper_ball_goal_tracking_target) ---
+    /// Ball→goal distance (yds) at which an advancing ball reaches full "ball
+    /// pressure" (keeper pushed to its max forward depth). 0 at this range, 1 at the goal.
+    pub tracking_ball_pressure_reference_yards: f64,
+    /// Holder→goal-line distance (yds) at which holder pressure saturates.
+    pub tracking_holder_pressure_reference_yards: f64,
+    /// Resting depth off the goal line (yds) with no pressure.
+    pub tracking_resting_depth_yards: f64,
+    /// Extra depth (yds) added at full ball pressure.
+    pub tracking_ball_pressure_depth_gain_yards: f64,
+    /// Extra depth (yds) added at full holder pressure.
+    pub tracking_holder_pressure_depth_gain_yards: f64,
+    /// Minimum resting depth (yds) before the genome line-height shift.
+    pub tracking_min_depth_yards: f64,
+    /// Full ± span (yds) the `gk_line_height` genome shifts the resting line (0/1 vs 0.5).
+    pub tracking_line_height_depth_span_yards: f64,
+    /// Minimum resting depth (yds) after the line-height shift.
+    pub tracking_line_height_min_depth_yards: f64,
+    /// Standoff (yds) kept short of the ball so the keeper never overruns it.
+    pub tracking_ball_standoff_yards: f64,
+
+    // --- ball↔goal line ALIGNMENT score (goalkeeper_ball_goal_line_alignment_score) ---
+    /// Perpendicular off-line distance (yds) that drops the line-alignment score by 1.0.
+    pub alignment_line_distance_reference_yards: f64,
+    /// Projection overshoot past the goal/ball endpoints that drops the projection score by 1.0.
+    pub alignment_projection_reference: f64,
+    /// Distance (yds) from the ideal tracking point that drops the depth score by 1.0.
+    pub alignment_depth_reference_yards: f64,
+    /// Weight of the on-line term in the blended alignment score.
+    pub alignment_line_weight: f64,
+    /// Weight of the projection (between-the-endpoints) term.
+    pub alignment_projection_weight: f64,
+    /// Weight of the depth (distance-to-ideal) term.
+    pub alignment_depth_weight: f64,
+
+    // --- buildup fan-out lane target (goalkeeper_buildup_lane_target_for) ---
+    /// Depth (yds) off the own goal line a WIDE defender fans out to receive a short pass.
+    pub buildup_wide_defender_depth_yards: f64,
+    /// Depth (yds) off the own goal line a CENTRAL defender fans out to.
+    pub buildup_central_defender_depth_yards: f64,
+    /// Lateral probe offset (yds) used to pick the most-open in-lane buildup spot (±this, and 0).
+    pub buildup_lane_probe_offset_yards: f64,
+
+    // --- leave-six-yard confidence blend (goalkeeper_leave_six_yard_confidence_from_times) ---
+    /// Weight of goalkeeping ability in the keeper's sweep "tool" term.
+    pub leave_confidence_goalkeeping_weight: f64,
+    /// Weight of acceleration ability in the sweep tool term.
+    pub leave_confidence_acceleration_weight: f64,
+    /// Weight of perceived-position confidence in the sweep tool term.
+    pub leave_confidence_perception_weight: f64,
+    /// Weight of the race-dominance term in the overall leave confidence.
+    pub leave_confidence_dominance_weight: f64,
+    /// Weight of the keeper-tool term in the overall leave confidence.
+    pub leave_confidence_tool_weight: f64,
+
+    // --- loose-ball commit, own-ball backpass case (goalkeeper_should_commit_to_loose_ball) ---
+    /// On a ball WE last touched (can't handle), the keeper only charges out if it beats the
+    /// nearest opponent to the ball by this fraction of the opponent's arrival time.
+    pub backpass_commit_opponent_time_fraction: f64,
+    /// ...and additionally reaches it at least this many seconds before the nearest teammate.
+    pub backpass_commit_teammate_margin_seconds: f64,
+}
+
+impl Default for GoalkeeperTunables {
+    fn default() -> Self {
+        GoalkeeperTunables {
+            tracking_ball_pressure_reference_yards: 72.0,
+            tracking_holder_pressure_reference_yards: 42.0,
+            tracking_resting_depth_yards: 3.0,
+            tracking_ball_pressure_depth_gain_yards: 3.0,
+            tracking_holder_pressure_depth_gain_yards: 1.2,
+            tracking_min_depth_yards: 2.0,
+            tracking_line_height_depth_span_yards: 2.0,
+            tracking_line_height_min_depth_yards: 1.5,
+            tracking_ball_standoff_yards: 0.85,
+            alignment_line_distance_reference_yards: 1.0,
+            alignment_projection_reference: 0.35,
+            alignment_depth_reference_yards: 4.5,
+            alignment_line_weight: 0.82,
+            alignment_projection_weight: 0.08,
+            alignment_depth_weight: 0.10,
+            buildup_wide_defender_depth_yards: 24.0,
+            buildup_central_defender_depth_yards: 18.0,
+            buildup_lane_probe_offset_yards: 4.0,
+            leave_confidence_goalkeeping_weight: 0.72,
+            leave_confidence_acceleration_weight: 0.18,
+            leave_confidence_perception_weight: 0.10,
+            leave_confidence_dominance_weight: 0.90,
+            leave_confidence_tool_weight: 0.10,
+            backpass_commit_opponent_time_fraction: 0.65,
+            backpass_commit_teammate_margin_seconds: 0.5,
         }
     }
 }

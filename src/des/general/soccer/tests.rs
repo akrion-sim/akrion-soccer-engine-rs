@@ -54177,6 +54177,102 @@ fn goalkeeper_holds_buildup_shape_for_our_pass_in_flight() {
 }
 
 #[test]
+fn goalkeeper_tunables_defaults_reproduce_historical_literals() {
+    // The GoalkeeperTunables defaults MUST equal the historical inline literals so an
+    // unconfigured process is byte-identical to before the positioning knobs were centralized.
+    let gk = GoalkeeperTunables::default();
+    assert_eq!(gk.tracking_ball_pressure_reference_yards, 72.0);
+    assert_eq!(gk.tracking_holder_pressure_reference_yards, 42.0);
+    assert_eq!(gk.tracking_resting_depth_yards, 3.0);
+    assert_eq!(gk.tracking_ball_pressure_depth_gain_yards, 3.0);
+    assert_eq!(gk.tracking_holder_pressure_depth_gain_yards, 1.2);
+    assert_eq!(gk.tracking_min_depth_yards, 2.0);
+    assert_eq!(gk.tracking_line_height_depth_span_yards, 2.0);
+    assert_eq!(gk.tracking_line_height_min_depth_yards, 1.5);
+    assert_eq!(gk.tracking_ball_standoff_yards, 0.85);
+    assert_eq!(gk.alignment_line_distance_reference_yards, 1.0);
+    assert_eq!(gk.alignment_projection_reference, 0.35);
+    assert_eq!(gk.alignment_depth_reference_yards, 4.5);
+    assert_eq!(gk.alignment_line_weight, 0.82);
+    assert_eq!(gk.alignment_projection_weight, 0.08);
+    assert_eq!(gk.alignment_depth_weight, 0.10);
+    assert_eq!(gk.buildup_wide_defender_depth_yards, 24.0);
+    assert_eq!(gk.buildup_central_defender_depth_yards, 18.0);
+    assert_eq!(gk.buildup_lane_probe_offset_yards, 4.0);
+    assert_eq!(gk.leave_confidence_goalkeeping_weight, 0.72);
+    assert_eq!(gk.leave_confidence_acceleration_weight, 0.18);
+    assert_eq!(gk.leave_confidence_perception_weight, 0.10);
+    assert_eq!(gk.leave_confidence_dominance_weight, 0.90);
+    assert_eq!(gk.leave_confidence_tool_weight, 0.10);
+    assert_eq!(gk.backpass_commit_opponent_time_fraction, 0.65);
+    assert_eq!(gk.backpass_commit_teammate_margin_seconds, 0.5);
+}
+
+#[test]
+fn goalkeeper_tracking_target_matches_historical_formula_under_default_tunables() {
+    // Reconstruct the pre-centralization inline formula from the bare literals and assert the
+    // (now tunable-driven) function reproduces it exactly for a spread of ball positions.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for &(bx, by) in &[(40.0, 40.0), (20.0, 12.0), (60.0, 80.0), (5.0, 4.0)] {
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(bx, by);
+        let snap = WorldSnapshot::from_match(&sim);
+        let got = snap.goalkeeper_ball_goal_tracking_target(Team::Home);
+
+        let goal = Vec2::new(snap.field_width * 0.5, snap.own_goal_y_for(Team::Home));
+        let to_ball = snap.ball.position - goal;
+        let ball_distance = to_ball.len();
+        let expected = if ball_distance <= 1e-9 {
+            goal.clamp_to_pitch(snap.field_width, snap.field_length)
+        } else {
+            let ball_pressure = (1.0 - ball_distance / 72.0).clamp(0.0, 1.0);
+            let raw_depth = (3.0 + ball_pressure * 3.0)
+                .clamp(2.0, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
+            let line_height = snap.genome_for(Team::Home).gk_line_height;
+            let raw_depth = (raw_depth + (line_height - 0.5) * 2.0)
+                .clamp(1.5, GOALKEEPER_SIX_YARD_LINE_MAX_DEPTH_YARDS);
+            let depth = raw_depth.min((ball_distance - 0.85).max(0.0));
+            let target = goal + to_ball.normalized() * depth;
+            let center_x = snap.field_width * 0.5;
+            let six = (snap.goal_width * 0.5 + SIX_YARD_BOX_POST_EXTENSION_YARDS)
+                .clamp(0.0, GOALKEEPER_BOX_STAY_HALF_WIDTH_YARDS);
+            Vec2::new(target.x.clamp(center_x - six, center_x + six), target.y)
+                .clamp_to_pitch(snap.field_width, snap.field_length)
+        };
+        assert!(
+            got.distance(expected) < 1e-9,
+            "default-tunable tracking target must equal the historical formula at ({bx},{by}): got={got:?} expected={expected:?}"
+        );
+    }
+}
+
+#[test]
+fn goalkeeper_positioning_survives_non_finite_ball() {
+    // A NaN ball position (e.g. a bad physics step) must not propagate NaN out of the keeper
+    // positioning / alignment scoring.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(f64::NAN, f64::NAN);
+    let snap = WorldSnapshot::from_match(&sim);
+
+    let target = snap.goalkeeper_ball_goal_tracking_target(Team::Home);
+    assert!(
+        target.x.is_finite() && target.y.is_finite(),
+        "tracking target must stay finite on a NaN ball: {target:?}"
+    );
+    let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");
+    let score = goalkeeper_ball_goal_line_alignment_score(
+        Team::Home,
+        sim.players[keeper].position,
+        &snap,
+    );
+    assert!(
+        score.is_finite(),
+        "alignment score must stay finite on a NaN ball: {score}"
+    );
+}
+
+#[test]
 fn goalkeeper_runtime_support_ignores_off_line_lp_guidance() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let keeper = sim.goalkeeper_for(Team::Home).expect("home keeper");

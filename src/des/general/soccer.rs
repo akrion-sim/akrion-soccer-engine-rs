@@ -22651,22 +22651,32 @@ fn goalkeeper_ball_goal_line_alignment_score(
         snapshot.field_width * 0.5,
         team.other().goal_y(snapshot.field_length),
     );
+    let gk = &tunables().goalkeeper;
     let ball = snapshot.ball.position;
     let ball_goal_distance = goal.distance(ball);
-    if ball_goal_distance <= 1e-9 {
+    // Non-finite (NaN) or degenerate ball: treat as perfectly aligned rather than emitting a
+    // NaN score that would corrupt the line-recovery decision downstream.
+    if !ball_goal_distance.is_finite() || ball_goal_distance <= 1e-9 {
         return 1.0;
     }
     let line_distance = segment_distance_to_point(goal, ball, player_position);
     let projection = segment_projection_factor(goal, ball, player_position);
-    let line_score = (1.0 - line_distance / 1.0).clamp(-1.0, 1.0);
+    let line_score =
+        (1.0 - line_distance / gk.alignment_line_distance_reference_yards).clamp(-1.0, 1.0);
     let projection_score = if (0.0..=1.0).contains(&projection) {
         1.0
     } else {
-        (1.0 - projection.min(0.0).abs().max((projection - 1.0).max(0.0)) / 0.35).clamp(-1.0, 1.0)
+        (1.0 - projection.min(0.0).abs().max((projection - 1.0).max(0.0))
+            / gk.alignment_projection_reference)
+            .clamp(-1.0, 1.0)
     };
     let ideal = snapshot.goalkeeper_ball_goal_tracking_target(team);
-    let depth_score = (1.0 - player_position.distance(ideal) / 4.5).clamp(-1.0, 1.0);
-    (line_score * 0.82 + projection_score * 0.08 + depth_score * 0.10).clamp(-1.0, 1.0)
+    let depth_score = (1.0 - player_position.distance(ideal) / gk.alignment_depth_reference_yards)
+        .clamp(-1.0, 1.0);
+    (line_score * gk.alignment_line_weight
+        + projection_score * gk.alignment_projection_weight
+        + depth_score * gk.alignment_depth_weight)
+        .clamp(-1.0, 1.0)
 }
 
 fn defensive_endline_depth_yards(
