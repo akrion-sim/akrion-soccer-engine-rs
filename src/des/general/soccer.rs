@@ -1181,6 +1181,9 @@ const SHORT_BACK_PASS_MAX_YARDS: f64 = 14.0;
 const FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE: f64 = 0.40;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD: f64 = 0.11;
 const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS: f64 = 3.0;
+// Probe cap normalising the defender-aware lateral escape-lane neural feature (mirrors the
+// world-side FIRST_TOUCH_ESCAPE_LANE_PROBE_CAP_YARDS).
+const FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS: f64 = 8.0;
 // Conceding a throw-in/goal-kick/corner by knocking the ball out is a turnover.
 // Penalize the offending player unless they were under heavy pressure (>=8/10),
 // where clearing it out of play is an acceptable last resort.
@@ -3567,8 +3570,15 @@ const SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_FIR
     + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM
     + SOCCER_NEURAL_PASS_AND_MOVE_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM
-    + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
+// Lateral escape-lane tail block: complements the existing first-touch-escape forward/backward
+// space features with a defender-aware LATERAL lane signal + a freeze-risk composite. Appended at
+// the very tail (after long-aerial-control) so old nets migrate by zero-padding — see
+// SOCCER_NEURAL_LEGACY_FEATURE_DIMS.
+const SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize = 2;
+const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_CONTROL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM
+    + SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -3847,6 +3857,11 @@ const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_DISTANCE + 1;
 const SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_RACE: usize =
     SOCCER_NEURAL_FEATURE_LONG_AERIAL_CONTROL_SECONDS + 1;
+// Lateral escape-lane tail block indices (appended after long-aerial-control).
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN: usize =
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK: usize =
+    SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -3945,6 +3960,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_PASS_AND_MOVE_FEATURE_DIM,
     // Same schema with pass-and-move channels, before long-aerial control channels.
     SOCCER_NEURAL_PRE_LONG_AERIAL_CONTROL_FEATURE_DIM,
+    // Same schema with long-aerial control channels, before the lateral escape-lane tail.
+    SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5734,6 +5751,11 @@ pub struct SoccerPomdpObservation {
     pub first_touch_escape_backward_space: f64,
     #[serde(default)]
     pub first_touch_escape_target_forward_yards: f64,
+    /// Defender-aware best LATERAL/forward escape-lane clearance (yards) among away-from-presser
+    /// directions — the lateral dimension the forward/backward escape signals don't cover. See
+    /// `WorldSnapshot::pressured_escape_lane_yards`.
+    #[serde(default)]
+    pub pressured_escape_lane_yards: f64,
     #[serde(default)]
     pub skill_top_speed: f64,
     #[serde(default)]
@@ -36222,6 +36244,22 @@ fn soccer_neural_transition_features_with_action(
         obs.long_aerial_control_race_advantage_seconds
             / LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS,
     );
+    // Lateral escape-lane tail: defender-aware lateral lane availability + freeze-risk composite
+    // (pressed with no easy out), complementing the forward/backward escape features above. Gated:
+    // zeroed when disabled so the appended slots contribute nothing.
+    if !dd_soccer_disable_first_touch_escape() {
+        let lane_norm = (obs.pressured_escape_lane_yards
+            / FIRST_TOUCH_ESCAPE_LANE_FEATURE_CAP_YARDS)
+            .clamp(0.0, 1.0);
+        let freeze_risk = (obs
+            .immediate_dispossession_risk
+            .max(obs.perceived_pressure)
+            .clamp(0.0, 1.0)
+            * (1.0 - lane_norm))
+            .clamp(0.0, 1.0);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN] = soccer_neural_unit(lane_norm);
+        features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK] = soccer_neural_unit(freeze_risk);
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
