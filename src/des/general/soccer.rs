@@ -917,8 +917,9 @@ const SHORT_LOFT_APEX_YARDS: f64 = 3.05; // ~9 ft (apex of a ~15yd lofted pass)
 const LOFT_APEX_PER_YARD: f64 = 0.11;
 const LOFT_APEX_MIN_YARDS: f64 = 1.6; // ~5 ft — a short clipped chip still clears a foot
 const LONG_AERIAL_CONTROL_MIN_DISTANCE_YARDS: f64 = 24.0;
-const LONG_AERIAL_FALL_CONTROL_HIGH_YARDS: f64 = 8.0 / 3.0;
-const LONG_AERIAL_FALL_CONTROL_LOW_YARDS: f64 = 5.0 / 3.0;
+// The control band (8ft top / 5ft settle) is owned by `aerial_reception`: the long-aerial
+// profile shares `AERIAL_CONTROL_BAND_TOP_YARDS` / `AERIAL_CONTROL_BAND_SWEET_YARDS` so the
+// two aerial-control paths can never drift apart (they were once duplicated as 8/3 & 5/3).
 const LONG_AERIAL_CONTROL_ENGAGE_RADIUS_YARDS: f64 = 16.0;
 const LONG_AERIAL_CONTROL_REFERENCE_DISTANCE_YARDS: f64 = 16.0;
 const LONG_AERIAL_CONTROL_REFERENCE_SECONDS: f64 = 1.2;
