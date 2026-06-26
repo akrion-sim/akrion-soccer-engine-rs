@@ -63,6 +63,8 @@ mod lane_discipline;
 pub use back_four_line::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod long_pass_run;
+pub use long_pass_run::*;
 mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
@@ -47170,6 +47172,7 @@ fn tracking_frame_to_world_snapshot(
         line_depth_head: None,
         pass_completion_head: None,
         loose_ball_commit_head: None,
+        long_pass_run_head: None,
         attack_spacing_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,

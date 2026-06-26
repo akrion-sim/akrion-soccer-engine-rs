@@ -7924,6 +7924,12 @@ impl PlayerAgent {
                 if let Some(target) = snapshot
                     .long_ball_in_behind_target(self.id)
                     .filter(|_| long_ball_in_behind_is_viable(&observation))
+                    .filter(|&t| {
+                        // Part B: a DEEP carrier only lofts the long ball to a teammate who
+                        // actually made the run — otherwise defer to the ranked decision
+                        // (keep / short outlet / dribble) instead of hoofing to nobody.
+                        snapshot.deep_long_aerial_target_is_committed_runner(self.id, t)
+                    })
                 {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
