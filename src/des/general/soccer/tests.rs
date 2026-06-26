@@ -8195,6 +8195,68 @@ fn transition_reward_infers_threaded_killer_pass_goal_channel_bonus() {
 }
 
 #[test]
+fn transition_reward_credits_pressured_lateral_escape_that_keeps_possession() {
+    // A pressed carrier with no forward gain who carries the ball AWAY from the nearest defender
+    // and keeps possession should learn MORE than the same carry that gains no cushion. This is the
+    // carry analogue of the pressure-relief PASS bonus — it credits the safe escape over freezing.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 991,
+        ..Default::default()
+    });
+    let holder = 6; // Home
+    let defender = 16; // Away
+    park_players_except(&mut sim, &[holder, defender]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    let origin = Vec2::new(40.0, 58.0);
+    sim.players[holder].position = origin;
+    sim.players[holder].home_position = origin;
+    sim.players[defender].position = Vec2::new(41.0, 58.0); // 1yd to the right: on top of the carrier
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = origin;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+
+    // Reward a lateral carry to `dest` (same y => no forward gain) that retains possession.
+    let reward_for_dest = |dest: Vec2| {
+        let mut after = before.clone();
+        after.ball.holder = Some(holder);
+        after.ball.position = dest;
+        after.ball.velocity = Vec2::zero();
+        after.set_player_position(holder, dest);
+        let mut decision = test_decision_trace(&before, holder, "carry-out-left");
+        // Under genuine pressure with the defender 1yd away on receipt.
+        decision.observation.perceived_pressure = 0.75;
+        decision.observation.pressure_urgency = 0.70;
+        decision.observation.immediate_dispossession_risk = 0.65;
+        decision.observation.nearest_opponent_distance = 1.0;
+        soccer_transition_reward(
+            &sim.players[holder],
+            &decision,
+            &before,
+            &after,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+    };
+
+    // Escape: 4yd left, away from the defender (cushion gained). Stay-put: no cushion gained.
+    let escape = reward_for_dest(Vec2::new(36.0, 58.0));
+    let stay = reward_for_dest(Vec2::new(40.0, 58.0));
+    assert!(
+        escape > stay + 0.2,
+        "a pressured lateral escape that keeps possession must learn above the no-cushion carry: \
+         escape={escape} stay={stay}"
+    );
+}
+
+#[test]
 fn transition_reward_ramps_threaded_killer_pass_as_goal_gets_closer() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -40989,6 +41051,80 @@ fn offside_geometry_uses_ball_second_last_defender_and_halfway_line() {
     assert_eq!(json["offsidePlayerY"], 108.0);
 }
 
+// Empirical proof of the law against the real rule function: across hundreds of
+// thousands of randomized whole-pitch configurations, `pending_offside_for_pass`
+// (the single chokepoint every enforcement path funnels through) must NEVER flag
+// a receiver whose frozen pass-time position sits in their own half. Fuzzing the
+// rule directly is far faster than waiting for offsides to occur in open play and
+// covers far more own-half receivers.
+#[test]
+fn rule_never_flags_a_receiver_in_their_own_half_across_randomized_snapshots() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let half = length * 0.5;
+
+    // Cheap deterministic LCG so the fuzz is reproducible.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut unit = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as f64) / ((1u64 << 31) as f64)
+    };
+
+    let mut flagged = 0usize;
+    let mut checked = 0usize;
+    let mut own_half_targets = 0usize;
+    for _ in 0..3000 {
+        for p in sim.players.iter_mut() {
+            p.position = Vec2::new(unit() * width, unit() * length);
+            p.velocity = Vec2::zero();
+        }
+        sim.ball.position = Vec2::new(unit() * width, unit() * length);
+        sim.ball.holder = None;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        for passer in 0..22usize {
+            for target in 0..22usize {
+                checked += 1;
+                if let Some(offside) = snapshot.pending_offside_for_pass(passer, target) {
+                    flagged += 1;
+                    let y = offside.position.y;
+                    match offside.team {
+                        Team::Home => {
+                            if y <= half {
+                                own_half_targets += 1;
+                            }
+                            assert!(
+                                y > half,
+                                "Home receiver flagged offside in OWN half: y={y} half={half}"
+                            );
+                        }
+                        Team::Away => {
+                            if y >= half {
+                                own_half_targets += 1;
+                            }
+                            assert!(
+                                y < half,
+                                "Away receiver flagged offside in OWN half: y={y} half={half}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        flagged > 0,
+        "fuzz produced no offside flags at all (checked {checked} pass pairs)"
+    );
+    assert_eq!(own_half_targets, 0);
+    eprintln!(
+        "checked {checked} pass pairs; {flagged} flagged offside; {own_half_targets} of them in own half"
+    );
+}
+
 #[test]
 fn ball_holder_dribble_target_beyond_line_is_not_self_offside() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -58181,10 +58317,11 @@ fn wide_final_third_carrier_commits_to_byline_drive_strategy() {
 }
 
 #[test]
-fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy() {
-    // Execution: the drive-to-corner carry fires ONLY when the team has committed to the byline
-    // drive — otherwise a wide carrier is free to cut inside as before (so this never spuriously
-    // hijacks a carry). The handoff to the cross at the corner is also checked.
+fn byline_drive_steers_the_carry_to_the_corner_under_commitment_or_solo_opt_in() {
+    // Execution: the drive-to-corner carry fires when the team has committed to the byline drive OR
+    // when an individual wide carrier opts in on his own (isolated wide, in the build-up band, with
+    // an open lane) — see `winger_byline_drive_opt_in`. Outside both it never spuriously hijacks a
+    // carry. The handoff to the cross at the corner is also checked.
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 5151,
@@ -58206,12 +58343,20 @@ fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy
             | TeamAttackStrategy::BylineCrossRightToPenaltySpot
             | TeamAttackStrategy::CrashTheBox
     );
+    let solo_opt_in = snapshot.winger_byline_drive_opt_in(carrier);
+    // Wide, in the build-up band, with an open lane (everyone else parked): the solo opt-in alone
+    // is enough to engage the drive even with no team commitment — the fix for "stalls ~30yd out".
+    assert!(
+        solo_opt_in,
+        "an isolated wide carrier in the build-up band must be able to drive the byline on his own"
+    );
     let drive = snapshot.byline_corner_drive_target_for(carrier);
-    // The execution gate exactly mirrors the committed decision: corner drive iff committed.
+    // The execution gate fires iff committed OR the individual opt-in is on.
     assert_eq!(
         drive.is_some(),
-        committed,
-        "the corner drive must fire iff the byline-drive strategy is committed (committed={committed})"
+        committed || solo_opt_in,
+        "the corner drive must fire iff committed or the solo opt-in is on \
+         (committed={committed} solo_opt_in={solo_opt_in})"
     );
     if let Some(corner) = drive {
         // When it fires, the carry heads forward-and-wide toward the left corner flag.
@@ -58235,6 +58380,70 @@ fn byline_drive_steers_the_carry_to_the_corner_only_under_the_committed_strategy
     assert!(
         at_corner.byline_corner_drive_target_for(carrier).is_none(),
         "at the corner the drive yields to the (legal, scored) flank cross"
+    );
+}
+
+#[test]
+fn winger_byline_solo_opt_in_respects_band_width_and_lane() {
+    // The solo (no team-commitment) byline opt-in is deliberately scoped so it does not hijack
+    // good central / finishing / blocked situations: it fires only for a WIDE carrier in the
+    // BUILD-UP band with an OPEN lane ahead. Lock those discriminators in.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 5151,
+        ..Default::default()
+    });
+    let carrier = 7;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    let set = |sim: &mut SoccerMatch, pos: Vec2| {
+        sim.players[carrier].position = pos;
+        sim.players[carrier].home_position = pos;
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = pos;
+        sim.ball.last_touch_team = Some(Team::Home);
+    };
+
+    // Baseline: touchline LEFT, 32yd from the byline (in the build-up band), lane clear -> opt in.
+    set(&mut sim, Vec2::new(6.0, 88.0));
+    assert!(
+        WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "touchline winger in the build-up band with an open lane should opt in"
+    );
+
+    // Too CENTRAL (not a wide attacker) -> defer to the cut-inside / goal drive.
+    set(&mut sim, Vec2::new(34.0, 88.0));
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a central carrier drives at goal, not the corner"
+    );
+
+    // Merely HALF-SPACE wide (well infield of the touchline) -> keeps the deliberate cut-inside
+    // toward goal in the approach band; only a touchline-hugging winger drives the corner.
+    set(&mut sim, Vec2::new(66.0, 88.0));
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a half-space carrier cuts inside toward goal rather than driving the corner"
+    );
+
+    // Too DEEP (inside the finishing zone) -> reserve the run to the byline for the committed drive.
+    set(&mut sim, Vec2::new(8.0, 108.0)); // 12yd from the byline
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "in the deep finishing zone, cutting inside to shoot wins over a solo corner run"
+    );
+
+    // Wide + build-up band, but the LANE is blocked by a defender straight ahead -> no reckless run.
+    set(&mut sim, Vec2::new(8.0, 88.0));
+    let blocker = sim
+        .players
+        .iter()
+        .position(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .expect("an away outfielder");
+    sim.players[blocker].position = Vec2::new(8.0, 92.0); // 4yd directly ahead, in the lane
+    assert!(
+        !WorldSnapshot::from_match(&sim).winger_byline_drive_opt_in(carrier),
+        "a defender packing the lane should suppress the solo drive"
     );
 }
 
@@ -61333,6 +61542,81 @@ fn stationary_unpressured_holder_carries_upfield_into_open_space() {
 }
 
 #[test]
+fn pressured_stationary_receiver_escapes_out_of_its_feet_instead_of_freezing() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    let marker = 14;
+    park_players_except(&mut sim, &[holder, marker]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    sim.players[holder].skills.dribbling = 6.5;
+    sim.players[holder].skills.first_touch = 6.5;
+    // Presser right on top of the carrier from the side: pressured band, but the lane
+    // away from the marker is open, so the carrier must push the ball out of its feet.
+    sim.players[marker].position = Vec2::new(41.6, 58.4);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let origin = sim.players[holder].position;
+    let marker_position = sim.players[marker].position;
+    let target = snapshot
+        .stationary_holder_open_space_carry_target_for(
+            holder,
+            origin,
+            Some(DribbleMoveKind::ProtectBall),
+            Some(DribbleTouchDecision::new(0, 1.0)),
+        )
+        .expect("a pressed stationary receiver with an open escape lane must move, not freeze");
+    assert!(
+        target.distance(origin) >= 2.0,
+        "escape must be a real step out of the feet: origin={origin:?} target={target:?}"
+    );
+    assert!(
+        target.distance(marker_position) > origin.distance(marker_position) + 1.0,
+        "escape must increase the cushion on the presser: origin={origin:?} target={target:?} marker={marker_position:?}"
+    );
+}
+
+#[test]
+fn boxed_in_pressured_receiver_keeps_the_shield() {
+    // Surround the carrier on all sides so no escape direction clears the cushion bar:
+    // the carrier is genuinely boxed in and must keep the shield, not shuffle pointlessly.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 8;
+    park_players_except(&mut sim, &[holder, 14, 15, 16, 17]);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 58.0);
+    sim.players[holder].home_position = sim.players[holder].position;
+    sim.players[holder].velocity = Vec2::zero();
+    let origin = sim.players[holder].position;
+    sim.players[14].position = origin + Vec2::new(1.7, 0.0);
+    sim.players[15].position = origin + Vec2::new(-1.7, 0.0);
+    sim.players[16].position = origin + Vec2::new(0.0, 1.7);
+    sim.players[17].position = origin + Vec2::new(0.0, -1.7);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = origin;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot
+            .stationary_holder_open_space_carry_target_for(
+                holder,
+                origin,
+                Some(DribbleMoveKind::ProtectBall),
+                Some(DribbleTouchDecision::new(0, 1.0)),
+            )
+            .is_none(),
+        "a genuinely boxed-in carrier must keep the shield (no escape lane), not shuffle"
+    );
+}
+
+#[test]
 fn player_movement_limits_acceleration_and_jerk_to_conserve_energy() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mover = 8;
@@ -62329,6 +62613,132 @@ fn force_wide_channel_pressure_steps_defender_to_inside_shoulder_and_reaches_lea
         features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER] > 0.0,
         "neural learner should directly see cover count"
     );
+}
+
+#[test]
+fn defensive_shepherd_takes_inside_shoulder_to_show_carrier_wide() {
+    // The shepherd transform should bias the presser's engage point toward the carrier's
+    // INSIDE (goal-centre) shoulder, leaving the touchline side open — so the carrier is
+    // shown wide rather than allowed straight down the middle.
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snap = WorldSnapshot::from_match(&sim);
+    let defender = 2; // Home: own goal at y≈0, attacks +y.
+    let me = snap.players.iter().find(|p| p.id == defender).unwrap();
+    let center = snap.field_width * 0.5;
+
+    // Carrier LEFT of centre, in the ~40→15yd shepherding band, with a square goal-side
+    // engage target. Inside shoulder is to the RIGHT (toward centre), so the shift is +x.
+    let carrier_l = Vec2::new(center - 12.0, 24.0);
+    let engage_l = Vec2::new(carrier_l.x, carrier_l.y - 1.0);
+    let shifted_l = snap.shepherd_show_wide_core(me, carrier_l, engage_l);
+    assert!(
+        shifted_l.x > engage_l.x + 0.25,
+        "left carrier: defender should take the inside (right) shoulder: {shifted_l:?}"
+    );
+    assert!(
+        (shifted_l.y - engage_l.y).abs() < 1e-9,
+        "shepherd is a pure lateral shift; goal-side depth must be preserved"
+    );
+    assert!(
+        shifted_l.x <= center + 1e-6,
+        "inside shoulder must not overshoot past the centre of the pitch"
+    );
+
+    // Carrier RIGHT of centre: inside shoulder is to the LEFT, so the shift is -x.
+    let carrier_r = Vec2::new(center + 12.0, 24.0);
+    let engage_r = Vec2::new(carrier_r.x, carrier_r.y - 1.0);
+    let shifted_r = snap.shepherd_show_wide_core(me, carrier_r, engage_r);
+    assert!(
+        shifted_r.x < engage_r.x - 0.25,
+        "right carrier: defender should take the inside (left) shoulder: {shifted_r:?}"
+    );
+
+    // The default-OFF gate makes the wrapper a no-op (byte-identical baseline).
+    let gated = snap.shepherd_show_wide_adjusted_target(me, carrier_l, engage_l);
+    assert_eq!(
+        gated, engage_l,
+        "with DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD unset the wrapper must not move the target"
+    );
+}
+
+#[test]
+fn defensive_shepherd_inactive_outside_band_and_tapers_when_pinned_wide() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snap = WorldSnapshot::from_match(&sim);
+    let defender = 2;
+    let me = snap.players.iter().find(|p| p.id == defender).unwrap();
+    let center = snap.field_width * 0.5;
+
+    // Beyond the far edge of the band (~40yd) the carrier is just contained: no shift.
+    let far_carrier = Vec2::new(center - 12.0, 48.0);
+    let far_engage = Vec2::new(far_carrier.x, far_carrier.y - 1.0);
+    assert_eq!(
+        snap.shepherd_show_wide_core(me, far_carrier, far_engage),
+        far_engage,
+        "outside the shepherding band the engage target is unchanged"
+    );
+
+    // A carrier already pinned against the touchline has little room to be shown wider,
+    // so the shoulder offset tapers well below a half-central carrier's at the same depth.
+    let mid_carrier = Vec2::new(center - 12.0, 22.0);
+    let mid_engage = Vec2::new(mid_carrier.x, mid_carrier.y - 1.0);
+    let mid_shift = (snap.shepherd_show_wide_core(me, mid_carrier, mid_engage).x - mid_engage.x).abs();
+
+    let wide_carrier = Vec2::new(2.0, 22.0);
+    let wide_engage = Vec2::new(wide_carrier.x, wide_carrier.y - 1.0);
+    let wide_shift =
+        (snap.shepherd_show_wide_core(me, wide_carrier, wide_engage).x - wide_engage.x).abs();
+
+    assert!(
+        wide_shift < mid_shift,
+        "a touchline-pinned carrier should be shepherded less than a half-central one: \
+         wide={wide_shift} mid={mid_shift}"
+    );
+}
+
+#[test]
+fn defensive_shepherd_end_to_end_shifts_assignment_inside_when_enabled() {
+    // End-to-end through `defensive_assignment_for`: with the gate ON the nearest presser's
+    // assignment is biased to the carrier's inside shoulder; with it OFF it squares up on the
+    // goal-side line (byte-identical baseline). Run the ON case in isolation with
+    // `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1` so the process-global gate reads true.
+    let enabled = std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    for id in 0..=10 {
+        sim.players[id].position = Vec2::new(5.0, 5.0);
+        sim.players[id].home_position = sim.players[id].position;
+    }
+    let center = WorldSnapshot::from_match(&sim).field_width * 0.5;
+    let defender = 2;
+    // Goal-side of the carrier (between it and our goal at y≈0), left of centre.
+    sim.players[defender].position = Vec2::new(center - 12.0, 18.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    let carrier = 17; // Away, fast and goal-bound inside our defensive third, left of centre.
+    sim.players[carrier].position = Vec2::new(center - 12.0, 26.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -6.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let carrier_pos =
+        snap.player_snapshot_position(snap.players.iter().find(|p| p.id == carrier).unwrap());
+    let assignment =
+        snap.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+
+    if enabled {
+        assert!(
+            assignment.x > carrier_pos.x + 0.3,
+            "shepherd ON: a left-side carrier should be shown wide — defender takes the inside \
+             (right) shoulder: assignment={assignment:?} carrier={carrier_pos:?}"
+        );
+    } else {
+        assert!(
+            assignment.x <= carrier_pos.x + CONTAIN_ENGAGE_GOAL_SIDE_YARDS + 0.3,
+            "shepherd OFF: defender squares up on the goal-side line (baseline): \
+             assignment={assignment:?} carrier={carrier_pos:?}"
+        );
+    }
 }
 
 #[test]
@@ -77578,6 +77988,33 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
 }
 
 #[test]
+fn pass_completion_head_installs_on_match_and_propagates_to_snapshot() {
+    // #4 wiring: the learner installs the carried pass-completion head on the match via
+    // `set_pass_completion_head`, and every per-tick `WorldSnapshot` shares it (Arc clone) so
+    // `pass_target_quality_for_snapshot` can consume it live. Default = none (parity).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        seed: 7,
+        ..MatchConfig::default()
+    });
+    // Consumption is opt-in: the gate must default OFF so the wiring is byte-identical until
+    // an operator flips DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION.
+    assert!(
+        !learned_pass_completion_enabled(),
+        "learned pass-completion consumption must be off by default (parity)"
+    );
+    // No head installed ⇒ the snapshot carries none (analytic estimate stands alone).
+    let before = WorldSnapshot::from_match(&sim);
+    assert!(before.pass_completion_head.is_none());
+    // Install a trained head; the snapshot must now share it.
+    sim.set_pass_completion_head(SoccerPassCompletionHead::new(3));
+    let after = WorldSnapshot::from_match(&sim);
+    assert!(
+        after.pass_completion_head.is_some(),
+        "installed head must propagate into the per-tick snapshot"
+    );
+}
+
+#[test]
 fn pass_outcome_samples_are_captured_during_play() {
     // Phase 1 (the learning substrate): resolved passes must emit labelled training samples whose
     // features are the 22+ball config embedding + pass features captured at launch.
@@ -77638,6 +78075,12 @@ fn hold_for_support_scenario() -> SoccerMatch {
     for (away, x) in (12..=21).zip(line_xs) {
         sim.players[away].position = Vec2::new(x, 95.0);
     }
+    // Block the carrier's STRAIGHT-AHEAD dribbling lane: one Away player steps into the central
+    // channel ~6yd in front (calm — outside the 4.5yd press radius — but inside the 6yd
+    // drive-into-space lane), so the picture is genuinely blocked and the answer is to wait-and-
+    // summon, not to carry. Placed off the carrier→runner diagonal so it leaves that summon lane
+    // clean. Without this, an unpressured carrier with the road open drives into the space itself.
+    sim.players[15].position = Vec2::new(37.0, 65.5);
     sim
 }
 
@@ -77690,6 +78133,24 @@ fn hold_for_support_declines_when_not_calm_on_the_ball() {
     assert!(
         snapshot.hold_for_support_option_for(6).is_none(),
         "a proximate defender should rule out the calm wait"
+    );
+}
+
+#[test]
+fn hold_for_support_declines_when_open_grass_is_ahead_to_drive_into() {
+    let mut sim = hold_for_support_scenario();
+    // Clear the central blocker so the carrier has an open forward dribbling lane again. A calm,
+    // unpressured carrier with the road open in front should DRIVE into the space rather than
+    // stand on the ball to summon support — the gate must decline (this is the freeze fix).
+    sim.players[15].position = Vec2::new(56.0, 95.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.forward_dribble_space_yards(6) >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS,
+        "scenario should leave open forward space to drive into"
+    );
+    assert!(
+        snapshot.hold_for_support_option_for(6).is_none(),
+        "open grass ahead should make the carrier drive, not wait"
     );
 }
 
@@ -77891,4 +78352,102 @@ fn neural_snapshot_carries_progress_so_loaded_net_is_warm() {
         snapshot.training_steps,
         "loaded net must restore training progress so the value blend treats it as warm"
     );
+}
+
+#[test]
+fn overload_weighted_progression_gate_defaults_off() {
+    // The whole feature must be opt-in: with the env unset the gate is off so the reward path is
+    // byte-identical to the prior behaviour. (No other test in this binary sets the env.)
+    assert!(
+        !dd_soccer_enable_overload_weighted_progression(),
+        "DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION must default OFF"
+    );
+}
+
+#[test]
+fn overload_forward_pass_progression_points_zero_without_overload() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    // No overload (the gated-off weight) => no bonus, regardless of forward yards.
+    assert_eq!(overload_forward_pass_progression_points(20.0, 0.0, per_yard), 0.0);
+    // Overload but the ball did not go forward => no bonus (we only reward forward progression).
+    assert_eq!(overload_forward_pass_progression_points(-5.0, 1.0, per_yard), 0.0);
+    assert_eq!(overload_forward_pass_progression_points(0.0, 1.0, per_yard), 0.0);
+}
+
+#[test]
+fn overload_forward_pass_progression_points_scales_with_overload_and_caps() {
+    let per_yard = OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT;
+    let half = overload_forward_pass_progression_points(10.0, 0.5, per_yard);
+    let full = overload_forward_pass_progression_points(10.0, 1.0, per_yard);
+    assert!((full - 10.0 * per_yard).abs() < 1e-9, "full overload => yards*per_yard");
+    assert!((half - full * 0.5).abs() < 1e-9, "bonus scales linearly in overload");
+    // Forward yardage is capped, so beyond the cap the bonus does not keep growing.
+    let at_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS,
+        1.0,
+        per_yard,
+    );
+    let beyond_cap = overload_forward_pass_progression_points(
+        OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS + 25.0,
+        1.0,
+        per_yard,
+    );
+    assert!((at_cap - beyond_cap).abs() < 1e-9, "forward yardage is capped");
+}
+
+#[test]
+fn overload_pass_chain_event_multiplier_is_identity_without_overload() {
+    let fraction = OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT;
+    // Gated-off weight (overload 0) => multiplier 1.0 => the chain event reward is unchanged.
+    assert_eq!(overload_pass_chain_event_multiplier_for(0.0, fraction), 1.0);
+    // Full overload => 1 + fraction; clamped overload keeps it bounded.
+    assert!((overload_pass_chain_event_multiplier_for(1.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+    assert!((overload_pass_chain_event_multiplier_for(2.0, fraction) - (1.0 + fraction)).abs() < 1e-9);
+}
+
+#[test]
+fn marl_balanced_team_component_default_gate_off() {
+    // The balanced-team-component fix must be opt-in so the default training run is byte-identical.
+    assert!(
+        !dd_soccer_enable_marl_balanced_team_component(),
+        "DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT must default OFF"
+    );
+}
+
+#[test]
+fn marl_team_component_balanced_only_suppresses_single_team_ticks() {
+    // A single-team tick: only the home team logged a sample (e.g. a drained deferred goal-chain
+    // credit trained apart from its 22-player cohort). The opponent mean is undefined.
+    let mut home_only = SoccerMarlTickReward::default();
+    home_only.record(Team::Home, 30.0);
+
+    // Legacy (unbalanced) behaviour: opponent mean defaults to 0.0, so the "zero-sum" term leaks
+    // the full one-sided reward — this is the bias being hardened against.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false),
+        30.0,
+        "unbalanced term leaks own reward when the opponent is absent"
+    );
+    // Balanced: a single-team tick contributes no centralized team component.
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, true),
+        0.0,
+        "balanced term suppresses single-team ticks"
+    );
+}
+
+#[test]
+fn marl_team_component_unchanged_when_both_teams_present() {
+    // Both teams logged samples this tick: the team component is the genuine zero-sum difference and
+    // the balanced flag must NOT change it.
+    let mut both = SoccerMarlTickReward::default();
+    both.record(Team::Home, 4.0);
+    both.record(Team::Home, 2.0); // home mean 3.0
+    both.record(Team::Away, 1.0); // away mean 1.0
+    let unbalanced = soccer_marl_team_component(both, Team::Home, false);
+    let balanced = soccer_marl_team_component(both, Team::Home, true);
+    assert!((unbalanced - 2.0).abs() < 1e-9, "home_mean - away_mean = 3 - 1");
+    assert_eq!(unbalanced, balanced, "balanced flag is a no-op when both teams are present");
+    // Antisymmetric across teams (genuinely zero-sum) when both are present.
+    assert!((soccer_marl_team_component(both, Team::Away, true) + balanced).abs() < 1e-9);
 }

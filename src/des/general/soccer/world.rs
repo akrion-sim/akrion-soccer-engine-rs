@@ -27,6 +27,18 @@ const STATIONARY_HOLDER_TARGET_EPSILON_YARDS: f64 = 0.72;
 const STATIONARY_HOLDER_CARRY_MAX_PRESSURE: f64 = 0.34;
 const STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS: f64 = 2.25;
 const STATIONARY_HOLDER_CARRY_TARGET_YARDS: f64 = 4.2;
+// First-touch escape: when a stationary receiver is under pressure (the band the calm
+// stationary-carry helper bails on) it must move the ball out of its feet rather than freeze
+// on a static shield. The escape probes a corridor this wide (half-width, yards) for clearance
+// along each candidate direction.
+const FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS: f64 = 3.0;
+// The escape only commits to a direction that actually gains this much distance from the nearest
+// presser — so the carrier never dribbles INTO the man it is escaping (and so a genuinely boxed-in
+// carrier falls through to the shield instead of a pointless shuffle).
+const FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS: f64 = 1.2;
+// ...and only into a landing spot with at least this much clearance from EVERY opponent, so the
+// first touch lands in real space, not under a second defender.
+const FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 1.6;
 const DRIBBLER_PRESSURE_ESCAPE_RADIUS_YARDS: f64 = 5.8;
 const DRIBBLER_PRESSURE_ESCAPE_TARGET_YARDS: f64 = 4.2;
 const EXPLOIT_SPACE_MIN_SCORE: f64 = 6.0;
@@ -290,7 +302,11 @@ pub struct SoccerMatch {
     /// completion; drained by the cluster learner to Postgres + [`SoccerPassCompletionHead`].
     pub(crate) pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     /// The learned pass-completion model, when present (trained from `pass_outcome_samples`).
-    pub(crate) pass_completion_head: Option<SoccerPassCompletionHead>,
+    /// Set by the learner (carried + trained across games, seeded from the Postgres corpus) so
+    /// the pass-quality assessor consumes it live; `None` ⇒ analytic completion estimate
+    /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
+    /// [`Self::line_depth_head`].
+    pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -317,6 +333,16 @@ pub struct SoccerMatch {
     pub(crate) loose_ball_commit_samples: Vec<LooseBallCommitSample>,
     /// Open loose-ball commit decisions awaiting their windowed reward.
     pub(crate) pending_loose_ball_commit: Vec<PendingLooseBallCommitDecision>,
+    /// The trained aerial-reception control head (how high to attack a dropping lofted
+    /// ball), when present. Carried + trained across games by the learner; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
+    /// Rolling RL corpus for the aerial-reception head: the descent/contest context + the
+    /// attack-height blend used + whether the ball was cleanly controlled. Collected only
+    /// while the model is enabled; empty + untouched in the default process.
+    pub(crate) aerial_reception_samples: Vec<AerialReceptionSample>,
+    /// Open aerial receptions awaiting their control outcome.
+    pub(crate) pending_aerial_reception: Vec<PendingAerialReception>,
     /// Tick at which the ball most recently became loose AND went uncontested (no
     /// player challenging it). `None` whenever the ball is held / contested. Drives
     /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
@@ -1704,6 +1730,9 @@ impl SoccerMatch {
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
+            aerial_reception_head: None,
+            aerial_reception_samples: Vec::new(),
+            pending_aerial_reception: Vec::new(),
             loose_ball_uncontested_since_tick: None,
             attack_spacing_samples: Vec::new(),
             pending_attack_spacing: Vec::new(),
@@ -6277,6 +6306,9 @@ impl SoccerMatch {
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
         self.collect_attack_spacing_rl_samples(&next_snapshot);
+        // Learnable aerial-reception control RL samples (no-op + byte-identical unless
+        // `DD_SOCCER_ENABLE_LEARNED_AERIAL_RECEPTION` is set).
+        self.collect_aerial_reception_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -7164,6 +7196,42 @@ impl SoccerMatch {
         }
     }
 
+    /// Attacking-overload score [0,1] for `team` from its current tactical directive — how big a
+    /// numbers advantage the team holds in the threat lane right now. Forced to 0.0 when the
+    /// overload-weighted-progression gate is OFF, so callers stay byte-identical by default.
+    fn overload_progression_weight(&self, team: Team) -> f64 {
+        if !dd_soccer_enable_overload_weighted_progression() {
+            return 0.0;
+        }
+        let score = self.central_brain.directive_for(team).attacking_overload_score;
+        if !score.is_finite() {
+            return 0.0;
+        }
+        score.clamp(0.0, 1.0)
+    }
+
+    /// Additive reward for a completed forward pass that carried the ball forward into a numbers
+    /// advantage — the forward yardage of the reception, capped, scaled by the attacking overload.
+    /// 0.0 when the gate is off, when there is no overload, or when the ball did not go forward.
+    fn overload_forward_pass_progression_bonus(&self, pass: &PendingPass, end: Vec2) -> f64 {
+        let overload = self.overload_progression_weight(pass.team);
+        let forward_yards = (end.y - pass.origin.y) * pass.team.attack_dir();
+        overload_forward_pass_progression_points(
+            forward_yards,
+            overload,
+            overload_forward_pass_progression_reward_per_yard(),
+        )
+    }
+
+    /// Multiplier applied to a forward pass-chain event reward, uplifting it when the chain was
+    /// played into a numbers advantage. 1.0 (no change) when the gate is off or there is no overload.
+    fn overload_pass_chain_event_multiplier(&self, team: Team) -> f64 {
+        overload_pass_chain_event_multiplier_for(
+            self.overload_progression_weight(team),
+            overload_pass_chain_event_bonus_fraction(),
+        )
+    }
+
     pub(crate) fn record_completed_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {
         let Some(passer) = self.players.get(pass.from) else {
             return;
@@ -7196,7 +7264,8 @@ impl SoccerMatch {
             )
             + killer_pass_reward
             + self.completed_pass_and_move_forward_reward(pass)
-            + progressive_pass_escape_reward(pass, self.ball.position);
+            + progressive_pass_escape_reward(pass, self.ball.position)
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
         if pass.is_cross {
             match pass.team {
@@ -7549,7 +7618,8 @@ impl SoccerMatch {
         {
             self.record_significant_pass_chain_rewards(
                 &chain[..2],
-                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+                PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS
+                    * self.overload_pass_chain_event_multiplier(pass.team),
                 SoccerRewardEventKind::TwoForwardPasses,
             );
         }
@@ -7558,7 +7628,8 @@ impl SoccerMatch {
             if net_forward_yards >= PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS {
                 self.record_significant_pass_chain_rewards(
                     &chain[..3],
-                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS,
+                    PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS
+                        * self.overload_pass_chain_event_multiplier(pass.team),
                     SoccerRewardEventKind::ThreePassForwardNetGain,
                 );
             }
@@ -17056,6 +17127,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// The trained pass-completion head, carried from the match for live consumption in
+    /// `pass_target_quality_for_snapshot`. `None` ⇒ analytic completion estimate (parity).
+    /// Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// The trained loose-ball commit head, carried from the match for live
     /// consumption in the retriever election. `None` ⇒ analytic seed (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
@@ -17067,6 +17143,11 @@ pub struct WorldSnapshot {
     /// Default = None).
     #[serde(skip)]
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Carried from the match for live consumption in the aerial-reception decision: how
+    /// high to attack a dropping lofted ball. `None` ⇒ analytic seed (parity). Skipped by
+    /// serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
     /// Carried from the match: the tick the loose ball last went uncontested (see
     /// `SoccerMatch::loose_ball_uncontested_since_tick`). `None` ⇒ not loose /
     /// contested. Read by the urgency override so a stale loose ball is attacked.
@@ -17747,6 +17828,24 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
     })
 }
 
+/// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only
+/// one team logged a sample, so the opponent mean is undefined and the "zero-sum" term degenerates
+/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). OFF by default so the default
+/// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
+/// Read once per process.
+pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1" || raw.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
 // goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
 // up rather than turning and chasing their own goal under a ball that is going the other
@@ -17783,6 +17882,20 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR").is_ok())
 }
+/// Defensive shepherding ("show one way"). Gated, default OFF = byte-identical for clean A/B.
+/// When ON, the single nearest defender pressing an opponent carrier in our own half does not
+/// just meet the ball square on the goal-side line: it approaches on a curved angle so its body
+/// takes the carrier's inside (goal-centre) shoulder, cutting the central / goal-bound route and
+/// SHOWING the carrier toward the nearer touchline (and, all else equal, toward our covering
+/// defender). This is the real-soccer answer to "don't back off forever" — the carrier driving
+/// from ~40 to ~15yd is jockeyed wide into low-value space instead of being allowed straight down
+/// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
+/// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
+fn dd_soccer_enable_defensive_shepherd() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+}
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -17811,6 +17924,16 @@ fn dd_soccer_disable_byline_drive_to_corner() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BYLINE_DRIVE_TO_CORNER").is_ok())
+}
+/// Individual winger "drive the byline" opt-in. ON by default: a wide carrier isolated wide with a
+/// clear lane drives for the corner flag (then crosses) ON HIS OWN — without waiting for the team
+/// strategy selector to commit to a byline-cross strategy — instead of stalling ~30yd out. Set
+/// `DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION=1` to restore the team-commitment-only behaviour
+/// (A/B / parity). See `winger_byline_drive_opt_in`.
+fn dd_soccer_disable_winger_byline_option() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
 }
 /// "Show for the ball" boost. ON by default: a teammate that can break into a clean, passable
 /// pocket near the carrier values that outlet markedly more (rewarding forward outlets most), so
@@ -18036,6 +18159,25 @@ fn dd_soccer_disable_hold_for_support() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT").is_ok())
+}
+/// Disables the "drive into open space instead of waiting" guard, restoring the prior
+/// hold-for-support gate (which let a calm carrier stand on the ball even with clear grass
+/// ahead). Default-off: the guard is ON so unpressured carriers attack the space.
+fn dd_soccer_disable_hold_drive_into_space() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE").is_ok())
+}
+/// Disables the "first-touch escape under pressure" mechanic, restoring the prior behaviour where a
+/// stationary carrier under pressure stays put on a static shield (the freeze the user flagged).
+/// Default-off: the escape is ON, so a pressed stationary receiver pushes the ball out of its feet
+/// into the safest available space (forward into a clear lane if there is one, else lateral away
+/// from the presser, else — for defenders / own-third carriers — a safe backward outlet). When no
+/// direction clears the cushion bar the carrier is genuinely boxed in and the shield is retained.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
 /// MPC pass execution is implemented and wired in, but DEFAULT-OFF: measured it regresses
 /// completion vs the empirically-tuned analytic lead (the point-mass receiver prediction diverges
@@ -18564,8 +18706,10 @@ impl WorldSnapshot {
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             line_depth_head: m.line_depth_head.clone(),
+            pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
+            aerial_reception_head: m.aerial_reception_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
@@ -20018,8 +20162,16 @@ impl WorldSnapshot {
             );
         let predicted_ball =
             finite_pitch_point(self.predicted_ball_position(lookahead), width, length, ball_position);
+        let lane_discipline_v2 = lane_discipline::lane_discipline_v2_enabled();
         let lane_match = |a: usize, b: usize| -> f64 {
-            (1.0 - a.abs_diff(b) as f64 / lane_tunables.lane_match_span_lanes).clamp(0.0, 1.0)
+            if lane_discipline_v2 {
+                // Yard-based: a same-size lane gap means the same lateral distance
+                // regardless of how many lanes the grid is sliced into.
+                lane_discipline::lane_match(a, b, width)
+            } else {
+                // Legacy path stays byte-identical to the `lane_affinity`-tuned baseline.
+                (1.0 - a.abs_diff(b) as f64 / lane_tunables.lane_match_span_lanes).clamp(0.0, 1.0)
+            }
         };
         let row_match = |a: usize, b: usize| -> f64 {
             (1.0 - a.abs_diff(b) as f64 / lane_tunables.row_match_span_rows).clamp(0.0, 1.0)
@@ -20094,7 +20246,9 @@ impl WorldSnapshot {
                 + flow_score * lane_tunables.role_flow_weight
                 + field_config_score * lane_tunables.role_field_config_weight
         };
-        (lane_score * possession_factor).clamp(0.0, 1.0)
+        // Global lane-discipline strength: the one knob every consumer of this
+        // affinity feels (1.0 / identity when v2 is off).
+        (lane_score * possession_factor * lane_discipline::strength()).clamp(0.0, 1.0)
     }
 
     fn lane_biased_player_target_score(
@@ -20119,8 +20273,11 @@ impl WorldSnapshot {
         if fit.commitment <= 1e-9 {
             return 0.0;
         }
-        (1.0 - fit.affinity_score) * (3.4 + fit.commitment * 5.6)
-            + fit.deviation_yards * 0.070 * fit.commitment
+        // Scaled by the global lane-discipline strength (identity when v2 is off),
+        // so one knob moves this penalty in lockstep with the affinity bonus.
+        ((1.0 - fit.affinity_score) * (3.4 + fit.commitment * 5.6)
+            + fit.deviation_yards * 0.070 * fit.commitment)
+            * lane_discipline::strength()
     }
 
     fn offensive_high_speed_run_relief(&self, player: &PlayerSnapshot, target: Vec2) -> f64 {
@@ -21525,6 +21682,147 @@ impl WorldSnapshot {
             (contain_target + (engage - contain_target) * stepup_fraction)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
+    }
+
+    /// Defensive shepherding / "show one way" (gated; `dd_soccer_enable_defensive_shepherd`).
+    ///
+    /// Transforms the lone presser's already-computed engage target so the defender approaches
+    /// on a curved angle and takes the carrier's INSIDE (goal-centre) shoulder, cutting the
+    /// central / goal-bound lane and showing the carrier toward the nearer touchline — the real
+    /// answer to "stop backing off and let them dribble down the middle". Pure lateral shift
+    /// (keeps the engage target's goal-side depth), so the defender stays goal-side while
+    /// jockeying the carrier wide. Strength ramps over the ~40→15yd band, is strongest for a
+    /// carrier in the central danger lane, eases on top of the box (square up to deny the shot),
+    /// and tapers to nothing once the carrier is already pinned against a touchline. No-op unless
+    /// the gate is on; only ever called for the single nearest presser, so the block keeps shape.
+    pub(crate) fn shepherd_show_wide_adjusted_target(
+        &self,
+        me: &PlayerSnapshot,
+        carrier: Vec2,
+        engage_target: Vec2,
+    ) -> Vec2 {
+        if !dd_soccer_enable_defensive_shepherd() {
+            return engage_target;
+        }
+        self.shepherd_show_wide_core(me, carrier, engage_target)
+    }
+
+    /// Gate-free shepherding math (see [`Self::shepherd_show_wide_adjusted_target`]). Split out so
+    /// it is directly unit-testable without the process-global env gate; returns `engage_target`
+    /// unchanged whenever shepherding does not apply (outside the band / pinned wide).
+    pub(crate) fn shepherd_show_wide_core(
+        &self,
+        me: &PlayerSnapshot,
+        carrier: Vec2,
+        engage_target: Vec2,
+    ) -> Vec2 {
+        // Active only while the carrier is in front of our goal within the shepherding band.
+        let goal_distance = (carrier.y - self.own_goal_y_for(me.team)).abs();
+        if !goal_distance.is_finite() || goal_distance > SHEPHERD_BAND_FAR_YARDS {
+            return engage_target;
+        }
+        // Band weight: 0 at ~40yd, ramping to full at ~15yd, then relaxing toward a holding
+        // value once on top of the box (you square up to deny the central shot rather than
+        // keep showing wide).
+        let band_span = (SHEPHERD_BAND_FAR_YARDS - SHEPHERD_BAND_NEAR_YARDS).max(1e-6);
+        let band_weight = if goal_distance >= SHEPHERD_BAND_NEAR_YARDS {
+            ((SHEPHERD_BAND_FAR_YARDS - goal_distance) / band_span).clamp(0.0, 1.0)
+        } else {
+            // Inside the near edge: ease from full down to the box-relax floor at the 6yd depth.
+            let inner_span = (SHEPHERD_BAND_NEAR_YARDS - OWN_GOAL_PRESS_FULL_YARDS).max(1e-6);
+            let t = ((SHEPHERD_BAND_NEAR_YARDS - goal_distance) / inner_span).clamp(0.0, 1.0);
+            1.0 - t * (1.0 - SHEPHERD_BOX_RELAX_FRACTION)
+        };
+        if band_weight <= 1e-3 {
+            return engage_target;
+        }
+
+        let center_x = self.field_width * 0.5;
+        let lateral_off = carrier.x - center_x; // >0 ⇒ carrier is right of centre.
+        // `show_dir`: the touchline direction we want to force the carrier toward.
+        let central_deadzone = 1.5_f64;
+        let show_dir = if lateral_off.abs() >= central_deadzone {
+            // Off-centre: show them toward the touchline they are already nearer to.
+            lateral_off.signum()
+        } else {
+            // Dead-central: commit them the way they are already leaning, else toward our
+            // covering teammate's side (shepherd into support), else a deterministic default.
+            let carrier_vel_x = self
+                .ball
+                .holder
+                .and_then(|h| self.player_velocity(h))
+                .map(|v| v.x)
+                .unwrap_or(0.0);
+            if carrier_vel_x.abs() > 0.25 {
+                carrier_vel_x.signum()
+            } else {
+                self.shepherd_cover_side(me, carrier).unwrap_or(1.0)
+            }
+        };
+        // Defender takes the shoulder on the OPPOSITE side from where we show — i.e. the
+        // inside (goal-centre) shoulder — so the open path is toward the touchline.
+        let shoulder_sign = -show_dir;
+
+        // How central the carrier is (1 in the danger lane, tapering to a floor when wide):
+        // a wide carrier still gets the inside cut denied, just less aggressively.
+        let central01 =
+            (1.0 - lateral_off.abs() / SHEPHERD_CENTRAL_LANE_HALF_WIDTH_YARDS).clamp(0.0, 1.0);
+        let central_weight = 0.4 + 0.6 * central01;
+        // Don't shove the carrier past the touchline once they are already pinned wide.
+        let room_to_show = if show_dir > 0.0 {
+            self.field_width - carrier.x
+        } else {
+            carrier.x
+        };
+        let wide_taper = (room_to_show / SHEPHERD_TOUCHLINE_MARGIN_YARDS).clamp(0.0, 1.0);
+
+        let shoulder_mag = SHEPHERD_SHOULDER_YARDS * band_weight * central_weight * wide_taper;
+        if shoulder_mag <= 1e-3 {
+            return engage_target;
+        }
+        Vec2::new(engage_target.x + shoulder_sign * shoulder_mag, engage_target.y)
+            .clamp_to_pitch(self.field_width, self.field_length)
+    }
+
+    /// Position of the opponent ball-holder, from the perspective of a defending `team`.
+    /// `None` when nobody holds the ball or our own team has it.
+    fn opponent_holder_position_for(&self, team: Team) -> Option<Vec2> {
+        let holder_id = self.ball.holder?;
+        let holder = self
+            .players
+            .iter()
+            .find(|p| p.id == holder_id && p.team != team)?;
+        Some(self.player_snapshot_position(holder))
+    }
+
+    /// Lateral side (sign of x relative to the carrier) of our nearest covering teammate behind
+    /// the line of the carrier — used as the dead-central shepherd tiebreak so we show the
+    /// carrier toward where we already have support. `None` when no useful cover is found.
+    fn shepherd_cover_side(&self, me: &PlayerSnapshot, carrier: Vec2) -> Option<f64> {
+        let attack_dir = me.team.attack_dir();
+        let mut best: Option<(f64, f64)> = None; // (distance, side)
+        for t in self.players.iter() {
+            if t.team != me.team || t.id == me.id || t.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let tp = self.player_snapshot_position(t);
+            // Goal-side of the carrier (between the carrier and our goal) within cover range.
+            if (tp.y - carrier.y) * attack_dir < 0.5 {
+                continue;
+            }
+            let d = tp.distance(carrier);
+            if d > CARRIER_COVER_RADIUS_YARDS {
+                continue;
+            }
+            let dx = tp.x - carrier.x;
+            if dx.abs() < 0.5 {
+                continue;
+            }
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, dx.signum()));
+            }
+        }
+        best.map(|(_, side)| side)
     }
 
     fn own_goal_depth_yards_for(&self, team: Team, p: Vec2) -> f64 {
@@ -26614,6 +26912,17 @@ impl WorldSnapshot {
         if forward_outlet_now {
             return None;
         }
+        // Open road ahead? An unpressured carrier (the calm gate above already cleared any
+        // proximate defender) with clear grass straight in front should DRIVE into it, not stand
+        // on the ball to summon support. Standing still with open space ahead is exactly the
+        // freeze the user flagged — real carriers attack the space. The wait is reserved for a
+        // blocked picture (no forward lane to carry into AND no clean outlet). Gated so the prior
+        // behaviour can be restored for A/B with `DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE=1`.
+        if !dd_soccer_disable_hold_drive_into_space()
+            && self.forward_dribble_space_yards(carrier_id) >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS
+        {
+            return None;
+        }
         // No forward outlet now: which teammates could BECOME one with a short run / reposition?
         let onside_cap_y = self
             .second_last_defender_line_for(carrier.team)
@@ -27012,6 +27321,73 @@ impl WorldSnapshot {
         }
     }
 
+    /// Descent-aware reception plan for `me` meeting the in-flight lofted `pass`:
+    /// anticipate where the ball drops into the control band (~8ft→5ft) and make the
+    /// MDP/POMDP attack decision (settle under it / attack it high / chase the drop).
+    /// `None` when the pass is not a genuine loft, the ball is already in the control
+    /// band (the normal flat election meets it), or the descent geometry is degenerate.
+    pub(crate) fn aerial_reception_plan_for(
+        &self,
+        me: &PlayerSnapshot,
+        pass: &PendingPassSnapshot,
+        current: Vec2,
+    ) -> Option<AerialReceptionPlan> {
+        self.aerial_reception_resolve(me, pass, current)
+            .map(|(_, _, plan)| plan)
+    }
+
+    /// The full resolved aerial reception: the descent geometry, the kinematic/contest
+    /// inputs, and the chosen plan. `aerial_reception_plan_for` returns just the plan for
+    /// the live decision; the RL sampler also reads the descent + inputs to build the
+    /// learning context. `None` per `aerial_reception_plan_for`'s conditions.
+    pub(crate) fn aerial_reception_resolve(
+        &self,
+        me: &PlayerSnapshot,
+        pass: &PendingPassSnapshot,
+        current: Vec2,
+    ) -> Option<(AerialDescentPlan, AerialReceptionInputs, AerialReceptionPlan)> {
+        if !pass.flight.is_aerial() {
+            return None;
+        }
+        // Only anticipate while the ball is still genuinely above the control band and
+        // descending; once it is already in reach the normal control/flat election meets it.
+        if self.ball.altitude_yards <= AERIAL_CONTROL_BAND_TOP_YARDS {
+            return None;
+        }
+        let apex = pending_pass_snapshot_apex_yards(pass);
+        let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        let descent = aerial_descent_plan(
+            apex,
+            pass.launch_speed_yps,
+            pass.origin,
+            pass.intended_target,
+            time_aloft,
+            self.field_width,
+            self.field_length,
+        )?;
+        let receiver_speed = player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+            * MovementGait::Sprint.speed_multiplier();
+        let inputs = AerialReceptionInputs {
+            receiver_speed_yps: receiver_speed,
+            receiver_position: current,
+            opponent_time_to_drop: self
+                .nearest_opponent_arrival_time_to(me.team, descent.settle_point),
+            opponent_distance_to_drop: self
+                .nearest_opponent_distance_at(me.team, descent.settle_point),
+            aerial_tool: aerial_duel_skill_from_snapshot(me),
+            first_touch_tool: ability01(me.skills.first_touch),
+        };
+        let plan = decide_aerial_reception(
+            &descent,
+            &inputs,
+            self.aerial_reception_head.as_deref(),
+            self.field_width,
+            self.field_length,
+        );
+        Some((descent, inputs, plan))
+    }
+
     pub(crate) fn pending_pass_reception_target_for(
         &self,
         player_id: usize,
@@ -27071,7 +27447,20 @@ impl WorldSnapshot {
             (self.ball.position + self.ball.velocity * lead_seconds)
                 .clamp_to_pitch(self.field_width, self.field_length)
         };
-        let target = if self.ball.velocity.len() > 0.25 {
+        // Long aerial pass: anticipate the descent (read the arc) and make the MDP/POMDP attack
+        // decision, instead of the flat horizontal projection below (which camps under a ball
+        // still sailing overhead). Gated default-ON; the disable env restores the flat election
+        // byte-for-byte. When a descent plan fires we use its target directly; otherwise the
+        // velocity-projection loop below (which folds in the long_aerial_control window) elects
+        // the meeting point — the two aerial paths stay mutually exclusive.
+        let aerial_plan = if aerial_reception_anticipation_enabled() {
+            self.aerial_reception_plan_for(me, pass, current)
+        } else {
+            None
+        };
+        let target = if let Some(plan) = aerial_plan {
+            plan.target
+        } else if self.ball.velocity.len() > 0.25 {
             let remaining_ball_path = self.ball.position.distance(pass.intended_target);
             let ball_time_to_target = (remaining_ball_path / self.ball.velocity.len().max(0.25))
                 .clamp(0.12, if pressured_reception { 0.85 } else { 1.35 });
@@ -27159,7 +27548,8 @@ impl WorldSnapshot {
             || long_aerial_control.attack_score >= 0.30
             || defender_can_contest
             || moving_pass_needs_attack
-            || bound_one_two_wall;
+            || bound_one_two_wall
+            || aerial_plan.map(|p| p.sprint).unwrap_or(false);
         Some((target, sprint))
     }
 
@@ -31794,21 +32184,35 @@ impl WorldSnapshot {
             return false;
         }
         let strategy = self.tactical_directive(player.team).attack_strategy;
-        if !is_byline_cross_drive_strategy(strategy) {
+        let team_byline = is_byline_cross_drive_strategy(strategy);
+        // Individual winger opt-in: a wide carrier executes the byline drive on his own even when
+        // the team directive has NOT committed to a byline-cross strategy (see
+        // `winger_byline_drive_opt_in`), so the moving-phase flag (no central pull, corner steering)
+        // engages for him too. Short-circuits to the team path when the team has committed, leaving
+        // that path byte-identical.
+        let solo_opt_in = !team_byline && self.winger_byline_drive_opt_in(player_id);
+        if !team_byline && !solo_opt_in {
             return false;
         }
         let current = self.player_snapshot_position(player);
         let attack_dir = player.team.attack_dir();
         let in_opposition_half = (current.y - self.field_length * 0.5) * attack_dir > 0.0;
         let on_wing = flank_lane_score(current, self.field_width) >= 0.30;
-        let on_strategy_side = match strategy {
-            TeamAttackStrategy::BylineCrossLeftToPenaltySpot
-            | TeamAttackStrategy::OutsideMidAttackDefenderLeft => current.x < self.field_width * 0.5,
-            TeamAttackStrategy::BylineCrossRightToPenaltySpot
-            | TeamAttackStrategy::OutsideMidAttackDefenderRight => {
-                current.x > self.field_width * 0.5
+        let on_strategy_side = if solo_opt_in {
+            // The solo carrier is on his own wing by construction (the opt-in requires flank width).
+            true
+        } else {
+            match strategy {
+                TeamAttackStrategy::BylineCrossLeftToPenaltySpot
+                | TeamAttackStrategy::OutsideMidAttackDefenderLeft => {
+                    current.x < self.field_width * 0.5
+                }
+                TeamAttackStrategy::BylineCrossRightToPenaltySpot
+                | TeamAttackStrategy::OutsideMidAttackDefenderRight => {
+                    current.x > self.field_width * 0.5
+                }
+                _ => false,
             }
-            _ => false,
         };
         // The outside-mid take-on shares the byline release by default, but the operator/learner
         // can still train an earlier cross window via `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS`.
@@ -31819,6 +32223,58 @@ impl WorldSnapshot {
         };
         let endline_depth = (player.team.goal_y(self.field_length) - current.y).abs();
         in_opposition_half && on_wing && on_strategy_side && endline_depth > release_depth
+    }
+
+    /// Individual "drive the byline" opt-in for a wide carrier, DECOUPLED from the team-level
+    /// byline-cross strategy commitment. Returns true when a winger (wide mid / wide forward) is
+    /// the carrier, advanced and wide in the opponent half, inside the byline activation window,
+    /// with a genuinely open lane ahead — so he drives for the corner flag (then crosses) on his
+    /// own instead of stalling ~30yd out waiting for the strategy selector to commit. The
+    /// team-committed drive is vetted by the selector; this solo path bypasses it, so it carries
+    /// its own clearance guard. ON by default; gated by `dd_soccer_disable_winger_byline_option`.
+    pub(crate) fn winger_byline_drive_opt_in(&self, player_id: usize) -> bool {
+        if dd_soccer_disable_winger_byline_option() {
+            return false;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return false;
+        };
+        // The carrier in possession, and a wide attacking player (wide mid or wide forward).
+        if self.ball.holder != Some(player_id)
+            || self.possession_team() != Some(me.team)
+            || me.role == PlayerRole::Goalkeeper
+            || !(self.is_wide_midfielder(me) || self.is_wide_attacker(me))
+        {
+            return false;
+        }
+        let pos = self.player_snapshot_position(me);
+        let attack_dir = me.team.attack_dir();
+        // Attacking, in the opponent half.
+        if (pos.y - self.field_length * 0.5) * attack_dir <= 0.0 {
+            return false;
+        }
+        // BUILD-UP band only: from the activation reach in to the deep-finishing floor. Outside the
+        // finishing zone (where cutting inside to shoot / a goalmouth carry is the better individual
+        // play) — this is the band where a winger otherwise stalls ~30yd out instead of driving.
+        // The deeper run all the way to the byline stays reserved for the team-committed drive.
+        let goal_y = me.team.goal_y(self.field_length);
+        let yards_to_byline = (goal_y - pos.y).abs();
+        if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
+            || yards_to_byline < WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
+        {
+            return false;
+        }
+        // Reserved for a genuinely TOUCHLINE-HUGGING winger — the player actually positioned to
+        // drive the corner flag. A merely half-space-wide carrier keeps the deliberate "cut inside
+        // toward goal in the approach band" behaviour, which is the better play from there.
+        let touchline_distance = pos.x.min(self.field_width - pos.x);
+        if touchline_distance > WINGER_BYLINE_MAX_TOUCHLINE_DISTANCE_YARDS {
+            return false;
+        }
+        // A sound option, not a reckless run: only opt in when there is a genuinely open lane to
+        // drive into. This is exactly the situation where a winger otherwise stalls ~30yd out with
+        // the ball at his feet instead of carrying for the corner.
+        self.forward_dribble_space_yards(player_id) >= WINGER_BYLINE_MIN_DRIVE_SPACE_YARDS
     }
 
     fn wingback_attacking_cover_count(&self, player: &PlayerSnapshot) -> usize {
@@ -34023,7 +34479,7 @@ impl WorldSnapshot {
         ) {
             return base_direction;
         }
-        let Some((_, defender_pos, defender_distance)) = nearest_defender else {
+        let Some((defender_id, defender_pos, defender_distance)) = nearest_defender else {
             return base_direction;
         };
         let away = current - defender_pos;
@@ -34031,6 +34487,18 @@ impl WorldSnapshot {
             return base_direction;
         }
         let away = away.normalized();
+        // "If the opponent is moving away it's ok": when the nearest defender is RECEDING
+        // (the gap is opening), don't bend the carry away from it — let the carrier drive
+        // straight forward into the space it is vacating, fast. (`away` points from the
+        // defender toward the carrier, so a positive separation rate = gap widening.)
+        if !dd_soccer_disable_dribble_cushion_discipline() {
+            let defender_velocity = self.player_velocity(defender_id).unwrap_or(Vec2::zero());
+            let separation_rate = (player.velocity - defender_velocity).dot(away);
+            let closing_rate = -separation_rate;
+            if closing_rate <= DRIBBLE_OPPONENT_RECEDING_YPS {
+                return base_direction;
+            }
+        }
         let yards_to_goal = (player.team.goal_y(self.field_length) - current.y).abs();
         if player.role == PlayerRole::Defender {
             if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL
@@ -34164,6 +34632,130 @@ impl WorldSnapshot {
         (straight * (1.0 - goal_blend) + to_goal * goal_blend).normalized()
     }
 
+    /// A pressed, stationary receiver must get the ball out of its feet rather than freeze on a
+    /// static shield. Returns the best escape carry target — forward into a clear lane when one
+    /// exists, otherwise lateral away from the presser, otherwise (for defenders / own-third
+    /// carriers only) a safe backward outlet — or `None` when the carrier is genuinely boxed in
+    /// (no direction both gains a cushion on the presser and lands in real space), in which case
+    /// the caller keeps the existing shield. Gated; `None` when disabled so OFF is byte-identical.
+    ///
+    /// Never returns a target toward the presser: every candidate must INCREASE distance from the
+    /// nearest opponent by [`FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS`], so this can only push the
+    /// carrier into space, never dribble it into the tackle.
+    fn first_touch_escape_carry_target_for(
+        &self,
+        me: &PlayerSnapshot,
+        current: Vec2,
+        kind: Option<DribbleMoveKind>,
+    ) -> Option<Vec2> {
+        if dd_soccer_disable_first_touch_escape() {
+            return None;
+        }
+        // Nutmeg / xavi-turn are themselves close-control evasive moves with their own geometry —
+        // don't second-guess them with a carry redirect.
+        if matches!(kind, Some(DribbleMoveKind::Nutmeg | DribbleMoveKind::XaviTurn)) {
+            return None;
+        }
+        let opp = me.team.other();
+        let (_, defender_pos, _) = self.nearest_opponent_at(me.team, current)?;
+        let attack_dir = me.team.attack_dir();
+        let forward = Vec2::new(0.0, attack_dir);
+        // Unit vector pointing away from the presser (the safe side to shield/escape toward).
+        let away = {
+            let v = current - defender_pos;
+            if v.len() < 1e-6 {
+                forward
+            } else {
+                v.normalized()
+            }
+        };
+        // Defenders (and any carrier pinned deep in its own third) may retreat to safety; an
+        // advanced attacker should not bail backward — for them the escape is forward/lateral or
+        // nothing (fall through to the shield).
+        let own_goal_y = me.team.goal_y(self.field_length);
+        let own_third_depth = (current.y - own_goal_y).abs();
+        let backward_ok = matches!(me.role, PlayerRole::Defender | PlayerRole::Goalkeeper)
+            || own_third_depth <= self.field_length / 3.0;
+        let role_forward_weight = match me.role {
+            PlayerRole::Forward => 1.0,
+            PlayerRole::Midfielder => 0.85,
+            PlayerRole::Defender => 0.55,
+            PlayerRole::Goalkeeper => 0.35,
+        };
+        // Candidate escape directions, biased toward the open (away-from-presser) side and forward.
+        let lateral_away = Vec2::new(away.x.signum().max(-1.0).min(1.0), 0.0);
+        let lateral_away = if lateral_away.len() < 1e-6 {
+            away
+        } else {
+            lateral_away.normalized()
+        };
+        let mut directions: Vec<Vec2> = vec![
+            forward,
+            (forward + lateral_away * 0.7).normalized(),
+            (forward * 0.6 + away).normalized(),
+            lateral_away,
+            away,
+        ];
+        if backward_ok {
+            directions.push((Vec2::new(0.0, -attack_dir) * 0.6 + lateral_away).normalized());
+            directions.push((Vec2::new(0.0, -attack_dir) * 0.7 + away * 0.7).normalized());
+        }
+        // Directional clearance probe: free distance to the nearest opponent inside a corridor
+        // along `dir` (the arbitrary-direction analogue of `forward_dribble_space_yards`).
+        let dir_space = |dir: Vec2| -> f64 {
+            let max_space = DRIBBLE_MAX_TOUCH_YARDS;
+            let mut nearest = max_space;
+            for o in self.players.iter().filter(|p| p.team == opp) {
+                let to = self.player_snapshot_position(o) - current;
+                let along = to.dot(dir);
+                if along <= 0.0 || along > max_space {
+                    continue;
+                }
+                let lateral = (to - dir * along).len();
+                if lateral <= FIRST_TOUCH_ESCAPE_CORRIDOR_HALF_WIDTH_YARDS {
+                    nearest = nearest.min((along - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+                }
+            }
+            nearest
+        };
+        let base_cushion = current.distance(defender_pos);
+        directions
+            .into_iter()
+            .filter(|dir| dir.len() > 1e-6)
+            .filter_map(|dir| {
+                let space = dir_space(dir);
+                let step = STATIONARY_HOLDER_CARRY_TARGET_YARDS
+                    .min(DRIBBLE_MAX_TOUCH_YARDS)
+                    .min(space);
+                if step < STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS {
+                    return None;
+                }
+                let raw = current + dir * step;
+                let landing = raw.clamp_to_pitch(self.field_width, self.field_length);
+                // The clamp must not eat the whole step (escape off the touchline is no escape).
+                if landing.distance(current) < STATIONARY_HOLDER_CARRY_MIN_STEP_YARDS {
+                    return None;
+                }
+                let cushion_gain = landing.distance(defender_pos) - base_cushion;
+                if cushion_gain < FIRST_TOUCH_ESCAPE_MIN_CUSHION_GAIN_YARDS {
+                    return None;
+                }
+                let landing_clear = self.nearest_opponent_distance_at(me.team, landing);
+                if landing_clear < FIRST_TOUCH_ESCAPE_MIN_LANDING_CLEARANCE_YARDS {
+                    return None;
+                }
+                let forward_gain = (landing.y - current.y) * attack_dir;
+                let open_space = (self.space_score_at(landing, me.team) / 12.0).clamp(0.0, 1.0);
+                let score = forward_gain * role_forward_weight
+                    + cushion_gain * 0.9
+                    + landing_clear * 0.18
+                    + open_space * 1.4;
+                Some((landing, score))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(landing, _)| landing)
+    }
+
     pub(crate) fn stationary_holder_open_space_carry_target_for(
         &self,
         player_id: usize,
@@ -34192,7 +34784,10 @@ impl WorldSnapshot {
             .map(|(_, _, distance)| distance)
             .unwrap_or(f64::INFINITY);
         if pressure_from_nearest_distance(nearest_opponent) > STATIONARY_HOLDER_CARRY_MAX_PRESSURE {
-            return None;
+            // Pressured: the calm forward-carry below assumes space and time the carrier no longer
+            // has. Don't freeze — move the ball out of the feet into the safest escape (gated;
+            // returns None when truly boxed in, restoring the prior shield-in-place behaviour).
+            return self.first_touch_escape_carry_target_for(me, current, kind);
         }
         let forward_space = self.forward_dribble_space_yards(player_id);
         if forward_space < WON_BALL_DRIVE_MIN_SPACE_YARDS {
@@ -34457,17 +35052,20 @@ impl WorldSnapshot {
         if self.ball.holder != Some(player_id) || me.role == PlayerRole::Goalkeeper {
             return None;
         }
-        // Drive the corner ONLY when the team has COMMITTED to the byline-drive strategy (the
-        // MDP/POMDP decision, held for `STRATEGY_COMMIT_TICKS`). Otherwise a wide carrier is free to
-        // cut inside toward goal as before — the two are deliberately different decisions.
-        if !matches!(
+        // Drive the corner when the team has COMMITTED to the byline-drive strategy (the MDP/POMDP
+        // decision, held for `STRATEGY_COMMIT_TICKS`) OR when an individual wide carrier opts into
+        // the drive on his own (`winger_byline_drive_opt_in`) — isolated wide with a clear lane —
+        // instead of stalling ~30yd out. Otherwise a wide carrier is free to cut inside toward goal
+        // as before — those remain deliberately different decisions.
+        let team_committed = matches!(
             self.tactical_directive(me.team).attack_strategy,
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot
                 | TeamAttackStrategy::BylineCrossRightToPenaltySpot
                 | TeamAttackStrategy::OutsideMidAttackDefenderLeft
                 | TeamAttackStrategy::OutsideMidAttackDefenderRight
                 | TeamAttackStrategy::CrashTheBox
-        ) {
+        );
+        if !team_committed && !self.winger_byline_drive_opt_in(player_id) {
             return None;
         }
         // Outside mid or striker — the players this programmed move is for.
@@ -36349,6 +36947,9 @@ impl WorldSnapshot {
         // returns the engage target directly (no goal-side cushion) so the press
         // actually reaches the ball.
         if let Some(engage) = self.fast_carrier_engage_target_for(me) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, engage);
+            }
             return engage;
         }
         // The nearest defender steps up to press any opponent holder (not only a fast
@@ -36384,6 +36985,9 @@ impl WorldSnapshot {
         // This applies after explicit line-break protection, so deep defenders do
         // not abandon the emergency goal-side retreat/collapse rules.
         if let Some(stepup) = self.advancing_carrier_stepup_target_for(me, guarded) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, stepup);
+            }
             return stepup;
         }
         self.goal_side_defensive_target_for_player(me, guarded)
@@ -36429,7 +37033,13 @@ impl WorldSnapshot {
                 self.field_width,
                 in_possession,
             );
-            if fit.commitment >= 0.65 && relief < 0.15 {
+            if lane_discipline::lane_discipline_v2_enabled() {
+                // Smooth relief taper instead of the legacy cliff: a mild relief
+                // relaxes the lane, it doesn't abandon it (floored at the same soft
+                // blend the legacy else-branch used under full relief).
+                let blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                bounded.x = bounded.x * (1.0 - blend) + lane_x * blend;
+            } else if fit.commitment >= 0.65 && relief < 0.15 {
                 bounded.x = lane_x;
             } else {
                 let lane_blend = (fit.commitment * 0.72).clamp(0.0, 0.72);

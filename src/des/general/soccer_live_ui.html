@@ -3048,7 +3048,10 @@ function drawPendingPassPhase(r, frame = state?.frame) {
   ctx.setLineDash(aerial ? [8, 6] : []);
   ctx.stroke();
   ctx.setLineDash([]);
-  if (target) drawPassTargetCue(target, frame, r);
+  // During the pass-line phase the receiver is ringed by drawPlayer's dedicated yellow
+  // pass-target ring (urgency rides its glow), so the animated drawPassTargetCue is reserved
+  // for the no-line idle case above; only the pass line and the offside overlay live here to
+  // avoid double-highlighting the same receiver.
   if (offside?.position) {
     const pt = mapPoint(offside.position, r);
     const radius = yardsToCanvasRadius(offside.interferenceRadiusYards ?? 3, r);
@@ -3414,7 +3417,7 @@ function displayHolderId(frame) {
   }
   return prev;
 }
-function drawPlayer(p, r, holderId = null) {
+function drawPlayer(p, r, holderId = null, passTargetId = null, passTargetUrgency = 0) {
   const pt = mapPoint(p.position, r);
   const color = p.team === "Home" ? "#1f6feb" : "#d64545";
   const assigned = p.controllerSlot != null;
@@ -3422,8 +3425,16 @@ function drawPlayer(p, r, holderId = null) {
   const hovered = p.id === hoverPlayerId;
   const slotColor = assigned ? SLOT_COLORS[p.controllerSlot % SLOT_COLORS.length] : null;
   const isHolder = holderId != null && Number(p.id) === Number(holderId);
+  // The pass target ring is mutually exclusive with the holder ring: a ball in
+  // flight has no holder, so these never stack on the same player.
+  const isPassTarget = !isHolder && passTargetId != null && Number(p.id) === Number(passTargetId);
   if (p.role === "Goalkeeper") drawPlayerRing(pt, 14.4, "#7cff3a", 2.4, 10);
   if (isHolder) drawPlayerRing(pt, 18.2, "#00e5ff", 3.1, 12);
+  // Urgency (how soon the receiver must act) rides the glow, 10→20, so the single
+  // yellow ring carries what the old faint pulsing receiver ring used to show.
+  if (isPassTarget) {
+    drawPlayerRing(pt, 18.2, "#ffe100", 2.8, 10 + clamp(Number(passTargetUrgency || 0), 0, 1) * 10);
+  }
   const isDuel = Array.isArray(p.lastDecision?.operationOrder)
     && p.lastDecision.operationOrder.includes("fifty-fifty-duel");
   if (isDuel) {
@@ -3547,6 +3558,42 @@ function interpolatedFrame(prev, target, t) {
   };
 }
 
+// The engine's ball.holder is a frame-tight "attached this exact tick" flag: it
+// is deliberately set to None on every dribble knock / first-touch while the ball
+// briefly travels off the foot, which made the cyan possession ring flicker. Latch
+// the ring to the last holder and only release it when the ball is genuinely gone:
+// handed to someone else (turnover/teammate), lofted into flight, passed, or rolled
+// more than ~2yd away. Matches the engine's own sticky tracking-holder inference.
+const DISPLAY_HOLDER_RELEASE_YARDS = 2.0;
+let lastDisplayHolder = null;
+function displayHolderId(frame) {
+  const raw = frame?.ball?.holder;
+  if (raw != null) { lastDisplayHolder = raw; return raw; } // attached → trust it (covers turnovers)
+  const prev = lastDisplayHolder;
+  if (prev == null) return null;
+  // Passed/shot/lofted → ball is in flight, drop the ring.
+  if (pendingPassPhase(frame) || ballAltitudeYards(frame?.ball) > 0.5) {
+    lastDisplayHolder = null;
+    return null;
+  }
+  const p = (frame?.players || []).find(pl => Number(pl.id) === Number(prev));
+  const bp = frame?.ball?.position;
+  if (!p || !bp) { lastDisplayHolder = null; return null; }
+  const d = Math.hypot(
+    Number(p.position?.x || 0) - Number(bp.x || 0),
+    Number(p.position?.y || 0) - Number(bp.y || 0),
+  );
+  if (d > DISPLAY_HOLDER_RELEASE_YARDS) { lastDisplayHolder = null; return null; }
+  return prev; // ball still at his feet through the touch — keep the ring lit
+}
+// The intended receiver of a ball in flight, ringed in yellow. The pending pass
+// exists only while the ball is travelling, so this naturally clears the moment
+// the ball is re-possessed (holder set again → pendingPass gone).
+function pendingPassTargetId(frame) {
+  const pass = pendingPassPhase(frame);
+  if (!pass) return null;
+  return pass.target ?? pass.nearestReceiver ?? null;
+}
 function drawField(frame, r) {
   drawPitch(r);
   drawPitchGridOverlay(r);
@@ -3560,7 +3607,9 @@ function drawField(frame, r) {
   drawDecisionIntentTraces(r);
   const holderId = displayHolderId(frame);
   for (const o of frame.officials || []) drawOfficial(o, r);
-  for (const p of frame.players || []) drawPlayer(p, r, holderId);
+  const passTargetId = pendingPassTargetId(frame);
+  const passTargetUrgency = clamp(Number(pendingPassPhase(frame)?.receiverUrgency ?? 0), 0, 1);
+  for (const p of frame.players || []) drawPlayer(p, r, holderId, passTargetId, passTargetUrgency);
   if (frame.ball) drawBall(frame.ball, r);
   drawCoachHintMarkers(r);
   drawCoachHintDrag(r);

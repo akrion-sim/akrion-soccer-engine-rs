@@ -53,6 +53,10 @@ pub struct Tunables {
     pub defensive_shape: DefensiveShapeTunables,
     /// Fine-grid lane/row affinity used by formation, support, and retrieval.
     pub lane_affinity: LaneAffinityTunables,
+    /// Centralized lane-discipline weights (12-lane grid). Read only when
+    /// `DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2` is set; see
+    /// [`crate::des::general::soccer::lane_discipline`].
+    pub lane_discipline: LaneDisciplineTunables,
 }
 
 impl Default for Tunables {
@@ -65,6 +69,74 @@ impl Default for Tunables {
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
             lane_affinity: LaneAffinityTunables::default(),
+            lane_discipline: LaneDisciplineTunables::default(),
+        }
+    }
+}
+
+/// Centralized **lane-discipline** weights — the single source of truth for how
+/// firmly outfield players are held in their assigned vertical channel (lane) of
+/// the 12-lane × 24-row pitch grid. Consumed exclusively by
+/// [`crate::des::general::soccer::lane_discipline`], and only when its gate
+/// (`DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2`) is on; with the gate off the engine
+/// runs the legacy inline formulas unchanged, so an unconfigured process is
+/// byte-identical to before this group existed.
+///
+/// The defaults **re-derive** the historical lane constants for the *current*
+/// 12-lane grid. The originals (`/5.0` lane-match divisor, `0.22`-per-lane
+/// static falloff, `0.15` relief cliff) were authored when the grid had **4**
+/// lanes (~20yd each) and were never rescaled when it tripled to 12 (~6.67yd
+/// each), so the lane signal silently sharpened ~3x and the enforcement stayed a
+/// cliff. These knobs express the same intent in **yard** terms (grid-/pitch-size
+/// invariant) plus a smooth relief taper.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaneDisciplineTunables {
+    /// Global lane-discipline **strength**: the one knob every consumer feels. It
+    /// scales the affinity bonus *and* the lane penalty the producer functions
+    /// emit, so a single value tightens or loosens shape everywhere at once.
+    /// `1.0` = the re-derived baseline; `>1` holds lanes harder, `<1` looser.
+    pub strength: f64,
+    /// Lane-match credit (how much a target in a *neighbouring* channel still
+    /// counts as "in lane") decays linearly to zero over this many **yards** of
+    /// lateral gap. Replaces the legacy `|a-b| lanes / 5.0` divisor, whose reach
+    /// was lane-count-relative and so silently shrank from ~3 lanes to ~5 lanes of
+    /// meaning when the grid changed. `33.3` ≈ the legacy 5-lane reach at the
+    /// standard 80yd width, now invariant to pitch size.
+    pub lane_match_decay_yards: f64,
+    /// Static out-of-band affinity falloff base: `affinity = 1 - commitment *
+    /// (base + per_yard * deviation_yards)` for a target outside the role band.
+    pub static_fit_base: f64,
+    /// Per-**yard**-outside-band coefficient of the static falloff. Replaces the
+    /// legacy per-*lane* `0.22` (which became ~3x steeper per yard at 12 lanes);
+    /// `0.033` ≈ `0.22 / (80/12)` reproduces the original yard-rate at standard
+    /// width.
+    pub static_fit_per_yard: f64,
+    /// Relief→clamp **taper** width. The legacy clamp was a cliff: a player was
+    /// hard-locked to its lane only while `relief < 0.15`, then dropped straight
+    /// to a soft blend. Instead the hard-lock *authority* ramps smoothly from full
+    /// (relief 0) to zero (relief ≥ this), so a *mild*, justified relief move
+    /// relaxes the lane rather than abandoning it — the core "hardening".
+    pub relief_full_release: f64,
+    /// Commitment at/above which a fully-unrelieved player is hard-locked to lane
+    /// (the legacy `0.65` threshold, now the top of the taper ramp).
+    pub commitment_hard_lock: f64,
+    /// Soft-blend ceiling the lane pull never falls below even under full relief
+    /// (`commitment * this`) — matches the legacy else-branch blend so a relieved
+    /// player still carries the same residual lane pull it always did.
+    pub soft_blend_max: f64,
+}
+
+impl Default for LaneDisciplineTunables {
+    fn default() -> Self {
+        LaneDisciplineTunables {
+            strength: 1.0,
+            lane_match_decay_yards: 33.3,
+            static_fit_base: 0.58,
+            static_fit_per_yard: 0.033,
+            relief_full_release: 0.55,
+            commitment_hard_lock: 0.65,
+            soft_blend_max: 0.72,
         }
     }
 }

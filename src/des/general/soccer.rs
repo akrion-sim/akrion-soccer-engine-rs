@@ -55,6 +55,10 @@ mod tunables;
 pub use tunables::*;
 mod pitch_value;
 pub use pitch_value::*;
+// Centralized lane-discipline (12-lane grid). Qualified path only (no glob
+// re-export) — its public fns have deliberately generic names (`strength`,
+// `lane_match`) that read clearly as `lane_discipline::strength()`.
+mod lane_discipline;
 mod back_four_line;
 pub use back_four_line::*;
 mod loose_ball_commit;
@@ -63,6 +67,10 @@ mod support_scorer;
 pub use support_scorer::*;
 mod spacing_target;
 pub use spacing_target::*;
+mod aerial_reception;
+pub use aerial_reception::*;
+mod reward_shaping;
+pub use reward_shaping::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -602,6 +610,36 @@ const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
 const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
+// --- Defensive shepherding / "show one way" (gated, default OFF = byte-identical) ---
+// Real defending of a 1v1 as the carrier drives from ~40 to ~15yd out is not a square
+// retreat: the pressing defender approaches on a CURVED angle so their body sits on the
+// inside (goal-centre) shoulder of the carrier, cutting the central / goal-bound route and
+// SHOWING the carrier toward the nearer touchline (and, all else equal, toward our cover).
+// The carrier is jockeyed wide into less dangerous space instead of being allowed to come
+// straight down the middle. These tune that lateral "shoulder" offset applied to the single
+// nearest presser's engage target. Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
+//
+// Lateral shoulder offset (yards) the presser takes to the inside of the carrier at full
+// engagement. ~2yd ≈ a body-width-plus stance: enough to clearly block the inside cut while
+// staying in contest range, not so far it leaves the carrier a straight lane down the middle.
+const SHEPHERD_SHOULDER_YARDS: f64 = 2.2;
+// Goalward band (yards from our own goal) over which shepherding is active and ramps. The
+// principle is a final-/middle-third behaviour: weight rises from 0 at SHEPHERD_BAND_FAR_YARDS
+// (~40yd out) to full at SHEPHERD_BAND_NEAR_YARDS (~15yd out), then eases back to a holding
+// value right on top of the box (where you square up and deny the shot rather than show wide).
+const SHEPHERD_BAND_FAR_YARDS: f64 = 40.0;
+const SHEPHERD_BAND_NEAR_YARDS: f64 = 15.0;
+// Right on the box edge the shepherd relaxes toward this fraction of full (you stop showing
+// wide and square up to deny the central shot once they are this deep), reached at the
+// six-yard depth `OWN_GOAL_PRESS_FULL_YARDS`.
+const SHEPHERD_BOX_RELAX_FRACTION: f64 = 0.45;
+// Half-width (yards either side of pitch centre) of the central "danger lane". Shepherding is
+// strongest for a carrier in this central channel (most goal threat, clearest case for showing
+// them wide); it tapers to a light touch once the carrier is already wide of it.
+const SHEPHERD_CENTRAL_LANE_HALF_WIDTH_YARDS: f64 = 14.0;
+// A carrier already within this lateral distance of a touchline is effectively pinned wide;
+// don't shove the presser past them into the touchline (no inside lane left to deny).
+const SHEPHERD_TOUCHLINE_MARGIN_YARDS: f64 = 8.0;
 /// In the final third, weight per yard of goalward progress an off-ball run
 /// buys, rewarded ONLY when the candidate also sits in a clear receivable
 /// channel from the ball. Lets receivers balance open space with a direct route
@@ -697,6 +735,11 @@ const DRIBBLE_OPPONENT_MIN_SPACE_YARDS: f64 = 2.0;
 const DRIBBLE_OWN_HALF_MIN_SPACE_YARDS: f64 = 3.0;
 const DRIBBLE_MOVING_AWAY_FULL_RELIEF_YPS: f64 = 2.5;
 const DRIBBLE_MOVING_AWAY_MAX_RELIEF: f64 = 0.86;
+// "If the opponent is moving away it's ok": an opponent ahead RECEDING at this rate or
+// faster (yds/s of separation gained) is vacating the space, so the carry-bend guard in
+// `pressure_escape_carry_direction` is lifted. Small negative threshold so genuinely
+// closing or stationary defenders still trip the guard.
+const DRIBBLE_OPPONENT_RECEDING_YPS: f64 = -0.5;
 const FINAL_THIRD_ATTACK_YARDS_TO_GOAL: f64 = 40.0;
 // Critical spacing discipline: most carriers should keep 2+ yards between the
 // ball and the NEAREST defender (in any direction), not just space straight ahead.
@@ -831,6 +874,22 @@ const BYLINE_DRIVE_BYLINE_MARGIN_YARDS: f64 = 3.5; // ...and this far short of t
 // Inside this distance of the byline the drive is "at the corner" — cross now (cutback / high ball)
 // rather than carry deeper into a dead end.
 const BYLINE_DRIVE_CROSS_TRIGGER_YARDS: f64 = 7.0;
+// Minimum straight-ahead clearance (yards) for an INDIVIDUAL winger to opt into the byline drive
+// without a team-level byline-cross commitment. The team-committed drive is vetted by the strategy
+// selector; this solo opt-in bypasses it, so it only fires when there is a genuinely open lane to
+// drive into — which is exactly the situation where a winger otherwise stalls ~30yd out instead of
+// driving for the corner. See `winger_byline_drive_opt_in`.
+const WINGER_BYLINE_MIN_DRIVE_SPACE_YARDS: f64 = 6.0;
+// The solo winger opt-in only fires in the BUILD-UP band — at least this far from the byline.
+// Inside it (the deep finishing zone) cutting inside to shoot or a goalmouth carry is the better
+// individual play, so the deep run to the corner stays reserved for the team-committed byline-cross
+// strategy. ~30yd out — where a winger otherwise stalls — sits comfortably inside the band.
+const WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS: f64 = 20.0;
+// The solo opt-in is reserved for a genuinely TOUCHLINE-HUGGING winger (within this many yards of
+// the nearest touchline) — the player actually positioned to drive the corner flag and cross. A
+// merely half-space-wide carrier (further infield) keeps the deliberate "cut inside toward goal in
+// the approach band" behaviour, which is the better individual play from there.
+const WINGER_BYLINE_MAX_TOUCHLINE_DISTANCE_YARDS: f64 = 9.0;
 const STRIKER_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.72;
 const STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.12;
 const STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.06;
@@ -1113,6 +1172,14 @@ const BLOCKED_LANE_FLOOR_PASS_OPEN_THRESHOLD: f64 = 0.5;
 const PRESSURE_RELIEF_PASS_MIN_PRESSURE: f64 = 0.45;
 const PRESSURE_RELIEF_PASS_BONUS: f64 = 5.0;
 const SHORT_BACK_PASS_MAX_YARDS: f64 = 14.0;
+// First-touch escape RETAIN reward (carry analogue of the pressure-relief PASS bonus above): a
+// pressed carrier who moves the ball AWAY from the nearest defender (lateral or, for a deep player,
+// backward) and KEEPS possession made the right call, but the forward-carry reward misses it
+// because there is no forward gain. Credit the cushion gained, scaled by danger. Kept well below
+// the forward-carry reward so forward progress stays strictly the most valuable carry.
+const FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE: f64 = 0.40;
+const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD: f64 = 0.11;
+const FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS: f64 = 3.0;
 // Conceding a throw-in/goal-kick/corner by knocking the ball out is a turnover.
 // Penalize the offending player unless they were under heavy pressure (>=8/10),
 // where clearing it out of play is an acceptable last resort.
@@ -1676,6 +1743,16 @@ const PASS_AND_MOVE_NUMBERS_ADVANTAGE_REFERENCE: f64 = 3.0;
 const PASS_AND_MOVE_RUN_LANE_REFERENCE_YARDS: f64 = 14.0;
 const PASS_AND_MOVE_FORWARD_REWARD_POINTS: f64 = 6.0;
 const PASS_AND_MOVE_FORWARD_REWARD_CAP_POINTS: f64 = 8.0;
+// --- Overload-weighted progression (gated DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION) ---
+// A forward pass / forward pass-chain played while the attacking team holds a numbers advantage in
+// the threat lane (`attacking_overload_score`, see `attacking_overload_profile`) is reinforced MORE
+// than the same ball into a packed defence — teaching the policy to combine forward INTO the
+// overload (the "biggest numbers advantage" objective) rather than away from it. Every term gated
+// below is multiplied by an overload weight that is forced to 0.0 when the gate is OFF, so the
+// default path is byte-identical to the prior reward. Weights are env-overridable for PG learning.
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT: f64 = 0.10;
+const OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS: f64 = 24.0;
+const OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT: f64 = 0.50;
 // --- Sterile vs. progressive passing WITHIN a retained possession (no turnover) ---
 // A handoff of the ball has a cost and every pass carries interception risk. A run of
 // STAGNANT_PASS_MIN_RUN+ completed passes whose ball travel never escapes this radius is
@@ -3044,6 +3121,12 @@ const HOLD_FOR_SUPPORT_MIN_SPACE_YARDS: f64 = 4.5;
 /// A teammate already ahead with a clean lane and at least this much space is a forward
 /// outlet NOW — so there is nothing to wait for and the gate declines (the carrier passes).
 const HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS: f64 = 3.0;
+/// ...and likewise there is nothing to WAIT for when the carrier has clear grass straight
+/// ahead to dribble into: an unpressured carrier with at least this much open forward lane
+/// drives into the space himself rather than standing on the ball to summon support (which
+/// is what made calm carriers freeze with the ball at their feet). Real carriers attack open
+/// space; the wait is for a genuinely blocked picture, not for when the road ahead is open.
+const HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS: f64 = 6.0;
 /// A summoned forward run must net at least this much ground toward goal to be worth waiting
 /// for (otherwise it is not a meaningful improvement on the current picture).
 const HOLD_FOR_SUPPORT_MIN_RUN_GAIN_YARDS: f64 = 5.0;
@@ -4680,7 +4763,10 @@ fn vertical_lane_fit_for_role_target(
     };
     let deviation_yards =
         vertical_lane_deviation_yards(target_x, role, home_x, field_width, in_possession);
-    let affinity_score = if lane_gap == 0 {
+    let affinity_score = if lane_discipline::lane_discipline_v2_enabled() {
+        // Yard-based 12-lane re-derivation (grid-/pitch-size invariant).
+        lane_discipline::static_affinity_score(deviation_yards, commitment)
+    } else if lane_gap == 0 {
         1.0
     } else {
         (1.0
@@ -10686,6 +10772,14 @@ impl SoccerMarlTickReward {
             _ => 0.0,
         }
     }
+
+    /// Whether BOTH teams contributed at least one sample this tick. The centralized zero-sum team
+    /// component (own mean − opponent mean) is only well-defined when both means exist; with only
+    /// one team present `average_for(opponent)` silently returns 0.0, turning the "zero-sum" term
+    /// into a one-sided bonus/penalty. See [`soccer_marl_adjusted_reward`].
+    fn has_both_teams(self) -> bool {
+        self.home_count > 0 && self.away_count > 0
+    }
 }
 
 pub(crate) fn soccer_marl_tick_rewards(
@@ -10726,16 +10820,36 @@ pub(crate) fn soccer_marl_adjusted_reward(
     let Some(tick_reward) = tick_reward else {
         return intermediate;
     };
-    let own_average = tick_reward.average_for(transition.team);
-    let opponent_average = tick_reward.average_for(transition.team.other());
-    // The cooperative-credit SHARE is already folded into `intermediate` above (the
-    // `shared` blend toward `own_avg`). Re-blending `intermediate` toward `own_average` a
-    // second time would double-count the team-reward share — its effect would grow roughly
-    // quadratically in `share` — a merge artifact of stacking the two convergent shapings.
-    // "Theirs" is purely the zero-sum centralized component below, so add it to
-    // `intermediate` directly. At `share = 0` (the default) this is byte-identical.
-    let team_component = own_average - opponent_average;
+    // The "zero-sum" team component is only balanced when BOTH teams logged a sample this tick.
+    // In the ONLINE training path, drained deferred reward transitions (goal/shot/chain/turnover
+    // credit, re-queued at their ORIGINAL tick) are trained in a batch SEPARATE from their tick's
+    // 22-player cohort, so that tick often carries only the scoring team. The opponent mean then
+    // defaults to 0.0 and the term degenerates into a one-sided amplification of the sparse event
+    // reward (e.g. a +30 chain credit becomes +30·team_weight extra) — and inconsistently with the
+    // full-game-replay path, where the same transition IS grouped with its cohort. When the
+    // balanced gate is on, the team component is suppressed on such single-team ticks so the
+    // centralized signal stays genuinely zero-sum. Gate OFF (default) => byte-identical.
+    let team_component = soccer_marl_team_component(
+        tick_reward,
+        transition.team,
+        dd_soccer_enable_marl_balanced_team_component(),
+    );
     intermediate + team_component * config.sanitized_marl_team_reward_weight()
+}
+
+/// Centralized zero-sum team component for the MAPPO advantage: `own_mean − opponent_mean` over the
+/// tick. When `balanced` is set and only one team logged a sample this tick, the opponent mean is
+/// undefined (it would silently read 0.0 and make the term one-sided), so the component is 0.0 — see
+/// [`soccer_marl_adjusted_reward`]. `balanced == false` reproduces the prior (byte-identical) term.
+fn soccer_marl_team_component(
+    tick_reward: SoccerMarlTickReward,
+    team: Team,
+    balanced: bool,
+) -> f64 {
+    if balanced && !tick_reward.has_both_teams() {
+        return 0.0;
+    }
+    tick_reward.average_for(team) - tick_reward.average_for(team.other())
 }
 
 fn soccer_full_game_replay_transitions(
@@ -16217,6 +16331,70 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
 }
 
+/// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
+/// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
+pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION").is_ok())
+}
+
+/// Per-yard reward for forward progress carried into a numbers advantage, scaled by the attacking
+/// overload score. Learner/operator override via `DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD`
+/// (clamped to a sane 0.0-0.5 window).
+pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 0.5))
+            .unwrap_or(OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT)
+    })
+}
+
+/// Fraction by which a forward pass-chain event reward is uplifted at full attacking overload.
+/// Learner/operator override via `DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION` (clamped 0.0-2.0).
+pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT)
+    })
+}
+
+/// Pure math for the overload-weighted forward-pass bonus: the reception's forward yardage capped
+/// at [`OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS`] and scaled by the attacking overload
+/// score [0,1] and `per_yard`. 0.0 when there is no overload or no forward progress.
+pub(crate) fn overload_forward_pass_progression_points(
+    forward_yards: f64,
+    overload: f64,
+    per_yard: f64,
+) -> f64 {
+    let overload = overload.clamp(0.0, 1.0);
+    if overload <= 0.0 {
+        return 0.0;
+    }
+    let forward = forward_yards.clamp(0.0, OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_MAX_YARDS);
+    if forward <= 0.0 {
+        return 0.0;
+    }
+    forward * per_yard * overload
+}
+
+/// Pure math for the overload pass-chain event multiplier: `1 + overload * fraction`. Returns 1.0
+/// (no change) when `overload` is 0, keeping the gated-off reward path byte-identical.
+pub(crate) fn overload_pass_chain_event_multiplier_for(overload: f64, fraction: f64) -> f64 {
+    1.0 + overload.clamp(0.0, 1.0) * fraction
+}
+
 /// End-line depth at which the "outside mid attack defender" play releases its cross (see
 /// [`OUTSIDE_MID_CROSS_RELEASE_DEPTH_YARDS_DEFAULT`]). Learner/operator override via
 /// `DD_SOCCER_OMAD_CROSS_RELEASE_DEPTH_YARDS` (clamped to a sane 7-34yd window).
@@ -20207,6 +20385,26 @@ fn dense_soccer_transition_reward(
                 }
             } else if carry_progress < -1.25 && before_obs.perceived_pressure < 0.30 {
                 reward -= 0.42;
+            }
+            // First-touch escape retain: a pressed carrier with no forward gain who nonetheless
+            // moves the ball away from the nearest defender (lateral / safe backward) and keeps
+            // possession is rewarded for the cushion gained. Gated so OFF is byte-identical.
+            if !dd_soccer_disable_first_touch_escape() && carry_progress <= 1.0 {
+                let danger = before_obs
+                    .perceived_pressure
+                    .max(before_obs.pressure_urgency)
+                    .max(before_obs.immediate_dispossession_risk)
+                    .clamp(0.0, 1.0);
+                if danger >= FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE {
+                    let cushion_gain = (after_obs.nearest_opponent_distance
+                        - before_obs.nearest_opponent_distance)
+                        .clamp(0.0, FIRST_TOUCH_ESCAPE_CUSHION_REWARD_MAX_YARDS);
+                    if cushion_gain > 0.0 {
+                        reward += cushion_gain
+                            * FIRST_TOUCH_ESCAPE_CUSHION_REWARD_PER_YARD
+                            * (0.2 + danger - FIRST_TOUCH_ESCAPE_REWARD_MIN_PRESSURE).clamp(0.0, 1.0);
+                    }
+                }
             }
         }
         if is_dribble_action_label(action) {
@@ -31023,14 +31221,14 @@ pub struct SoccerPassOutcomeSample {
 /// the learned replacement for the analytic completion estimate and the hand-scored MPC pass
 /// weights — trained on [`SoccerPassOutcomeSample`]s, conditioned on the 22+ball config.
 #[derive(Clone, Debug)]
-pub(crate) struct SoccerPassCompletionHead {
+pub struct SoccerPassCompletionHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
 }
 
 impl SoccerPassCompletionHead {
-    pub(crate) fn new(seed: u32) -> Self {
+    pub fn new(seed: u32) -> Self {
         let mut rng = mulberry32(seed ^ 0x5F37_2C1B);
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
@@ -31061,7 +31259,7 @@ impl SoccerPassCompletionHead {
 
     /// One SGD epoch over `samples` (binary cross-entropy via the clipped MSE step on a sigmoid
     /// output is adequate here). Returns the mean step loss.
-    pub(crate) fn train(&mut self, samples: &[SoccerPassOutcomeSample], learning_rate: f64) -> f64 {
+    pub fn train(&mut self, samples: &[SoccerPassOutcomeSample], learning_rate: f64) -> f64 {
         let mut total = 0.0;
         let mut applied = 0usize;
         for sample in samples {
@@ -31086,7 +31284,7 @@ impl SoccerPassCompletionHead {
         mean
     }
 
-    pub(crate) fn training_steps(&self) -> usize {
+    pub fn training_steps(&self) -> usize {
         self.training_steps
     }
 
@@ -31127,6 +31325,51 @@ fn normalize_pass_completion_features(features: &[f32]) -> Option<Vec<f32>> {
     }
 }
 
+/// Minimum SGD steps a [`SoccerPassCompletionHead`] must have taken before the live pass-quality
+/// assessor will blend its prediction into `expected_completion`. Below this the head is still
+/// noisy, so the analytic estimate stands alone (mirrors [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`]).
+pub const PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS: usize = 200;
+
+/// Weight given to the learned head's P(complete) when blended with the analytic completion
+/// estimate (the rest stays analytic). Conservative: the head nudges, it does not replace.
+const PASS_COMPLETION_HEAD_BLEND_WEIGHT: f64 = 0.5;
+
+/// Env flag enabling live consumption of the learned pass-completion head in
+/// `pass_target_quality_for_snapshot`. Off ⇒ the analytic completion estimate stands alone
+/// (byte-identical to the pre-wiring behaviour). Read once per process.
+pub fn learned_pass_completion_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"))
+    }
+}
+
+fn soccer_env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let v = raw.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+impl SoccerMatch {
+    /// Install the trained pass-completion head for live consumption. The learner carries +
+    /// trains it across games (seeded from the Postgres corpus) and re-installs it each game;
+    /// wrapped in `Arc` so every per-tick snapshot shares it cheaply. Consumed in
+    /// `pass_target_quality_for_snapshot` once it clears
+    /// [`PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS`] and the gate is on.
+    pub fn set_pass_completion_head(&mut self, head: SoccerPassCompletionHead) {
+        self.pass_completion_head = Some(std::sync::Arc::new(head));
+    }
+}
+
 /// Outcome of training the learned pass-completion head on a corpus loaded from Postgres
 /// (`SoccerStore::load_pass_outcome_samples`). Logged by the learning runner so an operator can
 /// see the persisted training data is actually being loaded and learned from.
@@ -31151,7 +31394,7 @@ pub struct SoccerPassCompletionTrainingReport {
 /// [`SoccerPassCompletionHead`] and run `epochs` SGD passes over it. Returns the trained head
 /// plus a [`SoccerPassCompletionTrainingReport`], or `None` if no usable samples were supplied
 /// (so the runner can skip cleanly rather than persist an untrained net).
-pub(crate) fn train_soccer_pass_completion_head(
+pub fn train_soccer_pass_completion_head(
     samples: &[SoccerPassOutcomeSample],
     seed: u32,
     epochs: usize,
@@ -45753,8 +45996,10 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        pass_completion_head: None,
         loose_ball_commit_head: None,
         attack_spacing_head: None,
+        aerial_reception_head: None,
         loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
@@ -47104,6 +47349,8 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         runaround: player.runaround,
         hold_for_support: player.hold_for_support.clone(),
         slide_recovery_seconds: player.slide_recovery_seconds,
+        decision_commit_ticks: VecDeque::new(),
+        last_intent: None,
     }
 }
 
@@ -47376,6 +47623,24 @@ fn dd_soccer_disable_round_the_keeper() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ROUND_THE_KEEPER").is_ok())
+}
+
+// ON by default: the carrier keeps a cushion ahead before driving into a defender
+// (3yd in our own half, 2yd otherwise) and is freed to drive on when the defender ahead
+// is receding. Set DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE to revert to the flat
+// 2yd guard (byte-identical to the prior behavior).
+fn dd_soccer_disable_dribble_cushion_discipline() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE").is_ok())
+}
+/// Mirror of the world/player first-touch-escape gate for the reward side — same env var so the
+/// escape carry geometry, the shield demotion, and this escape-retain reward toggle together.
+/// Default-off (escape ON); OFF zeroes the extra reward so learning is byte-identical.
+fn dd_soccer_disable_first_touch_escape() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
 
 /// Whether the `xavi-turn` shielded-pirouette dribble move is live for this match: on
@@ -51097,13 +51362,43 @@ fn pass_target_quality_for_snapshot_inner(
     };
     let pass_precision = 0.80 + pass_skill * 0.20;
     let mpc_receipt_gate = 0.68 + mpc_receipt.probability * 0.32;
-    let expected_completion =
+    let mut expected_completion =
         target_quality
             * lane_clearance
             * pass_precision
             * pressure_adjustment
             * mpc_receipt_gate
             * tight_mark_completion_gate;
+    // Learned pass-completion head (#4): blend the trained P(complete) into the analytic
+    // estimate when the gate is on and the carried head has trained enough. The head is
+    // conditioned on the 22+ball config along this pass's lane, so it captures completion
+    // signal the multiplicative analytic proxy misses. Off / untrained ⇒ analytic stands
+    // alone (parity). Same feature builder as the training-capture site, with passer
+    // pressure derived from the nearest opponent (the snapshot analogue of the POMDP
+    // `perceived_pressure` used at launch).
+    if learned_pass_completion_enabled() {
+        if let Some(head) = snapshot.pass_completion_head.as_ref() {
+            if head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS {
+                let passer_pressure = pressure_from_nearest_distance(
+                    snapshot.nearest_opponent_distance_at(passer.team, passer_position),
+                );
+                let features = snapshot.pass_completion_learn_features(
+                    passer.team,
+                    passer_position,
+                    anticipated_target,
+                    distance,
+                    passer_pressure,
+                    receiver_openness,
+                    flight,
+                );
+                if let Some(learned) = head.predict(&features) {
+                    expected_completion = expected_completion
+                        * (1.0 - PASS_COMPLETION_HEAD_BLEND_WEIGHT)
+                        + learned.clamp(0.0, 1.0) * PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+                }
+            }
+        }
+    }
     PassTargetQuality {
         receiver_openness,
         stride_fit,
@@ -51419,6 +51714,20 @@ fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
 fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
     (SHORT_LOFT_APEX_YARDS + (distance_yards.max(0.0) - 15.0) * LOFT_APEX_PER_YARD)
         .clamp(LOFT_APEX_MIN_YARDS, MAX_LOFT_APEX_YARDS)
+}
+
+/// Apex (yards) of a lofted pass reconstructed from its public [`PendingPassSnapshot`].
+/// Mirrors [`pass_loft_apex_yards`] (which reads the internal `PendingPass`) so the
+/// aerial-reception descent geometry sees the same arc the ball physics fly.
+pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f64 {
+    if pass.flight.is_scoop() {
+        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (pass.from as u64).wrapping_shl(17);
+        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        scoop_loft_apex_yards(pass.distance_yards, unit)
+    } else {
+        lofted_pass_apex_yards(pass.distance_yards)
+    }
 }
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
@@ -55609,6 +55918,8 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 runaround: None,
                 hold_for_support: None,
                 slide_recovery_seconds: 0.0,
+                decision_commit_ticks: VecDeque::new(),
+                last_intent: None,
             });
         }
     }
