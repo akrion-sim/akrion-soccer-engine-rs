@@ -49848,7 +49848,6 @@ fn shot_decision_is_qualified(observation: &SoccerPomdpObservation) -> bool {
         && observation.shot_on_frame_probability >= 0.18
         && observation.shot_beat_goalkeeper_probability >= 0.12;
     (quality_shot || pressure_bailout || goal_urgency_bailout)
-        && shot_trigger_timing_allows_shot(observation, PlayerRole::Forward)
 }
 
 fn shot_decision_is_qualified_for_role(
@@ -49868,7 +49867,6 @@ fn shot_decision_is_qualified_for_role(
         || clean_twenty_yard_shot_is_qualified(observation, role)
         || teammate_near_goal_shot_is_qualified(observation, role)
         || striker_shot_window_is_qualified(observation, role))
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_is_qualified(
@@ -49886,7 +49884,6 @@ fn attacking_goal_pressure_shot_is_qualified(
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && observation.opponent_goal_angle_degrees >= 8.0
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn attacking_goal_pressure_shot_attempt_probability(
@@ -50163,7 +50160,6 @@ fn clean_twenty_yard_shot_is_qualified(
         && observation.shot_beat_goalkeeper_probability >= CLEAN_SHOT_MIN_KEEPER_BEAT_PROBABILITY
         && (observation.forward_dribble_space_yards >= 1.5
             || observation.shot_block_probability <= CLEAN_SHOT_MAX_BLOCK_PROBABILITY * 0.52)
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn teammate_near_goal_shot_is_qualified(
@@ -50177,7 +50173,6 @@ fn teammate_near_goal_shot_is_qualified(
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn striker_shot_window_is_qualified(
@@ -50200,7 +50195,6 @@ fn striker_shot_window_is_qualified(
         && block_risk <= STRIKER_SHOT_MAX_BLOCK_PROBABILITY
         && observation.shot_on_frame_probability >= STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY
         && observation.shot_beat_goalkeeper_probability >= STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY
-        && shot_trigger_timing_allows_shot(observation, role)
 }
 
 fn shot_observation_body_mechanics_fit(observation: &SoccerPomdpObservation) -> f64 {
