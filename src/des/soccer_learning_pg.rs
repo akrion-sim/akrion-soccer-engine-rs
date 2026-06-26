@@ -13,20 +13,20 @@ use uuid::Uuid;
 
 use crate::des::general::soccer::{
     MatchConfig, PlayerRole, SoccerConfigComparison, SoccerConfigMomentInsert,
-    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SOCCER_PASS_COMPLETION_FEATURE_DIM,
-    SOCCER_PASS_COMPLETION_FEATURE_DIM_V1, SoccerMomentEmbeddingInsert,
-    SoccerNeuralNetworkSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
-    SoccerQStateKey, SoccerQTargetEntry, SoccerSetPlayTrainingArtifact,
-    SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM,
-    CONFIG_FEATURE_DIM_V1, SOCCER_MOMENT_EMBEDDING_DIM,
+    SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics,
+    SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey,
+    SoccerQTargetEntry, SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights,
+    SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM, CONFIG_FEATURE_DIM_V1,
+    SOCCER_MOMENT_EMBEDDING_DIM, SOCCER_PASS_COMPLETION_FEATURE_DIM,
+    SOCCER_PASS_COMPLETION_FEATURE_DIM_V1,
 };
 use crate::des::general::tournament::{
     MatchReport, SoccerTeamGenome, TournamentFormat, TournamentTeam,
 };
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
-    soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame,
-    SoccerLearningPolicyDelta, SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
+    soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame, SoccerLearningPolicyDelta,
+    SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
 use std::collections::HashMap;
 
@@ -2425,8 +2425,7 @@ impl SoccerLearningPgStore {
         let completed_pass_gain_yards_micros =
             soccer_learning_to_micros(metrics.completed_pass_gain_yards);
         let pass_chains = count(metrics.pass_chains);
-        let pass_chain_gain_yards_micros =
-            soccer_learning_to_micros(metrics.pass_chain_gain_yards);
+        let pass_chain_gain_yards_micros = soccer_learning_to_micros(metrics.pass_chain_gain_yards);
         let pass_chains_net_loss = count(metrics.pass_chains_net_loss);
         let shots_on_target = count(metrics.shots_on_target);
         let shots_after_pass = count(metrics.shots_after_pass);
