@@ -16,13 +16,14 @@
 //!
 //! ## What this module computes
 //!
-//! * [`aerial_descent_plan`] — pure projectile geometry. Given the lofted pass's launch
-//!   parameters (apex, launch pace, origin, intended target) and the elapsed flight time,
-//!   it returns the two horizontal points where the **descending** ball passes through
-//!   the control band: the *top* of the band (~8 ft — where a header/jump meets it) and
-//!   the *sweet* height (~5 ft — where a chest/thigh touch settles it), plus the times
-//!   the ball reaches each and the bare landing point. This is the trajectory the
-//!   receiver anticipates.
+//! * [`aerial_descent_plan`] — pure projectile geometry. From the arc's apex + elapsed
+//!   flight time (the vertical schedule) and the **current** ball position + horizontal
+//!   velocity (the horizontal projection, so it inherits the drag already bled off in
+//!   flight rather than assuming the launch pace), it returns the two horizontal points
+//!   where the **descending** ball passes through the control band: the *top* (~8 ft —
+//!   where a header/jump meets it) and the *sweet* height (~5 ft — where a chest/thigh
+//!   touch settles it), plus the times the ball reaches each and the bare landing point.
+//!   This is the trajectory the receiver anticipates.
 //! * [`decide_aerial_reception`] — the per-receiver **MDP/POMDP** decision. Given the
 //!   descent plan and the receiver's kinematics + the nearest opponent's race to the drop
 //!   zone, it picks an [`AerialReceptionDecision`] (attack it high, settle under it, or
@@ -167,23 +168,43 @@ fn descent_time_to_height(hang: f64, h: f64) -> Option<f64> {
     Some((hang + disc.sqrt()) * 0.5)
 }
 
-/// Pure projectile geometry of a descending lofted ball. `apex_yards` is the arc's peak
-/// height, `launch_speed_yps` its (constant-model) horizontal pace along `origin ->
-/// intended_target`, and `time_aloft_seconds` how long it has already been in the air.
-/// Returns `None` when the ball is not a genuine loft (apex below the band) — the caller
-/// then keeps the flat-projection election.
+/// How far past the intended landing spot a descent point may be projected before it is
+/// capped, in yards. A small slack so a slightly led/over-struck ball isn't truncated to
+/// the aim point, while a wildly over-hit ball isn't chased off the park.
+const AERIAL_OVERSHOOT_MARGIN_YARDS: f64 = 4.0;
+
+/// Pure projectile geometry of a descending lofted ball. The vertical schedule is the
+/// engine's own gravity-timed loft (`apex_yards` + `time_aloft_seconds` ⇒ when the ball
+/// passes each control height); the **horizontal** is projected from the **current** ball
+/// state (`ball_now` + `ball_horizontal_vel`) over the remaining time, so it inherits the
+/// drag already bled off in flight instead of assuming the launch pace for the whole arc
+/// (a long/fast aerial loses real horizontal pace to air + linear drag, so the constant-
+/// launch model over-shoots the drop zone). `intended_target` only bounds the projection
+/// so an over-hit ball isn't chased off the pitch. Returns `None` when the ball is not a
+/// genuine loft (apex below the band) — the caller then keeps the flat-projection election.
 pub fn aerial_descent_plan(
     apex_yards: f64,
-    launch_speed_yps: f64,
-    origin: Vec2,
-    intended_target: Vec2,
     time_aloft_seconds: f64,
+    ball_now: Vec2,
+    ball_horizontal_vel: Vec2,
+    intended_target: Vec2,
     field_width: f64,
     field_length: f64,
 ) -> Option<AerialDescentPlan> {
     if !apex_yards.is_finite() || apex_yards < AERIAL_ANTICIPATION_MIN_APEX_YARDS {
         return None;
     }
+    if !ball_now.x.is_finite() || !ball_now.y.is_finite() {
+        return None;
+    }
+    // A non-finite velocity ⇒ treat the ball as dropping vertically (project off the aim
+    // bearing only), never propagate a NaN into the target.
+    let ball_horizontal_vel = if ball_horizontal_vel.x.is_finite() && ball_horizontal_vel.y.is_finite()
+    {
+        ball_horizontal_vel
+    } else {
+        Vec2::new(0.0, 0.0)
+    };
     let hang = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
     if !hang.is_finite() || hang <= 1e-3 {
         return None;
@@ -192,27 +213,35 @@ pub fn aerial_descent_plan(
     // The sweet height is below the top, so it always exists when the top does.
     let t_settle =
         descent_time_to_height(hang, AERIAL_CONTROL_BAND_SWEET_YARDS).unwrap_or(t_attack);
-    let path = intended_target - origin;
-    let path_len = path.len();
-    let dir = if path_len > 1e-6 {
-        path / path_len
+    // Remaining time (from now) until the ball passes each height on the way down.
+    let r_attack = (t_attack - time_aloft_seconds).max(0.0);
+    let r_settle = (t_settle - time_aloft_seconds).max(0.0);
+    let r_land = (hang - time_aloft_seconds).max(0.0);
+    // Horizontal projection from the CURRENT ball state. Use the current horizontal pace
+    // and heading (drag-aware to date); fall back to the bearing to the aim point when the
+    // ball is dropping near-vertically (negligible horizontal speed).
+    let speed_now = ball_horizontal_vel.len();
+    let to_target = intended_target - ball_now;
+    let dist_to_target = to_target.len();
+    let dir = if speed_now > 1e-3 {
+        ball_horizontal_vel / speed_now
+    } else if dist_to_target > 1e-3 {
+        to_target / dist_to_target
     } else {
         Vec2::new(0.0, 0.0)
     };
-    let pace = launch_speed_yps.max(1.0);
-    // Horizontal advances at the (constant-model) launch pace along the path, clamped so
-    // it never projects past the intended landing spot.
-    let point_at = |t: f64| -> Vec2 {
-        let traveled = (pace * t).clamp(0.0, path_len);
-        (origin + dir * traveled).clamp_to_pitch(field_width, field_length)
+    let max_forward = dist_to_target + AERIAL_OVERSHOOT_MARGIN_YARDS;
+    let point_at = |r: f64| -> Vec2 {
+        let traveled = (speed_now * r).clamp(0.0, max_forward);
+        (ball_now + dir * traveled).clamp_to_pitch(field_width, field_length)
     };
     Some(AerialDescentPlan {
-        attack_point: point_at(t_attack),
-        settle_point: point_at(t_settle),
-        landing_point: point_at(hang),
-        time_to_attack: (t_attack - time_aloft_seconds).max(0.0),
-        time_to_settle: (t_settle - time_aloft_seconds).max(0.0),
-        time_to_land: (hang - time_aloft_seconds).max(0.0),
+        attack_point: point_at(r_attack),
+        settle_point: point_at(r_settle),
+        landing_point: point_at(r_land),
+        time_to_attack: r_attack,
+        time_to_settle: r_settle,
+        time_to_land: r_land,
         apex_yards,
     })
 }
@@ -312,13 +341,15 @@ pub fn analytic_aerial_reception(
         - lateness * 0.30)
         .clamp(0.0, 1.0);
 
-    // A chase keeps the full attack blend at 0 (take it where it lands).
-    if matches!(decision, AerialReceptionDecision::ChaseDrop) {
+    // A chase runs onto where the ball actually comes down (the landing point), not the
+    // settle spot it can't reach in time — keep the full attack blend at 0 for the trace.
+    let target = if matches!(decision, AerialReceptionDecision::ChaseDrop) {
         attack_blend = 0.0;
+        plan.landing_point
+    } else {
+        plan.point_for_blend(attack_blend)
     }
-    let target = plan
-        .point_for_blend(attack_blend)
-        .clamp_to_pitch(field_width, field_length);
+    .clamp_to_pitch(field_width, field_length);
     let sprint = !matches!(decision, AerialReceptionDecision::SettleUnder)
         || slack < AERIAL_SETTLE_SLACK_SECONDS * 2.0;
     AerialReceptionPlan {
@@ -589,8 +620,13 @@ pub fn train_aerial_reception_head(
     Some((head, report))
 }
 
-/// Ticks after an aerial reception is sampled at which its control outcome is scored.
-pub const AERIAL_RECEPTION_REWARD_WINDOW_TICKS: u64 = 14;
+/// Control-settling grace (seconds) added past the ball's landing time before an aerial
+/// reception's outcome is scored — long enough for the receiver to take the touch.
+pub const AERIAL_RECEPTION_SETTLE_GRACE_SECONDS: f64 = 0.45;
+/// Bounds (ticks) on the adaptive outcome window, so a degenerate flight time can't make
+/// the reward resolve instantly or hang indefinitely.
+pub const AERIAL_RECEPTION_MIN_WINDOW_TICKS: u64 = 4;
+pub const AERIAL_RECEPTION_MAX_WINDOW_TICKS: u64 = 60;
 
 impl SoccerMatch {
     /// Gated per-tick RL sample collection for the learnable aerial-reception control
@@ -667,12 +703,22 @@ impl SoccerMatch {
         let current = snapshot.player_snapshot_position(me);
         if let Some((descent, inputs, plan)) = snapshot.aerial_reception_resolve(me, pass, current) {
             let context = AerialReceptionContext::build(&descent, &inputs, plan.attack_blend);
+            // Resolve the outcome shortly AFTER the ball actually lands (flight time + a
+            // touch-settling grace), not a fixed window — a long lob is still airborne a
+            // fixed window later, which would score every high ball as "not controlled".
+            let dt = snapshot.dt_seconds.max(1e-3);
+            let window = (((descent.time_to_land + AERIAL_RECEPTION_SETTLE_GRACE_SECONDS) / dt)
+                .ceil() as u64)
+                .clamp(
+                    AERIAL_RECEPTION_MIN_WINDOW_TICKS,
+                    AERIAL_RECEPTION_MAX_WINDOW_TICKS,
+                );
             self.pending_aerial_reception.push(PendingAerialReception {
                 receiver: receiver_id,
                 team: pass.team,
                 context,
                 used_blend: plan.attack_blend,
-                due_tick: tick + AERIAL_RECEPTION_REWARD_WINDOW_TICKS,
+                due_tick: tick + window,
             });
         }
     }
@@ -695,10 +741,10 @@ mod tests {
         // see `steep_lob_band_points_coincide_horizontally`).
         aerial_descent_plan(
             4.5,
-            26.0,
-            Vec2::new(30.0, 10.0),
-            Vec2::new(30.0, 70.0),
             0.0,
+            Vec2::new(30.0, 10.0),
+            Vec2::new(0.0, 26.0),
+            Vec2::new(30.0, 70.0),
             68.0,
             105.0,
         )
@@ -725,10 +771,10 @@ mod tests {
         // differs (the lever for the receiver is *when* to jump, not where to step).
         let plan = aerial_descent_plan(
             7.0,
-            16.0,
-            Vec2::new(30.0, 10.0),
-            Vec2::new(30.0, 38.0),
             0.0,
+            Vec2::new(30.0, 10.0),
+            Vec2::new(0.0, 16.0),
+            Vec2::new(30.0, 38.0),
             68.0,
             105.0,
         )
@@ -742,10 +788,10 @@ mod tests {
         // Apex inside the control band ⇒ never a genuine loft to anticipate.
         assert!(aerial_descent_plan(
             1.0,
-            18.0,
-            Vec2::new(0.0, 0.0),
-            Vec2::new(0.0, 20.0),
             0.0,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 18.0),
+            Vec2::new(0.0, 20.0),
             68.0,
             105.0,
         )
@@ -759,6 +805,73 @@ mod tests {
         assert_eq!(plan.point_for_blend(1.0), plan.attack_point);
         let mid = plan.point_for_blend(0.5);
         assert!((mid.y - (plan.settle_point.y + plan.attack_point.y) * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drag_aware_projection_shortens_the_drop_zone_vs_launch_pace() {
+        // Same arc sampled mid-flight at two horizontal paces: a ball that has bled pace
+        // to drag (slower current velocity) must drop SHORTER than one still at full pace.
+        let fast = aerial_descent_plan(
+            5.0,
+            0.3,
+            Vec2::new(30.0, 25.0),
+            Vec2::new(0.0, 24.0),
+            Vec2::new(30.0, 80.0),
+            68.0,
+            105.0,
+        )
+        .expect("aerial");
+        let dragged = aerial_descent_plan(
+            5.0,
+            0.3,
+            Vec2::new(30.0, 25.0),
+            Vec2::new(0.0, 16.0),
+            Vec2::new(30.0, 80.0),
+            68.0,
+            105.0,
+        )
+        .expect("aerial");
+        assert!(
+            dragged.settle_point.y < fast.settle_point.y,
+            "a dragged ball ({}) drops shorter than a full-pace one ({})",
+            dragged.settle_point.y,
+            fast.settle_point.y
+        );
+    }
+
+    #[test]
+    fn overhit_ball_drop_zone_is_capped_near_the_aim() {
+        // A very fast ball over a short remaining distance must not project far past the
+        // intended target (the receiver shouldn't chase it off the park).
+        let plan = aerial_descent_plan(
+            5.0,
+            0.2,
+            Vec2::new(30.0, 60.0),
+            Vec2::new(0.0, 40.0),
+            Vec2::new(30.0, 66.0),
+            68.0,
+            105.0,
+        )
+        .expect("aerial");
+        assert!(plan.landing_point.y <= 66.0 + AERIAL_OVERSHOOT_MARGIN_YARDS + 1e-6);
+    }
+
+    #[test]
+    fn unreachable_ball_chases_the_landing_point() {
+        let plan = long_loft_plan();
+        // Receiver far behind the drop zone and slow: can't get under it ⇒ chase where it
+        // lands, not the settle spot it can't reach.
+        let inputs = AerialReceptionInputs {
+            receiver_speed_yps: 6.0,
+            receiver_position: plan.settle_point + Vec2::new(0.0, -40.0),
+            opponent_time_to_drop: 5.0,
+            opponent_distance_to_drop: 30.0,
+            aerial_tool: 0.5,
+            first_touch_tool: 0.6,
+        };
+        let resolved = analytic_aerial_reception(&plan, &inputs, 68.0, 105.0);
+        assert_eq!(resolved.decision, AerialReceptionDecision::ChaseDrop);
+        assert_eq!(resolved.target, plan.landing_point);
     }
 
     #[test]

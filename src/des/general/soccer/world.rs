@@ -27141,60 +27141,41 @@ impl WorldSnapshot {
         {
             return None;
         }
-        let path = pass.intended_target - pass.origin;
-        let path_len = path.len();
-        if path_len <= 1e-6 {
-            return None;
-        }
-        let apex = lofted_pass_apex_yards(pass.distance_yards);
-        if apex < LONG_AERIAL_FALL_CONTROL_HIGH_YARDS {
-            return None;
-        }
+        let apex = pending_pass_snapshot_apex_yards(pass);
+        let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        // Past the controllable descent (the ball has dropped below the settle height on
+        // the way DOWN) ⇒ the window has closed. (Checked against the descending root so the
+        // rising phase below 5ft right after launch is NOT mistaken for a closed window.)
         let hang_time = 2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt();
-        let descending_time_for_height = |height: f64| -> Option<f64> {
-            if height > apex {
+        let low_disc = hang_time * hang_time
+            - 8.0 * AERIAL_CONTROL_BAND_SWEET_YARDS / GRAVITY_YPS2;
+        if low_disc >= 0.0 {
+            let low_time = (hang_time + low_disc.sqrt()) * 0.5;
+            if time_aloft > low_time + self.dt_seconds {
                 return None;
             }
-            let discriminant = hang_time * hang_time - 8.0 * height / GRAVITY_YPS2;
-            if discriminant < 0.0 {
-                return None;
-            }
-            Some((hang_time + discriminant.sqrt()) * 0.5)
-        };
-        let high_time = descending_time_for_height(LONG_AERIAL_FALL_CONTROL_HIGH_YARDS)?;
-        let low_time = descending_time_for_height(LONG_AERIAL_FALL_CONTROL_LOW_YARDS)?;
-        if low_time <= high_time {
-            return None;
         }
-        let elapsed = (self.tick.saturating_sub(pass.launch_tick) as f64 * self.dt_seconds)
-            .clamp(0.0, hang_time);
-        if elapsed > low_time + self.dt_seconds {
-            return None;
-        }
-        let target_time = if elapsed < high_time {
-            high_time
-        } else {
-            (elapsed + self.dt_seconds * 0.5).clamp(high_time, low_time)
-        };
-        let seconds_until_window = (target_time - elapsed).max(0.0);
-        let direction = path / path_len;
-        let current_progress =
-            (dot(self.ball.position - pass.origin, path) / (path_len * path_len)).clamp(0.0, 1.0);
-        let current_along = current_progress * path_len;
-        let speed_along = self.ball.velocity.dot(direction).max(0.0);
-        let projected_along = current_along + speed_along * seconds_until_window;
-        let ballistic_along = pass.launch_speed_yps.max(1.0) * target_time;
-        let blended_along = if seconds_until_window <= 1e-6 {
-            current_along
-        } else {
-            projected_along * 0.65 + ballistic_along * 0.35
-        }
-        .clamp(current_along, path_len);
-        let target = (pass.origin + direction * blended_along)
-            .clamp_to_pitch(self.field_width, self.field_length);
+        // Unified descent geometry: the SAME drag-aware projection the reception plan uses
+        // (single source of truth — `aerial_descent_plan`), replacing the old duplicate
+        // blended ballistic/velocity projection. The window opens when the ball drops to the
+        // top of the control band; the target is where it settles to the feet.
+        let plan = aerial_descent_plan(
+            apex,
+            time_aloft,
+            self.ball.position,
+            self.ball.velocity,
+            pass.intended_target,
+            self.field_width,
+            self.field_length,
+        )?;
+        // Aim at the point where the ball first drops into reach (the top of the band): the
+        // receiver gets there ready, then tracks it down. Once inside the window `time_to_attack`
+        // is 0, so `attack_point` collapses to the ball's current ground position — the same
+        // "track where it is now" the old window did, but drag-aware. (Mirrors the old
+        // `target_time = high_time` before the window, current position once inside.)
         Some(LongAerialFallingWindow {
-            target,
-            seconds_until_window,
+            target: plan.attack_point,
+            seconds_until_window: plan.time_to_attack,
         })
     }
 
@@ -27288,7 +27269,9 @@ impl WorldSnapshot {
         pass: &PendingPassSnapshot,
         current: Vec2,
     ) -> Option<(AerialDescentPlan, AerialReceptionInputs, AerialReceptionPlan)> {
-        if !pass.flight.is_aerial() {
+        if !pass.flight.is_aerial() || me.role == PlayerRole::Goalkeeper {
+            // Keepers claim crosses with the hands on a separate model; this is outfield
+            // chest/head/foot reception.
             return None;
         }
         // Only anticipate while the ball is still genuinely above the control band and
@@ -27298,12 +27281,14 @@ impl WorldSnapshot {
         }
         let apex = pending_pass_snapshot_apex_yards(pass);
         let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        // Project the descent from the CURRENT ball state (drag-aware to date), not the
+        // launch pace — a long aerial bleeds real horizontal pace in flight.
         let descent = aerial_descent_plan(
             apex,
-            pass.launch_speed_yps,
-            pass.origin,
-            pass.intended_target,
             time_aloft,
+            self.ball.position,
+            self.ball.velocity,
+            pass.intended_target,
             self.field_width,
             self.field_length,
         )?;
