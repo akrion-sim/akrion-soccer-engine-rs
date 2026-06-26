@@ -1077,6 +1077,12 @@ pub struct PlayerAgent {
     /// distinct from `fatigue`, which is the slow aerobic drain over the match.
     #[serde(default)]
     pub anaerobic_load: f64,
+    /// Metabolic locomotion cost spent THIS tick (J) — the di Prampero running model
+    /// (run + accel power × dt) the W′ update already uses, surfaced for the learning
+    /// layer. Read only by the wasted-energy reward (`remember_recent_learning_transitions`);
+    /// it never feeds a decision, so it leaves the simulation trajectory byte-identical.
+    #[serde(default)]
+    pub last_tick_locomotion_joules: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
@@ -2579,6 +2585,21 @@ impl PlayerAgent {
                 0.0
             };
         self.fatigue = (self.fatigue + rotation_fatigue + involvement_fatigue).clamp(0.0, 1.0);
+
+        // Per-tick locomotion metabolic cost (J) for the wasted-energy reward. Computed
+        // every tick from the same speed/forward-accel running model the W′ branch uses,
+        // independent of `dd_soccer_disable_power_duration_ceiling()` so the metric exists
+        // under either energy model. Read-only metric: never changes a decision.
+        {
+            let speed_yps = self.velocity.len();
+            let accel_forward_yps2 = if speed_yps > 0.5 {
+                dot(self.acceleration, self.velocity / speed_yps).max(0.0)
+            } else {
+                self.acceleration.len()
+            };
+            self.last_tick_locomotion_joules =
+                metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2) * dt;
+        }
 
         if dd_soccer_disable_power_duration_ceiling() {
             let burst_load = match self.movement_gait {

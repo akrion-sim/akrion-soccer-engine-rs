@@ -63,6 +63,8 @@ mod back_four_line;
 pub use back_four_line::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod beat_defender;
+pub use beat_defender::*;
 mod support_scorer;
 pub use support_scorer::*;
 mod spacing_target;
@@ -73,6 +75,8 @@ mod shot_decision;
 pub use shot_decision::*;
 mod reward_shaping;
 pub use reward_shaping::*;
+mod field_numbers;
+pub use field_numbers::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -1645,6 +1649,32 @@ const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 4.5;
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
 const FAILED_DISPOSSESSION_PENALTY_POINTS: f64 = 2.0;
 const LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS: f64 = FAILED_DISPOSSESSION_PENALTY_POINTS;
+// --- Wasted-energy penalty (off-ball running with no ball involvement) ------------
+// A small, retroactive MDP/POMDP cost for locomotion energy a player spends in a tick
+// that turns out to buy NO ball interaction over the following 10 s — i.e. pointless
+// running. Mirrors the turnover-window mechanism: a tick-age-windowed history of recent
+// transitions, each re-queued into `deferred_reward_transitions` with a tiny negative
+// reward once its 10 s lookahead closes with no touch. Gated OFF by default
+// (`DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY`); when off it is byte-identical and zero-cost.
+// The complement, not the contradiction, of the near-ball effort reward
+// (`EFFORT_REWARD_POINTS`), which only fires inside a high-urgency contest at the ball.
+pub(crate) const WASTED_ENERGY_WINDOW_TICKS: u64 = secs_to_ticks(10.0);
+// Only ticks above this locomotion cost are "moving a lot" — walking/standing is exempt,
+// so a player is never taxed for economical positioning, only for hard off-ball running.
+// ~70 J/tick at dt = 1/15 ≈ a sustained run for a ~75 kg player (a flat-out sprint is
+// ~150 J/tick); below it the sample is never even retained.
+const WASTED_ENERGY_MIN_JOULES_PER_TICK: f64 = 70.0;
+// Normalises the spent joules to a ~unit ratio at a hard sprint, so the points below read
+// as "per fully-wasted sprint tick".
+const WASTED_ENERGY_REFERENCE_JOULES_PER_TICK: f64 = 145.0;
+// Penalty points for one fully-wasted hard-sprint tick. Deliberately tiny: the policy is
+// nudged off pointless running "to a small degree", not whipped off all movement.
+const WASTED_ENERGY_PENALTY_POINTS: f64 = 0.02;
+// Cap the energy ratio so a transient solver speed spike can't fabricate a large penalty.
+const WASTED_ENERGY_PENALTY_RATIO_CLAMP: f64 = 1.5;
+// Bound the windowed history (and thus the deferred re-train backlog) the same way the
+// turnover window is bounded — newest samples evict the oldest past this many.
+const WASTED_ENERGY_MAX_PENDING_SAMPLES: usize = 1024;
 // --- Slide tackle (a committed, high-variance defensive challenge) ---------------
 // A slide tackle is a LAST-DITCH lunge a defender throws at a ball-carrier who is
 // moving too fast to be contained on foot. It reaches further than a standing
@@ -5793,6 +5823,14 @@ pub struct SoccerPomdpObservation {
     pub defensive_urgency: f64,
     #[serde(default)]
     pub decision_urgency: f64,
+    /// The 11v11 numbers-up / numbers-down picture around this player, summarized from
+    /// the full field vector (all 22 bodies' position + kinematics) onto this player's
+    /// attack axis. Available to every MDP/POMDP decision; its two urgencies are also
+    /// folded into `offensive_urgency` / `defensive_urgency` when the default-ON gate is
+    /// enabled. Stays at [`Default`] (all zero) when `DD_SOCCER_DISABLE_FIELD_NUMBERS_VECTOR`
+    /// is set, so decisions are then byte-identical. See [`SoccerFieldNumbersVector`].
+    #[serde(default)]
+    pub field_numbers: SoccerFieldNumbersVector,
     #[serde(default)]
     pub goal_attack_window_score: f64,
     #[serde(default)]
@@ -47790,6 +47828,7 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         yaw_rate: 0.0,
         dizziness: 0.0,
         anaerobic_load: 0.0,
+        last_tick_locomotion_joules: 0.0,
         incoming_ball: player.incoming_ball.clone(),
         skills: player.skills.clone(),
         fatigue: player.fatigue.clamp(0.0, 1.0),
@@ -56785,6 +56824,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 yaw_rate: 0.0,
                 dizziness: 0.0,
                 anaerobic_load: 0.0,
+                last_tick_locomotion_joules: 0.0,
                 incoming_ball: None,
                 // Deterministic, position-only skills: every player is the same
                 // overall standard, shaped by their shirt (1-11) and identical

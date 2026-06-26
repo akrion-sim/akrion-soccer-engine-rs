@@ -5066,6 +5066,89 @@ fn half_open_forward_target_stays_visible_and_beats_backward_recycle() {
 }
 
 #[test]
+fn field_numbers_vector_is_wired_into_every_observation_and_lifts_carrier_urgency() {
+    // The 11v11 field-numbers vector must be computed onto every player's observation and,
+    // when an attacking overload sits ahead of the carrier, lift the carrier's offensive
+    // urgency. Home attacks toward +y; stack all teammates ahead and all opponents behind.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 7_321,
+        ..Default::default()
+    });
+    let carrier = 6usize;
+    for player in &mut sim.players {
+        if player.id == carrier {
+            continue;
+        }
+        let spread = 8.0 + (player.id % 8) as f64 * 8.0; // 8..=64 across the width
+        player.position = match player.team {
+            // Home teammates ahead of the carrier (toward the attacking goal at y=120),
+            // a couple driving forward so the centroid velocity is up-field.
+            Team::Home => Vec2::new(spread, 82.0 + (player.id % 5) as f64 * 3.0),
+            // Away opponents goal-side of the carrier (toward our own goal at y=0).
+            Team::Away => Vec2::new(spread, 30.0 + (player.id % 5) as f64 * 3.0),
+        };
+        player.velocity = match player.team {
+            Team::Home => Vec2::new(0.0, 3.0),
+            Team::Away => Vec2::zero(),
+        };
+        player.acceleration = Vec2::zero();
+    }
+    sim.players[carrier].role = PlayerRole::Midfielder;
+    sim.players[carrier].position = Vec2::new(40.0, 55.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, 2.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(carrier);
+    let fnv = &observation.field_numbers;
+
+    // The full field vector (all 22 bodies), not vision-filtered: 10 teammates ahead, all
+    // 11 opponents behind.
+    assert_eq!(fnv.teammates_ahead, 10, "all 10 teammates stacked ahead");
+    assert_eq!(fnv.opponents_ahead, 0);
+    assert_eq!(fnv.opponents_behind, 11, "all 11 opponents goal-side of the carrier");
+    assert_eq!(fnv.ahead_overload, 10);
+    assert_eq!(
+        fnv.players_ahead,
+        fnv.teammates_ahead + fnv.opponents_ahead,
+        "players_ahead is the both-teams total"
+    );
+    assert!(fnv.ahead_ratio > 1.0, "numbers up going forward");
+
+    // Counts + ratio drive a real offensive urgency, and it is folded into the carrier's
+    // offensive urgency (which therefore exceeds the bare shot-geometry baseline).
+    assert!(
+        fnv.offensive_numbers_urgency > 0.5,
+        "a big attacking overload ahead should spark offensive urgency: {fnv:?}"
+    );
+    assert!(
+        observation.offensive_urgency >= fnv.offensive_numbers_urgency * 0.40 - 1e-6,
+        "offensive numbers urgency must be folded into the carrier's offensive urgency: \
+         offensive_urgency {} vs numbers {}",
+        observation.offensive_urgency,
+        fnv.offensive_numbers_urgency
+    );
+
+    // Team centroids read off the field vector: our centre of mass sits up-field, theirs
+    // goal-side, and our collective velocity is shoving forward.
+    assert!(
+        fnv.own_center_of_mass_forward_yards > 0.0,
+        "own team centre of mass is ahead of the carrier"
+    );
+    assert!(
+        fnv.opp_center_of_mass_forward_yards < 0.0,
+        "opposing team centre of mass is goal-side of the carrier"
+    );
+    assert!(
+        fnv.own_center_of_velocity_forward_yps > 0.0 && fnv.team_push_forward_yps > 0.0,
+        "our side is winning the collective shove up-field: {fnv:?}"
+    );
+}
+
+#[test]
 fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -27437,6 +27520,105 @@ fn turnover_window_penalty_requeues_recent_losing_team_actions_with_recency_deca
     // A second turnover signal on the same tick is de-duped (no double penalty).
     sim.penalize_turnover_window(Team::Home);
     assert_eq!(sim.deferred_reward_transitions.len(), 2);
+}
+
+#[test]
+fn wasted_energy_window_penalizes_only_uninvolved_running() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(0);
+    let base = SoccerLearningTransition {
+        tick: 0,
+        player_id: 0,
+        team: Team::Home,
+        role: sim.players[0].role,
+        state: snapshot.mdp_state_for_player(0),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "carry".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(0),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let sample = |tick: u64, player_id: usize, joules: f64| WastedEnergySample {
+        transition: SoccerLearningTransition {
+            tick,
+            player_id,
+            ..base.clone()
+        },
+        joules,
+    };
+
+    // "Now" is well past the 10s window for the aged-out samples.
+    sim.tick = WASTED_ENERGY_WINDOW_TICKS + 100;
+    let full = WASTED_ENERGY_REFERENCE_JOULES_PER_TICK;
+    // p0: hard running, never touched the ball in its window → wasted.
+    sim.wasted_energy_history.push_back(sample(10, 0, full));
+    // p1: ran, but touched the ball inside its lookahead → productive, dropped.
+    sim.wasted_energy_history.push_back(sample(20, 1, full));
+    sim.player_last_ball_interaction_tick.insert(1, 120);
+    // p3: half the energy, no involvement → wasted, half the penalty of p0.
+    sim.wasted_energy_history.push_back(sample(30, 3, full * 0.5));
+    // p4: an EARLIER touch (before the sample) does not save it → still wasted.
+    sim.wasted_energy_history.push_back(sample(40, 4, full));
+    sim.player_last_ball_interaction_tick.insert(4, 35);
+    // p2: still inside its 10s window → retained, not yet settled.
+    sim.wasted_energy_history
+        .push_back(sample(sim.tick - 5, 2, full));
+
+    sim.finalize_wasted_energy_window();
+
+    // p0, p3, p4 are penalized; p1 (touched) is not; p2 (in-window) is untouched.
+    let penalized: std::collections::HashMap<usize, f64> = sim
+        .deferred_reward_transitions
+        .iter()
+        .map(|t| (t.player_id, t.reward))
+        .collect();
+    assert_eq!(penalized.len(), 3, "exactly the three wasted samples re-queued");
+    assert!(penalized.get(&0).is_some_and(|r| *r < 0.0));
+    assert!(penalized.get(&3).is_some_and(|r| *r < 0.0));
+    assert!(penalized.get(&4).is_some_and(|r| *r < 0.0));
+    assert!(!penalized.contains_key(&1), "a touch in the window spares the run");
+    // Penalty scales with energy spent: p3 spent half the joules → half the penalty.
+    let pen0 = penalized[&0];
+    let pen3 = penalized[&3];
+    assert!(
+        (pen3 - pen0 * 0.5).abs() < 1e-9,
+        "half the energy → half the penalty: {pen3} vs {pen0}"
+    );
+    // The in-window sample survives for a later verdict; the aged-out ones are consumed.
+    assert_eq!(sim.wasted_energy_history.len(), 1);
+    assert_eq!(sim.wasted_energy_history.front().unwrap().transition.player_id, 2);
+}
+
+#[test]
+fn wasted_energy_penalty_is_inert_when_disabled() {
+    // Default (no DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY): the windowed history and the
+    // per-player interaction map are never populated, so the feature is zero-cost and
+    // leaves training byte-identical.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        seed: 7,
+        ..MatchConfig::default()
+    });
+    for _ in 0..30 {
+        sim.run_time_step();
+    }
+    assert!(
+        sim.wasted_energy_history.is_empty(),
+        "no wasted-energy samples should be retained while the feature is off"
+    );
+    assert!(
+        sim.player_last_ball_interaction_tick.is_empty(),
+        "no ball-interaction ticks should be tracked while the feature is off"
+    );
 }
 
 #[test]
