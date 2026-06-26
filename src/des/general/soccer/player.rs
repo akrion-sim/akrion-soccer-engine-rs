@@ -2494,7 +2494,8 @@ impl PlayerAgent {
     /// in `SoccerMatch`.) `fatigue` is the slow aerobic channel; the fast anaerobic W′ battery
     /// (`anaerobic_load`) is the SEPARATE channel updated only below in this function.
     pub(crate) fn add_fatigue(&mut self, delta: f64) {
-        self.fatigue = (self.fatigue + delta).clamp(0.0, 1.0);
+        self.fatigue = (finite_metric(self.fatigue).clamp(0.0, 1.0) + finite_metric(delta))
+            .clamp(0.0, 1.0);
     }
 
     pub(crate) fn update_body_orientation_dizziness_energy(
@@ -2538,7 +2539,8 @@ impl PlayerAgent {
                 Vec2::new(0.0, self.team.attack_dir())
             };
             let velocity = self.velocity;
-            if velocity.len() < MOVING_FACING_MIN_SPEED_YPS {
+            let speed = finite_metric(velocity.len()).max(0.0);
+            if speed < MOVING_FACING_MIN_SPEED_YPS {
                 ball_dir
             } else {
                 let move_dir = velocity.normalized();
@@ -2560,7 +2562,8 @@ impl PlayerAgent {
             }
         };
 
-        let desired_yaw = desired_dir.y.atan2(desired_dir.x);
+        self.facing_yaw = finite_metric(self.facing_yaw);
+        let desired_yaw = finite_metric(desired_dir.y.atan2(desired_dir.x));
         let mut delta = desired_yaw - self.facing_yaw;
         while delta > PI {
             delta -= TAU;
@@ -2570,8 +2573,9 @@ impl PlayerAgent {
         }
 
         let max_rate_change = MAX_BODY_YAW_ACCEL_RAD_S2 * dt;
-        let top_speed = player_top_speed_yps(self.role, &self.skills).max(1e-6);
-        let speed_frac = (self.velocity.len() / top_speed).clamp(0.0, 1.0);
+        let top_speed = finite_metric(player_top_speed_yps(self.role, &self.skills)).max(1e-6);
+        let speed_frac =
+            (finite_metric(self.velocity.len()).max(0.0) / top_speed).clamp(0.0, 1.0);
         let max_yaw_rate = if ball_holder == Some(self.id) {
             POSSESSION_MAX_YAW_RATE_SLOW_RAD_S
                 - speed_frac
@@ -2582,9 +2586,10 @@ impl PlayerAgent {
         };
         let stopping_rate = (2.0 * MAX_BODY_YAW_ACCEL_RAD_S2 * delta.abs()).sqrt() * delta.signum();
         let target_rate = stopping_rate.clamp(-max_yaw_rate, max_yaw_rate);
+        let yaw_rate = finite_metric(self.yaw_rate);
         let new_rate = target_rate.clamp(
-            self.yaw_rate - max_rate_change,
-            self.yaw_rate + max_rate_change,
+            yaw_rate - max_rate_change,
+            yaw_rate + max_rate_change,
         );
         self.yaw_rate = new_rate;
         let proposed_turn = (new_rate * dt).clamp(
@@ -2606,7 +2611,7 @@ impl PlayerAgent {
 
         let turn_rate = actual_turn.abs() / dt;
         let accrual = (turn_rate - COMFORT_YAW_RATE_RAD_S).max(0.0) * DIZZINESS_GAIN_PER_RAD * dt;
-        self.dizziness = ((self.dizziness + accrual)
+        self.dizziness = ((finite_metric(self.dizziness).clamp(0.0, DIZZINESS_MAX) + accrual)
             * (1.0 - DIZZINESS_RECOVERY_PER_SECOND * dt).max(0.0))
         .clamp(0.0, DIZZINESS_MAX);
 
@@ -2629,44 +2634,55 @@ impl PlayerAgent {
         // independent of `dd_soccer_disable_power_duration_ceiling()` so the metric exists
         // under either energy model. Read-only metric: never changes a decision.
         {
-            let speed_yps = self.velocity.len();
+            let speed_yps = finite_metric(self.velocity.len()).max(0.0);
+            let accel_yps2 = finite_metric(self.acceleration.len()).max(0.0);
             let accel_forward_yps2 = if speed_yps > 0.5 {
-                dot(self.acceleration, self.velocity / speed_yps).max(0.0)
+                finite_metric(dot(self.acceleration, self.velocity / speed_yps)).max(0.0)
             } else {
-                self.acceleration.len()
+                accel_yps2
             };
-            self.last_tick_locomotion_joules =
+            let locomotion_joules =
                 metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2) * dt;
+            self.last_tick_locomotion_joules = finite_metric(locomotion_joules).max(0.0);
         }
 
         if dd_soccer_disable_power_duration_ceiling() {
+            let current_load = finite_metric(self.anaerobic_load).clamp(0.0, 1.0);
+            let accel_load = finite_metric(self.acceleration.len()).max(0.0)
+                * ANAEROBIC_ACCEL_LOAD_PER_YPS2
+                * dt;
             let burst_load = match self.movement_gait {
                 MovementGait::Sprint => ANAEROBIC_SPRINT_LOAD_PER_SECOND,
                 MovementGait::Run => ANAEROBIC_SPRINT_LOAD_PER_SECOND * 0.45,
                 _ => 0.0,
             } * dt
-                + self.acceleration.len() * ANAEROBIC_ACCEL_LOAD_PER_YPS2 * dt;
-            self.anaerobic_load = (self.anaerobic_load + burst_load
-                - ANAEROBIC_RECOVERY_PER_SECOND * dt)
-                .clamp(0.0, 1.0);
+                + accel_load;
+            self.anaerobic_load =
+                (current_load + burst_load - ANAEROBIC_RECOVERY_PER_SECOND * dt).clamp(0.0, 1.0);
         } else {
-            let cp = player_critical_power_w(&self.skills);
-            let w_prime_max = player_anaerobic_capacity_j(&self.skills);
-            let speed_yps = self.velocity.len();
+            let cp = finite_metric(player_critical_power_w(&self.skills)).max(1.0);
+            let w_prime_max = finite_metric(player_anaerobic_capacity_j(&self.skills)).max(1.0);
+            let speed_yps = finite_metric(self.velocity.len()).max(0.0);
+            let accel_yps2 = finite_metric(self.acceleration.len()).max(0.0);
             let accel_forward_yps2 = if speed_yps > 0.5 {
-                dot(self.acceleration, self.velocity / speed_yps).max(0.0)
+                finite_metric(dot(self.acceleration, self.velocity / speed_yps)).max(0.0)
             } else {
-                self.acceleration.len()
+                accel_yps2
             };
-            let demand = metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2);
-            let mut w_prime = (1.0 - self.anaerobic_load.clamp(0.0, 1.0)) * w_prime_max;
+            let demand =
+                finite_metric(metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2))
+                    .max(0.0);
+            let current_load = finite_metric(self.anaerobic_load).clamp(0.0, 1.0);
+            let mut w_prime = (1.0 - current_load) * w_prime_max;
             if demand >= cp {
                 let overshoot = demand - cp;
                 w_prime -= overshoot * dt;
                 let supra_cp_kj = overshoot * dt / 1000.0;
                 self.add_fatigue(supra_cp_kj * SUPRA_CP_AEROBIC_FATIGUE_PER_KJ);
             } else {
-                let mass_kg = player_weight_pounds(self.skills.weight_pounds) * KG_PER_POUND;
+                let mass_kg =
+                    finite_metric(player_weight_pounds(self.skills.weight_pounds) * KG_PER_POUND)
+                        .max(1.0);
                 let restore = ((cp - demand) * ANAEROBIC_RECOVERY_GAIN)
                     .min(ANAEROBIC_RECOVERY_CAP_W_PER_KG * mass_kg);
                 w_prime += restore * dt;
@@ -4699,27 +4715,33 @@ impl PlayerAgent {
                 * pressure_escape_progression_lift.clamp(0.0, 0.54);
             ensure_min_legal_option_probability(&mut options, "carry-forward", progression_floor);
         }
-        // Won the ball with clear space ahead: DRIVE into it. MDP/POMDP elects the forward-drive
-        // family here (the MPC dribble then sprints into the open space — see the DribbleMove
-        // execution, which sets sprint when there's forward room). A freshly-won carrier (low time
-        // on the ball) with real grass ahead and little pressure should accelerate forward rather
-        // than take a settling touch and recycle it sideways/backward. Unlike the final-third
-        // progression floor above, this fires ANYWHERE on the pitch — the gap was a ball won in
-        // midfield or our own half with space to run into. Role-scaled (forwards drive most,
-        // centre-backs least, keepers never) and damped by pressure (shield/pass when crowded).
-        // `actual_time_on_ball_seconds` is the REAL elapsed possession time (≈0 the instant the ball
-        // is won), unlike `perceived_time_on_ball_seconds` which is a pressure proxy. Gate the
-        // transition drive on it so this fires on a genuine just-won ball, not merely under
-        // pressure. (turnover-burst itself is only legal under heavy pressure, so under the low
-        // pressure we want here the family floor lands on carry-forward / vertical-attack.)
-        let just_won_fit = (1.0
-            - observation.actual_time_on_ball_seconds / WON_BALL_DRIVE_FRESH_SECONDS)
-            .clamp(0.0, 1.0);
+        // Won the ball with grass to escape into: DRIVE out. MDP/POMDP elects the forward-drive
+        // family here (the MPC dribble then sprints into the open space). A freshly-won carrier
+        // (low real time on the ball) should not be damped merely because the win happened under
+        // pressure — that is the moment when the first carry away from the crowd matters most.
+        // Pressure still prefers a good outlet when one exists; otherwise it lifts the transition
+        // carry/turnover-burst floor so the next decision keeps accelerating instead of settling.
+        let fresh_escape = &tunables().fresh_possession_escape;
+        let fresh_window = fresh_escape.fresh_seconds.max(f64::EPSILON);
+        let just_won_fit =
+            (1.0 - observation.actual_time_on_ball_seconds / fresh_window).clamp(0.0, 1.0);
+        let pressure_escape_fit = if fresh_escape.enabled {
+            ((steal_pressure - fresh_escape.min_pressure)
+                / (1.0 - fresh_escape.min_pressure).max(f64::EPSILON))
+            .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let pressure_drive_fit =
+            (1.0 - pressure * (1.0 - pressure_escape_fit * bad_escape_outlet_fit))
+                .clamp(0.0, 1.0);
+        let pressure_escape_drive_lift =
+            (1.0 + pressure_escape_fit * bad_escape_outlet_fit * 0.70).clamp(1.0, 1.45);
         if self.role != PlayerRole::Goalkeeper
             && carry_forward_legal
+            && fresh_escape.enabled
             && just_won_fit > 0.0
-            && observation.forward_dribble_space_yards >= WON_BALL_DRIVE_MIN_SPACE_YARDS
-            && pressure < 0.55
+            && observation.forward_dribble_space_yards >= fresh_escape.min_forward_space_yards
             && !goal_attack_shot_blocks_alternatives
         {
             let role_floor = match self.role {
@@ -4728,9 +4750,13 @@ impl PlayerAgent {
                 PlayerRole::Defender => 0.16,
                 PlayerRole::Goalkeeper => 0.0,
             };
-            let won_ball_drive_fit =
-                (just_won_fit * forward_space_fit * (1.0 - pressure)).clamp(0.0, 1.0);
-            let drive_floor = (role_floor * won_ball_drive_fit).clamp(0.0, 0.52);
+            let won_ball_drive_fit = (just_won_fit
+                * forward_space_fit
+                * pressure_drive_fit
+                * pressure_escape_drive_lift)
+                .clamp(0.0, 1.0);
+            let drive_floor = (role_floor * won_ball_drive_fit)
+                .clamp(0.0, fresh_escape.decision_floor_max_probability);
             ensure_min_legal_option_family_probability(
                 &mut options,
                 &["turnover-burst", "carry-forward", "vertical-attack"],
@@ -10580,6 +10606,8 @@ impl PlayerAgent {
     ) {
         let current = snapshot.player_position(self.id).unwrap_or(self.position);
         let attack_dir = self.team.attack_dir();
+        observation.field_player_motion =
+            soccer_field_player_motion_block(snapshot, self.id, self.team);
         let mut players_ahead = 0usize;
         let mut players_behind = 0usize;
         let mut teammates_ahead = 0usize;
