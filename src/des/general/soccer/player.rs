@@ -11255,3 +11255,83 @@ pub struct SoccerLearnedPlan {
     pub target_point: Option<Vec2>,
     pub mpc_replan: Option<SoccerLearnedMpcReplanTrace>,
 }
+
+#[cfg(test)]
+mod decision_refractory_tests {
+    use super::{
+        decision_refractory_blocks, DECISION_REFRACTORY_MIN_GAP_TICKS,
+        DECISION_REFRACTORY_WINDOW_TICKS,
+    };
+    use std::collections::VecDeque;
+
+    /// Drive the gate the way `apply_decision_refractory` does — at every tick the player *wants*
+    /// to change its mind; record the ticks on which a changed decision is actually allowed to
+    /// commit. The spec: at most 1 decision per 3 ticks AND 2 per 7-tick window, i.e. a
+    /// 3,4,3,4-tick cadence with the third decision possible on the 8th tick.
+    fn committed_ticks(span: u64) -> Vec<u64> {
+        let mut commits: VecDeque<u64> = VecDeque::new();
+        let mut allowed = Vec::new();
+        for now in 0..span {
+            // First decision (empty history) always commits; otherwise honour the gate.
+            if commits.is_empty() || !decision_refractory_blocks(&commits, now) {
+                allowed.push(now);
+                commits.push_back(now);
+                while commits.len() > 2 {
+                    commits.pop_front();
+                }
+            }
+        }
+        allowed
+    }
+
+    #[test]
+    fn refractory_yields_3_4_cadence_two_per_seven_ticks() {
+        // Starting from tick 0: 0, +3, +4, +3, +4 ... = 0,3,7,10,14,17 over 18 ticks.
+        assert_eq!(committed_ticks(18), vec![0, 3, 7, 10, 14, 17]);
+    }
+
+    #[test]
+    fn refractory_caps_two_decisions_per_seven_tick_window() {
+        let commits = committed_ticks(30);
+        for &t in &commits {
+            let in_window = commits
+                .iter()
+                .filter(|&&u| u <= t && t.saturating_sub(u) < DECISION_REFRACTORY_WINDOW_TICKS)
+                .count();
+            assert!(
+                in_window <= 2,
+                "tick {t}: {in_window} decisions within a {DECISION_REFRACTORY_WINDOW_TICKS}-tick window"
+            );
+        }
+    }
+
+    #[test]
+    fn refractory_enforces_min_gap_between_consecutive_decisions() {
+        let commits = committed_ticks(30);
+        for pair in commits.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= DECISION_REFRACTORY_MIN_GAP_TICKS,
+                "consecutive decisions {} and {} closer than the min gap",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn third_decision_lands_on_the_eighth_tick_after_a_first_tick_start() {
+        // Mirror the user's framing with a 1-based first decision on tick 1: 1, 4, 8.
+        let mut commits: VecDeque<u64> = VecDeque::new();
+        let mut allowed = Vec::new();
+        for now in 1..=8 {
+            if commits.is_empty() || !decision_refractory_blocks(&commits, now) {
+                allowed.push(now);
+                commits.push_back(now);
+                while commits.len() > 2 {
+                    commits.pop_front();
+                }
+            }
+        }
+        assert_eq!(allowed, vec![1, 4, 8]);
+    }
+}
