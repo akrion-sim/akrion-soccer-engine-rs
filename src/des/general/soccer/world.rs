@@ -17622,6 +17622,20 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR").is_ok())
 }
+/// Defensive shepherding ("show one way"). Gated, default OFF = byte-identical for clean A/B.
+/// When ON, the single nearest defender pressing an opponent carrier in our own half does not
+/// just meet the ball square on the goal-side line: it approaches on a curved angle so its body
+/// takes the carrier's inside (goal-centre) shoulder, cutting the central / goal-bound route and
+/// SHOWING the carrier toward the nearer touchline (and, all else equal, toward our covering
+/// defender). This is the real-soccer answer to "don't back off forever" — the carrier driving
+/// from ~40 to ~15yd is jockeyed wide into low-value space instead of being allowed straight down
+/// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
+/// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
+fn dd_soccer_enable_defensive_shepherd() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+}
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -21310,6 +21324,135 @@ impl WorldSnapshot {
             (contain_target + (engage - contain_target) * stepup_fraction)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
+    }
+
+    /// Defensive shepherding / "show one way" (gated; `dd_soccer_enable_defensive_shepherd`).
+    ///
+    /// Transforms the lone presser's already-computed engage target so the defender approaches
+    /// on a curved angle and takes the carrier's INSIDE (goal-centre) shoulder, cutting the
+    /// central / goal-bound lane and showing the carrier toward the nearer touchline — the real
+    /// answer to "stop backing off and let them dribble down the middle". Pure lateral shift
+    /// (keeps the engage target's goal-side depth), so the defender stays goal-side while
+    /// jockeying the carrier wide. Strength ramps over the ~40→15yd band, is strongest for a
+    /// carrier in the central danger lane, eases on top of the box (square up to deny the shot),
+    /// and tapers to nothing once the carrier is already pinned against a touchline. No-op unless
+    /// the gate is on; only ever called for the single nearest presser, so the block keeps shape.
+    fn shepherd_show_wide_adjusted_target(
+        &self,
+        me: &PlayerSnapshot,
+        carrier: Vec2,
+        engage_target: Vec2,
+    ) -> Vec2 {
+        if !dd_soccer_enable_defensive_shepherd() {
+            return engage_target;
+        }
+        // Active only while the carrier is in front of our goal within the shepherding band.
+        let goal_distance = (carrier.y - self.own_goal_y_for(me.team)).abs();
+        if !goal_distance.is_finite() || goal_distance > SHEPHERD_BAND_FAR_YARDS {
+            return engage_target;
+        }
+        // Band weight: 0 at ~40yd, ramping to full at ~15yd, then relaxing toward a holding
+        // value once on top of the box (you square up to deny the central shot rather than
+        // keep showing wide).
+        let band_span = (SHEPHERD_BAND_FAR_YARDS - SHEPHERD_BAND_NEAR_YARDS).max(1e-6);
+        let band_weight = if goal_distance >= SHEPHERD_BAND_NEAR_YARDS {
+            ((SHEPHERD_BAND_FAR_YARDS - goal_distance) / band_span).clamp(0.0, 1.0)
+        } else {
+            // Inside the near edge: ease from full down to the box-relax floor at the 6yd depth.
+            let inner_span = (SHEPHERD_BAND_NEAR_YARDS - OWN_GOAL_PRESS_FULL_YARDS).max(1e-6);
+            let t = ((SHEPHERD_BAND_NEAR_YARDS - goal_distance) / inner_span).clamp(0.0, 1.0);
+            1.0 - t * (1.0 - SHEPHERD_BOX_RELAX_FRACTION)
+        };
+        if band_weight <= 1e-3 {
+            return engage_target;
+        }
+
+        let center_x = self.field_width * 0.5;
+        let lateral_off = carrier.x - center_x; // >0 ⇒ carrier is right of centre.
+        // `show_dir`: the touchline direction we want to force the carrier toward.
+        let central_deadzone = 1.5_f64;
+        let show_dir = if lateral_off.abs() >= central_deadzone {
+            // Off-centre: show them toward the touchline they are already nearer to.
+            lateral_off.signum()
+        } else {
+            // Dead-central: commit them the way they are already leaning, else toward our
+            // covering teammate's side (shepherd into support), else a deterministic default.
+            let carrier_vel_x = self
+                .ball
+                .holder
+                .and_then(|h| self.player_velocity(h))
+                .map(|v| v.x)
+                .unwrap_or(0.0);
+            if carrier_vel_x.abs() > 0.25 {
+                carrier_vel_x.signum()
+            } else {
+                self.shepherd_cover_side(me, carrier).unwrap_or(1.0)
+            }
+        };
+        // Defender takes the shoulder on the OPPOSITE side from where we show — i.e. the
+        // inside (goal-centre) shoulder — so the open path is toward the touchline.
+        let shoulder_sign = -show_dir;
+
+        // How central the carrier is (1 in the danger lane, tapering to a floor when wide):
+        // a wide carrier still gets the inside cut denied, just less aggressively.
+        let central01 =
+            (1.0 - lateral_off.abs() / SHEPHERD_CENTRAL_LANE_HALF_WIDTH_YARDS).clamp(0.0, 1.0);
+        let central_weight = 0.4 + 0.6 * central01;
+        // Don't shove the carrier past the touchline once they are already pinned wide.
+        let room_to_show = if show_dir > 0.0 {
+            self.field_width - carrier.x
+        } else {
+            carrier.x
+        };
+        let wide_taper = (room_to_show / SHEPHERD_TOUCHLINE_MARGIN_YARDS).clamp(0.0, 1.0);
+
+        let shoulder_mag = SHEPHERD_SHOULDER_YARDS * band_weight * central_weight * wide_taper;
+        if shoulder_mag <= 1e-3 {
+            return engage_target;
+        }
+        Vec2::new(engage_target.x + shoulder_sign * shoulder_mag, engage_target.y)
+            .clamp_to_pitch(self.field_width, self.field_length)
+    }
+
+    /// Position of the opponent ball-holder, from the perspective of a defending `team`.
+    /// `None` when nobody holds the ball or our own team has it.
+    fn opponent_holder_position_for(&self, team: Team) -> Option<Vec2> {
+        let holder_id = self.ball.holder?;
+        let holder = self
+            .players
+            .iter()
+            .find(|p| p.id == holder_id && p.team != team)?;
+        Some(self.player_snapshot_position(holder))
+    }
+
+    /// Lateral side (sign of x relative to the carrier) of our nearest covering teammate behind
+    /// the line of the carrier — used as the dead-central shepherd tiebreak so we show the
+    /// carrier toward where we already have support. `None` when no useful cover is found.
+    fn shepherd_cover_side(&self, me: &PlayerSnapshot, carrier: Vec2) -> Option<f64> {
+        let attack_dir = me.team.attack_dir();
+        let mut best: Option<(f64, f64)> = None; // (distance, side)
+        for t in self.players.iter() {
+            if t.team != me.team || t.id == me.id || t.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let tp = self.player_snapshot_position(t);
+            // Goal-side of the carrier (between the carrier and our goal) within cover range.
+            if (tp.y - carrier.y) * attack_dir < 0.5 {
+                continue;
+            }
+            let d = tp.distance(carrier);
+            if d > CARRIER_COVER_RADIUS_YARDS {
+                continue;
+            }
+            let dx = tp.x - carrier.x;
+            if dx.abs() < 0.5 {
+                continue;
+            }
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, dx.signum()));
+            }
+        }
+        best.map(|(_, side)| side)
     }
 
     fn own_goal_depth_yards_for(&self, team: Team, p: Vec2) -> f64 {
@@ -35649,6 +35792,9 @@ impl WorldSnapshot {
         // returns the engage target directly (no goal-side cushion) so the press
         // actually reaches the ball.
         if let Some(engage) = self.fast_carrier_engage_target_for(me) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, engage);
+            }
             return engage;
         }
         // The nearest defender steps up to press any opponent holder (not only a fast
@@ -35684,6 +35830,9 @@ impl WorldSnapshot {
         // This applies after explicit line-break protection, so deep defenders do
         // not abandon the emergency goal-side retreat/collapse rules.
         if let Some(stepup) = self.advancing_carrier_stepup_target_for(me, guarded) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, stepup);
+            }
             return stepup;
         }
         self.goal_side_defensive_target_for_player(me, guarded)
