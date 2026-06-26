@@ -67,6 +67,8 @@ mod support_scorer;
 pub use support_scorer::*;
 mod spacing_target;
 pub use spacing_target::*;
+mod aerial_reception;
+pub use aerial_reception::*;
 mod reward_shaping;
 pub use reward_shaping::*;
 
@@ -45814,6 +45816,7 @@ fn tracking_frame_to_world_snapshot(
         pass_completion_head: None,
         loose_ball_commit_head: None,
         attack_spacing_head: None,
+        aerial_reception_head: None,
         loose_ball_uncontested_since_tick: None,
         home_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
         away_genome: crate::des::general::soccer_genome::SoccerTeamGenome::default(),
@@ -51445,6 +51448,20 @@ fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
 fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
     (SHORT_LOFT_APEX_YARDS + (distance_yards.max(0.0) - 15.0) * LOFT_APEX_PER_YARD)
         .clamp(LOFT_APEX_MIN_YARDS, MAX_LOFT_APEX_YARDS)
+}
+
+/// Apex (yards) of a lofted pass reconstructed from its public [`PendingPassSnapshot`].
+/// Mirrors [`pass_loft_apex_yards`] (which reads the internal `PendingPass`) so the
+/// aerial-reception descent geometry sees the same arc the ball physics fly.
+pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f64 {
+    if pass.flight.is_scoop() {
+        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (pass.from as u64).wrapping_shl(17);
+        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        scoop_loft_apex_yards(pass.distance_yards, unit)
+    } else {
+        lofted_pass_apex_yards(pass.distance_yards)
+    }
 }
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {

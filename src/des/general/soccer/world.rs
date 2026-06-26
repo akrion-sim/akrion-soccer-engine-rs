@@ -333,6 +333,16 @@ pub struct SoccerMatch {
     pub(crate) loose_ball_commit_samples: Vec<LooseBallCommitSample>,
     /// Open loose-ball commit decisions awaiting their windowed reward.
     pub(crate) pending_loose_ball_commit: Vec<PendingLooseBallCommitDecision>,
+    /// The trained aerial-reception control head (how high to attack a dropping lofted
+    /// ball), when present. Carried + trained across games by the learner; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
+    /// Rolling RL corpus for the aerial-reception head: the descent/contest context + the
+    /// attack-height blend used + whether the ball was cleanly controlled. Collected only
+    /// while the model is enabled; empty + untouched in the default process.
+    pub(crate) aerial_reception_samples: Vec<AerialReceptionSample>,
+    /// Open aerial receptions awaiting their control outcome.
+    pub(crate) pending_aerial_reception: Vec<PendingAerialReception>,
     /// Tick at which the ball most recently became loose AND went uncontested (no
     /// player challenging it). `None` whenever the ball is held / contested. Drives
     /// the "no loose ball sits uncontested for >¼s" urgency override; carried into
@@ -1720,6 +1730,9 @@ impl SoccerMatch {
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
+            aerial_reception_head: None,
+            aerial_reception_samples: Vec::new(),
+            pending_aerial_reception: Vec::new(),
             loose_ball_uncontested_since_tick: None,
             attack_spacing_samples: Vec::new(),
             pending_attack_spacing: Vec::new(),
@@ -6293,6 +6306,9 @@ impl SoccerMatch {
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
         self.collect_attack_spacing_rl_samples(&next_snapshot);
+        // Learnable aerial-reception control RL samples (no-op + byte-identical unless
+        // `DD_SOCCER_ENABLE_LEARNED_AERIAL_RECEPTION` is set).
+        self.collect_aerial_reception_rl_samples(&next_snapshot);
         self.update_possession_progress_milestones(
             &tick_start_snapshot,
             &next_snapshot,
@@ -17048,6 +17064,11 @@ pub struct WorldSnapshot {
     /// Default = None).
     #[serde(skip)]
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Carried from the match for live consumption in the aerial-reception decision: how
+    /// high to attack a dropping lofted ball. `None` ⇒ analytic seed (parity). Skipped by
+    /// serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) aerial_reception_head: Option<std::sync::Arc<AerialReceptionControlHead>>,
     /// Carried from the match: the tick the loose ball last went uncontested (see
     /// `SoccerMatch::loose_ball_uncontested_since_tick`). `None` ⇒ not loose /
     /// contested. Read by the urgency override so a stale loose ball is attacked.
@@ -18591,6 +18612,7 @@ impl WorldSnapshot {
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
+            aerial_reception_head: m.aerial_reception_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
             home_genome: m.home_genome.clone(),
             away_genome: m.away_genome.clone(),
@@ -27184,6 +27206,73 @@ impl WorldSnapshot {
         }
     }
 
+    /// Descent-aware reception plan for `me` meeting the in-flight lofted `pass`:
+    /// anticipate where the ball drops into the control band (~8ft→5ft) and make the
+    /// MDP/POMDP attack decision (settle under it / attack it high / chase the drop).
+    /// `None` when the pass is not a genuine loft, the ball is already in the control
+    /// band (the normal flat election meets it), or the descent geometry is degenerate.
+    pub(crate) fn aerial_reception_plan_for(
+        &self,
+        me: &PlayerSnapshot,
+        pass: &PendingPassSnapshot,
+        current: Vec2,
+    ) -> Option<AerialReceptionPlan> {
+        self.aerial_reception_resolve(me, pass, current)
+            .map(|(_, _, plan)| plan)
+    }
+
+    /// The full resolved aerial reception: the descent geometry, the kinematic/contest
+    /// inputs, and the chosen plan. `aerial_reception_plan_for` returns just the plan for
+    /// the live decision; the RL sampler also reads the descent + inputs to build the
+    /// learning context. `None` per `aerial_reception_plan_for`'s conditions.
+    pub(crate) fn aerial_reception_resolve(
+        &self,
+        me: &PlayerSnapshot,
+        pass: &PendingPassSnapshot,
+        current: Vec2,
+    ) -> Option<(AerialDescentPlan, AerialReceptionInputs, AerialReceptionPlan)> {
+        if !pass.flight.is_aerial() {
+            return None;
+        }
+        // Only anticipate while the ball is still genuinely above the control band and
+        // descending; once it is already in reach the normal control/flat election meets it.
+        if self.ball.altitude_yards <= AERIAL_CONTROL_BAND_TOP_YARDS {
+            return None;
+        }
+        let apex = pending_pass_snapshot_apex_yards(pass);
+        let time_aloft = (self.tick.saturating_sub(pass.launch_tick) as f64) * self.dt_seconds;
+        let descent = aerial_descent_plan(
+            apex,
+            pass.launch_speed_yps,
+            pass.origin,
+            pass.intended_target,
+            time_aloft,
+            self.field_width,
+            self.field_length,
+        )?;
+        let receiver_speed = player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+            * MovementGait::Sprint.speed_multiplier();
+        let inputs = AerialReceptionInputs {
+            receiver_speed_yps: receiver_speed,
+            receiver_position: current,
+            opponent_time_to_drop: self
+                .nearest_opponent_arrival_time_to(me.team, descent.settle_point),
+            opponent_distance_to_drop: self
+                .nearest_opponent_distance_at(me.team, descent.settle_point),
+            aerial_tool: aerial_duel_skill_from_snapshot(me),
+            first_touch_tool: ability01(me.skills.first_touch),
+        };
+        let plan = decide_aerial_reception(
+            &descent,
+            &inputs,
+            self.aerial_reception_head.as_deref(),
+            self.field_width,
+            self.field_length,
+        );
+        Some((descent, inputs, plan))
+    }
+
     pub(crate) fn pending_pass_reception_target_for(
         &self,
         player_id: usize,
@@ -27243,7 +27332,20 @@ impl WorldSnapshot {
             (self.ball.position + self.ball.velocity * lead_seconds)
                 .clamp_to_pitch(self.field_width, self.field_length)
         };
-        let target = if self.ball.velocity.len() > 0.25 {
+        // Long aerial pass: anticipate the descent (read the arc) and make the MDP/POMDP attack
+        // decision, instead of the flat horizontal projection below (which camps under a ball
+        // still sailing overhead). Gated default-ON; the disable env restores the flat election
+        // byte-for-byte. When a descent plan fires we use its target directly; otherwise the
+        // velocity-projection loop below (which folds in the long_aerial_control window) elects
+        // the meeting point — the two aerial paths stay mutually exclusive.
+        let aerial_plan = if aerial_reception_anticipation_enabled() {
+            self.aerial_reception_plan_for(me, pass, current)
+        } else {
+            None
+        };
+        let target = if let Some(plan) = aerial_plan {
+            plan.target
+        } else if self.ball.velocity.len() > 0.25 {
             let remaining_ball_path = self.ball.position.distance(pass.intended_target);
             let ball_time_to_target = (remaining_ball_path / self.ball.velocity.len().max(0.25))
                 .clamp(0.12, if pressured_reception { 0.85 } else { 1.35 });
@@ -27331,7 +27433,8 @@ impl WorldSnapshot {
             || long_aerial_control.attack_score >= 0.30
             || defender_can_contest
             || moving_pass_needs_attack
-            || bound_one_two_wall;
+            || bound_one_two_wall
+            || aerial_plan.map(|p| p.sprint).unwrap_or(false);
         Some((target, sprint))
     }
 
