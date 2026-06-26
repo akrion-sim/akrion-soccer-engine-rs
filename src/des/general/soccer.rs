@@ -832,6 +832,12 @@ const BYLINE_DRIVE_BYLINE_MARGIN_YARDS: f64 = 3.5; // ...and this far short of t
 // Inside this distance of the byline the drive is "at the corner" — cross now (cutback / high ball)
 // rather than carry deeper into a dead end.
 const BYLINE_DRIVE_CROSS_TRIGGER_YARDS: f64 = 7.0;
+// Minimum straight-ahead clearance (yards) for an INDIVIDUAL winger to opt into the byline drive
+// without a team-level byline-cross commitment. The team-committed drive is vetted by the strategy
+// selector; this solo opt-in bypasses it, so it only fires when there is a genuinely open lane to
+// drive into — which is exactly the situation where a winger otherwise stalls ~30yd out instead of
+// driving for the corner. See `winger_byline_drive_opt_in`.
+const WINGER_BYLINE_MIN_DRIVE_SPACE_YARDS: f64 = 6.0;
 const STRIKER_SHOT_MAX_BLOCK_PROBABILITY: f64 = 0.72;
 const STRIKER_SHOT_MIN_ON_FRAME_PROBABILITY: f64 = 0.12;
 const STRIKER_SHOT_MIN_KEEPER_BEAT_PROBABILITY: f64 = 0.06;
