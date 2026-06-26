@@ -264,8 +264,14 @@ pub fn sampled_index_by_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The gate is a process-wide env var, so gate-toggling tests must not run
+    // concurrently with one another (cargo runs tests in parallel by default).
+    static GATE_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_gate<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         if on {
             std::env::set_var(ENABLE_ENV, "1");
         } else {
@@ -359,6 +365,23 @@ mod tests {
                 assert_eq!(out, expected, "rank {rank} pid {pid} tick {tick}");
             }
         });
+    }
+
+    #[test]
+    fn behavior_probability_matches_renormalised_rank_weight() {
+        let w = [0.70, 0.20, 0.10];
+        // Three candidates: exactly the rank weights (sum ≈ 1).
+        assert!((behavior_probability_for_rank(3, w, 0) - 0.70).abs() < 1e-9);
+        assert!((behavior_probability_for_rank(3, w, 1) - 0.20).abs() < 1e-9);
+        assert!((behavior_probability_for_rank(3, w, 2) - 0.10).abs() < 1e-9);
+        // Two candidates renormalise to 0.70/0.90 and 0.20/0.90.
+        assert!((behavior_probability_for_rank(2, w, 0) - 0.70 / 0.90).abs() < 1e-9);
+        assert!((behavior_probability_for_rank(2, w, 1) - 0.20 / 0.90).abs() < 1e-9);
+        // Forced single candidate is certain.
+        assert_eq!(behavior_probability_for_rank(1, w, 0), 1.0);
+        // A rank beyond the weighted ranks gets a small positive floor (never 0,
+        // so an importance ratio can't divide by zero).
+        assert!(behavior_probability_for_rank(3, w, 5) > 0.0);
     }
 
     #[test]

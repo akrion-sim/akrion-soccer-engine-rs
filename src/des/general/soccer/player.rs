@@ -1470,6 +1470,37 @@ fn mpc_ball_execution_context_for_player(
     }
 }
 
+/// Whether the **full per-action MPC coverage** is live this process. OFF unless
+/// `DD_SOCCER_ENABLE_FULL_ACTION_MPC_COVERAGE` is set ⇒ off, the ball-contact
+/// actions that lack a bespoke striking/winning execution model (clearance,
+/// route-one, control-touch, tackle, slide-tackle) fall through to the plain
+/// movement reach-model exactly as before, so the trajectory is byte-identical.
+/// On, each of those actions gets its own execution model in
+/// [`mpc_execution_estimate_for_action`] — a clearance/route-one strike, a
+/// control-touch cushion, or a (slide-)tackle ball-win — so every `SoccerAction`
+/// carries an explicit "how to execute" definition rather than being treated as a
+/// bare move-to-a-point.
+fn full_action_mpc_coverage_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_FULL_ACTION_MPC_COVERAGE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_FULL_ACTION_MPC_COVERAGE")
+                .map(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
 fn mpc_execution_estimate_for_action(
     snapshot: &WorldSnapshot,
     player: &PlayerAgent,
@@ -2089,6 +2120,74 @@ fn mpc_execution_estimate_for_action(
                 ""
             };
         return estimate;
+    }
+
+    // Ball-contact actions that don't match the pass / shot / dribble families above
+    // (clearance, route-one, control-touch, tackle, slide-tackle) would otherwise
+    // fall through to the plain movement reach-model below — a "move to a point"
+    // definition that ignores the strike / cushion / challenge the action actually
+    // is. Give each its own execution model so every action carries an explicit
+    // "how to execute" definition. Gated (default OFF ⇒ byte-identical): when off
+    // these still use the movement default exactly as before.
+    if full_action_mpc_coverage_enabled() {
+        let contact_fit = (movement_execution_confidence * 0.5
+            + ball_context.body_mechanics_fit * 0.5)
+            .clamp(0.0, 1.0);
+        match label {
+            "clearance" | "route-one" => {
+                // A clearing strike: get a foot through the ball with enough power to
+                // send it to the target zone. Execution scales with leg power +
+                // technique, gated by whether the body can reach/strike it cleanly.
+                let strike = (ability01(player.skills.strength) * 0.40
+                    + ability01(player.skills.passing) * 0.30
+                    + ability01(player.skills.shooting) * 0.30)
+                    .clamp(0.0, 1.0);
+                estimate.execution_probability =
+                    ((0.58 + strike * 0.34) * contact_fit).clamp(0.0, 0.99);
+                // Recommended strike pace: a firm hit, harder from a stronger player.
+                estimate.recommended_speed_yps = 26.0 + ability01(player.skills.strength) * 16.0;
+                if estimate.execution_probability < 0.20 {
+                    estimate.reselect_reason = "mpc-clearance-strike-unreachable";
+                }
+            }
+            "control-touch" => {
+                // A cushioned first touch / settle: dominated by touch technique and
+                // a calm body shape, not power.
+                let cushion = (ability01(player.skills.first_touch) * 0.62
+                    + ability01(player.skills.passing) * 0.20
+                    + ability01(player.skills.acceleration) * 0.18)
+                    .clamp(0.0, 1.0);
+                estimate.execution_probability =
+                    ((0.50 + cushion * 0.45) * contact_fit).clamp(0.0, 0.99);
+                // Settle the ball under control: a soft touch, not a drive.
+                estimate.recommended_speed_yps = (3.5 + cushion * 3.0).min(player.velocity.len() + 4.0);
+                if estimate.execution_probability < 0.20 {
+                    estimate.reselect_reason = "mpc-control-touch-unsettled";
+                }
+            }
+            "tackle" | "slide-tackle" | "recover" => {
+                // A ball-winning challenge: reach the carrier's ball and come away
+                // with it. Slide tackles trade a little execution certainty (commit /
+                // recovery risk) for their extra reach.
+                let win = (ability01(player.skills.defending) * 0.50
+                    + ability01(player.skills.defensive_tracking) * 0.30
+                    + ability01(player.skills.aggression) * 0.20)
+                    .clamp(0.0, 1.0);
+                let slide_penalty = if label == "slide-tackle" { 0.90 } else { 1.0 };
+                estimate.execution_probability =
+                    ((0.34 + win * 0.50) * contact_fit * slide_penalty).clamp(0.0, 0.99);
+                // Close to the ball at pace.
+                estimate.recommended_speed_yps =
+                    player_top_speed_yps(player.role, &player.skills) * MovementGait::Sprint.speed_multiplier();
+                if estimate.execution_probability < 0.18 {
+                    estimate.reselect_reason = "mpc-tackle-cannot-win-ball";
+                }
+            }
+            _ => {}
+        }
+        if !estimate.reselect_reason.is_empty() {
+            return estimate;
+        }
     }
 
     if target_delta_yards > reachable_delta_yards {
@@ -6429,17 +6528,26 @@ impl PlayerAgent {
             + no_outlet_fit * 0.10
             - forward_space_fit * 0.08;
 
-        let mut best = (DribbleMoveKind::CarryForward, carry_forward_score);
-        for candidate in [
+        // Scored candidate carry kinds. The deterministic argmax is the first
+        // element with the highest score; with the top-k gate on, the stochastic
+        // selector draws among the best three (70/20/10) over this same set.
+        let kind_candidates = [
+            (DribbleMoveKind::CarryForward, carry_forward_score),
             (DribbleMoveKind::CarryOutLeft, carry_left_score),
             (DribbleMoveKind::CarryOutRight, carry_right_score),
             (DribbleMoveKind::ProtectBall, protect_score),
             (DribbleMoveKind::XaviTurn, xavi_turn_score),
-        ] {
-            if candidate.1 > best.1 {
-                best = candidate;
-            }
-        }
+        ];
+        let kind_scores: Vec<f64> = kind_candidates.iter().map(|(_, s)| *s).collect();
+        let best = sampled_index_by_score(
+            &kind_scores,
+            snapshot.decision_seed,
+            self.id,
+            snapshot.tick,
+            site::DRIBBLE_KIND,
+        )
+        .map(|idx| kind_candidates[idx])
+        .unwrap_or(kind_candidates[0]);
 
         if best.0 == DribbleMoveKind::CarryOutLeft
             && pressure >= 0.36
