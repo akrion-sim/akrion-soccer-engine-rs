@@ -148,10 +148,6 @@ const KINEMATIC_GATE_MIN_BALL_SPEED_YPS: f64 = 10.0;
 // predicts the same sprint-reach interceptions the physics resolver makes (a defender
 // stationary NOW but able to step into the lane), minus a beat for human reaction.
 const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
-/// Per-player POMDP reaction window. Everyone carries a bounded human response delay; defenders
-/// with better tracking and fresher legs sit nearer 100ms, tired/low-read defenders nearer 250ms.
-const PLAYER_POMDP_REACTION_MIN_SECONDS: f64 = 0.10;
-const PLAYER_POMDP_REACTION_MAX_SECONDS: f64 = 0.25;
 // Cap on the interception sprint window. A defender only realistically steps into a lane in
 // the brief moment the ball is passing near them — they cannot read a pass and hold a perfect
 // perpendicular sprint for the WHOLE flight of a long ball. Without this cap, a far-along lane
@@ -722,25 +718,6 @@ const PLAYER_BASE_VISION_RANGE_YARDS: f64 = 28.0;
 const PLAYER_VISION_RANGE_BONUS_YARDS: f64 = 28.0;
 const PLAYER_BASE_FIELD_OF_VIEW_DEGREES: f64 = 168.0;
 const PLAYER_FIELD_OF_VIEW_BONUS_DEGREES: f64 = 64.0;
-const BALL_HOLDER_CORE_VISION_DEGREES: f64 = 100.0;
-const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
-const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
-const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
-const BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE: f64 = 0.52;
-const BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE: f64 = 0.38;
-const BALL_HOLDER_HEAD_SCAN_MIN_SECONDS: f64 = 0.75;
-const BALL_HOLDER_HEAD_SCAN_MAX_SECONDS: f64 = 1.85;
-const BALL_HOLDER_HEAD_SCAN_VISION_RELIEF_SECONDS: f64 = 0.35;
-const KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS: f64 = 0.35;
-const KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES: usize = 2;
-const KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS: f64 = 0.15;
-const KALMAN_PERCEPTION_BASE_SIGMA_YARDS: f64 = 0.85;
-const KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS: f64 = 0.10;
-const KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS: f64 = 0.14;
-const KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE: f64 = 0.96;
-const KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE: f64 = 0.88;
-const KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE: f64 = 0.68;
-const KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE: f64 = 0.58;
 const PERCEPTION_OCCLUSION_BODY_RADIUS_YARDS: f64 = 1.15;
 const PERCEPTION_OCCLUSION_FULL_BLOCK_YARDS: f64 = 0.42;
 const PERCEPTION_OCCLUSION_VISIBILITY_CUTOFF: f64 = 0.82;
@@ -36958,9 +36935,9 @@ fn soccer_neural_extended_observation(
             if distance.is_finite() =>
         {
             let reaction_delay = player_pomdp_reaction_delay_seconds(read_skill, fatigue);
-            let reaction_fit = ((reaction_delay - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                    .max(1e-6))
+            let perception = &tunables().pomdp_perception;
+            let reaction_fit = ((reaction_delay - perception.player_reaction_min_seconds)
+                / perception.player_reaction_span_seconds())
             .clamp(0.0, 1.0);
             let on_ball = snapshot.ball.holder == Some(me.id);
             let forward_off = (position.y - me_position.y) * attack_dir;
@@ -37965,9 +37942,10 @@ fn soccer_neural_transition_features_with_action(
             soccer_neural_unit(lane_norm);
         features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK] = soccer_neural_unit(freeze_risk);
     }
+    let perception = &tunables().pomdp_perception;
     let reaction_norm = ((obs.neural_extended.nearest_defender_reaction_delay_seconds
-        - PLAYER_POMDP_REACTION_MIN_SECONDS)
-        / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS).max(1e-6))
+        - perception.player_reaction_min_seconds)
+        / perception.player_reaction_span_seconds())
     .clamp(0.0, 1.0);
     features[SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT] =
         soccer_neural_unit(obs.neural_extended.nearest_defender_overcommit_score);
@@ -51709,7 +51687,9 @@ fn player_field_of_view(player: &PlayerSnapshot) -> f64 {
 }
 
 fn ball_holder_shoulder_scan_limit_degrees() -> f64 {
-    BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES
+    tunables()
+        .pomdp_perception
+        .ball_holder_shoulder_scan_limit_degrees()
 }
 
 fn ball_holder_head_scan_fraction(angle_degrees: f64) -> f64 {
@@ -51722,31 +51702,41 @@ fn ball_holder_head_scan_delay_seconds(angle_degrees: f64, vision: f64) -> f64 {
     if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
         return 0.0;
     }
+    let perception = &tunables().pomdp_perception;
     let scan = ball_holder_head_scan_fraction(angle_degrees);
-    let max_seconds =
-        BALL_HOLDER_HEAD_SCAN_MAX_SECONDS - ability01(vision) * BALL_HOLDER_HEAD_SCAN_VISION_RELIEF_SECONDS;
-    (BALL_HOLDER_HEAD_SCAN_MIN_SECONDS
-        + scan * (max_seconds - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS).max(0.0))
-    .clamp(BALL_HOLDER_HEAD_SCAN_MIN_SECONDS, BALL_HOLDER_HEAD_SCAN_MAX_SECONDS)
+    let max_seconds = perception.ball_holder_head_scan_max_seconds
+        - ability01(vision) * perception.ball_holder_head_scan_vision_relief_seconds;
+    (perception.ball_holder_head_scan_min_seconds
+        + scan * (max_seconds - perception.ball_holder_head_scan_min_seconds).max(0.0))
+    .clamp(
+        perception.ball_holder_head_scan_min_seconds,
+        perception.ball_holder_head_scan_max_seconds,
+    )
 }
 
 fn ball_holder_head_scan_position_confidence(angle_degrees: f64, vision: f64) -> f64 {
-    if angle_degrees <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 {
-        BALL_HOLDER_CORE_POSITION_CONFIDENCE
+    let perception = &tunables().pomdp_perception;
+    if angle_degrees <= perception.ball_holder_core_degrees * 0.5 {
+        perception.ball_holder_core_confidence
     } else if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
-        BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE
+        perception.ball_holder_shoulder_confidence
     } else {
         let scan = ball_holder_head_scan_fraction(angle_degrees);
-        let base = BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE
-            + (BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE
-                - BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE)
+        let base = perception.ball_holder_side_scan_confidence
+            + (perception.ball_holder_rear_scan_confidence
+                - perception.ball_holder_side_scan_confidence)
                 * scan;
-        (base + ability01(vision) * 0.08).clamp(BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE, 0.62)
+        (base + ability01(vision) * perception.ball_holder_scan_confidence_vision_bonus).clamp(
+            perception.ball_holder_rear_scan_confidence,
+            perception.ball_holder_scan_confidence_cap,
+        )
     }
 }
 
 fn perception_latency_upper_bound_seconds() -> f64 {
-    PLAYER_POMDP_REACTION_MAX_SECONDS + BALL_HOLDER_HEAD_SCAN_MAX_SECONDS
+    tunables()
+        .pomdp_perception
+        .perception_latency_upper_bound_seconds()
 }
 
 fn average_player_position_confidence<I>(
@@ -51891,7 +51881,8 @@ fn kalman_perception_position_confidence(
     observer_has_ball: bool,
 ) -> f64 {
     let measurement = finite_metric(measurement_confidence).clamp(0.0, 1.0);
-    if target_history.len() < KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES {
+    let perception = &tunables().pomdp_perception;
+    if target_history.len() < perception.kalman_min_history_samples {
         return measurement;
     }
 
@@ -51915,17 +51906,17 @@ fn kalman_perception_position_confidence(
     let target_velocity = finite_vec2(target_velocity, history_velocity);
     let blended_velocity = history_velocity * 0.65 + target_velocity * 0.35;
     let prediction =
-        if latest.distance(target_position) <= KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS {
+        if latest.distance(target_position) <= perception.kalman_current_sample_epsilon_yards {
             previous + history_velocity * dt
         } else {
             latest + blended_velocity * dt
         };
     let innovation_yards = prediction.distance(target_position);
     let velocity_disagreement = history_velocity.distance(target_velocity);
-    let sigma_yards = (KALMAN_PERCEPTION_BASE_SIGMA_YARDS
-        + history_velocity.len().clamp(0.0, 12.0) * KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS * dt
+    let sigma_yards = (perception.kalman_base_sigma_yards
+        + history_velocity.len().clamp(0.0, 12.0) * perception.kalman_speed_sigma_per_yps * dt
         + velocity_disagreement.clamp(0.0, 12.0)
-            * KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS
+            * perception.kalman_velocity_disagreement_sigma_yards
             * dt)
         .clamp(0.55, 5.0);
     let prediction_fit = (1.0 / (1.0 + (innovation_yards / sigma_yards).powi(2))).clamp(0.0, 1.0);
@@ -51933,14 +51924,14 @@ fn kalman_perception_position_confidence(
         return measurement;
     }
 
-    let prediction_cap = if measurement >= BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE {
-        KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE
+    let prediction_cap = if measurement >= perception.ball_holder_shoulder_confidence {
+        perception.kalman_visible_max_confidence
     } else if in_front {
-        KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE
+        perception.kalman_front_max_confidence
     } else if observer_has_ball {
-        KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE
+        perception.kalman_ball_holder_occluded_max_confidence
     } else {
-        KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE
+        perception.kalman_occluded_max_confidence
     };
     let predicted_confidence = prediction_fit.min(prediction_cap);
     let prediction_uncertainty = (1.0 - predicted_confidence).clamp(0.04, 0.96);
@@ -57550,10 +57541,11 @@ pub(crate) fn dd_soccer_enable_aerobic_anaerobic_speed_split() -> bool {
 fn player_pomdp_reaction_delay_seconds(read_skill: f64, fatigue: f64) -> f64 {
     let read = ability01(read_skill);
     let fatigue_drag = fatigue.clamp(0.0, 1.0);
-    let span = PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS;
-    (PLAYER_POMDP_REACTION_MAX_SECONDS - span * read + fatigue_drag * span * 0.36).clamp(
-        PLAYER_POMDP_REACTION_MIN_SECONDS,
-        PLAYER_POMDP_REACTION_MAX_SECONDS,
+    let perception = &tunables().pomdp_perception;
+    let span = perception.player_reaction_span_seconds();
+    (perception.player_reaction_max_seconds - span * read + fatigue_drag * span * 0.36).clamp(
+        perception.player_reaction_min_seconds,
+        perception.player_reaction_max_seconds,
     )
 }
 

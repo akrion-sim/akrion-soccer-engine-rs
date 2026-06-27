@@ -32504,6 +32504,7 @@ fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
         .confidence;
 
     let prior_snapshot = WorldSnapshot::from_match_for_agent_decision(&configured_match(true));
+    let perception = &tunables().pomdp_perception;
     let target = prior_snapshot
         .players
         .iter()
@@ -32511,7 +32512,7 @@ fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
         .expect("behind player snapshot");
     assert_eq!(
         target.position_history.len(),
-        KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
+        perception.kalman_min_history_samples,
         "agent-decision snapshots should carry only the history tail needed for Kalman belief"
     );
     let posterior_behind = prior_snapshot
@@ -43860,6 +43861,7 @@ fn ball_carrier_has_high_confidence_front_vision() {
     sim.players[rear_teammate].velocity = Vec2::zero();
 
     let snapshot = WorldSnapshot::from_match(&sim);
+    let perception = &tunables().pomdp_perception;
     let core = Vec2::new(40.0, 80.0);
     let shoulder = Vec2::new(58.0, 66.5);
     let behind = Vec2::new(40.0, 40.0);
@@ -43869,20 +43871,20 @@ fn ball_carrier_has_high_confidence_front_vision() {
         snapshot
             .player_position_confidence_for_point(holder, core)
             .unwrap()
-            >= 0.90
+            >= perception.ball_holder_core_confidence
     );
     assert!(snapshot.player_can_see_point(holder, shoulder));
     let shoulder_confidence = snapshot
         .player_position_confidence_for_point(holder, shoulder)
         .unwrap();
-    assert!(shoulder_confidence >= 0.70);
-    assert!(shoulder_confidence < 0.90);
+    assert!(shoulder_confidence >= perception.ball_holder_shoulder_confidence);
+    assert!(shoulder_confidence < perception.ball_holder_core_confidence);
     assert!(snapshot.player_can_see_point(holder, behind));
     let behind_confidence = snapshot
         .player_position_confidence_for_point(holder, behind)
         .unwrap();
     assert!(
-        behind_confidence >= BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE,
+        behind_confidence >= perception.ball_holder_rear_scan_confidence,
         "rear scan confidence should remain usable: {behind_confidence}"
     );
     assert!(
@@ -43896,8 +43898,13 @@ fn ball_carrier_has_high_confidence_front_vision() {
         .find(|entry| entry.player_id == rear_teammate)
         .expect("rear teammate confidence entry");
     assert!(
-        rear_entry.latency_seconds >= 1.0,
+        rear_entry.latency_seconds >= perception.ball_holder_head_scan_min_seconds,
         "rear scan should cost realistic head-swivel time: {}",
+        rear_entry.latency_seconds
+    );
+    assert!(
+        rear_entry.latency_seconds <= perception.ball_holder_head_scan_max_seconds,
+        "rear scan latency should stay inside configured head-swivel max: {}",
         rear_entry.latency_seconds
     );
     assert!(
@@ -80752,16 +80759,17 @@ fn ball_holder_pomdp_encodes_overcommitted_defender_reaction_and_nutmeg_window()
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(carrier);
+    let perception = &tunables().pomdp_perception;
     assert!(
         observation
             .neural_extended
             .nearest_defender_reaction_delay_seconds
-            >= 0.18
+            >= perception.player_reaction_min_seconds
             && observation
                 .neural_extended
                 .nearest_defender_reaction_delay_seconds
-                <= PLAYER_POMDP_REACTION_MAX_SECONDS,
-        "defender POMDP reaction delay should sit in the 100-250ms band: {:?}",
+                <= perception.player_reaction_max_seconds,
+        "defender POMDP reaction delay should sit in the configured band: {:?}",
         observation.neural_extended
     );
     assert!(
@@ -80854,6 +80862,7 @@ fn runaround_dribble_prefers_escape_opposite_defender_lateral_momentum() {
     sim.players[defender].skills.defensive_tracking = 3.5;
 
     let snapshot = WorldSnapshot::from_match(&sim);
+    let perception = &tunables().pomdp_perception;
     let plan = snapshot
         .runaround_dribble_option_for(carrier)
         .expect("overcommitted defender with space should leave a runaround lane");
@@ -80866,7 +80875,7 @@ fn runaround_dribble_prefers_escape_opposite_defender_lateral_momentum() {
             sim.players[carrier].position,
             plan.recollect_point,
             sim.players[defender].position
-                + sim.players[defender].velocity * PLAYER_POMDP_REACTION_MAX_SECONDS,
+                + sim.players[defender].velocity * perception.player_reaction_max_seconds,
         ) > 1.0,
         "rendered body path should bend around the defender projection rather than collide: {plan:?}"
     );

@@ -20709,6 +20709,7 @@ fn pending_pass_snapshot_from(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorldSnapshotOptions {
     player_history_samples: usize,
+    use_configured_pomdp_history_samples: bool,
     include_shared_histories: bool,
     include_player_decisions: bool,
     include_ball_history: bool,
@@ -20718,6 +20719,7 @@ pub(crate) struct WorldSnapshotOptions {
 impl WorldSnapshotOptions {
     const FULL: Self = Self {
         player_history_samples: PLAYER_POSITION_HISTORY_LIMIT,
+        use_configured_pomdp_history_samples: false,
         include_shared_histories: true,
         include_player_decisions: true,
         include_ball_history: true,
@@ -20725,7 +20727,8 @@ impl WorldSnapshotOptions {
     };
 
     const AGENT_DECISION: Self = Self {
-        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
+        player_history_samples: 0,
+        use_configured_pomdp_history_samples: true,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -20733,7 +20736,8 @@ impl WorldSnapshotOptions {
     };
 
     pub(crate) const DEFENSIVE_OR_LOOSE_AGENT_DECISION: Self = Self {
-        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
+        player_history_samples: 0,
+        use_configured_pomdp_history_samples: true,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
@@ -20741,7 +20745,8 @@ impl WorldSnapshotOptions {
     };
 
     const LEARNING: Self = Self {
-        player_history_samples: KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES,
+        player_history_samples: 0,
+        use_configured_pomdp_history_samples: true,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -20750,6 +20755,7 @@ impl WorldSnapshotOptions {
 
     const OFFICIAL_DECISION: Self = Self {
         player_history_samples: 0,
+        use_configured_pomdp_history_samples: false,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: false,
@@ -20758,6 +20764,7 @@ impl WorldSnapshotOptions {
 
     const LIVE_HTTP_FRAME: Self = Self {
         player_history_samples: PLAYER_POSITION_HISTORY_LIMIT,
+        use_configured_pomdp_history_samples: false,
         include_shared_histories: false,
         include_player_decisions: false,
         include_ball_history: true,
@@ -20908,6 +20915,11 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn from_match_with_options(m: &SoccerMatch, options: WorldSnapshotOptions) -> Self {
+        let mut options = options;
+        if options.use_configured_pomdp_history_samples {
+            options.player_history_samples =
+                tunables().pomdp_perception.kalman_min_history_samples;
+        }
         let schedule_index_lookup = AgentScheduleIndexLookup::from_entries(&m.last_agent_schedule);
         let shared_positions = if options.include_shared_histories {
             m.shared_positions.snapshot_with_current_players(
@@ -25214,14 +25226,19 @@ impl WorldSnapshot {
                 })
                 .fold(0.0_f64, f64::max);
             if head_scan_seconds > 0.0 {
-                let scan_fit = ((head_scan_seconds - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS)
-                    / (BALL_HOLDER_HEAD_SCAN_MAX_SECONDS - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS)
-                        .max(1e-6))
+                let perception = &tunables().pomdp_perception;
+                let scan_fit = ((head_scan_seconds
+                    - perception.ball_holder_head_scan_min_seconds)
+                    / (perception.ball_holder_head_scan_max_seconds
+                        - perception.ball_holder_head_scan_min_seconds)
+                        .max(f64::EPSILON))
                 .clamp(0.0, 1.0);
                 look_behind_scan.active = true;
                 look_behind_scan.duration_seconds = head_scan_seconds;
                 look_behind_scan.confidence_bonus = 0.0;
-                look_behind_scan.drift_risk = (0.24 + scan_fit * 0.42).clamp(0.0, 1.0);
+                look_behind_scan.drift_risk = (perception.ball_holder_head_scan_drift_risk_base
+                    + scan_fit * perception.ball_holder_head_scan_drift_risk_span)
+                    .clamp(0.0, 1.0);
             }
         }
         let teammate_position_confidence =
@@ -28841,7 +28858,7 @@ impl WorldSnapshot {
             + occlusion_score.clamp(0.0, 1.0) * PERCEPTION_LATENCY_MAX_EXTRA_SECONDS * 0.34)
             .clamp(
                 PERCEPTION_LATENCY_BASE_SECONDS,
-                PLAYER_POMDP_REACTION_MAX_SECONDS,
+                tunables().pomdp_perception.player_reaction_max_seconds,
             )
     }
 
@@ -28872,7 +28889,7 @@ impl WorldSnapshot {
         {
             let target_position = self.player_snapshot_position(target);
             let match_distance = target_position.distance(point);
-            if match_distance <= KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS
+            if match_distance <= tunables().pomdp_perception.kalman_point_match_radius_yards
                 && matched_target
                     .map(|(_, _, best_distance)| match_distance < best_distance)
                     .unwrap_or(true)
@@ -30313,12 +30330,14 @@ impl WorldSnapshot {
             defender.skills.defensive_tracking,
             defender.fatigue,
         );
-        let defender_reaction_fit = ((defender_reaction_delay - PLAYER_POMDP_REACTION_MIN_SECONDS)
-            / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS).max(1e-6))
+        let perception = &tunables().pomdp_perception;
+        let defender_reaction_fit = ((defender_reaction_delay
+            - perception.player_reaction_min_seconds)
+            / perception.player_reaction_span_seconds())
         .clamp(0.0, 1.0);
         let defender_projection_seconds = defender_reaction_delay.clamp(
-            PLAYER_POMDP_REACTION_MIN_SECONDS,
-            PLAYER_POMDP_REACTION_MAX_SECONDS,
+            perception.player_reaction_min_seconds,
+            perception.player_reaction_max_seconds,
         );
         let projected_defender_pos = (defender_pos
             + defender_velocity * defender_projection_seconds

@@ -4094,11 +4094,12 @@ impl PlayerAgent {
             .neural_extended
             .nearest_defender_overcommit_score
             .clamp(0.0, 1.0);
+        let perception = &tunables().pomdp_perception;
         let defender_reaction_delay_fit = ((observation
             .neural_extended
             .nearest_defender_reaction_delay_seconds
-            - PLAYER_POMDP_REACTION_MIN_SECONDS)
-            / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS).max(1e-6))
+            - perception.player_reaction_min_seconds)
+            / perception.player_reaction_span_seconds())
         .clamp(0.0, 1.0);
         let momentum_escape_side = observation
             .neural_extended
@@ -8594,12 +8595,12 @@ impl PlayerAgent {
                         .neural_extended
                         .nearest_defender_overcommit_score
                         .clamp(0.0, 1.0);
+                    let perception = &tunables().pomdp_perception;
                     let defender_reaction_delay_fit = ((observation
                         .neural_extended
                         .nearest_defender_reaction_delay_seconds
-                        - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                        / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                            .max(1e-6))
+                        - perception.player_reaction_min_seconds)
+                        / perception.player_reaction_span_seconds())
                     .clamp(0.0, 1.0);
                     let appetite = (0.18
                         + plan.quality * 0.58

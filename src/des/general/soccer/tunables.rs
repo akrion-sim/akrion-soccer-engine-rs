@@ -91,6 +91,9 @@ pub struct Tunables {
     /// `DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` is set; see
     /// [`crate::des::general::soccer::policy_select`].
     pub policy_selection: PolicySelectionTunables,
+    /// POMDP perception model for ball-holder head turns, shoulder checks, and
+    /// delayed 360-degree pass recognition.
+    pub pomdp_perception: PomdpPerceptionTunables,
 }
 
 impl Default for Tunables {
@@ -109,7 +112,114 @@ impl Default for Tunables {
             lane_affinity: LaneAffinityTunables::default(),
             lane_discipline: LaneDisciplineTunables::default(),
             policy_selection: PolicySelectionTunables::default(),
+            pomdp_perception: PomdpPerceptionTunables::default(),
         }
+    }
+}
+
+/// Ball-holder POMDP perception knobs. A carrier can see the core body-facing
+/// cone immediately, shoulder-check wider lanes, and head-scan the rest of the
+/// pitch with lower confidence plus a realistic delay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PomdpPerceptionTunables {
+    /// Minimum bounded human reaction delay carried in the POMDP observation.
+    pub player_reaction_min_seconds: f64,
+    /// Maximum bounded human reaction delay carried in the POMDP observation.
+    pub player_reaction_max_seconds: f64,
+    /// Full body-facing vision cone, in degrees. Previously
+    /// `BALL_HOLDER_CORE_VISION_DEGREES`.
+    pub ball_holder_core_degrees: f64,
+    /// Additional degrees reachable by a quick shoulder check on either side.
+    /// Previously `BALL_HOLDER_SHOULDER_VISION_DEGREES`.
+    pub ball_holder_shoulder_degrees: f64,
+    /// Position confidence inside the core body-facing cone.
+    pub ball_holder_core_confidence: f64,
+    /// Position confidence inside shoulder-check range.
+    pub ball_holder_shoulder_confidence: f64,
+    /// Base position confidence for side head scans.
+    pub ball_holder_side_scan_confidence: f64,
+    /// Base position confidence for rear head scans.
+    pub ball_holder_rear_scan_confidence: f64,
+    /// Minimum added perception delay for non-forward head scans.
+    pub ball_holder_head_scan_min_seconds: f64,
+    /// Maximum added perception delay for non-forward head scans.
+    pub ball_holder_head_scan_max_seconds: f64,
+    /// Amount high-vision players shave from the maximum scan delay.
+    pub ball_holder_head_scan_vision_relief_seconds: f64,
+    /// Extra confidence high-vision players add while scanning side/rear lanes.
+    pub ball_holder_scan_confidence_vision_bonus: f64,
+    /// Maximum confidence for side/rear head-scan recognition.
+    pub ball_holder_scan_confidence_cap: f64,
+    /// Baseline drift risk recorded in the POMDP observation for any head scan.
+    pub ball_holder_head_scan_drift_risk_base: f64,
+    /// Extra drift risk added as the scan delay approaches its maximum.
+    pub ball_holder_head_scan_drift_risk_span: f64,
+    /// Radius for matching a perceived point against recent Kalman history.
+    pub kalman_point_match_radius_yards: f64,
+    /// Minimum history samples before the Kalman confidence bridge is trusted.
+    pub kalman_min_history_samples: usize,
+    /// Distance treated as a current-position sample rather than a prediction.
+    pub kalman_current_sample_epsilon_yards: f64,
+    /// Baseline uncertainty for stale/predicted player positions.
+    pub kalman_base_sigma_yards: f64,
+    /// Additional uncertainty per yard-per-second of target speed.
+    pub kalman_speed_sigma_per_yps: f64,
+    /// Additional uncertainty for velocity disagreement between history samples.
+    pub kalman_velocity_disagreement_sigma_yards: f64,
+    /// Confidence cap for currently visible, history-supported positions.
+    pub kalman_visible_max_confidence: f64,
+    /// Confidence cap for forward-but-not-currently-visible positions.
+    pub kalman_front_max_confidence: f64,
+    /// Confidence cap for generally occluded positions.
+    pub kalman_occluded_max_confidence: f64,
+    /// Confidence cap for ball-holder side/rear scanned but occluded positions.
+    pub kalman_ball_holder_occluded_max_confidence: f64,
+}
+
+impl Default for PomdpPerceptionTunables {
+    fn default() -> Self {
+        PomdpPerceptionTunables {
+            player_reaction_min_seconds: 0.10,
+            player_reaction_max_seconds: 0.25,
+            ball_holder_core_degrees: 100.0,
+            ball_holder_shoulder_degrees: 40.0,
+            ball_holder_core_confidence: 0.90,
+            ball_holder_shoulder_confidence: 0.70,
+            ball_holder_side_scan_confidence: 0.52,
+            ball_holder_rear_scan_confidence: 0.38,
+            ball_holder_head_scan_min_seconds: 0.75,
+            ball_holder_head_scan_max_seconds: 1.85,
+            ball_holder_head_scan_vision_relief_seconds: 0.35,
+            ball_holder_scan_confidence_vision_bonus: 0.08,
+            ball_holder_scan_confidence_cap: 0.62,
+            ball_holder_head_scan_drift_risk_base: 0.24,
+            ball_holder_head_scan_drift_risk_span: 0.42,
+            kalman_point_match_radius_yards: 0.35,
+            kalman_min_history_samples: 2,
+            kalman_current_sample_epsilon_yards: 0.15,
+            kalman_base_sigma_yards: 0.85,
+            kalman_speed_sigma_per_yps: 0.10,
+            kalman_velocity_disagreement_sigma_yards: 0.14,
+            kalman_visible_max_confidence: 0.96,
+            kalman_front_max_confidence: 0.88,
+            kalman_occluded_max_confidence: 0.68,
+            kalman_ball_holder_occluded_max_confidence: 0.58,
+        }
+    }
+}
+
+impl PomdpPerceptionTunables {
+    pub fn ball_holder_shoulder_scan_limit_degrees(&self) -> f64 {
+        self.ball_holder_core_degrees * 0.5 + self.ball_holder_shoulder_degrees
+    }
+
+    pub fn player_reaction_span_seconds(&self) -> f64 {
+        (self.player_reaction_max_seconds - self.player_reaction_min_seconds).max(f64::EPSILON)
+    }
+
+    pub fn perception_latency_upper_bound_seconds(&self) -> f64 {
+        self.player_reaction_max_seconds + self.ball_holder_head_scan_max_seconds
     }
 }
 
@@ -853,6 +963,7 @@ impl Tunables {
         self.fresh_possession_escape.sanitize();
         self.killer_pass_over_top.sanitize();
         self.lane_affinity.sanitize();
+        self.pomdp_perception.sanitize();
         self
     }
 
@@ -876,10 +987,468 @@ impl Tunables {
             .validate_strict("killer_pass_over_top", &mut errors);
         self.lane_affinity
             .validate_strict("lane_affinity", &mut errors);
+        self.pomdp_perception
+            .validate_strict("pomdp_perception", &mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors.join("; "))
+        }
+    }
+}
+
+impl PomdpPerceptionTunables {
+    fn sanitize(&mut self) {
+        let default = PomdpPerceptionTunables::default();
+        sanitize_f64(
+            "pomdp_perception.player_reaction_min_seconds",
+            &mut self.player_reaction_min_seconds,
+            default.player_reaction_min_seconds,
+            0.0,
+            1.0,
+            0.05,
+            0.25,
+        );
+        sanitize_f64(
+            "pomdp_perception.player_reaction_max_seconds",
+            &mut self.player_reaction_max_seconds,
+            default.player_reaction_max_seconds,
+            0.0,
+            1.0,
+            0.12,
+            0.50,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_core_degrees",
+            &mut self.ball_holder_core_degrees,
+            default.ball_holder_core_degrees,
+            1.0,
+            240.0,
+            60.0,
+            160.0,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_shoulder_degrees",
+            &mut self.ball_holder_shoulder_degrees,
+            default.ball_holder_shoulder_degrees,
+            0.0,
+            140.0,
+            20.0,
+            80.0,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_core_confidence",
+            &mut self.ball_holder_core_confidence,
+            default.ball_holder_core_confidence,
+            0.0,
+            1.0,
+            0.50,
+            1.0,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_shoulder_confidence",
+            &mut self.ball_holder_shoulder_confidence,
+            default.ball_holder_shoulder_confidence,
+            0.0,
+            1.0,
+            0.35,
+            0.95,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_side_scan_confidence",
+            &mut self.ball_holder_side_scan_confidence,
+            default.ball_holder_side_scan_confidence,
+            0.0,
+            1.0,
+            0.05,
+            0.85,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_rear_scan_confidence",
+            &mut self.ball_holder_rear_scan_confidence,
+            default.ball_holder_rear_scan_confidence,
+            0.0,
+            1.0,
+            0.05,
+            0.85,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_head_scan_min_seconds",
+            &mut self.ball_holder_head_scan_min_seconds,
+            default.ball_holder_head_scan_min_seconds,
+            0.0,
+            3.0,
+            0.25,
+            1.5,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_head_scan_max_seconds",
+            &mut self.ball_holder_head_scan_max_seconds,
+            default.ball_holder_head_scan_max_seconds,
+            0.0,
+            4.0,
+            1.0,
+            2.5,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_head_scan_vision_relief_seconds",
+            &mut self.ball_holder_head_scan_vision_relief_seconds,
+            default.ball_holder_head_scan_vision_relief_seconds,
+            0.0,
+            2.0,
+            0.0,
+            0.8,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_scan_confidence_vision_bonus",
+            &mut self.ball_holder_scan_confidence_vision_bonus,
+            default.ball_holder_scan_confidence_vision_bonus,
+            0.0,
+            0.25,
+            0.0,
+            0.12,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_scan_confidence_cap",
+            &mut self.ball_holder_scan_confidence_cap,
+            default.ball_holder_scan_confidence_cap,
+            0.0,
+            1.0,
+            0.45,
+            0.80,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_head_scan_drift_risk_base",
+            &mut self.ball_holder_head_scan_drift_risk_base,
+            default.ball_holder_head_scan_drift_risk_base,
+            0.0,
+            1.0,
+            0.0,
+            0.5,
+        );
+        sanitize_f64(
+            "pomdp_perception.ball_holder_head_scan_drift_risk_span",
+            &mut self.ball_holder_head_scan_drift_risk_span,
+            default.ball_holder_head_scan_drift_risk_span,
+            0.0,
+            1.0,
+            0.10,
+            0.75,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_point_match_radius_yards",
+            &mut self.kalman_point_match_radius_yards,
+            default.kalman_point_match_radius_yards,
+            0.0,
+            5.0,
+            0.05,
+            1.0,
+        );
+        sanitize_usize(
+            "pomdp_perception.kalman_min_history_samples",
+            &mut self.kalman_min_history_samples,
+            default.kalman_min_history_samples,
+            1,
+            10,
+            2,
+            4,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_current_sample_epsilon_yards",
+            &mut self.kalman_current_sample_epsilon_yards,
+            default.kalman_current_sample_epsilon_yards,
+            0.0,
+            2.0,
+            0.02,
+            0.50,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_base_sigma_yards",
+            &mut self.kalman_base_sigma_yards,
+            default.kalman_base_sigma_yards,
+            0.01,
+            10.0,
+            0.20,
+            2.50,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_speed_sigma_per_yps",
+            &mut self.kalman_speed_sigma_per_yps,
+            default.kalman_speed_sigma_per_yps,
+            0.0,
+            2.0,
+            0.0,
+            0.50,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_velocity_disagreement_sigma_yards",
+            &mut self.kalman_velocity_disagreement_sigma_yards,
+            default.kalman_velocity_disagreement_sigma_yards,
+            0.0,
+            2.0,
+            0.0,
+            0.50,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_visible_max_confidence",
+            &mut self.kalman_visible_max_confidence,
+            default.kalman_visible_max_confidence,
+            0.0,
+            1.0,
+            0.75,
+            1.0,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_front_max_confidence",
+            &mut self.kalman_front_max_confidence,
+            default.kalman_front_max_confidence,
+            0.0,
+            1.0,
+            0.60,
+            0.98,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_occluded_max_confidence",
+            &mut self.kalman_occluded_max_confidence,
+            default.kalman_occluded_max_confidence,
+            0.0,
+            1.0,
+            0.35,
+            0.85,
+        );
+        sanitize_f64(
+            "pomdp_perception.kalman_ball_holder_occluded_max_confidence",
+            &mut self.kalman_ball_holder_occluded_max_confidence,
+            default.kalman_ball_holder_occluded_max_confidence,
+            0.0,
+            1.0,
+            0.25,
+            0.80,
+        );
+        if self.player_reaction_max_seconds < self.player_reaction_min_seconds {
+            eprintln!(
+                "soccer tunables: pomdp_perception reaction min seconds exceeded max seconds; raising max"
+            );
+            self.player_reaction_max_seconds = self.player_reaction_min_seconds;
+        }
+        if self.ball_holder_head_scan_max_seconds < self.ball_holder_head_scan_min_seconds {
+            eprintln!(
+                "soccer tunables: pomdp_perception head-scan min seconds exceeded max seconds; raising max"
+            );
+            self.ball_holder_head_scan_max_seconds = self.ball_holder_head_scan_min_seconds;
+        }
+    }
+
+    fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
+        validate_f64(
+            prefix,
+            "player_reaction_min_seconds",
+            self.player_reaction_min_seconds,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "player_reaction_max_seconds",
+            self.player_reaction_max_seconds,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_core_degrees",
+            self.ball_holder_core_degrees,
+            1.0,
+            240.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_shoulder_degrees",
+            self.ball_holder_shoulder_degrees,
+            0.0,
+            140.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_core_confidence",
+            self.ball_holder_core_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_shoulder_confidence",
+            self.ball_holder_shoulder_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_side_scan_confidence",
+            self.ball_holder_side_scan_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_rear_scan_confidence",
+            self.ball_holder_rear_scan_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_head_scan_min_seconds",
+            self.ball_holder_head_scan_min_seconds,
+            0.0,
+            3.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_head_scan_max_seconds",
+            self.ball_holder_head_scan_max_seconds,
+            0.0,
+            4.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_head_scan_vision_relief_seconds",
+            self.ball_holder_head_scan_vision_relief_seconds,
+            0.0,
+            2.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_scan_confidence_vision_bonus",
+            self.ball_holder_scan_confidence_vision_bonus,
+            0.0,
+            0.25,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_scan_confidence_cap",
+            self.ball_holder_scan_confidence_cap,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_head_scan_drift_risk_base",
+            self.ball_holder_head_scan_drift_risk_base,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "ball_holder_head_scan_drift_risk_span",
+            self.ball_holder_head_scan_drift_risk_span,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_point_match_radius_yards",
+            self.kalman_point_match_radius_yards,
+            0.0,
+            5.0,
+            errors,
+        );
+        validate_usize(
+            prefix,
+            "kalman_min_history_samples",
+            self.kalman_min_history_samples,
+            1,
+            10,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_current_sample_epsilon_yards",
+            self.kalman_current_sample_epsilon_yards,
+            0.0,
+            2.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_base_sigma_yards",
+            self.kalman_base_sigma_yards,
+            0.01,
+            10.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_speed_sigma_per_yps",
+            self.kalman_speed_sigma_per_yps,
+            0.0,
+            2.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_velocity_disagreement_sigma_yards",
+            self.kalman_velocity_disagreement_sigma_yards,
+            0.0,
+            2.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_visible_max_confidence",
+            self.kalman_visible_max_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_front_max_confidence",
+            self.kalman_front_max_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_occluded_max_confidence",
+            self.kalman_occluded_max_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "kalman_ball_holder_occluded_max_confidence",
+            self.kalman_ball_holder_occluded_max_confidence,
+            0.0,
+            1.0,
+            errors,
+        );
+        if self.player_reaction_max_seconds < self.player_reaction_min_seconds {
+            errors.push(format!(
+                "{prefix}.player_reaction_max_seconds < {prefix}.player_reaction_min_seconds"
+            ));
+        }
+        if self.ball_holder_head_scan_max_seconds < self.ball_holder_head_scan_min_seconds {
+            errors.push(format!(
+                "{prefix}.ball_holder_head_scan_max_seconds < {prefix}.ball_holder_head_scan_min_seconds"
+            ));
         }
     }
 }
@@ -3338,6 +3907,64 @@ mod tests {
         assert_eq!(t.policy_selection.top2_weight, 0.20);
         assert_eq!(t.policy_selection.top3_weight, 0.10);
         assert_eq!(t.policy_selection.rank_weights(), [0.70, 0.20, 0.10]);
+        assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 0.10);
+        assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 0.25);
+        assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 100.0);
+        assert_eq!(t.pomdp_perception.ball_holder_shoulder_degrees, 40.0);
+        assert_eq!(t.pomdp_perception.ball_holder_core_confidence, 0.90);
+        assert_eq!(t.pomdp_perception.ball_holder_shoulder_confidence, 0.70);
+        assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.52);
+        assert_eq!(t.pomdp_perception.ball_holder_rear_scan_confidence, 0.38);
+        assert_eq!(
+            t.pomdp_perception.ball_holder_head_scan_min_seconds,
+            0.75
+        );
+        assert_eq!(
+            t.pomdp_perception.ball_holder_head_scan_max_seconds,
+            1.85
+        );
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_vision_relief_seconds,
+            0.35
+        );
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_scan_confidence_vision_bonus,
+            0.08
+        );
+        assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.62);
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_drift_risk_base,
+            0.24
+        );
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_drift_risk_span,
+            0.42
+        );
+        assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 0.35);
+        assert_eq!(t.pomdp_perception.kalman_min_history_samples, 2);
+        assert_eq!(
+            t.pomdp_perception.kalman_current_sample_epsilon_yards,
+            0.15
+        );
+        assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.85);
+        assert_eq!(t.pomdp_perception.kalman_speed_sigma_per_yps, 0.10);
+        assert_eq!(
+            t.pomdp_perception
+                .kalman_velocity_disagreement_sigma_yards,
+            0.14
+        );
+        assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 0.96);
+        assert_eq!(t.pomdp_perception.kalman_front_max_confidence, 0.88);
+        assert_eq!(t.pomdp_perception.kalman_occluded_max_confidence, 0.68);
+        assert_eq!(
+            t.pomdp_perception
+                .kalman_ball_holder_occluded_max_confidence,
+            0.58
+        );
     }
 
     #[test]
@@ -3359,6 +3986,13 @@ mod tests {
             "lane_affinity": {
                 "possession_factor": 0.74,
                 "open_space_dynamic_lane_bonus_weight": 1.3
+            },
+            "pomdp_perception": {
+                "player_reaction_max_seconds": 0.30,
+                "ball_holder_head_scan_max_seconds": 2.0,
+                "ball_holder_side_scan_confidence": 0.55,
+                "ball_holder_head_scan_drift_risk_span": 0.50,
+                "kalman_min_history_samples": 3
             }
         })]);
         assert_eq!(t.tracking.moved_dt_multiplier, 1.5);
@@ -3375,12 +4009,24 @@ mod tests {
         assert_eq!(t.fresh_possession_escape.corridor_half_width_yards, 2.6);
         assert_eq!(t.lane_affinity.possession_factor, 0.74);
         assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.3);
+        assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 0.30);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 2.0);
+        assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.55);
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_drift_risk_span,
+            0.50
+        );
+        assert_eq!(t.pomdp_perception.kalman_min_history_samples, 3);
         // Untouched fields keep their defaults.
         assert_eq!(t.tracking.tackle_recover_max_distance_yards, 3.8);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
         assert_eq!(t.carrier_keep_rolling.carry_target_yards, 4.2);
         assert_eq!(t.fresh_possession_escape.target_yards, 4.8);
         assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
+        assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 0.10);
+        assert_eq!(t.pomdp_perception.ball_holder_rear_scan_confidence, 0.38);
+        assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.85);
     }
 
     #[test]
@@ -3437,6 +4083,23 @@ mod tests {
                 "forward_lane_radius": 99,
                 "lookahead_min_seconds": 2.0,
                 "lookahead_max_seconds": 0.5
+            },
+            "pomdp_perception": {
+                "player_reaction_min_seconds": 2.0,
+                "player_reaction_max_seconds": -1.0,
+                "ball_holder_core_degrees": -4.0,
+                "ball_holder_side_scan_confidence": 2.0,
+                "ball_holder_head_scan_min_seconds": 99.0,
+                "ball_holder_head_scan_max_seconds": -1.0,
+                "ball_holder_scan_confidence_vision_bonus": 9.0,
+                "ball_holder_scan_confidence_cap": -1.0,
+                "ball_holder_head_scan_drift_risk_base": 5.0,
+                "ball_holder_head_scan_drift_risk_span": -5.0,
+                "kalman_point_match_radius_yards": 99.0,
+                "kalman_min_history_samples": 99,
+                "kalman_current_sample_epsilon_yards": -2.0,
+                "kalman_base_sigma_yards": 0.0,
+                "kalman_visible_max_confidence": 3.0
             }
         })]);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
@@ -3458,6 +4121,42 @@ mod tests {
         assert_eq!(t.lane_affinity.forward_lane_radius, 6);
         assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
         assert_eq!(t.lane_affinity.lookahead_max_seconds, 2.0);
+        assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 1.0);
+        assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 1.0);
+        assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 1.0);
+        assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 1.0);
+        assert_eq!(
+            t.pomdp_perception.ball_holder_head_scan_min_seconds,
+            3.0
+        );
+        assert_eq!(
+            t.pomdp_perception.ball_holder_head_scan_max_seconds,
+            3.0
+        );
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_scan_confidence_vision_bonus,
+            0.25
+        );
+        assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.0);
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_drift_risk_base,
+            1.0
+        );
+        assert_eq!(
+            t.pomdp_perception
+                .ball_holder_head_scan_drift_risk_span,
+            0.0
+        );
+        assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 5.0);
+        assert_eq!(t.pomdp_perception.kalman_min_history_samples, 10);
+        assert_eq!(
+            t.pomdp_perception.kalman_current_sample_epsilon_yards,
+            0.0
+        );
+        assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.01);
+        assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 1.0);
     }
 
     #[test]
@@ -3472,6 +4171,13 @@ mod tests {
         t.fresh_possession_escape.min_cushion_gain_yards = 1.2;
         t.lane_affinity.possession_factor = 1.2;
         t.lane_affinity.forward_lane_radius = 9;
+        t.pomdp_perception.player_reaction_min_seconds = 0.8;
+        t.pomdp_perception.player_reaction_max_seconds = 0.2;
+        t.pomdp_perception.ball_holder_head_scan_min_seconds = 2.5;
+        t.pomdp_perception.ball_holder_head_scan_max_seconds = 1.5;
+        t.pomdp_perception.ball_holder_side_scan_confidence = 1.2;
+        t.pomdp_perception.ball_holder_head_scan_drift_risk_base = -0.1;
+        t.pomdp_perception.kalman_min_history_samples = 0;
 
         let err = t.validate_strict().expect_err("config should be invalid");
         assert!(err.contains("shooting.shot_on_frame_min_probability"));
@@ -3480,5 +4186,16 @@ mod tests {
         assert!(err.contains("fresh_possession_escape.target_yards <"));
         assert!(err.contains("lane_affinity.possession_factor"));
         assert!(err.contains("lane_affinity.forward_lane_radius"));
+        assert!(err.contains(
+            "pomdp_perception.player_reaction_max_seconds < pomdp_perception.player_reaction_min_seconds"
+        ));
+        assert!(err.contains("pomdp_perception.ball_holder_side_scan_confidence"));
+        assert!(err.contains(
+            "pomdp_perception.ball_holder_head_scan_drift_risk_base"
+        ));
+        assert!(err.contains("pomdp_perception.kalman_min_history_samples"));
+        assert!(err.contains(
+            "pomdp_perception.ball_holder_head_scan_max_seconds < pomdp_perception.ball_holder_head_scan_min_seconds"
+        ));
     }
 }
