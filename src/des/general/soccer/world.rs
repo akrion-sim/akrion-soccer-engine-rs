@@ -14276,9 +14276,11 @@ impl SoccerMatch {
         let previous_acceleration = self.ball.acceleration;
         // Altitude when the receiver reaches the ball — drives the aerial header below.
         let control_altitude = self.ball.altitude_yards;
+        let dummy_let_through_guard = self.pass_lane_dummy_guard();
         let context = BallStepContext {
             tick: self.tick,
             double_touch_guard: self.restart_double_touch_guard,
+            dummy_let_through_guard,
             clock_seconds: self.clock_seconds,
             dt_seconds,
             ball_drag_per_tick: self.config.ball_drag_per_tick,
@@ -18576,6 +18578,7 @@ impl BallAgent {
                         same_tick_long_ball_launcher,
                         self.altitude_yards,
                         context.double_touch_guard,
+                        context.dummy_let_through_guard,
                         rng,
                     )
             {

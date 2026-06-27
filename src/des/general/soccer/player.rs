@@ -5623,6 +5623,21 @@ impl PlayerAgent {
                 true,
             ));
         }
+        // Lane-yield: I'm the middle of a three-in-a-line and the only thing blocking a
+        // longer pass from the carrier to a farther team-mate. Step out of the lane to
+        // space (forward when attacking, back for a deep defender) so the carrier can
+        // prefer the longer ball. Scored to win only when the opening is genuinely valuable.
+        if self.role != PlayerRole::Goalkeeper {
+            if let Some((lane_yield_target, lane_yield_strength)) =
+                snapshot.pass_lane_yield_target_for(self.id, self.home_position)
+            {
+                options.push(AgentActionOptionTrace::new(
+                    "lane-yield",
+                    special_score(lane_yield_target, 0.30 + lane_yield_strength * 0.95),
+                    true,
+                ));
+            }
+        }
         let home_x = self.home_position.x.clamp(0.0, snapshot.field_width);
         let wide_home =
             home_x < snapshot.field_width * 0.34 || home_x > snapshot.field_width * 0.66;
@@ -10537,6 +10552,12 @@ impl PlayerAgent {
                         target.action_label = "vacate-space";
                         Some(target)
                     }
+                    "lane-yield" => snapshot
+                        .pass_lane_yield_target_for(self.id, self.home_position)
+                        .map(|(point, _)| SupportMovementTarget {
+                            point: guarded_support_special(point),
+                            action_label: "lane-yield",
+                        }),
                     "support-roam" => Some(snapshot.attacking_support_movement_for_with_targets(
                         self.id,
                         self.home_position,

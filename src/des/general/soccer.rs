@@ -87,6 +87,8 @@ mod field_numbers;
 pub use field_numbers::*;
 mod policy_select;
 pub use policy_select::*;
+mod pass_lane_yield;
+pub use pass_lane_yield::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -16692,6 +16694,11 @@ struct BallStepContext<'a> {
     /// Restart taker who may not re-control the ball until another player touches
     /// it (no double-touch on restarts); `None` outside that window.
     double_touch_guard: Option<usize>,
+    /// Team-mate who has elected to **dummy** the in-flight pass — let it run through to a
+    /// farther man rather than trapping it. Excluded from control candidacy this tick, like
+    /// `double_touch_guard`. `None` unless the pass-lane-yield feature is on and a clean
+    /// dummy is on (see [`SoccerMatch::pass_lane_dummy_guard`]).
+    dummy_let_through_guard: Option<usize>,
     clock_seconds: f64,
     dt_seconds: f64,
     ball_drag_per_tick: f64,
@@ -55648,6 +55655,7 @@ fn nearest_ball_controller_for_segment(
         same_tick_long_ball_launcher,
         ball_altitude_yards,
         None,
+        None,
         rng,
     )
 }
@@ -55663,6 +55671,7 @@ fn nearest_ball_controller_for_segment_with_guard(
     same_tick_long_ball_launcher: Option<usize>,
     ball_altitude_yards: f64,
     double_touch_guard: Option<usize>,
+    dummy_let_through_guard: Option<usize>,
     rng: &mut SeededRandom,
 ) -> Option<(usize, Team, Vec2)> {
     let ball_speed = ball_velocity.len();
@@ -55681,6 +55690,11 @@ fn nearest_ball_controller_for_segment_with_guard(
         // player — a team-mate receiving the restart — then collects it, instead of the ball
         // stalling at the taker's feet whenever the taker happens to be the closest player.
         if double_touch_guard == Some(p.id) {
+            continue;
+        }
+        // A team-mate dummying the ball lets it run through to the man behind — exclude it
+        // from control candidacy this tick so it does not trap a pass aimed past it.
+        if dummy_let_through_guard == Some(p.id) {
             continue;
         }
         if let Some(pass) = pending_pass {
