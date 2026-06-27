@@ -4644,6 +4644,29 @@ impl PlayerAgent {
                 };
                 (base - damp).clamp(0.40, 1.22)
             };
+            // Own-half short-pass discipline (Layer 2): when the best floor pass on offer is a
+            // short ball played from our own half, lean the carrier toward keeping the dribble /
+            // holding rather than playing the square ball. Scales with how short the ball is and
+            // eases for a wide-open receiver; floored so it demotes without hard-vetoing. Off (or
+            // outside the own half / with a 4+yd ball available) ⇒ 1.0 (no change).
+            let own_half_short_pass_dribble_bias = if own_half
+                && !dd_soccer_disable_own_half_short_pass_liability()
+                && observation.best_floor_pass_distance_yards > 0.05
+                && observation.best_floor_pass_distance_yards
+                    < OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS
+            {
+                let shortness = (1.0
+                    - observation.best_floor_pass_distance_yards
+                        / OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS)
+                    .clamp(0.0, 1.0);
+                let openness_relief = observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+                let damp = OWN_HALF_SHORT_PASS_DRIBBLE_DAMP
+                    * (0.5 + 0.5 * shortness)
+                    * (1.0 - 0.5 * openness_relief);
+                (1.0 - damp).clamp(OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT, 1.0)
+            } else {
+                1.0
+            };
             let pass_score = (self.preferences.pass_bias
                 * directive.pass_priority
                 * (0.70 + passing * 0.42)
@@ -4655,6 +4678,7 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * low_cross_multiplier
                 * short_upfield_ground_pass_multiplier
+                * own_half_short_pass_dribble_bias
                 * pass_and_move_forward_lift
                 * crowded_pass_lift
                 * pressured_release_multiplier

@@ -19949,6 +19949,54 @@ pub(crate) fn keeper_giveaway_severity_factor(
     }
     severity
 }
+
+// ON by default: in our own half, short passes (<4yd) that aren't a genuine pressure
+// escape are treated as a liability — demoted in the pass ranking (Layer 1) and made the
+// carrier prefer to dribble/hold over playing them (Layer 2). Set
+// `DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY` to revert both layers (⇒ byte-identical).
+pub(crate) fn dd_soccer_disable_own_half_short_pass_liability() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY").is_ok())
+}
+
+/// Penalty (`>= 0`) demoting a short own-half pass in the floor-pass ranking (Layer 1).
+/// `> 0` only for a sub-[`OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS`] pass played from our own
+/// half that is NOT a genuine escape (the receiver is not clearly less pressured than the
+/// holder). Unlike the build-up penalty it carries a floor so it does not fade out as the
+/// pass nears 4yd. Returns `0.0` when the gate is disabled (⇒ byte-identical ranking).
+fn own_half_short_pass_liability_penalty(
+    in_own_half: bool,
+    dist: f64,
+    holder_pressure: f64,
+    receiver_pressure: f64,
+) -> f64 {
+    if dd_soccer_disable_own_half_short_pass_liability() {
+        return 0.0;
+    }
+    own_half_short_pass_liability_penalty_factor(in_own_half, dist, holder_pressure, receiver_pressure)
+}
+
+/// Pure Layer-1 penalty math (no env gate) so it can be unit-tested regardless of the
+/// process-global gate cache.
+pub(crate) fn own_half_short_pass_liability_penalty_factor(
+    in_own_half: bool,
+    dist: f64,
+    holder_pressure: f64,
+    receiver_pressure: f64,
+) -> f64 {
+    if !in_own_half || dist >= OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS {
+        return 0.0;
+    }
+    // A real escape — the receiver is clearly more open than the pressured holder — is the
+    // one short own-half ball worth playing; leave it alone.
+    if receiver_pressure <= holder_pressure - POINTLESS_SHORT_PASS_RELIEF_MARGIN {
+        return 0.0;
+    }
+    let shortness = (1.0 - dist / OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS).clamp(0.0, 1.0);
+    let floor = OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION;
+    OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * (floor + (1.0 - floor) * shortness)
+}
 /// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
 /// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
@@ -24581,6 +24629,7 @@ impl WorldSnapshot {
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
+                best_floor_pass_distance_yards: 0.0,
                 best_aerial_pass_receiver_openness: 0.0,
                 best_pass_stride_fit: 0.0,
                 best_aerial_pass_stride_fit: 0.0,
@@ -25925,6 +25974,7 @@ impl WorldSnapshot {
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
             best_pass_receiver_openness: best_floor_pass_quality.receiver_openness,
+            best_floor_pass_distance_yards: best_floor_pass_quality.distance_yards,
             best_aerial_pass_receiver_openness: best_aerial_pass_quality.receiver_openness,
             best_pass_stride_fit: best_floor_pass_stride_fit,
             best_aerial_pass_stride_fit: best_aerial_pass_stride_fit,
@@ -27981,6 +28031,30 @@ impl WorldSnapshot {
                         0.0
                     }
                 };
+                // Own-half short-pass LIABILITY (Layer 1): in our own half a sub-4yd ball that
+                // is not a genuine escape is a liability, not build-up — demote it hard (with a
+                // floor, so it bites even at 3-4yd, unlike the fading build-up penalty) so a 4+yd
+                // forward ball or keeping the dribble outranks it.
+                let own_half_short_pass_liability = if dist
+                    < OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS
+                {
+                    let in_own_half = (me.team.goal_y(self.field_length) - me_position.y).abs()
+                        > self.field_length / 2.0;
+                    if in_own_half {
+                        let holder_pressure = self.attacker_pressure_on_point(me.team, me_position);
+                        let receiver_pressure = self.attacker_pressure_on_point(me.team, position);
+                        own_half_short_pass_liability_penalty(
+                            in_own_half,
+                            dist,
+                            holder_pressure,
+                            receiver_pressure,
+                        )
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 // Answer a forward/mid calling for the ball in behind. Existing through-ball
                 // strategy still rewards a recent runner; the new backfield cue lets a calm
                 // carrier pick out a striker/attacking mid before the play degenerates into a
@@ -28030,6 +28104,7 @@ impl WorldSnapshot {
                     - marked_receiver_penalty
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
+                    - own_half_short_pass_liability
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                     - safe_pass_overrisk_penalty
                     + over_the_top_invite_bonus * goal_entry_pass_learning
