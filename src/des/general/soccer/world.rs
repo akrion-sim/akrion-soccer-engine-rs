@@ -21,7 +21,15 @@ const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
 const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
 const SOCCER_POLICY_RANK_SALT_SHARED_NEURAL: u64 = 0x5348_4152_4e45_5552;
 const SOCCER_POLICY_RANK_SALT_EXPLORATION: u64 = 0x4558_504c_4f52_4552;
+const SOCCER_POLICY_EPSILON_SALT_EXPLORATION: u64 = 0x4558_504c_4741_5445;
+const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE: f64 = 0.35;
+const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER: f64 = 4.0;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
+const OWN_HALF_TINY_PASS_MAX_YARDS: f64 = 3.0;
+const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
+const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
+const PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS: f64 = 4.0;
+const PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS: f64 = 2.2;
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
 const TEAMMATE_LANE_GUARD_SAME_ROLE_RADIUS_YARDS: f64 = 3.35;
@@ -881,6 +889,104 @@ fn soccer_policy_weighted_rank_index(candidate_count: usize, draw: f64) -> usize
     candidate_count - 1
 }
 
+fn soccer_policy_epsilon_gate_allows(epsilon: f64, draw: f64) -> bool {
+    let epsilon = soccer_q_sanitized_epsilon(epsilon);
+    if epsilon <= 0.0 || !draw.is_finite() {
+        return false;
+    }
+    draw.clamp(0.0, 1.0 - f64::EPSILON) < epsilon
+}
+
+fn soccer_policy_mixed_behavior_probability(
+    epsilon: f64,
+    exploration_probability: f64,
+    fallback_probability: f64,
+) -> f64 {
+    let epsilon = soccer_q_sanitized_epsilon(epsilon);
+    let exploration_probability = finite_unit_interval(exploration_probability);
+    let fallback_probability = finite_unit_interval(fallback_probability);
+    (epsilon * exploration_probability + (1.0 - epsilon) * fallback_probability).clamp(0.0, 1.0)
+}
+
+fn soccer_policy_rank_probability_for_label(
+    ranked: &[SoccerLearnedActionTrace],
+    label: &str,
+) -> f64 {
+    let normalized_label = normalize_soccer_action_label(label);
+    let mut candidate_count = 0usize;
+    let mut selected_rank = None;
+    for action in ranked.iter().filter(|action| action.legal) {
+        if candidate_count >= SOCCER_POLICY_TOP_RANK_LIMIT {
+            break;
+        }
+        if selected_rank.is_none()
+            && normalize_soccer_action_label(&action.label) == normalized_label
+        {
+            selected_rank = Some(candidate_count);
+        }
+        candidate_count += 1;
+    }
+    selected_rank
+        .map(|rank| soccer_policy_rank_probability(candidate_count, rank))
+        .unwrap_or(0.0)
+}
+
+fn soccer_policy_uncertainty_weighted_ranked_action_choice(
+    ranked: &[SoccerLearnedActionTrace],
+    draw: f64,
+) -> Option<SoccerPolicyActionChoice> {
+    let legal = ranked
+        .iter()
+        .filter(|action| action.legal)
+        .take(SOCCER_POLICY_TOP_RANK_LIMIT)
+        .collect::<Vec<_>>();
+    let candidate_count = legal.len();
+    if candidate_count == 0 {
+        return None;
+    }
+    let max_visits = legal.iter().map(|action| action.visits).max().unwrap_or(0) as f64;
+    let mut weights = [0.0; SOCCER_POLICY_TOP_RANK_LIMIT];
+    let mut total = 0.0;
+    for (rank, action) in legal.iter().enumerate() {
+        let visits = action.visits as f64;
+        let relative_uncertainty = ((max_visits + 1.0) / (visits + 1.0)).sqrt();
+        let multiplier = (1.0
+            + SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE * (relative_uncertainty - 1.0).max(0.0))
+        .clamp(1.0, SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER);
+        let weight = SOCCER_POLICY_TOP_RANK_WEIGHTS[rank] * multiplier;
+        weights[rank] = weight;
+        total += weight;
+    }
+    if !total.is_finite() || total <= 1e-9 {
+        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
+        return legal
+            .get(selected_rank)
+            .map(|action| SoccerPolicyActionChoice {
+                label: action.label.clone(),
+                behavior_probability: soccer_policy_rank_probability(
+                    candidate_count,
+                    selected_rank,
+                ),
+            });
+    }
+    let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
+    let mut selected_rank = 0usize;
+    for (rank, weight) in weights.iter().take(candidate_count).enumerate() {
+        if threshold < *weight {
+            selected_rank = rank;
+            break;
+        }
+        threshold -= *weight;
+        selected_rank = rank;
+    }
+    legal
+        .get(selected_rank)
+        .map(|action| SoccerPolicyActionChoice {
+            label: action.label.clone(),
+            behavior_probability: (weights[selected_rank] / total).clamp(0.0, 1.0),
+        })
+}
+
 fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
     let label = normalize_soccer_action_label(action);
     pass_like_action_flight(label).is_some()
@@ -960,6 +1066,17 @@ fn stamp_learned_policy_behavior_probability_on_decision(
 mod tests {
     use super::*;
 
+    fn learned_action_trace(label: &str, visits: u32) -> SoccerLearnedActionTrace {
+        SoccerLearnedActionTrace {
+            label: label.to_string(),
+            value: 1.0,
+            visits,
+            probability: 0.0,
+            legal: true,
+            level: PitchGridLevel::Fine,
+        }
+    }
+
     #[test]
     fn policy_weighted_rank_selector_uses_top_three_split() {
         assert_eq!(soccer_policy_weighted_rank_index(3, 0.0), 0);
@@ -978,6 +1095,51 @@ mod tests {
         assert_eq!(soccer_policy_weighted_rank_index(2, 0.777_779), 1);
         assert!((soccer_policy_rank_probability(2, 0) - (0.70 / 0.90)).abs() < 1e-9);
         assert!((soccer_policy_rank_probability(2, 1) - (0.20 / 0.90)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_epsilon_gate_uses_independent_probability_draw() {
+        assert!(soccer_policy_epsilon_gate_allows(0.10, 0.099_999));
+        assert!(!soccer_policy_epsilon_gate_allows(0.10, 0.100_001));
+        assert!(!soccer_policy_epsilon_gate_allows(0.0, 0.0));
+        assert!(!soccer_policy_epsilon_gate_allows(0.10, f64::NAN));
+    }
+
+    #[test]
+    fn policy_mixed_behavior_probability_records_marginal_action_probability() {
+        let probability = soccer_policy_mixed_behavior_probability(0.10, 0.40, 0.70);
+        assert!((probability - 0.67).abs() < 1e-9);
+        assert_eq!(
+            soccer_policy_mixed_behavior_probability(f64::NAN, 0.40, 0.70),
+            0.70
+        );
+    }
+
+    #[test]
+    fn policy_uncertainty_exploration_preserves_rank_weights_when_visits_match() {
+        let ranked = vec![
+            learned_action_trace("shoot", 10),
+            learned_action_trace("pass", 10),
+            learned_action_trace("dribble", 10),
+        ];
+        let choice =
+            soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, 0.85).expect("choice");
+        assert_eq!(choice.label, "pass");
+        assert!((choice.behavior_probability - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_uncertainty_exploration_promotes_under_visited_top_action() {
+        let ranked = vec![
+            learned_action_trace("shoot", 100),
+            learned_action_trace("pass", 1),
+            learned_action_trace("dribble", 100),
+        ];
+        let choice =
+            soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, 0.50).expect("choice");
+        assert_eq!(choice.label, "pass");
+        assert!(choice.behavior_probability > 0.20);
+        assert!(choice.behavior_probability < 0.70);
     }
 
     #[test]
@@ -3861,6 +4023,80 @@ impl SoccerMatch {
             })
     }
 
+    fn apply_retrieval_prior_to_policy_actions(
+        ranked: &mut [SoccerLearnedActionTrace],
+        retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+    ) {
+        if let Some((prior, weight)) =
+            retrieval_prior.filter(|(p, w)| !p.is_empty() && w.is_finite() && *w != 0.0)
+        {
+            for candidate in ranked.iter_mut().filter(|candidate| candidate.legal) {
+                candidate.value += weight
+                    * prior
+                        .get(normalize_soccer_action_label(&candidate.label))
+                        .copied()
+                        .unwrap_or(0.0);
+            }
+            ranked.sort_by(|a, b| {
+                b.legal
+                    .cmp(&a.legal)
+                    .then_with(|| b.value.total_cmp(&a.value))
+                    .then_with(|| b.visits.cmp(&a.visits))
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+        }
+    }
+
+    fn weighted_policy_action_probability_for_player(
+        &self,
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+        action_label: &str,
+    ) -> f64 {
+        let Some((_, mut ranked)) = policy.ranked_action_values_for_snapshot(
+            snapshot,
+            player_id,
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(SOCCER_POLICY_TOP_RANK_LIMIT),
+        ) else {
+            return policy
+                .best_action_for_state_observation_with_prior(
+                    snapshot,
+                    player_id,
+                    mdp_state,
+                    observation,
+                    retrieval_prior,
+                )
+                .filter(|label| {
+                    normalize_soccer_action_label(label)
+                        == normalize_soccer_action_label(action_label)
+                })
+                .map(|_| 1.0)
+                .unwrap_or(0.0);
+        };
+        Self::apply_retrieval_prior_to_policy_actions(&mut ranked, retrieval_prior);
+        let probability = soccer_policy_rank_probability_for_label(&ranked, action_label);
+        if probability > 0.0 {
+            return probability;
+        }
+        policy
+            .best_action_for_state_observation_with_prior(
+                snapshot,
+                player_id,
+                mdp_state,
+                observation,
+                retrieval_prior,
+            )
+            .filter(|label| {
+                normalize_soccer_action_label(label) == normalize_soccer_action_label(action_label)
+            })
+            .map(|_| 1.0)
+            .unwrap_or(0.0)
+    }
+
     fn weighted_policy_action_for_player(
         &self,
         policy: &SoccerQPolicy,
@@ -3877,22 +4113,7 @@ impl SoccerMatch {
             player_id,
             SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(SOCCER_POLICY_TOP_RANK_LIMIT),
         )?;
-        if let Some((prior, weight)) = retrieval_prior.filter(|(p, w)| !p.is_empty() && *w != 0.0) {
-            for candidate in ranked.iter_mut().filter(|candidate| candidate.legal) {
-                candidate.value += weight
-                    * prior
-                        .get(normalize_soccer_action_label(&candidate.label))
-                        .copied()
-                        .unwrap_or(0.0);
-            }
-            ranked.sort_by(|a, b| {
-                b.legal
-                    .cmp(&a.legal)
-                    .then_with(|| b.value.total_cmp(&a.value))
-                    .then_with(|| b.visits.cmp(&a.visits))
-                    .then_with(|| a.label.cmp(&b.label))
-            });
-        }
+        Self::apply_retrieval_prior_to_policy_actions(&mut ranked, retrieval_prior);
         Self::weighted_ranked_action_choice(&ranked, draw).or_else(|| {
             policy
                 .best_action_for_state_observation_with_prior(
@@ -3941,7 +4162,16 @@ impl SoccerMatch {
                     player.role,
                     SOCCER_POLICY_RANK_SALT_TEAM_NEURAL,
                 )
-                .or_else(|| self.exploration_action_for_player(policy, snapshot, player_id))
+                .or_else(|| {
+                    self.exploration_action_for_player(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                    )
+                })
                 .or_else(|| {
                     self.weighted_policy_action_for_player(
                         policy,
@@ -3976,7 +4206,16 @@ impl SoccerMatch {
             player.role,
             SOCCER_POLICY_RANK_SALT_SHARED_NEURAL,
         )
-        .or_else(|| self.exploration_action_for_player(learned_policy, snapshot, player_id))
+        .or_else(|| {
+            self.exploration_action_for_player(
+                learned_policy,
+                snapshot,
+                player_id,
+                mdp_state,
+                observation,
+                retrieval_prior,
+            )
+        })
         .or_else(|| {
             self.weighted_policy_action_for_player(
                 learned_policy,
@@ -4541,8 +4780,8 @@ impl SoccerMatch {
     }
 
     /// Opt-in exploration for the decision path. When a learning run explicitly enables ε,
-    /// choose among the ranked legal policy actions with the same top-rank distribution used by
-    /// live MDP/POMDP decisions: rank 1/2/3 at 70/20/10 when all three exist.
+    /// an independent deterministic gate occasionally samples among high-ranked legal policy
+    /// actions, nudging toward lower-visit candidates inside the plausible top-k set.
     ///
     /// Gating, by design:
     /// - Only active while `learning_enabled` is true. Realtime/4-controller
@@ -4551,18 +4790,30 @@ impl SoccerMatch {
     ///   and reproducible there).
     /// - ε defaults to 0 (`SoccerQPolicyOptions::exploration_epsilon`), so even
     ///   during a learning run nothing changes unless the run opts in. When enabled,
-    ///   it uses the deterministic match-seeded rank draw, keeping replays stable.
+    ///   both the ε gate and rank draw are deterministic and separately salted,
+    ///   keeping replays stable without biasing the rank distribution.
     fn exploration_action_for_player(
         &self,
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
         player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
     ) -> Option<SoccerPolicyActionChoice> {
         if !self.config.learning_enabled {
             return None;
         }
         let epsilon = soccer_q_sanitized_epsilon(policy.options.exploration_epsilon);
         if epsilon <= 0.0 {
+            return None;
+        }
+        let gate_draw = self.policy_rank_selection_draw(
+            snapshot,
+            player_id,
+            SOCCER_POLICY_EPSILON_SALT_EXPLORATION,
+        );
+        if !soccer_policy_epsilon_gate_allows(epsilon, gate_draw) {
             return None;
         }
         let (_state, ranked) = policy.ranked_action_values_for_snapshot(
@@ -4575,7 +4826,22 @@ impl SoccerMatch {
             player_id,
             SOCCER_POLICY_RANK_SALT_EXPLORATION,
         );
-        Self::weighted_ranked_action_choice(&ranked, draw)
+        let mut choice = soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, draw)?;
+        let fallback_probability = self.weighted_policy_action_probability_for_player(
+            policy,
+            snapshot,
+            player_id,
+            mdp_state,
+            observation,
+            retrieval_prior,
+            &choice.label,
+        );
+        choice.behavior_probability = soccer_policy_mixed_behavior_probability(
+            epsilon,
+            choice.behavior_probability,
+            fallback_probability,
+        );
+        Some(choice)
     }
 
     fn learned_policy_trace_for_player(
@@ -12711,14 +12977,23 @@ impl SoccerMatch {
                 if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
                     return 0.0;
                 }
-                let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
-                // Waive the 10yd minimum standoff close to our own goal (defend on the box, not
-                // a forced 10yd off the ball); the max still applies.
-                let min_gap = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
-                    0.0
+                let floor_depth = if ball_from_own_goal
+                    > DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS
+                {
+                    DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS
                 } else {
-                    DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
+                    ball_from_own_goal.max(BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS)
                 };
+                let gap_room_to_floor = (ball_from_own_goal - floor_depth).max(0.0);
+                let min_gap =
+                    if ball_from_own_goal < DEFENSIVE_LINE_FULL_CUSHION_DEPTH_FROM_OWN_GOAL_YARDS {
+                        gap_room_to_floor
+                    } else {
+                        DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(gap_room_to_floor)
+                    };
+                let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS
+                    .min(gap_room_to_floor)
+                    .max(min_gap);
                 let gap = ball_fwd - fwd(me.position);
                 urgency_for_error(role_layer_gap_band_error_yards(gap, min_gap, max_gap))
             }
@@ -27322,6 +27597,8 @@ impl WorldSnapshot {
             return Vec::new();
         };
         let me_position = self.player_snapshot_position(me);
+        let own_half = pass_origin_in_own_half(me.team, me_position, self.field_length);
+        let holder_pressure_for_tiny_pass = self.attacker_pressure_on_point(me.team, me_position);
         let directive = self.tactical_directive(me.team);
         let pass_target_learning =
             tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.30);
@@ -27381,6 +27658,19 @@ impl WorldSnapshot {
         // `long_backward_recycle_restricted`).
         let backward_recycle_restricted =
             self.long_backward_recycle_restricted(me.team, self.ball.position, me.id);
+        let own_half_progressive_floor_outlet_available = own_half
+            && self.players.iter().any(|p| {
+                if p.team != me.team || p.id == me.id || p.role == PlayerRole::Goalkeeper {
+                    return false;
+                }
+                let position = self.player_snapshot_position(p);
+                let forward = (position.y - me_position.y) * me.team.attack_dir();
+                let distance = me_position.distance(position);
+                forward >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
+                    && distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                    && (!visible_only || self.player_can_see_player(me.id, p.id))
+                    && self.pending_offside_for_pass(me.id, p.id).is_none()
+            });
         let mut ranked = self
             .players
             .iter()
@@ -27404,6 +27694,19 @@ impl WorldSnapshot {
                     .anticipated_pass_reception_point(me.id, p.id, PassFlight::Floor, nominal_speed)
                     .unwrap_or(position);
                 let forward = (anticipated_position.y - me_position.y) * me.team.attack_dir();
+                let receiver_distance = me_position.distance(position);
+                if own_half
+                    && own_half_progressive_floor_outlet_available
+                    && receiver_distance < OWN_HALF_TINY_PASS_MAX_YARDS
+                    && forward < OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS
+                {
+                    let receiver_pressure = self.attacker_pressure_on_point(me.team, position);
+                    if receiver_pressure
+                        > holder_pressure_for_tiny_pass - POINTLESS_SHORT_PASS_RELIEF_MARGIN
+                    {
+                        return None;
+                    }
+                }
                 if me.role == PlayerRole::Goalkeeper
                     && forward < -1.25
                     && !goalkeeper_backward_emergency_release_allowed(
@@ -27630,11 +27933,11 @@ impl WorldSnapshot {
                             )
                     })
                     .map(|(aim_point, anticipation_clear)| {
-                        (p, position, aim_point, anticipation_clear)
+                        (p, position, aim_point, anticipation_clear, receiver_distance)
                     })
             })
             .map(|p| {
-                let (p, position, pass_point, anticipation_clear) = p;
+                let (p, position, pass_point, anticipation_clear, receiver_distance) = p;
                 // Defender drifting into the lane (clear now, not for the whole flight):
                 // a penalty, not a veto — an open forward option can still win, but a safer
                 // ball is preferred when the scores are close.
@@ -27643,7 +27946,7 @@ impl WorldSnapshot {
                 // merely nudging away from them. Bumped 2.4->3.4 to cut intercepted/misplaced balls.
                 let anticipation_penalty = if anticipation_clear { 0.0 } else { 3.4 };
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
-                let dist = me_position.distance(position);
+                let dist = receiver_distance;
                 let support_fit = (dist - directive.support_depth_yards).abs();
                 let confidence = self
                     .player_position_confidence_for_point(me.id, position)
@@ -27804,6 +28107,24 @@ impl WorldSnapshot {
                 let forward_open_bonus = receiver_openness_for_score.clamp(0.0, 1.0)
                     * forward.clamp(0.0, 24.0)
                     * FORWARD_OPEN_PASS_BONUS_PER_YARD;
+                let progressive_floor_outlet_bonus = if forward
+                    >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
+                    && dist >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                {
+                    let distance_fit = quick_forward_pass_band_fit(dist);
+                    let upfield_fit = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+                    let quality_fit = (receiver_openness_for_score.clamp(0.0, 1.0) * 0.46
+                        + expected_completion_for_score.clamp(0.0, 1.0) * 0.32
+                        + pass_quality.stride_fit.clamp(0.0, 1.0) * 0.12
+                        + upfield_fit * 0.10)
+                        .clamp(0.0, 1.0);
+                    distance_fit
+                        * quality_fit
+                        * PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS
+                        * if own_half { 1.35 } else { 1.0 }
+                } else {
+                    0.0
+                };
                 // Exploit a wing overload: reward a receiver on the flank where we outnumber
                 // the opponent (computed once in the header) so the ball goes to the
                 // overloaded wing rather than being bypassed by a long ball.
@@ -27980,6 +28301,7 @@ impl WorldSnapshot {
                     + over_the_top_invite_bonus * goal_entry_pass_learning
                     + own_box_play_out_adjustment
                     + forward_open_bonus * pass_target_learning
+                    + progressive_floor_outlet_bonus * pass_target_learning
                     + wing_overload_bonus * pass_target_learning
                     + pass_length_bonus * pass_target_learning
                     + keeper_outlet_bonus
@@ -34381,6 +34703,70 @@ impl WorldSnapshot {
         (baseline_seconds.max(1e-6) / horizon).clamp(0.75, 1.0)
     }
 
+    fn defensive_line_band_bounds_fwd(
+        &self,
+        team: Team,
+        offside_suspended: bool,
+    ) -> (f64, f64, f64, f64, f64) {
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let field_length = self.field_length.max(1.0);
+        let ball_depth = (ball_fwd - own_goal_fwd).clamp(0.0, field_length);
+        let predicted_fwd = self
+            .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
+            .y
+            * attack;
+        let predicted_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, field_length);
+        let opp_half_ceiling_fwd = own_goal_fwd
+            + self.field_length * 0.5
+            + tunables()
+                .defensive_shape
+                .defensive_line_max_into_opp_half_yards;
+        let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_depth);
+        if offside_suspended {
+            let min_gap = NO_OFFSIDE_RESTART_DROP_OFF_YARDS.min(max_gap);
+            let deepest_fwd = predicted_fwd - max_gap;
+            let shallowest_fwd = (ball_fwd - min_gap).min(opp_half_ceiling_fwd);
+            return (
+                deepest_fwd.min(shallowest_fwd),
+                shallowest_fwd,
+                min_gap,
+                max_gap,
+                predicted_fwd,
+            );
+        }
+
+        let threat_depth = ball_depth.min(predicted_depth);
+        let shelf_depth = DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS;
+        let floor_depth = if threat_depth > shelf_depth {
+            shelf_depth
+        } else {
+            threat_depth.max(BACK_FOUR_SIX_YARD_LINE_FLOOR_YARDS)
+        };
+        let gap_room_to_floor = (ball_depth - floor_depth).max(0.0);
+        let min_gap = if threat_depth <= shelf_depth
+            || ball_depth < DEFENSIVE_LINE_FULL_CUSHION_DEPTH_FROM_OWN_GOAL_YARDS
+        {
+            gap_room_to_floor
+        } else {
+            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(gap_room_to_floor)
+        };
+        let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS
+            .min(gap_room_to_floor)
+            .max(min_gap);
+        let shelf_fwd = own_goal_fwd + floor_depth;
+        let deepest_fwd = (predicted_fwd - max_gap).max(shelf_fwd);
+        let shallowest_fwd = (ball_fwd - min_gap).min(opp_half_ceiling_fwd);
+        (
+            deepest_fwd.min(shallowest_fwd),
+            shallowest_fwd,
+            min_gap,
+            max_gap,
+            predicted_fwd,
+        )
+    }
+
     /// Keep the back four's AVERAGE y-position in its band relative to the ball (see the
     /// `DEFENSIVE_LINE_*` constants). For a defender's off-ball move, shifts its target along the
     /// attacking axis by the correction the full back-four average needs, so the whole line
@@ -34477,40 +34863,14 @@ impl WorldSnapshot {
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return target;
         }
-        // THE RULE (simple, no regimes): the back four's AVERAGE sits 10-30yd behind
-        // (goal-side of) the ball — always, in or out of possession. Exceptions:
-        // (1) inside our own 20yd emergency zone, and
-        // (2) the back four may not press more than 5yd into the opponent half, so
-        // a high ball may leave the line more than 30yd behind by design.
-        let defensive_line_bias = tactical_learning_weight_bias(
-            self.tactical_directive(me.team)
-                .defensive_line_press_learning_weight,
-        );
-        let learned_max_behind =
-            (DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS - defensive_line_bias * 4.0).clamp(20.0, 34.0);
-        let max_behind = learned_max_behind.min(ball_from_own_goal);
-        // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
-        // 10yd off the ball); the max still applies.
-        let min_behind = if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
-            0.0
-        } else {
-            (DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS - defensive_line_bias * 2.0)
-                .clamp(6.0, 13.0)
-                .min(max_behind)
-        };
-        // 5yd-into-the-opponents'-half ceiling (in attack-forward coords). The halfway
-        // line sits exactly field_length/2 forward of our own goal.
-        let opp_half_ceiling_fwd = own_goal_fwd
-            + self.field_length * 0.5
-            + tunables()
-                .defensive_shape
-                .defensive_line_max_into_opp_half_yards
-            + defensive_line_bias * 2.0;
-        // Upper bound = nearer of "10yd behind the ball" and the opp-half ceiling; pin the
-        // lower bound at/under it so a ball deep upfield can't invert the band (the
-        // ceiling wins — bulletproof, never panics on lower > upper).
-        let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
-        let lower = (ball_fwd - max_behind).min(upper);
+        // The average line lives at the intersection of the 15yd shelf and the 20-40yd
+        // ball cushion. At 15-35yd out this compresses onto the shelf; past 35yd the
+        // 20yd near edge opens up; past 55yd the full 20-40 band is available. The
+        // opponent-half ceiling wins when a very high ball would otherwise pull the
+        // line beyond 5yd into the opponent half.
+        let offside_suspended = self.offside_currently_suspended();
+        let (lower, upper, _, _, _) =
+            self.defensive_line_band_bounds_fwd(me.team, offside_suspended);
         let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
@@ -34547,7 +34907,7 @@ impl WorldSnapshot {
         // sets the TARGET only; the player then JOGS onto the line over ~3s (the movement grace,
         // `DEFENSIVE_LINE_GRACE_JOG_YARDS`), so a defender caught out of line eases level (eventual
         // consistency) rather than teleporting. The band AVERAGE correction below still slides the
-        // whole flat line to the legal 10-30yd gap. When WE genuinely control the ball the clamp
+        // whole flat line to the legal shelf/cushion band. When WE genuinely control the ball the clamp
         // lifts entirely (a centre-back may step into midfield, a full-back overlap and bomb on) —
         // offside doesn't apply to us, and we key on CONTROLLED possession (an actual holder), not
         // last-touch, so a 50/50 we last brushed still forms up flat.
@@ -40327,11 +40687,11 @@ impl WorldSnapshot {
     }
 
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
-    /// connected: 10-30 yards behind the ball (measured to where the ball is HEADED, so the line
-    /// retreats early on a fast break). Exceptions: the designated ball-presser is left alone (it
-    /// has stepped out of the line to contest); the band is fully suspended inside the team's own
-    /// 5-yard emergency zone; and within 20yd of our own goal the 10yd minimum standoff is waived
-    /// (the line may sit level with the ball on top of the box, just not ahead of it).
+    /// connected: a 15yd shelf near our own box, opening into a 20-40yd cushion once the ball is
+    /// at least 35yd from goal (measured to where the ball is HEADED, so the line retreats early
+    /// on a fast break). Exceptions: the designated ball-presser is left alone; the band is fully
+    /// suspended inside the team's own 5-yard emergency zone; and inside the shelf the line may
+    /// retreat with the ball until the six-yard sticky floor takes over.
     fn defender_line_band_average_adjusted_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         let attack = me.team.attack_dir();
         let ball_fwd = self.ball.position.y * attack;
@@ -40351,38 +40711,14 @@ impl WorldSnapshot {
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return compact_y;
         }
-        let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         // No offside in force (the ball is being played directly from a throw-in &c.): the line
         // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
         // into a deep block, sitting at least NO_OFFSIDE_RESTART_DROP_OFF_YARDS behind the ball
         // (capped by the max gap and by room to our own goal). The flat-line trap clamp below is
         // likewise meaningless and is lifted for the window.
         let offside_suspended = self.offside_currently_suspended();
-        // Waive the 10yd minimum standoff close to our own goal (defend on the box, not a forced
-        // 10yd off the ball); the max still applies.
-        let min_gap = if offside_suspended {
-            NO_OFFSIDE_RESTART_DROP_OFF_YARDS.min(max_gap)
-        } else if ball_from_own_goal < DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS {
-            0.0
-        } else {
-            DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS.min(max_gap)
-        };
-        // Lower bound of the gap: stay goal-side of the ball by the hard 10yd floor — measured to
-        // where the ball is HEADED (lookahead), so a fast carrier driving at the line pulls the
-        // back four back BEFORE he arrives. Upper bound: no more than 30yd behind the headed ball.
-        let predicted_fwd = self
-            .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
-            .y
-            * attack;
-        let deepest_fwd = predicted_fwd - max_gap; // floor: ≤ max_gap behind headed ball
-        let preferred_halfway_cap_fwd =
-            own_goal_fwd + self.field_length * 0.5 + DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS;
-        let required_halfway_cap_fwd = predicted_fwd - max_gap;
-        let halfway_cap_fwd = preferred_halfway_cap_fwd.max(required_halfway_cap_fwd);
-        let shallowest_fwd = (ball_fwd - min_gap).min(halfway_cap_fwd);
-        // Keep the band valid if the two bounds cross (e.g. ball very deep): the
-        // "don't sit level" ceiling wins so the line never overruns the ball.
-        let deepest_fwd = deepest_fwd.min(shallowest_fwd);
+        let (deepest_fwd, shallowest_fwd, _, max_gap, predicted_fwd) =
+            self.defensive_line_band_bounds_fwd(me.team, offside_suspended);
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
         // Offside line flatness: when DEFENDING, no defender may stand AHEAD of the back-four line
         // (toward the attackers) by more than half of BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS — that is
@@ -40390,7 +40726,7 @@ impl WorldSnapshot {
         // ASYMMETRIC: a defender may always drop DEEPER (goal-side) to cover or to retreat onto a
         // break — extra depth never breaks the offside line (the second-rearmost defender still
         // sets it). The reference is the band-corrected line CENTRE (`avg.clamp(band)`), not the
-        // raw average, so the whole flat line still slides to the legal 10-30yd gap as a unit. A
+        // raw average, so the whole flat line still slides to the legal shelf/cushion band. A
         // defender that has stepped OUT of the line to do a job — the designated presser or a
         // live-ball / pass-lane attacker — is excluded from both the centre and the clamp. This
         // sets the TARGET only; the player jogs onto the line over ~3s (the movement grace), so a
@@ -40920,7 +41256,7 @@ impl WorldSnapshot {
     pub fn defensive_assignment_for(&self, player_id: usize, home: Vec2, roam: bool) -> Vec2 {
         let target = self.defensive_assignment_for_unclamped(player_id, home, roam);
         // Final back-four band clamp: the blend toward a marked opponent / the candidate search
-        // can re-deepen the line past the zone target, so enforce the connected 10-30yd-behind-ball
+        // can re-deepen the line past the zone target, so enforce the connected shelf/cushion
         // rule on the FINAL assignment for defenders too.
         match self.players.iter().find(|p| p.id == player_id) {
             Some(me) if me.role == PlayerRole::Defender => {
@@ -41560,20 +41896,66 @@ impl WorldSnapshot {
             .clamp_to_pitch(self.field_width, self.field_length)
     }
 
-    fn target_lands_on_opponent(&self, player: &PlayerSnapshot, target: Vec2) -> bool {
+    fn target_opponent_mark_for(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> Option<(usize, Vec2)> {
         self.players
             .iter()
             .filter(|p| p.team == player.team.other())
-            .any(|p| {
-                self.player_snapshot_position(p).distance(target) <= CROSS_THROUGH_MARK_RADIUS_YARDS
+            .filter_map(|p| {
+                let position = self.player_snapshot_position(p);
+                let distance = position.distance(target);
+                (distance <= CROSS_THROUGH_MARK_RADIUS_YARDS)
+                    .then_some((p.id, position, distance))
             })
+            .min_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)))
+            .map(|(id, position, _)| (id, position))
+    }
+
+    fn target_lands_on_opponent(&self, player: &PlayerSnapshot, target: Vec2) -> bool {
+        self.target_opponent_mark_for(player, target).is_some()
+    }
+
+    fn teammate_spacing_mark_exemption_applies(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> bool {
+        let Some((_opponent_id, opponent_position)) = self.target_opponent_mark_for(player, target)
+        else {
+            return false;
+        };
+        let defending = self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team())
+            == Some(player.team.other());
+        if !defending || !matches!(player.role, PlayerRole::Defender | PlayerRole::Midfielder) {
+            return true;
+        }
+        self.players
+            .iter()
+            .filter(|candidate| {
+                candidate.team == player.team && candidate.role != PlayerRole::Goalkeeper
+            })
+            .min_by(|a, b| {
+                self.lane_biased_player_target_score(a, opponent_position, 1.10)
+                    .total_cmp(&self.lane_biased_player_target_score(
+                        b,
+                        opponent_position,
+                        1.10,
+                    ))
+                    .then(a.id.cmp(&b.id))
+            })
+            .is_some_and(|primary| primary.id == player.id)
     }
 
     fn teammate_spacing_path_adjusted_target(&self, player: &PlayerSnapshot, target: Vec2) -> Vec2 {
         if player.role == PlayerRole::Goalkeeper || self.active_set_play.is_some() {
             return target;
         }
-        if self.target_lands_on_opponent(player, target) {
+        if self.teammate_spacing_mark_exemption_applies(player, target) {
             return target;
         }
         let current = finite_pitch_point(

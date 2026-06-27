@@ -1900,26 +1900,22 @@ const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
-// along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line 10-30yd goal-side of the ball. The LP/formation nudge shifts the whole line to
-// restore the band. Near our own goal the band is relaxed (the minimum standoff is waived within
-// 20yd so the line may sit level with the ball on top of the box) and fully suspended inside the
-// team's own emergency 5-yard goal-line zone where parity with the ball is allowed.
+// along the attacking axis; the line normally sits BEHIND the ball). Past the 15+20yd shelf the
+// line holds 20-40yd goal-side of the ball. From 15-35yd out, that band compresses onto the
+// 15-yard line unless the ball is already behind it or clearly headed there; inside 6yd the
+// six-yard sticky floor takes over because the keeper controls the space behind it.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// THE rule: the back four's average sits 10-30yd behind (goal-side of) the ball, always,
-// outside the near-goal relaxation below. The deep edge (30) matches the emergency break-cover
-// cap `DEFENSIVE_MAX_BEHIND_BALL_YARDS`, so a line-break retreat is never clamped shallower than
-// the cover it is trying to provide. (Tournament genomes permute the min/max within this band.)
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 10.0;
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
-// ...but the 10yd MINIMUM standoff is waived once the ball is this close to our own goal:
-// defending on top of our own box we hold level with / goal-side of the ball rather than
-// being forced a full 10yd off it (which would shove the line into the six-yard box / off
-// the end-line). The 30yd maximum (capped by room to our own goal) still applies.
-const DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS: f64 = 20.0;
+// THE rule: the back four's average sits 20-40yd behind (goal-side of) the ball once
+// the ball is far enough upfield. The 15yd shelf below prevents that cushion from
+// dragging the whole line too deep around the top of the box.
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 20.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 40.0;
+const DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS: f64 = 15.0;
+const DEFENSIVE_LINE_FULL_CUSHION_DEPTH_FROM_OWN_GOAL_YARDS: f64 =
+    DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS + DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS;
 // When the offside law is NOT in force — the ball is being played DIRECTLY from a throw-in (the
 // common case), goal kick, or corner kick (Law 11) — the back four cannot hold a high offside
 // trap: an attacker may legally lurk goal-side of the line, so trapping leaves a runner free in
@@ -1939,16 +1935,14 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
-// The back-four band is FULLY suspended only inside the defending team's own 5-yard emergency
-// zone (a ball on the goal-line may be played at parity rather than forcing the line off the
-// end-line). Between there and DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS the band still holds,
-// but with its minimum standoff relaxed (the line may sit level with the ball, just not ahead).
+// The back-four band is fully suspended only inside the defending team's own 5-yard emergency
+// zone. Above that, the 15yd shelf holds until the ball crosses it or is clearly headed under it.
 const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 5.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
 // the tighter in-possession cap.
-const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
+const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 40.0;
 // Offside line flatness: when defending, the back four holds a FLAT line so it presents a clean
 // offside trap — the total fore-aft (along-attacking-axis) spread between the four is kept within
 // this many yards (each defender within ±half of it of the line average). Eased toward level over
@@ -1999,8 +1993,6 @@ const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
 const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
 const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
 const SHAPE_CONSISTENCY_FAR_SECONDS: f64 = 5.0;
-// In possession the line may push up, but no more than ~5yd past the halfway line.
-const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
 // project the ball forward by this many seconds (position + velocity + accel + jerk)
 // and never sit more than the not-in-possession max gap behind that predicted point.
