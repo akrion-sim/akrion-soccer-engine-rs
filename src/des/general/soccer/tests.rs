@@ -29705,6 +29705,154 @@ fn q_policy_trains_from_learning_episode() {
     assert_eq!(policy.entries().len(), policy.q_values.len());
 }
 
+fn outcome_credit_test_transition(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    team: Team,
+    tick: u64,
+    before_y: f64,
+    after_y: f64,
+    final_score_diff_home: i32,
+    reward: f64,
+) -> SoccerLearningTransition {
+    let observation = snapshot.observation_for(player_id);
+    let mut state = snapshot.mdp_state_for_player(player_id);
+    state.tick = tick;
+    state.ball_grid = pitch_grid_address(
+        Vec2::new(DEFAULT_FIELD_WIDTH_YARDS * 0.5, before_y),
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    state.ball_zone_x = state.ball_grid.tactical.x;
+    state.ball_zone_y = state.ball_grid.tactical.y;
+    state.possession_team = Some(team);
+    state.score_diff_for_home = 0;
+
+    let mut next_state = state.clone();
+    next_state.tick = tick.saturating_add(1);
+    next_state.ball_grid = pitch_grid_address(
+        Vec2::new(DEFAULT_FIELD_WIDTH_YARDS * 0.5, after_y),
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    next_state.ball_zone_x = next_state.ball_grid.tactical.x;
+    next_state.ball_zone_y = next_state.ball_grid.tactical.y;
+    next_state.score_diff_for_home = final_score_diff_home;
+
+    SoccerLearningTransition {
+        tick,
+        player_id,
+        team,
+        role: snapshot.players[player_id].role,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "hold".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward,
+        next_state,
+        next_observation: observation,
+        done: false,
+    }
+}
+
+#[test]
+fn full_game_replay_default_keeps_correlated_dense_reward_path() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let transition =
+        outcome_credit_test_transition(&snapshot, 1, Team::Home, 1, 40.0, 60.0, 1, 9.0);
+
+    let replay = soccer_full_game_replay_transitions_with_outcome_credit(&[transition], false);
+
+    assert_eq!(replay.len(), 1);
+    assert!((replay[0].reward - 9.0).abs() < 1e-9);
+    assert!(replay[0].done);
+}
+
+#[test]
+fn outcome_credit_replay_uses_match_result_not_dense_reward_size() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let home = outcome_credit_test_transition(&snapshot, 1, Team::Home, 1, 40.0, 60.0, 1, 999.0);
+    let away = outcome_credit_test_transition(&snapshot, 12, Team::Away, 2, 60.0, 50.0, 1, 0.0);
+
+    let replay = soccer_full_game_replay_transitions_with_outcome_credit(&[home, away], true);
+    let home_reward = replay
+        .iter()
+        .find(|transition| transition.team == Team::Home)
+        .expect("home transition")
+        .reward;
+    let away_reward = replay
+        .iter()
+        .find(|transition| transition.team == Team::Away)
+        .expect("away transition")
+        .reward;
+
+    assert!(home_reward > 0.0, "home win should credit home: {home_reward}");
+    assert!(away_reward < 0.0, "home win should debit away: {away_reward}");
+    assert!(
+        home_reward.abs() < 999.0 && away_reward.abs() < 999.0,
+        "outcome-credit mode must not preserve giant dense proxy rewards: home={home_reward} away={away_reward}"
+    );
+}
+
+#[test]
+fn outcome_credit_replay_preserves_bounded_short_term_quasi_wins() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass_chain = outcome_credit_test_transition(
+        &snapshot,
+        1,
+        Team::Home,
+        1,
+        60.0,
+        60.0,
+        0,
+        PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS,
+    );
+    let capped_dense_proxy =
+        outcome_credit_test_transition(&snapshot, 1, Team::Home, 2, 60.0, 60.0, 0, 999.0);
+
+    let pass_chain_replay =
+        soccer_full_game_replay_transitions_with_outcome_credit(&[pass_chain], true);
+    let capped_replay =
+        soccer_full_game_replay_transitions_with_outcome_credit(&[capped_dense_proxy], true);
+
+    assert_eq!(pass_chain_replay.len(), 1);
+    assert!(
+        (pass_chain_replay[0].reward - PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS).abs() < 1e-9,
+        "2+ forward pass-chain reward should survive outcome credit replay: {}",
+        pass_chain_replay[0].reward
+    );
+    assert_eq!(capped_replay.len(), 1);
+    assert!(
+        (capped_replay[0].reward - SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP).abs() < 1e-9,
+        "dense proxy reward should be capped to the milestone ladder: {}",
+        capped_replay[0].reward
+    );
+}
+
+#[test]
+fn outcome_credit_pitch_value_shaping_telescopes_on_returning_path() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let advance =
+        outcome_credit_test_transition(&snapshot, 1, Team::Home, 1, 35.0, 85.0, 0, 0.0);
+    let retreat =
+        outcome_credit_test_transition(&snapshot, 1, Team::Home, 2, 85.0, 35.0, 0, 0.0);
+
+    let replay = soccer_full_game_replay_transitions_with_outcome_credit(&[advance, retreat], true);
+    let total_reward = replay.iter().map(|transition| transition.reward).sum::<f64>();
+
+    assert!(
+        total_reward.abs() < 1e-9,
+        "PBRS xT shaping should telescope on a returning draw path, got {total_reward}"
+    );
+}
+
 #[test]
 fn anti_bunchball_keeps_field_players_off_the_ball_cluster() {
     // Over a full match, no side should ever swarm the ball outside the boxes:
@@ -34338,6 +34486,16 @@ fn neural_learning_config_sanitizes_unstable_fast_learning_knobs() {
         config.sanitized_learning_rate(),
         MAX_SOCCER_NEURAL_LEARNING_RATE
     );
+    for bad_rate in [0.0, -1.0, f64::NAN] {
+        let config = SoccerNeuralLearningConfig {
+            learning_rate: bad_rate,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        assert_eq!(
+            config.sanitized_learning_rate(),
+            DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+        );
+    }
     assert_eq!(config.sanitized_batch_size(), MAX_SOCCER_NEURAL_BATCH_SIZE);
     assert_eq!(
         config.sanitized_max_batches_per_tick(),
@@ -81221,8 +81379,13 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
         corpus.push(sample(1.0, true));
         corpus.push(sample(0.0, false));
     }
-    let report = report_soccer_pass_completion_training(&corpus, 7, 300, 0.05)
-        .expect("a non-empty corpus should train a head");
+    let report = report_soccer_pass_completion_training(
+        &corpus,
+        7,
+        300,
+        DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    )
+    .expect("a non-empty corpus should train a head");
     assert_eq!(report.samples, corpus.len());
     assert_eq!(report.epochs, 300);
     assert!(report.training_steps > 0);
@@ -81231,8 +81394,21 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
         "a head trained on the loaded corpus should fit the separable pattern: acc={}",
         report.accuracy
     );
+    for bad_rate in [f64::NAN, -1.0, 10_000.0] {
+        let report = report_soccer_pass_completion_training(&corpus, 7, 2, bad_rate)
+            .expect("standalone pass-completion training should sanitize bad rates");
+        assert!(report.training_steps > 0);
+        assert!(report.final_loss.is_finite());
+        assert!(report.accuracy.is_finite());
+    }
     // An empty corpus (nothing persisted yet) trains nothing rather than persisting a random net.
-    assert!(report_soccer_pass_completion_training(&[], 7, 300, 0.05).is_none());
+    assert!(report_soccer_pass_completion_training(
+        &[],
+        7,
+        300,
+        DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    )
+    .is_none());
 }
 
 #[test]

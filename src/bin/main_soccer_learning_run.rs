@@ -22,9 +22,9 @@ use soccer_engine::des::general::soccer::{
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
     SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
-    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
-    ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
-    LongPassRunHead, LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
+    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, LongPassRunHead,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -3165,7 +3165,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         let pass_corpus_limit = env_usize("SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT", 0)?;
         if pass_corpus_limit > 0 {
             let epochs = env_usize("SOCCER_PG_PASS_COMPLETION_EPOCHS", 8)?;
-            let learning_rate = env_f64("SOCCER_PG_PASS_COMPLETION_LR", 0.05)?;
+            let learning_rate = env_f64(
+                "SOCCER_PG_PASS_COMPLETION_LR",
+                DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+            )?;
             match store.load_pass_outcome_samples(&experiment_id, pass_corpus_limit as i64) {
                 Ok(samples) => {
                     // Seed the carried pass-completion head from the accumulated cross-game

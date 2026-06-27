@@ -4227,6 +4227,7 @@ const TEAM_BALL_RING_TIGHT_YARDS: f64 = 1.0;
 const TEAM_BALL_RING_CLOSE_YARDS: f64 = 3.0;
 const TEAM_BALL_RING_NEAR_YARDS: f64 = 5.0;
 const DEFAULT_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.015;
+pub const DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE: f64 = 0.05;
 const DEFAULT_SOCCER_NEURAL_BATCH_SIZE: usize = 16;
 const DEFAULT_SOCCER_NEURAL_TRAIN_EVERY_TICKS: usize = secs_to_ticks(0.4) as usize;
 const DEFAULT_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 2;
@@ -4308,7 +4309,7 @@ const SOCCER_SKILL_POLICY_DECISION_WEIGHT: f64 = 0.4;
 const SOCCER_WORLD_MODEL_HIDDEN_UNITS: usize = 64;
 const SOCCER_WORLD_MODEL_LEARNING_RATE: f64 = 0.02;
 const SOCCER_WORLD_MODEL_GRAD_CLIP_NORM: f64 = 8.0;
-const MAX_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.25;
+pub const MAX_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.25;
 const MAX_SOCCER_NEURAL_BATCH_SIZE: usize = 1024;
 const MAX_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 16;
 const MAX_SOCCER_NEURAL_HIDDEN_UNITS: usize = 256;
@@ -4319,6 +4320,9 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 250.0;
+const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
+const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
+const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 
 // --- Terminal won-game reward (the "long" rung of the quasi-win ladder) ---------
 // The short-horizon quasi-wins are already priced: a 2+ forward-pass combo
@@ -4535,6 +4539,19 @@ fn default_neural_learning_config() -> SoccerNeuralLearningConfig {
 
 fn default_soccer_neural_learning_rate() -> f64 {
     DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+}
+
+pub fn soccer_sanitized_learning_rate(learning_rate: f64, fallback_learning_rate: f64) -> f64 {
+    let fallback = if fallback_learning_rate.is_finite() && fallback_learning_rate > 0.0 {
+        fallback_learning_rate.min(MAX_SOCCER_NEURAL_LEARNING_RATE)
+    } else {
+        DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+    };
+    if learning_rate.is_finite() && learning_rate > 0.0 {
+        learning_rate.min(MAX_SOCCER_NEURAL_LEARNING_RATE)
+    } else {
+        fallback
+    }
 }
 
 fn default_soccer_neural_batch_size() -> usize {
@@ -11656,17 +11673,23 @@ struct MatchOutcomeReward {
 
 impl MatchOutcomeReward {
     fn from_score(home_goals: u32, away_goals: u32) -> Self {
-        let margin = (f64::from(home_goals) - f64::from(away_goals)).abs();
+        let score_diff_home = i64::from(home_goals) - i64::from(away_goals);
+        Self::from_home_score_diff(score_diff_home)
+    }
+
+    fn from_home_score_diff(score_diff_home: i64) -> Self {
+        let margin = score_diff_home.abs() as f64;
         let margin_bonus = MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS
             * (margin - 1.0).clamp(0.0, MATCH_OUTCOME_MARGIN_CAP_GOALS - 1.0);
-        let (home, away) = match home_goals.cmp(&away_goals) {
+        let magnitude = MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus;
+        let (home, away) = match score_diff_home.cmp(&0) {
             std::cmp::Ordering::Greater => (
-                MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus,
-                -(MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus),
+                magnitude,
+                -magnitude,
             ),
             std::cmp::Ordering::Less => (
-                -(MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus),
-                MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus,
+                -magnitude,
+                magnitude,
             ),
             std::cmp::Ordering::Equal => {
                 (MATCH_OUTCOME_DRAW_REWARD_POINTS, MATCH_OUTCOME_DRAW_REWARD_POINTS)
@@ -11683,6 +11706,19 @@ impl MatchOutcomeReward {
     }
 }
 
+fn dd_soccer_enable_outcome_credit() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(DD_SOCCER_OUTCOME_CREDIT_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_OUTCOME_CREDIT_ENV))
+    }
+}
+
 /// Env flag for the terminal won-game reward broadcast in
 /// `soccer_full_game_replay_transitions`. Off ⇒ `match_outcome` is `None` and the
 /// replay is byte-identical to the shaped-reward-only behaviour. Read once per
@@ -11690,17 +11726,45 @@ impl MatchOutcomeReward {
 pub fn match_outcome_reward_enabled() -> bool {
     #[cfg(test)]
     {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD")
+        dd_soccer_enable_outcome_credit()
+            || soccer_env_flag_enabled(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
     }
     #[cfg(not(test))]
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD"))
+        *ENABLED.get_or_init(|| {
+            dd_soccer_enable_outcome_credit()
+                || soccer_env_flag_enabled(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
+        })
     }
 }
 
 fn soccer_full_game_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+    match_outcome: Option<MatchOutcomeReward>,
+) -> Vec<SoccerLearningTransition> {
+    if dd_soccer_enable_outcome_credit() {
+        let outcome = match_outcome.or_else(|| soccer_outcome_match_reward_from_transitions(transitions));
+        return soccer_outcome_credit_replay_transitions(transitions, outcome);
+    }
+    soccer_correlated_full_game_replay_transitions(transitions, match_outcome)
+}
+
+fn soccer_full_game_replay_transitions_with_outcome_credit(
+    transitions: &[SoccerLearningTransition],
+    outcome_credit: bool,
+) -> Vec<SoccerLearningTransition> {
+    if outcome_credit {
+        return soccer_outcome_credit_replay_transitions(
+            transitions,
+            soccer_outcome_match_reward_from_transitions(transitions),
+        );
+    }
+    soccer_correlated_full_game_replay_transitions(transitions, None)
+}
+
+fn soccer_correlated_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
 ) -> Vec<SoccerLearningTransition> {
@@ -11777,6 +11841,113 @@ fn soccer_full_game_replay_transitions(
     }
     replay.reverse();
     replay
+}
+
+fn soccer_outcome_credit_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+    match_outcome: Option<MatchOutcomeReward>,
+) -> Vec<SoccerLearningTransition> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = (0..transitions.len()).collect();
+    indices.sort_by_key(|&idx| (transitions[idx].tick, idx));
+
+    let mut replay = Vec::with_capacity(transitions.len());
+    for idx in indices {
+        let mut transition = transitions[idx].clone();
+        let outcome_reward = match_outcome
+            .map(|outcome| outcome.for_team(transition.team))
+            .unwrap_or(0.0);
+        let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
+        let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
+        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
+            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.done = true;
+        replay.push(transition);
+    }
+    replay
+}
+
+fn soccer_outcome_credit_milestone_reward(transition: &SoccerLearningTransition) -> f64 {
+    // Keep bounded short-term quasi-wins already folded into the transition reward:
+    // pass chains, defender-beating dribbles, shots on target, and goals.
+    finite_metric(transition.reward)
+        .max(0.0)
+        .min(SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP)
+}
+
+fn soccer_outcome_match_reward_from_transitions(
+    transitions: &[SoccerLearningTransition],
+) -> Option<MatchOutcomeReward> {
+    let mut latest: Option<(u64, usize, i32)> = None;
+    for (idx, transition) in transitions.iter().enumerate() {
+        let candidate = (transition.tick, idx, transition.next_state.score_diff_for_home);
+        if latest
+            .map(|current| (candidate.0, candidate.1) > (current.0, current.1))
+            .unwrap_or(true)
+        {
+            latest = Some(candidate);
+        }
+    }
+    latest.map(|(_, _, score_diff)| MatchOutcomeReward::from_home_score_diff(i64::from(score_diff)))
+}
+
+fn soccer_outcome_credit_pitch_value_shaping(transition: &SoccerLearningTransition) -> f64 {
+    let scale = tunables().reward.pitch_value_threat_delta_points;
+    if scale <= 0.0 || !scale.is_finite() {
+        return 0.0;
+    }
+    let before = soccer_replay_pitch_value_potential(&transition.state, transition.team);
+    let after = soccer_replay_pitch_value_potential(&transition.next_state, transition.team);
+    potential_based_shaping(1.0, before, after) * scale
+}
+
+fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f64 {
+    let Some(possession_team) = state.possession_team else {
+        return 0.0;
+    };
+    let point = soccer_replay_ball_grid_center(state);
+    let threat = expected_threat(
+        possession_team,
+        point,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    if possession_team == team {
+        threat
+    } else {
+        -threat
+    }
+}
+
+fn soccer_replay_ball_grid_center(state: &SoccerMdpState) -> Vec2 {
+    let cell = if state.ball_grid.fine.columns > 1 || state.ball_grid.fine.rows > 1 {
+        state.ball_grid.fine
+    } else if state.ball_grid.tactical.columns > 1 || state.ball_grid.tactical.rows > 1 {
+        state.ball_grid.tactical
+    } else {
+        let columns = PITCH_TACTICAL_GRID_COLUMNS.max(1);
+        let rows = PITCH_TACTICAL_GRID_ROWS.max(1);
+        PitchGridCell {
+            level: PitchGridLevel::Tactical,
+            columns,
+            rows,
+            x: state.ball_zone_x.min(columns - 1),
+            y: state.ball_zone_y.min(rows - 1),
+            id: state.ball_zone_y.min(rows - 1) * columns + state.ball_zone_x.min(columns - 1),
+            parent_id: Some(0),
+        }
+    };
+    let columns = cell.columns.max(1);
+    let rows = cell.rows.max(1);
+    let x = cell.x.min(columns - 1);
+    let y = cell.y.min(rows - 1);
+    Vec2::new(
+        (x as f64 + 0.5) * DEFAULT_FIELD_WIDTH_YARDS / columns as f64,
+        (y as f64 + 0.5) * DEFAULT_FIELD_LENGTH_YARDS / rows as f64,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15070,12 +15241,7 @@ impl SoccerNeuralLearningConfig {
     }
 
     fn sanitized_learning_rate(&self) -> f64 {
-        if self.learning_rate.is_finite() {
-            self.learning_rate
-                .clamp(0.0, MAX_SOCCER_NEURAL_LEARNING_RATE)
-        } else {
-            DEFAULT_SOCCER_NEURAL_LEARNING_RATE
-        }
+        soccer_sanitized_learning_rate(self.learning_rate, DEFAULT_SOCCER_NEURAL_LEARNING_RATE)
     }
 
     fn sanitized_critic_baseline_weight(&self) -> f64 {
@@ -32456,6 +32622,8 @@ pub fn train_soccer_pass_completion_head(
     if usable == 0 || epochs == 0 {
         return None;
     }
+    let learning_rate =
+        soccer_sanitized_learning_rate(learning_rate, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE);
     let mut head = SoccerPassCompletionHead::new(seed);
     let mut final_loss = 0.0;
     for _ in 0..epochs {
