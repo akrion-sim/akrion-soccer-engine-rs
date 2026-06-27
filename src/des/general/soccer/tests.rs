@@ -82196,4 +82196,107 @@ fn shot_trigger_training_pass_reports_convergence_and_shot_distances() {
             buckets
         );
     }
+
+}
+
+// ---- Terminal won-game reward (the "long" rung of the quasi-win ladder) ----
+
+#[test]
+fn match_outcome_reward_is_zero_sum_with_capped_margin() {
+    // 1-0: base win reward, no margin bonus (margin 1 ⇒ 0 extra).
+    let one_nil = MatchOutcomeReward::from_score(1, 0);
+    assert!((one_nil.home - MATCH_OUTCOME_WIN_REWARD_POINTS).abs() < 1e-9);
+    assert!((one_nil.home + one_nil.away).abs() < 1e-9, "zero-sum");
+
+    // 3-0: +2 goals over the win margin ⇒ 2× per-goal bonus.
+    let three_nil = MatchOutcomeReward::from_score(3, 0);
+    let expected = MATCH_OUTCOME_WIN_REWARD_POINTS + 2.0 * MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS;
+    assert!((three_nil.home - expected).abs() < 1e-9);
+    assert!(three_nil.away < 0.0 && (three_nil.home + three_nil.away).abs() < 1e-9);
+
+    // A blowout is capped: the bonus saturates at MARGIN_CAP, so 9-0 == cap.
+    let blowout = MatchOutcomeReward::from_score(9, 0);
+    let capped = MATCH_OUTCOME_WIN_REWARD_POINTS
+        + (MATCH_OUTCOME_MARGIN_CAP_GOALS - 1.0) * MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS;
+    assert!((blowout.home - capped).abs() < 1e-9, "margin bonus is capped");
+
+    // Loss mirrors the win; draw is the neutral constant for both sides.
+    let loss = MatchOutcomeReward::from_score(0, 2);
+    assert!(loss.home < 0.0 && loss.away > 0.0);
+    let draw = MatchOutcomeReward::from_score(1, 1);
+    assert!((draw.home - MATCH_OUTCOME_DRAW_REWARD_POINTS).abs() < 1e-9);
+    assert!((draw.away - MATCH_OUTCOME_DRAW_REWARD_POINTS).abs() < 1e-9);
+}
+
+#[test]
+fn full_game_replay_outcome_label_is_broadcast_and_off_is_byte_identical() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 4.0,
+        seed: 42_424,
+        ..MatchConfig::default()
+    });
+    sim.run_time_step();
+    sim.run_time_step();
+    let after = WorldSnapshot::from_match(&sim);
+
+    let pick = |team: Team| -> usize {
+        sim.players
+            .iter()
+            .find(|p| {
+                p.team == team && p.role != PlayerRole::Goalkeeper && p.last_decision.is_some()
+            })
+            .expect("a field player with a decision")
+            .id
+    };
+    let home_id = pick(Team::Home);
+    let away_id = pick(Team::Away);
+    let belief = |id: usize| {
+        sim.players[id]
+            .last_decision
+            .as_ref()
+            .expect("decision")
+            .belief
+            .clone()
+    };
+    let make = |id: usize, team: Team, reward: f64| SoccerLearningTransition {
+        tick: after.tick,
+        player_id: id,
+        team,
+        role: PlayerRole::Midfielder,
+        state: after.mdp_state_for_player(id),
+        observation: after.observation_for(id),
+        belief: belief(id),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward,
+        next_state: after.mdp_state_for_player(id),
+        next_observation: after.observation_for(id),
+        done: false,
+    };
+    // Both transitions share the tick, so each team's single-sample mean equals
+    // its own reward and the blended baseline reward is exactly that reward.
+    let transitions = vec![make(home_id, Team::Home, 2.0), make(away_id, Team::Away, 1.0)];
+
+    let baseline = soccer_full_game_replay_transitions(&transitions, None);
+    let home_base = baseline.iter().find(|t| t.team == Team::Home).unwrap().reward;
+    let away_base = baseline.iter().find(|t| t.team == Team::Away).unwrap().reward;
+    assert!((home_base - 2.0).abs() < 1e-6, "off-path = shaped reward only");
+    assert!((away_base - 1.0).abs() < 1e-6);
+
+    // Home wins 2-0 ⇒ a positive label on the home decision, the mirror on away.
+    let outcome = MatchOutcomeReward::from_score(2, 0);
+    let labelled = soccer_full_game_replay_transitions(&transitions, Some(outcome));
+    let home_lab = labelled.iter().find(|t| t.team == Team::Home).unwrap().reward;
+    let away_lab = labelled.iter().find(|t| t.team == Team::Away).unwrap().reward;
+    assert!(
+        (home_lab - (home_base + outcome.home)).abs() < 1e-6,
+        "winner's whole-game decisions are credited by the result"
+    );
+    assert!(
+        (away_lab - (away_base + outcome.away)).abs() < 1e-6,
+        "loser's decisions are debited by the result"
+    );
+    assert!(home_lab > home_base && away_lab < away_base);
 }
