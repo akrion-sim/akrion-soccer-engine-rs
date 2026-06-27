@@ -117,11 +117,14 @@ impl Default for Tunables {
 /// [`crate::des::general::soccer::policy_select`]). When its gate
 /// (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK`) is on, each MDP/POMDP decision
 /// draws among its best three candidate actions with these probabilities
-/// (renormalised over however many candidates exist). With the gate off the
-/// engine takes the deterministic argmax and these values are never read, so an
-/// unconfigured process is byte-identical to before this group existed.
+/// (renormalised over however many candidates exist), or — when
+/// `boltzmann_temperature > 0` — proportional to `exp(score / temperature)` over
+/// all candidates (value-weighted). With the gate off the engine takes the
+/// deterministic argmax and these values are never read, so an unconfigured
+/// process is byte-identical to before this group existed.
 ///
-/// Defaults are the requested **70 / 20 / 10**.
+/// Defaults are the requested **70 / 20 / 10** rank split with the value-weighted
+/// path off (`boltzmann_temperature = 0`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicySelectionTunables {
@@ -131,6 +134,15 @@ pub struct PolicySelectionTunables {
     pub top2_weight: f64,
     /// Probability weight of committing to the **3rd-best** (rank-2) candidate.
     pub top3_weight: f64,
+    /// Boltzmann (softmax) temperature for **value-weighted** selection, in the
+    /// same score units the ranker scores candidates in. When `> 0` *and* the
+    /// stochastic gate is on, the decision draws over **all** candidates with
+    /// probability `∝ exp(score / temperature)` instead of the fixed-by-rank
+    /// `top{1,2,3}_weight` split — so a near-tie explores readily while a runaway
+    /// best is taken almost always. A **non-positive** value (the default `0.0`)
+    /// disables this path and falls back to the rank-weighted top-k, keeping an
+    /// unconfigured process byte-identical. Smaller ⇒ greedier, larger ⇒ flatter.
+    pub boltzmann_temperature: f64,
 }
 
 impl Default for PolicySelectionTunables {
@@ -139,7 +151,64 @@ impl Default for PolicySelectionTunables {
             top1_weight: 0.70,
             top2_weight: 0.20,
             top3_weight: 0.10,
+            boltzmann_temperature: 0.0,
         }
+    }
+}
+
+impl PolicySelectionTunables {
+    /// Clamp obvious garbage to safe ranges with a warning. The selection code is
+    /// already defensive (non-positive / non-finite weights are floored, and a
+    /// non-positive / non-finite temperature falls back to the rank-weighted
+    /// split), so this only turns silent misconfiguration into a visible warning
+    /// and keeps the values in a sensible band. The per-rank weights are
+    /// renormalised at use, so any non-negative magnitude is valid.
+    fn sanitize(&mut self) {
+        let default = PolicySelectionTunables::default();
+        // Weights are renormalised at use, so any non-negative magnitude is valid
+        // (e.g. [2,1,1] == 50/25/25). Clamp only negatives/non-finite (a hard
+        // floor of 0 matches the downstream flooring of non-positive weights);
+        // warn — but keep — values above 1.0 as "that looks unusual".
+        sanitize_f64(
+            "policy_selection.top1_weight",
+            &mut self.top1_weight,
+            default.top1_weight,
+            0.0,
+            f64::MAX,
+            0.0,
+            1.0,
+        );
+        sanitize_f64(
+            "policy_selection.top2_weight",
+            &mut self.top2_weight,
+            default.top2_weight,
+            0.0,
+            f64::MAX,
+            0.0,
+            1.0,
+        );
+        sanitize_f64(
+            "policy_selection.top3_weight",
+            &mut self.top3_weight,
+            default.top3_weight,
+            0.0,
+            f64::MAX,
+            0.0,
+            1.0,
+        );
+        // Temperature: 0 disables value-weighting; negatives are meaningless
+        // (treated as disabled downstream) so clamp them up to 0. The hard upper
+        // bound only catches absurd values — a very large temperature is a valid
+        // "near-uniform exploration" choice, hence the wide sane band.
+        sanitize_f64(
+            "policy_selection.boltzmann_temperature",
+            &mut self.boltzmann_temperature,
+            default.boltzmann_temperature,
+            0.0,
+            1_000.0,
+            0.0,
+            100.0,
+        );
     }
 }
 
@@ -845,6 +914,7 @@ impl Tunables {
         self.fresh_possession_escape.sanitize();
         self.killer_pass_over_top.sanitize();
         self.lane_affinity.sanitize();
+        self.policy_selection.sanitize();
         self
     }
 
@@ -3329,6 +3399,7 @@ mod tests {
         assert_eq!(t.policy_selection.top1_weight, 0.70);
         assert_eq!(t.policy_selection.top2_weight, 0.20);
         assert_eq!(t.policy_selection.top3_weight, 0.10);
+        assert_eq!(t.policy_selection.boltzmann_temperature, 0.0);
     }
 
     #[test]
@@ -3428,6 +3499,10 @@ mod tests {
                 "forward_lane_radius": 99,
                 "lookahead_min_seconds": 2.0,
                 "lookahead_max_seconds": 0.5
+            },
+            "policy_selection": {
+                "top1_weight": -0.5,
+                "boltzmann_temperature": 5000.0
             }
         })]);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
@@ -3449,6 +3524,10 @@ mod tests {
         assert_eq!(t.lane_affinity.forward_lane_radius, 6);
         assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
         assert_eq!(t.lane_affinity.lookahead_max_seconds, 2.0);
+        // Negative rank weight clamps up to the 0.0 hard floor; an absurd
+        // temperature clamps down to the 1000.0 hard ceiling.
+        assert_eq!(t.policy_selection.top1_weight, 0.0);
+        assert_eq!(t.policy_selection.boltzmann_temperature, 1_000.0);
     }
 
     #[test]
