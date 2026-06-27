@@ -53378,13 +53378,19 @@ fn pass_target_quality_for_snapshot_inner(
     }
 }
 
-fn best_pass_target_quality_for_snapshot(
+/// Evaluate [`pass_target_quality_for_snapshot`] once per target for `flight`, returning the
+/// per-target qualities. The `PassTargetQuality` struct carries BOTH `expected_completion`
+/// and `stride_fit`, so a caller that needs both (as `observation_for` does, binning them
+/// separately) can derive them from a single pass instead of re-running the
+/// O(targets × speed-buckets × opponents) MPC pass evaluation twice. Pure refactor: the
+/// per-target values and iteration order are identical to the originals.
+fn pass_target_qualities_for_snapshot(
     snapshot: &WorldSnapshot,
     player: &PlayerSnapshot,
     player_position: Vec2,
     targets: &[usize],
     flight: PassFlight,
-) -> PassTargetQuality {
+) -> Vec<PassTargetQuality> {
     targets
         .iter()
         .filter_map(|target_id| {
@@ -53401,12 +53407,43 @@ fn best_pass_target_quality_for_snapshot(
                 flight,
             ))
         })
+        .collect()
+}
+
+/// Best (max) expected completion across already-evaluated `qualities`; `default()` when
+/// empty. Byte-identical to the original `.max_by(expected_completion).unwrap_or_default()`.
+fn best_pass_quality_from(qualities: &[PassTargetQuality]) -> PassTargetQuality {
+    qualities
+        .iter()
+        .copied()
         .max_by(|a, b| {
             a.expected_completion
                 .partial_cmp(&b.expected_completion)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or_default()
+}
+
+/// Best (max) into-stride fit across already-evaluated `qualities`; `0.0` when empty.
+/// Byte-identical to the original `.map(stride_fit).fold(0.0, max)`.
+fn best_pass_stride_fit_from(qualities: &[PassTargetQuality]) -> f64 {
+    qualities.iter().map(|q| q.stride_fit).fold(0.0_f64, f64::max)
+}
+
+fn best_pass_target_quality_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    player_position: Vec2,
+    targets: &[usize],
+    flight: PassFlight,
+) -> PassTargetQuality {
+    best_pass_quality_from(&pass_target_qualities_for_snapshot(
+        snapshot,
+        player,
+        player_position,
+        targets,
+        flight,
+    ))
 }
 
 /// Best pass-into-stride ANTICIPATION available across `targets`, independent of which
@@ -53421,26 +53458,13 @@ fn best_pass_stride_fit_for_snapshot(
     targets: &[usize],
     flight: PassFlight,
 ) -> f64 {
-    targets
-        .iter()
-        .filter_map(|target_id| {
-            let target = snapshot.players.iter().find(|p| p.id == *target_id)?;
-            let target_position = snapshot
-                .player_position(target.id)
-                .unwrap_or(target.position);
-            Some(
-                pass_target_quality_for_snapshot(
-                    snapshot,
-                    player,
-                    player_position,
-                    target,
-                    target_position,
-                    flight,
-                )
-                .stride_fit,
-            )
-        })
-        .fold(0.0_f64, f64::max)
+    best_pass_stride_fit_from(&pass_target_qualities_for_snapshot(
+        snapshot,
+        player,
+        player_position,
+        targets,
+        flight,
+    ))
 }
 
 fn pass_execution_skill(skills: &SkillProfile, flight: PassFlight, is_cross: bool) -> f64 {
