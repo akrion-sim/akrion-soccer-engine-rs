@@ -122,6 +122,8 @@ impl Default for Tunables {
 /// unconfigured process is byte-identical to before this group existed.
 ///
 /// Defaults are the requested **70 / 20 / 10**.
+pub const POLICY_SELECTION_TOP_RANK_LIMIT: usize = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicySelectionTunables {
@@ -131,6 +133,12 @@ pub struct PolicySelectionTunables {
     pub top2_weight: f64,
     /// Probability weight of committing to the **3rd-best** (rank-2) candidate.
     pub top3_weight: f64,
+}
+
+impl PolicySelectionTunables {
+    pub fn rank_weights(&self) -> [f64; POLICY_SELECTION_TOP_RANK_LIMIT] {
+        [self.top1_weight, self.top2_weight, self.top3_weight]
+    }
 }
 
 impl Default for PolicySelectionTunables {
@@ -3329,6 +3337,7 @@ mod tests {
         assert_eq!(t.policy_selection.top1_weight, 0.70);
         assert_eq!(t.policy_selection.top2_weight, 0.20);
         assert_eq!(t.policy_selection.top3_weight, 0.10);
+        assert_eq!(t.policy_selection.rank_weights(), [0.70, 0.20, 0.10]);
     }
 
     #[test]

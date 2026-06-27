@@ -14,8 +14,6 @@ const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
-const SOCCER_POLICY_TOP_RANK_LIMIT: usize = 3;
-const SOCCER_POLICY_TOP_RANK_WEIGHTS: [f64; SOCCER_POLICY_TOP_RANK_LIMIT] = [0.70, 0.20, 0.10];
 const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
 const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
 const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
@@ -854,33 +852,41 @@ fn soccer_policy_rank_draw(seed: u32, tick: u64, player_id: usize, salt: u64) ->
     ((x >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
 }
 
+fn soccer_policy_top_rank_weights() -> [f64; POLICY_SELECTION_TOP_RANK_LIMIT] {
+    let mut weights = tunables().policy_selection.rank_weights();
+    for weight in &mut weights {
+        if !weight.is_finite() || *weight < 0.0 {
+            *weight = 0.0;
+        }
+    }
+    weights
+}
+
 fn soccer_policy_rank_probability(candidate_count: usize, rank: usize) -> f64 {
-    let candidate_count = candidate_count.min(SOCCER_POLICY_TOP_RANK_LIMIT);
+    let rank_weights = soccer_policy_top_rank_weights();
+    let candidate_count = candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if candidate_count == 0 || rank >= candidate_count {
         return 0.0;
     }
-    let total: f64 = SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
-        .iter()
-        .sum();
+    let total: f64 = rank_weights[..candidate_count].iter().sum();
     if !total.is_finite() || total <= 1e-9 {
         return 1.0 / candidate_count as f64;
     }
-    (SOCCER_POLICY_TOP_RANK_WEIGHTS[rank] / total).clamp(0.0, 1.0)
+    (rank_weights[rank] / total).clamp(0.0, 1.0)
 }
 
 fn soccer_policy_weighted_rank_index(candidate_count: usize, draw: f64) -> usize {
-    let candidate_count = candidate_count.min(SOCCER_POLICY_TOP_RANK_LIMIT);
+    let rank_weights = soccer_policy_top_rank_weights();
+    let candidate_count = candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if candidate_count <= 1 {
         return 0;
     }
-    let total: f64 = SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
-        .iter()
-        .sum();
+    let total: f64 = rank_weights[..candidate_count].iter().sum();
+    if !total.is_finite() || total <= 1e-9 {
+        return 0;
+    }
     let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
-    for (index, weight) in SOCCER_POLICY_TOP_RANK_WEIGHTS[..candidate_count]
-        .iter()
-        .enumerate()
-    {
+    for (index, weight) in rank_weights[..candidate_count].iter().enumerate() {
         if threshold < *weight {
             return index;
         }
@@ -916,7 +922,7 @@ fn soccer_policy_rank_probability_for_label(
     let mut candidate_count = 0usize;
     let mut selected_rank = None;
     for action in ranked.iter().filter(|action| action.legal) {
-        if candidate_count >= SOCCER_POLICY_TOP_RANK_LIMIT {
+        if candidate_count >= POLICY_SELECTION_TOP_RANK_LIMIT {
             break;
         }
         if selected_rank.is_none()
@@ -938,14 +944,15 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
     let legal = ranked
         .iter()
         .filter(|action| action.legal)
-        .take(SOCCER_POLICY_TOP_RANK_LIMIT)
+        .take(POLICY_SELECTION_TOP_RANK_LIMIT)
         .collect::<Vec<_>>();
     let candidate_count = legal.len();
     if candidate_count == 0 {
         return None;
     }
     let max_visits = legal.iter().map(|action| action.visits).max().unwrap_or(0) as f64;
-    let mut weights = [0.0; SOCCER_POLICY_TOP_RANK_LIMIT];
+    let rank_weights = soccer_policy_top_rank_weights();
+    let mut weights = [0.0; POLICY_SELECTION_TOP_RANK_LIMIT];
     let mut total = 0.0;
     for (rank, action) in legal.iter().enumerate() {
         let visits = action.visits as f64;
@@ -953,7 +960,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
         let multiplier = (1.0
             + SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE * (relative_uncertainty - 1.0).max(0.0))
         .clamp(1.0, SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER);
-        let weight = SOCCER_POLICY_TOP_RANK_WEIGHTS[rank] * multiplier;
+        let weight = rank_weights[rank] * multiplier;
         weights[rank] = weight;
         total += weight;
     }
@@ -3984,7 +3991,7 @@ impl SoccerMatch {
         let candidate_count = ranked
             .iter()
             .filter(|action| action.legal)
-            .take(SOCCER_POLICY_TOP_RANK_LIMIT)
+            .take(POLICY_SELECTION_TOP_RANK_LIMIT)
             .count();
         if candidate_count == 0 {
             return None;
@@ -4007,7 +4014,7 @@ impl SoccerMatch {
         candidates: &[SoccerNeuralMctsCandidate],
         draw: f64,
     ) -> Option<SoccerPolicyActionChoice> {
-        let candidate_count = candidates.len().min(SOCCER_POLICY_TOP_RANK_LIMIT);
+        let candidate_count = candidates.len().min(POLICY_SELECTION_TOP_RANK_LIMIT);
         if candidate_count == 0 {
             return None;
         }
@@ -4060,7 +4067,7 @@ impl SoccerMatch {
         let Some((_, mut ranked)) = policy.ranked_action_values_for_snapshot(
             snapshot,
             player_id,
-            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(SOCCER_POLICY_TOP_RANK_LIMIT),
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(POLICY_SELECTION_TOP_RANK_LIMIT),
         ) else {
             return policy
                 .best_action_for_state_observation_with_prior(
@@ -4111,7 +4118,7 @@ impl SoccerMatch {
         let (_, mut ranked) = policy.ranked_action_values_for_snapshot(
             snapshot,
             player_id,
-            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(SOCCER_POLICY_TOP_RANK_LIMIT),
+            SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(POLICY_SELECTION_TOP_RANK_LIMIT),
         )?;
         Self::apply_retrieval_prior_to_policy_actions(&mut ranked, retrieval_prior);
         Self::weighted_ranked_action_choice(&ranked, draw).or_else(|| {
@@ -4392,7 +4399,7 @@ impl SoccerMatch {
                 .then_with(|| a.q_visits.cmp(&b.q_visits))
                 .then_with(|| a.label.cmp(&b.label))
         });
-        let candidate_count = nodes.len().min(SOCCER_POLICY_TOP_RANK_LIMIT);
+        let candidate_count = nodes.len().min(POLICY_SELECTION_TOP_RANK_LIMIT);
         if candidate_count == 0 {
             return None;
         }
@@ -25130,7 +25137,7 @@ impl WorldSnapshot {
         let has_ball = self.ball.holder == Some(player_id);
         let visible_ball = has_ball || self.player_can_see_point(me.id, self.ball.position);
         let action_facing = self.player_state_action_facing(me);
-        let look_behind_scan = look_behind_scan_context_for_observer(
+        let mut look_behind_scan = look_behind_scan_context_for_observer(
             self.tick,
             self.dt_seconds,
             me,
@@ -25191,6 +25198,32 @@ impl WorldSnapshot {
                 }
             }
         }
+        if has_ball {
+            let facing = self.player_facing_direction(me);
+            let head_scan_seconds = player_position_confidences
+                .iter()
+                .filter(|entry| entry.team == me.team)
+                .filter_map(|entry| {
+                    let target = self.players.iter().find(|player| player.id == entry.player_id)?;
+                    let facing = facing?;
+                    let to_target = self.player_snapshot_position(target) - me_position;
+                    Some(ball_holder_head_scan_delay_seconds(
+                        angle_between_vectors_degrees(facing, to_target),
+                        me.skills.vision,
+                    ))
+                })
+                .fold(0.0_f64, f64::max);
+            if head_scan_seconds > 0.0 {
+                let scan_fit = ((head_scan_seconds - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS)
+                    / (BALL_HOLDER_HEAD_SCAN_MAX_SECONDS - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS)
+                        .max(1e-6))
+                .clamp(0.0, 1.0);
+                look_behind_scan.active = true;
+                look_behind_scan.duration_seconds = head_scan_seconds;
+                look_behind_scan.confidence_bonus = 0.0;
+                look_behind_scan.drift_risk = (0.24 + scan_fit * 0.42).clamp(0.0, 1.0);
+            }
+        }
         let teammate_position_confidence =
             average_player_position_confidence_entries(&player_position_confidences, me.team);
         let opponent_position_confidence = average_player_position_confidence_entries(
@@ -25225,7 +25258,7 @@ impl WorldSnapshot {
         }
         .clamp(
             PERCEPTION_LATENCY_BASE_SECONDS,
-            PLAYER_POMDP_REACTION_MAX_SECONDS,
+            perception_latency_upper_bound_seconds(),
         );
         let scheduled_index = self.scheduled_player_index(player_id);
         let ball_scheduled_index = self.scheduled_ball_index();
@@ -28705,8 +28738,9 @@ impl WorldSnapshot {
             return true;
         };
         let visible_by_fov = if self.ball.holder == Some(observer_id) {
-            let angle = angle_between_vectors_degrees(facing, to_point);
-            angle <= (BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES)
+            // A carrier can swivel their head without turning their body. Rear/side targets are
+            // still lower-confidence and slower via the POMDP perception fields, but not invisible.
+            true
         } else {
             let fov = player_field_of_view(observer);
             let half_fov_cos = (fov.to_radians() * 0.5).cos();
@@ -28954,7 +28988,20 @@ impl WorldSnapshot {
             observer_has_ball,
         );
         let noise_yards = self.perception_noise_yards_for(confidence, to_target.len(), occlusion);
-        let latency_seconds = self.perception_latency_seconds_for(observer, confidence, occlusion);
+        let scan_delay_seconds = if observer_has_ball {
+            facing
+                .map(|facing| angle_between_vectors_degrees(facing, to_target))
+                .map(|angle| ball_holder_head_scan_delay_seconds(angle, observer.skills.vision))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let latency_seconds = (self.perception_latency_seconds_for(observer, confidence, occlusion)
+            + scan_delay_seconds)
+            .clamp(
+                PERCEPTION_LATENCY_BASE_SECONDS,
+                perception_latency_upper_bound_seconds(),
+            );
         Some(PlayerPositionConfidence {
             observer_id,
             player_id: target.id,
@@ -31332,6 +31379,204 @@ impl WorldSnapshot {
         )
     }
 
+    fn pending_pass_dummy_through_applies_for_snapshot(
+        &self,
+        player: &PlayerSnapshot,
+        pass: &PendingPassSnapshot,
+    ) -> bool {
+        if player.team != pass.team
+            || player.role == PlayerRole::Goalkeeper
+            || pass.from == player.id
+            || pass.target == Some(player.id)
+            || !matches!(pass.flight, PassFlight::Floor)
+        {
+            return false;
+        }
+        let Some(receiver_id) = pass.target else {
+            return false;
+        };
+        let Some(receiver) = self.players.iter().find(|p| p.id == receiver_id) else {
+            return false;
+        };
+        if receiver.team != pass.team || receiver.role == PlayerRole::Goalkeeper {
+            return false;
+        }
+        let middle = self.player_snapshot_position(player);
+        teammate_dummy_pass_lane_geometry_applies(
+            pass.origin,
+            pass.intended_target,
+            middle,
+            pass.receiver_openness,
+            TEAMMATE_DUMMY_PASS_LANE_GAP_YARDS,
+        )
+    }
+
+    fn teammate_pass_lane_clearance_space_target_for_lane(
+        &self,
+        player: &PlayerSnapshot,
+        from: Vec2,
+        to: Vec2,
+    ) -> Option<Vec2> {
+        if player.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let current = self.player_snapshot_position(player);
+        let lane = to - from;
+        let lane_len = lane.len();
+        if lane_len < TEAMMATE_DUMMY_PASS_MIN_TOTAL_YARDS {
+            return None;
+        }
+        let dir = lane * (1.0 / lane_len);
+        let lateral = Vec2::new(-dir.y, dir.x);
+        let attack = player.team.attack_dir();
+        let preferred_y = if player.role == PlayerRole::Defender {
+            -attack
+        } else {
+            attack
+        };
+        let open = self.open_space_for(player.id, player.home_position);
+        let fallback = [open, player.home_position];
+        let mut best: Option<(f64, Vec2)> = None;
+        for side in [-1.0, 1.0] {
+            for (lateral_yards, vertical_yards) in [
+                (3.4, 0.0),
+                (2.6, 2.8),
+                (1.6, 4.4),
+                (4.2, 1.6),
+            ] {
+                let raw = (current
+                    + lateral * (side * lateral_yards)
+                    + Vec2::new(0.0, preferred_y * vertical_yards))
+                .clamp_to_pitch(self.field_width, self.field_length);
+                let target = self.shape_guarded_support_point(
+                    player.id,
+                    raw,
+                    &fallback,
+                    player.home_position,
+                    false,
+                );
+                let lane_gap = segment_distance_to_point(from, to, target);
+                if lane_gap < TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS {
+                    continue;
+                }
+                let occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
+                let open_space = (occupancy.open_space_score / 18.0).clamp(0.0, 1.0);
+                let teammate_pressure =
+                    occupancy.teammate_occupied_space_pressure().clamp(0.0, 1.0);
+                let shape = self.movement_target_shape_score(player, target);
+                let phase_fit = ((target.y - current.y) * preferred_y / 5.5).clamp(-1.0, 1.0);
+                let movement_cost = (target.distance(current) / 8.0).clamp(0.0, 1.4);
+                let score = lane_gap.min(8.0) * 0.18
+                    + open_space * 0.44
+                    + shape * 0.54
+                    + phase_fit * 0.34
+                    - teammate_pressure * 0.58
+                    - movement_cost * 0.16;
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|(best_score, _)| score > *best_score);
+                if replace {
+                    best = Some((score, target));
+                }
+            }
+        }
+        best.map(|(_, target)| target)
+    }
+
+    pub(crate) fn teammate_dummy_let_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        let pass = self.pending_pass.as_ref()?;
+        let player = self.players.iter().find(|p| p.id == player_id)?;
+        if !self.pending_pass_dummy_through_applies_for_snapshot(player, pass) {
+            return None;
+        }
+        self.teammate_pass_lane_clearance_space_target_for_lane(
+            player,
+            pass.origin,
+            pass.intended_target,
+        )
+        .or_else(|| Some(self.player_snapshot_position(player)))
+    }
+
+    pub(crate) fn teammate_pass_lane_clearance_target_for(&self, player_id: usize) -> Option<Vec2> {
+        let holder_id = self.ball.holder?;
+        let player = self.players.iter().find(|p| p.id == player_id)?;
+        if holder_id == player_id || self.controlled_possession_team() != Some(player.team) {
+            return None;
+        }
+        if player.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder = self.players.iter().find(|p| p.id == holder_id)?;
+        if holder.team != player.team {
+            return None;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        let player_pos = self.player_snapshot_position(player);
+        let nominal_speed =
+            pass_speed_yps_from_power(0.72, PassFlight::Floor, false, &holder.skills);
+        let mut best: Option<(f64, Vec2)> = None;
+        for receiver in self.players.iter() {
+            if receiver.team != player.team
+                || receiver.role == PlayerRole::Goalkeeper
+                || receiver.id == holder_id
+                || receiver.id == player_id
+                || self.pending_offside_for_pass(holder_id, receiver.id).is_some()
+            {
+                continue;
+            }
+            let receiver_pos = self.player_snapshot_position(receiver);
+            let receiver_openness = pass_receiver_openness_for_snapshots_with_teammates(
+                &self.players,
+                player.team,
+                receiver_pos,
+                Some(receiver.id),
+            );
+            if !teammate_dummy_pass_lane_geometry_applies(
+                holder_pos,
+                receiver_pos,
+                player_pos,
+                receiver_openness,
+                TEAMMATE_CLEAR_PASS_LANE_DETECTION_RADIUS_YARDS,
+            ) {
+                continue;
+            }
+            let (_, clear_through_flight) = self.pass_lane_clearance(
+                holder_pos,
+                receiver_pos,
+                player.team.other(),
+                TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS,
+                nominal_speed,
+            );
+            if !clear_through_flight {
+                continue;
+            }
+            let Some(target) = self.teammate_pass_lane_clearance_space_target_for_lane(
+                player,
+                holder_pos,
+                receiver_pos,
+            )
+            else {
+                continue;
+            };
+            let lane_len = holder_pos.distance(receiver_pos);
+            let forward = ((receiver_pos.y - holder_pos.y) * player.team.attack_dir()).max(0.0);
+            let lane_gap = segment_distance_to_point(holder_pos, receiver_pos, player_pos);
+            let target_gap = segment_distance_to_point(holder_pos, receiver_pos, target);
+            let score = lane_len * 0.18
+                + forward * 0.10
+                + receiver_openness * 4.0
+                + target_gap.min(8.0) * 0.28
+                - lane_gap * 0.42;
+            let replace = best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score);
+            if replace {
+                best = Some((score, target));
+            }
+        }
+        best.map(|(_, target)| target)
+    }
+
     pub(crate) fn pending_pass_reception_target_for(
         &self,
         player_id: usize,
@@ -31339,6 +31584,9 @@ impl WorldSnapshot {
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let pass = self.pending_pass.as_ref()?;
         if self.ball.holder.is_some() || pass.team != me.team || pass.from == player_id {
+            return None;
+        }
+        if self.pending_pass_dummy_through_applies_for_snapshot(me, pass) {
             return None;
         }
         // Who this function sends to meet the ball. Normally the named receiver. Its belief that
@@ -32446,6 +32694,9 @@ impl WorldSnapshot {
             || !matches!(pass.flight, PassFlight::Floor)
             || self.ball.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS
         {
+            return None;
+        }
+        if self.pending_pass_dummy_through_applies_for_snapshot(player, pass) {
             return None;
         }
         let from = self.ball.position;

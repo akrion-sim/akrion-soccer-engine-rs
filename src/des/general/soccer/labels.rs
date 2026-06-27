@@ -32,6 +32,19 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+/// Frequently shared canonical action labels. Keep these next to the action
+/// vocabulary so hot-path callers do not need their own local string copies.
+pub const ACTION_LABEL_RECOVER: &str = "recover";
+pub const FIFTY_FIFTY_DUEL_ACTION_LABEL: &str = "fifty-fifty-duel";
+pub const DUMMY_CLEAR_LANE_ACTION_LABEL: &str = "dummy-clear-lane";
+pub const DUMMY_LET_RUN_ACTION_LABEL: &str = "dummy-let-run";
+pub const OPEN_PASS_LANE_ACTION_LABEL: &str = "open-pass-lane";
+pub const ROUND_GOALKEEPER_ACTION_LABEL: &str = "round-goalkeeper";
+
+/// Shared operation/trace labels that are not policy actions themselves.
+pub const TRACE_REACTIVE_GROUND_PASS: &str = "reactive-ground-pass";
+pub const TRACE_TRAP_CONTROLLABLE_TRAJECTORY: &str = "trap-controllable-trajectory";
+
 /// A soccer decision-label: the canonical vocabulary the policy/learning/trace
 /// layers speak in. See the module docs for the round-trip guarantees.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -105,6 +118,12 @@ pub enum SoccerActionLabel {
     OneTwoRun,
     ExploitSpaceRun,
     VacateSpace,
+    /// Off-ball: a same-team middle player recognises it is blocking the longer
+    /// lane between two teammates and moves into space so the longer pass stays on.
+    DummyClearLane,
+    /// Off-ball/in-flight: the same middle-player read, but expressed as a dummy
+    /// through decision — do not trap the pass; let it continue to the outer runner.
+    DummyLetRun,
     WideOutlet,
     ShotCreationRun,
     OverlapRun,
@@ -178,6 +197,8 @@ impl SoccerActionLabel {
             SoccerActionLabel::OneTwoRun => "one-two-run",
             SoccerActionLabel::ExploitSpaceRun => "exploit-space-run",
             SoccerActionLabel::VacateSpace => "vacate-space",
+            SoccerActionLabel::DummyClearLane => "dummy-clear-lane",
+            SoccerActionLabel::DummyLetRun => "dummy-let-run",
             SoccerActionLabel::WideOutlet => "wide-outlet",
             SoccerActionLabel::ShotCreationRun => "shot-creation-run",
             SoccerActionLabel::OverlapRun => "overlap-run",
@@ -247,6 +268,8 @@ impl SoccerActionLabel {
             "one-two-run" => SoccerActionLabel::OneTwoRun,
             "exploit-space-run" => SoccerActionLabel::ExploitSpaceRun,
             "vacate-space" => SoccerActionLabel::VacateSpace,
+            "dummy-clear-lane" => SoccerActionLabel::DummyClearLane,
+            "dummy-let-run" => SoccerActionLabel::DummyLetRun,
             "wide-outlet" => SoccerActionLabel::WideOutlet,
             "shot-creation-run" => SoccerActionLabel::ShotCreationRun,
             "overlap-run" => SoccerActionLabel::OverlapRun,
@@ -654,6 +677,8 @@ mod tests {
             "recycle-reset",
             "flank-high-cross",
             "exploit-space-run",
+            "dummy-clear-lane",
+            "dummy-let-run",
             "hold",
             "defend",
             "space",

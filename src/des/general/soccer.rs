@@ -114,9 +114,6 @@ pub const DEFAULT_BALL_GRASS_RESISTANCE_YPS2: f64 = 0.96;
 pub const DEFAULT_BALL_STOP_SPEED_YPS: f64 = 0.55;
 pub const DEFAULT_PLAYER_VISION_SKILL: f64 = 7.6;
 pub const DEFAULT_CONTROLLER_DEBOUNCE_MS: u64 = 4;
-const ACTION_LABEL_RECOVER: &str = "recover";
-const TRACE_REACTIVE_GROUND_PASS: &str = "reactive-ground-pass";
-const TRACE_TRAP_CONTROLLABLE_TRAJECTORY: &str = "trap-controllable-trajectory";
 const PLAYER_CONTROL_RADIUS_YARDS: f64 = 1.55;
 // First-touch settle cap: when a player gains control of a ball from a distance
 // (within the control radius but not at their feet), the held ball is drawn in to
@@ -729,6 +726,11 @@ const BALL_HOLDER_CORE_VISION_DEGREES: f64 = 100.0;
 const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
 const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
 const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
+const BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE: f64 = 0.52;
+const BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE: f64 = 0.38;
+const BALL_HOLDER_HEAD_SCAN_MIN_SECONDS: f64 = 0.75;
+const BALL_HOLDER_HEAD_SCAN_MAX_SECONDS: f64 = 1.85;
+const BALL_HOLDER_HEAD_SCAN_VISION_RELIEF_SECONDS: f64 = 0.35;
 const KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS: f64 = 0.35;
 const KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES: usize = 2;
 const KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS: f64 = 0.15;
@@ -2801,6 +2803,15 @@ const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
 // touch that player before continuing to a later receiver. This is deliberately a
 // segment-level contact radius, not a scored reception preference.
 const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
+const TEAMMATE_DUMMY_PASS_MIN_TOTAL_YARDS: f64 = 14.0;
+const TEAMMATE_DUMMY_PASS_MIN_FROM_PASSER_YARDS: f64 = 4.0;
+const TEAMMATE_DUMMY_PASS_MIN_BEYOND_YARDS: f64 = 7.0;
+const TEAMMATE_DUMMY_PASS_LANE_GAP_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.35;
+const TEAMMATE_CLEAR_PASS_LANE_DETECTION_RADIUS_YARDS: f64 =
+    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS + 0.50;
+const TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS: f64 =
+    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS + 1.10;
+const TEAMMATE_DUMMY_PASS_MIN_RECEIVER_OPENNESS: f64 = 0.22;
 // Ground passes within this two-yard lane are controllable when reaction-delayed
 // reach says the player can trap them. Wider than body contact: it covers the step
 // or lunge onto a rolling pass that would otherwise ghost through a nearby player.
@@ -12236,6 +12247,8 @@ fn is_attacking_support_action_label(action: &str) -> bool {
                 | SupportScreen
                 | VerticalAttack
                 | VacateSpace
+                | DummyClearLane
+                | DummyLetRun
                 | OneTwoRun
         )
     )
@@ -36274,7 +36287,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         WallPass => "wall-pass",
         CornerFlagCross => "corner-flag-cross",
         VerticalAttack | RunInBehind | ExploitSpaceRun => "vertical-attack",
-        VacateSpace | SupportScreen => "vacate-space",
+        VacateSpace | SupportScreen | DummyClearLane | DummyLetRun => "vacate-space",
         SurprisePass => "surprise-pass",
         ScoopPass => "scoop-pass",
         FlickOn => "flick-on",
@@ -37982,7 +37995,10 @@ fn soccer_neural_transition_features_with_action(
         PERCEPTION_NOISE_MAX_YARDS,
     );
     features[SOCCER_NEURAL_FEATURE_PERCEPTION_LATENCY] =
-        soccer_neural_scaled(obs.perception_latency_seconds.max(0.0), 0.25);
+        soccer_neural_scaled(
+            obs.perception_latency_seconds.max(0.0),
+            perception_latency_upper_bound_seconds(),
+        );
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_FORWARD] =
         soccer_neural_scaled(obs.own_team_center_of_mass_forward_yards, 60.0);
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_LATERAL] =
@@ -51692,6 +51708,47 @@ fn player_field_of_view(player: &PlayerSnapshot) -> f64 {
     }
 }
 
+fn ball_holder_shoulder_scan_limit_degrees() -> f64 {
+    BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES
+}
+
+fn ball_holder_head_scan_fraction(angle_degrees: f64) -> f64 {
+    let shoulder_limit = ball_holder_shoulder_scan_limit_degrees();
+    let span = (180.0 - shoulder_limit).max(1.0);
+    ((angle_degrees - shoulder_limit) / span).clamp(0.0, 1.0)
+}
+
+fn ball_holder_head_scan_delay_seconds(angle_degrees: f64, vision: f64) -> f64 {
+    if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
+        return 0.0;
+    }
+    let scan = ball_holder_head_scan_fraction(angle_degrees);
+    let max_seconds =
+        BALL_HOLDER_HEAD_SCAN_MAX_SECONDS - ability01(vision) * BALL_HOLDER_HEAD_SCAN_VISION_RELIEF_SECONDS;
+    (BALL_HOLDER_HEAD_SCAN_MIN_SECONDS
+        + scan * (max_seconds - BALL_HOLDER_HEAD_SCAN_MIN_SECONDS).max(0.0))
+    .clamp(BALL_HOLDER_HEAD_SCAN_MIN_SECONDS, BALL_HOLDER_HEAD_SCAN_MAX_SECONDS)
+}
+
+fn ball_holder_head_scan_position_confidence(angle_degrees: f64, vision: f64) -> f64 {
+    if angle_degrees <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 {
+        BALL_HOLDER_CORE_POSITION_CONFIDENCE
+    } else if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
+        BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE
+    } else {
+        let scan = ball_holder_head_scan_fraction(angle_degrees);
+        let base = BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE
+            + (BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE
+                - BALL_HOLDER_SIDE_SCAN_POSITION_CONFIDENCE)
+                * scan;
+        (base + ability01(vision) * 0.08).clamp(BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE, 0.62)
+    }
+}
+
+fn perception_latency_upper_bound_seconds() -> f64 {
+    PLAYER_POMDP_REACTION_MAX_SECONDS + BALL_HOLDER_HEAD_SCAN_MAX_SECONDS
+}
+
 fn average_player_position_confidence<I>(
     snapshot: &WorldSnapshot,
     observer_id: usize,
@@ -51800,17 +51857,7 @@ fn position_confidence_for_observer(
             let dot = facing.dot(to_point.normalized());
             if observer_has_ball {
                 let angle = dot.clamp(-1.0, 1.0).acos().to_degrees();
-                if angle <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 {
-                    BALL_HOLDER_CORE_POSITION_CONFIDENCE
-                } else if angle
-                    <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES
-                {
-                    BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE
-                } else if dot >= 0.0 {
-                    0.42
-                } else {
-                    0.24
-                }
+                ball_holder_head_scan_position_confidence(angle, observer.skills.vision)
             } else {
                 let half_fov_cos = (player_field_of_view(observer).to_radians() * 0.5).cos();
                 if dot >= half_fov_cos {
@@ -55564,13 +55611,79 @@ fn goalkeeper_for_players(players: &[PlayerAgent], team: Team) -> Option<usize> 
 fn last_recover_target_for_player(player: &PlayerAgent) -> Option<Vec2> {
     let decision = player.last_decision.as_ref()?;
     let label = normalize_soccer_action_label(&decision.action);
-    if !matches!(label, ACTION_LABEL_RECOVER | "fifty-fifty-duel") {
+    if !matches!(label, ACTION_LABEL_RECOVER | FIFTY_FIFTY_DUEL_ACTION_LABEL) {
         return None;
     }
     decision
         .action_target
         .as_ref()
         .and_then(|target| target.point)
+}
+
+fn teammate_dummy_pass_lane_geometry_applies(
+    from: Vec2,
+    to: Vec2,
+    middle: Vec2,
+    receiver_openness: f64,
+    lane_gap_yards: f64,
+) -> bool {
+    let lane = to - from;
+    let lane_len = lane.len();
+    if lane_len < TEAMMATE_DUMMY_PASS_MIN_TOTAL_YARDS {
+        return false;
+    }
+    let projection = segment_projection_factor(from, to, middle);
+    if !(0.0..1.0).contains(&projection) {
+        return false;
+    }
+    let along = lane_len * projection;
+    let beyond = lane_len - along;
+    if along < TEAMMATE_DUMMY_PASS_MIN_FROM_PASSER_YARDS
+        || beyond < TEAMMATE_DUMMY_PASS_MIN_BEYOND_YARDS
+    {
+        return false;
+    }
+    if segment_distance_to_point(from, to, middle) > lane_gap_yards {
+        return false;
+    }
+    receiver_openness >= TEAMMATE_DUMMY_PASS_MIN_RECEIVER_OPENNESS
+}
+
+fn pending_pass_dummy_through_applies_for_agent(
+    player: &PlayerAgent,
+    players: &[PlayerAgent],
+    pass: &PendingPass,
+    control_point: Vec2,
+) -> bool {
+    if player.team != pass.team
+        || player.role == PlayerRole::Goalkeeper
+        || pass.from == player.id
+        || pass.target == Some(player.id)
+        || !matches!(pass.flight, PassFlight::Floor)
+    {
+        return false;
+    }
+    let Some(receiver_id) = pass.target else {
+        return false;
+    };
+    let Some(receiver) = players.iter().find(|p| p.id == receiver_id) else {
+        return false;
+    };
+    if receiver.team != pass.team || receiver.role == PlayerRole::Goalkeeper {
+        return false;
+    }
+    if segment_distance_to_point(pass.origin, pass.intended_target, control_point)
+        > TEAMMATE_CLEAR_PASS_LANE_DETECTION_RADIUS_YARDS
+    {
+        return false;
+    }
+    teammate_dummy_pass_lane_geometry_applies(
+        pass.origin,
+        pass.intended_target,
+        player.position,
+        pass.receiver_openness,
+        TEAMMATE_DUMMY_PASS_LANE_GAP_YARDS,
+    )
 }
 
 fn nearest_opponent_distance_to_point(players: &[PlayerAgent], team: Team, point: Vec2) -> f64 {
@@ -55682,6 +55795,11 @@ fn nearest_ball_controller_for_segment_with_guard(
         } else {
             ball_pos
         };
+        if pending_pass.is_some_and(|pass| {
+            pending_pass_dummy_through_applies_for_agent(p, players, pass, control_point)
+        }) {
+            continue;
+        }
         if let Some(pass) = pending_pass {
             let is_target = pass.target == Some(p.id);
             let progress = pass_progress_along_path(pass, control_point);
@@ -56708,6 +56826,16 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                 && snapshot
                     .wide_possession_outlet_target_for(player_id, player.home_position)
                     .is_some()
+        }
+        "dummy-clear-lane" => {
+            !observation.has_ball
+                && snapshot.controlled_possession_team() == Some(player.team)
+                && snapshot
+                    .teammate_pass_lane_clearance_target_for(player_id)
+                    .is_some()
+        }
+        "dummy-let-run" => {
+            !observation.has_ball && snapshot.teammate_dummy_let_run_target_for(player_id).is_some()
         }
         "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
         | "support-screen" | "vacate-space" | "support-shape" | "support-roam" => {

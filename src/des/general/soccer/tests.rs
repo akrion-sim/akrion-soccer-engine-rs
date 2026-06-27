@@ -19748,20 +19748,22 @@ fn no_target_forward_outlet_avoids_marked_teammate_and_opponents() {
 }
 
 #[test]
-fn visible_pass_targets_filter_hidden_teammates() {
+fn visible_pass_targets_include_head_scan_teammates_but_filter_range() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;
     let visible_teammate = 7;
-    let hidden_teammate = 8;
+    let rear_teammate = 8;
+    let distant_teammate = 9;
     sim.players[passer].position = Vec2::new(40.0, 60.0);
     sim.players[passer].velocity = Vec2::new(4.0, 0.0);
     sim.players[passer].action_facing = FacingBucket::East;
     sim.players[passer].receive_facing = FacingBucket::East;
     sim.players[visible_teammate].position = Vec2::new(56.0, 60.0);
-    sim.players[hidden_teammate].position = Vec2::new(18.0, 60.0);
+    sim.players[rear_teammate].position = Vec2::new(18.0, 60.0);
+    sim.players[distant_teammate].position = Vec2::new(1.0, 1.0);
     for home in 0..11 {
-        if ![passer, visible_teammate, hidden_teammate].contains(&home) {
-            sim.players[home].position = Vec2::new(6.0, 18.0 + home as f64);
+        if ![passer, visible_teammate, rear_teammate, distant_teammate].contains(&home) {
+            sim.players[home].position = Vec2::new(1.0, 2.0 + home as f64 * 0.1);
         }
     }
     for away in 11..22 {
@@ -19773,10 +19775,12 @@ fn visible_pass_targets_filter_hidden_teammates() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     assert!(snapshot.player_can_see_player(passer, visible_teammate));
-    assert!(!snapshot.player_can_see_player(passer, hidden_teammate));
-    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 3);
+    assert!(snapshot.player_can_see_player(passer, rear_teammate));
+    assert!(!snapshot.player_can_see_player(passer, distant_teammate));
+    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 4);
     assert!(visible_targets.contains(&visible_teammate));
-    assert!(!visible_targets.contains(&hidden_teammate));
+    assert!(visible_targets.contains(&rear_teammate));
+    assert!(!visible_targets.contains(&distant_teammate));
     assert_eq!(
         snapshot.observation_for(passer).visible_pass_options,
         visible_targets.len()
@@ -19794,10 +19798,10 @@ fn learned_pass_plan_cannot_bypass_pomdp_visibility() {
     sim.players[passer].action_facing = FacingBucket::East;
     sim.players[passer].receive_facing = FacingBucket::East;
     sim.players[visible_teammate].position = Vec2::new(56.0, 60.0);
-    sim.players[hidden_teammate].position = Vec2::new(18.0, 60.0);
+    sim.players[hidden_teammate].position = Vec2::new(1.0, 1.0);
     for home in 0..11 {
         if ![passer, visible_teammate, hidden_teammate].contains(&home) {
-            sim.players[home].position = Vec2::new(6.0, 18.0 + home as f64);
+            sim.players[home].position = Vec2::new(1.0, 2.0 + home as f64 * 0.1);
         }
     }
     for away in 11..22 {
@@ -19852,7 +19856,7 @@ fn learned_pass_plan_cannot_bypass_pomdp_visibility() {
         } if target == visible_teammate
     ));
 
-    sim.players[visible_teammate].position = Vec2::new(18.0, 62.0);
+    sim.players[visible_teammate].position = Vec2::new(1.0, 2.0);
     let hidden_snapshot = WorldSnapshot::from_match(&sim);
     let hidden_observation = hidden_snapshot.observation_for(passer);
     assert!(hidden_snapshot
@@ -19888,10 +19892,10 @@ fn human_pass_input_cannot_bypass_pomdp_visibility() {
     sim.players[passer].action_facing = FacingBucket::East;
     sim.players[passer].receive_facing = FacingBucket::East;
     sim.players[visible_teammate].position = Vec2::new(56.0, 60.0);
-    sim.players[hidden_teammate].position = Vec2::new(18.0, 60.0);
+    sim.players[hidden_teammate].position = Vec2::new(1.0, 1.0);
     for home in 0..11 {
         if ![passer, visible_teammate, hidden_teammate].contains(&home) {
-            sim.players[home].position = Vec2::new(6.0, 18.0 + home as f64);
+            sim.players[home].position = Vec2::new(1.0, 2.0 + home as f64 * 0.1);
         }
     }
     for away in 11..22 {
@@ -19954,7 +19958,7 @@ fn human_pass_input_cannot_bypass_pomdp_visibility() {
         } if target == visible_teammate
     ));
 
-    sim.players[visible_teammate].position = Vec2::new(18.0, 62.0);
+    sim.players[visible_teammate].position = Vec2::new(1.0, 2.0);
     let hidden_snapshot = WorldSnapshot::from_match(&sim);
     assert!(hidden_snapshot
         .ranked_visible_pass_targets(passer, 11)
@@ -33100,6 +33104,148 @@ fn ground_pass_reactive_trap_requires_reaction_time_not_just_two_yard_lane() {
 }
 
 #[test]
+fn middle_teammate_clears_longer_pass_lane_into_phase_space() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 7usize;
+    let midfielder = 8usize;
+    let defender = 3usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[holder, midfielder, defender, receiver]);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 50.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[midfielder].position = Vec2::new(40.2, 58.0);
+    sim.players[midfielder].velocity = Vec2::zero();
+    sim.players[defender].position = Vec2::new(39.8, 57.0);
+    sim.players[defender].velocity = Vec2::zero();
+    sim.players[receiver].position = Vec2::new(40.0, 74.0);
+    sim.players[receiver].velocity = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let midfielder_target = snapshot
+        .teammate_pass_lane_clearance_target_for(midfielder)
+        .expect("middle midfielder should clear the longer passing lane");
+    let defender_target = snapshot
+        .teammate_pass_lane_clearance_target_for(defender)
+        .expect("back-four defender should clear the longer passing lane");
+    let lane_from = sim.players[holder].position;
+    let lane_to = sim.players[receiver].position;
+
+    assert!(
+        segment_distance_to_point(lane_from, lane_to, midfielder_target)
+            >= TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS,
+        "clear-lane target should be outside the pass corridor: {midfielder_target:?}"
+    );
+    assert!(
+        midfielder_target.y > sim.players[midfielder].position.y,
+        "attacking midfielder should clear into forward space: {:?} from {:?}",
+        midfielder_target,
+        sim.players[midfielder].position
+    );
+    assert!(
+        defender_target.y < sim.players[defender].position.y,
+        "back-four player should clear the lane by dropping into safer space: {:?} from {:?}",
+        defender_target,
+        sim.players[defender].position
+    );
+
+    let mut middle_player = sim.players[midfielder].clone();
+    let intent = middle_player.run_time_step(&snapshot, None, None, &mut mulberry32(17_745));
+    let decision = middle_player
+        .last_decision
+        .as_ref()
+        .expect("middle player should record clear-lane decision");
+    assert_eq!(decision.action.as_str(), DUMMY_CLEAR_LANE_ACTION_LABEL);
+    match intent.action {
+        SoccerAction::MoveTo(target) => assert!(
+            target.distance(midfielder_target) < 1e-6,
+            "POMDP clear-lane intent should use the world clear-space target"
+        ),
+        other => panic!("expected middle player to move out of lane, got {other:?}"),
+    }
+}
+
+#[test]
+fn middle_teammate_dummies_ground_pass_through_to_longer_receiver() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6usize;
+    let middle = 8usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, middle, receiver]);
+    let origin = Vec2::new(40.0, 50.0);
+    let target = Vec2::new(40.0, 74.0);
+    sim.tick = 10;
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 55.0);
+    sim.ball.velocity = Vec2::new(0.0, 12.0);
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[passer].position = origin;
+    sim.players[middle].position = Vec2::new(40.15, 58.0);
+    sim.players[middle].velocity = Vec2::zero();
+    sim.players[middle].action_facing = FacingBucket::West;
+    sim.players[middle].receive_facing = FacingBucket::West;
+    sim.players[receiver].position = target;
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].skills.first_touch = 10.0;
+    let mut pass = test_pending_pass(Team::Home, passer, receiver, origin, target);
+    pass.launch_tick = 5;
+    pass.launch_speed_yps = 12.0;
+    sim.pending_pass = Some(pass.clone());
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot
+            .controllable_ground_pass_trajectory_for(middle)
+            .is_none(),
+        "middle teammate should decline the reactive trap when dummy-through is available"
+    );
+    let dummy_target = snapshot
+        .teammate_dummy_let_run_target_for(middle)
+        .expect("middle teammate should recognise the dummy-through action");
+    assert!(
+        segment_distance_to_point(origin, target, dummy_target)
+            >= TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS,
+        "dummy movement target should also clear the passing corridor: {dummy_target:?}"
+    );
+
+    let mut middle_player = sim.players[middle].clone();
+    let intent = middle_player.run_time_step(&snapshot, None, None, &mut mulberry32(17_746));
+    let decision = middle_player
+        .last_decision
+        .as_ref()
+        .expect("dummying middle player should record a decision");
+    assert_eq!(decision.action.as_str(), DUMMY_LET_RUN_ACTION_LABEL);
+    match intent.action {
+        SoccerAction::MoveTo(target) => assert!(
+            target.distance(dummy_target) < 1e-6,
+            "dummy-let-run intent should move to the lane-clearing space"
+        ),
+        other => panic!("expected dummy-let-run movement, got {other:?}"),
+    }
+
+    let controller = nearest_ball_controller_for_segment(
+        10,
+        origin,
+        target,
+        Vec2::new(0.0, 12.0),
+        &[sim.players[receiver].clone(), sim.players[middle].clone()],
+        Some(&pass),
+        None,
+        None,
+        0.0,
+        &mut mulberry32(17_747),
+    );
+    assert_eq!(
+        controller.map(|(id, team, _)| (id, team)),
+        Some((receiver, Team::Home)),
+        "physics resolver should let the dummy pass through to the longer receiver"
+    );
+}
+
+#[test]
 fn player_run_time_step_attacks_controllable_ground_pass_trajectory() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;
@@ -43705,10 +43851,13 @@ fn aerial_pass_likelihood_boosts_when_defender_or_midfielder_spots_runner() {
 fn ball_carrier_has_high_confidence_front_vision() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let holder = 9;
+    let rear_teammate = 8;
     sim.ball.holder = Some(holder);
     sim.ball.position = Vec2::new(40.0, 60.0);
     sim.players[holder].position = sim.ball.position;
     sim.players[holder].velocity = Vec2::zero();
+    sim.players[rear_teammate].position = Vec2::new(40.0, 40.0);
+    sim.players[rear_teammate].velocity = Vec2::zero();
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let core = Vec2::new(40.0, 80.0);
@@ -43728,12 +43877,32 @@ fn ball_carrier_has_high_confidence_front_vision() {
         .unwrap();
     assert!(shoulder_confidence >= 0.70);
     assert!(shoulder_confidence < 0.90);
-    assert!(!snapshot.player_can_see_point(holder, behind));
+    assert!(snapshot.player_can_see_point(holder, behind));
+    let behind_confidence = snapshot
+        .player_position_confidence_for_point(holder, behind)
+        .unwrap();
     assert!(
-        snapshot
-            .player_position_confidence_for_point(holder, behind)
-            .unwrap()
-            < 0.70
+        behind_confidence >= BALL_HOLDER_REAR_SCAN_POSITION_CONFIDENCE,
+        "rear scan confidence should remain usable: {behind_confidence}"
+    );
+    assert!(
+        behind_confidence < shoulder_confidence,
+        "rear scan confidence should stay below shoulder vision: rear={behind_confidence} shoulder={shoulder_confidence}"
+    );
+    let observation = snapshot.observation_for(holder);
+    let rear_entry = observation
+        .player_position_confidences
+        .iter()
+        .find(|entry| entry.player_id == rear_teammate)
+        .expect("rear teammate confidence entry");
+    assert!(
+        rear_entry.latency_seconds >= 1.0,
+        "rear scan should cost realistic head-swivel time: {}",
+        rear_entry.latency_seconds
+    );
+    assert!(
+        observation.look_behind_scan_active,
+        "ball-holder rear scan should be surfaced on the POMDP observation"
     );
 }
 

@@ -54,8 +54,6 @@ const WIDE_OUTLET_WIDTH_TARGET_FRACTION: f64 = 0.92;
 const WIDE_OUTLET_WIDTH_SHORTAGE_SCORE_LIFT: f64 = 0.42;
 const WIDE_OUTLET_WIDTH_SHORTAGE_FLOOR_LIFT: f64 = 0.20;
 const WIDE_OUTLET_NARROW_SHAPE_SUPPORT_DAMPING: f64 = 0.18;
-const OPEN_PASS_LANE_ACTION_LABEL: &str = "open-pass-lane";
-const ROUND_GOALKEEPER_ACTION_LABEL: &str = "round-goalkeeper";
 const OPEN_PASS_LANE_MIN_DRIBBLE_YARDS: f64 = 1.0;
 const OPEN_PASS_LANE_BASE_MAX_DRIBBLE_YARDS: f64 = 4.0;
 const OPEN_PASS_LANE_MAX_DRIBBLE_YARDS: f64 = 8.0;
@@ -1181,8 +1179,8 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "first-time-shot"
             | "first-time-header"
             | "dribble"
-            | "open-pass-lane"
-            | "round-goalkeeper"
+            | OPEN_PASS_LANE_ACTION_LABEL
+            | ROUND_GOALKEEPER_ACTION_LABEL
             | "carry-forward"
             | "carry-out-left"
             | "carry-out-right"
@@ -1896,8 +1894,8 @@ fn mpc_execution_estimate_for_action(
             | "side-step"
             | "left-cut"
             | "right-cut"
-            | "open-pass-lane"
-            | "round-goalkeeper"
+            | OPEN_PASS_LANE_ACTION_LABEL
+            | ROUND_GOALKEEPER_ACTION_LABEL
             | "nutmeg"
             | "xavi-turn"
             | "open-passing-lane"
@@ -2063,7 +2061,7 @@ fn mpc_execution_estimate_for_action(
                 (0.46 + dribble_skill * 0.26 + target_space_fit * 0.18 - pressure * 0.12)
                     .clamp(0.18, 0.97)
             }
-            "round-goalkeeper" => {
+            ROUND_GOALKEEPER_ACTION_LABEL => {
                 // A short carry to a closer spot with a clear strike past the keeper — feasible;
                 // scales with control + the space at the spot, lightly damped by pressure. (Ours'
                 // tuned estimate, folded onto the unified round-goalkeeper label during the merge.)
@@ -2071,7 +2069,7 @@ fn mpc_execution_estimate_for_action(
                     .clamp(0.18, 0.97)
             }
             "protect-ball" => (0.34 + dribble_skill * 0.28 + pressure * 0.22).clamp(0.10, 0.94),
-            "open-pass-lane" => {
+            OPEN_PASS_LANE_ACTION_LABEL => {
                 let situational_boost = open_lane_situation
                     .map(|situation| situation.pressure.max(situation.tracking) * 0.12)
                     .unwrap_or(0.0);
@@ -2165,7 +2163,7 @@ fn mpc_execution_estimate_for_action(
                     estimate.reselect_reason = "mpc-control-touch-unsettled";
                 }
             }
-            "tackle" | "slide-tackle" | "recover" => {
+            "tackle" | "slide-tackle" | ACTION_LABEL_RECOVER => {
                 // A ball-winning challenge: reach the carrier's ball and come away
                 // with it. Slide tackles trade a little execution certainty (commit /
                 // recovery risk) for their extra reach.
@@ -2305,7 +2303,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
                 | "press-cover"
                 | "defend"
                 | "hold"
-                | "recover"
+                | ACTION_LABEL_RECOVER
                 | "move"
         );
     let mpc_reselect_candidate = mpc_reselect_candidate_label(label);
@@ -2512,7 +2510,7 @@ fn decision_cadence_labels_match(committed_label: &str, candidate_label: &str) -
 fn decision_cadence_immediate_label(label: &str) -> bool {
     matches!(
         normalize_soccer_action_label(label),
-        "tackle" | "slide-tackle" | "recover"
+        "tackle" | "slide-tackle" | ACTION_LABEL_RECOVER
     )
 }
 
@@ -6138,7 +6136,7 @@ impl PlayerAgent {
         must_attack: bool,
     ) -> Vec<AgentActionOptionTrace> {
         if fifty_fifty_duel {
-            return single_action_option("fifty-fifty-duel");
+            return single_action_option(FIFTY_FIFTY_DUEL_ACTION_LABEL);
         }
 
         let recover_legal =
@@ -6179,7 +6177,7 @@ impl PlayerAgent {
         };
 
         normalize_action_options(vec![
-            AgentActionOptionTrace::new("recover", recover_score, recover_legal),
+            AgentActionOptionTrace::new(ACTION_LABEL_RECOVER, recover_score, recover_legal),
             AgentActionOptionTrace::new("hold", hold_score, true),
         ])
     }
@@ -7374,6 +7372,30 @@ impl PlayerAgent {
             }
         }
 
+        if !has_ball {
+            if let Some(target) = snapshot.teammate_dummy_let_run_target_for(self.id) {
+                let action = SoccerAction::MoveTo(target);
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state,
+                    observation,
+                    belief,
+                    vec![
+                        "pomdp-dummy-through".to_string(),
+                        DUMMY_LET_RUN_ACTION_LABEL.to_string(),
+                    ],
+                    single_action_option(DUMMY_LET_RUN_ACTION_LABEL),
+                    &action,
+                    DUMMY_LET_RUN_ACTION_LABEL,
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint: false,
+                };
+            }
+        }
+
         // Loose-ball awareness reflex (every tick, cheap): a player must recognize a LIVE
         // loose ball that is close OR rolling toward it and pounce on it directly — drive at
         // the kinematic trajectory intercept and sprint — instead of waiting for the broad
@@ -7422,9 +7444,9 @@ impl PlayerAgent {
                 // leading operation reflects the contest type — an explicit "fifty-fifty-duel"
                 // when both teams are right on it, else the ordinary "recover" pursuit.
                 let first_op = if fifty_fifty_duel {
-                    "fifty-fifty-duel"
+                    FIFTY_FIFTY_DUEL_ACTION_LABEL
                 } else {
-                    "recover"
+                    ACTION_LABEL_RECOVER
                 };
                 let action = SoccerAction::MoveTo(intercept);
                 let intent = self.committed_chaser_sprint_guarantee(
@@ -8215,6 +8237,27 @@ impl PlayerAgent {
                     };
                 }
             }
+            if let Some(target) = snapshot.teammate_pass_lane_clearance_target_for(self.id) {
+                let action = SoccerAction::MoveTo(target);
+                self.last_decision = Some(self.decision_trace(
+                    snapshot,
+                    mdp_state,
+                    observation,
+                    belief,
+                    vec![
+                        "pomdp-clear-pass-lane".to_string(),
+                        DUMMY_CLEAR_LANE_ACTION_LABEL.to_string(),
+                    ],
+                    single_action_option(DUMMY_CLEAR_LANE_ACTION_LABEL),
+                    &action,
+                    DUMMY_CLEAR_LANE_ACTION_LABEL,
+                ));
+                return PlayerIntent {
+                    player_id: self.id,
+                    action,
+                    sprint: false,
+                };
+            }
             if let Some((target, sprint)) = snapshot.pending_pass_reception_target_for(self.id) {
                 let action = SoccerAction::MoveTo(target);
                 self.last_decision = Some(self.decision_trace(
@@ -8223,9 +8266,9 @@ impl PlayerAgent {
                     observation,
                     belief,
                     vec!["receive-pending-pass".to_string()],
-                    single_action_option("recover"),
+                    single_action_option(ACTION_LABEL_RECOVER),
                     &action,
-                    "recover",
+                    ACTION_LABEL_RECOVER,
                 ));
                 return PlayerIntent {
                     player_id: self.id,
@@ -8277,9 +8320,9 @@ impl PlayerAgent {
                         "anticipate-pass".to_string(),
                         "contest-reception".to_string(),
                     ],
-                    single_action_option("recover"),
+                    single_action_option(ACTION_LABEL_RECOVER),
                     &action,
-                    "recover",
+                    ACTION_LABEL_RECOVER,
                 ));
                 return PlayerIntent {
                     player_id: self.id,
@@ -8355,10 +8398,10 @@ impl PlayerAgent {
                     mdp_state,
                     observation,
                     belief,
-                    vec!["long-ball-duel".to_string(), "recover".to_string()],
-                    single_action_option("recover"),
+                    vec!["long-ball-duel".to_string(), ACTION_LABEL_RECOVER.to_string()],
+                    single_action_option(ACTION_LABEL_RECOVER),
                     &action,
-                    "recover",
+                    ACTION_LABEL_RECOVER,
                 ));
                 return PlayerIntent {
                     player_id: self.id,
@@ -9696,7 +9739,7 @@ impl PlayerAgent {
                             }
                         }
                     }
-                    "open-pass-lane" => {
+                    OPEN_PASS_LANE_ACTION_LABEL => {
                         order_names.push(OPEN_PASS_LANE_ACTION_LABEL.to_string());
                         if let Some(plan) = open_pass_lane_plan {
                             let chance =
@@ -9719,7 +9762,7 @@ impl PlayerAgent {
                             }
                         }
                     }
-                    "round-goalkeeper" => {
+                    ROUND_GOALKEEPER_ACTION_LABEL => {
                         order_names.push(ROUND_GOALKEEPER_ACTION_LABEL.to_string());
                         if let Some(plan) = round_goalkeeper_plan {
                             let chance =
@@ -10207,7 +10250,7 @@ impl PlayerAgent {
                                     label.to_string(),
                                 ))
                             }
-                            "open-pass-lane" => open_pass_lane_plan.map(|plan| {
+                            OPEN_PASS_LANE_ACTION_LABEL => open_pass_lane_plan.map(|plan| {
                                 (
                                     SoccerAction::DribbleMove {
                                         target: plan.target,
@@ -10217,7 +10260,7 @@ impl PlayerAgent {
                                     OPEN_PASS_LANE_ACTION_LABEL.to_string(),
                                 )
                             }),
-                            "round-goalkeeper" => round_goalkeeper_plan.map(|plan| {
+                            ROUND_GOALKEEPER_ACTION_LABEL => round_goalkeeper_plan.map(|plan| {
                                 (
                                     SoccerAction::DribbleMove {
                                         target: plan.target,
@@ -10770,7 +10813,7 @@ impl PlayerAgent {
                     .loose_ball_attack_profile_for(self.id)
                     .attack_candidate
                     >= 0.65
-                || action_option_score(&loose_options, "recover") > 0.0;
+                || action_option_score(&loose_options, ACTION_LABEL_RECOVER) > 0.0;
             if should_recover {
                 action_options = loose_options;
                 order_names.extend(loose_order);
@@ -10793,7 +10836,10 @@ impl PlayerAgent {
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
                             <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
-                (SoccerAction::MoveTo(movement_target), "recover".to_string())
+                (
+                    SoccerAction::MoveTo(movement_target),
+                    ACTION_LABEL_RECOVER.to_string(),
+                )
             } else if let Some((support_target, sprint)) =
                 snapshot.aerial_attacking_support_intent_for(self.id, self.home_position)
             {
@@ -10881,7 +10927,7 @@ impl PlayerAgent {
                             && self.position.distance(*target) > 2.5)
                 }
             }
-            SoccerAction::MoveTo(target) if action_label == "recover" => {
+            SoccerAction::MoveTo(target) if action_label == ACTION_LABEL_RECOVER => {
                 // A loose ball that got away under pressure (notably the carrier's own
                 // long/heavy touch with a defender closing) must be SPRINTED to, not
                 // jogged — win the race back to it.
@@ -11461,7 +11507,7 @@ impl PlayerAgent {
                     "hold-up-flank".to_string(),
                 ))
             }
-            "round-goalkeeper" if observation.has_ball => self
+            ROUND_GOALKEEPER_ACTION_LABEL if observation.has_ball => self
                 .round_goalkeeper_dribble_plan_for(snapshot, observation)
                 .map(|round_plan| {
                     (
@@ -11481,7 +11527,7 @@ impl PlayerAgent {
                         "runaround-dribble".to_string(),
                     )
                 }),
-            "open-pass-lane" if observation.has_ball => {
+            OPEN_PASS_LANE_ACTION_LABEL if observation.has_ball => {
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
                 let mut lane_targets = Vec::with_capacity(visible_targets.len() + 1);
                 if let Some(target_player) = plan.target_player {
@@ -11650,9 +11696,9 @@ impl PlayerAgent {
                 )),
                 "defend".to_string(),
             )),
-            "recover" if snapshot.controlled_possession_team().is_none() => Some((
+            ACTION_LABEL_RECOVER if snapshot.controlled_possession_team().is_none() => Some((
                 SoccerAction::MoveTo(snapshot.loose_ball_recovery_target_for(self.id)),
-                "recover".to_string(),
+                ACTION_LABEL_RECOVER.to_string(),
             )),
             "tackle" => snapshot.ball.holder.and_then(|holder| {
                 if self.role == PlayerRole::Goalkeeper
@@ -11695,6 +11741,22 @@ impl PlayerAgent {
                     "press-cover".to_string(),
                 ))
             }
+            DUMMY_LET_RUN_ACTION_LABEL if !observation.has_ball => snapshot
+                .teammate_dummy_let_run_target_for(self.id)
+                .map(|target| {
+                    (
+                        SoccerAction::MoveTo(target),
+                        DUMMY_LET_RUN_ACTION_LABEL.to_string(),
+                    )
+                }),
+            DUMMY_CLEAR_LANE_ACTION_LABEL if !observation.has_ball => snapshot
+                .teammate_pass_lane_clearance_target_for(self.id)
+                .map(|target| {
+                    (
+                        SoccerAction::MoveTo(target),
+                        DUMMY_CLEAR_LANE_ACTION_LABEL.to_string(),
+                    )
+                }),
             "check-to-ball" if !observation.has_ball => snapshot
                 .check_to_ball_target_for(self.id, self.home_position)
                 .map(|target| {

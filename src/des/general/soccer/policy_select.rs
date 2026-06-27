@@ -36,6 +36,8 @@
 
 const ENABLE_ENV: &str = "DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK";
 
+use crate::des::general::soccer::POLICY_SELECTION_TOP_RANK_LIMIT;
+
 /// Distinct per-decision-site salts so the draw at, say, the possession ranker is
 /// statistically independent of the draw at the defensive ranker on the same tick
 /// for the same player. The concrete values are arbitrary but must stay stable
@@ -96,20 +98,26 @@ pub fn decision_unit_draw(decision_seed: u64, player_id: usize, tick: u64, site:
 /// The per-rank selection weights `[top1, top2, top3]` from the tunables tree
 /// (defaults `[0.70, 0.20, 0.10]`). Pulled through a thin accessor so the module
 /// stays unit-testable without the global tunables registry.
-fn rank_weights() -> [f64; 3] {
-    let t = &crate::des::general::soccer::tunables().policy_selection;
-    [t.top1_weight, t.top2_weight, t.top3_weight]
+fn rank_weights() -> [f64; POLICY_SELECTION_TOP_RANK_LIMIT] {
+    crate::des::general::soccer::tunables()
+        .policy_selection
+        .rank_weights()
 }
 
-/// Pick a rank in `0..n.min(3)` from a unit `draw`, using the first `n` rank
+/// Pick a rank in the supported top-k range from a unit `draw`, using the first
+/// `n` rank
 /// weights **renormalised** over what is available. Non-finite / non-positive
 /// weights are floored to zero; if everything is zero the best (rank 0) is taken.
 ///
 /// `n` is the number of candidates actually present. With `n >= 3` the full
 /// `[0.70, 0.20, 0.10]` applies; with `n == 2` it is `[0.70, 0.20]` renormalised
 /// to `~[0.78, 0.22]`; with `n <= 1` rank 0 is forced.
-pub fn sampled_rank(n: usize, weights: [f64; 3], draw: f64) -> usize {
-    let k = n.min(3);
+pub fn sampled_rank(
+    n: usize,
+    weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT],
+    draw: f64,
+) -> usize {
+    let k = n.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if k <= 1 {
         return 0;
     }
@@ -118,7 +126,7 @@ pub fn sampled_rank(n: usize, weights: [f64; 3], draw: f64) -> usize {
     } else {
         0.0
     };
-    let mut w = [0.0f64; 3];
+    let mut w = [0.0f64; POLICY_SELECTION_TOP_RANK_LIMIT];
     let mut total = 0.0;
     for i in 0..k {
         let wi = if weights[i].is_finite() {
@@ -150,9 +158,13 @@ pub fn sampled_rank(n: usize, weights: [f64; 3], draw: f64) -> usize {
 /// action was actually drawn from. Ranks past the available candidates (or past
 /// the three weighted ranks) get a small positive floor so an importance ratio
 /// never divides by zero. `n <= 1` ⇒ `1.0` (forced choice).
-pub fn behavior_probability_for_rank(n: usize, weights: [f64; 3], rank: usize) -> f64 {
+pub fn behavior_probability_for_rank(
+    n: usize,
+    weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT],
+    rank: usize,
+) -> f64 {
     const FLOOR: f64 = 1e-3;
-    let k = n.min(3);
+    let k = n.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if k <= 1 {
         return 1.0;
     }
