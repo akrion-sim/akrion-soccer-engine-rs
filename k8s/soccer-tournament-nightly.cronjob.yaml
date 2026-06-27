@@ -47,10 +47,10 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # 8h backstop (NOT a 7am stop) — the bracket is allowed to finish past the
-      # 2am-7am window; this only guards against a true hang. Includes the ~4-5 min
-      # cold clone+build (the build dir is a per-pod emptyDir — see volumes below).
-      activeDeadlineSeconds: 28800
+      # NO hard stop. Per owner directive (2026-06-18) the tournament runs OPEN-ENDED
+      # to completion however long it takes — there is no deadline window anymore.
+      # (Removed the 8h activeDeadlineSeconds backstop; concurrencyPolicy: Forbid still
+      # prevents the next night overlapping a still-running tournament.)
       backoffLimit: 1
       template:
         metadata:
@@ -161,14 +161,16 @@ spec:
                 # 60-min matches -> ~4.7h at T=2 before clone/build (see header).
                 - name: SOCCER_TOURNAMENT_MATCH_SECONDS
                   value: "3600"
-                # Soft cap is measured from binary start, after clone/build; with
-                # the current ~4-5m build this leaves roughly 5m before the hard
-                # job cap for failure marking, lock release, salvage promotion,
-                # and pod termination.
+                # 0 = DISABLED. There is no deadline anymore (open-ended run, owner
+                # directive 2026-06-18), so the app-level soft cap that used to stop
+                # the bracket between waves is turned off — it runs to completion.
                 - name: SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
-                  value: "17400"
+                  value: "0"
                 # Parallel workers - keep == the CPU limit below. Each worker runs one
-                # full SoccerMatch at a time.
+                # full SoccerMatch at a time. Held at 2 for the 128-team field: memory
+                # (128 brains + THREADS concurrent matches + bilearning buffers) is the
+                # binding limit on a 32Gi Hetzner node, and 22Gi was the proven-safe
+                # ceiling at T=2. With no deadline, T=2 still completes (~2h, ~60s/match).
                 - name: SOCCER_TOURNAMENT_THREADS
                   value: "2"
                 - name: SOCCER_TOURNAMENT_LEARNING_MODE
@@ -195,11 +197,11 @@ spec:
                   # the large AWS node, where the higher memory limit below actually fits.
                   memory: 8Gi
                 limits:
-                  # cpu == SOCCER_TOURNAMENT_THREADS (2). The tournament holds 128
+                  # cpu == SOCCER_TOURNAMENT_THREADS (6). The tournament holds 128
                   # neural brains + up to THREADS concurrent live matches and the
                   # bilearning transition buffers; 12Gi OOMKilled the run ~45min in
-                  # (exit 137, verified 2026-06-17 on Hetzner), so raise to 22Gi —
-                  # still comfortably under a 32Gi node alongside the control plane.
+                  # (exit 137, verified 2026-06-17 on Hetzner), so 22Gi — still
+                  # comfortably under a 32Gi node alongside the control plane.
                   cpu: "2"
                   memory: 22Gi
               securityContext:
