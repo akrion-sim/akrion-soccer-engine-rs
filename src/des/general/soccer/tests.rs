@@ -34486,6 +34486,16 @@ fn neural_learning_config_sanitizes_unstable_fast_learning_knobs() {
         config.sanitized_learning_rate(),
         MAX_SOCCER_NEURAL_LEARNING_RATE
     );
+    for bad_rate in [0.0, -1.0, f64::NAN] {
+        let config = SoccerNeuralLearningConfig {
+            learning_rate: bad_rate,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        assert_eq!(
+            config.sanitized_learning_rate(),
+            DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+        );
+    }
     assert_eq!(config.sanitized_batch_size(), MAX_SOCCER_NEURAL_BATCH_SIZE);
     assert_eq!(
         config.sanitized_max_batches_per_tick(),
@@ -81369,8 +81379,13 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
         corpus.push(sample(1.0, true));
         corpus.push(sample(0.0, false));
     }
-    let report = report_soccer_pass_completion_training(&corpus, 7, 300, 0.05)
-        .expect("a non-empty corpus should train a head");
+    let report = report_soccer_pass_completion_training(
+        &corpus,
+        7,
+        300,
+        DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    )
+    .expect("a non-empty corpus should train a head");
     assert_eq!(report.samples, corpus.len());
     assert_eq!(report.epochs, 300);
     assert!(report.training_steps > 0);
@@ -81379,8 +81394,21 @@ fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
         "a head trained on the loaded corpus should fit the separable pattern: acc={}",
         report.accuracy
     );
+    for bad_rate in [f64::NAN, -1.0, 10_000.0] {
+        let report = report_soccer_pass_completion_training(&corpus, 7, 2, bad_rate)
+            .expect("standalone pass-completion training should sanitize bad rates");
+        assert!(report.training_steps > 0);
+        assert!(report.final_loss.is_finite());
+        assert!(report.accuracy.is_finite());
+    }
     // An empty corpus (nothing persisted yet) trains nothing rather than persisting a random net.
-    assert!(report_soccer_pass_completion_training(&[], 7, 300, 0.05).is_none());
+    assert!(report_soccer_pass_completion_training(
+        &[],
+        7,
+        300,
+        DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    )
+    .is_none());
 }
 
 #[test]

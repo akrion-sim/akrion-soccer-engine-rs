@@ -4227,6 +4227,7 @@ const TEAM_BALL_RING_TIGHT_YARDS: f64 = 1.0;
 const TEAM_BALL_RING_CLOSE_YARDS: f64 = 3.0;
 const TEAM_BALL_RING_NEAR_YARDS: f64 = 5.0;
 const DEFAULT_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.015;
+pub const DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE: f64 = 0.05;
 const DEFAULT_SOCCER_NEURAL_BATCH_SIZE: usize = 16;
 const DEFAULT_SOCCER_NEURAL_TRAIN_EVERY_TICKS: usize = secs_to_ticks(0.4) as usize;
 const DEFAULT_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 2;
@@ -4308,7 +4309,7 @@ const SOCCER_SKILL_POLICY_DECISION_WEIGHT: f64 = 0.4;
 const SOCCER_WORLD_MODEL_HIDDEN_UNITS: usize = 64;
 const SOCCER_WORLD_MODEL_LEARNING_RATE: f64 = 0.02;
 const SOCCER_WORLD_MODEL_GRAD_CLIP_NORM: f64 = 8.0;
-const MAX_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.25;
+pub const MAX_SOCCER_NEURAL_LEARNING_RATE: f64 = 0.25;
 const MAX_SOCCER_NEURAL_BATCH_SIZE: usize = 1024;
 const MAX_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 16;
 const MAX_SOCCER_NEURAL_HIDDEN_UNITS: usize = 256;
@@ -4538,6 +4539,19 @@ fn default_neural_learning_config() -> SoccerNeuralLearningConfig {
 
 fn default_soccer_neural_learning_rate() -> f64 {
     DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+}
+
+pub fn soccer_sanitized_learning_rate(learning_rate: f64, fallback_learning_rate: f64) -> f64 {
+    let fallback = if fallback_learning_rate.is_finite() && fallback_learning_rate > 0.0 {
+        fallback_learning_rate.min(MAX_SOCCER_NEURAL_LEARNING_RATE)
+    } else {
+        DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+    };
+    if learning_rate.is_finite() && learning_rate > 0.0 {
+        learning_rate.min(MAX_SOCCER_NEURAL_LEARNING_RATE)
+    } else {
+        fallback
+    }
 }
 
 fn default_soccer_neural_batch_size() -> usize {
@@ -15227,12 +15241,7 @@ impl SoccerNeuralLearningConfig {
     }
 
     fn sanitized_learning_rate(&self) -> f64 {
-        if self.learning_rate.is_finite() {
-            self.learning_rate
-                .clamp(0.0, MAX_SOCCER_NEURAL_LEARNING_RATE)
-        } else {
-            DEFAULT_SOCCER_NEURAL_LEARNING_RATE
-        }
+        soccer_sanitized_learning_rate(self.learning_rate, DEFAULT_SOCCER_NEURAL_LEARNING_RATE)
     }
 
     fn sanitized_critic_baseline_weight(&self) -> f64 {
@@ -32613,6 +32622,8 @@ pub fn train_soccer_pass_completion_head(
     if usable == 0 || epochs == 0 {
         return None;
     }
+    let learning_rate =
+        soccer_sanitized_learning_rate(learning_rate, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE);
     let mut head = SoccerPassCompletionHead::new(seed);
     let mut final_loss = 0.0;
     for _ in 0..epochs {

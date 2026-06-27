@@ -20,7 +20,7 @@ use crate::des::general::soccer::{
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS,
-    DEFAULT_FIELD_WIDTH_YARDS,
+    DEFAULT_FIELD_WIDTH_YARDS, MAX_SOCCER_NEURAL_LEARNING_RATE,
 };
 use crate::des::shared::capabilities::RandomSource;
 
@@ -924,6 +924,11 @@ pub fn validate_soccer_neural_learning_config_for_learning_run(
     }
     if config.learning_rate <= 0.0 {
         return Err("learningRate must be positive when neural learning is enabled".to_string());
+    }
+    if config.learning_rate > MAX_SOCCER_NEURAL_LEARNING_RATE {
+        return Err(format!(
+            "learningRate must be <= {MAX_SOCCER_NEURAL_LEARNING_RATE} when neural learning is enabled"
+        ));
     }
     if config.batch_size == 0 {
         return Err("batchSize must be at least 1 when neural learning is enabled".to_string());
@@ -6303,6 +6308,16 @@ mod tests {
             .expect_err("zero neural batch size should fail fast");
 
         assert!(err.contains("batchSize"), "{err}");
+
+        let neural = SoccerNeuralLearningConfig {
+            enabled: true,
+            learning_rate: MAX_SOCCER_NEURAL_LEARNING_RATE * 2.0,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let err = validate_soccer_neural_learning_config_for_learning_run(&neural)
+            .expect_err("above-cap neural learning rate should fail fast");
+
+        assert!(err.contains("learningRate"), "{err}");
 
         let neural = SoccerNeuralLearningConfig {
             enabled: true,
