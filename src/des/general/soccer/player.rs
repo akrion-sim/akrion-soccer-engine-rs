@@ -2607,13 +2607,28 @@ mod decision_cadence_player_tests {
 }
 
 fn agentic_action_order<T>(items: Vec<(T, f64)>) -> Vec<T> {
+    agentic_action_order_scored(items).0
+}
+
+/// Like [`agentic_action_order`] but also returns the post-transform ordering
+/// weight of each item in ranked order, so a value-weighted (Boltzmann) policy
+/// draw can score candidates by how good they are rather than by rank alone. The
+/// item order is identical to [`agentic_action_order`]; the weights are exactly
+/// the keys it sorts on (so `weights[0]` is the argmax weight).
+fn agentic_action_order_scored<T>(items: Vec<(T, f64)>) -> (Vec<T>, Vec<f64>) {
     let mut keyed = Vec::with_capacity(items.len());
     for (ordinal, (item, weight)) in items.into_iter().enumerate() {
         let weight = weighted_agentic_order_weight(weight);
         keyed.push((weight, ordinal, item));
     }
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    keyed.into_iter().map(|(_, _, item)| item).collect()
+    let mut ordered = Vec::with_capacity(keyed.len());
+    let mut weights = Vec::with_capacity(keyed.len());
+    for (weight, _, item) in keyed {
+        ordered.push(item);
+        weights.push(weight);
+    }
+    (ordered, weights)
 }
 
 impl PlayerAgent {
@@ -7748,8 +7763,10 @@ impl PlayerAgent {
                 })
                 .collect::<Vec<_>>();
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(weighted_ops),
+                let (ordered, ordered_scores) = agentic_action_order_scored(weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -8980,8 +8997,10 @@ impl PlayerAgent {
                 apply_decision_cadence_hold_weights(&mut weighted_ops, label);
             }
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(weighted_ops),
+                let (ordered, ordered_scores) = agentic_action_order_scored(weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10441,8 +10460,11 @@ impl PlayerAgent {
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
             let support_order = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(support_weighted_ops),
+                let (ordered, ordered_scores) =
+                    agentic_action_order_scored(support_weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10594,8 +10616,11 @@ impl PlayerAgent {
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(defensive_weighted_ops),
+                let (ordered, ordered_scores) =
+                    agentic_action_order_scored(defensive_weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10735,18 +10760,20 @@ impl PlayerAgent {
                     >= 0.65,
             );
             let loose_order = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(
-                        loose_options
-                            .iter()
-                            .map(|option| {
-                                (
-                                    option.label.clone(),
-                                    if option.legal { option.score } else { 0.0 },
-                                )
-                            })
-                            .collect(),
-                    ),
+                let (ordered, ordered_scores) = agentic_action_order_scored(
+                    loose_options
+                        .iter()
+                        .map(|option| {
+                            (
+                                option.label.clone(),
+                                if option.legal { option.score } else { 0.0 },
+                            )
+                        })
+                        .collect(),
+                );
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,

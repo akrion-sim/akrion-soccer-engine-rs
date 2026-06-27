@@ -66,6 +66,28 @@ const BACK_FOUR_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_M
 /// flat line + the 5s consistency window) at the midfield band chokepoint. Off by
 /// default ⇒ byte-identical to the existing fixed-ideal midfield band.
 const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MODEL";
+/// Env gate enabling the **v2 field-anchored back-four line depth**: the line
+/// CENTRE is anchored on the [`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`] line while the
+/// ball is upfield of it, tracks the ball to parity between the keeper's 6 and the
+/// anchor, sticks at the 6 inside it, and trails a dynamic
+/// [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`]..[`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
+/// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
+/// the existing ball-relative 10-30yd band + halfway+5 cap.
+const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
+
+/// Own-goal depth (yd) the back-four AVERAGE is anchored to while the ball is
+/// upfield of it: the line holds here (offside trap) until the ball penetrates
+/// inside it, then tracks the ball back to parity, then sticks at the keeper's 6.
+pub const BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS: f64 = 15.0;
+/// Trailing-gap band (yd behind the ball) in the rising regime once the ball is
+/// deep upfield (`ball_depth > anchor + gap`). The dynamic line head picks within
+/// it: the min is a higher line (smaller gap), the max a deeper line.
+pub const BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS: f64 = 20.0;
+pub const BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS: f64 = 40.0;
+/// Neutral gap fraction (mid-band) used when the line-depth inputs are degenerate
+/// (a roster with no defenders/opponents/keeper) so the desired gap falls back to
+/// the middle of the 20-40 band rather than an arbitrary literal.
+pub const BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION: f64 = 0.5;
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -104,6 +126,56 @@ pub fn midfield_line_model_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| env_flag_enabled(MIDFIELD_LINE_MODEL_ENABLE_ENV))
     }
+}
+
+/// Whether the v2 field-anchored back-four line depth is used at the live line
+/// chokepoint this process. Off ⇒ the existing ball-relative band stands (parity).
+pub fn back_four_line_depth_v2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+    }
+}
+
+/// Pure, RNG-free **v2 line-centre depth** (yd from own goal). All arguments are
+/// yards-from-own-goal in the defending team's attacking frame.
+///
+/// - `ball_depth`: the (predicted) ball's distance from our own goal.
+/// - `desired_gap`: the trailing gap the line wants behind a deep ball (20..40).
+/// - `anchor`: the depth the line holds while the ball is upfield of it (15).
+/// - `six`: the keeper's sticky floor (≈6) — the line never drops deeper.
+/// - `max_depth`: the high-line cap (halfway + into-opp-half allowance).
+///
+/// Shape vs. `ball_depth`: parity ramp `six→anchor`, a plateau at `anchor` across
+/// `[anchor, anchor+desired_gap]`, then a rising `ball_depth − desired_gap` ramp,
+/// then the `max_depth` plateau. Monotonic non-decreasing and continuous.
+pub fn back_four_line_target_depth_v2(
+    ball_depth: f64,
+    desired_gap: f64,
+    anchor: f64,
+    six: f64,
+    max_depth: f64,
+) -> f64 {
+    let raw = ball_depth - desired_gap;
+    // The deepest (closest-to-goal) the CENTRE may sit: hold the anchor while the
+    // ball is outside it; track the ball back to parity between the 6 and the
+    // anchor; stick at the 6 once the ball is inside it (the keeper owns behind).
+    let min_depth = if ball_depth > anchor {
+        anchor
+    } else if ball_depth >= six {
+        ball_depth
+    } else {
+        six
+    };
+    // Keep the band valid if a degenerate roster pushes `six`/anchor past the cap.
+    let lo = min_depth.min(max_depth);
+    raw.clamp(lo, max_depth)
 }
 
 /// Raw (un-normalized) state the line model is a function of, captured in the
@@ -999,6 +1071,52 @@ mod back_four_line_tests {
         assert_eq!(report.samples, 16);
         assert_eq!(report.epochs, 4);
         assert!(report.training_steps > 0 && report.final_loss.is_finite());
+    }
+
+    #[test]
+    fn v2_depth_holds_the_anchor_while_ball_is_outside_it() {
+        // anchor 15, six 6, cap 65 (halfway+5 on a 120 pitch), desired_gap 30.
+        let d = |ball: f64| back_four_line_target_depth_v2(ball, 30.0, 15.0, 6.0, 65.0);
+        // Ball at 30 / 25 → line ~15 (the plateau), not dragged up to ball-30.
+        assert!((d(30.0) - 15.0).abs() < 1e-9, "ball 30 -> {}", d(30.0));
+        assert!((d(25.0) - 15.0).abs() < 1e-9, "ball 25 -> {}", d(25.0));
+        // Plateau holds across [anchor, anchor+gap] = [15, 45].
+        assert!((d(45.0) - 15.0).abs() < 1e-9, "ball 45 -> {}", d(45.0));
+    }
+
+    #[test]
+    fn v2_depth_tracks_to_parity_between_six_and_anchor_then_sticks_at_six() {
+        let d = |ball: f64| back_four_line_target_depth_v2(ball, 30.0, 15.0, 6.0, 65.0);
+        // Between the 6 and the 15 the centre tracks the ball to parity (gap 0).
+        assert!((d(15.0) - 15.0).abs() < 1e-9, "ball 15 -> {}", d(15.0));
+        assert!((d(12.0) - 12.0).abs() < 1e-9, "ball 12 -> {}", d(12.0));
+        assert!((d(6.0) - 6.0).abs() < 1e-9, "ball 6 -> {}", d(6.0));
+        // Inside the 6 the centre sticks at 6 ⇒ a signed (negative) gap behind ball.
+        assert!((d(4.0) - 6.0).abs() < 1e-9, "ball 4 -> {}", d(4.0));
+        assert!(4.0 - d(4.0) < 0.0, "ball 4 should give a negative signed gap");
+    }
+
+    #[test]
+    fn v2_depth_rises_and_caps_when_the_ball_is_deep_upfield() {
+        let d = |ball: f64| back_four_line_target_depth_v2(ball, 30.0, 15.0, 6.0, 65.0);
+        // Past anchor+gap (45) the line rises, trailing `desired_gap` behind the ball.
+        assert!((d(60.0) - 30.0).abs() < 1e-9, "ball 60 -> {}", d(60.0));
+        assert!((d(80.0) - 50.0).abs() < 1e-9, "ball 80 -> {}", d(80.0));
+        // ...but never past the high-line cap (halfway+5 = 65).
+        assert!((d(110.0) - 65.0).abs() < 1e-9, "ball 110 -> {}", d(110.0));
+    }
+
+    #[test]
+    fn v2_depth_is_monotonic_non_decreasing_in_ball_depth() {
+        let d = |ball: f64| back_four_line_target_depth_v2(ball, 30.0, 15.0, 6.0, 65.0);
+        let mut prev = d(0.0);
+        let mut ball = 0.0;
+        while ball <= 120.0 {
+            let cur = d(ball);
+            assert!(cur + 1e-9 >= prev, "non-monotonic at ball={ball}: {prev} -> {cur}");
+            prev = cur;
+            ball += 0.5;
+        }
     }
 
     #[test]

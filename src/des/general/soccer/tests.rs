@@ -19536,6 +19536,170 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     }
 }
 
+/// v2 field-anchored line CENTRE geometry (gate-independent: calls the helper
+/// directly). Home defends y=0 attacking +y, so a centre's forward-coordinate
+/// equals its depth from our own goal.
+#[test]
+fn v2_line_centre_anchors_at_fifteen_tracks_inside_and_sticks_at_six() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    let cap = sim.config.field_length_yards * 0.5
+        + tunables()
+            .defensive_shape
+            .defensive_line_max_into_opp_half_yards;
+    // Move the (stationary, so predicted == current) ball to a depth and read the
+    // v2 centre depth from our own goal.
+    let centre_at = |sim: &mut SoccerMatch, depth: f64| -> f64 {
+        let x = sim.ball.position.x;
+        sim.ball.position = Vec2::new(x, depth);
+        sim.ball.velocity = Vec2::zero();
+        WorldSnapshot::from_match(sim).back_four_line_v2_centre_fwd(Team::Home)
+    };
+
+    // Ball outside the 15yd anchor ⇒ the centre HOLDS the anchor (the plateau),
+    // independent of the dynamic 20-40 gap — it is not dragged up to the ball.
+    assert!(
+        (centre_at(&mut sim, 30.0) - 15.0).abs() < 1e-6,
+        "ball 30 -> centre {}",
+        centre_at(&mut sim, 30.0)
+    );
+    assert!(
+        (centre_at(&mut sim, 25.0) - 15.0).abs() < 1e-6,
+        "ball 25 -> centre {}",
+        centre_at(&mut sim, 25.0)
+    );
+    // Between the 6 and the 15 the centre tracks the ball back to parity.
+    assert!(
+        (centre_at(&mut sim, 12.0) - 12.0).abs() < 1e-6,
+        "ball 12 -> centre {}",
+        centre_at(&mut sim, 12.0)
+    );
+    // Inside the 6 the centre sticks at the keeper's line (~6), never deeper.
+    let c4 = centre_at(&mut sim, 4.0);
+    assert!((6.0..=8.0).contains(&c4), "ball 4 -> centre {c4} (want ~6)");
+    // Deep in the opponent half the centre never crosses the high cap (halfway+5).
+    let c_deep = centre_at(&mut sim, 110.0);
+    assert!((c_deep - cap).abs() < 1e-6, "ball 110 -> centre {c_deep}, cap {cap}");
+    // In the rising regime the line trails a 20-40yd gap behind a deep ball.
+    let c80 = centre_at(&mut sim, 80.0);
+    let trailing_gap = 80.0 - c80;
+    assert!(
+        (20.0..=40.0).contains(&trailing_gap),
+        "ball 80 -> centre {c80}, trailing gap {trailing_gap} out of [20,40]"
+    );
+}
+
+/// v2 flatten end-to-end: a defender caught far upfield is pulled back onto the
+/// anchored flat line (it may never sit ahead of the centre by more than the
+/// half-band), exercising `back_four_line_depth_v2_adjusted_y` directly.
+#[test]
+fn v2_adjusted_y_pulls_an_upfield_defender_back_onto_the_anchor() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(sim.ball.position.x, 25.0); // ball on the plateau
+    sim.ball.velocity = Vec2::zero();
+    let snap = WorldSnapshot::from_match(&sim);
+    let me = snap
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .expect("a home defender");
+    let centre = snap.back_four_line_v2_centre_fwd(Team::Home); // ~15
+    let level_half_band = 0.5 * 2.0; // BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5
+    // Ask for a target 40yd upfield (well ahead of the ~15yd anchor).
+    let adjusted = snap.back_four_line_depth_v2_adjusted_y(me, 40.0);
+    assert!(
+        adjusted <= centre + level_half_band + 1e-6,
+        "a defender at 40 must be pulled back to <= centre+halfband: adjusted {adjusted}, centre {centre}"
+    );
+    assert!(adjusted < 25.0, "must be pulled well back from the 40yd ask: {adjusted}");
+}
+
+/// A/B sim report for the v2 line (run explicitly, isolated from the parallel
+/// suite so the process-wide env gate can't race):
+///   cargo test --lib v2_sim_ab_report -- --ignored --nocapture --exact \
+///     des::general::soccer::tests::v2_sim_ab_report
+/// Simulates the same seeds with the gate off then on and prints how deep the home
+/// back four sits, how often it strays into the opponent half, and the scoreline.
+#[test]
+#[ignore]
+fn v2_sim_ab_report() {
+    const ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
+    let seeds = [7_777u32, 13_013, 24_601];
+    let secs = 300.0;
+    let ticks = (secs * 15.0) as usize; // DEFAULT_DT_SECONDS = 1/15
+
+    // Returns (avg home back-four depth, fraction of ticks in opp half, gh, ga).
+    let run = |on: bool| -> (f64, f64, u32, u32) {
+        if on {
+            std::env::set_var(ENV, "1");
+        } else {
+            std::env::remove_var(ENV);
+        }
+        let (mut depth_sum, mut samples, mut opp_half, mut gh, mut ga) =
+            (0.0f64, 0u64, 0u64, 0u32, 0u32);
+        for &seed in &seeds {
+            let mut m = SoccerMatch::default_11v11(MatchConfig {
+                seed,
+                duration_seconds: secs + 50.0,
+                ..Default::default()
+            });
+            let halfway = m.config.field_length_yards * 0.5;
+            for _ in 0..ticks {
+                m.run_time_step();
+                let (mut s, mut n) = (0.0, 0.0);
+                for p in m.players.iter() {
+                    if p.team == Team::Home && p.role == PlayerRole::Defender {
+                        s += p.position.y; // Home own goal at y=0 ⇒ depth == y
+                        n += 1.0;
+                    }
+                }
+                if n > 0.0 {
+                    let avg = s / n;
+                    depth_sum += avg;
+                    samples += 1;
+                    if avg > halfway {
+                        opp_half += 1;
+                    }
+                }
+            }
+            gh += m.score_home;
+            ga += m.score_away;
+        }
+        std::env::remove_var(ENV);
+        (
+            depth_sum / samples.max(1) as f64,
+            opp_half as f64 / samples.max(1) as f64,
+            gh,
+            ga,
+        )
+    };
+
+    let (off_depth, off_opp, off_gh, off_ga) = run(false);
+    let (on_depth, on_opp, on_gh, on_ga) = run(true);
+    eprintln!("\n=== v2 back-four line A/B ({} seeds, {secs}s each) ===", seeds.len());
+    eprintln!(
+        "OFF: home back-four avg depth {off_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{off_gh}-A{off_ga}",
+        off_opp * 100.0
+    );
+    eprintln!(
+        "ON : home back-four avg depth {on_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{on_gh}-A{on_ga}",
+        on_opp * 100.0
+    );
+    eprintln!(
+        "Δ  : depth {:+.2}yd (negative = deeper line) | opp-half {:+.1}pp\n",
+        on_depth - off_depth,
+        (on_opp - off_opp) * 100.0
+    );
+
+    assert!(off_depth.is_finite() && on_depth.is_finite());
+    // The whole point: v2 keeps the back four deeper / out of the opponent half.
+    assert!(
+        on_opp <= off_opp + 1e-3,
+        "v2 should not spend MORE time in the opponent half (on {on_opp:.3} vs off {off_opp:.3})"
+    );
+}
+
 #[test]
 fn defensive_line_cushion_suspends_band_inside_own_twenty_yards() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {

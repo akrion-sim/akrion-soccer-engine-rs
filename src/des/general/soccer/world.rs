@@ -34566,7 +34566,16 @@ impl WorldSnapshot {
         // ceiling wins — bulletproof, never panics on lower > upper).
         let upper = (ball_fwd - min_behind).min(opp_half_ceiling_fwd);
         let lower = (ball_fwd - max_behind).min(upper);
-        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
+        // v2 field-anchored line (gated): the desired AVERAGE is the v2 centre
+        // (15yd anchor + dynamic 20-40yd gap + sticky-6 + halfway cap) rather than
+        // the ball-relative band clamp. All projected-average corrections and the
+        // flat-line clamp below then target that single centre. Off ⇒ byte-identical.
+        let v2_centre_fwd =
+            back_four_line_depth_v2_enabled().then(|| self.back_four_line_v2_centre_fwd(me.team));
+        let line_band_avg_fwd = |avg: f64| match v2_centre_fwd {
+            Some(centre) => centre,
+            None => avg.clamp(lower, upper),
+        };
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -40387,6 +40396,99 @@ impl WorldSnapshot {
     /// has stepped out of the line to contest); the band is fully suspended inside the team's own
     /// 5-yard emergency zone; and within 20yd of our own goal the 10yd minimum standoff is waived
     /// (the line may sit level with the ball on top of the box, just not ahead of it).
+    /// The dynamic trailing gap (yd, in `[BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS,
+    /// BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS]`) the v2 line wants behind a deep ball.
+    /// Read from the learned line-depth head once trained + enabled, else the
+    /// analytic seed; `frac` 0 = a higher line (min gap), 1 = a deeper line (max).
+    fn back_four_desired_gap_yards(&self, team: Team) -> f64 {
+        let frac = self
+            .build_back_four_line_inputs(team)
+            .map(|inputs| {
+                self.line_depth_head
+                    .as_ref()
+                    .filter(|head| {
+                        back_four_line_model_enabled()
+                            && head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS
+                    })
+                    .and_then(|head| head.predict(&inputs))
+                    .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs))
+            })
+            .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
+            .clamp(0.0, 1.0);
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac
+    }
+
+    /// The v2 line-CENTRE forward-coordinate (attack frame) for `team`'s back four:
+    /// `own_goal_fwd + ` the pure [`back_four_line_target_depth_v2`] depth (anchor on
+    /// the 15yd line, track to parity inside it, stick at the keeper's 6, trail a
+    /// dynamic 20-40yd behind a deep ball, capped at halfway + the into-opp-half
+    /// allowance). Shared by both live line chokepoints so they agree on the centre.
+    /// Leads the ball by the standard lookahead so a fast carrier pulls it early.
+    pub(crate) fn back_four_line_v2_centre_fwd(&self, team: Team) -> f64 {
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let predicted_fwd = self
+            .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
+            .y
+            * attack;
+        let ball_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, self.field_length);
+        let desired_gap = self.back_four_desired_gap_yards(team);
+        let six = self.back_four_six_yard_line_target_depth(team);
+        let max_depth = self.field_length * 0.5
+            + tunables()
+                .defensive_shape
+                .defensive_line_max_into_opp_half_yards;
+        let centre_depth = back_four_line_target_depth_v2(
+            ball_depth,
+            desired_gap,
+            BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS,
+            six,
+            max_depth,
+        );
+        own_goal_fwd + centre_depth
+    }
+
+    /// v2 field-anchored back-four line target for `me` (gated by
+    /// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2`). The CENTRE comes from
+    /// [`Self::back_four_line_v2_centre_fwd`]. The ≤2yd flat offside clamp is kept
+    /// around that centre; the ~3s movement grace (handled by the caller's shape
+    /// easing) lets individuals sit transiently off the line and converge. Mirrors
+    /// the flatten tail of [`Self::defender_line_band_average_adjusted_y`].
+    pub(crate) fn back_four_line_depth_v2_adjusted_y(
+        &self,
+        me: &PlayerSnapshot,
+        compact_y: f64,
+    ) -> f64 {
+        let attack = me.team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
+        let centre_fwd = self.back_four_line_v2_centre_fwd(me.team);
+        let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+        // The line may always drop DEEPER (cover/retreat) but never step ahead of
+        // the centre by more than the half-band (that plays runners onside).
+        let shallowest_fwd = centre_fwd + level_half_band;
+        let deepest_fwd = own_goal_fwd;
+        let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
+        // The flat trap is lifted while WE control (centre-backs split / full-backs
+        // overlap), while a pass is in flight (offside already judged; lane-cutters
+        // must be free to step), and when the offside law is suspended (a restart in
+        // behind — nothing to trap). Unlike the legacy line the v2 trap is NOT gated
+        // off deep in our own third: holding the flat 15yd line there is the point.
+        let controls_ball = self.controlled_possession_team() == Some(me.team);
+        if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
+            return clamped_fwd * attack;
+        }
+        let ahead_cap = centre_fwd + level_half_band;
+        // While a carrier breaks through, the line must be free to DROP and cover, so
+        // the pull-up (lower edge) is suspended and the four re-level once it clears.
+        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
+            clamped_fwd.min(ahead_cap)
+        } else {
+            clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
+        };
+        leveled_fwd * attack
+    }
+
     fn defender_line_band_average_adjusted_y(&self, me: &PlayerSnapshot, compact_y: f64) -> f64 {
         let attack = me.team.attack_dir();
         let ball_fwd = self.ball.position.y * attack;
@@ -40405,6 +40507,12 @@ impl WorldSnapshot {
         }
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return compact_y;
+        }
+        // v2 field-anchored line depth (gated). Takes over the band+flatten below
+        // with a 15yd-anchored centre + dynamic 20-40yd trailing gap; off ⇒ the
+        // legacy ball-relative 10-30yd band + halfway+5 cap stands (byte-identical).
+        if back_four_line_depth_v2_enabled() {
+            return self.back_four_line_depth_v2_adjusted_y(me, compact_y);
         }
         let max_gap = DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS.min(ball_from_own_goal);
         // No offside in force (the ball is being played directly from a throw-in &c.): the line
