@@ -40460,6 +40460,25 @@ fn soccer_live_pg_neural_tactical_only() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the live server pays the (potentially minutes-long) initial Postgres policy load
+/// *before* binding the HTTP port. Default `false`: bind first and defer the first load to the
+/// background refresh thread (which does an immediate first pass), so `:5055` is never dead on
+/// arrival while a large gen-N tabular policy streams in from a remote RDS. Opt in with
+/// `SOCCER_LIVE_POLICY_BLOCKING_STARTUP_LOAD=1` to restore the old block-until-loaded behaviour
+/// (e.g. a headless capture that must serve the cluster policy from its very first request).
+/// Regardless of this flag, a blocking load is still used when the background refresh is disabled
+/// (`SOCCER_LIVE_POLICY_PG_REFRESH_SECONDS=0`), since nothing else would ever perform it.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_blocking_startup_load() -> bool {
+    std::env::var("SOCCER_LIVE_POLICY_BLOCKING_STARTUP_LOAD")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 // ── Postgres → live-server policy bridge ───────────────────────────────────────────────
 // Built only with the `postgres-persistence` feature. When `SOCCER_DATABASE_URL` is set the
 // live server loads the latest ACTIVE learned policy (tabular Q + neural net) for the
@@ -40729,7 +40748,21 @@ impl SoccerLiveServer {
                 println!(
                     "# soccer-live: reused warm in-memory learned policy (skipped postgres reload)"
                 );
+            } else if !soccer_live_pg_blocking_startup_load() && soccer_live_pg_refresh_seconds() > 0
+            {
+                // DEFAULT (bind-first): skip the synchronous initial PG load so `run()` binds the
+                // HTTP port immediately instead of blocking for minutes while a large gen-N tabular
+                // policy streams from a remote RDS. The background refresh thread spawned in `run()`
+                // performs an immediate first pass, swapping the cluster policy in (and warming the
+                // per-game cache) within seconds. Until then the server serves on the local-file +
+                // neural snapshot loaded above — never dead on arrival. Opt back into the old
+                // block-until-loaded behaviour with `SOCCER_LIVE_POLICY_BLOCKING_STARTUP_LOAD=1`.
+                println!(
+                    "# soccer-live: deferring initial postgres policy load to the background refresher (binds immediately; serving local-file policy meanwhile)"
+                );
             } else {
+                // Blocking load: explicitly requested, or the background refresh is disabled
+                // (`SOCCER_LIVE_POLICY_PG_REFRESH_SECONDS=0`) so nothing else would ever load it.
                 match soccer_live_pg_connect_for_policy(&session.sim.config) {
                     Ok(Some((mut store, experiment_id))) => {
                         match soccer_live_fetch_latest_pg_policy(&mut store, &experiment_id) {
@@ -40798,8 +40831,18 @@ impl SoccerLiveServer {
                             Option<(crate::des::soccer_learning_pg::SoccerLearningPgStore, String)> =
                             None;
                         let mut last_seen: Option<i64> = None;
+                        // The first pass runs immediately (no pre-sleep) so the cluster policy is
+                        // loaded within seconds of the port binding — this is what the bind-first
+                        // startup (see `new()`) relies on to swap the deferred policy in. Every
+                        // later pass, and every retry after a transient failure, waits the refresh
+                        // interval first.
+                        let mut first_pass = true;
                         loop {
-                            thread::sleep(std::time::Duration::from_secs(refresh_seconds));
+                            if first_pass {
+                                first_pass = false;
+                            } else {
+                                thread::sleep(std::time::Duration::from_secs(refresh_seconds));
+                            }
                             if connected.is_none() {
                                 match soccer_live_pg_connect_for_policy(&config) {
                                     Ok(Some(pair)) => connected = Some(pair),
