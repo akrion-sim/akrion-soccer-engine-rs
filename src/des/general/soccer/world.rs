@@ -24904,8 +24904,13 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let best_floor_pass_quality = if has_ball {
-            best_pass_target_quality_for_snapshot(
+        // Evaluate each pass target once per flight, then derive BOTH the best completion and
+        // the best into-stride fit from the same per-target qualities. The MPC pass evaluation
+        // (O(targets × speed-buckets × opponents)) is the bulk of the on-ball decision cost,
+        // and `PassTargetQuality` already carries both fields — so computing once and reducing
+        // twice avoids re-running the whole evaluation a second time just for stride fit.
+        let floor_pass_qualities = if has_ball {
+            pass_target_qualities_for_snapshot(
                 self,
                 me,
                 me_position,
@@ -24913,10 +24918,10 @@ impl WorldSnapshot {
                 PassFlight::Floor,
             )
         } else {
-            PassTargetQuality::default()
+            Vec::new()
         };
-        let best_aerial_pass_quality = if has_ball {
-            best_pass_target_quality_for_snapshot(
+        let aerial_pass_qualities = if has_ball {
+            pass_target_qualities_for_snapshot(
                 self,
                 me,
                 me_position,
@@ -24924,33 +24929,15 @@ impl WorldSnapshot {
                 PassFlight::Aerial,
             )
         } else {
-            PassTargetQuality::default()
+            Vec::new()
         };
+        let best_floor_pass_quality = best_pass_quality_from(&floor_pass_qualities);
+        let best_aerial_pass_quality = best_pass_quality_from(&aerial_pass_qualities);
         // Best into-stride anticipation available — binned SEPARATELY from completion, so a
         // safer static outlet (which may win on completion) doesn't hide a runner who could
         // be played into space. (Not read off the best-completion target.)
-        let best_floor_pass_stride_fit = if has_ball {
-            best_pass_stride_fit_for_snapshot(
-                self,
-                me,
-                me_position,
-                &visible_pass_targets,
-                PassFlight::Floor,
-            )
-        } else {
-            0.0
-        };
-        let best_aerial_pass_stride_fit = if has_ball {
-            best_pass_stride_fit_for_snapshot(
-                self,
-                me,
-                me_position,
-                &visible_aerial_pass_targets,
-                PassFlight::Aerial,
-            )
-        } else {
-            0.0
-        };
+        let best_floor_pass_stride_fit = best_pass_stride_fit_from(&floor_pass_qualities);
+        let best_aerial_pass_stride_fit = best_pass_stride_fit_from(&aerial_pass_qualities);
         let aerial_pass_bypass_score = if has_ball {
             aerial_pass_bypass_score_for_snapshot(
                 self,
