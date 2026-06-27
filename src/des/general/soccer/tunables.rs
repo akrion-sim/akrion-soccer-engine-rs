@@ -453,7 +453,7 @@ impl Default for CarrierKeepRollingTunables {
     fn default() -> Self {
         CarrierKeepRollingTunables {
             enabled: true,
-            stop_target_yards: 1.85,
+            stop_target_yards: 2.75,
             min_opponent_distance_yards: 3.0,
             min_space_yards: 5.0,
             carry_target_yards: 4.2,
@@ -2656,7 +2656,7 @@ impl CarrierKeepRollingTunables {
             0.0,
             6.0,
             0.5,
-            2.5,
+            3.25,
         );
         sanitize_f64(
             "carrier_keep_rolling.min_opponent_distance_yards",
@@ -3299,7 +3299,7 @@ mod tests {
         );
         assert_eq!(t.defensive_shape.defensive_goal_side_min_yards, 1.5);
         assert!(t.carrier_keep_rolling.enabled);
-        assert_eq!(t.carrier_keep_rolling.stop_target_yards, 1.85);
+        assert_eq!(t.carrier_keep_rolling.stop_target_yards, 2.75);
         assert_eq!(t.carrier_keep_rolling.min_opponent_distance_yards, 3.0);
         assert_eq!(t.carrier_keep_rolling.min_space_yards, 5.0);
         assert_eq!(t.carrier_keep_rolling.carry_target_yards, 4.2);

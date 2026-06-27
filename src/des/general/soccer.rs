@@ -1303,9 +1303,10 @@ const DRIBBLE_DWELL_RELEASE_LIFT: f64 = 0.22;
 // commitments (1st, 4th, 8th ticks). This keeps players from changing strategy
 // faster than reaction/mental processing speed while still allowing genuine
 // reflex branches elsewhere in the player logic.
-const PLAYER_DECISION_COMMITMENT_MIN_GAP_TICKS: u64 = 3;
-const PLAYER_DECISION_COMMITMENT_WINDOW_TICKS: u64 = 7;
-const PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW: usize = 2;
+const PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS: u64 = 3;
+const PLAYER_DECISION_COMMITMENT_MAX_IN_SHORT_WINDOW: usize = 1;
+const PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS: u64 = 7;
+const PLAYER_DECISION_COMMITMENT_MAX_IN_LONG_WINDOW: usize = 2;
 // Anti-spasm: a holder commits to one dribble move-kind (and its touch) for this window
 // instead of re-evaluating a fresh cut/feint/swivel every single tick. Without it the ball
 // jerks in a new direction each frame (the "spasm" look). ~0.45s is long enough to read as
@@ -3071,6 +3072,8 @@ const FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE: f64 = 0.48;
 const FIRST_TOUCH_ESCAPE_STATIONARY_SPEED_YPS: f64 = 1.25;
 const FIRST_TOUCH_ESCAPE_MIN_STEP_YARDS: f64 = 1.85;
 const FIRST_TOUCH_ESCAPE_MAX_STEP_YARDS: f64 = 3.55;
+const RECEPTION_APPROACH_REFERENCE_YARDS: f64 = 8.0;
+const RECEPTION_APPROACH_RACE_REFERENCE_SECONDS: f64 = 1.25;
 // A first-time flick onto a team-mate's run is taken only when a team-mate is making a forward run
 // into space within this range, at least _MIN_AHEAD ahead, and the short lane to him is clear.
 const FIRST_TOUCH_FLICK_RUNNER_MAX_YARDS: f64 = 18.0;
@@ -3720,6 +3723,10 @@ const SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM: usize = 5;
 /// Append-only killer over-top block: whether a threaded pass can clip the back four,
 /// plus distance, 12ft apex, lateral angle, back-line clearance, and keeper avoidance.
 const SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM: usize = 6;
+/// Append-only receiver-approach block: how strongly a pending-pass receiver should step
+/// into the approaching ball, the signed approach/retreat amount, race margin, and
+/// current position/velocity/acceleration/jerk fit for that move.
+const SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM: usize = 4;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3735,8 +3742,10 @@ const SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_TEAM_CENTER_FEATURE_DIM + SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4104,6 +4113,14 @@ const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE: usize =
     SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_LATERAL_OFFSET + 1;
 const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_GOALKEEPER_AVOIDANCE: usize =
     SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_BACK_LINE_CLEARANCE + 1;
+const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_PRESSURE: usize =
+    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET: usize =
+    SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE: usize =
+    SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET + 1;
+const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT: usize =
+    SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4218,6 +4235,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM,
     // Same schema with energy-economy features, before killer over-top pass channels.
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM,
+    // Same schema with killer over-top pass channels, before reception-approach control.
+    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6156,6 +6175,21 @@ pub struct SoccerPomdpObservation {
     pub pending_pass_off_target_yards: f64,
     #[serde(default)]
     pub pending_pass_receiver_urgency: f64,
+    /// Pending-pass receiver control: how urgent it is to step into the approaching ball
+    /// rather than waiting/retreating and risking an opponent winning the race.
+    #[serde(default)]
+    pub pending_pass_receiver_approach_pressure: f64,
+    /// Signed yards along the receiver-to-ball line for the elected receive target:
+    /// positive means move toward the ball, negative means let it run/peel away.
+    #[serde(default)]
+    pub pending_pass_receiver_approach_target_yards: f64,
+    /// Receiver arrival minus nearest-opponent race margin at the elected target.
+    /// Positive means the receiver wins the race.
+    #[serde(default)]
+    pub pending_pass_receiver_approach_race_advantage_seconds: f64,
+    /// Current position/velocity/acceleration/jerk fit for the elected approach target.
+    #[serde(default)]
+    pub pending_pass_receiver_approach_kinematic_fit: f64,
     #[serde(default)]
     pub long_aerial_control_window_available: bool,
     #[serde(default)]
@@ -6776,7 +6810,7 @@ fn soccer_compact_decision_commitment_history(mut history: Vec<u64>, tick: u64) 
         return history;
     };
     history.retain(|&commitment_tick| {
-        tick.saturating_sub(commitment_tick) < PLAYER_DECISION_COMMITMENT_WINDOW_TICKS
+        tick.saturating_sub(commitment_tick) < PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS
             || commitment_tick == last_commitment
     });
     history
@@ -6805,11 +6839,15 @@ pub(crate) fn soccer_decision_commitment_history_after_decision(
     soccer_compact_decision_commitment_history(history, decision_tick)
 }
 
-fn soccer_decision_commitment_recent_count(history: &[u64], tick: u64) -> usize {
+fn soccer_decision_commitment_recent_count(
+    history: &[u64],
+    tick: u64,
+    window_ticks: u64,
+) -> usize {
     history
         .iter()
         .filter(|&&commitment_tick| {
-            tick.saturating_sub(commitment_tick) < PLAYER_DECISION_COMMITMENT_WINDOW_TICKS
+            tick.saturating_sub(commitment_tick) < window_ticks
         })
         .count()
 }
@@ -6828,13 +6866,19 @@ pub(crate) fn soccer_decision_commitment_switch_locked_for_history(
     if history.is_empty() {
         return false;
     }
-    if soccer_decision_commitment_ticks_since(history, tick)
-        < PLAYER_DECISION_COMMITMENT_MIN_GAP_TICKS
+    if soccer_decision_commitment_recent_count(
+        history,
+        tick,
+        PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS,
+    ) >= PLAYER_DECISION_COMMITMENT_MAX_IN_SHORT_WINDOW
     {
         return true;
     }
-    soccer_decision_commitment_recent_count(history, tick)
-        >= PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW
+    soccer_decision_commitment_recent_count(
+        history,
+        tick,
+        PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS,
+    ) >= PLAYER_DECISION_COMMITMENT_MAX_IN_LONG_WINDOW
 }
 
 pub(crate) fn soccer_decision_commitment_cadence_blocks(
@@ -6872,7 +6916,11 @@ pub(crate) fn soccer_refresh_decision_commitment_cadence(
     carryover.ticks_since_commitment =
         soccer_decision_commitment_ticks_since(&carryover.commitment_ticks, observed_at_tick);
     carryover.recent_commitment_count_7_ticks =
-        soccer_decision_commitment_recent_count(&carryover.commitment_ticks, observed_at_tick)
+        soccer_decision_commitment_recent_count(
+            &carryover.commitment_ticks,
+            observed_at_tick,
+            PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS,
+        )
             .min(u8::MAX as usize) as u8;
     carryover.decision_cadence_switch_locked = soccer_decision_commitment_switch_locked_for_history(
         &carryover.commitment_ticks,
@@ -7068,14 +7116,15 @@ fn normalize_action_options(
     let total: f64 = options
         .iter()
         .filter(|option| option.legal)
-        .map(|option| option.score.max(0.0))
+        .map(|option| soccer_finite_nonnegative_metric(option.score))
         .sum();
     let legal_count = options.iter().filter(|option| option.legal).count();
     for option in &mut options {
+        option.score = soccer_finite_nonnegative_metric(option.score);
         option.probability = if !option.legal {
             0.0
         } else if total > 1e-9 {
-            option.score.max(0.0) / total
+            option.score / total
         } else if legal_count > 0 {
             1.0 / legal_count as f64
         } else {
@@ -7272,7 +7321,7 @@ fn scale_legal_option_score(options: &mut [AgentActionOptionTrace], label: &str,
         .iter_mut()
         .find(|option| option.legal && option.label == label)
     {
-        option.score *= multiplier;
+        option.score = soccer_finite_nonnegative_metric(option.score * multiplier);
     }
 }
 
@@ -7281,7 +7330,11 @@ fn ensure_min_legal_option_probability(
     label: &str,
     min_probability: f64,
 ) {
-    let min_probability = min_probability.clamp(0.0, 0.99);
+    let min_probability = if min_probability.is_finite() {
+        min_probability.clamp(0.0, 0.99)
+    } else {
+        0.0
+    };
     if min_probability <= 0.0 {
         return;
     }
@@ -7295,14 +7348,16 @@ fn ensure_min_legal_option_probability(
         .iter()
         .enumerate()
         .filter(|(idx, option)| *idx != target_idx && option.legal)
-        .map(|(_, option)| option.score.max(0.0))
+        .map(|(_, option)| soccer_finite_nonnegative_metric(option.score))
         .sum();
     if other_total <= 1e-9 {
-        options[target_idx].score = options[target_idx].score.max(1.0);
+        options[target_idx].score =
+            soccer_finite_nonnegative_metric(options[target_idx].score).max(1.0);
         return;
     }
     let required_score = min_probability / (1.0 - min_probability) * other_total;
-    options[target_idx].score = options[target_idx].score.max(required_score);
+    options[target_idx].score =
+        soccer_finite_nonnegative_metric(options[target_idx].score).max(required_score);
 }
 
 fn ensure_min_legal_option_family_probability(
@@ -7310,7 +7365,11 @@ fn ensure_min_legal_option_family_probability(
     labels: &[&str],
     min_probability: f64,
 ) {
-    let min_probability = min_probability.clamp(0.0, 0.99);
+    let min_probability = if min_probability.is_finite() {
+        min_probability.clamp(0.0, 0.99)
+    } else {
+        0.0
+    };
     if min_probability <= 0.0 || labels.is_empty() {
         return;
     }
@@ -7323,9 +7382,9 @@ fn ensure_min_legal_option_family_probability(
     for option in options.iter() {
         if in_family(option) {
             family_count += 1;
-            family_total += option.score.max(0.0);
+            family_total += soccer_finite_nonnegative_metric(option.score);
         } else if option.legal {
-            other_total += option.score.max(0.0);
+            other_total += soccer_finite_nonnegative_metric(option.score);
         }
     }
     if family_count == 0 {
@@ -7333,7 +7392,7 @@ fn ensure_min_legal_option_family_probability(
     }
     if other_total <= 1e-9 {
         for option in options.iter_mut().filter(|option| in_family(option)) {
-            option.score = option.score.max(1.0);
+            option.score = soccer_finite_nonnegative_metric(option.score).max(1.0);
         }
         return;
     }
@@ -7344,12 +7403,12 @@ fn ensure_min_legal_option_family_probability(
     if family_total > 1e-9 {
         let multiplier = (required_family_total / family_total).clamp(1.0, 24.0);
         for option in options.iter_mut().filter(|option| in_family(option)) {
-            option.score *= multiplier;
+            option.score = soccer_finite_nonnegative_metric(option.score * multiplier);
         }
     } else {
         let score_per_option = required_family_total / family_count as f64;
         for option in options.iter_mut().filter(|option| in_family(option)) {
-            option.score = option.score.max(score_per_option);
+            option.score = soccer_finite_nonnegative_metric(option.score).max(score_per_option);
         }
     }
 }
@@ -7375,7 +7434,8 @@ fn weighted_agentic_order<T>(items: Vec<(T, f64)>) -> Vec<T> {
 }
 
 fn time_window_probability(probability_at_reference_dt: f64, dt_seconds: f64) -> f64 {
-    let p = probability_at_reference_dt.clamp(0.0, 1.0);
+    let p = finite_unit_interval(probability_at_reference_dt);
+    let dt_seconds = soccer_finite_nonnegative_metric(dt_seconds);
     if p <= 0.0 || dt_seconds <= 0.0 {
         return 0.0;
     }
@@ -8619,6 +8679,14 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub pending_pass_receiver_urgency_bin: u8,
     #[serde(default)]
+    pub pending_pass_receiver_approach_pressure_bin: u8,
+    #[serde(default)]
+    pub pending_pass_receiver_approach_direction_bin: i8,
+    #[serde(default)]
+    pub pending_pass_receiver_approach_race_bin: i8,
+    #[serde(default)]
+    pub pending_pass_receiver_approach_kinematic_bin: u8,
+    #[serde(default)]
     pub long_aerial_control_window_available: bool,
     #[serde(default)]
     pub long_aerial_control_distance_bin: u8,
@@ -9311,6 +9379,34 @@ impl SoccerQStateKey {
                 observation.pending_pass_receiver_urgency,
                 &[0.20, 0.40, 0.60, 0.82],
             ),
+            pending_pass_receiver_approach_pressure_bin: distance_bucket(
+                observation.pending_pass_receiver_approach_pressure,
+                &[0.20, 0.40, 0.60, 0.82],
+            ),
+            pending_pass_receiver_approach_direction_bin: if observation
+                .pending_pass_receiver_approach_target_yards
+                > 0.75
+            {
+                1
+            } else if observation.pending_pass_receiver_approach_target_yards < -0.75 {
+                -1
+            } else {
+                0
+            },
+            pending_pass_receiver_approach_race_bin: if observation
+                .pending_pass_receiver_approach_race_advantage_seconds
+                > 0.25
+            {
+                1
+            } else if observation.pending_pass_receiver_approach_race_advantage_seconds < -0.25 {
+                -1
+            } else {
+                0
+            },
+            pending_pass_receiver_approach_kinematic_bin: distance_bucket(
+                observation.pending_pass_receiver_approach_kinematic_fit,
+                &[0.20, 0.40, 0.60, 0.82],
+            ),
             long_aerial_control_window_available: observation.long_aerial_control_window_available,
             long_aerial_control_distance_bin: distance_bucket(
                 observation.long_aerial_control_window_distance_yards,
@@ -9611,6 +9707,14 @@ impl SoccerQStateKey {
             && self.receiving_pending_pass == other.receiving_pending_pass
             && self.pending_pass_off_target_bin == other.pending_pass_off_target_bin
             && self.pending_pass_receiver_urgency_bin == other.pending_pass_receiver_urgency_bin
+            && self.pending_pass_receiver_approach_pressure_bin
+                == other.pending_pass_receiver_approach_pressure_bin
+            && self.pending_pass_receiver_approach_direction_bin
+                == other.pending_pass_receiver_approach_direction_bin
+            && self.pending_pass_receiver_approach_race_bin
+                == other.pending_pass_receiver_approach_race_bin
+            && self.pending_pass_receiver_approach_kinematic_bin
+                == other.pending_pass_receiver_approach_kinematic_bin
             && self.long_aerial_control_window_available
                 == other.long_aerial_control_window_available
             && self.long_aerial_control_distance_bin == other.long_aerial_control_distance_bin
@@ -21030,9 +21134,28 @@ fn dense_soccer_transition_reward(
     action: &str,
     tactical_learning: &SoccerTacticalLearningWeights,
 ) -> f64 {
-    let before_pos = before.player_position(player.id).unwrap_or(player.position);
-    let after_pos = after.player_position(player.id).unwrap_or(before_pos);
-    let moved_yards = before_pos.distance(after_pos);
+    let (before_width, before_length) =
+        sane_pitch_dimensions(before.field_width, before.field_length);
+    let (after_width, after_length) = sane_pitch_dimensions(after.field_width, after.field_length);
+    let fallback_pos = finite_pitch_point(
+        player.position,
+        before_width,
+        before_length,
+        Vec2::new(before_width * 0.5, before_length * 0.5),
+    );
+    let before_pos = finite_pitch_point(
+        before.player_position(player.id).unwrap_or(fallback_pos),
+        before_width,
+        before_length,
+        fallback_pos,
+    );
+    let after_pos = finite_pitch_point(
+        after.player_position(player.id).unwrap_or(before_pos),
+        after_width,
+        after_length,
+        before_pos,
+    );
+    let moved_yards = finite_metric(before_pos.distance(after_pos)).max(0.0);
     let before_obs = &decision.observation;
     let after_obs = after.observation_for(player.id);
     let before_possession = before.controlled_possession_team();
@@ -21048,8 +21171,9 @@ fn dense_soccer_transition_reward(
             .energy_waste_pressure
             .clamp(0.0, 1.0);
         if waste_pressure > 0.0 && moved_yards > 1e-4 {
-            let tick_move_reference =
-                (before.dt_seconds * ENERGY_ECONOMY_FAST_SPEED_YPS).max(0.25);
+            let tick_move_reference = (sane_dt_seconds(before.dt_seconds, DEFAULT_DT_SECONDS)
+                * ENERGY_ECONOMY_FAST_SPEED_YPS)
+                .max(0.25);
             let moved_fit = (moved_yards / tick_move_reference).clamp(0.0, 1.0);
             reward -= waste_pressure
                 * (0.35 + 0.65 * moved_fit)
@@ -36602,29 +36726,41 @@ fn soccer_energy_ball_interaction_next_ten_seconds(
         return 1.0;
     }
 
+    let (field_width, field_length) =
+        sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let field_center = Vec2::new(field_width * 0.5, field_length * 0.5);
+    let me_position = finite_pitch_point(me_position, field_width, field_length, field_center);
+    let ball_position =
+        finite_pitch_point(snapshot.ball.position, field_width, field_length, field_center);
+    let ball_velocity = limit_vec2_len(snapshot.ball.velocity, SOCCER_PHYSICS_BALL_MAX_SPEED_YPS);
     let sprint_speed = (player_top_speed_yps(me.role, &me.skills)
         * fatigue_speed_factor(me.skills.stamina, me.fatigue)
         * MovementGait::Sprint.speed_multiplier())
     .max(1.0);
     let reach_fit = |target: Vec2| {
-        let seconds = me_position.distance(target) / sprint_speed;
+        let target = finite_pitch_point(target, field_width, field_length, ball_position);
+        let seconds = finite_metric(me_position.distance(target) / sprint_speed).max(0.0);
         (1.0 - seconds / ENERGY_ECONOMY_LOOKAHEAD_SECONDS).clamp(0.0, 1.0)
     };
 
-    let projected_ball = (snapshot.ball.position
-        + snapshot.ball.velocity * ENERGY_ECONOMY_LOOKAHEAD_SECONDS)
-        .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
-    let mut interaction = reach_fit(snapshot.ball.position).max(reach_fit(projected_ball));
+    let projected_ball = finite_pitch_point(
+        ball_position + ball_velocity * ENERGY_ECONOMY_LOOKAHEAD_SECONDS,
+        field_width,
+        field_length,
+        ball_position,
+    );
+    let mut interaction = reach_fit(ball_position).max(reach_fit(projected_ball));
 
     if let Some(pass) = snapshot.pending_pass.as_ref() {
         if pass.team == me.team && (pass.target == Some(me.id) || pass.nearest_receiver == Some(me.id))
         {
             return 1.0;
         }
-        let reception_fit = reach_fit(pass.intended_target);
+        let pass_target =
+            finite_pitch_point(pass.intended_target, field_width, field_length, ball_position);
+        let reception_fit = reach_fit(pass_target);
         let lane_fit = (1.0
-            - segment_distance_to_point(snapshot.ball.position, pass.intended_target, me_position)
-                / 5.0)
+            - segment_distance_to_point(ball_position, pass_target, me_position) / 5.0)
             .clamp(0.0, 1.0);
         let pass_interaction = if pass.team == me.team {
             reception_fit * 0.85
@@ -37736,11 +37872,11 @@ fn soccer_neural_transition_features_with_action(
     if let Some(carryover) = obs.previous_tick_carryover.as_ref() {
         features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_AGE] = soccer_neural_scaled(
             carryover.ticks_since_commitment as f64,
-            PLAYER_DECISION_COMMITMENT_WINDOW_TICKS as f64,
+            PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS as f64,
         );
         features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_WINDOW_PRESSURE] = soccer_neural_unit(
             carryover.recent_commitment_count_7_ticks as f64
-                / PLAYER_DECISION_COMMITMENT_MAX_IN_WINDOW as f64,
+                / PLAYER_DECISION_COMMITMENT_MAX_IN_LONG_WINDOW as f64,
         );
         features[SOCCER_NEURAL_FEATURE_DECISION_COMMITMENT_SWITCH_LOCKED] =
             soccer_neural_bool(carryover.decision_cadence_switch_locked);
@@ -37930,6 +38066,17 @@ fn soccer_neural_transition_features_with_action(
         obs.threaded_goal_pass_over_top_goalkeeper_avoidance_yards,
         KILLER_PASS_OVER_TOP_NEURAL_GOALKEEPER_AVOIDANCE_NORMALIZER_YARDS,
     );
+    features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_PRESSURE] =
+        soccer_neural_unit(obs.pending_pass_receiver_approach_pressure);
+    features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET] = soccer_neural_signed_unit(
+        obs.pending_pass_receiver_approach_target_yards / RECEPTION_APPROACH_REFERENCE_YARDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE] = soccer_neural_signed_unit(
+        obs.pending_pass_receiver_approach_race_advantage_seconds
+            / RECEPTION_APPROACH_RACE_REFERENCE_SECONDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT] =
+        soccer_neural_unit(obs.pending_pass_receiver_approach_kinematic_fit);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }

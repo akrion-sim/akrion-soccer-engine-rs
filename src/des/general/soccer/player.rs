@@ -2525,6 +2525,9 @@ fn decision_cadence_hold_label_from_weights(
     if !soccer_decision_commitment_switch_locked_for_history(&carryover.commitment_ticks, tick) {
         return None;
     }
+    if decision_cadence_immediate_label(&carryover.action) {
+        return None;
+    }
     weighted_ops
         .iter()
         .filter(|(_, score)| score.is_finite() && *score > 0.0)
@@ -2533,18 +2536,73 @@ fn decision_cadence_hold_label_from_weights(
 }
 
 fn apply_decision_cadence_hold_weights(weighted_ops: &mut [(String, f64)], hold_label: &str) {
-    let best_score = weighted_ops
+    let best_non_immediate_score = weighted_ops
         .iter()
+        .filter(|(label, _)| !decision_cadence_immediate_label(label))
         .map(|(_, score)| if score.is_finite() { *score } else { 0.0 })
         .fold(0.0_f64, f64::max);
     for (label, score) in weighted_ops.iter_mut() {
         if decision_cadence_labels_match(hold_label, label) {
-            *score = (*score).max(best_score + 1.0).max(1.0);
+            *score = (*score).max(best_non_immediate_score + 1.0).max(1.0);
         } else if decision_cadence_immediate_label(label) {
             *score = (*score).max(0.0);
         } else {
             *score *= 0.01;
         }
+    }
+}
+
+#[cfg(test)]
+mod decision_cadence_player_tests {
+    use super::*;
+
+    fn score_for(weighted_ops: &[(String, f64)], label: &str) -> f64 {
+        weighted_ops
+            .iter()
+            .find(|(candidate, _)| candidate == label)
+            .map(|(_, score)| *score)
+            .expect("weighted label")
+    }
+
+    #[test]
+    fn decision_cadence_hold_boosts_committed_non_immediate_label() {
+        let mut weighted_ops = vec![
+            ("support-shape".to_string(), 0.15),
+            ("run-in-behind".to_string(), 0.72),
+            ("wide-outlet".to_string(), 0.44),
+        ];
+
+        apply_decision_cadence_hold_weights(&mut weighted_ops, "support-shape");
+
+        assert!(
+            score_for(&weighted_ops, "support-shape") > score_for(&weighted_ops, "run-in-behind"),
+            "cadence-held support shape should outrank ordinary support switches"
+        );
+        assert!(
+            score_for(&weighted_ops, "wide-outlet") < 0.01,
+            "non-held ordinary switches should be damped while cadence-locked"
+        );
+    }
+
+    #[test]
+    fn decision_cadence_hold_does_not_outboost_high_immediate_tackle() {
+        let mut weighted_ops = vec![
+            ("defend-shape".to_string(), 0.20),
+            ("press-cover".to_string(), 0.80),
+            ("tackle".to_string(), 4.00),
+        ];
+
+        apply_decision_cadence_hold_weights(&mut weighted_ops, "defend");
+
+        assert_eq!(score_for(&weighted_ops, "tackle"), 4.00);
+        assert!(
+            score_for(&weighted_ops, "tackle") > score_for(&weighted_ops, "defend-shape"),
+            "urgent tackle scores must remain able to outrank a cadence-held defensive shape"
+        );
+        assert!(
+            score_for(&weighted_ops, "defend-shape") > score_for(&weighted_ops, "press-cover"),
+            "held defensive shape should still beat ordinary non-immediate defensive switches"
+        );
     }
 }
 
@@ -10855,170 +10913,73 @@ impl PlayerAgent {
         snapshot: &WorldSnapshot,
         observation: &mut SoccerPomdpObservation,
     ) {
-        let current = snapshot.player_position(self.id).unwrap_or(self.position);
-        let attack_dir = self.team.attack_dir();
-        observation.field_player_motion =
-            soccer_field_player_motion_block(snapshot, self.id, self.team);
-        let mut players_ahead = 0usize;
-        let mut players_behind = 0usize;
-        let mut teammates_ahead = 0usize;
-        let mut teammates_behind = 0usize;
-        let mut opponents_ahead = 0usize;
-        let mut opponents_behind = 0usize;
-        let mut own_position_sum = Vec2::zero();
-        let mut own_velocity_sum = Vec2::zero();
-        let mut own_acceleration_sum = Vec2::zero();
-        let mut own_count = 0.0;
-        let mut opponent_position_sum = Vec2::zero();
-        let mut opponent_velocity_sum = Vec2::zero();
-        let mut opponent_acceleration_sum = Vec2::zero();
-        let mut opponent_count = 0.0;
-
-        for player in &snapshot.players {
-            let position = snapshot
-                .player_position(player.id)
-                .unwrap_or(player.position);
-            let velocity = snapshot
-                .player_velocity(player.id)
-                .unwrap_or(player.velocity);
-            let acceleration = snapshot
-                .player_acceleration(player.id)
-                .unwrap_or(player.acceleration);
-            if player.team == self.team {
-                own_position_sum += position;
-                own_velocity_sum += velocity;
-                own_acceleration_sum += acceleration;
-                own_count += 1.0;
-            } else {
-                opponent_position_sum += position;
-                opponent_velocity_sum += velocity;
-                opponent_acceleration_sum += acceleration;
-                opponent_count += 1.0;
-            }
-            if player.id == self.id {
-                continue;
-            }
-            let forward = (position.y - current.y) * attack_dir;
-            let teammate = player.team == self.team;
-            if forward >= 0.0 {
-                players_ahead += 1;
-                if teammate {
-                    teammates_ahead += 1;
-                } else {
-                    opponents_ahead += 1;
-                }
-            } else {
-                players_behind += 1;
-                if teammate {
-                    teammates_behind += 1;
-                } else {
-                    opponents_behind += 1;
-                }
-            }
-        }
-
-        let ahead_ratio = if players_ahead > 0 {
-            teammates_ahead as f64 / players_ahead as f64
-        } else {
-            0.5
-        };
-        let behind_ratio = if players_behind > 0 {
-            teammates_behind as f64 / players_behind as f64
-        } else {
-            0.5
-        };
-        observation.field_players_ahead = players_ahead;
-        observation.field_players_behind = players_behind;
-        observation.field_teammates_ahead = teammates_ahead;
-        observation.field_teammates_behind = teammates_behind;
-        observation.field_opponents_ahead = opponents_ahead;
-        observation.field_opponents_behind = opponents_behind;
-        observation.field_ahead_teammate_ratio = ahead_ratio.clamp(0.0, 1.0);
-        observation.field_behind_teammate_ratio = behind_ratio.clamp(0.0, 1.0);
-        let average = |sum: Vec2, count: f64, fallback: Vec2| {
-            if count > 0.0 {
-                sum / count
-            } else {
-                fallback
-            }
-        };
-        let own_center_of_mass = average(own_position_sum, own_count, current);
-        let opponent_center_of_mass = average(opponent_position_sum, opponent_count, current);
-        let own_center_velocity = average(own_velocity_sum, own_count, Vec2::zero());
-        let opponent_center_velocity = average(opponent_velocity_sum, opponent_count, Vec2::zero());
-        let own_center_acceleration = average(own_acceleration_sum, own_count, Vec2::zero());
-        let opponent_center_acceleration =
-            average(opponent_acceleration_sum, opponent_count, Vec2::zero());
-        let canonical_point = |point: Vec2| {
-            (
-                finite_metric((point.y - current.y) * attack_dir),
-                finite_metric((point.x - current.x) * attack_dir),
-            )
-        };
-        let canonical_vector = |vector: Vec2| {
-            (
-                finite_metric(vector.y * attack_dir),
-                finite_metric(vector.x * attack_dir),
-            )
-        };
-        let (own_com_forward, own_com_lateral) = canonical_point(own_center_of_mass);
-        let (opponent_com_forward, opponent_com_lateral) = canonical_point(opponent_center_of_mass);
-        let (own_cov_forward, own_cov_lateral) = canonical_vector(own_center_velocity);
-        let (opponent_cov_forward, opponent_cov_lateral) =
-            canonical_vector(opponent_center_velocity);
-        let (own_coa_forward, own_coa_lateral) = canonical_vector(own_center_acceleration);
-        let (opponent_coa_forward, opponent_coa_lateral) =
-            canonical_vector(opponent_center_acceleration);
-        observation.own_team_center_of_mass_forward_yards = own_com_forward;
-        observation.own_team_center_of_mass_lateral_yards = own_com_lateral;
-        observation.opponent_team_center_of_mass_forward_yards = opponent_com_forward;
-        observation.opponent_team_center_of_mass_lateral_yards = opponent_com_lateral;
-        observation.team_center_of_mass_forward_gap_yards = opponent_com_forward - own_com_forward;
-        observation.team_center_of_mass_lateral_gap_yards = opponent_com_lateral - own_com_lateral;
-        observation.own_team_center_velocity_forward_yps = own_cov_forward;
-        observation.own_team_center_velocity_lateral_yps = own_cov_lateral;
-        observation.opponent_team_center_velocity_forward_yps = opponent_cov_forward;
-        observation.opponent_team_center_velocity_lateral_yps = opponent_cov_lateral;
-        observation.team_center_velocity_forward_gap_yps = opponent_cov_forward - own_cov_forward;
-        observation.team_center_velocity_lateral_gap_yps = opponent_cov_lateral - own_cov_lateral;
-        observation.own_team_center_acceleration_forward_yps2 = own_coa_forward;
-        observation.own_team_center_acceleration_lateral_yps2 = own_coa_lateral;
-        observation.opponent_team_center_acceleration_forward_yps2 = opponent_coa_forward;
-        observation.opponent_team_center_acceleration_lateral_yps2 = opponent_coa_lateral;
-        observation.team_center_acceleration_forward_gap_yps2 =
-            opponent_coa_forward - own_coa_forward;
-        observation.team_center_acceleration_lateral_gap_yps2 =
-            opponent_coa_lateral - own_coa_lateral;
-
-        let front_numbers_advantage = ((ahead_ratio - 0.5) * 2.0).clamp(0.0, 1.0);
-        let front_numbers_disadvantage = ((0.5 - ahead_ratio) * 2.0).clamp(0.0, 1.0);
-        let behind_numbers_disadvantage = ((0.5 - behind_ratio) * 2.0).clamp(0.0, 1.0);
-        let front_density = (players_ahead as f64 / 21.0).clamp(0.0, 1.0);
-        let behind_density = (players_behind as f64 / 21.0).clamp(0.0, 1.0);
-        let offensive_lift = (front_numbers_advantage * front_density * 0.12).clamp(0.0, 1.0);
-        let defensive_lift = (front_numbers_disadvantage * front_density * 0.18
-            + behind_numbers_disadvantage * behind_density * 0.24)
-            .clamp(0.0, 1.0);
-        let own_center_drive = ((own_cov_forward / 7.0).max(0.0)
-            + (own_coa_forward / 10.0).max(0.0) * 0.35)
-            .clamp(0.0, 1.0);
-        let opponent_center_drive = ((-opponent_cov_forward / 7.0).max(0.0)
-            + (-opponent_coa_forward / 10.0).max(0.0) * 0.35)
-            .clamp(0.0, 1.0);
-        let offensive_lift = (offensive_lift + own_center_drive * 0.05).clamp(0.0, 1.0);
-        let defensive_lift = (defensive_lift + opponent_center_drive * 0.07).clamp(0.0, 1.0);
-
-        if observation.has_ball || snapshot.controlled_possession_team() == Some(self.team) {
-            observation.offensive_urgency = observation.offensive_urgency.max(offensive_lift);
-        }
-        if !observation.has_ball
-            || snapshot.controlled_possession_team() == Some(self.team.other())
-            || pass_origin_in_own_half(self.team, current, snapshot.field_length)
+        let canonical = snapshot.observation_for(self.id);
+        let mut field_player_motion = canonical.field_player_motion.clone();
+        if field_player_motion.len() != SOCCER_NEURAL_FIELD_MOTION_DIM
+            || field_player_motion.iter().any(|value| !value.is_finite())
         {
-            observation.defensive_urgency = observation.defensive_urgency.max(defensive_lift);
+            field_player_motion = soccer_field_player_motion_block(snapshot, self.id, self.team);
         }
+        debug_assert_eq!(field_player_motion.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
+        debug_assert!(field_player_motion.iter().all(|value| value.is_finite()));
+
+        observation.field_player_motion = field_player_motion;
+        observation.field_players_ahead = canonical.field_players_ahead;
+        observation.field_players_behind = canonical.field_players_behind;
+        observation.field_teammates_ahead = canonical.field_teammates_ahead;
+        observation.field_teammates_behind = canonical.field_teammates_behind;
+        observation.field_opponents_ahead = canonical.field_opponents_ahead;
+        observation.field_opponents_behind = canonical.field_opponents_behind;
+        observation.field_ahead_teammate_ratio =
+            canonical.field_ahead_teammate_ratio.clamp(0.0, 1.0);
+        observation.field_behind_teammate_ratio =
+            canonical.field_behind_teammate_ratio.clamp(0.0, 1.0);
+        observation.own_team_center_of_mass_forward_yards =
+            canonical.own_team_center_of_mass_forward_yards;
+        observation.own_team_center_of_mass_lateral_yards =
+            canonical.own_team_center_of_mass_lateral_yards;
+        observation.opponent_team_center_of_mass_forward_yards =
+            canonical.opponent_team_center_of_mass_forward_yards;
+        observation.opponent_team_center_of_mass_lateral_yards =
+            canonical.opponent_team_center_of_mass_lateral_yards;
+        observation.team_center_of_mass_forward_gap_yards =
+            canonical.team_center_of_mass_forward_gap_yards;
+        observation.team_center_of_mass_lateral_gap_yards =
+            canonical.team_center_of_mass_lateral_gap_yards;
+        observation.own_team_center_velocity_forward_yps =
+            canonical.own_team_center_velocity_forward_yps;
+        observation.own_team_center_velocity_lateral_yps =
+            canonical.own_team_center_velocity_lateral_yps;
+        observation.opponent_team_center_velocity_forward_yps =
+            canonical.opponent_team_center_velocity_forward_yps;
+        observation.opponent_team_center_velocity_lateral_yps =
+            canonical.opponent_team_center_velocity_lateral_yps;
+        observation.team_center_velocity_forward_gap_yps =
+            canonical.team_center_velocity_forward_gap_yps;
+        observation.team_center_velocity_lateral_gap_yps =
+            canonical.team_center_velocity_lateral_gap_yps;
+        observation.own_team_center_acceleration_forward_yps2 =
+            canonical.own_team_center_acceleration_forward_yps2;
+        observation.own_team_center_acceleration_lateral_yps2 =
+            canonical.own_team_center_acceleration_lateral_yps2;
+        observation.opponent_team_center_acceleration_forward_yps2 =
+            canonical.opponent_team_center_acceleration_forward_yps2;
+        observation.opponent_team_center_acceleration_lateral_yps2 =
+            canonical.opponent_team_center_acceleration_lateral_yps2;
+        observation.team_center_acceleration_forward_gap_yps2 =
+            canonical.team_center_acceleration_forward_gap_yps2;
+        observation.team_center_acceleration_lateral_gap_yps2 =
+            canonical.team_center_acceleration_lateral_gap_yps2;
+
+        observation.offensive_urgency = observation
+            .offensive_urgency
+            .max(finite_metric(canonical.offensive_urgency).clamp(0.0, 1.0));
+        observation.defensive_urgency = observation
+            .defensive_urgency
+            .max(finite_metric(canonical.defensive_urgency).clamp(0.0, 1.0));
         observation.decision_urgency = observation
             .decision_urgency
+            .max(finite_metric(canonical.decision_urgency).clamp(0.0, 1.0))
             .max(observation.offensive_urgency)
             .max(observation.defensive_urgency)
             .clamp(0.0, 1.0);

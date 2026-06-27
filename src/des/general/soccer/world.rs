@@ -11273,9 +11273,18 @@ impl SoccerMatch {
             // produce the walk-stop freeze are eligible.
             let settling_target = match intent.action {
                 SoccerAction::HoldShape => Some(self.players[player_id].home_position),
-                SoccerAction::MoveTo(target)
-                | SoccerAction::Dribble(target)
-                | SoccerAction::DribbleMove { target, .. } => Some(target),
+                SoccerAction::MoveTo(target) | SoccerAction::Dribble(target) => Some(target),
+                SoccerAction::DribbleMove { target, kind, .. }
+                    if matches!(
+                        kind,
+                        DribbleMoveKind::CarryForward
+                            | DribbleMoveKind::CarryOutLeft
+                            | DribbleMoveKind::CarryOutRight
+                            | DribbleMoveKind::ProtectBall
+                    ) =>
+                {
+                    Some(target)
+                }
                 _ => None,
             };
             if let Some(settling_target) = settling_target {
@@ -12806,13 +12815,20 @@ impl SoccerMatch {
         let Some(p) = self.players.get(player_id) else {
             return 1.0;
         };
-        let speed = p.velocity.len();
+        let velocity = limit_vec2_len(p.velocity, SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS);
+        let kick_dir = finite_vec2(kick_dir, Vec2::new(0.0, p.team.attack_dir()));
+        let kick_dir = if kick_dir.len() > 1e-6 {
+            kick_dir.normalized()
+        } else {
+            Vec2::new(0.0, p.team.attack_dir())
+        };
+        let speed = velocity.len();
         if speed <= 1.0 {
             return 1.0; // planted: full power
         }
-        let top_speed = player_top_speed_yps(p.role, &p.skills).max(1e-6);
+        let top_speed = finite_metric(player_top_speed_yps(p.role, &p.skills)).max(1e-6);
         let speed_frac = (speed / top_speed).clamp(0.0, 1.0);
-        let align = p.velocity.normalized().dot(kick_dir); // -1 (opposed) .. 1 (into kick)
+        let align = velocity.normalized().dot(kick_dir).clamp(-1.0, 1.0);
         let against = (1.0 - align).max(0.0);
         // The faster you move, the harder it is to drive the ball against that momentum — a
         // sprint can't reverse-blast (it forces a settling touch first), a jog keeps most power.
@@ -12830,10 +12846,22 @@ impl SoccerMatch {
         if player_id >= self.players.len() {
             return;
         }
-        let dt = self.config.dt_seconds;
+        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS);
         let fw = self.config.field_width_yards;
         let fl = self.config.field_length_yards;
-        let v0 = self.players[player_id].velocity;
+        let fallback_position = self.players[player_id].home_position;
+        self.players[player_id].position =
+            finite_pitch_point(self.players[player_id].position, fw, fl, fallback_position);
+        let v0 = limit_vec2_len(
+            self.players[player_id].velocity,
+            SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS,
+        );
+        self.players[player_id].velocity = v0;
+        self.players[player_id].acceleration = limit_vec2_len(
+            self.players[player_id].acceleration,
+            SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2,
+        );
+        let dir = finite_vec2(dir, Vec2::zero());
         if pace == 0 || dir.len() < 1e-6 {
             let mut v = v0 * HUMAN_CONTROL_BRAKE;
             if v.len() < 0.2 {
@@ -12863,6 +12891,32 @@ impl SoccerMatch {
         if player_id >= self.players.len() {
             return;
         }
+        let (field_width, field_length) = sane_pitch_dimensions(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let fallback_position = self.players[player_id].home_position;
+        let current_position = finite_pitch_point(
+            self.players[player_id].position,
+            field_width,
+            field_length,
+            fallback_position,
+        );
+        self.players[player_id].position = current_position;
+        self.players[player_id].velocity = limit_vec2_len(
+            self.players[player_id].velocity,
+            SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS,
+        );
+        self.players[player_id].acceleration = limit_vec2_len(
+            self.players[player_id].acceleration,
+            SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2,
+        );
+        self.players[player_id].jerk = finite_vec2(self.players[player_id].jerk, Vec2::zero());
+        self.players[player_id].fatigue =
+            finite_metric(self.players[player_id].fatigue).clamp(0.0, 1.0);
+        self.players[player_id].anaerobic_load =
+            finite_metric(self.players[player_id].anaerobic_load).clamp(0.0, 1.0);
+        let target = finite_pitch_point(target, field_width, field_length, current_position);
         // Wing-back lane discipline is a movement resistance, not a wall. A wide
         // defender can cross the center when the chosen target really asks for it,
         // but off-ball movement is compressed after the normal tuck-in zone so the
@@ -12893,7 +12947,7 @@ impl SoccerMatch {
                 target
             }
         };
-        let dt = self.config.dt_seconds;
+        let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS);
         let previous_acceleration = self.players[player_id].acceleration;
         let to_target = target - self.players[player_id].position;
         // Chased: a fast opponent (running/sprinting) is right on top of us, so a
@@ -13229,12 +13283,19 @@ impl SoccerMatch {
             self.ball.holder = None;
             return;
         };
-        let player_pos = player.position;
-        let velocity = player.velocity;
-        let acceleration = player.acceleration;
-        let jerk = player.jerk;
+        let field_width = self.config.field_width_yards;
+        let field_length = self.config.field_length_yards;
+        let player_pos = finite_pitch_point(
+            player.position,
+            field_width,
+            field_length,
+            player.home_position,
+        );
+        let velocity = limit_vec2_len(player.velocity, SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS);
+        let acceleration = limit_vec2_len(player.acceleration, SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2);
+        let jerk = finite_vec2(player.jerk, Vec2::zero());
         let team = player.team;
-        let facing_yaw = player.facing_yaw;
+        let facing_yaw = finite_metric(player.facing_yaw);
         // A goalkeeper holding the ball IN HIS HANDS (inside his own box) is not
         // dribbling — the ball is gathered to his body, so it must NOT run the
         // orbit/close-control machinery (which would swing it 0.25-1yd around him
@@ -13286,8 +13347,6 @@ impl SoccerMatch {
             nearest_opponent_distance,
             nearest_opponent_dir,
         );
-        let field_width = self.config.field_width_yards;
-        let field_length = self.config.field_length_yards;
         let tick = self.tick;
         // Orbit the ball around the carrier (advanced at most once per tick; later calls
         // in the same tick just re-anchor it to the carrier's current position).
@@ -14162,6 +14221,25 @@ impl SoccerMatch {
     }
 
     pub(crate) fn run_ball_time_step(&mut self) {
+        let (field_width, field_length) = sane_pitch_dimensions(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let field_center = Vec2::new(field_width * 0.5, field_length * 0.5);
+        self.ball.position =
+            finite_pitch_point(self.ball.position, field_width, field_length, field_center);
+        self.ball.velocity = limit_vec2_len(self.ball.velocity, SOCCER_PHYSICS_BALL_MAX_SPEED_YPS);
+        self.ball.acceleration = limit_vec2_len(
+            self.ball.acceleration,
+            SOCCER_PHYSICS_BALL_MAX_ACCEL_YPS2,
+        );
+        self.ball.jerk = finite_vec2(self.ball.jerk, Vec2::zero());
+        self.ball.curl_acceleration = limit_vec2_len(
+            self.ball.curl_acceleration,
+            SOCCER_PHYSICS_BALL_MAX_ACCEL_YPS2,
+        );
+        self.ball.altitude_yards = finite_metric(self.ball.altitude_yards).max(0.0);
+        let dt_seconds = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS);
         // A shot that has slowed to a roll on the ground is no longer a credible attempt on goal —
         // it is a loose ball again. While `pending_shot` is set, control is never attempted (the
         // ball step only resolves control when `pending_shot.is_none()`), so EVERY player is locked
@@ -14186,13 +14264,13 @@ impl SoccerMatch {
             tick: self.tick,
             double_touch_guard: self.restart_double_touch_guard,
             clock_seconds: self.clock_seconds,
-            dt_seconds: self.config.dt_seconds,
+            dt_seconds,
             ball_drag_per_tick: self.config.ball_drag_per_tick,
             ball_air_resistance: self.config.ball_air_resistance,
             ball_grass_resistance_yps2: self.config.ball_grass_resistance_yps2,
             ball_stop_speed_yps: self.config.ball_stop_speed_yps,
-            field_length: self.config.field_length_yards,
-            field_width: self.config.field_width_yards,
+            field_length,
+            field_width,
             goal_width: self.config.goal_width_yards,
             players: &self.players,
             pending_pass: self.pending_pass.clone(),
@@ -17769,13 +17847,18 @@ impl BallAgent {
         previous_acceleration: Vec2,
         dt_seconds: f64,
     ) {
-        self.acceleration = if dt_seconds > 0.0 {
-            (self.velocity - previous_velocity) / dt_seconds
+        let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        let previous_velocity = finite_vec2(previous_velocity, Vec2::zero());
+        let previous_acceleration = finite_vec2(previous_acceleration, Vec2::zero());
+        self.velocity = limit_vec2_len(self.velocity, SOCCER_PHYSICS_BALL_MAX_SPEED_YPS);
+        self.acceleration = if dt > 0.0 {
+            finite_vec2((self.velocity - previous_velocity) / dt, Vec2::zero())
         } else {
             Vec2::zero()
         };
-        self.jerk = if dt_seconds > 0.0 {
-            (self.acceleration - previous_acceleration) / dt_seconds
+        self.acceleration = limit_vec2_len(self.acceleration, SOCCER_PHYSICS_BALL_MAX_ACCEL_YPS2);
+        self.jerk = if dt > 0.0 {
+            finite_vec2((self.acceleration - previous_acceleration) / dt, Vec2::zero())
         } else {
             Vec2::zero()
         };
@@ -17895,6 +17978,18 @@ impl BallAgent {
         _rng: &mut SeededRandom,
     ) -> Vec2 {
         use std::f64::consts::{PI, TAU};
+        let (field_width, field_length) = sane_pitch_dimensions(field_width, field_length);
+        let player_pos = finite_pitch_point(
+            player_pos,
+            field_width,
+            field_length,
+            Vec2::new(field_width * 0.5, field_length * 0.5),
+        );
+        self.position = finite_pitch_point(self.position, field_width, field_length, player_pos);
+        self.carry_orbit_world_rad = finite_metric(self.carry_orbit_world_rad);
+        self.carry_orbit_radius_yards =
+            finite_metric(self.carry_orbit_radius_yards).clamp(0.0, CARRY_MAX_ORBIT_RADIUS_YARDS);
+        self.carry_orbit_swept_rad = finite_metric(self.carry_orbit_swept_rad);
         // Already advanced this tick (e.g. by the ball sub-agent before the world's
         // post-step sync): re-anchor to the stored orbit without stepping again.
         if self.carry_orbit_last_tick == tick && tick != 0 {
@@ -17905,7 +18000,8 @@ impl BallAgent {
             return (player_pos + dir * self.carry_orbit_radius_yards)
                 .clamp_to_pitch(field_width, field_length);
         }
-        let dt = dt_seconds.clamp(1e-3, 1.0);
+        let dt = sane_dt_seconds(dt_seconds, DEFAULT_DT_SECONDS).clamp(1e-3, 1.0);
+        let desired_dir = finite_vec2(desired_dir, Vec2::new(0.0, 1.0));
         let desired_dir = if desired_dir.len() > 1e-6 {
             desired_dir.normalized()
         } else {
@@ -17917,7 +18013,8 @@ impl BallAgent {
         } else {
             CARRY_BODY_FLOOR_RADIUS_YARDS
         };
-        let target_radius = desired_radius.clamp(radius_floor, CARRY_MAX_ORBIT_RADIUS_YARDS);
+        let target_radius =
+            finite_metric(desired_radius).clamp(radius_floor, CARRY_MAX_ORBIT_RADIUS_YARDS);
         let winding_cap = if winding_cap_rad.is_finite() {
             winding_cap_rad.max(0.0)
         } else {
@@ -17972,7 +18069,7 @@ impl BallAgent {
                 dtheta += TAU * turn_sign;
             }
         }
-        let max_step = max_orbit_rate_rad_s.max(0.0) * dt;
+        let max_step = finite_metric(max_orbit_rate_rad_s).max(0.0) * dt;
         let mut step = dtheta.clamp(-max_step, max_step);
 
         // Per-possession winding cap: unless this possession rolled the rare unlock,
@@ -19316,6 +19413,26 @@ pub(crate) struct PassAndMoveForwardProfile {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReceptionApproachProfile {
+    pub(crate) pressure: f64,
+    pub(crate) target_approach_yards: f64,
+    pub(crate) race_advantage_seconds: f64,
+    pub(crate) kinematic_fit: f64,
+}
+
+impl ReceptionApproachProfile {
+    fn score_adjustment(self) -> f64 {
+        let approach_fit =
+            (self.target_approach_yards / RECEPTION_APPROACH_REFERENCE_YARDS).clamp(-0.75, 1.0);
+        let race_fit = (self.race_advantage_seconds / RECEPTION_APPROACH_RACE_REFERENCE_SECONDS)
+            .clamp(-1.0, 1.0);
+        (self.pressure.clamp(0.0, 1.0) * approach_fit * 0.46)
+            + (self.kinematic_fit.clamp(0.0, 1.0) - 0.5) * 0.16
+            + race_fit * 0.10
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LongAerialControlProfile {
     pub(crate) available: bool,
     pub(crate) target: Vec2,
@@ -19323,6 +19440,8 @@ pub(crate) struct LongAerialControlProfile {
     pub(crate) seconds_until_window: f64,
     pub(crate) race_advantage_seconds: f64,
     pub(crate) attack_score: f64,
+    pub(crate) attack_blend: f64,
+    pub(crate) control_estimate: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24563,6 +24682,10 @@ impl WorldSnapshot {
                 receiving_pending_pass: false,
                 pending_pass_off_target_yards: 0.0,
                 pending_pass_receiver_urgency: 0.0,
+                pending_pass_receiver_approach_pressure: 0.0,
+                pending_pass_receiver_approach_target_yards: 0.0,
+                pending_pass_receiver_approach_race_advantage_seconds: 0.0,
+                pending_pass_receiver_approach_kinematic_fit: 0.0,
                 long_aerial_control_window_available: false,
                 long_aerial_control_window_distance_yards: 0.0,
                 long_aerial_control_window_seconds: 0.0,
@@ -25215,6 +25338,12 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let pending_pass_receiver_approach =
+            if receiving_pending_pass {
+                self.pending_pass_reception_approach_profile_for(player_id)
+            } else {
+                ReceptionApproachProfile::default()
+            };
         let first_touch_shape_prior = if first_touch_available {
             first_touch_shape_prior_for_snapshot(team_directive, team_shape, formation_lp_guidance)
         } else {
@@ -25926,6 +26055,13 @@ impl WorldSnapshot {
             receiving_pending_pass,
             pending_pass_off_target_yards,
             pending_pass_receiver_urgency,
+            pending_pass_receiver_approach_pressure: pending_pass_receiver_approach.pressure,
+            pending_pass_receiver_approach_target_yards: pending_pass_receiver_approach
+                .target_approach_yards,
+            pending_pass_receiver_approach_race_advantage_seconds: pending_pass_receiver_approach
+                .race_advantage_seconds,
+            pending_pass_receiver_approach_kinematic_fit: pending_pass_receiver_approach
+                .kinematic_fit,
             long_aerial_control_window_available: long_aerial_control.available,
             long_aerial_control_window_distance_yards: long_aerial_control.distance_yards,
             long_aerial_control_window_seconds: long_aerial_control.seconds_until_window,
@@ -30537,8 +30673,9 @@ impl WorldSnapshot {
         }
         // Unified descent geometry: the SAME drag-aware projection the reception plan uses
         // (single source of truth — `aerial_descent_plan`), replacing the old duplicate
-        // blended ballistic/velocity projection. The window opens when the ball drops to the
-        // top of the control band; the target is where it settles to the feet.
+        // blended ballistic/velocity projection. This shared fallback cue opens when the ball
+        // first drops into the top of the control band; player-specific control profiles can
+        // override it with the resolved settle/attack/chase take point.
         let plan = aerial_descent_plan(
             apex,
             time_aloft,
@@ -30548,11 +30685,10 @@ impl WorldSnapshot {
             self.field_width,
             self.field_length,
         )?;
-        // Aim at the point where the ball first drops into reach (the top of the band): the
-        // receiver gets there ready, then tracks it down. Once inside the window `time_to_attack`
-        // is 0, so `attack_point` collapses to the ball's current ground position — the same
-        // "track where it is now" the old window did, but drag-aware. (Mirrors the old
-        // `target_time = high_time` before the window, current position once inside.)
+        // Aim at the point where the ball first drops into reach (the top of the band): this
+        // remains a shared election/fallback cue, while the receiver-specific profile below uses
+        // the POMDP reception plan when actual player context is available. Once inside the window
+        // `time_to_attack` is 0, so `attack_point` collapses to the ball's current ground position.
         Some(LongAerialFallingWindow {
             target: plan.attack_point,
             seconds_until_window: plan.time_to_attack,
@@ -30577,30 +30713,59 @@ impl WorldSnapshot {
         {
             return LongAerialControlProfile::default();
         }
+        let current = self.player_snapshot_position(me);
         let Some(window) = self.descending_long_aerial_control_window(pass) else {
             return LongAerialControlProfile::default();
         };
-        let current = self.player_snapshot_position(me);
-        let distance = current.distance(window.target);
-        let player_arrival = self.snapshot_sprint_time_to(me, window.target);
+        let (target, seconds_until_window, attack_blend, resolved_control_estimate, deadline_slack) =
+            if let Some((descent, _inputs, reception_plan)) =
+                self.aerial_reception_resolve(me, pass, current)
+            {
+                let seconds = if matches!(reception_plan.decision, AerialReceptionDecision::ChaseDrop)
+                {
+                    descent.time_to_land
+                } else {
+                    descent.time_for_blend(reception_plan.attack_blend)
+                };
+                let slack = if matches!(reception_plan.decision, AerialReceptionDecision::ChaseDrop)
+                {
+                    0.85
+                } else {
+                    0.55
+                };
+                (
+                    reception_plan.target,
+                    seconds,
+                    reception_plan.attack_blend,
+                    Some(reception_plan.control_estimate),
+                    slack,
+                )
+            } else {
+                (window.target, window.seconds_until_window, 1.0, None, 0.55)
+            };
+        let distance = current.distance(target);
+        let player_arrival = self.snapshot_sprint_time_to(me, target);
         if distance > LONG_AERIAL_CONTROL_ENGAGE_RADIUS_YARDS
-            && player_arrival > window.seconds_until_window + 0.55
+            && player_arrival > seconds_until_window + deadline_slack
         {
             return LongAerialControlProfile::default();
         }
-        let opponent_arrival = self.nearest_opponent_arrival_time_to(me.team, window.target);
+        let opponent_arrival = self.nearest_opponent_arrival_time_to(me.team, target);
         let race_advantage = opponent_arrival - player_arrival;
         let distance_fit =
             (1.0 - distance / LONG_AERIAL_CONTROL_ENGAGE_RADIUS_YARDS).clamp(0.0, 1.0);
-        let time_fit = (1.0 - window.seconds_until_window / LONG_AERIAL_CONTROL_REFERENCE_SECONDS)
+        let time_fit = (1.0 - seconds_until_window / LONG_AERIAL_CONTROL_REFERENCE_SECONDS)
             .clamp(0.0, 1.0);
         let race_fit = ((race_advantage + 0.65)
             / (LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS + 0.65))
             .clamp(0.0, 1.0);
-        let control_fit = (ability01(me.skills.first_touch) * 0.46
+        let skill_control_fit = (ability01(me.skills.first_touch) * 0.46
             + ability01(me.skills.height) * 0.22
             + ability01(me.skills.vision) * 0.20
             + ability01(me.skills.acceleration) * 0.12)
+            .clamp(0.0, 1.0);
+        let control_fit = resolved_control_estimate
+            .unwrap_or(skill_control_fit)
             .clamp(0.0, 1.0);
         let named_bonus =
             if pass.target == Some(player_id) || pass.nearest_receiver == Some(player_id) {
@@ -30616,11 +30781,13 @@ impl WorldSnapshot {
             .clamp(0.0, 1.0);
         LongAerialControlProfile {
             available: true,
-            target: window.target,
+            target,
             distance_yards: distance,
-            seconds_until_window: window.seconds_until_window,
+            seconds_until_window,
             race_advantage_seconds: race_advantage,
             attack_score,
+            attack_blend,
+            control_estimate: control_fit,
         }
     }
 
@@ -30697,6 +30864,128 @@ impl WorldSnapshot {
             self.field_length,
         );
         Some((descent, inputs, plan))
+    }
+
+    fn reception_approach_profile_for_target(
+        &self,
+        me: &PlayerSnapshot,
+        current: Vec2,
+        target: Vec2,
+        ball_time_seconds: f64,
+        horizon_seconds: f64,
+        receiver_arrival_time: f64,
+        opponent_arrival_time: f64,
+        pressured_reception: bool,
+        intended_target_confidence: f64,
+    ) -> ReceptionApproachProfile {
+        let current = finite_pitch_point(current, self.field_width, self.field_length, me.position);
+        let target = finite_pitch_point(target, self.field_width, self.field_length, current);
+        let ball_position =
+            finite_pitch_point(self.ball.position, self.field_width, self.field_length, target);
+        let ball_velocity = limit_vec2_len(self.ball.velocity, SOCCER_PHYSICS_BALL_MAX_SPEED_YPS);
+        let to_ball = ball_position - current;
+        let approach_axis = if to_ball.len() > 1e-6 {
+            to_ball.normalized()
+        } else if ball_velocity.len() > 1e-6 {
+            (Vec2::zero() - ball_velocity).normalized()
+        } else {
+            Vec2::new(0.0, me.team.attack_dir())
+        };
+        let target_delta = target - current;
+        let target_approach_yards = finite_metric(target_delta.dot(approach_axis));
+        let race_advantage_seconds =
+            finite_metric(opponent_arrival_time - receiver_arrival_time).clamp(-3.0, 3.0);
+        let ball_speed = ball_velocity.len();
+        let moving_ball_pressure = ((ball_speed - 1.0) / 13.0).clamp(0.0, 1.0);
+        let race_pressure =
+            (1.0 - race_advantage_seconds / RECEPTION_APPROACH_RACE_REFERENCE_SECONDS)
+                .clamp(0.0, 1.0);
+        let early_window_pressure = (1.0
+            - finite_metric(ball_time_seconds) / finite_metric(horizon_seconds).max(1e-3))
+        .clamp(0.0, 1.0);
+        let pressure = ((if pressured_reception { 0.34 } else { 0.14 })
+            + moving_ball_pressure * 0.22
+            + race_pressure * 0.30
+            + early_window_pressure * 0.12
+            + intended_target_confidence.clamp(0.0, 1.0) * 0.18)
+            .clamp(0.0, 1.0);
+        let kinematic_fit = if target_delta.len() <= 0.05 {
+            1.0
+        } else {
+            let target_dir = target_delta.normalized();
+            let speed_cap = (player_top_speed_yps(me.role, &me.skills)
+                * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+                * MovementGait::Sprint.speed_multiplier())
+            .max(1.0);
+            let velocity = limit_vec2_len(me.velocity, SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS);
+            let acceleration =
+                limit_vec2_len(me.acceleration, SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2);
+            let jerk = finite_vec2(me.jerk, Vec2::zero());
+            let velocity_fit = ((velocity.dot(target_dir) / speed_cap).clamp(-1.0, 1.0) + 1.0)
+                * 0.5;
+            let accel_fit = ((acceleration.dot(target_dir) / SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2)
+                .clamp(-1.0, 1.0)
+                + 1.0)
+                * 0.5;
+            let jerk_fit = 1.0 - (jerk.len() / PLAYER_ACCEL_JERK_LIMIT_YPS3).clamp(0.0, 1.0);
+            (velocity_fit * 0.46 + accel_fit * 0.34 + jerk_fit * 0.20).clamp(0.0, 1.0)
+        };
+        ReceptionApproachProfile {
+            pressure,
+            target_approach_yards,
+            race_advantage_seconds,
+            kinematic_fit,
+        }
+    }
+
+    pub(crate) fn pending_pass_reception_approach_profile_for(
+        &self,
+        player_id: usize,
+    ) -> ReceptionApproachProfile {
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return ReceptionApproachProfile::default();
+        };
+        let Some(pass) = self.pending_pass.as_ref() else {
+            return ReceptionApproachProfile::default();
+        };
+        let Some((target, _)) = self.pending_pass_reception_target_for(player_id) else {
+            return ReceptionApproachProfile::default();
+        };
+        let current = self.player_snapshot_position(me);
+        let distance_to_ball = current.distance(self.ball.position);
+        let nearest_opponent_to_ball =
+            self.nearest_opponent_distance_at(me.team, self.ball.position);
+        let pressured_reception =
+            nearest_opponent_to_ball <= distance_to_ball + 5.0 || nearest_opponent_to_ball <= 6.0;
+        let receiver_speed = (player_top_speed_yps(me.role, &me.skills)
+            * fatigue_speed_factor(me.skills.stamina, me.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(1.0);
+        let receiver_arrival_time = current.distance(target) / receiver_speed;
+        let ball_speed = finite_metric(self.ball.velocity.len()).max(0.0);
+        let ball_time = if ball_speed > 0.25 {
+            self.ball.position.distance(target) / ball_speed.max(0.25)
+        } else {
+            0.0
+        };
+        let horizon = ball_time.clamp(0.08, if pressured_reception { 0.85 } else { 1.35 });
+        let opponent_arrival_time = self.nearest_opponent_arrival_time_to(me.team, target);
+        let intended_target_confidence = if pass.target == Some(player_id) {
+            INTENDED_PASS_TARGET_AWARENESS_PROBABILITY * INTENDED_PASS_TARGET_BELIEF_CONFIDENCE
+        } else {
+            0.0
+        };
+        self.reception_approach_profile_for_target(
+            me,
+            current,
+            target,
+            ball_time,
+            horizon,
+            receiver_arrival_time,
+            opponent_arrival_time,
+            pressured_reception,
+            intended_target_confidence,
+        )
     }
 
     pub(crate) fn pending_pass_reception_target_for(
@@ -30796,6 +31085,17 @@ impl WorldSnapshot {
                 } else {
                     (contest_margin / 1.40).clamp(-0.8, 1.0) * 0.42
                 };
+                let approach_profile = self.reception_approach_profile_for_target(
+                    me,
+                    current,
+                    candidate,
+                    t,
+                    horizon,
+                    arrival_time,
+                    opponent_arrival_time,
+                    pressured_reception,
+                    intended_target_confidence,
+                );
                 // Prefer meeting the ball EARLY — step toward it and control it sooner rather
                 // than drifting off and letting it run (which reads as "running away from the
                 // ball"). Strong pull under pressure; a smaller but non-zero pull even when
@@ -30832,6 +31132,7 @@ impl WorldSnapshot {
                     + forward_receive * 0.035
                     + contest_score
                     + pressure_early_touch_bonus
+                    + approach_profile.score_adjustment()
                     + receipt_shape * if pressured_reception { 0.18 } else { 0.24 }
                     + falling_control_bonus
                     + intended_target_confidence * 0.18;
@@ -35572,7 +35873,7 @@ impl WorldSnapshot {
         let goal_y = me.team.goal_y(self.field_length);
         let yards_to_byline = (goal_y - pos.y).abs();
         if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
-            || yards_to_byline < WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
+            || yards_to_byline <= WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
         {
             return false;
         }
@@ -38777,11 +39078,11 @@ impl WorldSnapshot {
     /// apply. The committed run: an outside-midfielder / striker carrying in the opponent half on
     /// the flank, inside the activation window of the byline, heads for the corner flag (wide of the
     /// keeper) rather than slowing 32-38yd out or cutting infield into traffic — buying trailing
-    /// runners time to arrive before a cutback / high cross. Returns the corner-flag target the carry
-    /// drives at. Once WITHIN [`BYLINE_DRIVE_CROSS_TRIGGER_YARDS`] of the byline it returns `None`,
-    /// handing off to the (already legal + scored) flank-cross decision — i.e. cross now. The
-    /// conditions hold continuously as the carrier advances, so the run is naturally committed; the
-    /// `BylineCross` team strategy commits the off-ball box runs alongside it.
+    /// runners time to arrive before a cutback / high cross. Returns the corner-flag target the
+    /// carry drives at. Once inside the strategy's release depth it returns `None`, handing off to
+    /// the (already legal + scored) flank-cross decision — i.e. cross now. The conditions hold
+    /// continuously as the carrier advances, so the run is naturally committed; the `BylineCross`
+    /// team strategy commits the off-ball box runs alongside it.
     pub(crate) fn byline_corner_drive_target_for(&self, player_id: usize) -> Option<Vec2> {
         if dd_soccer_disable_byline_drive_to_corner() {
             return None;
@@ -38795,15 +39096,16 @@ impl WorldSnapshot {
         // the drive on his own (`winger_byline_drive_opt_in`) — isolated wide with a clear lane —
         // instead of stalling ~30yd out. Otherwise a wide carrier is free to cut inside toward goal
         // as before — those remain deliberately different decisions.
+        let strategy = self.tactical_directive(me.team).attack_strategy;
         let team_committed = matches!(
-            self.tactical_directive(me.team).attack_strategy,
+            strategy,
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot
                 | TeamAttackStrategy::BylineCrossRightToPenaltySpot
                 | TeamAttackStrategy::OutsideMidAttackDefenderLeft
                 | TeamAttackStrategy::OutsideMidAttackDefenderRight
-                | TeamAttackStrategy::CrashTheBox
         );
-        if !team_committed && !self.winger_byline_drive_opt_in(player_id) {
+        let solo_opt_in = self.winger_byline_drive_opt_in(player_id);
+        if !team_committed && !solo_opt_in {
             return None;
         }
         // Outside mid or striker — the players this programmed move is for.
@@ -38821,11 +39123,16 @@ impl WorldSnapshot {
         }
         let goal_y = me.team.goal_y(self.field_length);
         let yards_to_byline = (goal_y - pos.y).abs();
-        // Inside the activation window but not yet AT the corner: at the corner, hand off to the
-        // cross decision (return None) rather than carrying into the dead ball behind the byline.
-        if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS
-            || yards_to_byline <= BYLINE_DRIVE_CROSS_TRIGGER_YARDS
-        {
+        let release_depth = if solo_opt_in && !team_committed {
+            WINGER_BYLINE_SOLO_MIN_DEPTH_YARDS
+        } else if is_outside_mid_attack_strategy(strategy) {
+            outside_mid_cross_release_depth_yards()
+        } else {
+            BYLINE_CROSS_RELEASE_DEPTH_YARDS
+        };
+        // Inside the activation window but not yet at the release point: at the release depth, hand
+        // off to the cross decision rather than carrying into the dead ball behind the byline.
+        if yards_to_byline > BYLINE_DRIVE_ACTIVATION_YARDS || yards_to_byline <= release_depth {
             return None;
         }
         // Wide enough that the corner — not the goal — is the right destination.
