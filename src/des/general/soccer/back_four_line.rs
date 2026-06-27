@@ -84,6 +84,10 @@ pub const BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS: f64 = 15.0;
 /// it: the min is a higher line (smaller gap), the max a deeper line.
 pub const BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS: f64 = 20.0;
 pub const BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS: f64 = 40.0;
+/// Neutral gap fraction (mid-band) used when the line-depth inputs are degenerate
+/// (a roster with no defenders/opponents/keeper) so the desired gap falls back to
+/// the middle of the 20-40 band rather than an arbitrary literal.
+pub const BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION: f64 = 0.5;
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)

@@ -40413,7 +40413,7 @@ impl WorldSnapshot {
                     .and_then(|head| head.predict(&inputs))
                     .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs))
             })
-            .unwrap_or(0.5)
+            .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
             .clamp(0.0, 1.0);
         BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
             + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac
