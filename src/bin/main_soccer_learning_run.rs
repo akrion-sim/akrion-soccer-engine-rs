@@ -25,6 +25,7 @@ use soccer_engine::des::general::soccer::{
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, LongPassRunHead,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    ReceiveApproachHead, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -1893,6 +1894,13 @@ static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHe
 static CARRIED_LONG_PASS_RUN_HEAD: std::sync::Mutex<Option<LongPassRunHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory receive-approach head (how far a receiver steps toward/away from an incoming
+/// ball), carried + trained across games WITHIN a learner process, mirroring
+/// `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart; untouched unless the model is
+/// enabled (DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL).
+static CARRIED_RECEIVE_APPROACH_HEAD: std::sync::Mutex<Option<ReceiveApproachHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -1966,6 +1974,12 @@ fn run_game(
     // live once trained. No-op unless the commit model is enabled.
     if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
         sim.set_loose_ball_commit_head(head.clone());
+    }
+    // Install the carried receive-approach head so `receive_approach_adjusted_target`
+    // consumes it live once trained. No-op unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL
+    // is set.
+    if let Some(head) = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap().as_ref() {
+        sim.set_receive_approach_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2051,6 +2065,25 @@ fn run_game(
             loose_ball_commit_samples.len(),
             head.training_steps(),
             head.training_steps() >= LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED receive-approach head on this game's reward-weighted RL corpus (how
+    // far a receiver stepping toward/away from an incoming ball led to securing possession).
+    // Empty + skipped unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL is set.
+    let receive_approach_samples = sim.drain_receive_approach_samples();
+    if !receive_approach_samples.is_empty() {
+        let mut guard = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| ReceiveApproachHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&receive_approach_samples, 0.02);
+        }
+        eprintln!(
+            "receive_approach_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            receive_approach_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }

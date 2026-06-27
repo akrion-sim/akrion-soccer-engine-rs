@@ -385,6 +385,16 @@ pub struct SoccerMatch {
     pub(crate) loose_ball_commit_samples: Vec<LooseBallCommitSample>,
     /// Open loose-ball commit decisions awaiting their windowed reward.
     pub(crate) pending_loose_ball_commit: Vec<PendingLooseBallCommitDecision>,
+    /// The trained receive-approach head (how far a receiver steps toward/away from an
+    /// incoming ball), when present. Carried + trained across games by the learner;
+    /// `None` ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) receive_approach_head: Option<std::sync::Arc<ReceiveApproachHead>>,
+    /// Rolling RL corpus for the receive-approach head: per-receiver state + the signed
+    /// approach action taken + the windowed possession/territorial reward. Collected only
+    /// while the model is enabled; empty + untouched in the default process.
+    pub(crate) receive_approach_samples: Vec<ReceiveApproachSample>,
+    /// Open receive-approach decisions awaiting their windowed reward.
+    pub(crate) pending_receive_approach: Vec<PendingReceiveApproachDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -2312,6 +2322,9 @@ impl SoccerMatch {
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
+            receive_approach_head: None,
+            receive_approach_samples: Vec::new(),
+            pending_receive_approach: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -7420,6 +7433,9 @@ impl SoccerMatch {
         // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
         self.update_loose_ball_urgency(&next_snapshot);
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        // Learnable receive-approach RL samples (no-op + byte-identical unless
+        // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
+        self.collect_receive_approach_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
@@ -18853,6 +18869,11 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained receive-approach head, carried from the match for live consumption in
+    /// the reception election (`receive_approach_adjusted_target`). `None` ⇒ analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) receive_approach_head: Option<std::sync::Arc<ReceiveApproachHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -20610,6 +20631,7 @@ impl WorldSnapshot {
             line_depth_head: m.line_depth_head.clone(),
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            receive_approach_head: m.receive_approach_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
@@ -30843,6 +30865,17 @@ impl WorldSnapshot {
             best_target
         } else {
             fallback_target
+        };
+        // Learnable receive-approach (MDP/POMDP): how far to step TOWARD the incoming ball
+        // (meet it early, deny an opponent reaching it first) or ease AWAY (let it run onto
+        // a better foot, into space), as a function of both bodies' position / velocity /
+        // acceleration / jerk and the race to the reception. Gated OFF by default ⇒ returns
+        // `target` unchanged (byte-identical). Skipped for an aerial descent plan, whose
+        // catch point is already plotted by `aerial_reception_plan_for`.
+        let target = if aerial_plan.is_some() {
+            target
+        } else {
+            self.receive_approach_adjusted_target(me, current, target)
         };
         let receiver_target_time = current.distance(target) / receiver_sprint_speed.max(1.0);
         let opponent_target_time = self.nearest_opponent_arrival_time_to(me.team, target);
