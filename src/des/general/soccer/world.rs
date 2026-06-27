@@ -5729,18 +5729,13 @@ impl SoccerMatch {
 
         // PPO/MAPPO advantage standardization (zero-mean / unit-variance over the batch):
         // the standard variance-reduction trick that keeps the policy-gradient step scale
-        // stable across episodes with different reward magnitudes. Opt-in (default OFF →
-        // byte-identical); a degenerate (zero-variance) batch is left untouched.
-        if dd_soccer_enable_advantage_normalization() && samples.len() >= 2 {
-            let n = samples.len() as f64;
-            let mean = samples.iter().map(|s| s.advantage).sum::<f64>() / n;
-            let variance = samples
-                .iter()
-                .map(|s| (s.advantage - mean).powi(2))
-                .sum::<f64>()
-                / n;
-            let std = variance.sqrt();
-            if std.is_finite() && std > 1e-8 {
+        // stable across episodes with different reward magnitudes. Opt-in via the
+        // advantage-normalization gate, and FORCED on when the terminal won-game reward is
+        // on (its flat label needs it — see `dd_soccer_standardize_policy_advantages`).
+        // Default OFF ⇒ byte-identical; a degenerate (zero-variance) batch is left untouched.
+        if dd_soccer_standardize_policy_advantages() {
+            let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
+            if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
                 for sample in &mut samples {
                     sample.advantage = (sample.advantage - mean) / (std + 1e-8);
                 }
@@ -5807,7 +5802,7 @@ impl SoccerMatch {
         &self,
         replay: &[SoccerLearningTransition],
     ) -> Vec<SoccerKeeperPolicySample> {
-        replay
+        let mut samples: Vec<SoccerKeeperPolicySample> = replay
             .iter()
             .filter(|transition| transition.role == PlayerRole::Goalkeeper)
             .filter(|transition| soccer_actor_policy_sample_allowed(transition))
@@ -5842,7 +5837,21 @@ impl SoccerMatch {
                     advantage,
                 })
             })
-            .collect()
+            .collect();
+        // The keeper head uses the raw one-step reward as its advantage (no critic
+        // baseline), so the flat won-game label would dominate it. When that label is on,
+        // standardize the keeper batch to remove the common-mode and bound the step scale.
+        // Gated on the outcome reward alone ⇒ byte-identical for every pre-existing path
+        // (the keeper head never standardized before).
+        if match_outcome_reward_enabled() {
+            let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
+            if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+                for sample in &mut samples {
+                    sample.advantage = (sample.advantage - mean) / (std + 1e-8);
+                }
+            }
+        }
+        samples
     }
 
     fn ensure_world_model(&mut self) {
@@ -19615,6 +19624,32 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Whether a policy batch's advantages must be standardized (zero-mean / unit-variance)
+/// before the gradient step. True when advantage normalization is explicitly opted in,
+/// OR when the terminal won-game reward is on: that flat per-game Monte-Carlo label is
+/// only safe *with* standardization — it otherwise (a) raises the effective learning
+/// rate (the GAE sum accumulates the constant label over a trajectory before the critic
+/// can absorb it) and (b) dominates baseline-free heads (the keeper actor uses the raw
+/// reward as its advantage). Standardization removes the common-mode label and fixes the
+/// step scale, preserving only the realised win-vs-loss contrast. Off ⇒ byte-identical.
+pub(crate) fn dd_soccer_standardize_policy_advantages() -> bool {
+    dd_soccer_enable_advantage_normalization() || match_outcome_reward_enabled()
+}
+
+/// `(mean, std)` to standardize a policy batch's advantages by, or `None` for a
+/// degenerate batch (fewer than two samples, or non-finite / zero variance) that must
+/// be left untouched. Shared so the actor and keeper heads standardize identically.
+pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f64, f64)> {
+    if advantages.len() < 2 {
+        return None;
+    }
+    let n = advantages.len() as f64;
+    let mean = advantages.iter().sum::<f64>() / n;
+    let variance = advantages.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / n;
+    let std = variance.sqrt();
+    (std.is_finite() && std > 1e-8).then_some((mean, std))
 }
 
 /// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only

@@ -115,7 +115,7 @@ small head.
 
 | # | Surface | Live call site | Hardcoded as | Conversion / training signal |
 |---|---------|----------------|--------------|------------------------------|
-| 4 | **Pass completion** (DORMANT) | head on the sim `pass_completion_head` ([world.rs:277](../src/des/general/soccer/world.rs#L277)); features via `pass_completion_learn_features` ([world.rs:32343](../src/des/general/soccer/world.rs#L32343)) | head is **trained but not consumed live** — `.predict()` never called in the decision path; the analytic completion estimate still drives passes | **promote** `SoccerPassCompletionHead::predict` into the pass ranker behind a readiness gate; corpus already collected |
+| 4 | **Pass completion** (~~DORMANT~~ **DONE**) | now consumed live in `pass_target_quality_for_snapshot` ([soccer.rs:52888](../src/des/general/soccer.rs#L52888)) behind `DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION`, blended 50/50 with the analytic estimate once the head clears `PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS` (200) | ~~head trained but not consumed~~ — **wired**; off ⇒ analytic estimate stands alone (parity) | **DONE** — `SoccerPassCompletionHead::predict` is in the ranker; gate it on in the trained learner |
 | 5 | **Pass velocity/power** (PARTIAL) | `dd_soccer_disable_learnable_pass_velocity()` live at [world.rs:10033](../src/des/general/soccer/world.rs#L10033), [world.rs:23446](../src/des/general/soccer/world.rs#L23446) | gated seam **landed on main**, but the chosen speed is a heuristic bucket sweep, not a learned head | feed the power buckets to a small head trained on completion×xT-gain at speed ([[soccer-learnable-pass-velocity]]) |
 | 6 | **GK save probability** (HARDCODED) | `goalkeeper_save_probability_from_traits` live at [world.rs:18866](../src/des/general/soccer/world.rs#L18866), [world.rs:34577](../src/des/general/soccer/world.rs#L34577) | closed-form trait/physics formula | learned save model on (shot geometry, pace, keeper traits) → saved?; label is the shot outcome already logged |
 | 7 | **Tackle / duel success** (HARDCODED) | `tackle_success_probability` / `slide_tackle_success_probability` / `slide_tackle_foul_probability` ([soccer.rs:43874](../src/des/general/soccer.rs#L43874)) consumed at [world.rs:10512](../src/des/general/soccer/world.rs#L10512), [world.rs:10658](../src/des/general/soccer/world.rs#L10658) | skill-profile formula × `SLIDE_TACKLE_SUCCESS_BOOST` clamp | learned duel model on (closing speed, angle, from-behind, skills) → won/lost/foul; label is the duel outcome |
@@ -131,6 +131,53 @@ small head.
 | 10 | **Off-ball support runs** | `open_space_for` ([world.rs:30791](../src/des/general/soccer/world.rs#L30791)) | heuristic-scored run targets; learn from pitch-value×xT gain of the run |
 
 ---
+
+## Learning-signal & evaluation infrastructure (landed)
+
+These are not action-surface conversions — they raise the *rate* and *trustworthiness*
+of learning across every surface above.
+
+### Terminal won-game reward — the "long" rung of the quasi-win ladder (gated, default-OFF)
+
+The short-horizon quasi-wins were already priced — a 2+ forward-pass combo
+(`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` 7.5 / three-net-forward 10.0), a
+defender beaten on the dribble (`DRIBBLE_BEAT_REWARD_POINTS` 6.0 / `NUTMEG_BEAT` 7.0,
+×1.5 if the defender committed), a shot off/on target (10/40), a goal (100). The one
+rung missing from the *learning* signal was the final result: `soccer_full_game_replay_transitions`
+built its return purely from per-tick SHAPED rewards, so a side that farmed shaping
+but **lost** still trained on a high return. At dt = 1/15s a match is thousands of
+ticks, so a terminal reward funnelled through the existing 0.995/tick discount decays
+to ~0 within ~40s — it could only credit the dying minutes.
+
+So the result is broadcast as a flat **Monte-Carlo outcome label** `z` (AlphaZero-style)
+added to *every* transition of a team: `+win` / `draw` / `−win` with a capped per-goal
+margin bonus (`MATCH_OUTCOME_*` consts). The critic learns `E[outcome | state]`, so the
+advantage `return − V(s)` credits whether THIS game beat the pre-result expectation —
+the constant is not absorbed because it differs by the realised result, which the state
+alone cannot predict.
+- **Seam:** `soccer_full_game_replay_transitions(transitions, match_outcome: Option<MatchOutcomeReward>)`
+  ([soccer.rs](../src/des/general/soccer.rs)); the caller `apply_full_game_learning_if_ready`
+  ([world.rs:5981](../src/des/general/soccer/world.rs#L5981)) passes `Some(..)` from the
+  final score only when the gate is on.
+- **Gate:** `DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD` (`match_outcome_reward_enabled()`),
+  default-OFF ⇒ `None` ⇒ byte-identical replay.
+- **Magnitudes** (`WIN=8.0`, `PER_GOAL_MARGIN=1.5`, `MARGIN_CAP=4`) are a starting point
+  and **must be A/B'd through the promotion eval gate below**, never tuned on raw reward.
+
+### Promotion eval gate — held-out Elo / cross-play / exploitability (pure, always-on tool)
+
+Raw training reward is a training instrument, not the truth: a candidate must beat a
+diverse **frozen** field on matches it never trained on before it replaces the incumbent.
+- **Module:** `soccer_eval_gate` ([soccer_eval_gate.rs](../src/des/general/soccer_eval_gate.rs)) —
+  `evaluate_promotion(reports, candidate, baseline, thresholds) -> PromotionVerdict`. Pure,
+  deterministic, folds held-out `MatchReport`s through the existing `EloRatings` +
+  `CrossPlayMatrix`. Promotes iff all three clear: **strength** (mean cross-play payoff vs
+  field + held-out Elo Δ), **confidence** (Wilson score lower bound on the field mean, so a
+  lucky few-game edge cannot promote), and **robustness** (worst-case single-opponent payoff
+  ≥ floor — a hard-countered brain is *different, not better*).
+- **Runner:** `soccer_eval_gate_run` bin plays a candidate vs a frozen pool over a held-out
+  seed range (disjoint from training) with the frozen `EngineMatchRunner`, then prints the
+  verdict + every metric. This is the gate every reward/architecture change is judged by.
 
 ## Tier 4 — Tactical "manager" (the meta-policy above the players)
 
