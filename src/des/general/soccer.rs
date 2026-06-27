@@ -4319,6 +4319,31 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 250.0;
+
+// --- Terminal won-game reward (the "long" rung of the quasi-win ladder) ---------
+// The short-horizon quasi-wins are already priced: a 2+ forward-pass combo
+// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS`), a defender beaten on the dribble
+// (`DRIBBLE_BEAT_REWARD_POINTS`/`NUTMEG_BEAT_REWARD_POINTS`), a shot off/on target
+// (`SHOT_OFF_TARGET_REWARD_POINTS`/`SHOT_ON_TARGET_REWARD_POINTS`), and a goal
+// (`GOAL_REWARD_POINTS`). The one rung missing from the *learning* signal is the
+// final result: `soccer_full_game_replay_transitions` builds its return purely from
+// the per-tick SHAPED rewards, so a side that farms shaping but loses still trains
+// on a high return. At dt = 1/15s a match is thousands of ticks, so a terminal
+// reward funnelled through the 0.995/tick discount decays to ~0 within ~40s — it
+// would only credit the dying minutes, not the whole game.
+//
+// So the won-game signal is broadcast as a flat Monte-Carlo outcome label `z`
+// (AlphaZero-style) added to EVERY transition of a team: every decision in a won
+// game is labelled positive, every decision in a lost game negative. The critic
+// learns `E[outcome | state]` (the pre-result expectation), so the advantage
+// `return − V(s)` credits whether THIS game beat that expectation — the constant is
+// not absorbed because it differs by the realised result, which the state alone
+// cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
+// promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 8.0;
+const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 1.5;
+const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
@@ -11619,8 +11644,65 @@ fn soccer_marl_team_component(
     finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS)
 }
 
+/// The flat Monte-Carlo outcome label `z` each team carries for every transition of
+/// a finished match: `+win / draw / −win`, plus a capped per-goal margin bonus, so a
+/// decisive win labels harder than a 1-0. Built from the final score; `for_team`
+/// returns that team's signed label. See the `MATCH_OUTCOME_*` constants.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MatchOutcomeReward {
+    home: f64,
+    away: f64,
+}
+
+impl MatchOutcomeReward {
+    fn from_score(home_goals: u32, away_goals: u32) -> Self {
+        let margin = (f64::from(home_goals) - f64::from(away_goals)).abs();
+        let margin_bonus = MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS
+            * (margin - 1.0).clamp(0.0, MATCH_OUTCOME_MARGIN_CAP_GOALS - 1.0);
+        let (home, away) = match home_goals.cmp(&away_goals) {
+            std::cmp::Ordering::Greater => (
+                MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus,
+                -(MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus),
+            ),
+            std::cmp::Ordering::Less => (
+                -(MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus),
+                MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus,
+            ),
+            std::cmp::Ordering::Equal => {
+                (MATCH_OUTCOME_DRAW_REWARD_POINTS, MATCH_OUTCOME_DRAW_REWARD_POINTS)
+            }
+        };
+        MatchOutcomeReward { home, away }
+    }
+
+    fn for_team(&self, team: Team) -> f64 {
+        match team {
+            Team::Home => self.home,
+            Team::Away => self.away,
+        }
+    }
+}
+
+/// Env flag for the terminal won-game reward broadcast in
+/// `soccer_full_game_replay_transitions`. Off ⇒ `match_outcome` is `None` and the
+/// replay is byte-identical to the shaped-reward-only behaviour. Read once per
+/// process (mirrors [`learned_pass_completion_enabled`]).
+pub fn match_outcome_reward_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD"))
+    }
+}
+
 fn soccer_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
+    match_outcome: Option<MatchOutcomeReward>,
 ) -> Vec<SoccerLearningTransition> {
     if transitions.is_empty() {
         return Vec::new();
@@ -11677,10 +11759,18 @@ fn soccer_full_game_replay_transitions(
                 Team::Home => home_return,
                 Team::Away => away_return,
             };
-            transition.reward = ((1.0 - SOCCER_FULL_GAME_RETURN_BLEND)
+            let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND)
                 * finite_metric(transition.reward)
-                + SOCCER_FULL_GAME_RETURN_BLEND * correlated_return)
-                .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+                + SOCCER_FULL_GAME_RETURN_BLEND * correlated_return;
+            // The "long" reward: a flat per-transition outcome label, added after the
+            // shaped blend so a whole game of decisions is credited by the result, not
+            // just the dying ticks the 0.995 discount can reach. `None` ⇒ byte-identical.
+            let with_outcome = match match_outcome {
+                Some(outcome) => blended + outcome.for_team(transition.team),
+                None => blended,
+            };
+            transition.reward =
+                with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
             transition.done = true;
             replay.push(transition);
         }
