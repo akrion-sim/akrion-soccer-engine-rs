@@ -1636,6 +1636,28 @@ const AERIAL_LATERAL_PASS_PENALTY: f64 = 1.20;
 // combination play around the box is valuable. Scaled by how far under 4yd the pass is.
 const SHORT_PASS_BUILDUP_MAX_YARDS: f64 = 4.0;
 const SHORT_PASS_BUILDUP_PENALTY: f64 = 2.8;
+// Own-half short-pass LIABILITY. In our own half a sub-4yd pass that is not a genuine
+// pressure-escape is a liability, not build-up: it keeps the ball in front of our own
+// goal for no progress and is the giveaway that turns into a chance against. Unlike
+// `SHORT_PASS_BUILDUP_PENALTY` (which fades linearly to ~0 as the pass approaches 4yd, so
+// a 3-4yd square ball is barely touched), this carries a strong FLOOR so every sub-4yd
+// own-half pass is demoted hard enough that a 4+yd forward ball — or just keeping the
+// dribble — outranks it. Stacks on top of the build-up penalty in the own half; the
+// middle third keeps only the (mild) build-up penalty and the final third stays free.
+// Waived for a real escape (receiver clearly less pressured than the holder). Gated by
+// `DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY` (default-on; off ⇒ byte-identical).
+const OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS: f64 = 4.0;
+const OWN_HALF_SHORT_PASS_LIABILITY_PENALTY: f64 = 3.4;
+// Fraction of the penalty applied even at the 4yd edge (no fade-to-zero): a 3.9yd square
+// ball in our own half still costs 0.6 * 3.4; a tap at the feet costs the full 3.4.
+const OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION: f64 = 0.6;
+// Layer 2 (decision): when the only floor pass on offer in our own half is short, damp the
+// generic pass action so the carrier prefers to keep the dribble / hold rather than play it.
+// `DAMP` is the max fraction shaved off `pass_score`; the cut scales with how short the ball
+// is and eases for a wide-open receiver (a genuine out). `MIN_MULT` floors the multiplier so
+// a short pass is demoted, never hard-vetoed (dribbling into trouble can still be worse).
+const OWN_HALF_SHORT_PASS_DRIBBLE_DAMP: f64 = 0.6;
+const OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT: f64 = 0.35;
 // Scoop (lofted dink over a close defender): a teammate this far away, open on all sides by
 // this radius, with a defender within this distance of the direct lane.
 const SCOOP_PASS_MIN_RANGE_YARDS: f64 = 5.0;
@@ -5772,6 +5794,12 @@ pub struct SoccerPomdpObservation {
     pub floor_pass_lane_score: f64,
     #[serde(default)]
     pub best_pass_receiver_openness: f64,
+    /// Passer→receiver distance (yards) of the best floor pass. Lets the own-half
+    /// short-pass discipline (Layer 2) tell a short square ball from a progressive one at
+    /// decision time. NOT part of the neural feature vector (FEATURE_DIM is unchanged);
+    /// `0.0` when no floor pass is available.
+    #[serde(default)]
+    pub best_floor_pass_distance_yards: f64,
     #[serde(default)]
     pub best_aerial_pass_receiver_openness: f64,
     #[serde(default)]
@@ -52283,6 +52311,12 @@ struct PassTargetQuality {
     long_aerial_bounds_risk: f64,
     long_aerial_bounds_margin_yards: f64,
     long_aerial_bounds_inward_correction_yards: f64,
+    /// Straight-line passer→receiver distance (yards) for this target. Carried so the
+    /// observation can expose the LENGTH of the best floor pass (the `max_by` on
+    /// `expected_completion` keeps this for the selected target), letting the own-half
+    /// short-pass discipline tell a short square ball from a progressive one at decision
+    /// time. `0.0` on a default/no-pass quality.
+    distance_yards: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -53332,6 +53366,7 @@ fn pass_target_quality_for_snapshot_inner(
         long_aerial_bounds_risk: long_aerial_bounds.risk,
         long_aerial_bounds_margin_yards: long_aerial_bounds.margin_yards,
         long_aerial_bounds_inward_correction_yards: long_aerial_bounds.inward_correction_yards,
+        distance_yards: passer_position.distance(target_position),
     }
 }
 

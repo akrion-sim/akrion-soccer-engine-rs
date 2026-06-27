@@ -5832,6 +5832,92 @@ fn synthetic_killer_pressure_without_threaded_receiver_cannot_legalize_killer_pa
 }
 
 #[test]
+fn own_half_short_pass_liability_factor_floors_and_exempts_escapes() {
+    // Outside our own half: never a liability.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(false, 2.0, 0.3, 0.3),
+        0.0
+    );
+    // A 4+yd ball is the progressive pass we want — no penalty.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(true, 4.0, 0.3, 0.3),
+        0.0
+    );
+    // A genuine escape (receiver clearly less pressured than the holder) is exempt.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(true, 2.0, 0.5, 0.2),
+        0.0
+    );
+    // A short own-half square ball that is not an escape is demoted, and unlike the
+    // build-up penalty it keeps a strong floor even right at the 4yd edge.
+    let edge = own_half_short_pass_liability_penalty_factor(true, 3.9, 0.3, 0.3);
+    let floor = OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION;
+    assert!(edge >= floor - 1e-9, "edge {edge} should keep the floor {floor}");
+    // Shorter = harder, capped at the full penalty for a tap at the feet.
+    let tap = own_half_short_pass_liability_penalty_factor(true, 0.3, 0.3, 0.3);
+    assert!(tap > edge);
+    assert!(tap <= OWN_HALF_SHORT_PASS_LIABILITY_PENALTY + 1e-9);
+}
+
+#[test]
+fn own_half_short_floor_pass_damps_generic_pass_toward_dribble() {
+    // A carrier in our own half with the same situation either side of the 4yd threshold:
+    // the short floor pass demotes the generic pass; the 4+yd ball does not.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_117,
+        ..Default::default()
+    });
+    let passer = 8;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].role = PlayerRole::Defender;
+    sim.players[passer].position = Vec2::new(40.0, 22.0); // deep in our own half
+    sim.players[passer].skills.passing_completion_rate = 9.0;
+    sim.players[passer].skills.passing = 8.8;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(42.0, 24.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 3);
+    let aerial = snapshot.ranked_visible_aerial_pass_targets(passer, 3).len();
+    let directive = snapshot.tactical_directive(Team::Home);
+    let base = snapshot.observation_for(passer);
+    // Confirm the fixture really is in our own half (the Layer-2 gate condition).
+    assert!(base.yards_to_own_goal < base.yards_to_goal, "fixture must be in own half");
+
+    let pass1_score = |best_floor_pass_distance_yards: f64| {
+        let mut observation = base.clone();
+        observation.best_pass_receiver_openness = 0.4;
+        observation.best_floor_pass_distance_yards = best_floor_pass_distance_yards;
+        sim.players[passer]
+            .possession_action_options(
+                &observation,
+                &directive,
+                visible_targets.len(),
+                aerial,
+                false,
+                snapshot.dt_seconds,
+                snapshot.field_width,
+            )
+            .iter()
+            .find(|o| o.label == "pass1")
+            .map(|o| o.probability)
+            .expect("generic pass option present")
+    };
+
+    let short_ball = pass1_score(2.5);
+    let progressive_ball = pass1_score(8.0);
+    assert!(
+        short_ball < progressive_ball,
+        "a short own-half ball should be demoted vs a 4+yd one: short={short_ball} long={progressive_ball}"
+    );
+}
+
+#[test]
 fn near_goal_decisive_pressure_prefers_shot_or_killer_pass_over_recycling() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
