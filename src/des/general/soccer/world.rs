@@ -17563,8 +17563,13 @@ impl SoccerMatch {
             if recency <= 1e-3 {
                 continue;
             }
+            let severity = keeper_giveaway_severity(
+                transition.role,
+                transition.observation.yards_to_own_goal,
+                self.config.field_length_yards,
+            );
             let mut penalized_transition = transition.clone();
-            penalized_transition.reward -= TURNOVER_WINDOW_PENALTY_POINTS * recency;
+            penalized_transition.reward -= TURNOVER_WINDOW_PENALTY_POINTS * recency * severity;
             penalized.push(penalized_transition);
             if penalized.len() >= TURNOVER_PENALTY_MAX_TRANSITIONS {
                 break;
@@ -19893,6 +19898,56 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
+}
+// ON by default: a turnover is weighted by how costly it actually was — a goalkeeper
+// giving the ball away, and any giveaway deep in our own end, is punished several times
+// harder than a routine midfield turnover (see `keeper_giveaway_severity`). Set
+// `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY` to revert to the flat per-transition
+// turnover penalty (⇒ byte-identical to the previous reward shaping).
+fn dd_soccer_disable_keeper_giveaway_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY").is_ok())
+}
+
+/// Severity multiplier (`>= 1.0`) on the turnover-window penalty for a single lost-possession
+/// transition, keyed off who lost it and where. A flat turnover treats a keeper hooking it
+/// straight to the opposition inside his own box the same as a midfielder over-hitting a pass
+/// at halfway; this makes the dangerous giveaways the policy should actually fear cost more.
+///
+/// Two independent, multiplicative factors, both `1.0` in the benign case so they only ever
+/// raise the cost:
+/// * **zone danger** — ramps from `1.0` at the edge of our own third up to
+///   [`KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT`] right on our own goal line, off `yards_to_own_goal`.
+/// * **keeper role** — a goalkeeper giveaway is additionally scaled by
+///   [`KEEPER_GIVEAWAY_ROLE_MULT`] (the keeper is the last line; losing it there is worst).
+///
+/// Returns `1.0` (no change) when the giveaway-weighting gate is disabled.
+fn keeper_giveaway_severity(role: PlayerRole, yards_to_own_goal: f64, field_length: f64) -> f64 {
+    if dd_soccer_disable_keeper_giveaway_penalty() {
+        return 1.0;
+    }
+    keeper_giveaway_severity_factor(role, yards_to_own_goal, field_length)
+}
+
+/// Pure severity math (no env gate) so the weighting can be unit-tested deterministically
+/// regardless of the process-global `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY` cache.
+pub(crate) fn keeper_giveaway_severity_factor(
+    role: PlayerRole,
+    yards_to_own_goal: f64,
+    field_length: f64,
+) -> f64 {
+    let mut severity = 1.0;
+    let own_third = (field_length / 3.0).max(1.0);
+    if yards_to_own_goal.is_finite() && yards_to_own_goal < own_third {
+        // 0.0 at the own-third line, 1.0 on the own goal line.
+        let depth = (1.0 - yards_to_own_goal.max(0.0) / own_third).clamp(0.0, 1.0);
+        severity *= 1.0 + depth * (KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT - 1.0);
+    }
+    if matches!(role, PlayerRole::Goalkeeper) {
+        severity *= KEEPER_GIVEAWAY_ROLE_MULT;
+    }
+    severity
 }
 /// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set

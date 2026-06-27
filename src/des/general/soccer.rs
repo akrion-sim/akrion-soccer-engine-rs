@@ -1685,6 +1685,14 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 // state→action pairs down. 5 s = 75 ticks at dt = 1/15.
 pub(crate) const TURNOVER_PENALTY_WINDOW_TICKS: u64 = 75;
 const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 4.5;
+// Severity multipliers on the per-transition turnover penalty for dangerous giveaways
+// (see `keeper_giveaway_severity`). A goalkeeper losing possession is the worst case —
+// he is the last line — so it is scaled hardest; any giveaway deep in our own end ramps
+// up toward the own goal line. Both default to making the giveaways the policy should
+// fear materially costlier than a routine midfield turnover, without touching the benign
+// case. Disable the whole weighting with `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY`.
+pub(crate) const KEEPER_GIVEAWAY_ROLE_MULT: f64 = 2.5;
+pub(crate) const KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT: f64 = 2.0;
 // Bound the re-queued work per turnover (newest, most-blameworthy transitions first) so a
 // flurry of turnovers can't back up the deferred-training queue.
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;

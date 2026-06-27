@@ -28379,6 +28379,90 @@ fn turnover_window_penalty_requeues_recent_losing_team_actions_with_recency_deca
 }
 
 #[test]
+fn keeper_giveaway_severity_weights_keeper_and_deep_giveaways_hardest() {
+    let field = 115.0;
+    let own_third = field / 3.0;
+    // Baseline: an outfield turnover at/beyond the halfway mark — no extra weighting.
+    let midfield_outfield =
+        keeper_giveaway_severity_factor(PlayerRole::Midfielder, field * 0.5, field);
+    assert!((midfield_outfield - 1.0).abs() < 1e-9);
+    // An outfield turnover just inside our own third already costs more than at halfway,
+    // and the cost ramps up the deeper it is toward our own goal.
+    let edge_third = keeper_giveaway_severity_factor(PlayerRole::Defender, own_third - 0.01, field);
+    let deep_outfield = keeper_giveaway_severity_factor(PlayerRole::Defender, 2.0, field);
+    assert!(edge_third > midfield_outfield);
+    assert!(deep_outfield > edge_third);
+    assert!(deep_outfield <= KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT + 1e-9);
+    // A goalkeeper giveaway is punished hardest of all: the role multiplier stacks on top of
+    // the (maximal, since the keeper sits on his own line) zone-danger weighting.
+    let keeper_on_line = keeper_giveaway_severity_factor(PlayerRole::Goalkeeper, 0.0, field);
+    assert!(keeper_on_line > deep_outfield);
+    assert!(
+        (keeper_on_line - KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT * KEEPER_GIVEAWAY_ROLE_MULT).abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn keeper_giveaway_penalty_scales_requeued_reward_by_severity() {
+    // End-to-end through penalize_turnover_window: with identical tick (same recency), a
+    // keeper giveaway deep in our own end is re-queued with a materially larger negative
+    // reward than a midfield outfield turnover.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let field = sim.config.field_length_yards;
+    let observation = snapshot.observation_for(0);
+    let base = SoccerLearningTransition {
+        tick: 95,
+        player_id: 0,
+        team: Team::Home,
+        role: PlayerRole::Midfielder,
+        state: snapshot.mdp_state_for_player(0),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(0),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let mut keeper = base.clone();
+    keeper.player_id = 1;
+    keeper.role = PlayerRole::Goalkeeper;
+    keeper.observation.yards_to_own_goal = 0.0;
+    let mut midfield = base.clone();
+    midfield.player_id = 2;
+    midfield.role = PlayerRole::Midfielder;
+    midfield.observation.yards_to_own_goal = field * 0.5;
+
+    sim.tick = 100;
+    sim.turnover_penalty_history.push_back(keeper);
+    sim.turnover_penalty_history.push_back(midfield);
+    sim.penalize_turnover_window(Team::Home);
+
+    let pen = |player_id: usize| {
+        sim.deferred_reward_transitions
+            .iter()
+            .find(|t| t.player_id == player_id)
+            .map(|t| t.reward)
+            .expect("penalized transition present")
+    };
+    let keeper_pen = pen(1);
+    let midfield_pen = pen(2);
+    assert!(keeper_pen < midfield_pen, "keeper giveaway must cost more");
+    // The keeper penalty equals the midfield (severity 1.0) penalty times the full
+    // keeper-on-line severity, within rounding.
+    let expected_ratio = KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT * KEEPER_GIVEAWAY_ROLE_MULT;
+    assert!((keeper_pen / midfield_pen - expected_ratio).abs() < 1e-6);
+}
+
+#[test]
 fn wasted_energy_window_penalizes_only_uninvolved_running() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         learning_enabled: true,
