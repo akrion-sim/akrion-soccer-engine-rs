@@ -4319,6 +4319,10 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 250.0;
+const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
+const SOCCER_OUTCOME_CREDIT_MARGIN_FRACTION: f64 = 0.25;
+const SOCCER_OUTCOME_CREDIT_MAX_EXTRA_MARGIN_GOALS: i32 = 3;
+const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
@@ -11619,7 +11623,39 @@ fn soccer_marl_team_component(
     finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS)
 }
 
+fn dd_soccer_enable_outcome_credit() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(DD_SOCCER_OUTCOME_CREDIT_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_OUTCOME_CREDIT_ENV))
+    }
+}
+
 fn soccer_full_game_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+) -> Vec<SoccerLearningTransition> {
+    soccer_full_game_replay_transitions_with_outcome_credit(
+        transitions,
+        dd_soccer_enable_outcome_credit(),
+    )
+}
+
+fn soccer_full_game_replay_transitions_with_outcome_credit(
+    transitions: &[SoccerLearningTransition],
+    outcome_credit: bool,
+) -> Vec<SoccerLearningTransition> {
+    if outcome_credit {
+        return soccer_outcome_credit_replay_transitions(transitions);
+    }
+    soccer_correlated_full_game_replay_transitions(transitions)
+}
+
+fn soccer_correlated_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
 ) -> Vec<SoccerLearningTransition> {
     if transitions.is_empty() {
@@ -11687,6 +11723,133 @@ fn soccer_full_game_replay_transitions(
     }
     replay.reverse();
     replay
+}
+
+fn soccer_outcome_credit_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+) -> Vec<SoccerLearningTransition> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = (0..transitions.len()).collect();
+    indices.sort_by_key(|&idx| (transitions[idx].tick, idx));
+    let final_score_diff_home = indices
+        .last()
+        .map(|idx| transitions[*idx].next_state.score_diff_for_home)
+        .unwrap_or(0);
+    let home_count = transitions
+        .iter()
+        .filter(|transition| transition.team == Team::Home)
+        .count()
+        .max(1);
+    let away_count = transitions
+        .iter()
+        .filter(|transition| transition.team == Team::Away)
+        .count()
+        .max(1);
+    let home_outcome_share =
+        soccer_terminal_outcome_credit(final_score_diff_home, Team::Home) / home_count as f64;
+    let away_outcome_share =
+        soccer_terminal_outcome_credit(final_score_diff_home, Team::Away) / away_count as f64;
+
+    let mut replay = Vec::with_capacity(transitions.len());
+    for idx in indices {
+        let mut transition = transitions[idx].clone();
+        let outcome_share = match transition.team {
+            Team::Home => home_outcome_share,
+            Team::Away => away_outcome_share,
+        };
+        let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
+        let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
+        transition.reward = finite_metric(outcome_share + milestone_reward + pitch_shaping)
+            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.done = true;
+        replay.push(transition);
+    }
+    replay
+}
+
+fn soccer_outcome_credit_milestone_reward(transition: &SoccerLearningTransition) -> f64 {
+    // Keep bounded short-term quasi-wins already folded into the transition reward:
+    // pass chains, defender-beating dribbles, shots on target, and goals.
+    finite_metric(transition.reward)
+        .max(0.0)
+        .min(SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP)
+}
+
+fn soccer_terminal_outcome_credit(final_score_diff_home: i32, team: Team) -> f64 {
+    let team_score_diff = match team {
+        Team::Home => final_score_diff_home,
+        Team::Away => -final_score_diff_home,
+    };
+    if team_score_diff == 0 {
+        return 0.0;
+    }
+    let win_points = tunables().reward.goal_scored_points.max(1.0);
+    let extra_margin_goals = team_score_diff
+        .abs()
+        .saturating_sub(1)
+        .min(SOCCER_OUTCOME_CREDIT_MAX_EXTRA_MARGIN_GOALS);
+    let magnitude =
+        win_points + win_points * SOCCER_OUTCOME_CREDIT_MARGIN_FRACTION * extra_margin_goals as f64;
+    magnitude.copysign(team_score_diff as f64)
+}
+
+fn soccer_outcome_credit_pitch_value_shaping(transition: &SoccerLearningTransition) -> f64 {
+    let scale = tunables().reward.pitch_value_threat_delta_points;
+    if scale <= 0.0 || !scale.is_finite() {
+        return 0.0;
+    }
+    let before = soccer_replay_pitch_value_potential(&transition.state, transition.team);
+    let after = soccer_replay_pitch_value_potential(&transition.next_state, transition.team);
+    potential_based_shaping(1.0, before, after) * scale
+}
+
+fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f64 {
+    let Some(possession_team) = state.possession_team else {
+        return 0.0;
+    };
+    let point = soccer_replay_ball_grid_center(state);
+    let threat = expected_threat(
+        possession_team,
+        point,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    if possession_team == team {
+        threat
+    } else {
+        -threat
+    }
+}
+
+fn soccer_replay_ball_grid_center(state: &SoccerMdpState) -> Vec2 {
+    let cell = if state.ball_grid.fine.columns > 1 || state.ball_grid.fine.rows > 1 {
+        state.ball_grid.fine
+    } else if state.ball_grid.tactical.columns > 1 || state.ball_grid.tactical.rows > 1 {
+        state.ball_grid.tactical
+    } else {
+        let columns = PITCH_TACTICAL_GRID_COLUMNS.max(1);
+        let rows = PITCH_TACTICAL_GRID_ROWS.max(1);
+        PitchGridCell {
+            level: PitchGridLevel::Tactical,
+            columns,
+            rows,
+            x: state.ball_zone_x.min(columns - 1),
+            y: state.ball_zone_y.min(rows - 1),
+            id: state.ball_zone_y.min(rows - 1) * columns + state.ball_zone_x.min(columns - 1),
+            parent_id: Some(0),
+        }
+    };
+    let columns = cell.columns.max(1);
+    let rows = cell.rows.max(1);
+    let x = cell.x.min(columns - 1);
+    let y = cell.y.min(rows - 1);
+    Vec2::new(
+        (x as f64 + 0.5) * DEFAULT_FIELD_WIDTH_YARDS / columns as f64,
+        (y as f64 + 0.5) * DEFAULT_FIELD_LENGTH_YARDS / rows as f64,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

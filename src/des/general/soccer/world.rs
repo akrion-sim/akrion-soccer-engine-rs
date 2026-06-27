@@ -5713,9 +5713,14 @@ impl SoccerMatch {
                     .and_then(|head| head.action_distribution(&state_features))
                     .and_then(|probs| probs.get(action_index).copied());
                 // Stochastic top-k selection records the true behavior policy;
-                // older/deterministic rows fall back to the actor head.
+                // older/deterministic rows keep their chosen-action probability
+                // before falling back to the actor head.
                 let old_action_probability = soccer_behavior_old_action_probability(
-                    transition.decision_context.behavior_policy_probability,
+                    transition
+                        .decision_context
+                        .behavior_policy_probability
+                        .filter(|probability| probability.is_finite() && *probability > 0.0)
+                        .or(Some(transition.decision_context.chosen_action_probability)),
                     actor_probability,
                 );
                 advantage.is_finite().then(|| SoccerPolicySample {
