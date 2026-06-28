@@ -11955,10 +11955,14 @@ pub(crate) fn soccer_marl_adjusted_reward(
     let tick_reward = tick_rewards.get(&transition.tick).copied();
     // MAPPO cooperative-credit SHARE (ours): blend the agent's individual reward toward its team's
     // per-tick mean BEFORE the centralized weighting, so off-ball work that sets up a teammate's
-    // later goal is credited. `share = 0` (the default) leaves the reward fully individual, so the
-    // `intermediate` line below reduces to the prior `reward * intermediate_weight` byte-for-byte.
+    // later goal is credited. Independent actor-critic stays individual even if a runner/default
+    // leaves a non-zero MAPPO share in the config.
     let own_avg = tick_reward.map_or(0.0, |tr| tr.average_for(transition.team));
-    let share = config.sanitized_mappo_team_reward_share();
+    let share = if config.marl_algorithm == SoccerMarlAlgorithm::Mappo {
+        config.sanitized_mappo_team_reward_share()
+    } else {
+        0.0
+    };
     let shared = (1.0 - share) * reward + share * own_avg;
     let intermediate = shared * config.sanitized_marl_intermediate_reward_weight();
     if config.marl_algorithm != SoccerMarlAlgorithm::Mappo {
@@ -34426,21 +34430,19 @@ impl SoccerPolicyRoleHead {
         Some(probs)
     }
 
-    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
-        let Some(old_prob) = sample.old_action_probability else {
-            return sample.advantage;
-        };
+    fn clipped_mappo_advantage(
+        &self,
+        sample: &SoccerPolicySample,
+        clip_epsilon: f64,
+    ) -> Option<f64> {
+        let old_prob = sample.old_action_probability?;
         if !old_prob.is_finite() || old_prob <= 1e-9 {
-            return sample.advantage;
+            return None;
         }
-        let Some(current_probs) = self.action_distribution(&sample.state_features) else {
-            return sample.advantage;
-        };
-        let Some(current_prob) = current_probs.get(sample.action_index).copied() else {
-            return sample.advantage;
-        };
+        let current_probs = self.action_distribution(&sample.state_features)?;
+        let current_prob = current_probs.get(sample.action_index).copied()?;
         if !current_prob.is_finite() || current_prob <= 0.0 {
-            return 0.0;
+            return None;
         }
         let epsilon = clip_epsilon.clamp(0.01, 1.0);
         let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
@@ -34450,7 +34452,7 @@ impl SoccerPolicyRoleHead {
         } else {
             ratio.max(clipped)
         };
-        sample.advantage * ppo_ratio
+        Some(sample.advantage * ppo_ratio)
     }
 
     fn train(
@@ -34468,7 +34470,7 @@ impl SoccerPolicyRoleHead {
             })
             .filter_map(|sample| {
                 let advantage = match mappo_clip_epsilon {
-                    Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon),
+                    Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon)?,
                     None => sample.advantage,
                 };
                 advantage.is_finite().then_some((sample, advantage))
@@ -34598,11 +34600,14 @@ impl SoccerPolicyHead {
             .action_distribution(state_features)
     }
 
-    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
+    fn clipped_mappo_advantage(
+        &self,
+        sample: &SoccerPolicySample,
+        clip_epsilon: f64,
+    ) -> Option<f64> {
         let role = soccer_policy_role_from_features(&sample.state_features);
         self.role_head_for_role(role)
-            .map(|head| head.clipped_mappo_advantage(sample, clip_epsilon))
-            .unwrap_or(sample.advantage)
+            .and_then(|head| head.clipped_mappo_advantage(sample, clip_epsilon))
     }
 
     /// One advantage policy-gradient pass over a batch of samples.
