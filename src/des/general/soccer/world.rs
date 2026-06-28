@@ -28879,6 +28879,13 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let own_half = pass_origin_in_own_half(me.team, me_position, self.field_length);
+        // Role-aware risk/safety appetite for the player on the ball (see
+        // `pass_risk_appetite_for_passer`): defenders price interception risk harder, forwards in
+        // the final third price a FORWARD ball softer and prefer it over a safe square/back ball.
+        // NEUTRAL (byte-identical) unless `DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE` is set.
+        let passer_in_attacking_third =
+            (me.team.goal_y(self.field_length) - me_position.y).abs() <= self.field_length / 3.0;
+        let pass_risk_appetite = pass_risk_appetite_for_passer(me.role, passer_in_attacking_third);
         let holder_pressure_for_tiny_pass = self.attacker_pressure_on_point(me.team, me_position);
         let directive = self.tactical_directive(me.team);
         let pass_target_learning =
