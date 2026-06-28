@@ -33752,10 +33752,19 @@ fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
         .iter()
         .find(|player| player.id == behind_teammate)
         .expect("behind player snapshot");
-    assert_eq!(
+    // The agent-decision snapshot must carry AT LEAST the Kalman minimum so the perception
+    // belief activates, while staying a trimmed tail (not the full position history). Other
+    // decision-time consumers (e.g. the loose-ball-contest stall window) may legitimately lift
+    // the retained count above the Kalman minimum, so this is a lower-bound invariant, not an
+    // exact-equality one.
+    assert!(
+        target.position_history.len() >= perception.kalman_min_history_samples
+            && target.position_history.len() < PLAYER_POSITION_HISTORY_LIMIT,
+        "agent-decision snapshot should carry a trimmed history tail >= the Kalman minimum \
+         (got {}, kalman min {}, full limit {})",
         target.position_history.len(),
         perception.kalman_min_history_samples,
-        "agent-decision snapshots should carry only the history tail needed for Kalman belief"
+        PLAYER_POSITION_HISTORY_LIMIT
     );
     let posterior_behind = prior_snapshot
         .observation_for(observer)
