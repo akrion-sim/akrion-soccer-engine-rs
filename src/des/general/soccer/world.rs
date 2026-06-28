@@ -12648,6 +12648,9 @@ impl SoccerMatch {
                     self.players[player_id].incoming_ball = None;
                     let offside = target_id
                         .and_then(|target| snapshot.pending_offside_for_pass(player_id, target));
+                    // Captured before `offside` is moved into the pending pass below; the
+                    // slip-break reward only fires when the runner was onside (trap beaten).
+                    let pass_is_onside = offside.is_none();
                     let offside_candidates = snapshot.offside_candidates_for_pass(player_id);
                     let receiver_position_at_launch = target_id.and_then(|target| {
                         snapshot.player_position(target).or_else(|| {
