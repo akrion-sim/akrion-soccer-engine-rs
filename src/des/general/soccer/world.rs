@@ -28,6 +28,9 @@ const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS: f64 = 2.2;
+const GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT: f64 = 0.34;
+const GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION: f64 = 0.30;
+const GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT: f64 = 0.26;
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
 const TEAMMATE_LANE_GUARD_SAME_ROLE_RADIUS_YARDS: f64 = 3.35;
@@ -19881,6 +19884,66 @@ pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
     (1.0 - outside / QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS).clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ForwardFloorOutletAssessment {
+    actionable: bool,
+    receiver_openness_for_score: f64,
+    expected_completion_for_score: f64,
+    quality_fit: f64,
+    distance_fit: f64,
+}
+
+fn forward_floor_outlet_assessment(
+    forward_yards: f64,
+    distance_yards: f64,
+    quality: &PassTargetQuality,
+    require_reception_won: bool,
+) -> ForwardFloorOutletAssessment {
+    let half_open_forward = forward_yards >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
+        && quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
+    let lane_safe = !require_reception_won
+        || quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH;
+    let receiver_openness_for_score = if half_open_forward {
+        quality
+            .receiver_openness
+            .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
+    } else {
+        quality.receiver_openness
+    };
+    let expected_completion_for_score = if half_open_forward && lane_safe {
+        quality
+            .expected_completion
+            .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
+    } else {
+        quality.expected_completion
+    };
+    let upfield_fit = (forward_yards / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+    let quality_fit = (receiver_openness_for_score.clamp(0.0, 1.0) * 0.46
+        + expected_completion_for_score.clamp(0.0, 1.0) * 0.32
+        + quality.stride_fit.clamp(0.0, 1.0) * 0.12
+        + upfield_fit * 0.10)
+        .clamp(0.0, 1.0);
+    let progressive_floor_outlet = forward_yards >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
+        && distance_yards >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS;
+    let completion_or_stride_fit =
+        quality.expected_completion >= GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION
+            || quality.stride_fit >= GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT
+            || expected_completion_for_score >= HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR;
+    let actionable = progressive_floor_outlet
+        && lane_safe
+        && receiver_openness_for_score >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
+        && completion_or_stride_fit
+        && quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT;
+
+    ForwardFloorOutletAssessment {
+        actionable,
+        receiver_openness_for_score,
+        expected_completion_for_score,
+        quality_fit,
+        distance_fit: quick_forward_pass_band_fit(distance_yards),
+    }
+}
+
 fn first_touch_shape_prior_for_snapshot(
     directive: &TeamTacticalDirective,
     team_shape: TeamShapeObservation,
@@ -26044,7 +26107,7 @@ impl WorldSnapshot {
         let visibility_elapsed = phase_started.elapsed();
         let phase_started = Instant::now();
         let visible_pass_targets = if has_ball {
-            self.ranked_visible_pass_targets(player_id, 3)
+            self.ranked_visible_pass_targets(player_id, 8)
         } else {
             Vec::new()
         };
@@ -28464,12 +28527,60 @@ impl WorldSnapshot {
                     return false;
                 }
                 let position = self.player_snapshot_position(p);
-                let forward = (position.y - me_position.y) * me.team.attack_dir();
+                let initial_is_cross = pass_would_be_cross(
+                    me_position,
+                    position,
+                    me.team,
+                    self.field_width,
+                    self.field_length,
+                );
+                let nominal_speed = pass_speed_yps_from_power(
+                    0.68,
+                    PassFlight::Floor,
+                    initial_is_cross,
+                    &me.skills,
+                );
+                let pass_point = self
+                    .anticipated_pass_reception_point(me.id, p.id, PassFlight::Floor, nominal_speed)
+                    .unwrap_or(position);
+                let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let distance = me_position.distance(position);
-                forward >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
-                    && distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
-                    && (!visible_only || self.player_can_see_player(me.id, p.id))
+                if !visible_only && self.pending_offside_for_pass(me.id, p.id).is_none() {
+                    let quality = pass_target_quality_for_snapshot(
+                        self,
+                        me,
+                        me_position,
+                        p,
+                        position,
+                        PassFlight::Floor,
+                    );
+                    return forward_floor_outlet_assessment(
+                        forward,
+                        distance,
+                        &quality,
+                        require_reception_won,
+                    )
+                    .actionable;
+                }
+                self.player_can_see_player(me.id, p.id)
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
+                    && {
+                        let quality = pass_target_quality_for_snapshot(
+                            self,
+                            me,
+                            me_position,
+                            p,
+                            position,
+                            PassFlight::Floor,
+                        );
+                        forward_floor_outlet_assessment(
+                            forward,
+                            distance,
+                            &quality,
+                            require_reception_won,
+                        )
+                        .actionable
+                    }
             });
         // Forward-option recognition (computed ONCE per decision): the best lane-aware
         // quality across visible forward teammates. A backward/square target is demoted
@@ -28669,8 +28780,9 @@ impl WorldSnapshot {
                                     .max(me.skills.passing)
                                     .max(me.skills.vision),
                             );
-                            receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
-                                && passer_skill >= HALF_OPEN_FORWARD_PASS_MIN_SKILL
+                            receiver_openness >= HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR
+                                || (receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
+                                    && passer_skill >= HALF_OPEN_FORWARD_PASS_MIN_SKILL)
                         } else {
                             false
                         };
@@ -28827,31 +28939,14 @@ impl WorldSnapshot {
                     position,
                     PassFlight::Floor,
                 );
-                let half_open_forward_score = forward >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
-                    && pass_quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
-                let receiver_openness_for_score = if half_open_forward_score {
-                    pass_quality
-                        .receiver_openness
-                        .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
-                } else {
-                    pass_quality.receiver_openness
-                };
-                // For SAFE passes, a high dynamic lane-interception risk strips the half-open
-                // forward completion floor (we'd rather not score up an interceptable ball).
-                // For THREADED/killer candidates (`require_reception_won == false`) we deliberately
-                // KEEP the floor even under high risk: a killer ball through a congested defence is
-                // risky by nature, and per `ranked_threaded_pass_candidates` that risk is priced
-                // into the score, NOT used to hide (truncate) the option out of the candidate pool.
-                let expected_completion_for_score = if half_open_forward_score
-                    && (!require_reception_won
-                        || pass_quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH)
-                {
-                    pass_quality
-                        .expected_completion
-                        .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
-                } else {
-                    pass_quality.expected_completion
-                };
+                let forward_outlet = forward_floor_outlet_assessment(
+                    forward,
+                    dist,
+                    &pass_quality,
+                    require_reception_won,
+                );
+                let receiver_openness_for_score = forward_outlet.receiver_openness_for_score;
+                let expected_completion_for_score = forward_outlet.expected_completion_for_score;
                 let reception_teammate_penalty =
                     self.teammate_occupied_space_penalty_at(me.team, pass_point, Some(p.id), 0.0);
                 let finishing_window_bonus = self.shooting_window_score_at(p, pass_point)
@@ -28949,15 +29044,9 @@ impl WorldSnapshot {
                     >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
                     && dist >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
                 {
-                    let distance_fit = quick_forward_pass_band_fit(dist);
-                    let upfield_fit = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
-                    let quality_fit = (receiver_openness_for_score.clamp(0.0, 1.0) * 0.46
-                        + expected_completion_for_score.clamp(0.0, 1.0) * 0.32
-                        + pass_quality.stride_fit.clamp(0.0, 1.0) * 0.12
-                        + upfield_fit * 0.10)
-                        .clamp(0.0, 1.0);
-                    distance_fit
-                        * quality_fit
+                    forward_outlet
+                        .distance_fit
+                        * forward_outlet.quality_fit
                         * PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS
                         * if own_half { 1.35 } else { 1.0 }
                 } else {
@@ -39490,9 +39579,6 @@ impl WorldSnapshot {
             if forward <= 1.25 {
                 continue;
             }
-            visible_forward_pass_options += 1;
-            nearest_visible_forward_pass_distance_yards =
-                nearest_visible_forward_pass_distance_yards.min(current.distance(target_position));
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -39501,25 +39587,30 @@ impl WorldSnapshot {
                 target_position,
                 PassFlight::Floor,
             );
+            let distance = current.distance(target_position);
+            let outlet =
+                forward_floor_outlet_assessment(forward, distance, &quality, true);
+            if !outlet.actionable {
+                continue;
+            }
+            visible_forward_pass_options += 1;
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(distance);
             best_forward_pass_receiver_openness =
-                best_forward_pass_receiver_openness.max(quality.receiver_openness);
+                best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
             best_forward_pass_option_quality = best_forward_pass_option_quality.max(
-                forward_pass_option_quality(quality.receiver_openness, quality.expected_completion),
+                forward_pass_option_quality(
+                    outlet.receiver_openness_for_score,
+                    quality.expected_completion,
+                ),
             );
             // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
             // advanced teammate. Reward openness × completion most, weight the in-band
             // distance, and add a modest upfield-gain term so a more advanced open runner
             // edges a square one. The ranked execution targets this player when the value
             // wins (see `quick_forward_pass_target`).
-            let distance = current.distance(target_position);
-            let band_fit = quick_forward_pass_band_fit(distance);
-            if band_fit > 0.0 {
-                let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
-                let openness = quality.receiver_openness.clamp(0.0, 1.0);
-                let completion = quality.expected_completion.clamp(0.0, 1.0);
-                let value = (band_fit
-                    * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
-                    .clamp(0.0, 1.0);
+            if outlet.distance_fit > 0.0 {
+                let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
                 if value > best_quick_forward_open_value {
                     best_quick_forward_open_value = value;
                     best_quick_forward_target = Some(*target_id);
