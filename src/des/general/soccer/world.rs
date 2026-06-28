@@ -30946,6 +30946,13 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn in_behind_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        // Slip-and-break-the-offside-trap (gated): a runner staged onside who has a seam to break
+        // into takes priority over the generic in-behind cadence — he initiates the sprint into
+        // the seam channel and the carrier then slips the ball through. `None` (so the generic
+        // logic below runs) when off or no seam is on. See `slip_break_run_target_for`.
+        if let Some(target) = self.slip_break_run_target_for(player_id) {
+            return Some(target);
+        }
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let backfield_long_pass_invite = self.backfield_long_pass_run_invite_for(player_id);
         if self.possession_team() != Some(me.team)
