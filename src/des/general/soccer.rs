@@ -719,6 +719,9 @@ const FIRST_TOUCH_WINDOW_TICKS: u64 = secs_to_ticks(0.3);
 // playback traces, and neural grid features all flow through this address.
 const PITCH_FINE_GRID_COLUMNS: usize = PITCH_GENOME_LANES as usize;
 const PITCH_FINE_GRID_ROWS: usize = PITCH_GENOME_ROWS as usize;
+pub(crate) const CRASH_BOX_OUTER_FLANK_FINE_LANES: usize = 3;
+pub(crate) const CRASH_BOX_TARGET_MIN_ATTACKERS: usize = 2;
+pub(crate) const CRASH_BOX_TARGET_MAX_ATTACKERS: usize = 3;
 const PITCH_TACTICAL_GRID_COLUMNS: usize = 6;
 const PITCH_TACTICAL_GRID_ROWS: usize = 8;
 const PITCH_MACRO_GRID_COLUMNS: usize = 3;
@@ -889,6 +892,28 @@ const KILLER_PASS_MIN_FORWARD_YARDS: f64 = 4.0;
 const KILLER_PASS_MIN_RECEIVER_GOAL_GAIN_YARDS: f64 = 5.0;
 const KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION: f64 = 0.24;
 const KILLER_PASS_MIN_LANE_FIT: f64 = 0.30;
+const SLIP_BREAK_OFFSIDE_TRAP_START_MIN_GAP_YARDS: f64 = 5.0;
+const SLIP_BREAK_OFFSIDE_TRAP_START_MAX_GAP_YARDS: f64 = 10.0;
+const SLIP_BREAK_OFFSIDE_TRAP_START_IDEAL_GAP_YARDS: f64 = 7.5;
+const SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MIN_GAP_YARDS: f64 = 1.5;
+const SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MAX_GAP_YARDS: f64 = 4.0;
+const SLIP_BREAK_OFFSIDE_TRAP_RELEASE_IDEAL_GAP_YARDS: f64 = 2.6;
+const SLIP_BREAK_OFFSIDE_TRAP_LINE_BREAK_DEPTH_YARDS: f64 = 4.2;
+const SLIP_BREAK_OFFSIDE_TRAP_MIN_FORWARD_SPEED_YPS: f64 = 3.8;
+const SLIP_BREAK_OFFSIDE_TRAP_SPRINT_REFERENCE_YPS: f64 = 6.2;
+const SLIP_BREAK_OFFSIDE_TRAP_MIN_SPEED_EDGE_YPS: f64 = 0.25;
+const SLIP_BREAK_OFFSIDE_TRAP_SPEED_EDGE_REFERENCE_YPS: f64 = 2.8;
+const SLIP_BREAK_OFFSIDE_TRAP_MIN_SEAM_WIDTH_YARDS: f64 = 4.5;
+const SLIP_BREAK_OFFSIDE_TRAP_IDEAL_SEAM_WIDTH_YARDS: f64 = 8.0;
+const SLIP_BREAK_OFFSIDE_TRAP_SEAM_MARGIN_YARDS: f64 = 1.15;
+const SLIP_BREAK_OFFSIDE_TRAP_MIN_PASS_MPH: f64 = 25.0;
+const SLIP_BREAK_OFFSIDE_TRAP_TARGET_PASS_MPH: f64 = 30.0;
+const SLIP_BREAK_OFFSIDE_TRAP_MAX_PASS_MPH: f64 = 35.0;
+const SLIP_BREAK_OFFSIDE_TRAP_KEEPER_AVOID_YARDS: f64 = 5.0;
+const SLIP_BREAK_OFFSIDE_TRAP_MAX_DISTANCE_YARDS: f64 = 40.0;
+const SLIP_BREAK_OFFSIDE_TRAP_SCORE_BONUS_WEIGHT: f64 = 3.2;
+const SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT: f64 = 2.7;
+const SLIP_BREAK_OFFSIDE_TRAP_NUMERIC_EPSILON: f64 = 1e-6;
 // A threaded ball whose GROUND lane is blocked by a defender is not hidden — it is lifted OVER
 // them onto the runner (a chip/clipped ball), provided a loft actually clears the block. The
 // aerial lane is tested with a tighter corridor (only a defender almost directly under the
@@ -2523,15 +2548,11 @@ const STRIKER_AHEAD_OF_MID_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 // - DEFENDING: pinch IN toward centre, but only as far as the wider (closer-to-touchline) of
 //   {the outermost opponent on that flank, the near edge of the 6-yard box} — never further,
 //   so the wide channel / box corner stays protected.
-// - IN POSSESSION: open OUT toward the touchline for attacking width, bombing wide when there
-//   is cover behind the ball (more than `WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN` team-mates
-//   goal-side of it), opening only moderately when cover is thin.
+// - IN POSSESSION: outside backs may push forward with the ball beyond the back-four line, but
+//   only open laterally to the touchline when they are a playable short ground outlet.
 // The 6-yard box (goal area) extends this far either side of each post.
 const SIX_YARD_BOX_DEPTH_YARDS: f64 = 6.0;
 const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
-const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 8.0;
-const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 2;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
@@ -2658,6 +2679,17 @@ const SWITCH_PLAY_MAX_FORWARD_YARDS: f64 = 14.0;
 const SWITCH_PLAY_MIN_LATERAL_YARDS: f64 = 22.0;
 const DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.65;
 const DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.05;
+const SURPRISE_BEHIND_STEAL_MAX_DISTANCE_YARDS: f64 = 8.5;
+const SURPRISE_BEHIND_STEAL_MIN_BEHIND_YARDS: f64 = 0.55;
+const SURPRISE_BEHIND_STEAL_MAX_LATERAL_YARDS: f64 = 3.25;
+const SURPRISE_BEHIND_STEAL_MAX_HOLDER_SPEED_YPS: f64 = 4.85;
+const SURPRISE_BEHIND_STEAL_MIN_FORWARD_YPS: f64 = 0.25;
+const SURPRISE_BEHIND_STEAL_MIN_SCORE: f64 = 0.50;
+const SURPRISE_BEHIND_STEAL_CATCH_GRACE_SECONDS: f64 = 0.38;
+const SURPRISE_BEHIND_STEAL_MAX_GLANCE_CONTROL_COST: f64 = 0.095;
+const SURPRISE_BEHIND_STEAL_BALL_REACH_YARDS: f64 =
+    DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS + 0.28;
+const SURPRISE_BEHIND_STEAL_ATTACK_OFFSET_YARDS: f64 = 0.55;
 // Ball protection (0 = exposed/pushed-ahead at speed, 1 = shielded at the feet).
 // A ball that the holder has pushed past this many yards is fully lead-exposed;
 // a dribble at this pace is fully speed-exposed. A contestable (low-protection)
@@ -3791,6 +3823,13 @@ const SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM: usize = 6;
 /// into the approaching ball, the signed approach/retreat amount, race margin, and
 /// current position/velocity/acceleration/jerk fit for that move.
 const SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM: usize = 4;
+/// Append-only blind-side steal block: trailing threat, catch margin, carrier
+/// recognition from side glances, the small scan/control cost, and escape pressure.
+const SOCCER_NEURAL_SURPRISE_BEHIND_STEAL_FEATURE_DIM: usize = 5;
+/// Append-only slip-break/offside-trap block: runner timing, release gap, seam
+/// width, 25-35 mph ground-pass speed, speed edge over the back line, line-break
+/// depth, and keeper angle.
+const SOCCER_NEURAL_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM: usize = 9;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3808,6 +3847,11 @@ const SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_SURPRISE_BEHIND_STEAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_SURPRISE_BEHIND_STEAL_FEATURE_DIM
+        + SOCCER_NEURAL_SURPRISE_BEHIND_STEAL_FEATURE_DIM;
 /// Append-only **relational attention readout** block. The whole-field motion block already
 /// carries every player as a flat, fixed-order list of actor-relative pos/vel/acc/jerk, and the
 /// team-center block carries fixed (mean) centroids — but neither exposes a permutation-invariant,
@@ -3820,10 +3864,18 @@ const SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM: usize =
 /// `DD_SOCCER_ENABLE_RELATIONAL_ATTENTION`; OFF (default) leaves the block all-zeros, so the block
 /// content is byte-identical to before and an A/B is a clean on/off within the same dimensions.
 const SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM: usize = 8;
+/// Append-only isolated-carrier block: goal-side defender count, lack of forward support,
+/// dribble runway, and speed edge. This gives MARL/MAPPO the same solo-goal vs hold-up
+/// evidence that the hand-authored action scorer uses.
+const SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM: usize = 4;
 const SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM: usize =
-    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
-    + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM;
+    SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM
+        + SOCCER_NEURAL_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+        + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM
+    + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4177,8 +4229,7 @@ const SOCCER_NEURAL_FEATURE_ENERGY_BALL_INTERACTION_10S: usize =
     SOCCER_NEURAL_FEATURE_ENERGY_NO_BALL_MOVEMENT + 1;
 const SOCCER_NEURAL_FEATURE_TEAM_ENERGY_RHYTHM: usize =
     SOCCER_NEURAL_FEATURE_ENERGY_BALL_INTERACTION_10S + 1;
-const SOCCER_NEURAL_FEATURE_TEAM_ENERGY_DEBT: usize =
-    SOCCER_NEURAL_FEATURE_TEAM_ENERGY_RHYTHM + 1;
+const SOCCER_NEURAL_FEATURE_TEAM_ENERGY_DEBT: usize = SOCCER_NEURAL_FEATURE_TEAM_ENERGY_RHYTHM + 1;
 const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE: usize =
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE: usize =
@@ -4199,6 +4250,34 @@ const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET + 1;
 const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE + 1;
+const SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_THREAT: usize =
+    SOCCER_NEURAL_PRE_SURPRISE_BEHIND_STEAL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_CATCH_MARGIN: usize =
+    SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_THREAT + 1;
+const SOCCER_NEURAL_FEATURE_SIDE_GLANCE_RECOGNITION: usize =
+    SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_CATCH_MARGIN + 1;
+const SOCCER_NEURAL_FEATURE_SIDE_GLANCE_CONTROL_COST: usize =
+    SOCCER_NEURAL_FEATURE_SIDE_GLANCE_RECOGNITION + 1;
+const SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_ESCAPE_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_SIDE_GLANCE_CONTROL_COST + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_OFFSIDE_TRAP_AVAILABLE: usize =
+    SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_START_GAP: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_OFFSIDE_TRAP_AVAILABLE + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_RELEASE_GAP: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_START_GAP + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_SEAM_WIDTH: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_RELEASE_GAP + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_PASS_SPEED: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_SEAM_WIDTH + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_BACK_LINE_SPEED_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_PASS_SPEED + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_LINE_BREAK_DEPTH: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_BACK_LINE_SPEED_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_GOALKEEPER_AVOIDANCE: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_LINE_BREAK_DEPTH + 1;
+const SOCCER_NEURAL_FEATURE_SLIP_BREAK_ANGLED_AWAY_FROM_GOALKEEPER: usize =
+    SOCCER_NEURAL_FEATURE_SLIP_BREAK_GOALKEEPER_AVOIDANCE + 1;
 // Relational attention readout indices (teammate channels first, then opponents).
 const SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH: usize =
     SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM;
@@ -4216,6 +4295,14 @@ const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING: usize =
     SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_WIDTH + 1;
 const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY: usize =
     SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING + 1;
+const SOCCER_NEURAL_FEATURE_SOLO_GOAL_SIDE_DEFENDER_GAP: usize =
+    SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_SOLO_NO_FORWARD_SUPPORT: usize =
+    SOCCER_NEURAL_FEATURE_SOLO_GOAL_SIDE_DEFENDER_GAP + 1;
+const SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE: usize =
+    SOCCER_NEURAL_FEATURE_SOLO_NO_FORWARD_SUPPORT + 1;
+const SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE + 1;
 const DD_SOCCER_RELATIONAL_ATTENTION_ENV: &str = "DD_SOCCER_ENABLE_RELATIONAL_ATTENTION";
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
@@ -4333,8 +4420,14 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM,
     // Same schema with killer over-top pass channels, before reception-approach control.
     SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM,
-    // Same schema with reception-approach control, before the relational attention readout.
+    // Same schema with reception-approach control, before blind-side steal/glance channels.
+    SOCCER_NEURAL_PRE_SURPRISE_BEHIND_STEAL_FEATURE_DIM,
+    // Same schema with blind-side steal/glance channels, before slip-break/offside-trap channels.
+    SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM,
+    // Same schema with slip-break/offside-trap channels, before the relational attention readout.
     SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
+    // Same schema with relational attention, before isolated-carrier solo/hold-up channels.
+    SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5785,6 +5878,21 @@ pub struct SoccerNeuralExtendedObservation {
     /// Nutmeg lane score [0,1] when the defender is central, close, committed, and beatable.
     #[serde(default)]
     pub dribble_nutmeg_window_score: f64,
+    /// Blind-side trailing defender threat while the actor carries, [0, 1].
+    #[serde(default)]
+    pub surprise_behind_steal_threat: f64,
+    /// Positive when a trailing defender can reach before the carrier can react.
+    #[serde(default)]
+    pub surprise_behind_steal_catch_margin_seconds: f64,
+    /// Pressure to accelerate or move away once the carrier recognizes the blind-side threat.
+    #[serde(default)]
+    pub surprise_behind_steal_escape_pressure: f64,
+    /// Carrier's side-to-side glance recognition of that trailing steal threat, [0, 1].
+    #[serde(default)]
+    pub side_glance_surprise_recognition: f64,
+    /// Fractional speed/control tax paid for active side glances while carrying.
+    #[serde(default)]
+    pub side_glance_control_cost: f64,
 }
 
 /// Serde default for [`SoccerPomdpObservation::aerial_pass_landing_safety`]: a missing field
@@ -5884,6 +5992,26 @@ pub struct SoccerPomdpObservation {
     #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
     pub threaded_goal_pass_over_top_goalkeeper_avoidance_yards: f64,
     #[serde(default)]
+    pub slip_break_offside_trap_available: bool,
+    #[serde(default)]
+    pub slip_break_offside_trap_target: Option<usize>,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_runner_start_gap_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_release_gap_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_seam_width_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_pass_speed_yps: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_runner_back_line_speed_edge_yps: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_line_break_depth_yards: f64,
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub slip_break_goalkeeper_avoidance_yards: f64,
+    #[serde(default)]
+    pub slip_break_angled_away_from_goalkeeper: bool,
+    #[serde(default)]
     pub best_forward_pass_receiver_openness: f64,
     #[serde(default)]
     pub nearest_forward_teammate_distance_yards: f64,
@@ -5957,6 +6085,14 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
+    #[serde(default)]
+    pub side_glance_scan_active: bool,
+    #[serde(default)]
+    pub side_glance_scan_rate_hz: f64,
+    #[serde(default)]
+    pub side_glance_surprise_recognition: f64,
+    #[serde(default)]
+    pub side_glance_control_cost: f64,
     /// Previous settled run-time-step decision/action summary for this player.
     /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
     /// current observation stays current-state-first, while this optional payload
@@ -6489,6 +6625,30 @@ struct LookBehindScanContext {
     drift_risk: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SideGlanceThreatMetrics {
+    pub active: bool,
+    pub scan_rate_hz: f64,
+    pub recognition: f64,
+    pub control_cost: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SurpriseBehindStealProfile {
+    pub available: bool,
+    pub score: f64,
+    pub catch_margin_seconds: f64,
+    pub defender_catch_time_seconds: f64,
+    pub holder_reaction_seconds: f64,
+    pub holder_blind_spot: f64,
+    pub holder_glance_scan_rate_hz: f64,
+    pub holder_glance_recognition: f64,
+    pub holder_glance_control_cost: f64,
+    pub escape_pressure: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BeliefState {
@@ -6966,16 +7126,10 @@ pub(crate) fn soccer_decision_commitment_history_after_decision(
     soccer_compact_decision_commitment_history(history, decision_tick)
 }
 
-fn soccer_decision_commitment_recent_count(
-    history: &[u64],
-    tick: u64,
-    window_ticks: u64,
-) -> usize {
+fn soccer_decision_commitment_recent_count(history: &[u64], tick: u64, window_ticks: u64) -> usize {
     history
         .iter()
-        .filter(|&&commitment_tick| {
-            tick.saturating_sub(commitment_tick) < window_ticks
-        })
+        .filter(|&&commitment_tick| tick.saturating_sub(commitment_tick) < window_ticks)
         .count()
 }
 
@@ -7042,13 +7196,12 @@ pub(crate) fn soccer_refresh_decision_commitment_cadence(
     }
     carryover.ticks_since_commitment =
         soccer_decision_commitment_ticks_since(&carryover.commitment_ticks, observed_at_tick);
-    carryover.recent_commitment_count_7_ticks =
-        soccer_decision_commitment_recent_count(
-            &carryover.commitment_ticks,
-            observed_at_tick,
-            PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS,
-        )
-            .min(u8::MAX as usize) as u8;
+    carryover.recent_commitment_count_7_ticks = soccer_decision_commitment_recent_count(
+        &carryover.commitment_ticks,
+        observed_at_tick,
+        PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS,
+    )
+    .min(u8::MAX as usize) as u8;
     carryover.decision_cadence_switch_locked = soccer_decision_commitment_switch_locked_for_history(
         &carryover.commitment_ticks,
         observed_at_tick,
@@ -8599,6 +8752,10 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub field_players_behind_bin: u8,
     #[serde(default)]
+    pub field_opponents_ahead_bin: u8,
+    #[serde(default)]
+    pub field_opponents_behind_bin: u8,
+    #[serde(default)]
     pub field_ahead_teammate_ratio_bin: u8,
     #[serde(default)]
     pub field_behind_teammate_ratio_bin: u8,
@@ -8630,6 +8787,24 @@ pub struct SoccerQStateKey {
     pub threaded_goal_pass_over_top_back_line_clearance_bin: u8,
     #[serde(default)]
     pub threaded_goal_pass_over_top_goalkeeper_avoidance_bin: u8,
+    #[serde(default)]
+    pub slip_break_offside_trap_available: bool,
+    #[serde(default)]
+    pub slip_break_runner_start_gap_bin: u8,
+    #[serde(default)]
+    pub slip_break_release_gap_bin: u8,
+    #[serde(default)]
+    pub slip_break_seam_width_bin: u8,
+    #[serde(default)]
+    pub slip_break_pass_speed_bin: u8,
+    #[serde(default)]
+    pub slip_break_runner_back_line_speed_edge_bin: u8,
+    #[serde(default)]
+    pub slip_break_line_break_depth_bin: u8,
+    #[serde(default)]
+    pub slip_break_goalkeeper_avoidance_bin: u8,
+    #[serde(default)]
+    pub slip_break_angled_away_from_goalkeeper: bool,
     #[serde(default)]
     pub best_forward_pass_receiver_openness_bin: u8,
     #[serde(default)]
@@ -8769,6 +8944,18 @@ pub struct SoccerQStateKey {
     /// Nutmeg-window bucket when the defender is central and committed.
     #[serde(default)]
     pub dribble_nutmeg_window_bin: u8,
+    /// Blind-side trailing steal threat bucket for on-ball carriers.
+    #[serde(default)]
+    pub surprise_behind_steal_threat_bin: u8,
+    /// Catch-margin bucket: can the trailer arrive before the carrier reacts.
+    #[serde(default)]
+    pub surprise_behind_steal_catch_margin_bin: u8,
+    /// Carrier side-glance recognition bucket for blind-side steal threats.
+    #[serde(default)]
+    pub side_glance_surprise_recognition_bin: u8,
+    /// Small movement/control tax bucket paid by active side glances.
+    #[serde(default)]
+    pub side_glance_control_cost_bin: u8,
     #[serde(default)]
     pub perceived_time_on_ball_bin: u8,
     #[serde(default)]
@@ -8893,7 +9080,11 @@ fn q_state_ball_fine_lane_row(
     }
     if q_state_grid_has_policy_fine_cell(&observation.ball_grid) {
         return (
-            observation.ball_grid.fine.x.min(PITCH_FINE_GRID_COLUMNS - 1) as u8,
+            observation
+                .ball_grid
+                .fine
+                .x
+                .min(PITCH_FINE_GRID_COLUMNS - 1) as u8,
             observation.ball_grid.fine.y.min(PITCH_FINE_GRID_ROWS - 1) as u8,
         );
     }
@@ -9223,6 +9414,14 @@ impl SoccerQStateKey {
                 observation.field_players_behind as f64,
                 &[2.5, 5.5, 8.5, 12.5, 16.5],
             ),
+            field_opponents_ahead_bin: distance_bucket(
+                observation.field_opponents_ahead as f64,
+                &[0.5, 1.5, 2.5, 3.5, 5.5],
+            ),
+            field_opponents_behind_bin: distance_bucket(
+                observation.field_opponents_behind as f64,
+                &[0.5, 1.5, 2.5, 3.5, 5.5],
+            ),
             field_ahead_teammate_ratio_bin: distance_bucket(
                 observation.field_ahead_teammate_ratio,
                 &[0.25, 0.42, 0.58, 0.75],
@@ -9281,6 +9480,47 @@ impl SoccerQStateKey {
                 observation.threaded_goal_pass_over_top_goalkeeper_avoidance_yards,
                 &KILLER_PASS_OVER_TOP_GOALKEEPER_AVOIDANCE_BINS_YARDS,
             ),
+            slip_break_offside_trap_available: observation.slip_break_offside_trap_available,
+            slip_break_runner_start_gap_bin: distance_bucket(
+                observation.slip_break_runner_start_gap_yards,
+                &[5.0, 6.5, 8.5, 10.0],
+            ),
+            slip_break_release_gap_bin: distance_bucket(
+                observation.slip_break_release_gap_yards,
+                &[1.5, 2.3, 3.2, 4.0],
+            ),
+            slip_break_seam_width_bin: distance_bucket(
+                observation.slip_break_seam_width_yards,
+                &[4.5, 6.0, 8.0, 11.0],
+            ),
+            slip_break_pass_speed_bin: distance_bucket(
+                observation.slip_break_pass_speed_yps,
+                &[
+                    mph_to_yps(25.0),
+                    mph_to_yps(28.0),
+                    mph_to_yps(32.0),
+                    mph_to_yps(35.0),
+                ],
+            ),
+            slip_break_runner_back_line_speed_edge_bin: distance_bucket(
+                observation.slip_break_runner_back_line_speed_edge_yps,
+                &[
+                    SLIP_BREAK_OFFSIDE_TRAP_MIN_SPEED_EDGE_YPS,
+                    0.8,
+                    1.6,
+                    SLIP_BREAK_OFFSIDE_TRAP_SPEED_EDGE_REFERENCE_YPS,
+                ],
+            ),
+            slip_break_line_break_depth_bin: distance_bucket(
+                observation.slip_break_line_break_depth_yards,
+                &[2.0, 3.2, 4.8, 6.5],
+            ),
+            slip_break_goalkeeper_avoidance_bin: distance_bucket(
+                observation.slip_break_goalkeeper_avoidance_yards,
+                &[2.0, 4.0, 6.0, 9.0],
+            ),
+            slip_break_angled_away_from_goalkeeper: observation
+                .slip_break_angled_away_from_goalkeeper,
             best_forward_pass_receiver_openness_bin: distance_bucket(
                 observation.best_forward_pass_receiver_openness,
                 &[0.20, 0.40, 0.62, 0.82],
@@ -9523,6 +9763,28 @@ impl SoccerQStateKey {
             dribble_nutmeg_window_bin: distance_bucket(
                 observation.neural_extended.dribble_nutmeg_window_score,
                 &[0.12, 0.30, 0.55, 0.78],
+            ),
+            surprise_behind_steal_threat_bin: distance_bucket(
+                observation.neural_extended.surprise_behind_steal_threat,
+                &[0.12, 0.30, 0.55, 0.78],
+            ),
+            surprise_behind_steal_catch_margin_bin: distance_bucket(
+                observation
+                    .neural_extended
+                    .surprise_behind_steal_catch_margin_seconds,
+                &[-0.20, 0.0, 0.25, 0.60],
+            ),
+            side_glance_surprise_recognition_bin: distance_bucket(
+                observation
+                    .side_glance_surprise_recognition
+                    .max(observation.neural_extended.side_glance_surprise_recognition),
+                &[0.15, 0.35, 0.58, 0.80],
+            ),
+            side_glance_control_cost_bin: distance_bucket(
+                observation
+                    .side_glance_control_cost
+                    .max(observation.neural_extended.side_glance_control_cost),
+                &[0.015, 0.035, 0.060, 0.085],
             ),
             perceived_time_on_ball_bin: distance_bucket(
                 observation.perceived_time_on_ball_seconds,
@@ -9826,6 +10088,8 @@ impl SoccerQStateKey {
             && self.teammates_ahead_bin == other.teammates_ahead_bin
             && self.field_players_ahead_bin == other.field_players_ahead_bin
             && self.field_players_behind_bin == other.field_players_behind_bin
+            && self.field_opponents_ahead_bin == other.field_opponents_ahead_bin
+            && self.field_opponents_behind_bin == other.field_opponents_behind_bin
             && self.field_ahead_teammate_ratio_bin == other.field_ahead_teammate_ratio_bin
             && self.field_behind_teammate_ratio_bin == other.field_behind_teammate_ratio_bin
             && self.visible_forward_pass_options_bin == other.visible_forward_pass_options_bin
@@ -9851,6 +10115,18 @@ impl SoccerQStateKey {
                 == other.threaded_goal_pass_over_top_back_line_clearance_bin
             && self.threaded_goal_pass_over_top_goalkeeper_avoidance_bin
                 == other.threaded_goal_pass_over_top_goalkeeper_avoidance_bin
+            && self.slip_break_offside_trap_available == other.slip_break_offside_trap_available
+            && self.slip_break_runner_start_gap_bin == other.slip_break_runner_start_gap_bin
+            && self.slip_break_release_gap_bin == other.slip_break_release_gap_bin
+            && self.slip_break_seam_width_bin == other.slip_break_seam_width_bin
+            && self.slip_break_pass_speed_bin == other.slip_break_pass_speed_bin
+            && self.slip_break_runner_back_line_speed_edge_bin
+                == other.slip_break_runner_back_line_speed_edge_bin
+            && self.slip_break_line_break_depth_bin == other.slip_break_line_break_depth_bin
+            && self.slip_break_goalkeeper_avoidance_bin
+                == other.slip_break_goalkeeper_avoidance_bin
+            && self.slip_break_angled_away_from_goalkeeper
+                == other.slip_break_angled_away_from_goalkeeper
             && self.best_forward_pass_receiver_openness_bin
                 == other.best_forward_pass_receiver_openness_bin
             && self.nearest_forward_teammate_distance_bin
@@ -9923,6 +10199,12 @@ impl SoccerQStateKey {
             && self.dribble_defender_reaction_delay_bin == other.dribble_defender_reaction_delay_bin
             && self.dribble_momentum_escape_side_bin == other.dribble_momentum_escape_side_bin
             && self.dribble_nutmeg_window_bin == other.dribble_nutmeg_window_bin
+            && self.surprise_behind_steal_threat_bin == other.surprise_behind_steal_threat_bin
+            && self.surprise_behind_steal_catch_margin_bin
+                == other.surprise_behind_steal_catch_margin_bin
+            && self.side_glance_surprise_recognition_bin
+                == other.side_glance_surprise_recognition_bin
+            && self.side_glance_control_cost_bin == other.side_glance_control_cost_bin
             && self.perceived_time_on_ball_bin == other.perceived_time_on_ball_bin
             && self.excessive_hold_pressure_bin == other.excessive_hold_pressure_bin
             && self.fatigue_bin == other.fatigue_bin
@@ -9998,6 +10280,7 @@ impl SoccerQStateKey {
             && self.threaded_goal_pass_available == other.threaded_goal_pass_available
             && self.threaded_goal_pass_over_top_available
                 == other.threaded_goal_pass_over_top_available
+            && self.slip_break_offside_trap_available == other.slip_break_offside_trap_available
             && self.first_touch_kind == other.first_touch_kind
             && self.receiving_pending_pass == other.receiving_pending_pass
             && facing_bucket_matches(self.receive_facing, other.receive_facing)
@@ -11938,10 +12221,7 @@ pub(crate) fn soccer_marl_tick_rewards(
             .record(
                 transition.team,
                 transition.reward,
-                transition
-                    .observation
-                    .neural_extended
-                    .energy_waste_pressure,
+                transition.observation.neural_extended.energy_waste_pressure,
             );
     }
     tick_rewards
@@ -12041,17 +12321,12 @@ impl MatchOutcomeReward {
             * (margin - 1.0).clamp(0.0, MATCH_OUTCOME_MARGIN_CAP_GOALS - 1.0);
         let magnitude = MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus;
         let (home, away) = match score_diff_home.cmp(&0) {
-            std::cmp::Ordering::Greater => (
-                magnitude,
-                -magnitude,
+            std::cmp::Ordering::Greater => (magnitude, -magnitude),
+            std::cmp::Ordering::Less => (-magnitude, magnitude),
+            std::cmp::Ordering::Equal => (
+                MATCH_OUTCOME_DRAW_REWARD_POINTS,
+                MATCH_OUTCOME_DRAW_REWARD_POINTS,
             ),
-            std::cmp::Ordering::Less => (
-                -magnitude,
-                magnitude,
-            ),
-            std::cmp::Ordering::Equal => {
-                (MATCH_OUTCOME_DRAW_REWARD_POINTS, MATCH_OUTCOME_DRAW_REWARD_POINTS)
-            }
         };
         MatchOutcomeReward { home, away }
     }
@@ -12093,8 +12368,7 @@ pub fn match_outcome_reward_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         // Promoted to default-ON in production (terminal won-game reward; training-time only).
         *ENABLED.get_or_init(|| {
-            dd_soccer_enable_outcome_credit()
-                || gate_default_on(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
+            dd_soccer_enable_outcome_credit() || gate_default_on(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
         })
     }
 }
@@ -12104,7 +12378,8 @@ fn soccer_full_game_replay_transitions(
     match_outcome: Option<MatchOutcomeReward>,
 ) -> Vec<SoccerLearningTransition> {
     if dd_soccer_enable_outcome_credit() {
-        let outcome = match_outcome.or_else(|| soccer_outcome_match_reward_from_transitions(transitions));
+        let outcome =
+            match_outcome.or_else(|| soccer_outcome_match_reward_from_transitions(transitions));
         return soccer_outcome_credit_replay_transitions(transitions, outcome);
     }
     soccer_correlated_full_game_replay_transitions(transitions, match_outcome)
@@ -12182,8 +12457,7 @@ fn soccer_correlated_full_game_replay_transitions(
                 Team::Home => home_return,
                 Team::Away => away_return,
             };
-            let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND)
-                * finite_metric(transition.reward)
+            let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND) * finite_metric(transition.reward)
                 + SOCCER_FULL_GAME_RETURN_BLEND * correlated_return;
             // The "long" reward: a flat per-transition outcome label, added after the
             // shaped blend so a whole game of decisions is credited by the result, not
@@ -12242,7 +12516,11 @@ fn soccer_outcome_match_reward_from_transitions(
 ) -> Option<MatchOutcomeReward> {
     let mut latest: Option<(u64, usize, i32)> = None;
     for (idx, transition) in transitions.iter().enumerate() {
-        let candidate = (transition.tick, idx, transition.next_state.score_diff_for_home);
+        let candidate = (
+            transition.tick,
+            idx,
+            transition.next_state.score_diff_for_home,
+        );
         if latest
             .map(|current| (candidate.0, candidate.1) > (current.0, current.1))
             .unwrap_or(true)
@@ -12481,6 +12759,44 @@ fn flank_cross_context_is_legal(
     observation.has_ball
         && observation.yards_to_goal <= max_yards_to_goal
         && flank_lane_score(player_position, field_width_yards).clamp(0.0, 1.0) >= min_flank_score
+}
+
+pub(crate) fn pitch_fine_lane_for_position(position: Vec2, field_width_yards: f64) -> usize {
+    zone(
+        position.x,
+        field_width_yards.max(1.0),
+        PITCH_FINE_GRID_COLUMNS,
+    )
+}
+
+pub(crate) fn position_in_outer_flank_fine_lanes(position: Vec2, field_width_yards: f64) -> bool {
+    let lane = pitch_fine_lane_for_position(position, field_width_yards);
+    let right_flank_start =
+        PITCH_FINE_GRID_COLUMNS.saturating_sub(CRASH_BOX_OUTER_FLANK_FINE_LANES);
+    lane < CRASH_BOX_OUTER_FLANK_FINE_LANES || lane >= right_flank_start
+}
+
+pub(crate) fn position_in_opponent_final_third(
+    team: Team,
+    position: Vec2,
+    field_length_yards: f64,
+) -> bool {
+    if !position.y.is_finite() || field_length_yards <= 0.0 {
+        return false;
+    }
+    let distance_to_goal = (team.goal_y(field_length_yards) - position.y).abs();
+    distance_to_goal <= field_length_yards / 3.0
+        && (position.y - field_length_yards * 0.5) * team.attack_dir() > 0.0
+}
+
+pub(crate) fn wide_final_third_cross_lane_context(
+    team: Team,
+    position: Vec2,
+    field_width_yards: f64,
+    field_length_yards: f64,
+) -> bool {
+    position_in_outer_flank_fine_lanes(position, field_width_yards)
+        && position_in_opponent_final_third(team, position, field_length_yards)
 }
 
 fn is_attacking_support_action_label(action: &str) -> bool {
@@ -18086,7 +18402,7 @@ fn tactical_directive_for_team(
         + shot_choice_bias * 0.025
         + overload_score * 0.22)
         .clamp(0.55, 1.35);
-    let flank_attack_policy = flank_attack_policy_for_team(
+    let mut flank_attack_policy = flank_attack_policy_for_team(
         team,
         attacking_phase,
         build_up_phase,
@@ -18098,6 +18414,11 @@ fn tactical_directive_for_team(
         risk_tolerance,
         overload_score,
     );
+    let outer_flank_final_third =
+        wide_final_third_cross_lane_context(team, ball_position, field_width, field_length);
+    if has_ball && outer_flank_final_third {
+        flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    }
     let mut flank_overlap_run_probability = if flank_attack_policy.is_flank() {
         ((1.0 / 3.0)
             + risk_tolerance * 0.16
@@ -18210,10 +18531,10 @@ fn tactical_directive_for_team(
     .clamp(-1.0, 1.0);
     let endline_depth = (team.goal_y(field_length) - ball_position.y).abs();
     let wide_cross_program_context = has_ball
-        && flank_attack_policy.is_flank()
         && attacking_phase
         && attack_progress > 0.0
-        && width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+        && (flank_attack_policy.is_flank() || outer_flank_final_third)
+        && (width_from_center >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER || outer_flank_final_third)
         && !matches!(ball_side, StrategyLane::Center);
     // "Outside mid attack defender" may override the cross-release window for training/operator
     // experiments, but by default it shares the same near-byline release as the corner drive.
@@ -18224,7 +18545,9 @@ fn tactical_directive_for_team(
         BYLINE_CROSS_RELEASE_DEPTH_YARDS
     };
     let byline_drive_context = wide_cross_program_context && endline_depth > cross_release_depth;
-    let crash_box_context = wide_cross_program_context && endline_depth <= cross_release_depth;
+    let crash_box_context = has_ball
+        && (outer_flank_final_third
+            || (wide_cross_program_context && endline_depth <= cross_release_depth));
     let pressure_fit =
         ((attacking_overload.defenders as f64 - attacking_overload.attackers as f64 + 2.0) / 5.0)
             .clamp(0.0, 1.0);
@@ -18256,6 +18579,8 @@ fn tactical_directive_for_team(
         TeamAttackStrategy::TransitionBurstOnRegain
     } else if !has_ball {
         TeamAttackStrategy::CounterTransitionVertical
+    } else if crash_box_context {
+        TeamAttackStrategy::CrashTheBox
     } else if byline_drive_context {
         match ball_side {
             // With the play enabled, the wide drive becomes a take-the-man-on program (still drives
@@ -18271,8 +18596,6 @@ fn tactical_directive_for_team(
             StrategyLane::Right => TeamAttackStrategy::BylineCrossRightToPenaltySpot,
             StrategyLane::Center => unreachable!("wide byline context cannot be central"),
         }
-    } else if crash_box_context {
-        TeamAttackStrategy::CrashTheBox
     } else if byline_drive_zone {
         if ball_position.x <= field_width * 0.5 {
             TeamAttackStrategy::BylineCrossLeftToPenaltySpot
@@ -21516,9 +21839,8 @@ fn dense_soccer_transition_reward(
                 * ENERGY_ECONOMY_FAST_SPEED_YPS)
                 .max(0.25);
             let moved_fit = (moved_yards / tick_move_reference).clamp(0.0, 1.0);
-            reward -= waste_pressure
-                * (0.35 + 0.65 * moved_fit)
-                * ENERGY_ECONOMY_REWARD_PENALTY_POINTS;
+            reward -=
+                waste_pressure * (0.35 + 0.65 * moved_fit) * ENERGY_ECONOMY_REWARD_PENALTY_POINTS;
         }
     }
     // Territorial spacing (cover ground): a small, always-on shaping term. Reward
@@ -30534,6 +30856,19 @@ pub struct SoccerDecisionModelContract {
     pub killer_pass_over_top_in_pomdp_observation: bool,
     pub killer_pass_over_top_binned_in_mdp_state: bool,
     pub killer_pass_over_top_in_neural_features: bool,
+    pub slip_break_offside_trap_ground_pass_enabled: bool,
+    pub slip_break_offside_trap_start_min_gap_yards: f64,
+    pub slip_break_offside_trap_start_max_gap_yards: f64,
+    pub slip_break_offside_trap_release_min_gap_yards: f64,
+    pub slip_break_offside_trap_release_max_gap_yards: f64,
+    pub slip_break_offside_trap_min_pass_mph: f64,
+    pub slip_break_offside_trap_max_pass_mph: f64,
+    pub slip_break_offside_trap_runner_starts_first: bool,
+    pub slip_break_offside_trap_speed_differential_required: bool,
+    pub slip_break_offside_trap_min_speed_edge_yps: f64,
+    pub slip_break_offside_trap_in_pomdp_observation: bool,
+    pub slip_break_offside_trap_binned_in_mdp_state: bool,
+    pub slip_break_offside_trap_in_neural_features: bool,
     pub goal_entry_boosts_killer_pass_score: bool,
     pub single_thread_goal_pressure_boosts_decisive_action: bool,
     pub single_thread_goal_pressure_damps_recycling: bool,
@@ -31400,6 +31735,23 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         killer_pass_over_top_in_pomdp_observation: true,
         killer_pass_over_top_binned_in_mdp_state: true,
         killer_pass_over_top_in_neural_features: true,
+        slip_break_offside_trap_ground_pass_enabled: true,
+        slip_break_offside_trap_start_min_gap_yards:
+            SLIP_BREAK_OFFSIDE_TRAP_START_MIN_GAP_YARDS,
+        slip_break_offside_trap_start_max_gap_yards:
+            SLIP_BREAK_OFFSIDE_TRAP_START_MAX_GAP_YARDS,
+        slip_break_offside_trap_release_min_gap_yards:
+            SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MIN_GAP_YARDS,
+        slip_break_offside_trap_release_max_gap_yards:
+            SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MAX_GAP_YARDS,
+        slip_break_offside_trap_min_pass_mph: SLIP_BREAK_OFFSIDE_TRAP_MIN_PASS_MPH,
+        slip_break_offside_trap_max_pass_mph: SLIP_BREAK_OFFSIDE_TRAP_MAX_PASS_MPH,
+        slip_break_offside_trap_runner_starts_first: true,
+        slip_break_offside_trap_speed_differential_required: true,
+        slip_break_offside_trap_min_speed_edge_yps: SLIP_BREAK_OFFSIDE_TRAP_MIN_SPEED_EDGE_YPS,
+        slip_break_offside_trap_in_pomdp_observation: true,
+        slip_break_offside_trap_binned_in_mdp_state: true,
+        slip_break_offside_trap_in_neural_features: true,
         goal_entry_boosts_killer_pass_score: true,
         single_thread_goal_pressure_boosts_decisive_action: true,
         single_thread_goal_pressure_damps_recycling: true,
@@ -36246,7 +36598,9 @@ fn soccer_relational_attention_group(entries: &[(f64, f64, f64, f64)]) -> (f64, 
 /// motion block is the wrong length so an absent/older block degrades gracefully. The actor's own
 /// slot (the teammate nearest the origin in actor-relative space) is excluded from the teammate
 /// readout so a player does not attend to itself.
-fn soccer_relational_attention_readout(motion: &[f32]) -> [f64; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM] {
+fn soccer_relational_attention_readout(
+    motion: &[f32],
+) -> [f64; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM] {
     let mut out = [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM];
     if motion.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
         return out;
@@ -36276,8 +36630,9 @@ fn soccer_relational_attention_readout(motion: &[f32]) -> [f64; SOCCER_NEURAL_RE
     }
     let teammates: Vec<(f64, f64, f64, f64)> =
         (0..half).filter(|&s| s != self_slot).map(entity).collect();
-    let opponents: Vec<(f64, f64, f64, f64)> =
-        (half..SOCCER_NEURAL_FIELD_MOTION_PLAYERS).map(entity).collect();
+    let opponents: Vec<(f64, f64, f64, f64)> = (half..SOCCER_NEURAL_FIELD_MOTION_PLAYERS)
+        .map(entity)
+        .collect();
     let (td, tw, tc, te) = soccer_relational_attention_group(&teammates);
     let (od, ow, oc, oe) = soccer_relational_attention_group(&opponents);
     out[0] = td;
@@ -37183,8 +37538,7 @@ fn soccer_team_energy_rhythm_phase(clock_seconds: f64) -> f64 {
     if !clock_seconds.is_finite() {
         return 0.5;
     }
-    let phase =
-        clock_seconds.max(0.0) / ENERGY_RHYTHM_PERIOD_SECONDS * std::f64::consts::TAU;
+    let phase = clock_seconds.max(0.0) / ENERGY_RHYTHM_PERIOD_SECONDS * std::f64::consts::TAU;
     (0.5 + 0.5 * phase.sin()).clamp(0.0, 1.0)
 }
 
@@ -37201,8 +37555,12 @@ fn soccer_energy_ball_interaction_next_ten_seconds(
         sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
     let field_center = Vec2::new(field_width * 0.5, field_length * 0.5);
     let me_position = finite_pitch_point(me_position, field_width, field_length, field_center);
-    let ball_position =
-        finite_pitch_point(snapshot.ball.position, field_width, field_length, field_center);
+    let ball_position = finite_pitch_point(
+        snapshot.ball.position,
+        field_width,
+        field_length,
+        field_center,
+    );
     let ball_velocity = limit_vec2_len(snapshot.ball.velocity, SOCCER_PHYSICS_BALL_MAX_SPEED_YPS);
     let sprint_speed = (player_top_speed_yps(me.role, &me.skills)
         * fatigue_speed_factor(me.skills.stamina, me.fatigue)
@@ -37223,12 +37581,17 @@ fn soccer_energy_ball_interaction_next_ten_seconds(
     let mut interaction = reach_fit(ball_position).max(reach_fit(projected_ball));
 
     if let Some(pass) = snapshot.pending_pass.as_ref() {
-        if pass.team == me.team && (pass.target == Some(me.id) || pass.nearest_receiver == Some(me.id))
+        if pass.team == me.team
+            && (pass.target == Some(me.id) || pass.nearest_receiver == Some(me.id))
         {
             return 1.0;
         }
-        let pass_target =
-            finite_pitch_point(pass.intended_target, field_width, field_length, ball_position);
+        let pass_target = finite_pitch_point(
+            pass.intended_target,
+            field_width,
+            field_length,
+            ball_position,
+        );
         let reception_fit = reach_fit(pass_target);
         let lane_fit = (1.0
             - segment_distance_to_point(ball_position, pass_target, me_position) / 5.0)
@@ -37265,8 +37628,8 @@ fn soccer_energy_economy_profile_for_snapshot(
         / (ENERGY_ECONOMY_REFERENCE_MOVEMENT_YARDS - ENERGY_ECONOMY_LOW_VALUE_MOVEMENT_YARDS)
             .max(1e-6))
     .clamp(0.0, 1.0);
-    let fast_gate = ((speed - 2.4) / (ENERGY_ECONOMY_FAST_SPEED_YPS - 2.4).max(1e-6))
-        .clamp(0.0, 1.0);
+    let fast_gate =
+        ((speed - 2.4) / (ENERGY_ECONOMY_FAST_SPEED_YPS - 2.4).max(1e-6)).clamp(0.0, 1.0);
     let player_energy_debt = soccer_energy_debt_for_player_snapshot(me);
     let recovery_half = 1.0 - team_energy_rhythm_phase;
     let debt_weight =
@@ -37481,6 +37844,11 @@ fn soccer_neural_extended_observation(
         }
         _ => (0.0, 0.0, 0.0, 0.0),
     };
+    let surprise_behind_steal = if snapshot.ball.holder == Some(me.id) {
+        snapshot.surprise_behind_steal_threat_for_holder(me.id)
+    } else {
+        SurpriseBehindStealProfile::default()
+    };
     let second_nearest_opponent_distance = if second_nearest_opp_dist.is_finite() {
         second_nearest_opp_dist
     } else {
@@ -37596,6 +37964,15 @@ fn soccer_neural_extended_observation(
         nearest_defender_overcommit_score: finite_metric(nearest_defender_overcommit_score),
         dribble_momentum_escape_side: finite_metric(dribble_momentum_escape_side),
         dribble_nutmeg_window_score: finite_metric(dribble_nutmeg_window_score),
+        surprise_behind_steal_threat: finite_metric(surprise_behind_steal.score),
+        surprise_behind_steal_catch_margin_seconds: finite_metric(
+            surprise_behind_steal.catch_margin_seconds,
+        ),
+        surprise_behind_steal_escape_pressure: finite_metric(surprise_behind_steal.escape_pressure),
+        side_glance_surprise_recognition: finite_metric(
+            surprise_behind_steal.holder_glance_recognition,
+        ),
+        side_glance_control_cost: finite_metric(surprise_behind_steal.holder_glance_control_cost),
     }
 }
 
@@ -37707,7 +38084,10 @@ fn soccer_neural_ball_zone_features(
 /// Player-position neural features (base indices 10-11). `separate_xy` selects the
 /// Fix-C (axis-separated fine lane/row) encoding; `false` reproduces the legacy
 /// flattened-id encoding.
-fn soccer_neural_player_grid_features(player_grid: &PitchGridAddress, separate_xy: bool) -> (f64, f64) {
+fn soccer_neural_player_grid_features(
+    player_grid: &PitchGridAddress,
+    separate_xy: bool,
+) -> (f64, f64) {
     if separate_xy {
         (
             soccer_neural_scaled(
@@ -37743,12 +38123,18 @@ mod grid_neural_feature_tests {
         // Columns 2..=5 all map to the SAME saturated value ⇒ width info is lost.
         let (c2, _) = soccer_neural_ball_zone_features(2, 0, false);
         let (c5, _) = soccer_neural_ball_zone_features(5, 0, false);
-        assert_eq!(c2, c5, "legacy macro scale saturates the attacking-half width");
+        assert_eq!(
+            c2, c5,
+            "legacy macro scale saturates the attacking-half width"
+        );
         // Tactical scale: columns 0..=5 spread monotonically across [0, 1].
         let (t2, _) = soccer_neural_ball_zone_features(2, 0, true);
         let (t5, _) = soccer_neural_ball_zone_features(5, 0, true);
         assert!(t5 > t2, "tactical scale keeps the ball width monotone");
-        assert!((t5 - 1.0).abs() < 1e-9, "last tactical column reaches exactly 1.0");
+        assert!(
+            (t5 - 1.0).abs() < 1e-9,
+            "last tactical column reaches exactly 1.0"
+        );
         // Gate OFF is byte-identical to the historical inline formula.
         assert_eq!(
             soccer_neural_ball_zone_features(3, 4, false),
@@ -37767,7 +38153,10 @@ mod grid_neural_feature_tests {
         let (ax, ay) = soccer_neural_player_grid_features(&a, true);
         let (bx, by) = soccer_neural_player_grid_features(&b, true);
         assert!(bx > ax, "higher lane ⇒ larger x (width) feature");
-        assert!((ay - by).abs() < 1e-9, "same row ⇒ identical y (depth) feature");
+        assert!(
+            (ay - by).abs() < 1e-9,
+            "same row ⇒ identical y (depth) feature"
+        );
         // Gate OFF is byte-identical to the legacy flattened-id encoding.
         assert_eq!(
             soccer_neural_player_grid_features(&a, false),
@@ -37817,8 +38206,10 @@ fn soccer_neural_transition_features_with_action(
         state.ball_zone_y,
         dd_soccer_enable_ball_zone_tactical_scale(),
     );
-    let (player_grid_feature_a, player_grid_feature_b) =
-        soccer_neural_player_grid_features(&player_grid, dd_soccer_enable_player_grid_xy_features());
+    let (player_grid_feature_a, player_grid_feature_b) = soccer_neural_player_grid_features(
+        &player_grid,
+        dd_soccer_enable_player_grid_xy_features(),
+    );
     let action_label = normalize_soccer_action_label(action);
     let (action_attack, action_defense, action_support) =
         soccer_neural_action_family_features(action);
@@ -38251,10 +38642,7 @@ fn soccer_neural_transition_features_with_action(
         // Ball fine-grid lane/row (indices 180-181): keep the explicit 12-lane /
         // 24-row ball address in the MDP/POMDP neural input without putting the
         // high-cardinality ball cell in the tabular Q-key.
-        soccer_neural_scaled(
-            ball_fine_lane as f64,
-            PITCH_FINE_GRID_COLUMNS as f64 - 1.0,
-        ),
+        soccer_neural_scaled(ball_fine_lane as f64, PITCH_FINE_GRID_COLUMNS as f64 - 1.0),
         soccer_neural_scaled(ball_fine_row as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
         // Pass receipt learning (indices 182-185): chosen-target completion plus
         // the MPC/QP reach prior from the 22-player + ball configuration. These
@@ -38289,13 +38677,12 @@ fn soccer_neural_transition_features_with_action(
     // The whole-field motion block fills exactly SOCCER_NEURAL_FIELD_MOTION_DIM slots after the
     // base; the zip stops there even though the tail is now longer (it also holds the belief
     // block), leaving the belief slots at 0 until filled below.
-    let field_player_motion = if transition.observation.field_player_motion.len()
-        == SOCCER_NEURAL_FIELD_MOTION_DIM
-    {
-        transition.observation.field_player_motion.as_slice()
-    } else {
-        transition.decision_context.field_player_motion.as_slice()
-    };
+    let field_player_motion =
+        if transition.observation.field_player_motion.len() == SOCCER_NEURAL_FIELD_MOTION_DIM {
+            transition.observation.field_player_motion.as_slice()
+        } else {
+            transition.decision_context.field_player_motion.as_slice()
+        };
     for (slot, value) in features[SOCCER_NEURAL_BASE_FEATURE_DIM..]
         .iter_mut()
         .zip(field_player_motion.iter())
@@ -38602,11 +38989,10 @@ fn soccer_neural_transition_features_with_action(
         obs.perception_noise_yards.max(0.0),
         PERCEPTION_NOISE_MAX_YARDS,
     );
-    features[SOCCER_NEURAL_FEATURE_PERCEPTION_LATENCY] =
-        soccer_neural_scaled(
-            obs.perception_latency_seconds.max(0.0),
-            perception_latency_upper_bound_seconds(),
-        );
+    features[SOCCER_NEURAL_FEATURE_PERCEPTION_LATENCY] = soccer_neural_scaled(
+        obs.perception_latency_seconds.max(0.0),
+        perception_latency_upper_bound_seconds(),
+    );
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_FORWARD] =
         soccer_neural_scaled(obs.own_team_center_of_mass_forward_yards, 60.0);
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_LATERAL] =
@@ -38656,13 +39042,12 @@ fn soccer_neural_transition_features_with_action(
     features[SOCCER_NEURAL_FEATURE_TEAM_ENERGY_DEBT] =
         soccer_neural_unit(obs.neural_extended.team_energy_debt);
     let killer_pass_over_top = tunables().killer_pass_over_top;
-    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE] = if obs
-        .threaded_goal_pass_over_top_available
-    {
-        1.0
-    } else {
-        0.0
-    };
+    features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_AVAILABLE] =
+        if obs.threaded_goal_pass_over_top_available {
+            1.0
+        } else {
+            0.0
+        };
     features[SOCCER_NEURAL_FEATURE_KILLER_OVER_TOP_DISTANCE] = soccer_neural_scaled(
         obs.threaded_goal_pass_over_top_distance_yards,
         killer_pass_over_top.max_distance_yards,
@@ -38695,6 +39080,52 @@ fn soccer_neural_transition_features_with_action(
     );
     features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT] =
         soccer_neural_unit(obs.pending_pass_receiver_approach_kinematic_fit);
+    features[SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_THREAT] =
+        soccer_neural_unit(obs.neural_extended.surprise_behind_steal_threat);
+    features[SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_CATCH_MARGIN] = soccer_neural_signed_unit(
+        obs.neural_extended
+            .surprise_behind_steal_catch_margin_seconds
+            / 1.2,
+    );
+    features[SOCCER_NEURAL_FEATURE_SIDE_GLANCE_RECOGNITION] = soccer_neural_unit(
+        obs.side_glance_surprise_recognition
+            .max(obs.neural_extended.side_glance_surprise_recognition),
+    );
+    features[SOCCER_NEURAL_FEATURE_SIDE_GLANCE_CONTROL_COST] = soccer_neural_unit(
+        (obs.side_glance_control_cost
+            .max(obs.neural_extended.side_glance_control_cost)
+            / SURPRISE_BEHIND_STEAL_MAX_GLANCE_CONTROL_COST)
+            .clamp(0.0, 1.0),
+    );
+    features[SOCCER_NEURAL_FEATURE_SURPRISE_BEHIND_STEAL_ESCAPE_PRESSURE] =
+        soccer_neural_unit(obs.neural_extended.surprise_behind_steal_escape_pressure);
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_OFFSIDE_TRAP_AVAILABLE] =
+        soccer_neural_bool(obs.slip_break_offside_trap_available);
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_START_GAP] = soccer_neural_scaled(
+        obs.slip_break_runner_start_gap_yards,
+        SLIP_BREAK_OFFSIDE_TRAP_START_MAX_GAP_YARDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_RELEASE_GAP] = soccer_neural_scaled(
+        obs.slip_break_release_gap_yards,
+        SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MAX_GAP_YARDS,
+    );
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_SEAM_WIDTH] =
+        soccer_neural_scaled(obs.slip_break_seam_width_yards, 14.0);
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_PASS_SPEED] = soccer_neural_scaled(
+        obs.slip_break_pass_speed_yps,
+        mph_to_yps(SLIP_BREAK_OFFSIDE_TRAP_MAX_PASS_MPH),
+    );
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_BACK_LINE_SPEED_EDGE] =
+        soccer_neural_scaled(
+            obs.slip_break_runner_back_line_speed_edge_yps.max(0.0),
+            SLIP_BREAK_OFFSIDE_TRAP_SPEED_EDGE_REFERENCE_YPS,
+        );
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_LINE_BREAK_DEPTH] =
+        soccer_neural_scaled(obs.slip_break_line_break_depth_yards, 10.0);
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_GOALKEEPER_AVOIDANCE] =
+        soccer_neural_scaled(obs.slip_break_goalkeeper_avoidance_yards, 12.0);
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_ANGLED_AWAY_FROM_GOALKEEPER] =
+        soccer_neural_bool(obs.slip_break_angled_away_from_goalkeeper);
     // Relational attention readout (graph-style neighbourhood pooling over the whole-field motion
     // block). Computed from the same actor-relative motion slice already laid into the feature
     // vector; left all-zeros unless `DD_SOCCER_ENABLE_RELATIONAL_ATTENTION` is set, so old nets
@@ -38710,6 +39141,18 @@ fn soccer_neural_transition_features_with_action(
         features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING] = readout[6];
         features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY] = readout[7];
     }
+    let goal_side_defender_gap =
+        1.0 - (obs.field_opponents_ahead.min(6) as f64 / 6.0).clamp(0.0, 1.0);
+    features[SOCCER_NEURAL_FEATURE_SOLO_GOAL_SIDE_DEFENDER_GAP] = goal_side_defender_gap;
+    features[SOCCER_NEURAL_FEATURE_SOLO_NO_FORWARD_SUPPORT] = soccer_neural_bool(
+        obs.has_ball && obs.teammates_ahead == 0 && obs.visible_forward_pass_options == 0,
+    );
+    features[SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE] =
+        soccer_neural_scaled(obs.forward_dribble_space_yards, 24.0);
+    let solo_speed_edge = (((obs.perceived_fatigue_advantage + 0.08) / 0.46).clamp(0.0, 1.0)
+        * obs.nearest_defender_fatigue_confidence.clamp(0.35, 1.0))
+    .clamp(0.0, 1.0);
+    features[SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE] = soccer_neural_unit(solo_speed_edge);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -41379,7 +41822,8 @@ impl SoccerLiveServer {
                 println!(
                     "# soccer-live: reused warm in-memory learned policy (skipped postgres reload)"
                 );
-            } else if !soccer_live_pg_blocking_startup_load() && soccer_live_pg_refresh_seconds() > 0
+            } else if !soccer_live_pg_blocking_startup_load()
+                && soccer_live_pg_refresh_seconds() > 0
             {
                 // DEFAULT (bind-first): skip the synchronous initial PG load so `run()` binds the
                 // HTTP port immediately instead of blocking for minutes while a large gen-N tabular
@@ -48737,9 +49181,9 @@ fn tracking_incoming_context_from_frames(
         team: Some(target.team),
         kind: match (flight, is_cross) {
             (PassFlight::Floor, false) => IncomingBallKind::GroundPass,
-            (PassFlight::Aerial, false)
-            | (PassFlight::Scoop, _)
-            | (PassFlight::OverTop, false) => IncomingBallKind::AerialPass,
+            (PassFlight::Aerial, false) | (PassFlight::Scoop, _) | (PassFlight::OverTop, false) => {
+                IncomingBallKind::AerialPass
+            }
             (PassFlight::Floor, true) => IncomingBallKind::Cross,
             (PassFlight::Aerial, true) | (PassFlight::OverTop, true) => {
                 IncomingBallKind::AerialCross
@@ -52496,6 +52940,221 @@ fn ball_holder_head_scan_position_confidence(angle_degrees: f64, vision: f64) ->
     }
 }
 
+fn ball_holder_surprise_facing_vector(
+    team: Team,
+    action_facing: FacingBucket,
+    holder_velocity: Vec2,
+) -> Vec2 {
+    facing_bucket_to_vector(action_facing)
+        .or_else(|| (holder_velocity.len() > 0.35).then(|| holder_velocity.normalized()))
+        .unwrap_or_else(|| Vec2::new(0.0, team.attack_dir()))
+}
+
+fn side_glance_threat_metrics(
+    holder_team: Team,
+    holder_position: Vec2,
+    holder_velocity: Vec2,
+    holder_action_facing: FacingBucket,
+    holder_vision: f64,
+    possession_seconds: f64,
+    threat_position: Vec2,
+    threat_proximity: f64,
+) -> SideGlanceThreatMetrics {
+    let to_threat = threat_position - holder_position;
+    if to_threat.len() <= 1e-6 {
+        return SideGlanceThreatMetrics {
+            active: true,
+            recognition: 1.0,
+            ..SideGlanceThreatMetrics::default()
+        };
+    }
+    let facing =
+        ball_holder_surprise_facing_vector(holder_team, holder_action_facing, holder_velocity);
+    let angle = angle_between_vectors_degrees(facing, to_threat);
+    let side_scan_start = tunables().pomdp_perception.ball_holder_core_degrees * 0.5;
+    if angle <= side_scan_start {
+        return SideGlanceThreatMetrics {
+            recognition: 1.0,
+            ..SideGlanceThreatMetrics::default()
+        };
+    }
+
+    let scan_seconds = finite_metric(possession_seconds).max(0.0);
+    let scan_delay =
+        ball_holder_head_scan_delay_seconds(angle, holder_vision).max(DEFAULT_DT_SECONDS);
+    let delay_fit = (scan_seconds / scan_delay).clamp(0.0, 1.0);
+    let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
+    let coverage = scan_coverage(
+        angle.to_radians(),
+        fov_half,
+        scan_seconds.max(DEFAULT_DT_SECONDS),
+        ability01(holder_vision),
+    )
+    .clamp(0.0, 1.0);
+    let proximity = finite_metric(threat_proximity).clamp(0.0, 1.0);
+    let recognition = (0.10 + coverage * 0.62 + delay_fit * 0.18 + ability01(holder_vision) * 0.10)
+        .clamp(0.0, 0.96);
+    let scan_rate_hz = (0.28 + proximity * 0.54 + (1.0 - recognition) * 0.24).clamp(0.0, 1.35);
+    let control_cost = (0.014 + scan_rate_hz * 0.040 + (1.0 - ability01(holder_vision)) * 0.012)
+        .clamp(0.0, SURPRISE_BEHIND_STEAL_MAX_GLANCE_CONTROL_COST);
+
+    SideGlanceThreatMetrics {
+        active: true,
+        scan_rate_hz,
+        recognition,
+        control_cost,
+    }
+}
+
+fn surprise_holder_gait_fit(gait: MovementGait) -> f64 {
+    match gait {
+        MovementGait::Stand => 0.74,
+        MovementGait::Walk | MovementGait::BackWalk => 1.0,
+        MovementGait::Jog | MovementGait::BackJog | MovementGait::Skip | MovementGait::BackSkip => {
+            0.92
+        }
+        MovementGait::SideStep => 0.82,
+        MovementGait::Run => 0.48,
+        MovementGait::Sprint => 0.22,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn surprise_behind_steal_profile_from_kinematics(
+    defender_team: Team,
+    defender_role: PlayerRole,
+    defender_position: Vec2,
+    defender_velocity: Vec2,
+    defender_skills: &SkillProfile,
+    defender_fatigue: f64,
+    holder_team: Team,
+    holder_role: PlayerRole,
+    holder_position: Vec2,
+    holder_velocity: Vec2,
+    holder_gait: MovementGait,
+    holder_action_facing: FacingBucket,
+    holder_skills: &SkillProfile,
+    holder_fatigue: f64,
+    holder_possession_seconds: f64,
+) -> SurpriseBehindStealProfile {
+    if defender_team == holder_team || defender_role == PlayerRole::Goalkeeper {
+        return SurpriseBehindStealProfile::default();
+    }
+    let holder_attack_dir = holder_team.attack_dir();
+    let to_defender = defender_position - holder_position;
+    let behind_yards = -(to_defender.y * holder_attack_dir);
+    let lateral_yards = to_defender.x.abs();
+    let distance = defender_position.distance(holder_position);
+    let holder_forward_speed = holder_velocity.y * holder_attack_dir;
+    let holder_speed = holder_velocity.len();
+    if behind_yards < SURPRISE_BEHIND_STEAL_MIN_BEHIND_YARDS
+        || lateral_yards > SURPRISE_BEHIND_STEAL_MAX_LATERAL_YARDS
+        || distance > SURPRISE_BEHIND_STEAL_MAX_DISTANCE_YARDS
+        || holder_forward_speed < SURPRISE_BEHIND_STEAL_MIN_FORWARD_YPS
+        || holder_speed > SURPRISE_BEHIND_STEAL_MAX_HOLDER_SPEED_YPS
+    {
+        return SurpriseBehindStealProfile::default();
+    }
+
+    let distance_fit = (1.0
+        - (distance - DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS).max(0.0)
+            / (SURPRISE_BEHIND_STEAL_MAX_DISTANCE_YARDS
+                - DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS)
+                .max(1e-6))
+    .clamp(0.0, 1.0);
+    let behind_fit =
+        ((behind_yards - SURPRISE_BEHIND_STEAL_MIN_BEHIND_YARDS) / 4.8).clamp(0.0, 1.0);
+    let lateral_fit =
+        (1.0 - lateral_yards / SURPRISE_BEHIND_STEAL_MAX_LATERAL_YARDS).clamp(0.0, 1.0);
+    let speed_fit = (1.0
+        - (holder_speed / SURPRISE_BEHIND_STEAL_MAX_HOLDER_SPEED_YPS).powi(2) * 0.68)
+        .clamp(0.18, 1.0)
+        * surprise_holder_gait_fit(holder_gait);
+    let threat_proximity =
+        (distance_fit * 0.55 + behind_fit * 0.25 + lateral_fit * 0.20).clamp(0.0, 1.0);
+    let glance = side_glance_threat_metrics(
+        holder_team,
+        holder_position,
+        holder_velocity,
+        holder_action_facing,
+        holder_skills.vision,
+        holder_possession_seconds,
+        defender_position,
+        threat_proximity,
+    );
+    let blind_spot = (1.0 - glance.recognition * 0.86).clamp(0.05, 1.0);
+
+    let axis = (holder_position - defender_position).normalized();
+    let closing_rate = if axis.len() > 1e-6 {
+        (defender_velocity - holder_velocity).dot(axis).max(0.0)
+    } else {
+        0.0
+    };
+    let defender_fatigue_factor = fatigue_speed_factor(defender_skills.stamina, defender_fatigue);
+    let holder_fatigue_factor = fatigue_speed_factor(holder_skills.stamina, holder_fatigue);
+    let defender_chase_speed = (player_top_speed_yps(defender_role, defender_skills)
+        * defender_fatigue_factor
+        * MovementGait::Sprint.speed_multiplier()
+        * (1.0 + ability01(defender_skills.acceleration) * 0.08)
+        + closing_rate * 0.35)
+        .max(0.45);
+    let holder_escape_speed = (player_top_speed_yps(holder_role, holder_skills)
+        * holder_fatigue_factor
+        * MovementGait::Run.speed_multiplier()
+        * (1.0 - glance.control_cost))
+        .max(holder_speed);
+    let relative_catch_speed = (defender_chase_speed - holder_escape_speed * 0.58).max(0.18);
+    let gap_to_steal = (distance - SURPRISE_BEHIND_STEAL_BALL_REACH_YARDS).max(0.0);
+    let defender_catch_time_seconds = gap_to_steal / relative_catch_speed;
+    let scan_delay =
+        ball_holder_head_scan_delay_seconds(180.0, holder_skills.vision).max(DEFAULT_DT_SECONDS);
+    let holder_reaction_seconds = (player_pomdp_reaction_delay_seconds(
+        holder_skills.vision.max(holder_skills.first_touch),
+        holder_fatigue,
+    ) + scan_delay * (1.0 - glance.recognition) * 0.65)
+        .clamp(0.08, 2.2);
+    let catch_margin_seconds = holder_reaction_seconds + SURPRISE_BEHIND_STEAL_CATCH_GRACE_SECONDS
+        - defender_catch_time_seconds;
+    let catch_fit = ((catch_margin_seconds + 0.18) / 1.05).clamp(0.0, 1.0);
+
+    let defender_steal_skill = ability01(defender_skills.defending) * 0.42
+        + ability01(defender_skills.aggression) * 0.22
+        + ability01(defender_skills.acceleration) * 0.22
+        + ability01(defender_skills.top_speed) * 0.14;
+    let holder_security = ability01(holder_skills.dribbling) * 0.36
+        + ability01(holder_skills.first_touch) * 0.24
+        + ability01(holder_skills.acceleration) * 0.20
+        + ability01(holder_skills.vision) * 0.12
+        + ability01(holder_skills.strength) * 0.08;
+    let skill_edge = ((defender_steal_skill - holder_security + 0.42) / 0.84).clamp(0.0, 1.0);
+    let score = (distance_fit * 0.16
+        + behind_fit * 0.12
+        + lateral_fit * 0.12
+        + speed_fit * 0.15
+        + catch_fit * 0.22
+        + blind_spot * 0.15
+        + skill_edge * 0.08)
+        .clamp(0.0, 1.0);
+    let available = score >= SURPRISE_BEHIND_STEAL_MIN_SCORE
+        && catch_fit >= 0.24
+        && catch_margin_seconds >= -0.18;
+    let escape_pressure =
+        (score * (0.32 + glance.recognition * 0.62) + catch_fit * 0.12).clamp(0.0, 1.0);
+
+    SurpriseBehindStealProfile {
+        available,
+        score,
+        catch_margin_seconds,
+        defender_catch_time_seconds,
+        holder_reaction_seconds,
+        holder_blind_spot: blind_spot,
+        holder_glance_scan_rate_hz: glance.scan_rate_hz,
+        holder_glance_recognition: glance.recognition,
+        holder_glance_control_cost: glance.control_cost,
+        escape_pressure,
+    }
+}
+
 fn perception_latency_upper_bound_seconds() -> f64 {
     tunables()
         .pomdp_perception
@@ -53055,8 +53714,12 @@ pub(crate) fn long_aerial_bounds_risk_for_target(
     let y_margin = target.y.min(length - target.y);
     let margin_yards = x_margin.min(y_margin);
     let safe_target = Vec2::new(
-        target.x.clamp(safe_touchline_margin, width - safe_touchline_margin),
-        target.y.clamp(safe_byline_margin, length - safe_byline_margin),
+        target
+            .x
+            .clamp(safe_touchline_margin, width - safe_touchline_margin),
+        target
+            .y
+            .clamp(safe_byline_margin, length - safe_byline_margin),
     );
     let inward_correction_yards = target.distance(safe_target);
     let touch_deficit =
@@ -54213,7 +54876,10 @@ fn best_pass_quality_from(qualities: &[PassTargetQuality]) -> PassTargetQuality 
 /// Best (max) into-stride fit across already-evaluated `qualities`; `0.0` when empty.
 /// Byte-identical to the original `.map(stride_fit).fold(0.0, max)`.
 fn best_pass_stride_fit_from(qualities: &[PassTargetQuality]) -> f64 {
-    qualities.iter().map(|q| q.stride_fit).fold(0.0_f64, f64::max)
+    qualities
+        .iter()
+        .map(|q| q.stride_fit)
+        .fold(0.0_f64, f64::max)
 }
 
 fn best_pass_target_quality_for_snapshot(
@@ -54440,9 +55106,9 @@ fn incoming_context_from_pass(
         team: Some(pass.team),
         kind: match (pass.flight, pass.is_cross) {
             (PassFlight::Floor, false) => IncomingBallKind::GroundPass,
-            (PassFlight::Aerial, false)
-            | (PassFlight::Scoop, _)
-            | (PassFlight::OverTop, false) => IncomingBallKind::AerialPass,
+            (PassFlight::Aerial, false) | (PassFlight::Scoop, _) | (PassFlight::OverTop, false) => {
+                IncomingBallKind::AerialPass
+            }
             (PassFlight::Floor, true) => IncomingBallKind::Cross,
             (PassFlight::Aerial, true) | (PassFlight::OverTop, true) => {
                 IncomingBallKind::AerialCross
@@ -57439,10 +58105,19 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
     let outside_midfielder = player.role == PlayerRole::Midfielder
         && (player.home_position.x < snapshot.field_width * 0.30
             || player.home_position.x > snapshot.field_width * 0.70);
+    let committed_crash_box_cross_release = directive.attack_strategy
+        == TeamAttackStrategy::CrashTheBox
+        && wide_final_third_cross_lane_context(
+            player.team,
+            player_position,
+            snapshot.field_width,
+            snapshot.field_length,
+        );
     let committed_byline_cross_release = (player.role == PlayerRole::Forward || outside_midfielder)
-        && flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+        && (flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
+            || committed_crash_box_cross_release)
         && directive.attack_strategy == TeamAttackStrategy::CrashTheBox
-        && directive.flank_attack_policy.is_flank();
+        && (directive.flank_attack_policy.is_flank() || committed_crash_box_cross_release);
     match action {
         "keeper-survey-hands" => {
             player.role == PlayerRole::Goalkeeper
@@ -57508,7 +58183,11 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "flank-low-cross" => {
             observation.has_ball
-                && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
+                && (flank_cross_context_is_legal(
+                    &observation,
+                    player_position,
+                    snapshot.field_width,
+                ) || committed_crash_box_cross_release)
                 && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && !snapshot
                     .ranked_visible_pass_targets(player_id, 1)
@@ -57516,7 +58195,11 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "flank-high-cross" => {
             observation.has_ball
-                && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
+                && (flank_cross_context_is_legal(
+                    &observation,
+                    player_position,
+                    snapshot.field_width,
+                ) || committed_crash_box_cross_release)
                 && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && !snapshot
                     .ranked_visible_aerial_pass_targets(player_id, 1)
@@ -57524,7 +58207,11 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "corner-flag-cross" => {
             observation.has_ball
-                && flank_cross_context_is_legal(&observation, player_position, snapshot.field_width)
+                && (flank_cross_context_is_legal(
+                    &observation,
+                    player_position,
+                    snapshot.field_width,
+                ) || committed_crash_box_cross_release)
                 && (!goal_attack_blocks_alternatives || committed_byline_cross_release)
                 && (!snapshot
                     .ranked_visible_pass_targets(player_id, 1)
@@ -57656,7 +58343,10 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                     .is_some()
         }
         "dummy-let-run" => {
-            !observation.has_ball && snapshot.teammate_dummy_let_run_target_for(player_id).is_some()
+            !observation.has_ball
+                && snapshot
+                    .teammate_dummy_let_run_target_for(player_id)
+                    .is_some()
         }
         "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
         | "support-screen" | "vacate-space" | "support-shape" | "support-roam" => {
@@ -58050,10 +58740,16 @@ mod genome_anchor_home_position_tests {
     fn width_is_monotonic_in_lane() {
         let left = genome_anchor_home_position(2, 5, Team::Home, W, L);
         let right = genome_anchor_home_position(9, 5, Team::Home, W, L);
-        assert!(right.x > left.x, "a higher lane sits further across the width");
+        assert!(
+            right.x > left.x,
+            "a higher lane sits further across the width"
+        );
         // Lane is team-independent: away keeps the same x for the same lane.
         let away_left = genome_anchor_home_position(2, 5, Team::Away, W, L);
-        assert!((away_left.x - left.x).abs() < 1e-9, "lane→x is team-invariant");
+        assert!(
+            (away_left.x - left.x).abs() < 1e-9,
+            "lane→x is team-invariant"
+        );
     }
 
     #[test]
