@@ -71,3 +71,25 @@ graph/recurrent/tree-search cost."
   fast partial loads.
 - Tip generations (2026-06-28): `soccer-self-play-k8s-overnight` gen 308 (actively training,
   +17 gens/24h), `…-deterministic` gen 372 (stalled ~3 days), `…-queue` gen 38 (stalled).
+
+## Offline distilled-encoder harness — status
+
+**Step 1 (dataset export): DONE.** `scripts/export_offline_dataset.sh` streams a
+supervised `(state → action value)` dataset from `des_soccer_learning_run_deltas`
+to JSONL (filtered by the experiment's recent `run_id`s — the indexed FK path; the
+created_at/experiment 3-way join over the 10M-row table times out). Verified on
+overnight gen-308: **47 distinct actions, 205 binned engineered features
+(int/bool/str), value target ≈ [-7, 11], visit-weighted.**
+
+**Step 2 (offline train + distill): planned.**
+1. Flatten `state_key` → fixed feature vector: one-hot the categorical/bool bins,
+   scale the int bins; freeze the column order as the canonical feature layout.
+2. Train a small relational/attention encoder → value (and per-action policy) head
+   offline, sample-weighted by `weight_micros` (effective visits). Compare held-out
+   value MSE vs the tabular baseline.
+3. **Distill** the encoder→head into the engine's existing `FeedForwardNetwork`
+   input shape (dense forward pass only), so runtime per-tick cost is unchanged.
+   Ship via the neural-snapshot path; append new channels at the tail (zero-pad old
+   snapshots — already supported) so it composes with the live policy.
+4. A/B the distilled head behind a gate (default-OFF) using the existing
+   `soccer_eval_gate` (held-out Elo / cross-play) before promotion.
