@@ -9081,6 +9081,7 @@ fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
 /// the play is specifically a *wide aerial cross* into a crashed box.
 #[test]
 fn flank_crash_box_window_requires_a_wide_aerial_cross() {
+    let _env = crash_box_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.players[9].role = PlayerRole::Forward;
     sim.players[10].role = PlayerRole::Forward;
