@@ -6348,20 +6348,6 @@ impl PlayerAgent {
             && ball_protection < CONTESTABLE_PROTECTION_THRESHOLD
             && goal_side_or_level;
 
-        // Surprise steal from behind (gated; OFF ⇒ assessment is `None`). A defender that has
-        // crept into a slow, forward-dribbling carrier's blind arc and is now at contact range
-        // nicks the ball — the one case a steal from behind is won, because an unaware carrier
-        // at a walk/jog is not shielding the led ball. The catch-belief / slowness / blind-arc
-        // gating all lives in `blindside_steal_assessment`.
-        let blindside_contact = snapshot
-            .blindside_steal_assessment(self.id)
-            .map(|assessment| {
-                assessment.target == holder
-                    && assessment.gap_yards <= BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS
-                    && assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD
-            })
-            .unwrap_or(false);
-
         (clean_contact || exposed_dribble || contestable_close || blindside_contact)
             .then_some(holder)
     }
