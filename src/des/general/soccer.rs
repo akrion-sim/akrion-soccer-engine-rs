@@ -348,6 +348,10 @@ const ENERGY_ECONOMY_REFERENCE_MOVEMENT_YARDS: f64 = 42.0;
 const ENERGY_ECONOMY_FAST_SPEED_YPS: f64 = 4.0;
 const ENERGY_ECONOMY_REWARD_PENALTY_POINTS: f64 = 0.06;
 const ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS: f64 = ENERGY_ECONOMY_REWARD_PENALTY_POINTS;
+// Default symmetric bound for the (gated) MAPPO team-component clamp — about a shot's reward
+// magnitude, so dense per-tick differentials pass through but a sparse single-team event spike is
+// capped. See `dd_soccer_enable_marl_team_component_clamp` / `soccer_marl_team_component`.
+const MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT: f64 = 12.0;
 // A whole-team urgency wave: roughly six minutes rising/spent and six minutes recovering.
 const ENERGY_RHYTHM_PERIOD_SECONDS: f64 = 12.0 * 60.0;
 // Two-tier energy: `fatigue` is the slow aerobic drain; `anaerobic_load` is the
@@ -11985,6 +11989,7 @@ pub(crate) fn soccer_marl_adjusted_reward(
         tick_reward,
         transition.team,
         dd_soccer_enable_marl_balanced_team_component(),
+        dd_soccer_enable_marl_team_component_clamp().then(marl_team_component_clamp_points),
     );
     intermediate + team_component * config.sanitized_marl_team_reward_weight()
 }
@@ -11997,6 +12002,7 @@ fn soccer_marl_team_component(
     tick_reward: SoccerMarlTickReward,
     team: Team,
     balanced: bool,
+    clamp_points: Option<f64>,
 ) -> f64 {
     if balanced && !tick_reward.has_both_teams() {
         return 0.0;
@@ -12004,7 +12010,13 @@ fn soccer_marl_team_component(
     let reward_delta = tick_reward.average_for(team) - tick_reward.average_for(team.other());
     let waste_delta = tick_reward.energy_waste_average_for(team)
         - tick_reward.energy_waste_average_for(team.other());
-    finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS)
+    let component =
+        finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS);
+    // Bound a sparse single-team event spike (gated; None ⇒ unbounded, byte-identical).
+    match clamp_points {
+        Some(bound) if bound > 0.0 => component.clamp(-bound, bound),
+        _ => component,
+    }
 }
 
 /// The flat Monte-Carlo outcome label `z` each team carries for every transition of
