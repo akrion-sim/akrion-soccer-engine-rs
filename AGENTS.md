@@ -3,6 +3,11 @@ branches, and do NOT create git worktrees on other branches. Stay in this one
 working tree on `main` and commit directly to it. To incorporate another branch's
 work, run `git merge <branch>` FROM main (a merge does not check the branch out).
 Branches/worktrees are forbidden even as a "safe sandbox" — keep everything on main.
+If a throwaway worktree is ever unavoidable, it MUST live under `tmp/worktrees/`
+(`tmp/` is gitignored), e.g. `git worktree add tmp/worktrees/<name>`. NEVER create a
+worktree in the repo root or any other in-tree path: `git add -A` then stages it as an
+embedded gitlink/submodule (the `adding embedded git repository` warning). System `/tmp`
+is also fine, but `tmp/worktrees/` is the convention here.
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
 MPC = model predictive control

@@ -74,6 +74,30 @@ const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MOD
 /// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
 /// the existing ball-relative 20-40yd band + halfway+5 cap.
 const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
+/// Env gate enabling **wingback-first forward priority** on the back-four line band.
+/// Without this, the 20-40yd ball cushion / flat offside line is enforced on the AVERAGE
+/// of all four defenders, which couples them badly: high or overlapping wingbacks raise
+/// the average, and the flat-line clamp then drags the two CENTRAL defenders FORWARD onto
+/// it (the "centre-backs rush up toward the ball" fault), while conserving that average
+/// yanks the advanced wingbacks BACKWARD to rebalance. With this on, the line + cushion are
+/// anchored on the CENTRAL defenders alone; the wide defenders (wingbacks) are decoupled —
+/// free to follow their own (typically more advanced) target and only kept from dropping
+/// BEHIND the central line. So the centre-backs hold the band (and on a turnover DROP onto
+/// it rather than step up), and the wingbacks get forward first. Off (unset) ⇒ the
+/// symmetric all-four-average line stands (byte-identical).
+const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
+
+/// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
+/// under wingback-first priority. Decoupling the wingbacks from the line average removed the
+/// (incidental) restoring pull that deep-dropping wingbacks used to give the four-man
+/// average, letting the centre-back line ride up onto the 20yd edge and break inside it. So
+/// the central line is floored DEEPER than this gap (never closer to the ball), keeping it
+/// off the 20yd edge and firmly inside the legal 20-40yd band, while still capped at 40 by
+/// the band itself. Only ever pulls the line DEEPER — a line already sitting deeper than this
+/// is left alone — and only bites when the ball is upfield (in our own third the shelf / 6yd
+/// floor take over). Active ball-challengers are already exempt upstream.
+pub const DEFENSIVE_LINE_CENTRAL_RESTING_GAP_YARDS: f64 = 27.0;
 
 /// Own-goal depth (yd) the back-four AVERAGE is anchored to while the ball is
 /// upfield of it: the line holds here (offside trap) until the ball penetrates
@@ -140,6 +164,23 @@ pub fn back_four_line_depth_v2_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+    }
+}
+
+/// Whether wingback-first forward priority is applied at the back-four line band this
+/// process. Off ⇒ the symmetric (equal-share) correction stands (parity).
+pub fn defensive_line_wingback_forward_priority_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            env_flag_enabled(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV)
+        })
     }
 }
 

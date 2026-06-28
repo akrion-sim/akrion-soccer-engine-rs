@@ -35366,11 +35366,22 @@ impl WorldSnapshot {
         None
     }
 
-    fn target_is_authorized_wingback_overlap(&self, player: &PlayerSnapshot, target: Vec2) -> bool {
+    pub(crate) fn target_is_authorized_wingback_overlap(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> bool {
         if self.controlled_possession_team() != Some(player.team)
             || !self.is_wide_defender(player)
             || !target.x.is_finite()
             || !target.y.is_finite()
+        {
+            return false;
+        }
+        // One wing-back forward at a time: only the single designated wing-back may break the
+        // line; the other wide defender is held with the rest of the back four.
+        if single_wingback_overlap_enabled()
+            && self.sole_overlap_wingback_id(player.team) != Some(player.id)
         {
             return false;
         }
@@ -35458,6 +35469,42 @@ impl WorldSnapshot {
                 .unwrap_or(others_mean);
             cand_fwd > others_mean + BACK_LINE_WINGBACK_RUN_MARGIN_YARDS
         })
+    }
+
+    /// The single wide defender (wing-back) permitted to be released forward at a time. This is
+    /// the one source of truth that enforces "one wing-back forward, the other three of the back
+    /// four held back" — without it, two wide defenders could each independently qualify for the
+    /// overlap exemption / forward push in the same tick. Geometric and possession-agnostic: the
+    /// ball-side-most wide defender (nearest the ball laterally), tie-broken by the more advanced
+    /// one, then by id (a stable, deterministic single winner). `None` when the team fields no
+    /// wide defender. Callers supply the possession / phase context.
+    pub(crate) fn sole_overlap_wingback_id(&self, team: Team) -> Option<usize> {
+        let attack = team.attack_dir();
+        let ball_x = self.ball.position.x;
+        // (id, lateral gap to the ball, forward advancement) of the current best candidate.
+        let mut best: Option<(usize, f64, f64)> = None;
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == team && self.is_wide_defender(p))
+        {
+            let pos = self.player_snapshot_position(p);
+            let lateral = (pos.x - ball_x).abs();
+            let fwd = pos.y * attack;
+            let better = match best {
+                None => true,
+                Some((best_id, best_lat, best_fwd)) => {
+                    lateral < best_lat - 1e-9
+                        || ((lateral - best_lat).abs() <= 1e-9
+                            && (fwd > best_fwd + 1e-9
+                                || ((fwd - best_fwd).abs() <= 1e-9 && p.id < best_id)))
+                }
+            };
+            if better {
+                best = Some((p.id, lateral, fwd));
+            }
+        }
+        best.map(|(id, _, _)| id)
     }
 
     fn loose_ball_totally_uncontested_for_team(&self, team: Team, target: Vec2) -> bool {
@@ -35664,7 +35711,25 @@ impl WorldSnapshot {
         &self,
         player: &PlayerSnapshot,
         target: Vec2,
+        baseline_seconds: f64,
+    ) -> f64 {
+        self.shape_consistency_horizon_seconds_with_far(
+            player,
+            target,
+            baseline_seconds,
+            SHAPE_CONSISTENCY_FAR_SECONDS,
+        )
+    }
+
+    /// As [`Self::shape_consistency_horizon_seconds_for_player_target`] but with an explicit
+    /// far-ball horizon ceiling, so a line can choose a longer grace window (e.g. the back
+    /// four's renewable 7s resync) without changing the shared default.
+    fn shape_consistency_horizon_seconds_with_far(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
         _baseline_seconds: f64,
+        far_seconds: f64,
     ) -> f64 {
         let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
         let player_position = finite_pitch_point(
@@ -35687,7 +35752,7 @@ impl WorldSnapshot {
             / (SHAPE_CONSISTENCY_FAR_BALL_YARDS - SHAPE_CONSISTENCY_CLOSE_BALL_YARDS).max(1e-6))
         .clamp(0.0, 1.0);
         (SHAPE_CONSISTENCY_CLOSE_SECONDS
-            + (SHAPE_CONSISTENCY_FAR_SECONDS - SHAPE_CONSISTENCY_CLOSE_SECONDS) * ball_distance_t)
+            + (far_seconds - SHAPE_CONSISTENCY_CLOSE_SECONDS) * ball_distance_t)
             .max(1e-6)
     }
 
@@ -35703,6 +35768,33 @@ impl WorldSnapshot {
             baseline_seconds,
         );
         (baseline_seconds.max(1e-6) / horizon).clamp(0.75, 1.0)
+    }
+
+    /// Per-tick easing gain for resyncing the BACK FOUR into shape, realizing a renewable ~7s
+    /// grace window (default-ON; see [`back_four_resync_grace_enabled`]): when the ball is far
+    /// the line eases gently (small gain ⇒ it settles over ~7s, because there is time), when
+    /// the ball is close it snaps onto the line (urgent). Recomputed every tick, so a fresh
+    /// disruption simply renews the window. Off ⇒ the shared 3s/[0.75,1.0] gain (parity).
+    pub(crate) fn defensive_line_resync_consistency_gain(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+    ) -> f64 {
+        if !back_four_resync_grace_enabled() {
+            return self.shape_consistency_gain_for_player_target(
+                player,
+                target,
+                DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
+            );
+        }
+        let horizon = self.shape_consistency_horizon_seconds_with_far(
+            player,
+            target,
+            DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
+            BACK_FOUR_RESYNC_GRACE_SECONDS,
+        );
+        (DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS.max(1e-6) / horizon)
+            .clamp(BACK_FOUR_RESYNC_GAIN_FLOOR, 1.0)
     }
 
     pub(crate) fn defensive_line_band_bounds_fwd(
@@ -35893,16 +35985,84 @@ impl WorldSnapshot {
             Some(centre) => centre,
             None => avg.clamp(lower, upper),
         };
+        // Wingback-first forward priority (gated): anchor the flat line + 20-40yd cushion on
+        // the CENTRAL defenders alone and decouple the wide defenders (wingbacks). This fixes
+        // two coupled faults of the all-four-average line: (1) high/overlapping wingbacks
+        // raised the average and the flat clamp then dragged the CENTRAL defenders FORWARD
+        // onto it (centre-backs surging up toward the ball), and (2) conserving that average
+        // then yanked the advanced wingbacks BACKWARD to rebalance. Here the centre-backs hold
+        // the band (on a turnover they DROP onto it rather than step up), while a wingback
+        // keeps its own, typically more advanced, target and is only kept from dropping BEHIND
+        // the central line. Off ⇒ this branch is skipped (byte-identical to the code below).
+        if defensive_line_wingback_forward_priority_enabled() {
+            let central: Vec<&PlayerSnapshot> = line_defenders
+                .iter()
+                .copied()
+                .filter(|p| !self.is_wide_defender(p))
+                .collect();
+            // Fall back to the full line if a side has no recognizable central pair, so a back
+            // three / unusual shape still gets a sane reference rather than an empty average.
+            let central_ref: &[&PlayerSnapshot] = if central.len() >= 2 {
+                central.as_slice()
+            } else {
+                line_defenders.as_slice()
+            };
+            let central_avg_fwd = central_ref
+                .iter()
+                .map(|p| fwd(self.player_snapshot_position(p)))
+                .sum::<f64>()
+                / central_ref.len() as f64;
+            let desired_avg_fwd = line_band_avg_fwd(central_avg_fwd);
+            let controls_ball = self.controlled_possession_team() == Some(me.team);
+            let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+            let target_fwd = fwd(target);
+            let adjusted_fwd = if self.is_wide_defender(me) {
+                // Wingback: keep its own (often advanced) target — it goes forward first —
+                // but never sit deeper than the central line, so the offside trap is still
+                // set by the centre-backs and the wingback is never dragged back to flatten
+                // an average it no longer belongs to.
+                target_fwd.max(desired_avg_fwd - level_half_band)
+            } else if controls_ball {
+                // In possession a centre-back may step up WITH the ball, but never deeper
+                // than the band line.
+                target_fwd.max(desired_avg_fwd)
+            } else {
+                // Defending: hold the flat band line (the offside line), but floored DEEPER
+                // than a comfortable resting gap so the central line never rides up onto the
+                // 20yd edge (it sits firmly inside 20-40 rather than tight to the ball). The
+                // floor only ever pulls DEEPER (`min` in the attacking frame); a line already
+                // deeper than the resting gap is left where it is. If a centre-back had drifted
+                // high (e.g. just after a turnover) this DROPS it back, never forward.
+                let resting_fwd = (ball_fwd - DEFENSIVE_LINE_CENTRAL_RESTING_GAP_YARDS)
+                    .clamp(lower, upper);
+                desired_avg_fwd.min(resting_fwd)
+            };
+            let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
+            let in_possession = self
+                .controlled_possession_team()
+                .or_else(|| self.possession_team())
+                == Some(me.team);
+            let adjusted_x = vertical_lane_clamped_x_for_role(
+                me.role,
+                me.home_position.x,
+                target.x,
+                self.field_width,
+                in_possession,
+            );
+            let adjusted_x = self
+                .back_four_horizontal_gap_adjusted_x(me, adjusted_x, exempt_defender)
+                .unwrap_or(adjusted_x);
+            let adjusted_x = self
+                .wingback_defensive_pinch_adjusted_x(me, adjusted_x)
+                .unwrap_or(adjusted_x);
+            return Vec2::new(adjusted_x, adjusted_y);
+        }
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
         let defender_count = defenders.len() as f64;
         let line_count = line_defenders.len() as f64;
-        let consistency_gain = self.shape_consistency_gain_for_player_target(
-            me,
-            target,
-            DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS,
-        );
+        let consistency_gain = self.defensive_line_resync_consistency_gain(me, target);
         let current_delta = desired_avg_fwd - avg_fwd;
         let distributed_delta = current_delta * (defender_count / line_count).clamp(1.0, 2.0);
         let adjusted_fwd = if current_delta.abs() > 1e-6 {
@@ -37859,7 +38019,13 @@ impl WorldSnapshot {
                 && (p.position.x - self.ball.position.x).abs() < this_to_ball_x
         });
         let covered_attack_fit = self.wingback_covered_attack_fit(player);
-        if other_wide_on_ball_side && covered_attack_fit <= 0.0 {
+        if single_wingback_overlap_enabled() {
+            // Only the single designated wing-back is released forward; the other three of the
+            // back four hold their line regardless of any covered-attack opportunity.
+            if self.sole_overlap_wingback_id(player.team) != Some(player.id) {
+                return 0.0;
+            }
+        } else if other_wide_on_ball_side && covered_attack_fit <= 0.0 {
             return 0.0;
         }
         let directive = self.tactical_directive(player.team);
