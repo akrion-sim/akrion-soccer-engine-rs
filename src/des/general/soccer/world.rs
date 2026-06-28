@@ -30024,7 +30024,9 @@ impl WorldSnapshot {
                 };
                 let directional_progress_score = directional_pass_progress_score(
                     forward,
-                    0.16 + directive.risk_tolerance * 0.24,
+                    (0.16 + directive.risk_tolerance * 0.24
+                        + pass_risk_appetite.forward_preference_lift)
+                        .max(0.0),
                 );
                 let corner_affinity = self.long_pass_attacking_corner_affinity(
                     me.team,
