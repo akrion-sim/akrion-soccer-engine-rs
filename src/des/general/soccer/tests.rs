@@ -9010,6 +9010,190 @@ fn completed_pass_reward_event_includes_killer_pass_goal_channel_bonus() {
         );
 }
 
+// --- Situational "crash the box" from a flank aerial cross (see `crash_box`). ---
+
+/// Two attackers crashed into the opponent box as a wide-and-high aerial cross is released ⇒ the
+/// "live cross" window latches and the small bounded arrival reward is paid to the crashers. With
+/// the gate off, the same call is a complete no-op (byte-identical).
+#[test]
+fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Home attacks y = 120; the opponent (Away) box is y in [102, 120], x in [18, 62].
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+    let crosser = 8;
+    let origin = Vec2::new(8.0, 100.0); // outer flank lane (x<20), attacking final third (y>=80).
+
+    // Gate OFF ⇒ no window, no events.
+    let before_off = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    assert!(
+        sim.flank_crash_box_cross.is_none(),
+        "gate off must not latch a cross window (byte-identical)"
+    );
+    assert_eq!(
+        sim.reward_events.len(),
+        before_off,
+        "gate off must not emit any crash-box reward events"
+    );
+
+    // Gate ON ⇒ window latches and the two box crashers are credited.
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let before_on = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let latched = sim
+        .flank_crash_box_cross
+        .expect("an aerial cross from the flank in the final third must latch the window");
+    assert_eq!(latched.crosser, crosser);
+    assert_eq!(latched.team, Team::Home);
+
+    for crasher in [9_usize, 10] {
+        let credited = sim.reward_events[before_on..]
+            .iter()
+            .filter(|event| {
+                event.player_id == crasher
+                    && event.kind == SoccerRewardEventKind::CrashBoxArrival
+            })
+            .map(|event| event.amount)
+            .sum::<f64>();
+        assert!(
+            credited > 0.0,
+            "crasher {crasher} in the box should earn a bounded arrival reward, got {credited}"
+        );
+    }
+}
+
+/// A genuine ground pass (not an aerial cross), or a central origin, must not open the window —
+/// the play is specifically a *wide aerial cross* into a crashed box.
+#[test]
+fn flank_crash_box_window_requires_a_wide_aerial_cross() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    // A ground (floor) ball from the flank is not a crash-the-box cross.
+    sim.register_flank_crash_box_cross(Team::Home, 8, Vec2::new(8.0, 100.0), true, PassFlight::Floor);
+    assert!(sim.flank_crash_box_cross.is_none(), "a floor ball is not an aerial cross");
+    // An aerial ball from a central origin is a shot/through-ball channel, not a flank cross.
+    sim.register_flank_crash_box_cross(Team::Home, 8, Vec2::new(40.0, 100.0), true, PassFlight::Aerial);
+    assert!(sim.flank_crash_box_cross.is_none(), "a central origin is not a flank cross");
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+}
+
+/// A headed (aerial) finish scored inside the live cross window pays the terminal bonus, split
+/// between the header scorer and the deliverer of the cross.
+#[test]
+fn headed_goal_off_a_flank_cross_pays_the_finisher_and_the_crosser() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+    let crosser = 8;
+    let scorer = 9;
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    sim.register_flank_crash_box_cross(
+        Team::Home,
+        crosser,
+        Vec2::new(8.0, 100.0),
+        true,
+        PassFlight::Aerial,
+    );
+    assert!(sim.flank_crash_box_cross.is_some());
+    // The finishing header is struck this tick (ball up in the heading band).
+    sim.pending_aerial_finish = Some((scorer, sim.tick));
+
+    let before = sim.reward_events.len();
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let header_bonus = |player: usize| {
+        sim.reward_events[before..]
+            .iter()
+            .filter(|event| {
+                event.player_id == player
+                    && event.kind == SoccerRewardEventKind::HeaderGoalFromCross
+            })
+            .map(|event| event.amount)
+            .sum::<f64>()
+    };
+    let finisher = header_bonus(scorer);
+    let assist = header_bonus(crosser);
+    assert!(
+        finisher > assist && assist > 0.0,
+        "scorer should take the lion's share and the crosser an assist: finisher={finisher} assist={assist}"
+    );
+    assert!(
+        (finisher + assist - crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS).abs() < 1e-6,
+        "finisher+assist should sum to the configured bonus, got {}",
+        finisher + assist
+    );
+    // The window is consumed so a later goal can't double-credit it.
+    assert!(sim.flank_crash_box_cross.is_none());
+}
+
+/// A foot finish (ball on the ground) in the same window does *not* earn the headed-goal bonus.
+#[test]
+fn ground_finish_in_the_window_earns_no_header_bonus() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    let crosser = 8;
+    let scorer = 9;
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    sim.register_flank_crash_box_cross(
+        Team::Home,
+        crosser,
+        Vec2::new(8.0, 100.0),
+        true,
+        PassFlight::Aerial,
+    );
+    // No aerial finish stamped ⇒ a ground strike.
+    sim.pending_aerial_finish = None;
+    let before = sim.reward_events.len();
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let header_events = sim.reward_events[before..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::HeaderGoalFromCross)
+        .count();
+    assert_eq!(header_events, 0, "a ground finish must not earn the headed-goal bonus");
+}
+
+/// The situational box-flood fires from the geometry alone: a wide-and-high ball in possession
+/// pulls attackers into the box even when the team brain never rolled the `CrashTheBox` strategy.
+#[test]
+fn situational_recognizer_floods_the_box_independent_of_strategy() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = Some(8);
+    sim.ball.position = Vec2::new(8.0, 100.0); // wide flank, attacking final third for Home.
+    sim.players[8].position = Vec2::new(8.0, 100.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.flank_final_third_crash_box_active(Team::Home),
+        "gate off ⇒ recognizer inactive (byte-identical)"
+    );
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let active = snapshot.flank_final_third_crash_box_active(Team::Home);
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+    assert!(
+        active,
+        "Home holding the ball wide-and-high in the final third should activate the recognizer"
+    );
+}
+
 #[test]
 fn transition_reward_infers_dangerous_completed_cross_bonus() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
