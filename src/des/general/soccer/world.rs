@@ -18019,7 +18019,7 @@ impl SoccerMatch {
     /// half with NO teammate ahead who recycled backward instead of driving / holding up. This is
     /// the world-state analogue of [`isolated_attacking_carrier_drive_mode`]'s precondition, used
     /// to emit the [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`] training penalty.
-    fn isolated_carrier_panic_back_pass(
+    pub(crate) fn isolated_carrier_panic_back_pass(
         &self,
         player_id: usize,
         origin: Vec2,
