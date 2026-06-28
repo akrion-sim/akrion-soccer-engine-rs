@@ -19813,8 +19813,6 @@ struct ForwardSupportContext {
 /// [`WorldSnapshot::slip_break_runner_opportunity`]). All scalar factors are `[0,1]`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlipBreakOpportunity {
-    /// In-behind target point to slip the ball into (angled away from the keeper).
-    pub(crate) seam_target: Vec2,
     /// How well the release moment fits the ~2–3-yd-before-the-line window given the runner's
     /// sprint (0 if offside or not closing).
     pub(crate) timing: f64,
