@@ -30303,7 +30303,6 @@ impl WorldSnapshot {
             lane_openness,
             speed_advantage,
         );
-        let _ = seam_target;
         Some(SlipBreakOpportunity {
             timing,
             lane_openness,
