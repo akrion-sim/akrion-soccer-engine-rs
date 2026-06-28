@@ -38329,21 +38329,10 @@ impl WorldSnapshot {
                 current.distance(*holder_pos) <= 20.0 && self.no_pressure_at(me.team, *holder_pos)
             })
             .map_or(0.0, |_| 1.6);
-        // Open up MOST on the flank the ball is on, scaled SMOOTHLY by how close the ball's
-        // lane is to THIS player's own touchline: the closer the ball sits to his flank the
-        // harder he is pulled to the touchline to offer the ball-side outlet, while a winger on
-        // the far flank barely opens. `closeness` ∈ [0, 1] is 1 when the ball is on his
-        // touchline and 0 when it is on the opposite one (the ball's lateral lane mapped onto
-        // his flank), modelling the "the closer the ball is to your flank, the wider you should
-        // be" ask as a continuous ramp rather than a binary same-side switch.
-        let ball_side_wide_boost = if outside_mid_ball_lane_width_enabled() {
-            let my_touchline_x = if home.x <= center_x { 0.0 } else { self.field_width };
-            let ball_to_my_touchline = (self.ball.position.x - my_touchline_x).abs();
-            let closeness =
-                (1.0 - ball_to_my_touchline / self.field_width.max(1.0)).clamp(0.0, 1.0);
-            closeness * OUTSIDE_MID_BALL_LANE_WIDTH_WEIGHT
-        } else {
-            // Legacy binary: full boost iff this player's home flank shares the ball's half.
+        // Open up MOST on the flank the ball is on: a wide attacker whose home flank sits
+        // on the ball's side of the pitch is pulled harder to the touchline to offer the
+        // ball-side outlet (the "get wide on the side the ball is on" ask).
+        let ball_side_wide_boost = {
             let center = self.field_width * 0.5;
             let on_ball_side = (home.x - center).signum()
                 == (self.ball.position.x - center).signum()
