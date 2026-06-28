@@ -2599,6 +2599,179 @@ fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
     assert!(trace.mpc_recommended_speed_yps > 0.0);
 }
 
+/// A slow Home carrier dribbling forward with an Away defender crept directly into its
+/// blind arc, fast enough to catch it: the blindside-steal assessment recognises the
+/// chance with the gate on, and short-circuits to `None` with the gate off.
+fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> WorldSnapshot {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let carrier = 7;
+    let thief = 14;
+    park_players_except(&mut sim, &[carrier, thief]);
+    sim.players[carrier].team = Team::Home; // attacks +y
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].velocity = carrier_velocity;
+    sim.players[carrier].action_facing = FacingBucket::Unknown; // ⇒ faces +y (attack dir)
+    sim.players[carrier].skills.dribbling = 5.0;
+    // Thief directly BEHIND the carrier (lower y), quick enough to chase it down.
+    sim.players[thief].team = Team::Away;
+    sim.players[thief].position = Vec2::new(40.0, 60.0 - defender_gap);
+    sim.players[thief].velocity = Vec2::new(0.0, 1.0);
+    sim.players[thief].skills.top_speed = 9.0;
+    sim.players[thief].skills.acceleration = 8.0;
+    sim.players[thief].skills.defending = 8.0;
+    sim.players[thief].skills.aggression = 7.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    WorldSnapshot::from_match(&sim)
+}
+
+#[test]
+fn blindside_steal_recognises_slow_unaware_catchable_carrier() {
+    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.5), 2.0);
+    let thief = 14;
+
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let on = snapshot.blindside_steal_assessment(thief);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    let off = snapshot.blindside_steal_assessment(thief);
+
+    let assessment = on.expect("a slow forward carrier with a catchable thief behind is exploitable");
+    assert_eq!(assessment.target, 7);
+    assert!(
+        assessment.carrier_unaware > 0.9,
+        "thief dead behind ⇒ carrier fully unaware, got {}",
+        assessment.carrier_unaware
+    );
+    assert!(
+        assessment.carrier_slow > 0.9,
+        "a ~2.5 yps jog ⇒ fully exploitable pace, got {}",
+        assessment.carrier_slow
+    );
+    assert!(
+        assessment.catch_belief > 0.0,
+        "a quick thief 2yd behind a jogging carrier believes it can catch it"
+    );
+    assert!(
+        assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD,
+        "opportunity {} should clear the commit threshold",
+        assessment.opportunity
+    );
+    assert!(off.is_none(), "gate off must short-circuit to None (byte-identical)");
+}
+
+#[test]
+fn blindside_steal_declines_when_carrier_is_sprinting_clear() {
+    // Same blind-arc geometry, but the carrier is flat-out sprinting — it simply runs
+    // away from the thief, so there is no surprise-steal chance even behind the eyes.
+    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let assessment = snapshot.blindside_steal_assessment(14);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    assert!(
+        assessment.is_none(),
+        "a sprinting carrier is not robbed from behind, got {assessment:?}"
+    );
+}
+
+#[test]
+fn immediate_steal_wins_ball_from_behind_only_under_blindside_gate() {
+    // Thief at contact range directly behind a jogging carrier. Normally a steal from
+    // behind is blocked (the body shields the led ball); the blindside gate is the one
+    // exception against a slow, unaware, catchable carrier.
+    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
+    let thief = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == 14)
+        .cloned()
+        .expect("thief present");
+
+    let off = thief.immediate_defensive_steal_target(&snapshot);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let on = thief.immediate_defensive_steal_target(&snapshot);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+
+    assert_eq!(off, None, "gate off: a steal from behind stays blocked");
+    assert_eq!(on, Some(7), "gate on: the blindside nick wins the ball from behind");
+}
+
+#[test]
+fn carrier_glance_recognises_blindside_threat_and_biases_escape() {
+    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
+    let carrier = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == 7)
+        .cloned()
+        .expect("carrier present");
+    let directive = snapshot.tactical_directive(Team::Home);
+
+    let obs_off = snapshot.observation_for(7);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let obs_on = snapshot.observation_for(7);
+
+    // Gate off ⇒ the carrier neither glances nor perceives the rear threat (byte-identical).
+    assert_eq!(obs_off.blindside_threat_from_behind, 0.0);
+    assert!(!obs_off.blindside_scan_active);
+    // Gate on ⇒ the forward-dribbling carrier side-glances (a real drift cost) and, having
+    // looked, recognises the thief sneaking up behind.
+    assert!(obs_on.blindside_scan_active, "a forward dribbler glances to its blind side");
+    assert!(
+        obs_on.blindside_scan_drift_risk > 0.0,
+        "the glance carries a ball-control drift cost"
+    );
+    assert!(
+        obs_on.blindside_threat_from_behind > 0.0,
+        "after glancing, the carrier recognises the blindside threat"
+    );
+    // The full-field neural motion block is unchanged in length (FEATURE_DIM intact).
+    assert_eq!(
+        obs_on.field_player_motion.len(),
+        obs_off.field_player_motion.len()
+    );
+
+    // The recognised threat biases the carrier to break away rather than dwell/shield.
+    let escape = carrier.possession_action_options(
+        &obs_on,
+        &directive,
+        obs_on.visible_pass_options,
+        obs_on.visible_aerial_pass_options,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    let dwell = carrier.possession_action_options(
+        &obs_off,
+        &directive,
+        obs_off.visible_pass_options,
+        obs_off.visible_aerial_pass_options,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
+    );
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    let prob = |opts: &[AgentActionOptionTrace], label: &str| {
+        opts.iter()
+            .find(|o| o.label == label)
+            .map(|o| o.probability)
+            .unwrap_or(0.0)
+    };
+    assert!(
+        prob(&escape, "carry-forward") >= prob(&dwell, "carry-forward"),
+        "recognising the thief should not lower the break-away-forward weight"
+    );
+    assert!(
+        prob(&escape, "protect-ball") <= prob(&dwell, "protect-ball") + 1e-9,
+        "recognising the thief should damp slow shielding into the steal"
+    );
+}
+
 #[test]
 fn mpc_bouncing_ball_urgency_reprices_pass_execution_window() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
