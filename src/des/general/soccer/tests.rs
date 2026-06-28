@@ -2706,8 +2706,9 @@ fn immediate_steal_wins_ball_from_behind_only_under_blindside_gate() {
 
 #[test]
 fn carrier_glance_recognises_blindside_threat_and_biases_escape() {
-    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
-    let carrier = snapshot
+    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let carrier = sim
         .players
         .iter()
         .find(|p| p.id == 7)
