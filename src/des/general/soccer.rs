@@ -17123,6 +17123,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// learning signal, complementing the retrospective concede penalty.
     KeeperSave,
     Goal,
+    /// A headed goal finished from a situational flank crash-the-box aerial cross. Carries the
+    /// same learning weight as a [`Goal`](SoccerRewardEventKind::Goal) but lets the bonus that
+    /// rewards the whole wide-cross → bodies-in-the-box → header pattern be attributed
+    /// distinctly. See [`crash_box`].
+    HeaderGoalFromCross,
+    /// Bounded shaped credit for an attacker having crashed into the box as a flank aerial
+    /// cross is released — the off-ball "be there for the delivery" signal.
+    CrashBoxArrival,
     MatchResult,
 }
 
