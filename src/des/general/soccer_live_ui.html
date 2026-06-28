@@ -3510,27 +3510,67 @@ function drawBall(ball, r) {
 // directly is choppy. Instead a requestAnimationFrame loop draws the field at the
 // display refresh rate, lerping each entity's position between the previous and
 // latest server frame. Metrics/overlays still update per server frame in render().
-let interpPrevFrame = null;
-let interpTargetFrame = null;
-let interpStart = 0;
-let interpDuration = LIVE_STEP_INTERVAL_MS;
-let interpLastArrival = 0;
+// --- Jitter-buffer playout -------------------------------------------------
+// Frames are buffered by sim tick and played back a couple of frames BEHIND the
+// most recent arrival. With a steady server push this is invisible; under jitter
+// on the last network hop (a frame arriving late/early), the playhead keeps
+// advancing smoothly and always has a "next" frame to interpolate toward, so
+// motion no longer stalls-then-snaps. Holds the latest frame on buffer underrun,
+// and restarts cleanly on a match reset (tick rewind) or a large forward seek.
+let frameBuf = [];                 // [{tick, frame}] ascending by tick, capped
+let playHeadTick = null;           // float playback position, in tick units
+let playHeadLastMs = 0;            // wall clock of the last playhead advance
+const JBUF_TARGET_TICKS = 2;       // render ~this many frames behind the latest
+const JBUF_MAX_FRAMES = 60;        // ~4s of history at 15Hz
+const JBUF_NOMINAL_MS = 1000 / 15; // sim cadence: one tick per 1/15s
+
+function jbufReset() { frameBuf = []; playHeadTick = null; }
 
 function registerFrameForInterpolation(frame) {
   if (!frame) return;
-  const now = performance.now();
-  if (interpTargetFrame && Number(frame.tick) === Number(interpTargetFrame.tick)) {
-    interpTargetFrame = frame; // same tick re-rendered (UI toggle); keep the lerp
-    return;
+  const tick = Number(frame.tick);
+  if (!Number.isFinite(tick)) return;
+  const latest = frameBuf.length ? frameBuf[frameBuf.length - 1].tick : null;
+  // Match reset / rewind, or a big forward jump (seek): start the buffer fresh.
+  if (latest != null && (tick < latest || tick > latest + 30)) {
+    if (tick !== latest) jbufReset();
   }
-  const measured = interpLastArrival ? now - interpLastArrival : LIVE_STEP_INTERVAL_MS;
-  // EMA of the real wall-clock gap between frames -> motion paced to actual
-  // arrivals (robust to network jitter), not the nominal step interval.
-  interpDuration = clamp(0.6 * interpDuration + 0.4 * clamp(measured, 30, 1500), 30, 1500);
-  interpLastArrival = now;
-  interpPrevFrame = interpTargetFrame || frame;
-  interpTargetFrame = frame;
-  interpStart = now;
+  const i = frameBuf.length ? frameBuf.findIndex(e => e.tick === tick) : -1;
+  if (i >= 0) {
+    frameBuf[i].frame = frame;                // same tick re-rendered (UI toggle)
+  } else if (frameBuf.length === 0 || tick > frameBuf[frameBuf.length - 1].tick) {
+    frameBuf.push({ tick, frame });           // common case: next tick → push to end
+  } else {
+    frameBuf.push({ tick, frame });
+    frameBuf.sort((a, b) => a.tick - b.tick);
+  }
+  while (frameBuf.length > JBUF_MAX_FRAMES) frameBuf.shift();
+}
+
+function jbufFrameAtTick(tick) {
+  for (let i = 0; i < frameBuf.length; i++) if (frameBuf[i].tick === tick) return frameBuf[i].frame;
+  return null;
+}
+
+// Advance the playhead toward (latest - JBUF_TARGET_TICKS) at the sim cadence with
+// bounded proportional catch-up (so it tracks buffer depth without jerking), and
+// return the interpolated frame to draw — or null when nothing is buffered yet.
+function jbufCurrentFrame(now) {
+  if (frameBuf.length === 0) return null;
+  const latest = frameBuf[frameBuf.length - 1].tick;
+  const oldest = frameBuf[0].tick;
+  if (playHeadTick == null) { playHeadTick = Math.max(oldest, latest - JBUF_TARGET_TICKS); playHeadLastMs = now; }
+  const dtMs = Math.min(Math.max(now - playHeadLastMs, 0), 250);
+  playHeadLastMs = now;
+  const target = latest - JBUF_TARGET_TICKS;
+  let adv = dtMs / JBUF_NOMINAL_MS;                                  // nominal 1 tick / (1/15s)
+  adv *= clamp(1 + (target - playHeadTick) * 0.5, 0.2, 2.2);         // bounded catch-up
+  playHeadTick = clamp(playHeadTick + adv, oldest, latest);          // never extrapolate past latest
+  const lo = Math.floor(playHeadTick);
+  const frac = playHeadTick - lo;
+  const a = jbufFrameAtTick(lo) || jbufFrameAtTick(Math.ceil(playHeadTick)) || frameBuf[frameBuf.length - 1].frame;
+  const b = jbufFrameAtTick(lo + 1) || a;
+  return interpolatedFrame(a, b, a === b ? 0 : frac);
 }
 
 function lerpPosition(a, b, t) {
@@ -3695,12 +3735,9 @@ function animateField() {
   // though the sim keeps stepping server-side. Guard the draw and ALWAYS re-arm (finally), and
   // surface the error once instead of dying silently.
   try {
-    if (state && interpTargetFrame) {
-      const r = pitchRect();
-      const t = interpDuration > 0
-        ? clamp((performance.now() - interpStart) / interpDuration, 0, 1)
-        : 1;
-      drawField(interpolatedFrame(interpPrevFrame, interpTargetFrame, t), r);
+    if (state) {
+      const f = jbufCurrentFrame(performance.now());
+      if (f) drawField(f, pitchRect());
     }
   } catch (e) {
     if (typeof console !== "undefined") console.error("animateField draw error", e);
