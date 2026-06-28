@@ -17166,6 +17166,8 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::Goal
+                | SoccerRewardEventKind::HeaderGoalFromCross
+                | SoccerRewardEventKind::CrashBoxArrival
         )
     }
 }
