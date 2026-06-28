@@ -2602,7 +2602,7 @@ fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
 /// A slow Home carrier dribbling forward with an Away defender crept directly into its
 /// blind arc, fast enough to catch it: the blindside-steal assessment recognises the
 /// chance with the gate on, and short-circuits to `None` with the gate off.
-fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> WorldSnapshot {
+fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> SoccerMatch {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 4_242,
@@ -2628,12 +2628,13 @@ fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> WorldS
     sim.ball.holder = Some(carrier);
     sim.ball.position = sim.players[carrier].position;
     sim.ball.last_touch_team = Some(Team::Home);
-    WorldSnapshot::from_match(&sim)
+    sim
 }
 
 #[test]
 fn blindside_steal_recognises_slow_unaware_catchable_carrier() {
-    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.5), 2.0);
+    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 2.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
     let thief = 14;
 
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
