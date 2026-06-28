@@ -29339,9 +29339,11 @@ impl WorldSnapshot {
                 // Recycled possession: lean harder on forward progress and demote handing the
                 // ball straight back to a recycle partner unless THIS pass actually breaks the
                 // ball forward past them (a genuine progression escapes the recycle).
-                let forward_weight = 0.22
+                let forward_weight = (0.22
                     + directive.risk_tolerance * 0.30
-                    + recycle_urgency * RECYCLED_POSSESSION_FORWARD_WEIGHT_BOOST;
+                    + recycle_urgency * RECYCLED_POSSESSION_FORWARD_WEIGHT_BOOST
+                    + pass_risk_appetite.forward_preference_lift)
+                    .max(0.0);
                 let recycle_pingpong_penalty = if recycle_urgency > 0.0
                     && recycle_participants.contains(&p.id)
                     && forward <= RECYCLED_POSSESSION_PROGRESS_YARDS
