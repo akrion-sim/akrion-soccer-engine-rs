@@ -39570,6 +39570,18 @@ impl WorldSnapshot {
         let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
+        // Count a forward option whenever the receiver is a genuinely playable visible target
+        // that is ahead of the ball — NOT only when a straight floor lane is uncontested. An
+        // advanced, OPEN runner with a trailing/already-beaten defender nominally near the lane
+        // (high `lane_interception_risk`, so a strict reception-won `actionable` reads false) is
+        // exactly the "good forward option the carrier failed to recognise" this revision fixes;
+        // demanding strict actionability here would re-introduce that blindness and would also
+        // diverge from the established option-scoring parity baseline. So the COUNT and the
+        // nearest-distance follow every forward visible target in both modes; only the openness/
+        // quality AGGREGATION takes the richer lane-aware (`forward_floor_outlet_assessment`)
+        // recognition under `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION` — gate OFF reproduces
+        // the legacy raw-openness aggregation byte-for-byte (parity suite default-off).
+        let recognition_on = dd_soccer_enable_forward_option_recognition();
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -39579,6 +39591,10 @@ impl WorldSnapshot {
             if forward <= 1.25 {
                 continue;
             }
+            visible_forward_pass_options += 1;
+            let distance = current.distance(target_position);
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(distance);
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -39587,33 +39603,49 @@ impl WorldSnapshot {
                 target_position,
                 PassFlight::Floor,
             );
-            let distance = current.distance(target_position);
-            let outlet =
-                forward_floor_outlet_assessment(forward, distance, &quality, true);
-            if !outlet.actionable {
-                continue;
-            }
-            visible_forward_pass_options += 1;
-            nearest_visible_forward_pass_distance_yards =
-                nearest_visible_forward_pass_distance_yards.min(distance);
-            best_forward_pass_receiver_openness =
-                best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
-            best_forward_pass_option_quality = best_forward_pass_option_quality.max(
-                forward_pass_option_quality(
-                    outlet.receiver_openness_for_score,
-                    quality.expected_completion,
-                ),
-            );
-            // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
-            // advanced teammate. Reward openness × completion most, weight the in-band
-            // distance, and add a modest upfield-gain term so a more advanced open runner
-            // edges a square one. The ranked execution targets this player when the value
-            // wins (see `quick_forward_pass_target`).
-            if outlet.distance_fit > 0.0 {
-                let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
-                if value > best_quick_forward_open_value {
-                    best_quick_forward_open_value = value;
-                    best_quick_forward_target = Some(*target_id);
+            if recognition_on {
+                let outlet = forward_floor_outlet_assessment(forward, distance, &quality, true);
+                best_forward_pass_receiver_openness =
+                    best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
+                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                    forward_pass_option_quality(
+                        outlet.receiver_openness_for_score,
+                        quality.expected_completion,
+                    ),
+                );
+                // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
+                // advanced teammate. The lane-aware `quality_fit` already blends openness,
+                // completion, stride and upfield gain; weight it by the in-band distance fit.
+                if outlet.distance_fit > 0.0 {
+                    let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
+                    if value > best_quick_forward_open_value {
+                        best_quick_forward_open_value = value;
+                        best_quick_forward_target = Some(*target_id);
+                    }
+                }
+            } else {
+                best_forward_pass_receiver_openness =
+                    best_forward_pass_receiver_openness.max(quality.receiver_openness);
+                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                    forward_pass_option_quality(
+                        quality.receiver_openness,
+                        quality.expected_completion,
+                    ),
+                );
+                // Legacy quick-forward value (raw openness × completion × upfield gain), kept
+                // byte-identical so the option-scoring parity suite is unchanged with the gate off.
+                let band_fit = quick_forward_pass_band_fit(distance);
+                if band_fit > 0.0 {
+                    let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+                    let openness = quality.receiver_openness.clamp(0.0, 1.0);
+                    let completion = quality.expected_completion.clamp(0.0, 1.0);
+                    let value = (band_fit
+                        * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
+                        .clamp(0.0, 1.0);
+                    if value > best_quick_forward_open_value {
+                        best_quick_forward_open_value = value;
+                        best_quick_forward_target = Some(*target_id);
+                    }
                 }
             }
         }
