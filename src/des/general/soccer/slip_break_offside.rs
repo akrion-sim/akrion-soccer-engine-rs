@@ -11,9 +11,11 @@
 //! seam, the runner's timed-break target, the passer's release bias, and the shared reward) live
 //! on [`WorldSnapshot`]/`SoccerWorld` in `world.rs`, and the decision wiring is in `player.rs`.
 //!
-//! Everything here is gated default-OFF (byte-identical parity suite); a learner enables the
-//! decision/movement side with `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE=1` and the shared MAPPO
-//! reward with `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE_REWARD=1`, then retrains.
+//! Both gates are **default-ON in production** and **default-OFF under test** (so the parity suite
+//! stays byte-identical): the decision/movement side `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE` and the
+//! shared MAPPO reward `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE_REWARD`. Set either to `0/false/no/off`
+//! as a kill switch. The decision biases are non-learned (the POMDP features are not in the neural
+//! encoder), so they act immediately; the reward shapes the next training run.
 
 /// Onside staging band: a slip-break runner sets up 5–10 yd on the onside of the second-last
 /// defender line so the sprint into the seam can be timed to cross the line *after* the ball is
