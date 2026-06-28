@@ -12705,7 +12705,7 @@ impl SoccerMatch {
                     if dd_soccer_enable_slip_break_offside_reward()
                         && !flight.is_aerial()
                         && !is_cross
-                        && offside.is_none()
+                        && pass_is_onside
                     {
                         if let Some(runner) = target_id {
                             if let Some(opportunity) = snapshot.slip_break_runner_opportunity(
