@@ -12695,33 +12695,54 @@ impl SoccerMatch {
                             flight,
                         ),
                     });
-                    // Shared (centralized MAPPO) reward for executing a slip-and-break-the-trap:
-                    // a firm forward GROUND ball slipped to an ONSIDE runner who timed his break
-                    // into a two-defender seam. The passer AND the runner split the credit (the
-                    // cooperative team-reward path), so the learner reinforces the coordinated
-                    // pattern — the runner starting first, the carrier slipping it through at the
-                    // right moment. Gated; off ⇒ never fires (byte-identical). A pass flagged
-                    // offside earns nothing: the trap was not beaten.
-                    if dd_soccer_enable_slip_break_offside_reward()
-                        && !flight.is_aerial()
-                        && !is_cross
-                        && pass_is_onside
-                    {
-                        if let Some(runner) = target_id {
-                            if let Some(opportunity) = snapshot.slip_break_runner_opportunity(
-                                player_team,
-                                player_id,
-                                player_pos,
-                                runner,
-                            ) {
-                                let amount = opportunity.opportunity * SLIP_BREAK_REWARD_POINTS;
-                                self.record_involved_team_reward_at(
-                                    self.tick,
+                    // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
+                    // to an ONSIDE runner who timed his break into a two-defender seam. Detect the
+                    // opportunity once (the actual pass target IS the breaking runner) and use it
+                    // for two gated, independent effects. Both off ⇒ byte-identical.
+                    let slip_break_executed = if !flight.is_aerial() && !is_cross && pass_is_onside {
+                        target_id.and_then(|runner| {
+                            snapshot
+                                .slip_break_runner_opportunity(
                                     player_team,
-                                    amount,
-                                    &[player_id, runner],
-                                );
+                                    player_id,
+                                    player_pos,
+                                    runner,
+                                )
+                                .map(|opportunity| (runner, opportunity))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((runner, opportunity)) = slip_break_executed {
+                        // Decision side: firm the slip into the 25–35 mph band so it beats the
+                        // recovering defender into the space (a tentative ground ball gets cut
+                        // out). Only ever raises the speed; never softens it.
+                        if dd_soccer_enable_slip_break_offside() {
+                            let firm_yps = mph_to_yps(slip_break_pass_speed_mph(release_distance));
+                            let current_speed = self.ball.velocity.len();
+                            if current_speed.is_finite()
+                                && current_speed > 1e-6
+                                && current_speed < firm_yps
+                            {
+                                self.ball.velocity = self.ball.velocity * (firm_yps / current_speed);
+                                if let Some(pending) = self.pending_pass.as_mut() {
+                                    pending.launch_speed_yps = firm_yps;
+                                }
                             }
+                        }
+                        // Shared (centralized MAPPO) reward: the passer AND the runner split the
+                        // credit (the cooperative team-reward path), reinforcing the coordinated
+                        // pattern — the runner starting first, the carrier slipping it through at
+                        // the right moment. A pass flagged offside never reaches here: the trap
+                        // was not beaten, so there is nothing to reward.
+                        if dd_soccer_enable_slip_break_offside_reward() {
+                            let amount = opportunity.opportunity * SLIP_BREAK_REWARD_POINTS;
+                            self.record_involved_team_reward_at(
+                                self.tick,
+                                player_team,
+                                amount,
+                                &[player_id, runner],
+                            );
                         }
                     }
                     self.pending_shot = None;
