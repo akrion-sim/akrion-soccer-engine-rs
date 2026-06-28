@@ -39475,6 +39475,7 @@ impl WorldSnapshot {
             teammates_ahead,
             visible_forward_pass_options,
             best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: if nearest_forward_teammate_distance_yards
                 .is_finite()
             {
