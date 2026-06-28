@@ -30307,10 +30307,8 @@ impl WorldSnapshot {
         );
         Some(SlipBreakOpportunity {
             seam_target,
-            seam_quality,
             timing,
             lane_openness,
-            speed_advantage,
             opportunity,
         })
     }
