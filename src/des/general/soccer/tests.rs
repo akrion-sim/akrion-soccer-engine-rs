@@ -9026,6 +9026,7 @@ fn crash_box_env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// the gate off, the same call is a complete no-op (byte-identical).
 #[test]
 fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
+    let _env = crash_box_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     // Home attacks y = 120; the opponent (Away) box is y in [102, 120], x in [18, 62].
     sim.players[9].role = PlayerRole::Forward;
