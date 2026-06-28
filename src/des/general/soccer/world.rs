@@ -39447,6 +39447,9 @@ impl WorldSnapshot {
             );
             best_forward_pass_receiver_openness =
                 best_forward_pass_receiver_openness.max(quality.receiver_openness);
+            best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                forward_pass_option_quality(quality.receiver_openness, quality.expected_completion),
+            );
             // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
             // advanced teammate. Reward openness × completion most, weight the in-band
             // distance, and add a modest upfield-gain term so a more advanced open runner
