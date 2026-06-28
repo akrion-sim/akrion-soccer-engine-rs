@@ -5612,7 +5612,7 @@ impl SoccerMatch {
         }
         let current = snapshot.player_snapshot_position(player);
         let target = match label {
-            "tackle" => snapshot
+            "tackle" | "blindside-steal" => snapshot
                 .ball
                 .holder
                 .and_then(|holder| snapshot.player_position(holder)),
