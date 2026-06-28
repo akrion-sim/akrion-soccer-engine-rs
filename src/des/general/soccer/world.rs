@@ -20412,6 +20412,45 @@ pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
     })
 }
 
+/// Whether to bound the magnitude of the centralized MAPPO team component (see
+/// [`soccer_marl_team_component`]). The term is `own_mean − opponent_mean` over a tick; on a
+/// single-team tick (e.g. a drained deferred goal/chain-credit row trained apart from its
+/// 22-player cohort) the absent opponent mean reads 0.0, so a sparse +30 scorer share becomes a
+/// one-sided +30 spike that — without advantage standardization (default off) — is a large,
+/// destabilizing policy-gradient step. This clamp caps that spike while leaving the small dense
+/// per-tick differentials untouched; a softer, always-safe complement to the balanced gate (which
+/// suppresses the term entirely on single-team ticks). OFF by default ⇒ byte-identical; set
+/// `DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP=1`. Read once per process.
+pub(crate) fn dd_soccer_enable_marl_team_component_clamp() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1" || raw.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Symmetric bound (in reward points) for the MAPPO team-component clamp when it is enabled.
+/// Defaults to [`MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT`] — about a shot's reward magnitude, so
+/// legitimate dense differentials pass through while a sparse single-team event spike is capped.
+/// Learner/operator override via `DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS` (clamped 1.0-200.0).
+pub(crate) fn marl_team_component_clamp_points() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 200.0))
+            .unwrap_or(MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT)
+    })
+}
+
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
 // goal-side defensive drop is suppressed for off-ball players so mid/forwards keep pushing
 // up rather than turning and chasing their own goal under a ball that is going the other

@@ -84168,15 +84168,51 @@ fn marl_team_component_balanced_only_suppresses_single_team_ticks() {
     // Legacy (unbalanced) behaviour: opponent mean defaults to 0.0, so the "zero-sum" term leaks
     // the full one-sided reward — this is the bias being hardened against.
     assert_eq!(
-        soccer_marl_team_component(home_only, Team::Home, false),
+        soccer_marl_team_component(home_only, Team::Home, false, None),
         30.0,
         "unbalanced term leaks own reward when the opponent is absent"
     );
     // Balanced: a single-team tick contributes no centralized team component.
     assert_eq!(
-        soccer_marl_team_component(home_only, Team::Home, true),
+        soccer_marl_team_component(home_only, Team::Home, true, None),
         0.0,
         "balanced term suppresses single-team ticks"
+    );
+}
+
+#[test]
+fn marl_team_component_clamp_bounds_single_team_spike() {
+    // The same single-team spike (one drained +30 scorer-share row, no opponent sample). The
+    // balanced gate suppresses it to 0; the clamp instead bounds its magnitude. Both are gated
+    // and complementary; None ⇒ unbounded (byte-identical legacy).
+    let mut home_only = SoccerMarlTickReward::default();
+    home_only.record(Team::Home, 30.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false, None),
+        30.0,
+        "no clamp leaves the +30 one-sided spike intact"
+    );
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false, Some(12.0)),
+        12.0,
+        "clamp caps the +30 spike at +12"
+    );
+    // Symmetric on the conceding side.
+    let mut away_only = SoccerMarlTickReward::default();
+    away_only.record(Team::Away, 30.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(away_only, Team::Home, false, Some(12.0)),
+        -12.0,
+        "clamp caps the -30 opponent-only spike at -12"
+    );
+    // A small dense differential is BELOW the bound, so the clamp is a no-op there.
+    let mut both = SoccerMarlTickReward::default();
+    both.record(Team::Home, 3.0, 0.0);
+    both.record(Team::Away, 1.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(both, Team::Home, false, Some(12.0)),
+        soccer_marl_team_component(both, Team::Home, false, None),
+        "clamp leaves an in-bound dense differential untouched"
     );
 }
 
@@ -84188,8 +84224,8 @@ fn marl_team_component_unchanged_when_both_teams_present() {
     both.record(Team::Home, 4.0, 0.0);
     both.record(Team::Home, 2.0, 0.0); // home mean 3.0
     both.record(Team::Away, 1.0, 0.0); // away mean 1.0
-    let unbalanced = soccer_marl_team_component(both, Team::Home, false);
-    let balanced = soccer_marl_team_component(both, Team::Home, true);
+    let unbalanced = soccer_marl_team_component(both, Team::Home, false, None);
+    let balanced = soccer_marl_team_component(both, Team::Home, true, None);
     assert!(
         (unbalanced - 2.0).abs() < 1e-9,
         "home_mean - away_mean = 3 - 1"
@@ -84199,7 +84235,7 @@ fn marl_team_component_unchanged_when_both_teams_present() {
         "balanced flag is a no-op when both teams are present"
     );
     // Antisymmetric across teams (genuinely zero-sum) when both are present.
-    assert!((soccer_marl_team_component(both, Team::Away, true) + balanced).abs() < 1e-9);
+    assert!((soccer_marl_team_component(both, Team::Away, true, None) + balanced).abs() < 1e-9);
 }
 
 /// Headless A/B for wingback-first forward priority (`DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY`).
