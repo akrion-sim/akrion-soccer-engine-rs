@@ -12850,6 +12850,16 @@ impl SoccerMatch {
             SoccerAction::Shoot { power } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
+                    // The ball altitude before this contact overwrites it: a finish struck while
+                    // the ball is up in the heading band is an aerial (headed) finish — the signal
+                    // the flank crash-the-box bonus keys off.
+                    let incoming_ball_altitude = self.ball.altitude_yards;
+                    self.pending_aerial_finish =
+                        if incoming_ball_altitude >= AERIAL_HEADER_MIN_ALTITUDE_YARDS {
+                            Some((player_id, self.tick))
+                        } else {
+                            None
+                        };
                     let snapshot = WorldSnapshot::from_match(self);
                     let observation = snapshot.observation_for(player_id);
                     let pressure = pressure_from_observation(&observation);
