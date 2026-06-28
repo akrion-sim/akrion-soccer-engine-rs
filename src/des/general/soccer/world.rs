@@ -308,6 +308,14 @@ pub struct SoccerMatch {
     pub(crate) suppress_generic_oob_turnover: bool,
     pub(crate) pending_shot: Option<PendingShot>,
     pub(crate) pending_rebound: Option<PendingRebound>,
+    /// Latched "live cross" window for the situational flank crash-the-box play: set when an
+    /// aerial cross is released into the box under the recognizer, consumed to credit a headed
+    /// finish (and the box-crash arrivals) back to the move. Runtime-only; `None` unless
+    /// `DD_SOCCER_ENABLE_FLANK_CRASH_BOX` is on. See [`crash_box`].
+    pub(crate) flank_crash_box_cross: Option<crash_box::FlankCrashBoxCross>,
+    /// `(shooter, tick)` stamped when a shot is taken with the ball aerial in the heading band,
+    /// so a goal on the same tick can be recognised as a headed finish. Runtime-only.
+    pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
