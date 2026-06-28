@@ -2676,8 +2676,10 @@ fn blindside_surprise_steal_and_carrier_glance_recognition() {
     std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
     assert!(fast.is_none(), "a sprinting carrier is not robbed from behind, got {fast:?}");
 
-    // --- 3. Ball is actually won from behind only under the gate (normally blocked). ---
-    let contact_sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
+    // --- 3. Ball is won from behind only under the gate. The thief sits in the 1.6–2.1yd
+    // band — beyond the existing close-range emergency-contact reach (so a from-behind
+    // steal is normally blocked there) but inside the blindside nick range. ---
+    let contact_sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.9);
     let contact_snapshot = WorldSnapshot::from_match(&contact_sim);
     let thief = contact_sim
         .players
@@ -2685,22 +2687,6 @@ fn blindside_surprise_steal_and_carrier_glance_recognition() {
         .find(|p| p.id == 14)
         .cloned()
         .expect("thief present");
-    {
-        let hp = contact_snapshot.player_snapshot_position(
-            contact_snapshot.players.iter().find(|p| p.id == 7).unwrap(),
-        );
-        let my_depth = contact_snapshot.depth_from_own_goal_y(Team::Away, thief.position.y);
-        let holder_depth = contact_snapshot.depth_from_own_goal_y(Team::Away, hp.y);
-        eprintln!(
-            "PROBE thief.y={} holder.y={} dist={} my_depth={} holder_depth={} goal_side={}",
-            thief.position.y,
-            hp.y,
-            thief.position.distance(hp),
-            my_depth,
-            holder_depth,
-            my_depth <= holder_depth + 0.65
-        );
-    }
     let steal_off = thief.immediate_defensive_steal_target(&contact_snapshot);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
     let steal_on = thief.immediate_defensive_steal_target(&contact_snapshot);
