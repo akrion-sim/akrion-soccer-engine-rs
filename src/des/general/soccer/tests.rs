@@ -9012,6 +9012,15 @@ fn completed_pass_reward_event_includes_killer_pass_goal_channel_bonus() {
 
 // --- Situational "crash the box" from a flank aerial cross (see `crash_box`). ---
 
+/// Serialise the crash-the-box tests that toggle `DD_SOCCER_ENABLE_FLANK_CRASH_BOX`: the gate
+/// re-reads the env each call under `cfg(test)`, so two of these running concurrently would see
+/// each other's `set_var`. Holding this lock for the test body keeps each one's on/off window
+/// to itself.
+fn crash_box_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Two attackers crashed into the opponent box as a wide-and-high aerial cross is released ⇒ the
 /// "live cross" window latches and the small bounded arrival reward is paid to the crashers. With
 /// the gate off, the same call is a complete no-op (byte-identical).
