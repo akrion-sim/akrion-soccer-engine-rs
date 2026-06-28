@@ -37302,6 +37302,12 @@ impl WorldSnapshot {
                 _ => box_edge_x,
             }
         } else {
+            // Ball well ahead of the back four and we are not a live ground-pass outlet ⇒ hold
+            // width: stay in our current lane and push up with the play rather than bombing out
+            // to the touchline from behind an advanced ball.
+            if self.wingback_advanced_ball_should_hold_width(me) {
+                return target;
+            }
             // Open OUT toward the touchline; bomb wide when there is cover behind the ball.
             let attack = me.team.attack_dir();
             let ball_fwd = self.ball.position.y * attack;
