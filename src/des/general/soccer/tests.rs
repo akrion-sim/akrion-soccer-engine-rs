@@ -66631,6 +66631,25 @@ fn mappo_team_component_penalizes_relative_team_energy_waste() {
         away_adjusted > ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS * 0.9,
         "the opponent should get the zero-sum mirror of the energy economy signal: {away_adjusted}"
     );
+
+    let independent_config = SoccerNeuralLearningConfig {
+        enabled: true,
+        marl_algorithm: SoccerMarlAlgorithm::IndependentActorCritic,
+        mappo_team_reward_share: 1.0,
+        marl_team_reward_weight: 1.0,
+        marl_intermediate_reward_weight: 1.0,
+        ..SoccerNeuralLearningConfig::default()
+    };
+    assert_eq!(
+        soccer_marl_adjusted_reward(&transitions[0], &tick_rewards, &independent_config),
+        0.0,
+        "independent actor-critic must ignore MAPPO team-reward share"
+    );
+    assert_eq!(
+        soccer_marl_adjusted_reward(&transitions[1], &tick_rewards, &independent_config),
+        0.0,
+        "independent actor-critic must not receive MAPPO's zero-sum team component"
+    );
 }
 
 #[test]
