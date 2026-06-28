@@ -2605,13 +2605,28 @@ mod decision_cadence_player_tests {
 }
 
 fn agentic_action_order<T>(items: Vec<(T, f64)>) -> Vec<T> {
+    agentic_action_order_scored(items).0
+}
+
+/// Like [`agentic_action_order`] but also returns the post-transform ordering
+/// weight of each item in ranked order, so a value-weighted (Boltzmann) policy
+/// draw can score candidates by how good they are rather than by rank alone. The
+/// item order is identical to [`agentic_action_order`]; the weights are exactly
+/// the keys it sorts on (so `weights[0]` is the argmax weight).
+fn agentic_action_order_scored<T>(items: Vec<(T, f64)>) -> (Vec<T>, Vec<f64>) {
     let mut keyed = Vec::with_capacity(items.len());
     for (ordinal, (item, weight)) in items.into_iter().enumerate() {
         let weight = weighted_agentic_order_weight(weight);
         keyed.push((weight, ordinal, item));
     }
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    keyed.into_iter().map(|(_, _, item)| item).collect()
+    let mut ordered = Vec::with_capacity(keyed.len());
+    let mut weights = Vec::with_capacity(keyed.len());
+    for (weight, _, item) in keyed {
+        ordered.push(item);
+        weights.push(weight);
+    }
+    (ordered, weights)
 }
 
 impl PlayerAgent {
@@ -4628,6 +4643,29 @@ impl PlayerAgent {
                 };
                 (base - damp).clamp(0.40, 1.22)
             };
+            // Own-half short-pass discipline (Layer 2): when the best floor pass on offer is a
+            // short ball played from our own half, lean the carrier toward keeping the dribble /
+            // holding rather than playing the square ball. Scales with how short the ball is and
+            // eases for a wide-open receiver; floored so it demotes without hard-vetoing. Off (or
+            // outside the own half / with a 4+yd ball available) ⇒ 1.0 (no change).
+            let own_half_short_pass_dribble_bias = if own_half
+                && !dd_soccer_disable_own_half_short_pass_liability()
+                && observation.best_floor_pass_distance_yards > 0.05
+                && observation.best_floor_pass_distance_yards
+                    < OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS
+            {
+                let shortness = (1.0
+                    - observation.best_floor_pass_distance_yards
+                        / OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS)
+                    .clamp(0.0, 1.0);
+                let openness_relief = observation.best_pass_receiver_openness.clamp(0.0, 1.0);
+                let damp = OWN_HALF_SHORT_PASS_DRIBBLE_DAMP
+                    * (0.5 + 0.5 * shortness)
+                    * (1.0 - 0.5 * openness_relief);
+                (1.0 - damp).clamp(OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT, 1.0)
+            } else {
+                1.0
+            };
             let pass_score = (self.preferences.pass_bias
                 * directive.pass_priority
                 * (0.70 + passing * 0.42)
@@ -4639,6 +4677,7 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * low_cross_multiplier
                 * short_upfield_ground_pass_multiplier
+                * own_half_short_pass_dribble_bias
                 * pass_and_move_forward_lift
                 * crowded_pass_lift
                 * pressured_release_multiplier
@@ -7771,8 +7810,10 @@ impl PlayerAgent {
                 })
                 .collect::<Vec<_>>();
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(weighted_ops),
+                let (ordered, ordered_scores) = agentic_action_order_scored(weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -9024,8 +9065,10 @@ impl PlayerAgent {
                 apply_decision_cadence_hold_weights(&mut weighted_ops, label);
             }
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(weighted_ops),
+                let (ordered, ordered_scores) = agentic_action_order_scored(weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10485,8 +10528,11 @@ impl PlayerAgent {
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
             let support_order = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(support_weighted_ops),
+                let (ordered, ordered_scores) =
+                    agentic_action_order_scored(support_weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10638,8 +10684,11 @@ impl PlayerAgent {
                 order_names.push(format!("decision-cadence-hold:{label}"));
             }
             let ops = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(defensive_weighted_ops),
+                let (ordered, ordered_scores) =
+                    agentic_action_order_scored(defensive_weighted_ops);
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,
@@ -10779,18 +10828,20 @@ impl PlayerAgent {
                     >= 0.65,
             );
             let loose_order = {
-                let sampled = reorder_by_draw_traced(
-                    agentic_action_order(
-                        loose_options
-                            .iter()
-                            .map(|option| {
-                                (
-                                    option.label.clone(),
-                                    if option.legal { option.score } else { 0.0 },
-                                )
-                            })
-                            .collect(),
-                    ),
+                let (ordered, ordered_scores) = agentic_action_order_scored(
+                    loose_options
+                        .iter()
+                        .map(|option| {
+                            (
+                                option.label.clone(),
+                                if option.legal { option.score } else { 0.0 },
+                            )
+                        })
+                        .collect(),
+                );
+                let sampled = reorder_with_scores_traced(
+                    ordered,
+                    &ordered_scores,
                     snapshot.decision_seed,
                     self.id,
                     snapshot.tick,

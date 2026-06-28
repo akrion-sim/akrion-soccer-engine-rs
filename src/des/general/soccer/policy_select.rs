@@ -15,6 +15,23 @@
 //! exact weights live in [`crate::des::general::soccer::tunables`] under
 //! `policy_selection`, env/PG-overridable; the defaults reproduce 70/20/10.
 //!
+//! ## Value-weighted (Boltzmann) mode
+//!
+//! The fixed 70/20/10 split is *rank*-weighted: it explores the 2nd-best as
+//! often whether it trails the best by 0.001 or by 10. Set
+//! `policy_selection.boltzmann_temperature > 0` to switch the same gated draw to
+//! a **value-weighted** softmax over *all* candidates — probability
+//! `∝ exp(score / temperature)` — so a near-tie explores readily while a runaway
+//! best is taken almost always, and the explored option is picked by how good it
+//! actually scores rather than merely by being 2nd in line. The temperature
+//! default `0.0` leaves the rank-weighted split in force, so an unconfigured
+//! process is byte-identical. The behaviour-policy probability reported for
+//! learning honesty is the softmax probability of the chosen candidate in this
+//! mode (vs. the renormalised rank weight in the legacy mode). This path needs
+//! candidate *scores*, so it is only taken by the scored entry points
+//! ([`reorder_with_scores_traced`], [`sampled_index_by_score`]); the score-less
+//! [`reorder_by_draw`] always uses the rank-weighted split.
+//!
 //! ## Determinism
 //!
 //! Player decisions run off an immutable [`WorldSnapshot`] and have no mutable
@@ -31,6 +48,21 @@
 //! off every helper here is a no-op that returns the input order / rank 0
 //! unchanged, so an unconfigured process is byte-identical to before this module
 //! existed.
+//!
+//! ## Learning-honesty caveat
+//!
+//! These helpers report the behaviour-policy probability of the **promoted**
+//! (sampled) candidate. Downstream the engine "commits to the first *feasible*
+//! candidate" in the reordered list, so the executed action equals the promoted
+//! one **only when the promoted candidate passes its own feasibility/MPC check**;
+//! if it is skipped, the executed action is a later candidate but the recorded
+//! probability still refers to the promoted one. This is a property of the
+//! promote-then-verify design shared by both the rank-weighted and value-weighted
+//! draws, not specific to either. The value-weighted path narrows the gap by
+//! giving ineligible (non-positive-weight) candidates zero exploration mass (see
+//! [`reorder_with_scores_traced`]) so it does not *add* skip-prone promotions; the
+//! residual (a legal candidate vetoed by a later MPC/target check) is left as a
+//! known limitation rather than reconciled here.
 //!
 //! [`WorldSnapshot`]: crate::des::general::soccer::WorldSnapshot
 
@@ -104,8 +136,92 @@ fn rank_weights() -> [f64; POLICY_SELECTION_TOP_RANK_LIMIT] {
         .rank_weights()
 }
 
-/// Pick a rank in the supported top-k range from a unit `draw`, using the first
-/// `n` rank
+/// The Boltzmann (softmax) temperature from the tunables tree. `> 0` selects the
+/// value-weighted draw; the default `0.0` (and any non-positive / non-finite
+/// value) keeps the rank-weighted top-k split, preserving byte-identical
+/// behaviour. Pulled through a thin accessor so the value-weighted helpers stay
+/// unit-testable in isolation.
+fn boltzmann_temperature() -> f64 {
+    crate::des::general::soccer::tunables()
+        .policy_selection
+        .boltzmann_temperature
+}
+
+/// Value-weighted draw: pick an index into `scores` with probability
+/// `∝ exp(score / temperature)` (numerically-stable softmax), using the
+/// deterministic unit `draw`. Returns `(index, probability_of_that_index)` for
+/// learning honesty.
+///
+/// Degenerate inputs fall back to the plain argmax with probability 1.0:
+/// fewer than two candidates, a non-positive / non-finite temperature, no finite
+/// score, or an all-zero weight mass. Non-finite scores contribute zero mass.
+/// `scores` need not be sorted; the returned index is into the slice as given.
+/// The probability is floored to [`SELECTION_PROB_FLOOR`] so an importance ratio
+/// can never divide by zero.
+fn boltzmann_pick(scores: &[f64], temperature: f64, draw: f64) -> (usize, f64) {
+    let n = scores.len();
+    if n < 2 {
+        return (0, 1.0);
+    }
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return (argmax_index(scores), 1.0);
+    }
+    let max = scores
+        .iter()
+        .copied()
+        .filter(|s| s.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+        return (argmax_index(scores), 1.0);
+    }
+    let mut weights = Vec::with_capacity(n);
+    let mut total = 0.0;
+    for &s in scores {
+        let w = if s.is_finite() {
+            ((s - max) / temperature).exp()
+        } else {
+            0.0
+        };
+        weights.push(w);
+        total += w;
+    }
+    if !(total > 0.0) {
+        return (argmax_index(scores), 1.0);
+    }
+    let draw = if draw.is_finite() { draw.clamp(0.0, 1.0) } else { 0.0 };
+    let target = draw * total;
+    let mut acc = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w;
+        if target < acc {
+            return (i, (w / total).max(SELECTION_PROB_FLOOR));
+        }
+    }
+    // Floating-point slack: fall to the last positive-weight candidate.
+    let last = (0..n).rev().find(|&i| weights[i] > 0.0).unwrap_or(n - 1);
+    (last, (weights[last] / total).max(SELECTION_PROB_FLOOR))
+}
+
+/// Index of the highest finite score (lowest index on ties), or 0 if none is
+/// finite — the deterministic argmax fallback shared by the value-weighted path.
+fn argmax_index(scores: &[f64]) -> usize {
+    let mut best = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    for (i, &s) in scores.iter().enumerate() {
+        if s.is_finite() && s > best_score {
+            best_score = s;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Lower bound on any reported behaviour-policy probability, shared by the
+/// rank-weighted and value-weighted paths so an off-policy importance ratio can
+/// never divide by zero.
+const SELECTION_PROB_FLOOR: f64 = 1e-3;
+
+/// Pick a rank in `0..n.min(3)` from a unit `draw`, using the first `n` rank
 /// weights **renormalised** over what is available. Non-finite / non-positive
 /// weights are floored to zero; if everything is zero the best (rank 0) is taken.
 ///
@@ -163,7 +279,6 @@ pub fn behavior_probability_for_rank(
     weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT],
     rank: usize,
 ) -> f64 {
-    const FLOOR: f64 = 1e-3;
     let k = n.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if k <= 1 {
         return 1.0;
@@ -175,12 +290,12 @@ pub fn behavior_probability_for_rank(
         }
     }
     if total <= 0.0 {
-        return if rank == 0 { 1.0 } else { FLOOR };
+        return if rank == 0 { 1.0 } else { SELECTION_PROB_FLOOR };
     }
     if rank < k && weights[rank].is_finite() && weights[rank] > 0.0 {
-        (weights[rank] / total).max(FLOOR)
+        (weights[rank] / total).max(SELECTION_PROB_FLOOR)
     } else {
-        FLOOR
+        SELECTION_PROB_FLOOR
     }
 }
 
@@ -195,8 +310,76 @@ pub struct SampledOrder<T> {
 
 /// Like [`reorder_by_draw`] but also reports the behaviour-policy probability of
 /// the promoted front candidate (see [`behavior_probability_for_rank`]).
+///
+/// This score-less entry point always uses the **rank-weighted** top-k split; to
+/// get the value-weighted (Boltzmann) draw, pass candidate scores to
+/// [`reorder_with_scores_traced`].
 pub fn reorder_by_draw_traced<T>(
+    ordered: Vec<T>,
+    decision_seed: u64,
+    player_id: usize,
+    tick: u64,
+    site: u64,
+) -> SampledOrder<T> {
+    // No scores ⇒ the value-weighted path is never eligible; delegate with an
+    // empty score list so there is a single reorder code path.
+    reorder_with_scores_traced(ordered, &[], decision_seed, player_id, tick, site)
+}
+
+/// Like [`reorder_by_draw_traced`] but value-weighted when configured: given the
+/// candidate `scores` aligned with `ordered` (same length, same order), a
+/// positive `policy_selection.boltzmann_temperature` draws over the candidates
+/// with probability `∝ exp(score / temperature)`; otherwise the rank-weighted
+/// top-k split applies. `scores.len() != ordered.len()` (e.g. the empty slice
+/// from [`reorder_by_draw_traced`]) forces the rank-weighted path.
+///
+/// `scores` are the **ordering weights** of the agentic ranker, where a
+/// non-positive weight marks an **ineligible** candidate (e.g. an illegal action
+/// scored 0). Those receive **zero** exploration mass in value-weighted mode, so
+/// the draw never promotes an option the downstream "commit to the first feasible
+/// candidate" loop would only skip — which would otherwise waste the exploration
+/// budget *and* mis-record the behaviour probability against a different executed
+/// action. (The raw-score entry point [`sampled_index_by_score`] keeps full
+/// softmax, since there a non-positive score is a legitimate value.)
+///
+/// The reported `behavior_probability` is the softmax probability of the chosen
+/// candidate in value-weighted mode, or the renormalised rank weight otherwise —
+/// honest for off-policy correction either way. No-op (and `None` probability)
+/// when the gate is off or there are fewer than two candidates, so an
+/// unconfigured process is byte-identical.
+pub fn reorder_with_scores_traced<T>(
+    ordered: Vec<T>,
+    scores: &[f64],
+    decision_seed: u64,
+    player_id: usize,
+    tick: u64,
+    site: u64,
+) -> SampledOrder<T> {
+    // Read the (global) temperature only when the gate is actually on, so an
+    // unconfigured process does no extra tunables lookup.
+    if !stochastic_policy_topk_enabled() || ordered.len() < 2 {
+        return SampledOrder {
+            ordered,
+            behavior_probability: None,
+        };
+    }
+    reorder_with_scores_traced_at(
+        ordered,
+        scores,
+        boltzmann_temperature(),
+        decision_seed,
+        player_id,
+        tick,
+        site,
+    )
+}
+
+/// [`reorder_with_scores_traced`] with the Boltzmann `temperature` passed in
+/// explicitly rather than read from the global tunables — the unit-testable core.
+fn reorder_with_scores_traced_at<T>(
     mut ordered: Vec<T>,
+    scores: &[f64],
+    temperature: f64,
     decision_seed: u64,
     player_id: usize,
     tick: u64,
@@ -209,16 +392,31 @@ pub fn reorder_by_draw_traced<T>(
         };
     }
     let n = ordered.len();
-    let weights = rank_weights();
     let draw = decision_unit_draw(decision_seed, player_id, tick, site);
-    let rank = sampled_rank(n, weights, draw);
-    if rank > 0 {
+    let (rank, probability) = if temperature > 0.0 && scores.len() == n {
+        // Value-weighted: spread softmax mass over *eligible* candidates only.
+        // A non-positive ordering weight is ineligible; mapping it to
+        // NEG_INFINITY makes `boltzmann_pick` treat it as zero mass (and if none
+        // are eligible it falls back to the deterministic argmax). This keeps the
+        // value draw consistent with the rank-weighted path, which never floats
+        // an ineligible option up out of its sorted-to-the-bottom position.
+        let eligible: Vec<f64> = scores
+            .iter()
+            .map(|&s| if s > 0.0 { s } else { f64::NEG_INFINITY })
+            .collect();
+        boltzmann_pick(&eligible, temperature, draw)
+    } else {
+        let weights = rank_weights();
+        let rank = sampled_rank(n, weights, draw);
+        (rank, behavior_probability_for_rank(n, weights, rank))
+    };
+    if rank > 0 && rank < n {
         let chosen = ordered.remove(rank);
         ordered.insert(0, chosen);
     }
     SampledOrder {
         ordered,
-        behavior_probability: Some(behavior_probability_for_rank(n, weights, rank)),
+        behavior_probability: Some(probability),
     }
 }
 
@@ -241,12 +439,16 @@ pub fn reorder_by_draw<T>(
 }
 
 /// Pick an index into a scored candidate slice (`scores` need not be sorted): the
-/// indices are ranked by descending score, then the top-k stochastic draw selects
-/// among the best three. Returns the index of the chosen candidate. Used by the
-/// specialised heads that argmax over a small fixed set of discrete sub-actions.
+/// indices are ranked by descending score, then the stochastic draw selects among
+/// them — by rank (top-k 70/20/10) or, when `boltzmann_temperature > 0`, by value
+/// (softmax over the scores). Returns the index of the chosen candidate. Used by
+/// the specialised heads that argmax over a small fixed set of discrete
+/// sub-actions.
 ///
 /// Returns the plain argmax (gate off / <2 candidates / all-equal ties resolved
-/// by lowest index) to preserve byte-identical behaviour when disabled.
+/// by lowest index) to preserve byte-identical behaviour when disabled. See
+/// [`sampled_index_by_score_traced`] for the variant that also reports the
+/// behaviour-policy probability needed for off-policy learning honesty.
 pub fn sampled_index_by_score(
     scores: &[f64],
     decision_seed: u64,
@@ -254,6 +456,47 @@ pub fn sampled_index_by_score(
     tick: u64,
     site: u64,
 ) -> Option<usize> {
+    sampled_index_by_score_traced(scores, decision_seed, player_id, tick, site).map(|(idx, _)| idx)
+}
+
+/// Like [`sampled_index_by_score`] but also returns the behaviour-policy
+/// probability of the chosen index (`None` when the gate is off or there are
+/// fewer than two candidates — a greedy argmax that needs no importance
+/// correction). The probability is the softmax probability in value-weighted
+/// mode, or the renormalised rank weight in the legacy rank-weighted mode.
+pub fn sampled_index_by_score_traced(
+    scores: &[f64],
+    decision_seed: u64,
+    player_id: usize,
+    tick: u64,
+    site: u64,
+) -> Option<(usize, Option<f64>)> {
+    // Read the (global) temperature only when the gate is on; gate-off ignores it.
+    let temperature = if stochastic_policy_topk_enabled() {
+        boltzmann_temperature()
+    } else {
+        0.0
+    };
+    sampled_index_by_score_traced_at(
+        scores,
+        temperature,
+        decision_seed,
+        player_id,
+        tick,
+        site,
+    )
+}
+
+/// [`sampled_index_by_score_traced`] with the Boltzmann `temperature` passed in
+/// explicitly rather than read from the global tunables — the unit-testable core.
+fn sampled_index_by_score_traced_at(
+    scores: &[f64],
+    temperature: f64,
+    decision_seed: u64,
+    player_id: usize,
+    tick: u64,
+    site: u64,
+) -> Option<(usize, Option<f64>)> {
     if scores.is_empty() {
         return None;
     }
@@ -266,11 +509,19 @@ pub fn sampled_index_by_score(
         sb.total_cmp(&sa).then_with(|| a.cmp(&b))
     });
     if !stochastic_policy_topk_enabled() || idx.len() < 2 {
-        return idx.first().copied();
+        return idx.first().copied().map(|i| (i, None));
     }
     let draw = decision_unit_draw(decision_seed, player_id, tick, site);
-    let rank = sampled_rank(idx.len(), rank_weights(), draw);
-    idx.get(rank).copied()
+    let (rank, probability) = if temperature > 0.0 {
+        // Softmax over the score-sorted scores; `rank` indexes the sorted order.
+        let sorted_scores: Vec<f64> = idx.iter().map(|&i| scores[i]).collect();
+        boltzmann_pick(&sorted_scores, temperature, draw)
+    } else {
+        let weights = rank_weights();
+        let rank = sampled_rank(idx.len(), weights, draw);
+        (rank, behavior_probability_for_rank(idx.len(), weights, rank))
+    };
+    idx.get(rank).copied().map(|i| (i, Some(probability)))
 }
 
 #[cfg(test)]
@@ -403,6 +654,249 @@ mod tests {
             assert_eq!(
                 sampled_index_by_score(&scores, 7, 1, 1, site::BEAT_DEFENDER),
                 Some(1)
+            );
+        });
+    }
+
+    // ---- value-weighted (Boltzmann) mode ----
+
+    #[test]
+    fn boltzmann_pick_is_argmax_for_nonpositive_or_degenerate_inputs() {
+        // Non-positive / non-finite temperature → greedy argmax, certain.
+        assert_eq!(boltzmann_pick(&[0.1, 0.9, 0.5], 0.0, 0.99), (1, 1.0));
+        assert_eq!(boltzmann_pick(&[0.1, 0.9, 0.5], -1.0, 0.99), (1, 1.0));
+        assert_eq!(boltzmann_pick(&[0.1, 0.9, 0.5], f64::NAN, 0.99), (1, 1.0));
+        // Fewer than two candidates is forced.
+        assert_eq!(boltzmann_pick(&[42.0], 2.0, 0.99), (0, 1.0));
+        // No finite score → argmax fallback at index 0.
+        let nan = f64::NAN;
+        assert_eq!(boltzmann_pick(&[nan, nan], 2.0, 0.99), (0, 1.0));
+    }
+
+    #[test]
+    fn boltzmann_pick_partitions_the_unit_interval_by_softmax_mass() {
+        // Two candidates, scores 2 and 0, temperature 1 ⇒ softmax = e^2 : e^0,
+        // i.e. p0 = e^2/(e^2+1) ≈ 0.8808, p1 ≈ 0.1192. The cumulative sampler
+        // must put the band edge at ~0.8808.
+        let scores = [2.0, 0.0];
+        let p0 = 1.0 / (1.0 + (-2.0_f64).exp()); // e^2/(e^2+1)
+        let (i_lo, prob_lo) = boltzmann_pick(&scores, 1.0, 0.0);
+        assert_eq!(i_lo, 0);
+        assert!((prob_lo - p0).abs() < 1e-9, "prob {prob_lo} vs {p0}");
+        // Just inside the first band stays on index 0.
+        assert_eq!(boltzmann_pick(&scores, 1.0, p0 - 1e-6).0, 0);
+        // Just past the edge crosses to index 1.
+        let (i_hi, prob_hi) = boltzmann_pick(&scores, 1.0, p0 + 1e-6);
+        assert_eq!(i_hi, 1);
+        assert!((prob_hi - (1.0 - p0)).abs() < 1e-9, "prob {prob_hi}");
+    }
+
+    #[test]
+    fn boltzmann_pick_explores_near_ties_more_than_clear_gaps() {
+        // Probability mass on the 2nd-best grows as the score gap shrinks: a
+        // near-tie should leave a much larger non-best mass than a clear gap.
+        let near = boltzmann_pick(&[1.00, 0.99], 0.5, 1.0).1; // p(2nd) for a near-tie
+        let clear = boltzmann_pick(&[1.00, 0.00], 0.5, 1.0).1; // p(2nd) for a clear gap
+        assert!(near > clear, "near-tie {near} should exceed clear-gap {clear}");
+        // And hotter temperature flattens (more exploration) vs. colder.
+        let hot = boltzmann_pick(&[1.0, 0.0], 2.0, 1.0).1;
+        let cold = boltzmann_pick(&[1.0, 0.0], 0.2, 1.0).1;
+        assert!(hot > cold, "hot {hot} should exceed cold {cold}");
+    }
+
+    #[test]
+    fn boltzmann_pick_ignores_non_finite_candidates() {
+        // A NaN-scored candidate contributes zero mass and is never selected.
+        let scores = [1.0, f64::NAN, 0.5];
+        for draw in [0.0, 0.25, 0.5, 0.75, 0.999] {
+            let (idx, prob) = boltzmann_pick(&scores, 1.0, draw);
+            assert_ne!(idx, 1, "NaN candidate selected at draw {draw}");
+            assert!(prob > 0.0);
+        }
+    }
+
+    #[test]
+    fn value_weighted_reorder_falls_back_to_rank_weighted_at_zero_temperature() {
+        // With temperature 0 the scored reorder must reproduce the rank-weighted
+        // reorder exactly (same front element and behaviour probability), so the
+        // default-0 tunable stays byte-identical to the legacy path.
+        with_gate(true, || {
+            let base = vec![10u32, 20, 30, 40];
+            let scores = [4.0, 3.0, 2.0, 1.0];
+            for (pid, tick) in [(0, 0), (1, 5), (2, 9), (3, 42), (7, 1234)] {
+                let legacy = reorder_by_draw_traced(base.clone(), 7, pid, tick, site::POSSESSION);
+                let scored = reorder_with_scores_traced_at(
+                    base.clone(),
+                    &scores,
+                    0.0,
+                    7,
+                    pid,
+                    tick,
+                    site::POSSESSION,
+                );
+                assert_eq!(scored.ordered, legacy.ordered, "order pid {pid}");
+                assert_eq!(
+                    scored.behavior_probability, legacy.behavior_probability,
+                    "prob pid {pid}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn value_weighted_reorder_falls_back_when_scores_misaligned() {
+        // A score list whose length != candidate count can't be trusted, so the
+        // rank-weighted path is used even at a positive temperature.
+        with_gate(true, || {
+            let base = vec![10u32, 20, 30, 40];
+            let short_scores = [4.0, 3.0]; // wrong length
+            let legacy = reorder_by_draw_traced(base.clone(), 7, 2, 9, site::SUPPORT);
+            let scored = reorder_with_scores_traced_at(
+                base.clone(),
+                &short_scores,
+                2.5,
+                7,
+                2,
+                9,
+                site::SUPPORT,
+            );
+            assert_eq!(scored.ordered, legacy.ordered);
+            assert_eq!(scored.behavior_probability, legacy.behavior_probability);
+        });
+    }
+
+    #[test]
+    fn value_weighted_reorder_is_a_noop_when_gate_off() {
+        with_gate(false, || {
+            let base = vec!["a", "b", "c", "d"];
+            let scores = [4.0, 3.0, 2.0, 1.0];
+            let out =
+                reorder_with_scores_traced_at(base.clone(), &scores, 2.5, 7, 3, 100, site::POSSESSION);
+            assert_eq!(out.ordered, base);
+            assert_eq!(out.behavior_probability, None);
+        });
+    }
+
+    #[test]
+    fn value_weighted_reorder_promotes_the_softmax_sampled_candidate() {
+        // With the gate on and a positive temperature, the front element and its
+        // reported probability must match a direct Boltzmann draw over the scores.
+        // All scores positive (eligible) so the eligibility mask is a no-op here.
+        with_gate(true, || {
+            let base = vec![10u32, 20, 30, 40];
+            let scores = [3.0, 2.5, 1.0, 0.5];
+            let temperature = 1.5;
+            for (pid, tick) in [(0, 0), (1, 5), (2, 9), (3, 42), (7, 1234)] {
+                let draw = decision_unit_draw(7, pid, tick, site::DEFENSIVE);
+                let (rank, prob) = boltzmann_pick(&scores, temperature, draw);
+                let scored = reorder_with_scores_traced_at(
+                    base.clone(),
+                    &scores,
+                    temperature,
+                    7,
+                    pid,
+                    tick,
+                    site::DEFENSIVE,
+                );
+                assert_eq!(scored.ordered[0], base[rank], "front pid {pid}");
+                assert_eq!(scored.behavior_probability, Some(prob), "prob pid {pid}");
+            }
+        });
+    }
+
+    #[test]
+    fn value_weighted_reorder_never_promotes_ineligible_candidates() {
+        // A non-positive ordering weight is ineligible (illegal action): it must
+        // get zero exploration mass, so the value draw never floats it to the
+        // front, and the reported probability matches a softmax over the eligible
+        // candidates only (here just the first two).
+        with_gate(true, || {
+            let base = vec![10u32, 20, 30, 40];
+            let scores = [3.0, 2.0, 0.0, -1.0]; // only indices 0,1 eligible
+            let masked = [3.0, 2.0, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            let temperature = 1.0;
+            for (pid, tick) in [(0, 0), (1, 5), (2, 9), (3, 42), (7, 1234), (11, 77)] {
+                let draw = decision_unit_draw(7, pid, tick, site::POSSESSION);
+                let (rank, prob) = boltzmann_pick(&masked, temperature, draw);
+                let scored = reorder_with_scores_traced_at(
+                    base.clone(),
+                    &scores,
+                    temperature,
+                    7,
+                    pid,
+                    tick,
+                    site::POSSESSION,
+                );
+                assert!(
+                    scored.ordered[0] == 10 || scored.ordered[0] == 20,
+                    "promoted an ineligible candidate: {:?}",
+                    scored.ordered[0]
+                );
+                assert_eq!(scored.ordered[0], base[rank], "front pid {pid}");
+                assert_eq!(scored.behavior_probability, Some(prob), "prob pid {pid}");
+            }
+        });
+    }
+
+    #[test]
+    fn value_weighted_reorder_with_no_eligible_candidates_keeps_argmax() {
+        // All ordering weights non-positive ⇒ no eligible candidate ⇒ fall back to
+        // the deterministic front (no reorder), reported with certainty.
+        with_gate(true, || {
+            let base = vec![10u32, 20, 30];
+            let scores = [0.0, 0.0, -2.0];
+            let out = reorder_with_scores_traced_at(
+                base.clone(),
+                &scores,
+                1.0,
+                7,
+                3,
+                9,
+                site::LOOSE_BALL,
+            );
+            assert_eq!(out.ordered, base);
+            assert_eq!(out.behavior_probability, Some(1.0));
+        });
+    }
+
+    #[test]
+    fn value_weighted_index_matches_boltzmann_over_sorted_scores() {
+        // sampled_index_by_score_traced_at in value-weighted mode must return the
+        // original index whose score the Boltzmann draw selected (scores need not
+        // be pre-sorted), plus that candidate's softmax probability.
+        with_gate(true, || {
+            let scores = [0.5, 3.0, 2.5, 1.0]; // argmax at index 1
+            let temperature = 1.25;
+            for (pid, tick) in [(0, 0), (1, 5), (2, 9), (3, 42)] {
+                let mut sorted: Vec<f64> = scores.to_vec();
+                sorted.sort_by(|a, b| b.total_cmp(a)); // [3.0, 2.5, 1.0, 0.5]
+                let draw = decision_unit_draw(7, pid, tick, site::DRIBBLE_KIND);
+                let (rank, prob) = boltzmann_pick(&sorted, temperature, draw);
+                let chosen_score = sorted[rank];
+                let got = sampled_index_by_score_traced_at(
+                    &scores,
+                    temperature,
+                    7,
+                    pid,
+                    tick,
+                    site::DRIBBLE_KIND,
+                )
+                .unwrap();
+                assert_eq!(scores[got.0], chosen_score, "score pid {pid}");
+                assert_eq!(got.1, Some(prob), "prob pid {pid}");
+            }
+        });
+    }
+
+    #[test]
+    fn value_weighted_index_is_argmax_when_gate_off() {
+        with_gate(false, || {
+            let scores = [0.1, 0.9, 0.5];
+            // Even with a positive temperature, gate-off is the greedy argmax and
+            // reports no behaviour probability.
+            assert_eq!(
+                sampled_index_by_score_traced_at(&scores, 3.0, 7, 1, 1, site::BEAT_DEFENDER),
+                Some((1, None))
             );
         });
     }

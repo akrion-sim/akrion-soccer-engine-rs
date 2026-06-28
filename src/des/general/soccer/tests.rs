@@ -5832,6 +5832,92 @@ fn synthetic_killer_pressure_without_threaded_receiver_cannot_legalize_killer_pa
 }
 
 #[test]
+fn own_half_short_pass_liability_factor_floors_and_exempts_escapes() {
+    // Outside our own half: never a liability.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(false, 2.0, 0.3, 0.3),
+        0.0
+    );
+    // A 4+yd ball is the progressive pass we want — no penalty.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(true, 4.0, 0.3, 0.3),
+        0.0
+    );
+    // A genuine escape (receiver clearly less pressured than the holder) is exempt.
+    assert_eq!(
+        own_half_short_pass_liability_penalty_factor(true, 2.0, 0.5, 0.2),
+        0.0
+    );
+    // A short own-half square ball that is not an escape is demoted, and unlike the
+    // build-up penalty it keeps a strong floor even right at the 4yd edge.
+    let edge = own_half_short_pass_liability_penalty_factor(true, 3.9, 0.3, 0.3);
+    let floor = OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION;
+    assert!(edge >= floor - 1e-9, "edge {edge} should keep the floor {floor}");
+    // Shorter = harder, capped at the full penalty for a tap at the feet.
+    let tap = own_half_short_pass_liability_penalty_factor(true, 0.3, 0.3, 0.3);
+    assert!(tap > edge);
+    assert!(tap <= OWN_HALF_SHORT_PASS_LIABILITY_PENALTY + 1e-9);
+}
+
+#[test]
+fn own_half_short_floor_pass_damps_generic_pass_toward_dribble() {
+    // A carrier in our own half with the same situation either side of the 4yd threshold:
+    // the short floor pass demotes the generic pass; the 4+yd ball does not.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_117,
+        ..Default::default()
+    });
+    let passer = 8;
+    let receiver = 9;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].role = PlayerRole::Defender;
+    sim.players[passer].position = Vec2::new(40.0, 22.0); // deep in our own half
+    sim.players[passer].skills.passing_completion_rate = 9.0;
+    sim.players[passer].skills.passing = 8.8;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(42.0, 24.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let visible_targets = snapshot.ranked_visible_pass_targets(passer, 3);
+    let aerial = snapshot.ranked_visible_aerial_pass_targets(passer, 3).len();
+    let directive = snapshot.tactical_directive(Team::Home);
+    let base = snapshot.observation_for(passer);
+    // Confirm the fixture really is in our own half (the Layer-2 gate condition).
+    assert!(base.yards_to_own_goal < base.yards_to_goal, "fixture must be in own half");
+
+    let pass1_score = |best_floor_pass_distance_yards: f64| {
+        let mut observation = base.clone();
+        observation.best_pass_receiver_openness = 0.4;
+        observation.best_floor_pass_distance_yards = best_floor_pass_distance_yards;
+        sim.players[passer]
+            .possession_action_options(
+                &observation,
+                &directive,
+                visible_targets.len(),
+                aerial,
+                false,
+                snapshot.dt_seconds,
+                snapshot.field_width,
+            )
+            .iter()
+            .find(|o| o.label == "pass1")
+            .map(|o| o.probability)
+            .expect("generic pass option present")
+    };
+
+    let short_ball = pass1_score(2.5);
+    let progressive_ball = pass1_score(8.0);
+    assert!(
+        short_ball < progressive_ball,
+        "a short own-half ball should be demoted vs a 4+yd one: short={short_ball} long={progressive_ball}"
+    );
+}
+
+#[test]
 fn near_goal_decisive_pressure_prefers_shot_or_killer_pass_over_recycling() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -18552,6 +18638,80 @@ fn defensive_line_cushion_drops_off_and_pushes_up_with_the_ball() {
 }
 
 #[test]
+fn defensive_line_cushion_holds_20_40_gap_at_halfway_and_short_pitch_midfield() {
+    fn adjusted_gap_for(
+        team: Team,
+        field_length_yards: f64,
+        ball_y: f64,
+        seed: u32,
+    ) -> (f64, f64, Vec<Vec2>) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            field_length_yards,
+            seed,
+            ..Default::default()
+        });
+        let defenders: Vec<usize> = sim
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.role == PlayerRole::Defender)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(defenders.len(), 4, "test setup needs a back four");
+
+        let start_y = ball_y - team.attack_dir();
+        for (id, x) in defenders
+            .iter()
+            .copied()
+            .zip([28.0, 36.0, 44.0, 52.0])
+        {
+            sim.players[id].position = Vec2::new(x, start_y);
+            sim.players[id].home_position = sim.players[id].position;
+        }
+
+        let holder_team = team.other();
+        let holder = sim
+            .players
+            .iter()
+            .find(|p| p.team == holder_team && p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .unwrap();
+        sim.players[holder].position = Vec2::new(sim.config.field_width_yards * 0.5, ball_y);
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.altitude_yards = 0.0;
+        sim.ball.last_touch_team = Some(holder_team);
+
+        let snap = WorldSnapshot::from_match(&sim);
+        let targets: Vec<Vec2> = defenders
+            .iter()
+            .map(|&id| snap.defensive_line_cushion_adjusted_target(id, sim.players[id].position))
+            .collect();
+        let avg_y = targets.iter().map(|target| target.y).sum::<f64>() / targets.len() as f64;
+        let goal_side_gap = (ball_y - avg_y) * team.attack_dir();
+        (goal_side_gap, avg_y, targets)
+    }
+
+    for (team, field_length_yards, ball_y, seed) in [
+        (Team::Home, 120.0, 60.0, 221),
+        (Team::Away, 120.0, 60.0, 222),
+        (Team::Home, 70.0, 35.0, 223),
+        (Team::Away, 70.0, 35.0, 224),
+    ] {
+        let (gap, avg_y, targets) = adjusted_gap_for(team, field_length_yards, ball_y, seed);
+        assert!(
+            gap >= DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS - 1e-9,
+            "{team:?} back four on a {field_length_yards}yd pitch must be at least 20yd goal-side of a ball at y={ball_y}: gap={gap} avg_y={avg_y} targets={targets:?}"
+        );
+        assert!(
+            gap <= DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS + 1e-9,
+            "{team:?} back four on a {field_length_yards}yd pitch must stay within 40yd of a ball at y={ball_y}: gap={gap} avg_y={avg_y} targets={targets:?}"
+        );
+    }
+}
+
+#[test]
 fn defensive_line_cushion_uses_full_back_four_average_y() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -19586,6 +19746,170 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
             "away back-four target must not press beyond 5yd into opponent half: id={id} target={adjusted:?} ceiling={away_ceiling}"
         );
     }
+}
+
+/// v2 field-anchored line CENTRE geometry (gate-independent: calls the helper
+/// directly). Home defends y=0 attacking +y, so a centre's forward-coordinate
+/// equals its depth from our own goal.
+#[test]
+fn v2_line_centre_anchors_at_fifteen_tracks_inside_and_sticks_at_six() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    let cap = sim.config.field_length_yards * 0.5
+        + tunables()
+            .defensive_shape
+            .defensive_line_max_into_opp_half_yards;
+    // Move the (stationary, so predicted == current) ball to a depth and read the
+    // v2 centre depth from our own goal.
+    let centre_at = |sim: &mut SoccerMatch, depth: f64| -> f64 {
+        let x = sim.ball.position.x;
+        sim.ball.position = Vec2::new(x, depth);
+        sim.ball.velocity = Vec2::zero();
+        WorldSnapshot::from_match(sim).back_four_line_v2_centre_fwd(Team::Home)
+    };
+
+    // Ball outside the 15yd anchor ⇒ the centre HOLDS the anchor (the plateau),
+    // independent of the dynamic 20-40 gap — it is not dragged up to the ball.
+    assert!(
+        (centre_at(&mut sim, 30.0) - 15.0).abs() < 1e-6,
+        "ball 30 -> centre {}",
+        centre_at(&mut sim, 30.0)
+    );
+    assert!(
+        (centre_at(&mut sim, 25.0) - 15.0).abs() < 1e-6,
+        "ball 25 -> centre {}",
+        centre_at(&mut sim, 25.0)
+    );
+    // Between the 6 and the 15 the centre tracks the ball back to parity.
+    assert!(
+        (centre_at(&mut sim, 12.0) - 12.0).abs() < 1e-6,
+        "ball 12 -> centre {}",
+        centre_at(&mut sim, 12.0)
+    );
+    // Inside the 6 the centre sticks at the keeper's line (~6), never deeper.
+    let c4 = centre_at(&mut sim, 4.0);
+    assert!((6.0..=8.0).contains(&c4), "ball 4 -> centre {c4} (want ~6)");
+    // Deep in the opponent half the centre never crosses the high cap (halfway+5).
+    let c_deep = centre_at(&mut sim, 110.0);
+    assert!((c_deep - cap).abs() < 1e-6, "ball 110 -> centre {c_deep}, cap {cap}");
+    // In the rising regime the line trails a 20-40yd gap behind a deep ball.
+    let c80 = centre_at(&mut sim, 80.0);
+    let trailing_gap = 80.0 - c80;
+    assert!(
+        (20.0..=40.0).contains(&trailing_gap),
+        "ball 80 -> centre {c80}, trailing gap {trailing_gap} out of [20,40]"
+    );
+}
+
+/// v2 flatten end-to-end: a defender caught far upfield is pulled back onto the
+/// anchored flat line (it may never sit ahead of the centre by more than the
+/// half-band), exercising `back_four_line_depth_v2_adjusted_y` directly.
+#[test]
+fn v2_adjusted_y_pulls_an_upfield_defender_back_onto_the_anchor() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(sim.ball.position.x, 25.0); // ball on the plateau
+    sim.ball.velocity = Vec2::zero();
+    let snap = WorldSnapshot::from_match(&sim);
+    let me = snap
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .expect("a home defender");
+    let centre = snap.back_four_line_v2_centre_fwd(Team::Home); // ~15
+    let level_half_band = 0.5 * 2.0; // BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5
+    // Ask for a target 40yd upfield (well ahead of the ~15yd anchor).
+    let adjusted = snap.back_four_line_depth_v2_adjusted_y(me, 40.0);
+    assert!(
+        adjusted <= centre + level_half_band + 1e-6,
+        "a defender at 40 must be pulled back to <= centre+halfband: adjusted {adjusted}, centre {centre}"
+    );
+    assert!(adjusted < 25.0, "must be pulled well back from the 40yd ask: {adjusted}");
+}
+
+/// A/B sim report for the v2 line (run explicitly, isolated from the parallel
+/// suite so the process-wide env gate can't race):
+///   cargo test --lib v2_sim_ab_report -- --ignored --nocapture --exact \
+///     des::general::soccer::tests::v2_sim_ab_report
+/// Simulates the same seeds with the gate off then on and prints how deep the home
+/// back four sits, how often it strays into the opponent half, and the scoreline.
+#[test]
+#[ignore]
+fn v2_sim_ab_report() {
+    const ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
+    let seeds = [7_777u32, 13_013, 24_601];
+    let secs = 300.0;
+    let ticks = (secs * 15.0) as usize; // DEFAULT_DT_SECONDS = 1/15
+
+    // Returns (avg home back-four depth, fraction of ticks in opp half, gh, ga).
+    let run = |on: bool| -> (f64, f64, u32, u32) {
+        if on {
+            std::env::set_var(ENV, "1");
+        } else {
+            std::env::remove_var(ENV);
+        }
+        let (mut depth_sum, mut samples, mut opp_half, mut gh, mut ga) =
+            (0.0f64, 0u64, 0u64, 0u32, 0u32);
+        for &seed in &seeds {
+            let mut m = SoccerMatch::default_11v11(MatchConfig {
+                seed,
+                duration_seconds: secs + 50.0,
+                ..Default::default()
+            });
+            let halfway = m.config.field_length_yards * 0.5;
+            for _ in 0..ticks {
+                m.run_time_step();
+                let (mut s, mut n) = (0.0, 0.0);
+                for p in m.players.iter() {
+                    if p.team == Team::Home && p.role == PlayerRole::Defender {
+                        s += p.position.y; // Home own goal at y=0 ⇒ depth == y
+                        n += 1.0;
+                    }
+                }
+                if n > 0.0 {
+                    let avg = s / n;
+                    depth_sum += avg;
+                    samples += 1;
+                    if avg > halfway {
+                        opp_half += 1;
+                    }
+                }
+            }
+            gh += m.score_home;
+            ga += m.score_away;
+        }
+        std::env::remove_var(ENV);
+        (
+            depth_sum / samples.max(1) as f64,
+            opp_half as f64 / samples.max(1) as f64,
+            gh,
+            ga,
+        )
+    };
+
+    let (off_depth, off_opp, off_gh, off_ga) = run(false);
+    let (on_depth, on_opp, on_gh, on_ga) = run(true);
+    eprintln!("\n=== v2 back-four line A/B ({} seeds, {secs}s each) ===", seeds.len());
+    eprintln!(
+        "OFF: home back-four avg depth {off_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{off_gh}-A{off_ga}",
+        off_opp * 100.0
+    );
+    eprintln!(
+        "ON : home back-four avg depth {on_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{on_gh}-A{on_ga}",
+        on_opp * 100.0
+    );
+    eprintln!(
+        "Δ  : depth {:+.2}yd (negative = deeper line) | opp-half {:+.1}pp\n",
+        on_depth - off_depth,
+        (on_opp - off_opp) * 100.0
+    );
+
+    assert!(off_depth.is_finite() && on_depth.is_finite());
+    // The whole point: v2 keeps the back four deeper / out of the opponent half.
+    assert!(
+        on_opp <= off_opp + 1e-3,
+        "v2 should not spend MORE time in the opponent half (on {on_opp:.3} vs off {off_opp:.3})"
+    );
 }
 
 #[test]
@@ -28432,6 +28756,90 @@ fn turnover_window_penalty_requeues_recent_losing_team_actions_with_recency_deca
     // A second turnover signal on the same tick is de-duped (no double penalty).
     sim.penalize_turnover_window(Team::Home);
     assert_eq!(sim.deferred_reward_transitions.len(), 2);
+}
+
+#[test]
+fn keeper_giveaway_severity_weights_keeper_and_deep_giveaways_hardest() {
+    let field = 115.0;
+    let own_third = field / 3.0;
+    // Baseline: an outfield turnover at/beyond the halfway mark — no extra weighting.
+    let midfield_outfield =
+        keeper_giveaway_severity_factor(PlayerRole::Midfielder, field * 0.5, field);
+    assert!((midfield_outfield - 1.0).abs() < 1e-9);
+    // An outfield turnover just inside our own third already costs more than at halfway,
+    // and the cost ramps up the deeper it is toward our own goal.
+    let edge_third = keeper_giveaway_severity_factor(PlayerRole::Defender, own_third - 0.01, field);
+    let deep_outfield = keeper_giveaway_severity_factor(PlayerRole::Defender, 2.0, field);
+    assert!(edge_third > midfield_outfield);
+    assert!(deep_outfield > edge_third);
+    assert!(deep_outfield <= KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT + 1e-9);
+    // A goalkeeper giveaway is punished hardest of all: the role multiplier stacks on top of
+    // the (maximal, since the keeper sits on his own line) zone-danger weighting.
+    let keeper_on_line = keeper_giveaway_severity_factor(PlayerRole::Goalkeeper, 0.0, field);
+    assert!(keeper_on_line > deep_outfield);
+    assert!(
+        (keeper_on_line - KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT * KEEPER_GIVEAWAY_ROLE_MULT).abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn keeper_giveaway_penalty_scales_requeued_reward_by_severity() {
+    // End-to-end through penalize_turnover_window: with identical tick (same recency), a
+    // keeper giveaway deep in our own end is re-queued with a materially larger negative
+    // reward than a midfield outfield turnover.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let field = sim.config.field_length_yards;
+    let observation = snapshot.observation_for(0);
+    let base = SoccerLearningTransition {
+        tick: 95,
+        player_id: 0,
+        team: Team::Home,
+        role: PlayerRole::Midfielder,
+        state: snapshot.mdp_state_for_player(0),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(0),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let mut keeper = base.clone();
+    keeper.player_id = 1;
+    keeper.role = PlayerRole::Goalkeeper;
+    keeper.observation.yards_to_own_goal = 0.0;
+    let mut midfield = base.clone();
+    midfield.player_id = 2;
+    midfield.role = PlayerRole::Midfielder;
+    midfield.observation.yards_to_own_goal = field * 0.5;
+
+    sim.tick = 100;
+    sim.turnover_penalty_history.push_back(keeper);
+    sim.turnover_penalty_history.push_back(midfield);
+    sim.penalize_turnover_window(Team::Home);
+
+    let pen = |player_id: usize| {
+        sim.deferred_reward_transitions
+            .iter()
+            .find(|t| t.player_id == player_id)
+            .map(|t| t.reward)
+            .expect("penalized transition present")
+    };
+    let keeper_pen = pen(1);
+    let midfield_pen = pen(2);
+    assert!(keeper_pen < midfield_pen, "keeper giveaway must cost more");
+    // The keeper penalty equals the midfield (severity 1.0) penalty times the full
+    // keeper-on-line severity, within rounding.
+    let expected_ratio = KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT * KEEPER_GIVEAWAY_ROLE_MULT;
+    assert!((keeper_pen / midfield_pen - expected_ratio).abs() < 1e-6);
 }
 
 #[test]

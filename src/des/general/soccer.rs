@@ -1615,6 +1615,28 @@ const AERIAL_LATERAL_PASS_PENALTY: f64 = 1.20;
 // combination play around the box is valuable. Scaled by how far under 4yd the pass is.
 const SHORT_PASS_BUILDUP_MAX_YARDS: f64 = 4.0;
 const SHORT_PASS_BUILDUP_PENALTY: f64 = 2.8;
+// Own-half short-pass LIABILITY. In our own half a sub-4yd pass that is not a genuine
+// pressure-escape is a liability, not build-up: it keeps the ball in front of our own
+// goal for no progress and is the giveaway that turns into a chance against. Unlike
+// `SHORT_PASS_BUILDUP_PENALTY` (which fades linearly to ~0 as the pass approaches 4yd, so
+// a 3-4yd square ball is barely touched), this carries a strong FLOOR so every sub-4yd
+// own-half pass is demoted hard enough that a 4+yd forward ball — or just keeping the
+// dribble — outranks it. Stacks on top of the build-up penalty in the own half; the
+// middle third keeps only the (mild) build-up penalty and the final third stays free.
+// Waived for a real escape (receiver clearly less pressured than the holder). Gated by
+// `DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY` (default-on; off ⇒ byte-identical).
+const OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS: f64 = 4.0;
+const OWN_HALF_SHORT_PASS_LIABILITY_PENALTY: f64 = 3.4;
+// Fraction of the penalty applied even at the 4yd edge (no fade-to-zero): a 3.9yd square
+// ball in our own half still costs 0.6 * 3.4; a tap at the feet costs the full 3.4.
+const OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION: f64 = 0.6;
+// Layer 2 (decision): when the only floor pass on offer in our own half is short, damp the
+// generic pass action so the carrier prefers to keep the dribble / hold rather than play it.
+// `DAMP` is the max fraction shaved off `pass_score`; the cut scales with how short the ball
+// is and eases for a wide-open receiver (a genuine out). `MIN_MULT` floors the multiplier so
+// a short pass is demoted, never hard-vetoed (dribbling into trouble can still be worse).
+const OWN_HALF_SHORT_PASS_DRIBBLE_DAMP: f64 = 0.6;
+const OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT: f64 = 0.35;
 // Scoop (lofted dink over a close defender): a teammate this far away, open on all sides by
 // this radius, with a defender within this distance of the direct lane.
 const SCOOP_PASS_MIN_RANGE_YARDS: f64 = 5.0;
@@ -1664,6 +1686,14 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 // state→action pairs down. 5 s = 75 ticks at dt = 1/15.
 pub(crate) const TURNOVER_PENALTY_WINDOW_TICKS: u64 = 75;
 const TURNOVER_WINDOW_PENALTY_POINTS: f64 = 4.5;
+// Severity multipliers on the per-transition turnover penalty for dangerous giveaways
+// (see `keeper_giveaway_severity`). A goalkeeper losing possession is the worst case —
+// he is the last line — so it is scaled hardest; any giveaway deep in our own end ramps
+// up toward the own goal line. Both default to making the giveaways the policy should
+// fear materially costlier than a routine midfield turnover, without touching the benign
+// case. Disable the whole weighting with `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY`.
+pub(crate) const KEEPER_GIVEAWAY_ROLE_MULT: f64 = 2.5;
+pub(crate) const KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT: f64 = 2.0;
 // Bound the re-queued work per turnover (newest, most-blameworthy transitions first) so a
 // flurry of turnovers can't back up the deferred-training queue.
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
@@ -5752,6 +5782,12 @@ pub struct SoccerPomdpObservation {
     pub floor_pass_lane_score: f64,
     #[serde(default)]
     pub best_pass_receiver_openness: f64,
+    /// Passer→receiver distance (yards) of the best floor pass. Lets the own-half
+    /// short-pass discipline (Layer 2) tell a short square ball from a progressive one at
+    /// decision time. NOT part of the neural feature vector (FEATURE_DIM is unchanged);
+    /// `0.0` when no floor pass is available.
+    #[serde(default)]
+    pub best_floor_pass_distance_yards: f64,
     #[serde(default)]
     pub best_aerial_pass_receiver_openness: f64,
     #[serde(default)]
@@ -52313,6 +52349,12 @@ struct PassTargetQuality {
     long_aerial_bounds_risk: f64,
     long_aerial_bounds_margin_yards: f64,
     long_aerial_bounds_inward_correction_yards: f64,
+    /// Straight-line passer→receiver distance (yards) for this target. Carried so the
+    /// observation can expose the LENGTH of the best floor pass (the `max_by` on
+    /// `expected_completion` keeps this for the selected target), letting the own-half
+    /// short-pass discipline tell a short square ball from a progressive one at decision
+    /// time. `0.0` on a default/no-pass quality.
+    distance_yards: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -53362,16 +53404,23 @@ fn pass_target_quality_for_snapshot_inner(
         long_aerial_bounds_risk: long_aerial_bounds.risk,
         long_aerial_bounds_margin_yards: long_aerial_bounds.margin_yards,
         long_aerial_bounds_inward_correction_yards: long_aerial_bounds.inward_correction_yards,
+        distance_yards: passer_position.distance(target_position),
     }
 }
 
-fn best_pass_target_quality_for_snapshot(
+/// Evaluate [`pass_target_quality_for_snapshot`] once per target for `flight`, returning the
+/// per-target qualities. The `PassTargetQuality` struct carries BOTH `expected_completion`
+/// and `stride_fit`, so a caller that needs both (as `observation_for` does, binning them
+/// separately) can derive them from a single pass instead of re-running the
+/// O(targets × speed-buckets × opponents) MPC pass evaluation twice. Pure refactor: the
+/// per-target values and iteration order are identical to the originals.
+fn pass_target_qualities_for_snapshot(
     snapshot: &WorldSnapshot,
     player: &PlayerSnapshot,
     player_position: Vec2,
     targets: &[usize],
     flight: PassFlight,
-) -> PassTargetQuality {
+) -> Vec<PassTargetQuality> {
     targets
         .iter()
         .filter_map(|target_id| {
@@ -53388,12 +53437,43 @@ fn best_pass_target_quality_for_snapshot(
                 flight,
             ))
         })
+        .collect()
+}
+
+/// Best (max) expected completion across already-evaluated `qualities`; `default()` when
+/// empty. Byte-identical to the original `.max_by(expected_completion).unwrap_or_default()`.
+fn best_pass_quality_from(qualities: &[PassTargetQuality]) -> PassTargetQuality {
+    qualities
+        .iter()
+        .copied()
         .max_by(|a, b| {
             a.expected_completion
                 .partial_cmp(&b.expected_completion)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or_default()
+}
+
+/// Best (max) into-stride fit across already-evaluated `qualities`; `0.0` when empty.
+/// Byte-identical to the original `.map(stride_fit).fold(0.0, max)`.
+fn best_pass_stride_fit_from(qualities: &[PassTargetQuality]) -> f64 {
+    qualities.iter().map(|q| q.stride_fit).fold(0.0_f64, f64::max)
+}
+
+fn best_pass_target_quality_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    player_position: Vec2,
+    targets: &[usize],
+    flight: PassFlight,
+) -> PassTargetQuality {
+    best_pass_quality_from(&pass_target_qualities_for_snapshot(
+        snapshot,
+        player,
+        player_position,
+        targets,
+        flight,
+    ))
 }
 
 /// Best pass-into-stride ANTICIPATION available across `targets`, independent of which
@@ -53408,26 +53488,13 @@ fn best_pass_stride_fit_for_snapshot(
     targets: &[usize],
     flight: PassFlight,
 ) -> f64 {
-    targets
-        .iter()
-        .filter_map(|target_id| {
-            let target = snapshot.players.iter().find(|p| p.id == *target_id)?;
-            let target_position = snapshot
-                .player_position(target.id)
-                .unwrap_or(target.position);
-            Some(
-                pass_target_quality_for_snapshot(
-                    snapshot,
-                    player,
-                    player_position,
-                    target,
-                    target_position,
-                    flight,
-                )
-                .stride_fit,
-            )
-        })
-        .fold(0.0_f64, f64::max)
+    best_pass_stride_fit_from(&pass_target_qualities_for_snapshot(
+        snapshot,
+        player,
+        player_position,
+        targets,
+        flight,
+    ))
 }
 
 fn pass_execution_skill(skills: &SkillProfile, flight: PassFlight, is_cross: bool) -> f64 {

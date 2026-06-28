@@ -17845,8 +17845,13 @@ impl SoccerMatch {
             if recency <= 1e-3 {
                 continue;
             }
+            let severity = keeper_giveaway_severity(
+                transition.role,
+                transition.observation.yards_to_own_goal,
+                self.config.field_length_yards,
+            );
             let mut penalized_transition = transition.clone();
-            penalized_transition.reward -= TURNOVER_WINDOW_PENALTY_POINTS * recency;
+            penalized_transition.reward -= TURNOVER_WINDOW_PENALTY_POINTS * recency * severity;
             penalized.push(penalized_transition);
             if penalized.len() >= TURNOVER_PENALTY_MAX_TRANSITIONS {
                 break;
@@ -20175,6 +20180,104 @@ fn dd_soccer_disable_turnover_window_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_TURNOVER_WINDOW_PENALTY").is_ok())
+}
+// ON by default: a turnover is weighted by how costly it actually was — a goalkeeper
+// giving the ball away, and any giveaway deep in our own end, is punished several times
+// harder than a routine midfield turnover (see `keeper_giveaway_severity`). Set
+// `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY` to revert to the flat per-transition
+// turnover penalty (⇒ byte-identical to the previous reward shaping).
+fn dd_soccer_disable_keeper_giveaway_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY").is_ok())
+}
+
+/// Severity multiplier (`>= 1.0`) on the turnover-window penalty for a single lost-possession
+/// transition, keyed off who lost it and where. A flat turnover treats a keeper hooking it
+/// straight to the opposition inside his own box the same as a midfielder over-hitting a pass
+/// at halfway; this makes the dangerous giveaways the policy should actually fear cost more.
+///
+/// Two independent, multiplicative factors, both `1.0` in the benign case so they only ever
+/// raise the cost:
+/// * **zone danger** — ramps from `1.0` at the edge of our own third up to
+///   [`KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT`] right on our own goal line, off `yards_to_own_goal`.
+/// * **keeper role** — a goalkeeper giveaway is additionally scaled by
+///   [`KEEPER_GIVEAWAY_ROLE_MULT`] (the keeper is the last line; losing it there is worst).
+///
+/// Returns `1.0` (no change) when the giveaway-weighting gate is disabled.
+fn keeper_giveaway_severity(role: PlayerRole, yards_to_own_goal: f64, field_length: f64) -> f64 {
+    if dd_soccer_disable_keeper_giveaway_penalty() {
+        return 1.0;
+    }
+    keeper_giveaway_severity_factor(role, yards_to_own_goal, field_length)
+}
+
+/// Pure severity math (no env gate) so the weighting can be unit-tested deterministically
+/// regardless of the process-global `DD_SOCCER_DISABLE_KEEPER_GIVEAWAY_PENALTY` cache.
+pub(crate) fn keeper_giveaway_severity_factor(
+    role: PlayerRole,
+    yards_to_own_goal: f64,
+    field_length: f64,
+) -> f64 {
+    let mut severity = 1.0;
+    let own_third = (field_length / 3.0).max(1.0);
+    if yards_to_own_goal.is_finite() && yards_to_own_goal < own_third {
+        // 0.0 at the own-third line, 1.0 on the own goal line.
+        let depth = (1.0 - yards_to_own_goal.max(0.0) / own_third).clamp(0.0, 1.0);
+        severity *= 1.0 + depth * (KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT - 1.0);
+    }
+    if matches!(role, PlayerRole::Goalkeeper) {
+        severity *= KEEPER_GIVEAWAY_ROLE_MULT;
+    }
+    severity
+}
+
+// ON by default: in our own half, short passes (<4yd) that aren't a genuine pressure
+// escape are treated as a liability — demoted in the pass ranking (Layer 1) and made the
+// carrier prefer to dribble/hold over playing them (Layer 2). Set
+// `DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY` to revert both layers (⇒ byte-identical).
+pub(crate) fn dd_soccer_disable_own_half_short_pass_liability() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY").is_ok())
+}
+
+/// Penalty (`>= 0`) demoting a short own-half pass in the floor-pass ranking (Layer 1).
+/// `> 0` only for a sub-[`OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS`] pass played from our own
+/// half that is NOT a genuine escape (the receiver is not clearly less pressured than the
+/// holder). Unlike the build-up penalty it carries a floor so it does not fade out as the
+/// pass nears 4yd. Returns `0.0` when the gate is disabled (⇒ byte-identical ranking).
+fn own_half_short_pass_liability_penalty(
+    in_own_half: bool,
+    dist: f64,
+    holder_pressure: f64,
+    receiver_pressure: f64,
+) -> f64 {
+    if dd_soccer_disable_own_half_short_pass_liability() {
+        return 0.0;
+    }
+    own_half_short_pass_liability_penalty_factor(in_own_half, dist, holder_pressure, receiver_pressure)
+}
+
+/// Pure Layer-1 penalty math (no env gate) so it can be unit-tested regardless of the
+/// process-global gate cache.
+pub(crate) fn own_half_short_pass_liability_penalty_factor(
+    in_own_half: bool,
+    dist: f64,
+    holder_pressure: f64,
+    receiver_pressure: f64,
+) -> f64 {
+    if !in_own_half || dist >= OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS {
+        return 0.0;
+    }
+    // A real escape — the receiver is clearly more open than the pressured holder — is the
+    // one short own-half ball worth playing; leave it alone.
+    if receiver_pressure <= holder_pressure - POINTLESS_SHORT_PASS_RELIEF_MARGIN {
+        return 0.0;
+    }
+    let shortness = (1.0 - dist / OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS).clamp(0.0, 1.0);
+    let floor = OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION;
+    OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * (floor + (1.0 - floor) * shortness)
 }
 /// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
@@ -24820,6 +24923,7 @@ impl WorldSnapshot {
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
+                best_floor_pass_distance_yards: 0.0,
                 best_aerial_pass_receiver_openness: 0.0,
                 best_pass_stride_fit: 0.0,
                 best_aerial_pass_stride_fit: 0.0,
@@ -25374,8 +25478,13 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let best_floor_pass_quality = if has_ball {
-            best_pass_target_quality_for_snapshot(
+        // Evaluate each pass target once per flight, then derive BOTH the best completion and
+        // the best into-stride fit from the same per-target qualities. The MPC pass evaluation
+        // (O(targets × speed-buckets × opponents)) is the bulk of the on-ball decision cost,
+        // and `PassTargetQuality` already carries both fields — so computing once and reducing
+        // twice avoids re-running the whole evaluation a second time just for stride fit.
+        let floor_pass_qualities = if has_ball {
+            pass_target_qualities_for_snapshot(
                 self,
                 me,
                 me_position,
@@ -25383,10 +25492,10 @@ impl WorldSnapshot {
                 PassFlight::Floor,
             )
         } else {
-            PassTargetQuality::default()
+            Vec::new()
         };
-        let best_aerial_pass_quality = if has_ball {
-            best_pass_target_quality_for_snapshot(
+        let aerial_pass_qualities = if has_ball {
+            pass_target_qualities_for_snapshot(
                 self,
                 me,
                 me_position,
@@ -25394,33 +25503,15 @@ impl WorldSnapshot {
                 PassFlight::Aerial,
             )
         } else {
-            PassTargetQuality::default()
+            Vec::new()
         };
+        let best_floor_pass_quality = best_pass_quality_from(&floor_pass_qualities);
+        let best_aerial_pass_quality = best_pass_quality_from(&aerial_pass_qualities);
         // Best into-stride anticipation available — binned SEPARATELY from completion, so a
         // safer static outlet (which may win on completion) doesn't hide a runner who could
         // be played into space. (Not read off the best-completion target.)
-        let best_floor_pass_stride_fit = if has_ball {
-            best_pass_stride_fit_for_snapshot(
-                self,
-                me,
-                me_position,
-                &visible_pass_targets,
-                PassFlight::Floor,
-            )
-        } else {
-            0.0
-        };
-        let best_aerial_pass_stride_fit = if has_ball {
-            best_pass_stride_fit_for_snapshot(
-                self,
-                me,
-                me_position,
-                &visible_aerial_pass_targets,
-                PassFlight::Aerial,
-            )
-        } else {
-            0.0
-        };
+        let best_floor_pass_stride_fit = best_pass_stride_fit_from(&floor_pass_qualities);
+        let best_aerial_pass_stride_fit = best_pass_stride_fit_from(&aerial_pass_qualities);
         let aerial_pass_bypass_score = if has_ball {
             aerial_pass_bypass_score_for_snapshot(
                 self,
@@ -26195,6 +26286,7 @@ impl WorldSnapshot {
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
             best_pass_receiver_openness: best_floor_pass_quality.receiver_openness,
+            best_floor_pass_distance_yards: best_floor_pass_quality.distance_yards,
             best_aerial_pass_receiver_openness: best_aerial_pass_quality.receiver_openness,
             best_pass_stride_fit: best_floor_pass_stride_fit,
             best_aerial_pass_stride_fit: best_aerial_pass_stride_fit,
@@ -28297,6 +28389,30 @@ impl WorldSnapshot {
                         0.0
                     }
                 };
+                // Own-half short-pass LIABILITY (Layer 1): in our own half a sub-4yd ball that
+                // is not a genuine escape is a liability, not build-up — demote it hard (with a
+                // floor, so it bites even at 3-4yd, unlike the fading build-up penalty) so a 4+yd
+                // forward ball or keeping the dribble outranks it.
+                let own_half_short_pass_liability = if dist
+                    < OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS
+                {
+                    let in_own_half = (me.team.goal_y(self.field_length) - me_position.y).abs()
+                        > self.field_length / 2.0;
+                    if in_own_half {
+                        let holder_pressure = self.attacker_pressure_on_point(me.team, me_position);
+                        let receiver_pressure = self.attacker_pressure_on_point(me.team, position);
+                        own_half_short_pass_liability_penalty(
+                            in_own_half,
+                            dist,
+                            holder_pressure,
+                            receiver_pressure,
+                        )
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 // Answer a forward/mid calling for the ball in behind. Existing through-ball
                 // strategy still rewards a recent runner; the new backfield cue lets a calm
                 // carrier pick out a striker/attacking mid before the play degenerates into a
@@ -28346,6 +28462,7 @@ impl WorldSnapshot {
                     - marked_receiver_penalty
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
+                    - own_half_short_pass_liability
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                     - safe_pass_overrisk_penalty
                     + over_the_top_invite_bonus * goal_entry_pass_learning
@@ -35141,7 +35258,16 @@ impl WorldSnapshot {
         let offside_suspended = self.offside_currently_suspended();
         let (lower, upper, _, _, _) =
             self.defensive_line_band_bounds_fwd(me.team, offside_suspended);
-        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
+        // v2 field-anchored line (gated): the desired AVERAGE is the v2 centre
+        // (15yd anchor + dynamic 20-40yd gap + sticky-6 + halfway cap) rather than
+        // the ball-relative band clamp. All projected-average corrections and the
+        // flat-line clamp below then target that single centre. Off ⇒ byte-identical.
+        let v2_centre_fwd =
+            back_four_line_depth_v2_enabled().then(|| self.back_four_line_v2_centre_fwd(me.team));
+        let line_band_avg_fwd = |avg: f64| match v2_centre_fwd {
+            Some(centre) => centre,
+            None => avg.clamp(lower, upper),
+        };
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -40956,6 +41082,99 @@ impl WorldSnapshot {
                 .is_some()
     }
 
+    /// The dynamic trailing gap (yd, in `[BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS,
+    /// BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS]`) the v2 line wants behind a deep ball.
+    /// Read from the learned line-depth head once trained + enabled, else the
+    /// analytic seed; `frac` 0 = a higher line (min gap), 1 = a deeper line (max).
+    fn back_four_desired_gap_yards(&self, team: Team) -> f64 {
+        let frac = self
+            .build_back_four_line_inputs(team)
+            .map(|inputs| {
+                self.line_depth_head
+                    .as_ref()
+                    .filter(|head| {
+                        back_four_line_model_enabled()
+                            && head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS
+                    })
+                    .and_then(|head| head.predict(&inputs))
+                    .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs))
+            })
+            .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
+            .clamp(0.0, 1.0);
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac
+    }
+
+    /// The v2 line-CENTRE forward-coordinate (attack frame) for `team`'s back four:
+    /// `own_goal_fwd + ` the pure [`back_four_line_target_depth_v2`] depth (anchor on
+    /// the 15yd line, track to parity inside it, stick at the keeper's 6, trail a
+    /// dynamic 20-40yd behind a deep ball, capped at halfway + the into-opp-half
+    /// allowance). Shared by both live line chokepoints so they agree on the centre.
+    /// Leads the ball by the standard lookahead so a fast carrier pulls it early.
+    pub(crate) fn back_four_line_v2_centre_fwd(&self, team: Team) -> f64 {
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let predicted_fwd = self
+            .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
+            .y
+            * attack;
+        let ball_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, self.field_length);
+        let desired_gap = self.back_four_desired_gap_yards(team);
+        let six = self.back_four_six_yard_line_target_depth(team);
+        let max_depth = self.field_length * 0.5
+            + tunables()
+                .defensive_shape
+                .defensive_line_max_into_opp_half_yards;
+        let centre_depth = back_four_line_target_depth_v2(
+            ball_depth,
+            desired_gap,
+            BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS,
+            six,
+            max_depth,
+        );
+        own_goal_fwd + centre_depth
+    }
+
+    /// v2 field-anchored back-four line target for `me` (gated by
+    /// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2`). The CENTRE comes from
+    /// [`Self::back_four_line_v2_centre_fwd`]. The ≤2yd flat offside clamp is kept
+    /// around that centre; the ~3s movement grace (handled by the caller's shape
+    /// easing) lets individuals sit transiently off the line and converge. Mirrors
+    /// the flatten tail of [`Self::defender_line_band_average_adjusted_y`].
+    pub(crate) fn back_four_line_depth_v2_adjusted_y(
+        &self,
+        me: &PlayerSnapshot,
+        compact_y: f64,
+    ) -> f64 {
+        let attack = me.team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
+        let centre_fwd = self.back_four_line_v2_centre_fwd(me.team);
+        let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+        // The line may always drop DEEPER (cover/retreat) but never step ahead of
+        // the centre by more than the half-band (that plays runners onside).
+        let shallowest_fwd = centre_fwd + level_half_band;
+        let deepest_fwd = own_goal_fwd;
+        let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
+        // The flat trap is lifted while WE control (centre-backs split / full-backs
+        // overlap), while a pass is in flight (offside already judged; lane-cutters
+        // must be free to step), and when the offside law is suspended (a restart in
+        // behind — nothing to trap). Unlike the legacy line the v2 trap is NOT gated
+        // off deep in our own third: holding the flat 15yd line there is the point.
+        let controls_ball = self.controlled_possession_team() == Some(me.team);
+        if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
+            return clamped_fwd * attack;
+        }
+        let ahead_cap = centre_fwd + level_half_band;
+        // While a carrier breaks through, the line must be free to DROP and cover, so
+        // the pull-up (lower edge) is suspended and the four re-level once it clears.
+        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
+            clamped_fwd.min(ahead_cap)
+        } else {
+            clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
+        };
+        leveled_fwd * attack
+    }
+
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
     /// connected: a 15yd shelf near our own box, opening into a 20-40yd cushion once the ball is
     /// at least 35yd from goal (measured to where the ball is HEADED, so the line retreats early
@@ -40980,6 +41199,12 @@ impl WorldSnapshot {
         }
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return compact_y;
+        }
+        // v2 field-anchored line depth (gated). Takes over the band+flatten below
+        // with a 15yd-anchored centre + dynamic 20-40yd trailing gap; off ⇒ the
+        // legacy ball-relative 20-40yd band + halfway+5 cap stands (byte-identical).
+        if back_four_line_depth_v2_enabled() {
+            return self.back_four_line_depth_v2_adjusted_y(me, compact_y);
         }
         // No offside in force (the ball is being played directly from a throw-in &c.): the line
         // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
