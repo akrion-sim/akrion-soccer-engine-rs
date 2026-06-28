@@ -5885,6 +5885,13 @@ pub struct SoccerPomdpObservation {
     pub threaded_goal_pass_over_top_goalkeeper_avoidance_yards: f64,
     #[serde(default)]
     pub best_forward_pass_receiver_openness: f64,
+    /// Lane-aware recognition of the best forward pass option (see
+    /// [`forward_pass_option_quality`]) — `>=` [`best_forward_pass_receiver_openness`].
+    /// Consumed by the forward-pass-first release and pass-target ranking under
+    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`. Not part of the neural feature
+    /// encoder (FEATURE_DIM unchanged).
+    #[serde(default)]
+    pub best_forward_pass_option_quality: f64,
     #[serde(default)]
     pub nearest_forward_teammate_distance_yards: f64,
     #[serde(default)]
