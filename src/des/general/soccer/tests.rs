@@ -7958,6 +7958,120 @@ fn quick_forward_pass_values_open_advanced_teammate_and_stays_inert_when_gated_o
 }
 
 #[test]
+fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
+    let passer = 7;
+    let forward_outlet = 9;
+    let backward_reset = 6;
+    let pressure_defender = 12;
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 58_119,
+        ..Default::default()
+    });
+    park_players_except(&mut sim, &[passer, forward_outlet, backward_reset, pressure_defender]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 48.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].skills.passing = 6.4;
+    sim.players[passer].skills.passing_completion_rate = 6.2;
+    sim.players[passer].skills.vision = 6.3;
+    sim.players[forward_outlet].team = Team::Home;
+    sim.players[forward_outlet].role = PlayerRole::Forward;
+    sim.players[forward_outlet].position = Vec2::new(41.2, 56.3);
+    sim.players[forward_outlet].home_position = sim.players[forward_outlet].position;
+    sim.players[forward_outlet].velocity = Vec2::new(0.2, 2.1);
+    sim.players[backward_reset].team = Team::Home;
+    sim.players[backward_reset].role = PlayerRole::Defender;
+    sim.players[backward_reset].position = Vec2::new(38.0, 44.2);
+    sim.players[backward_reset].home_position = sim.players[backward_reset].position;
+    sim.players[backward_reset].velocity = Vec2::zero();
+    sim.players[pressure_defender].team = Team::Away;
+    sim.players[pressure_defender].role = PlayerRole::Defender;
+    sim.players[pressure_defender].position = Vec2::new(44.0, 48.1);
+    sim.players[pressure_defender].home_position = sim.players[pressure_defender].position;
+    sim.players[pressure_defender].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let ranked = snapshot.ranked_visible_pass_targets(passer, 10);
+    assert_eq!(
+        ranked.first().copied(),
+        Some(forward_outlet),
+        "the open forward outlet should outrank the backward reset: {ranked:?}"
+    );
+    assert!(
+        ranked.contains(&backward_reset),
+        "fixture should still leave a backward reset available as a fallback: {ranked:?}"
+    );
+
+    let observation = snapshot.observation_for(passer);
+    assert!(
+        observation.visible_forward_pass_options >= 1,
+        "POMDP should expose the actionable forward outlet: {observation:?}"
+    );
+    assert!(
+        observation.best_forward_pass_receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS,
+        "forward outlet openness should clear the learnable good-option threshold: {observation:?}"
+    );
+    assert!(
+        observation.nearest_forward_teammate_distance_yards < 10.0,
+        "nearest forward distance should follow the actionable outlet"
+    );
+
+    let state = snapshot.mdp_state_for_player(passer);
+    let q_key =
+        SoccerQStateKey::from_parts(&state, &observation, Team::Home, sim.players[passer].role);
+    assert!(
+        q_key.visible_forward_pass_options_bin > 0,
+        "Q-state should bucket the actionable forward option: {q_key:?}"
+    );
+    assert!(
+        q_key.best_forward_pass_receiver_openness_bin > 0,
+        "Q-state should bucket the forward outlet openness: {q_key:?}"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: passer,
+        team: Team::Home,
+        role: sim.players[passer].role,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(passer),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_VISIBLE_FORWARD_OPTIONS] > 0.0,
+        "neural features should see the actionable forward option"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_BEST_FORWARD_OPENNESS] > 0.0,
+        "neural features should see forward outlet openness"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FORWARD_SUPPORT_PROXIMITY] > 0.0,
+        "neural features should see forward support proximity"
+    );
+}
+
+#[test]
 fn first_touch_mpc_vetoes_unplayable_one_touch_pass_and_controls_first() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
