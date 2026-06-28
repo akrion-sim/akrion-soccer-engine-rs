@@ -91,6 +91,8 @@ mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
 pub use pass_lane_yield::*;
+mod slip_break_offside;
+pub(crate) use slip_break_offside::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
