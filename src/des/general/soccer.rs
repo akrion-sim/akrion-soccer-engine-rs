@@ -2688,6 +2688,8 @@ const BLINDSIDE_CATCH_HORIZON_SECONDS: f64 = 1.5;
 const BLINDSIDE_CHASE_SPEED_MARGIN_YPS: f64 = 0.4;
 // Contact band within which a believed blindside approach actually nicks the ball.
 const BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.55;
+// Minimum opportunity strength at which a blindside approach at contact range wins the ball.
+const BLINDSIDE_STEAL_COMMIT_THRESHOLD: f64 = 0.30;
 // The carrier's side-glance (head-scan) control-drift cost while dribbling forward,
 // scaled by carrier speed (a quicker carrier glancing loses more control). This is the
 // physical price of looking: it rides the same ball-control drift channel as the
