@@ -2599,6 +2599,172 @@ fn mpc_dribble_execution_distinguishes_left_and_right_feints() {
     assert!(trace.mpc_recommended_speed_yps > 0.0);
 }
 
+/// A slow Home carrier dribbling forward with an Away defender crept directly into its
+/// blind arc, fast enough to catch it: the blindside-steal assessment recognises the
+/// chance with the gate on, and short-circuits to `None` with the gate off.
+fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let carrier = 7;
+    let thief = 14;
+    park_players_except(&mut sim, &[carrier, thief]);
+    sim.players[carrier].team = Team::Home; // attacks +y
+    sim.players[carrier].position = Vec2::new(40.0, 60.0);
+    sim.players[carrier].home_position = sim.players[carrier].position;
+    sim.players[carrier].velocity = carrier_velocity;
+    sim.players[carrier].action_facing = FacingBucket::Unknown; // ⇒ faces +y (attack dir)
+    sim.players[carrier].skills.dribbling = 5.0;
+    // Thief directly BEHIND the carrier (lower y), quick enough to chase it down.
+    sim.players[thief].team = Team::Away;
+    sim.players[thief].position = Vec2::new(40.0, 60.0 - defender_gap);
+    sim.players[thief].velocity = Vec2::new(0.0, 1.0);
+    sim.players[thief].skills.top_speed = 9.0;
+    sim.players[thief].skills.acceleration = 8.0;
+    sim.players[thief].skills.defending = 8.0;
+    sim.players[thief].skills.aggression = 7.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim
+}
+
+// One consolidated test so only a single test toggles `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`
+// (process-global env ⇒ separate parallel tests touching the same var would race).
+#[test]
+fn blindside_surprise_steal_and_carrier_glance_recognition() {
+    // --- 1. Assessment: a slow forward carrier with a catchable thief dead behind. ---
+    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 2.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
+
+    let off = snapshot.blindside_steal_assessment(14);
+    assert!(off.is_none(), "gate off must short-circuit to None (byte-identical)");
+
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let assessment = snapshot
+        .blindside_steal_assessment(14)
+        .expect("a slow forward carrier with a catchable thief behind is exploitable");
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    assert_eq!(assessment.target, 7);
+    assert!(
+        assessment.carrier_unaware > 0.9,
+        "thief dead behind ⇒ carrier fully unaware, got {}",
+        assessment.carrier_unaware
+    );
+    assert!(
+        assessment.carrier_slow > 0.9,
+        "a ~2.5 yps jog ⇒ fully exploitable pace, got {}",
+        assessment.carrier_slow
+    );
+    assert!(
+        assessment.catch_belief > 0.0,
+        "a quick thief 2yd behind a jogging carrier believes it can catch it"
+    );
+    assert!(
+        assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD,
+        "opportunity {} should clear the commit threshold",
+        assessment.opportunity
+    );
+
+    // --- 2. A flat-out sprinting carrier simply runs away ⇒ no chance even behind. ---
+    let fast_sim = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
+    let fast_snapshot = WorldSnapshot::from_match(&fast_sim);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let fast = fast_snapshot.blindside_steal_assessment(14);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    assert!(fast.is_none(), "a sprinting carrier is not robbed from behind, got {fast:?}");
+
+    // --- 3. Ball is won from behind only under the gate. The thief sits in the 1.6–2.1yd
+    // band — beyond the existing close-range emergency-contact reach (so a from-behind
+    // steal is normally blocked there) but inside the blindside nick range. ---
+    let contact_sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.9);
+    let contact_snapshot = WorldSnapshot::from_match(&contact_sim);
+    let thief = contact_sim
+        .players
+        .iter()
+        .find(|p| p.id == 14)
+        .cloned()
+        .expect("thief present");
+    let steal_off = thief.immediate_defensive_steal_target(&contact_snapshot);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let steal_on = thief.immediate_defensive_steal_target(&contact_snapshot);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    assert_eq!(steal_off, None, "gate off: a steal from behind stays blocked");
+    assert_eq!(steal_on, Some(7), "gate on: the blindside nick wins the ball from behind");
+
+    // --- 4. The carrier glances (physics cost), recognises the threat, and escapes. ---
+    let glance_sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
+    let glance_snapshot = WorldSnapshot::from_match(&glance_sim);
+    let carrier = glance_sim
+        .players
+        .iter()
+        .find(|p| p.id == 7)
+        .cloned()
+        .expect("carrier present");
+    let directive = glance_snapshot.tactical_directive(Team::Home);
+
+    let obs_off = glance_snapshot.observation_for(7);
+    std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
+    let obs_on = glance_snapshot.observation_for(7);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+
+    // Gate off ⇒ the carrier neither glances nor perceives the rear threat (byte-identical).
+    assert_eq!(obs_off.blindside_threat_from_behind, 0.0);
+    assert!(!obs_off.blindside_scan_active);
+    // Gate on ⇒ the forward-dribbling carrier side-glances (a real drift cost) and, having
+    // looked, recognises the thief sneaking up behind.
+    assert!(obs_on.blindside_scan_active, "a forward dribbler glances to its blind side");
+    assert!(
+        obs_on.blindside_scan_drift_risk > 0.0,
+        "the glance carries a ball-control drift cost"
+    );
+    assert!(
+        obs_on.blindside_threat_from_behind > 0.0,
+        "after glancing, the carrier recognises the blindside threat"
+    );
+    // The full-field neural motion block is unchanged in length (FEATURE_DIM intact).
+    assert_eq!(
+        obs_on.field_player_motion.len(),
+        obs_off.field_player_motion.len()
+    );
+
+    // The recognised threat biases the carrier to break away rather than dwell/shield.
+    let escape = carrier.possession_action_options(
+        &obs_on,
+        &directive,
+        obs_on.visible_pass_options,
+        obs_on.visible_aerial_pass_options,
+        false,
+        glance_snapshot.dt_seconds,
+        glance_snapshot.field_width,
+    );
+    let dwell = carrier.possession_action_options(
+        &obs_off,
+        &directive,
+        obs_off.visible_pass_options,
+        obs_off.visible_aerial_pass_options,
+        false,
+        glance_snapshot.dt_seconds,
+        glance_snapshot.field_width,
+    );
+    let prob = |opts: &[AgentActionOptionTrace], label: &str| {
+        opts.iter()
+            .find(|o| o.label == label)
+            .map(|o| o.probability)
+            .unwrap_or(0.0)
+    };
+    assert!(
+        prob(&escape, "carry-forward") >= prob(&dwell, "carry-forward"),
+        "recognising the thief should not lower the break-away-forward weight"
+    );
+    assert!(
+        prob(&escape, "protect-ball") <= prob(&dwell, "protect-ball") + 1e-9,
+        "recognising the thief should damp slow shielding into the steal"
+    );
+}
+
 #[test]
 fn mpc_bouncing_ball_urgency_reprices_pass_execution_window() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -8842,6 +9008,204 @@ fn completed_pass_reward_event_includes_killer_pass_goal_channel_bonus() {
             passer_reward > base + 3.0,
             "completed threaded goal-channel pass should include killer-pass bonus: reward={passer_reward} base={base}"
         );
+}
+
+// --- Situational "crash the box" from a flank aerial cross (see `crash_box`). ---
+
+/// Serialise the crash-the-box tests that toggle `DD_SOCCER_ENABLE_FLANK_CRASH_BOX`: the gate
+/// re-reads the env each call under `cfg(test)`, so two of these running concurrently would see
+/// each other's `set_var`. Holding this lock for the test body keeps each one's on/off window
+/// to itself.
+fn crash_box_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Two attackers crashed into the opponent box as a wide-and-high aerial cross is released ⇒ the
+/// "live cross" window latches and the small bounded arrival reward is paid to the crashers. With
+/// the gate off, the same call is a complete no-op (byte-identical).
+#[test]
+fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Home attacks y = 120; the opponent (Away) box is y in [102, 120], x in [18, 62].
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+    let crosser = 8;
+    let origin = Vec2::new(8.0, 100.0); // outer flank lane (x<20), attacking final third (y>=80).
+
+    // Gate OFF ⇒ no window, no events.
+    let before_off = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    assert!(
+        sim.flank_crash_box_cross.is_none(),
+        "gate off must not latch a cross window (byte-identical)"
+    );
+    assert_eq!(
+        sim.reward_events.len(),
+        before_off,
+        "gate off must not emit any crash-box reward events"
+    );
+
+    // Gate ON ⇒ window latches and the two box crashers are credited.
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let before_on = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let latched = sim
+        .flank_crash_box_cross
+        .expect("an aerial cross from the flank in the final third must latch the window");
+    assert_eq!(latched.crosser, crosser);
+    assert_eq!(latched.team, Team::Home);
+
+    for crasher in [9_usize, 10] {
+        let credited = sim.reward_events[before_on..]
+            .iter()
+            .filter(|event| {
+                event.player_id == crasher
+                    && event.kind == SoccerRewardEventKind::CrashBoxArrival
+            })
+            .map(|event| event.amount)
+            .sum::<f64>();
+        assert!(
+            credited > 0.0,
+            "crasher {crasher} in the box should earn a bounded arrival reward, got {credited}"
+        );
+    }
+}
+
+/// A genuine ground pass (not an aerial cross), or a central origin, must not open the window —
+/// the play is specifically a *wide aerial cross* into a crashed box.
+#[test]
+fn flank_crash_box_window_requires_a_wide_aerial_cross() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    // A ground (floor) ball from the flank is not a crash-the-box cross.
+    sim.register_flank_crash_box_cross(Team::Home, 8, Vec2::new(8.0, 100.0), true, PassFlight::Floor);
+    assert!(sim.flank_crash_box_cross.is_none(), "a floor ball is not an aerial cross");
+    // An aerial ball from a central origin is a shot/through-ball channel, not a flank cross.
+    sim.register_flank_crash_box_cross(Team::Home, 8, Vec2::new(40.0, 100.0), true, PassFlight::Aerial);
+    assert!(sim.flank_crash_box_cross.is_none(), "a central origin is not a flank cross");
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+}
+
+/// A headed (aerial) finish scored inside the live cross window pays the terminal bonus, split
+/// between the header scorer and the deliverer of the cross.
+#[test]
+fn headed_goal_off_a_flank_cross_pays_the_finisher_and_the_crosser() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    sim.players[10].position = Vec2::new(45.0, 110.0);
+    let crosser = 8;
+    let scorer = 9;
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    sim.register_flank_crash_box_cross(
+        Team::Home,
+        crosser,
+        Vec2::new(8.0, 100.0),
+        true,
+        PassFlight::Aerial,
+    );
+    assert!(sim.flank_crash_box_cross.is_some());
+    // The finishing header is struck this tick (ball up in the heading band).
+    sim.pending_aerial_finish = Some((scorer, sim.tick));
+
+    let before = sim.reward_events.len();
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let header_bonus = |player: usize| {
+        sim.reward_events[before..]
+            .iter()
+            .filter(|event| {
+                event.player_id == player
+                    && event.kind == SoccerRewardEventKind::HeaderGoalFromCross
+            })
+            .map(|event| event.amount)
+            .sum::<f64>()
+    };
+    let finisher = header_bonus(scorer);
+    let assist = header_bonus(crosser);
+    assert!(
+        finisher > assist && assist > 0.0,
+        "scorer should take the lion's share and the crosser an assist: finisher={finisher} assist={assist}"
+    );
+    assert!(
+        (finisher + assist - crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS).abs() < 1e-6,
+        "finisher+assist should sum to the configured bonus, got {}",
+        finisher + assist
+    );
+    // The window is consumed so a later goal can't double-credit it.
+    assert!(sim.flank_crash_box_cross.is_none());
+}
+
+/// A foot finish (ball on the ground) in the same window does *not* earn the headed-goal bonus.
+#[test]
+fn ground_finish_in_the_window_earns_no_header_bonus() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[9].role = PlayerRole::Forward;
+    let crosser = 8;
+    let scorer = 9;
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    sim.register_flank_crash_box_cross(
+        Team::Home,
+        crosser,
+        Vec2::new(8.0, 100.0),
+        true,
+        PassFlight::Aerial,
+    );
+    // No aerial finish stamped ⇒ a ground strike.
+    sim.pending_aerial_finish = None;
+    let before = sim.reward_events.len();
+    sim.record_goal_rewards(Team::Home, Some(scorer));
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let header_events = sim.reward_events[before..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::HeaderGoalFromCross)
+        .count();
+    assert_eq!(header_events, 0, "a ground finish must not earn the headed-goal bonus");
+}
+
+/// The situational box-flood fires from the geometry alone: a wide-and-high ball in possession
+/// pulls attackers into the box even when the team brain never rolled the `CrashTheBox` strategy.
+#[test]
+fn situational_recognizer_floods_the_box_independent_of_strategy() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = Some(8);
+    sim.ball.position = Vec2::new(8.0, 100.0); // wide flank, attacking final third for Home.
+    sim.players[8].position = Vec2::new(8.0, 100.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        !snapshot.flank_final_third_crash_box_active(Team::Home),
+        "gate off ⇒ recognizer inactive (byte-identical)"
+    );
+
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let active = snapshot.flank_final_third_crash_box_active(Team::Home);
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+    assert!(
+        active,
+        "Home holding the ball wide-and-high in the final third should activate the recognizer"
+    );
 }
 
 #[test]
@@ -18746,6 +19110,137 @@ fn wingback_opens_to_the_flank_in_possession_scaled_by_cover() {
         modest.x > full.x && modest.x < 25.0,
         "without cover open only moderately (wider than tucked-in, less than full): \
          modest={modest:?} full={full:?}"
+    );
+}
+
+#[test]
+fn wide_defender_holds_width_when_ball_far_ahead_unless_reachable() {
+    // When the ball is 10+ yds ahead of the back-four line average, a wide DEFENDER pushes up
+    // with the play but should NOT bomb out to the touchline to "open up" — UNLESS he is a live
+    // ground-pass outlet (within ~20yd of the ball on a clear lane). This pins both the rule and
+    // its exception on `wingback_width_adjusted_target`.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 77,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home)
+        .map(|p| p.id)
+        .collect();
+    let left_wb = home
+        .iter()
+        .copied()
+        .filter(|&id| sim.players[id].role == PlayerRole::Defender)
+        .min_by(|&a, &b| {
+            sim.players[a]
+                .home_position
+                .x
+                .total_cmp(&sim.players[b].home_position.x)
+        })
+        .unwrap();
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    // Back four sits deep (line average ~y=44); the left wing-back is tucked in at x=25, y=60.
+    for &h in &home {
+        if sim.players[h].role == PlayerRole::Defender {
+            sim.players[h].position = Vec2::new(sim.players[h].home_position.x, 44.0);
+        }
+    }
+    sim.players[left_wb].position = Vec2::new(25.0, 60.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.ball.holder = Some(holder);
+    // Opponents parked far away so the ground-pass lane is clean when the ball is near.
+    for away in sim.players.iter().map(|p| p.id).collect::<Vec<_>>() {
+        if sim.players[away].team == Team::Away {
+            sim.players[away].position = Vec2::new(40.0, 110.0);
+        }
+    }
+    let target = Vec2::new(25.0, 60.0);
+
+    // (A) Ball far ahead (y=85, 41yd beyond the line) and the wing-back ~29yd away ⇒ NOT a live
+    // outlet ⇒ hold width: he keeps his lane instead of bombing out to the touchline.
+    sim.ball.position = Vec2::new(40.0, 85.0);
+    sim.players[holder].position = sim.ball.position;
+    let held = WorldSnapshot::from_match(&sim).wingback_width_adjusted_target(left_wb, target);
+    assert!(
+        held.x > 24.0,
+        "ball far ahead and unreachable ⇒ wing-back holds his lane, does not open wide: {held:?}"
+    );
+
+    // (B) Same advanced phase, but now the ball is within ~16yd on a clear lane ⇒ he IS a live
+    // outlet ⇒ the exception applies and he opens out toward the touchline (smaller x).
+    sim.ball.position = Vec2::new(35.0, 72.0);
+    sim.players[holder].position = sim.ball.position;
+    let opened = WorldSnapshot::from_match(&sim).wingback_width_adjusted_target(left_wb, target);
+    assert!(
+        opened.x < held.x - 1.0,
+        "ball advanced but a reachable ground-pass outlet ⇒ wing-back opens wide: \
+         opened={opened:?} held={held:?}"
+    );
+}
+
+#[test]
+fn outside_mid_opens_wider_when_the_ball_is_on_his_flank() {
+    // A wide attacker's possession outlet hugs his touchline more when the ball's lane is close
+    // to his flank, and tucks in toward the half-space when the ball is on the far flank.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 91,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home)
+        .map(|p| p.id)
+        .collect();
+    // Make a clean left-wide midfielder and a separate carrier.
+    let wide_mid = home
+        .iter()
+        .copied()
+        .find(|&id| sim.players[id].role == PlayerRole::Midfielder)
+        .unwrap();
+    let holder = home
+        .iter()
+        .copied()
+        .find(|&id| sim.players[id].role == PlayerRole::Forward)
+        .unwrap();
+    let wide_home = Vec2::new(12.0, 50.0);
+    sim.players[wide_mid].home_position = wide_home;
+    sim.players[wide_mid].position = Vec2::new(18.0, 55.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.ball.holder = Some(holder);
+    for away in sim.players.iter().map(|p| p.id).collect::<Vec<_>>() {
+        if sim.players[away].team == Team::Away {
+            sim.players[away].position = Vec2::new(40.0, 112.0);
+        }
+    }
+
+    // Ball on the wide mid's OWN (left) flank ⇒ hug the touchline (small x).
+    sim.ball.position = Vec2::new(8.0, 60.0);
+    sim.players[holder].position = sim.ball.position;
+    let ball_on_flank = WorldSnapshot::from_match(&sim)
+        .wide_possession_outlet_target_for(wide_mid, wide_home)
+        .expect("a left-wide midfielder in possession should have a wide outlet");
+
+    // Ball on the FAR (right) flank ⇒ tuck in toward the half-space (larger x).
+    sim.ball.position = Vec2::new(72.0, 60.0);
+    sim.players[holder].position = sim.ball.position;
+    let ball_far = WorldSnapshot::from_match(&sim)
+        .wide_possession_outlet_target_for(wide_mid, wide_home)
+        .expect("a left-wide midfielder in possession should have a wide outlet");
+
+    assert!(
+        ball_on_flank.x < ball_far.x - 3.0,
+        "the closer the ball is to his flank, the wider the winger opens: \
+         on_flank={ball_on_flank:?} far={ball_far:?}"
     );
 }
 
@@ -50541,7 +51036,11 @@ fn covered_possession_opens_wingbacks_wide_but_releases_only_one_forward() {
     fn configure_covered_wingback_shape(sim: &mut SoccerMatch, covered: bool) {
         let holder = 7usize;
         sim.ball.holder = Some(holder);
-        sim.ball.position = Vec2::new(40.0, 62.0);
+        // Build-up phase: the ball sits just ahead of the back four (line ~y=44), NOT 10+ yds
+        // beyond it — so this exercises the covered-overlap WIDTH release, not the separate
+        // "hold width when the ball is far advanced" guard (see
+        // `wingback_advanced_ball_should_hold_width`).
+        sim.ball.position = Vec2::new(40.0, 52.0);
         sim.ball.velocity = Vec2::zero();
         sim.ball.acceleration = Vec2::zero();
         sim.ball.last_touch_team = Some(Team::Home);
@@ -85150,116 +85649,236 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
 
-#[test]
-fn slip_break_seam_and_runner_opportunity_are_recognised() {
-    // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
-    // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
-    // via the pure helpers to avoid process-global env races). Home attacks toward larger y.
+// --- Isolated attacking carrier: drive / hold-up instead of a panic backward pass --------------
+// (gate `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; see `isolated_attacking_carrier_drive_mode`).
+
+/// A baseline observation for a Home Forward carrying the ball in the attacking half with every
+/// teammate parked behind him. The recognizer-relevant fields are overwritten per assertion so the
+/// pure decision logic is exercised independently of exact pitch geometry.
+fn isolated_attacking_carrier_base_observation() -> SoccerPomdpObservation {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
-        seed: 4_242,
+        seed: 51_217,
         ..Default::default()
     });
-    let away_keeper = sim
-        .players
-        .iter()
-        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
-        .map(|p| p.id)
-        .expect("away keeper");
-    let away_defs: Vec<usize> = sim
-        .players
-        .iter()
-        .filter(|p| p.team == Team::Away && p.role == PlayerRole::Defender)
-        .map(|p| p.id)
-        .take(4)
-        .collect();
-    assert_eq!(away_defs.len(), 4, "expected a back four");
-    let passer = sim
-        .players
-        .iter()
-        .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
-        .map(|p| p.id)
-        .expect("home midfielder");
-    let runner = sim
-        .players
-        .iter()
-        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
-        .map(|p| p.id)
-        .expect("home forward");
-    let kept = {
-        let mut v = away_defs.clone();
-        v.extend_from_slice(&[away_keeper, passer, runner]);
-        v
-    };
-    // Push everyone else upfield (small y) so the back four are the deepest outfielders and
-    // define the offside line.
-    for p in &mut sim.players {
-        if kept.contains(&p.id) {
-            continue;
-        }
-        p.position = Vec2::new(8.0, 55.0);
-        p.velocity = Vec2::zero();
-    }
-    // Back four on a line at y=90 with a wide central seam (x 32..52) and tighter outer gaps.
-    let line_y = 90.0;
-    for (def, x) in away_defs.iter().zip([24.0, 32.0, 52.0, 60.0]) {
-        sim.players[*def].position = Vec2::new(x, line_y);
-        sim.players[*def].velocity = Vec2::zero();
-    }
-    sim.players[away_keeper].position = Vec2::new(40.0, 110.0);
-    sim.players[away_keeper].velocity = Vec2::zero();
-    // Carrier on the ball behind; runner staged ~2.5 yd onside of the line, sprinting forward.
-    sim.players[passer].position = Vec2::new(40.0, 70.0);
-    sim.players[passer].velocity = Vec2::zero();
-    sim.ball.holder = Some(passer);
-    sim.ball.position = sim.players[passer].position;
+    let carrier = 9;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(40.0, 85.0);
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
     sim.ball.last_touch_team = Some(Team::Home);
-    sim.players[runner].position = Vec2::new(42.0, line_y - 2.5);
-    sim.players[runner].velocity = Vec2::new(0.0, 5.0);
+    WorldSnapshot::from_match(&sim).observation_for(carrier)
+}
+
+/// Force the "isolated attacking carrier with no outlet ahead" picture onto a base observation.
+fn make_isolated(observation: &mut SoccerPomdpObservation) {
+    observation.has_ball = true;
+    observation.yards_to_goal = 30.0;
+    observation.yards_to_own_goal = 90.0;
+    observation.field_teammates_ahead = 0;
+    observation.teammates_ahead = 0;
+    observation.visible_forward_pass_options = 0;
+    observation.best_forward_pass_option_quality = 0.0;
+    observation.best_forward_pass_receiver_openness = 0.0;
+    // No solo space/pace advantage by default; defenders count set per assertion.
+    observation.forward_dribble_space_yards = 4.0;
+    observation.nearest_opponent_distance = 4.0;
+    observation.neural_extended.nearest_opponent_closing_rate_yps = 1.5;
+}
+
+#[test]
+fn isolated_attacking_carrier_recognizer_truth_table() {
+    let mut base = isolated_attacking_carrier_base_observation();
+    make_isolated(&mut base);
+
+    // Few defenders goal-side of the ball ⇒ drive at goal solo.
+    let mut solo = base.clone();
+    solo.field_opponents_ahead = 2;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // A packed block behind the ball AND no space/pace ⇒ hold the ball up.
+    let mut hold = base.clone();
+    hold.field_opponents_ahead = 6;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&hold, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::HoldUp)
+    );
+
+    // Packed block but lots of space + a favourable speed differential ⇒ back to a solo drive.
+    let mut solo_space = hold.clone();
+    solo_space.forward_dribble_space_yards = 16.0;
+    solo_space.nearest_opponent_distance = 9.0;
+    solo_space.neural_extended.nearest_opponent_closing_rate_yps = -0.5;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo_space, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // A winger (outside / wide midfielder) is treated exactly like a forward.
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Midfielder, true),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // --- None cases: the recognizer must stay out of the way. ---
+    // A teammate IS ahead ⇒ a normal forward pass is available.
+    let mut teammate_ahead = solo.clone();
+    teammate_ahead.field_teammates_ahead = 1;
+    teammate_ahead.teammates_ahead = 1;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&teammate_ahead, PlayerRole::Forward, false),
+        None
+    );
+
+    // An open forward pass is on ⇒ let the forward-pass-first / killer-pass logic play it.
+    let mut forward_open = solo.clone();
+    forward_open.visible_forward_pass_options = 1;
+    forward_open.best_forward_pass_receiver_openness = 0.7;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&forward_open, PlayerRole::Forward, false),
+        None
+    );
+
+    // In the OWN half a backward/build-up ball is correct ⇒ never overridden.
+    let mut own_half = solo.clone();
+    own_half.yards_to_goal = 90.0;
+    own_half.yards_to_own_goal = 30.0;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&own_half, PlayerRole::Forward, false),
+        None
+    );
+
+    // Central midfielders / defenders are not the stranded attackers this targets.
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Midfielder, false),
+        None
+    );
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Defender, false),
+        None
+    );
+}
+
+#[test]
+fn isolated_carrier_panic_back_pass_detector_truth_table() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51_218,
+        ..Default::default()
+    });
+    let carrier = 9;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(40.0, 85.0);
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    let origin = sim.players[carrier].position;
+    let attack = Team::Home.attack_dir();
+    let backward = Vec2::new(40.0, origin.y - 15.0 * attack);
+    let forward = Vec2::new(40.0, origin.y + 12.0 * attack);
+
+    // The exact bug: isolated forward in the attacking half plays the ball backward.
+    assert!(sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+    // A forward ball is not the blunder.
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, forward, false));
+    // A backward ball from the OWN half is a legitimate reset.
+    assert!(sim.isolated_carrier_panic_back_pass(carrier, origin, backward, true) == false);
+
+    // A central defender hitting it backward is not penalised by this signal.
+    sim.players[carrier].role = PlayerRole::Defender;
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+    sim.players[carrier].role = PlayerRole::Forward;
+
+    // With a teammate ahead of the ball it is no longer the isolated picture.
+    sim.players[8].role = PlayerRole::Forward;
+    sim.players[8].position = Vec2::new(42.0, origin.y + 10.0 * attack);
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+}
+
+/// Serialise the tests that toggle `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` (the gate re-reads
+/// the env each call under `cfg(test)`).
+fn isolated_carrier_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn isolated_carrier_drive_floors_forward_and_damps_backward_recycle() {
+    let _lock = isolated_carrier_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51_219,
+        ..Default::default()
+    });
+    let carrier = 9;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(40.0, 85.0);
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    assert_eq!(
-        snapshot.second_last_defender_line_for(Team::Home),
-        Some(line_y),
-        "back four should set the offside line"
+    let mut observation = snapshot.observation_for(carrier);
+    make_isolated(&mut observation);
+    // Out past shooting range so this is a pure DRIVE scenario (no shot blocking the carry
+    // alternatives), keeping the comparison about forward-drive vs backward-recycle.
+    observation.yards_to_goal = 40.0;
+    observation.field_opponents_ahead = 2; // few behind the ball ⇒ solo-goal drive
+    observation.forward_dribble_space_yards = 8.0;
+    observation.shot_lane_open = false;
+    observation.shot_on_frame_probability = 0.0;
+    observation.shot_beat_goalkeeper_probability = 0.0;
+    observation.goal_attack_window_score = 0.0;
+    // A square/backward outlet exists and is open so recycle-reset / pass1 are legal options.
+    observation.best_pass_receiver_openness = 0.6;
+    observation.expected_pass_completion = 0.6;
+
+    let directive = snapshot.tactical_directive(Team::Home);
+    let score = |opts: &[AgentActionOptionTrace], label: &str| {
+        opts.iter()
+            .find(|o| o.label == label && o.legal)
+            .map(|o| o.score)
+            .unwrap_or(0.0)
+    };
+
+    std::env::set_var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE", "1");
+    let on = sim.players[carrier].possession_action_options(
+        &observation,
+        &directive,
+        1,
+        0,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
     );
-    let (seam_target, seam_quality) = snapshot
-        .slip_break_seam_for(Team::Home, sim.players[runner].position)
-        .expect("a seam through the back four");
-    assert!(seam_quality > 0.5, "wide central seam quality {seam_quality}");
-    // The slip is angled into the space behind the line.
-    assert!(
-        (seam_target.y - line_y) * Team::Home.attack_dir() > 0.0,
-        "seam target {seam_target:?} should be behind the line"
+    std::env::remove_var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE");
+    let off = sim.players[carrier].possession_action_options(
+        &observation,
+        &directive,
+        1,
+        0,
+        false,
+        snapshot.dt_seconds,
+        snapshot.field_width,
     );
 
-    let opportunity = snapshot
-        .slip_break_runner_opportunity(
-            Team::Home,
-            passer,
-            sim.players[passer].position,
-            runner,
-        )
-        .expect("an onside, well-timed slip-break runner");
+    let drive_on = score(&on, "carry-forward").max(score(&on, "vertical-attack"));
+    let recycle_on = score(&on, "recycle-reset");
     assert!(
-        opportunity.timing > 0.5,
-        "runner ~2.5 yd before the line, sprinting, should be at the release window: {}",
-        opportunity.timing
+        drive_on > recycle_on,
+        "isolated solo carrier should prefer driving at goal ({drive_on:.4}) over recycling backward ({recycle_on:.4})"
     );
-    assert!(opportunity.opportunity > 0.0, "a real opportunity exists");
-
-    // A runner who has already crossed the line is offside-side ⇒ not a slip-break candidate.
-    sim.players[runner].position = Vec2::new(42.0, line_y + 5.0);
-    let snapshot_offside = WorldSnapshot::from_match(&sim);
+    // The gate must actually damp the backward recycle relative to the un-gated baseline.
+    let recycle_off = score(&off, "recycle-reset");
     assert!(
-        snapshot_offside
-            .slip_break_runner_opportunity(
-                Team::Home,
-                passer,
-                sim.players[passer].position,
-                runner,
-            )
-            .is_none(),
-        "a runner already beyond the line is not a slip-break candidate"
+        recycle_off > 0.0 && recycle_on < recycle_off,
+        "gate should damp the backward recycle: on {recycle_on:.4} vs off {recycle_off:.4}"
     );
 }
