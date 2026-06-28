@@ -29743,6 +29743,11 @@ impl WorldSnapshot {
         };
         let me_position = self.player_snapshot_position(me);
         let directive = self.tactical_directive(me.team);
+        // Role-aware forward appetite (see `pass_risk_appetite_for_passer`): forwards lift the
+        // weight on a forward loft, defenders/keeper trim it. NEUTRAL (byte-identical) off.
+        let passer_in_attacking_third =
+            (me.team.goal_y(self.field_length) - me_position.y).abs() <= self.field_length / 3.0;
+        let pass_risk_appetite = pass_risk_appetite_for_passer(me.role, passer_in_attacking_third);
         let pass_target_learning =
             tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.24);
         let goal_entry_pass_learning =
