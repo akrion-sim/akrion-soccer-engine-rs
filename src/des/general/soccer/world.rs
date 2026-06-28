@@ -14081,6 +14081,57 @@ impl SoccerMatch {
         obstacles
     }
 
+    /// Offside line (the second-last defender's `y`, GK included) for
+    /// `attacking_team`, computed from the live players. `None` when the defending
+    /// side has fewer than two players. Used to keep the xT terminal shaping onside.
+    fn live_offside_line_for(&self, attacking_team: Team) -> Option<f64> {
+        let attack = attacking_team.attack_dir();
+        // Progress toward the opponent goal; the two largest are the last and
+        // second-last defenders, and the offside line sits at the second-last.
+        let mut progress: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team != attacking_team && p.position.y.is_finite())
+            .map(|p| p.position.y * attack)
+            .collect();
+        if progress.len() < 2 {
+            return None;
+        }
+        progress.sort_by(|a, b| b.total_cmp(a));
+        Some(progress[1] * attack)
+    }
+
+    /// Cap the xT-`shaped` reference so its attack-direction progress never exceeds
+    /// the larger of the original (onside) target's progress and the offside line —
+    /// i.e. the nudge may pull sideways/back freely but cannot advance an attacker
+    /// past the line the support search kept it behind. No-op for non-attackers,
+    /// when the line is unknown, or when the shaped point is already onside.
+    fn xt_onside_capped_reference(
+        &self,
+        player_id: usize,
+        my_team: Team,
+        original: Vec2,
+        shaped: Vec2,
+    ) -> Vec2 {
+        let is_attacker = self
+            .players
+            .get(player_id)
+            .map_or(false, |p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder));
+        if !is_attacker {
+            return shaped;
+        }
+        let Some(line_y) = self.live_offside_line_for(my_team) else {
+            return shaped;
+        };
+        let attack = my_team.attack_dir();
+        let cap_progress = (original.y * attack).max(line_y * attack);
+        if shaped.y * attack > cap_progress {
+            Vec2::new(shaped.x, cap_progress * attack)
+        } else {
+            shaped
+        }
+    }
+
     /// The desired velocity actually executed this tick, after the MPC execution
     /// and (optionally) MDP↔MPC reconciliation layers. The "MDP" decision is the
     /// learned-policy/heuristic [`Self::collision_aware_desired_velocity`]; the
@@ -14500,7 +14551,15 @@ impl SoccerMatch {
                     top_speed: player_top_speed_yps(p.role, &p.skills),
                 })
                 .collect();
-            xt_terminal_shaped_target(&points, my_team, pitch_value_target, fw, fl)
+            let shaped = xt_terminal_shaped_target(&points, my_team, pitch_value_target, fw, fl);
+            // Onside discipline: the support search already held this reference
+            // onside; the goalward pull of the xT gradient must not undo that and
+            // park an attacker offside. Cap the shaped reference's attack-direction
+            // progress so it never advances FURTHER beyond the offside line than the
+            // assigned target already was (a sanctioned in-behind run keeps its lead,
+            // but the nudge can't extend it). Applies only to forwards/midfielders,
+            // matching `clamp_forward_onside_support`.
+            self.xt_onside_capped_reference(player_id, my_team, pitch_value_target, shaped)
         } else {
             pitch_value_target
         };
@@ -20330,7 +20389,7 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok())
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS"))
     }
 }
 
@@ -20419,16 +20478,25 @@ pub(crate) fn soccer_mappo_epochs() -> usize {
 /// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
 /// to opt in) — leaving the default training run byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
-            .map(|raw| {
-                let raw = raw.trim();
-                raw == "1" || raw.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION"))
+    }
 }
 
 /// Whether a policy batch's advantages must be standardized (zero-mean / unit-variance)
@@ -20463,15 +20531,63 @@ pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f6
 /// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
 /// Read once per process.
 pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT"))
+    }
+}
+
+/// Whether to bound the magnitude of the centralized MAPPO team component (see
+/// [`soccer_marl_team_component`]). The term is `own_mean − opponent_mean` over a tick; on a
+/// single-team tick (e.g. a drained deferred goal/chain-credit row trained apart from its
+/// 22-player cohort) the absent opponent mean reads 0.0, so a sparse +30 scorer share becomes a
+/// one-sided +30 spike that — without advantage standardization (default off) — is a large,
+/// destabilizing policy-gradient step. This clamp caps that spike while leaving the small dense
+/// per-tick differentials untouched; a softer, always-safe complement to the balanced gate (which
+/// suppresses the term entirely on single-team ticks). OFF by default ⇒ byte-identical; set
+/// `DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP=1`. Read once per process.
+pub(crate) fn dd_soccer_enable_marl_team_component_clamp() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+        std::env::var("DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP")
             .map(|raw| {
                 let raw = raw.trim();
                 raw == "1" || raw.eq_ignore_ascii_case("true")
             })
             .unwrap_or(false)
+    })
+}
+
+/// Symmetric bound (in reward points) for the MAPPO team-component clamp when it is enabled.
+/// Defaults to [`MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT`] — about a shot's reward magnitude, so
+/// legitimate dense differentials pass through while a sparse single-team event spike is capped.
+/// Learner/operator override via `DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS` (clamped 1.0-200.0).
+pub(crate) fn marl_team_component_clamp_points() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 200.0))
+            .unwrap_or(MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT)
     })
 }
 
@@ -20540,9 +20656,18 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
 /// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
 /// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
 fn dd_soccer_enable_defensive_shepherd() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD"))
+    }
 }
 
 /// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
@@ -20550,9 +20675,18 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
 /// second pressure rather than a clean run at the back line. See
 /// [`WorldSnapshot::press_cover_target_for`].
 fn dd_soccer_enable_press_cover() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_COVER"))
+    }
 }
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
@@ -20666,18 +20800,38 @@ pub(crate) fn own_half_short_pass_liability_penalty_factor(
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
 /// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY"))
+    }
 }
 /// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
 /// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
 /// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
 /// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
 pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok()
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY"))
+    }
 }
 /// True when either wasted-energy variant is active. Both share the windowed-sample +
 /// ball-interaction-tracking machinery; the sustained variant additionally requires a long
@@ -20690,9 +20844,18 @@ pub(crate) fn wasted_energy_tracking_active() -> bool {
 /// Far-from-ball off-ball energy conservation throttle. OFF by default; set
 /// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION"))
+    }
 }
 /// Team → fixed history-array index (`Home` = 0, `Away` = 1).
 pub(crate) fn team_index(team: Team) -> usize {
@@ -20803,9 +20966,18 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
 /// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
 /// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
 fn dd_soccer_enable_off_ball_space_discipline() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
+    }
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
@@ -20843,9 +21015,18 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
 /// retrospective concede penalty (byte-identical baseline / A/B). See
 /// [`SoccerSimulation::record_keeper_save_reward`].
 fn dd_soccer_enable_keeper_save_reward() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD"))
+    }
 }
 
 /// Full reward points for a clean shot-stop (catch/save) of a maximally dangerous effort.
@@ -29590,7 +29771,7 @@ impl WorldSnapshot {
             .unwrap_or(observer.position);
         let facing = self.player_facing_direction(observer);
         let observer_has_ball = self.ball.holder == Some(observer_id);
-        let mut measurement_confidence = finite_metric(position_confidence_for_observer(
+        let measurement_confidence = finite_metric(position_confidence_for_observer(
             observer,
             observer_position,
             point,
@@ -29620,20 +29801,19 @@ impl WorldSnapshot {
             }
         }
         let Some((target, target_position, _)) = matched_target else {
-            let occlusion = self.point_occlusion_score_for_observer(observer_id, point, None);
-            measurement_confidence *=
-                (1.0 - occlusion * PERCEPTION_OCCLUSION_CONFIDENCE_PENALTY).clamp(0.0, 1.0);
-            return Some(measurement_confidence);
+            return Some(self.occlusion_scaled_confidence(
+                observer_id,
+                observer_position,
+                point,
+                None,
+                measurement_confidence,
+            ));
         };
-        let occlusion =
-            self.point_occlusion_score_for_observer(observer_id, target_position, Some(target.id));
-        measurement_confidence *=
-            (1.0 - occlusion * PERCEPTION_OCCLUSION_CONFIDENCE_PENALTY).clamp(0.0, 1.0);
         let to_target = target_position - observer_position;
         let in_front = facing
             .map(|facing| facing.normalized().dot(to_target.normalized()) >= 0.0)
             .unwrap_or(false);
-        Some(kalman_perception_position_confidence(
+        let kalman = kalman_perception_position_confidence(
             measurement_confidence,
             target_position,
             target.velocity,
@@ -29641,7 +29821,44 @@ impl WorldSnapshot {
             self.dt_seconds,
             in_front,
             observer_has_ball,
+        );
+        Some(self.occlusion_scaled_confidence(
+            observer_id,
+            observer_position,
+            point,
+            Some(target.id),
+            kalman,
         ))
+    }
+
+    /// Multiply a perception `confidence` down by how screened the sightline
+    /// `observer → point` is (excluding `target_id` itself as a blocker). Gated by
+    /// `DD_SOCCER_ENABLE_OCCLUSION`; OFF ⇒ returns `confidence` unchanged so the
+    /// confidence model is byte-identical. This makes body-occlusion grade the
+    /// SAME confidence every consumer reads, consistent with the hard visibility
+    /// cut in `player_can_see_point` (which fires once the screen is near-total).
+    fn occlusion_scaled_confidence(
+        &self,
+        observer_id: usize,
+        observer_position: Vec2,
+        point: Vec2,
+        target_id: Option<usize>,
+        confidence: f64,
+    ) -> f64 {
+        if !occlusion_enabled() {
+            return confidence;
+        }
+        let blockers = self.players.iter().filter_map(|p| {
+            (p.id != observer_id && Some(p.id) != target_id)
+                .then(|| self.player_snapshot_position(p))
+        });
+        let occ = sightline_occlusion_fraction(
+            observer_position,
+            point,
+            blockers,
+            OCCLUSION_BODY_RADIUS_YARDS,
+        );
+        (confidence * (1.0 - occ)).clamp(0.0, 1.0)
     }
 
     /// The position `observer_id` PERCEIVES `target_id` at: the true position
@@ -29661,32 +29878,24 @@ impl WorldSnapshot {
         if !perception_noise_enabled() || observer_id == target_id {
             return Some(true_pos);
         }
-        let mut confidence = self
+        // `player_position_confidence_for_point` is already occlusion-aware (it folds
+        // the sightline screen into the confidence), so there is no second occlusion
+        // multiply here — avoiding the earlier double-count.
+        let confidence = self
             .player_position_confidence_for_point(observer_id, true_pos)
             .unwrap_or(1.0);
-        if occlusion_enabled() {
-            if let Some(observer) = self.players.iter().find(|p| p.id == observer_id) {
-                let observer_position = self
-                    .player_position(observer.id)
-                    .unwrap_or(observer.position);
-                let blockers = self.players.iter().filter_map(|p| {
-                    (p.id != observer_id && p.id != target_id)
-                        .then(|| self.player_snapshot_position(p))
-                });
-                let occ = sightline_occlusion_fraction(
-                    observer_position,
-                    true_pos,
-                    blockers,
-                    OCCLUSION_BODY_RADIUS_YARDS,
-                );
-                confidence *= 1.0 - occ;
-            }
-        }
         let bucket = self.tick / PERCEPTION_REFRESH_TICKS.max(1);
         let seed = (observer_id as u64).wrapping_mul(0x9E37_79B1)
             ^ (target_id as u64).wrapping_mul(0x85EB_CA77).rotate_left(17)
             ^ bucket.wrapping_mul(0xC2B2_AE3D);
-        Some(perceived_position(true_pos, confidence, seed))
+        // Lag the belief along the target's own motion (stale track when uncertain),
+        // then add the disk error on top.
+        Some(perceived_position_lagged(
+            true_pos,
+            target.velocity,
+            confidence,
+            seed,
+        ))
     }
 
     pub fn player_position_confidence_entry(

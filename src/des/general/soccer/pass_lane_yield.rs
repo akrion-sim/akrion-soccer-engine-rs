@@ -88,7 +88,8 @@ pub fn pass_lane_yield_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_enabled(PASS_LANE_YIELD_ENABLE_ENV))
+        // Promoted to default-ON in production (low-risk behavioral hardening).
+        *ENABLED.get_or_init(|| gate_default_on(PASS_LANE_YIELD_ENABLE_ENV))
     }
 }
 

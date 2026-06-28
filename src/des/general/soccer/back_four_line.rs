@@ -178,8 +178,9 @@ pub fn defensive_line_wingback_forward_priority_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
+        // Promoted to default-ON in production (A/B-validated low-risk behavioral hardening).
         *ENABLED.get_or_init(|| {
-            env_flag_enabled(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV)
+            gate_default_on(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV)
         })
     }
 }

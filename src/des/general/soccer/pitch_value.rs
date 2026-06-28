@@ -105,7 +105,8 @@ pub fn pitch_value_reward_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_enabled(PITCH_VALUE_REWARD_ENABLE_ENV))
+        // Promoted to default-ON in production (pitch-value PBRS reward; training-time only).
+        *ENABLED.get_or_init(|| gate_default_on(PITCH_VALUE_REWARD_ENABLE_ENV))
     }
 }
 
@@ -121,7 +122,8 @@ pub fn xt_terminal_cost_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_enabled(XT_TERMINAL_COST_ENABLE_ENV))
+        // Promoted to default-ON in production (xT terminal-cost MPC shaping).
+        *ENABLED.get_or_init(|| gate_default_on(XT_TERMINAL_COST_ENABLE_ENV))
     }
 }
 

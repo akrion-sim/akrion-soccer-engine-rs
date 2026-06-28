@@ -348,6 +348,10 @@ const ENERGY_ECONOMY_REFERENCE_MOVEMENT_YARDS: f64 = 42.0;
 const ENERGY_ECONOMY_FAST_SPEED_YPS: f64 = 4.0;
 const ENERGY_ECONOMY_REWARD_PENALTY_POINTS: f64 = 0.06;
 const ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS: f64 = ENERGY_ECONOMY_REWARD_PENALTY_POINTS;
+// Default symmetric bound for the (gated) MAPPO team-component clamp — about a shot's reward
+// magnitude, so dense per-tick differentials pass through but a sparse single-team event spike is
+// capped. See `dd_soccer_enable_marl_team_component_clamp` / `soccer_marl_team_component`.
+const MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT: f64 = 12.0;
 // A whole-team urgency wave: roughly six minutes rising/spent and six minutes recovering.
 const ENERGY_RHYTHM_PERIOD_SECONDS: f64 = 12.0 * 60.0;
 // Two-tier energy: `fatigue` is the slow aerobic drain; `anaerobic_load` is the
@@ -3804,8 +3808,22 @@ const SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+/// Append-only **relational attention readout** block. The whole-field motion block already
+/// carries every player as a flat, fixed-order list of actor-relative pos/vel/acc/jerk, and the
+/// team-center block carries fixed (mean) centroids — but neither exposes a permutation-invariant,
+/// content-addressed RELATIONAL summary, so the flat MLP has to re-learn "who is near me / closing
+/// on me" from raw coordinates every forward pass. This block computes a small graph-attention-style
+/// readout (softmax-over-proximity weights over teammates, and separately over opponents) of the
+/// attended support depth, lateral spread, closing speed, and interaction entropy. It is the
+/// learned-feature analogue of a GNN/attention encoder's neighbourhood pooling, expressed as an
+/// append-only feature block so old nets migrate by zero-padding. Gated by
+/// `DD_SOCCER_ENABLE_RELATIONAL_ATTENTION`; OFF (default) leaves the block all-zeros, so the block
+/// content is byte-identical to before and an A/B is a clean on/off within the same dimensions.
+const SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM: usize = 8;
+const SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+    + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4181,6 +4199,24 @@ const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET + 1;
 const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE + 1;
+// Relational attention readout indices (teammate channels first, then opponents).
+const SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH: usize =
+    SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_WIDTH: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_CLOSING: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_WIDTH + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_ENTROPY: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_CLOSING + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_DEPTH: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_ENTROPY + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_WIDTH: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_DEPTH + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_WIDTH + 1;
+const SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY: usize =
+    SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING + 1;
+const DD_SOCCER_RELATIONAL_ATTENTION_ENV: &str = "DD_SOCCER_ENABLE_RELATIONAL_ATTENTION";
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4297,6 +4333,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM,
     // Same schema with killer over-top pass channels, before reception-approach control.
     SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM,
+    // Same schema with reception-approach control, before the relational attention readout.
+    SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -11951,6 +11989,7 @@ pub(crate) fn soccer_marl_adjusted_reward(
         tick_reward,
         transition.team,
         dd_soccer_enable_marl_balanced_team_component(),
+        dd_soccer_enable_marl_team_component_clamp().then(marl_team_component_clamp_points),
     );
     intermediate + team_component * config.sanitized_marl_team_reward_weight()
 }
@@ -11963,6 +12002,7 @@ fn soccer_marl_team_component(
     tick_reward: SoccerMarlTickReward,
     team: Team,
     balanced: bool,
+    clamp_points: Option<f64>,
 ) -> f64 {
     if balanced && !tick_reward.has_both_teams() {
         return 0.0;
@@ -11970,7 +12010,13 @@ fn soccer_marl_team_component(
     let reward_delta = tick_reward.average_for(team) - tick_reward.average_for(team.other());
     let waste_delta = tick_reward.energy_waste_average_for(team)
         - tick_reward.energy_waste_average_for(team.other());
-    finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS)
+    let component =
+        finite_metric(reward_delta - waste_delta * ENERGY_ECONOMY_MARL_TEAM_PENALTY_POINTS);
+    // Bound a sparse single-team event spike (gated; None ⇒ unbounded, byte-identical).
+    match clamp_points {
+        Some(bound) if bound > 0.0 => component.clamp(-bound, bound),
+        _ => component,
+    }
 }
 
 /// The flat Monte-Carlo outcome label `z` each team carries for every transition of
@@ -12045,9 +12091,10 @@ pub fn match_outcome_reward_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
+        // Promoted to default-ON in production (terminal won-game reward; training-time only).
         *ENABLED.get_or_init(|| {
             dd_soccer_enable_outcome_credit()
-                || soccer_env_flag_enabled(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
+                || gate_default_on(DD_SOCCER_MATCH_OUTCOME_REWARD_ENV)
         })
     }
 }
@@ -17699,15 +17746,42 @@ pub(crate) fn is_outside_mid_attack_strategy(strategy: TeamAttackStrategy) -> bo
     )
 }
 
+/// Resolve a feature gate that has been promoted to **default-ON in production**.
+///
+/// In `#[cfg(test)]` builds the gate stays default-OFF and purely env-driven (each gate's
+/// own test branch keeps its original reader), so the byte-identical parity suite is
+/// unchanged. Production callers feed this into their own `OnceLock`: the gate is ON unless
+/// the operator explicitly sets the env var to a falsey value (`0` / `false` / `no` /
+/// `off`) — the kill switch. Empty / any other value ⇒ ON.
+pub(crate) fn gate_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
 /// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
 /// carrier driving the flank in the opponent half. Unset (default) the strategy is never proposed,
 /// so play is byte-identical to baseline. The learner and `SOCCER_FORCE_ATTACK_STRATEGY` can still
 /// select the strategy regardless of this flag (for training / live demos).
+/// Promoted to default-ON in production (low-risk behavioral hardening).
 pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER"))
+    }
 }
 
 /// Gate for aerial-pass-out-of-bounds discipline. OFF (the default) ⇒ no extra penalty event,
@@ -17716,9 +17790,18 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
 /// all three (MDP reward + POMDP observation + MPC execution) so the policy learns to stop
 /// blazing long lofts out of play. See [`AERIAL_PASS_OOB_MIN_DISTANCE_YARDS`] and friends.
 pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE"))
+    }
 }
 
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
@@ -36079,6 +36162,135 @@ fn soccer_neural_signed_unit(value: f64) -> f64 {
     }
 }
 
+/// Whether the relational attention readout block carries signal this process. OFF (default)
+/// leaves the block all-zeros, so the appended channels are byte-identical to the pre-block schema
+/// and a freshly trained net simply never learns from them — a clean on/off A/B.
+fn soccer_relational_attention_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(DD_SOCCER_RELATIONAL_ATTENTION_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_RELATIONAL_ATTENTION_ENV))
+    }
+}
+
+/// Softmax-over-proximity (graph-attention-style) readout of one player group relative to the
+/// actor, from the actor-relative whole-field motion block. `entries` is a slice of
+/// `(forward, lateral, vel_forward, vel_lateral)` already scaled into ~[-1, 1] (the leading four
+/// channels of each motion entity). Returns `(depth, width, closing, entropy)`:
+///   * `depth`   attention-weighted forward offset (where the relevant group sits ahead/behind),
+///   * `width`   attention-weighted lateral spread,
+///   * `closing` attention-weighted approach speed toward the actor (support arriving / pressure),
+///   * `entropy` normalised attention entropy in [0, 1] (how many members are realistically in play).
+/// The proximity attention is permutation-invariant, so player ordering inside the group never
+/// changes the readout — the structural property a flat fixed-order list cannot offer the MLP.
+fn soccer_relational_attention_group(entries: &[(f64, f64, f64, f64)]) -> (f64, f64, f64, f64) {
+    // Attention temperature in scaled-distance units (the motion block divides forward by 60yd
+    // and lateral by 40yd, so a value of ~0.3 weights a ~12-18yd neighbourhood most strongly).
+    const TAU: f64 = 0.30;
+    if entries.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    // Content-based logits = -distance / TAU (closer ⇒ higher weight); stabilised softmax.
+    let mut logits: Vec<f64> = Vec::with_capacity(entries.len());
+    for &(fy, fx, _vy, _vx) in entries {
+        let dist = (fy * fy + fx * fx).sqrt();
+        logits.push(-dist / TAU);
+    }
+    let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut weights: Vec<f64> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
+    let sum: f64 = weights.iter().sum();
+    if !(sum.is_finite()) || sum <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    for w in &mut weights {
+        *w /= sum;
+    }
+    let mut depth = 0.0;
+    let mut width = 0.0;
+    let mut closing = 0.0;
+    let mut entropy = 0.0;
+    for (&(fy, fx, vy, vx), &w) in entries.iter().zip(weights.iter()) {
+        depth += w * fy;
+        width += w * fx.abs();
+        // Approach speed = -(velocity · unit(position)); positive ⇒ moving toward the actor.
+        let dist = (fy * fy + fx * fx).sqrt();
+        if dist > 1e-6 {
+            closing += w * (-((vy * fy + vx * fx) / dist));
+        }
+        if w > 1e-12 {
+            entropy -= w * w.ln();
+        }
+    }
+    // Normalise entropy by ln(n) so a single dominant member ⇒ 0 and a flat field ⇒ 1.
+    let norm = (entries.len() as f64).ln();
+    let entropy = if norm > 1e-9 {
+        (entropy / norm).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (
+        soccer_neural_signed_unit(depth),
+        soccer_neural_unit(width),
+        soccer_neural_signed_unit(closing),
+        entropy,
+    )
+}
+
+/// Compute the eight relational-attention channels (teammate depth/width/closing/entropy, then the
+/// same for opponents) from the actor-relative whole-field motion block. Returns all-zeros when the
+/// motion block is the wrong length so an absent/older block degrades gracefully. The actor's own
+/// slot (the teammate nearest the origin in actor-relative space) is excluded from the teammate
+/// readout so a player does not attend to itself.
+fn soccer_relational_attention_readout(motion: &[f32]) -> [f64; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM] {
+    let mut out = [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM];
+    if motion.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
+        return out;
+    }
+    let per = SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+    // First 11 motion entities are teammates (incl. the actor), next 11 are opponents.
+    let half = SOCCER_NEURAL_FIELD_MOTION_PLAYERS / 2;
+    let entity = |slot: usize| -> (f64, f64, f64, f64) {
+        let base = slot * per;
+        (
+            f64::from(motion[base]),
+            f64::from(motion[base + 1]),
+            f64::from(motion[base + 2]),
+            f64::from(motion[base + 3]),
+        )
+    };
+    // Identify the actor's own slot (nearest the origin among teammates) to exclude it.
+    let mut self_slot = 0usize;
+    let mut self_dist = f64::INFINITY;
+    for slot in 0..half {
+        let (fy, fx, _, _) = entity(slot);
+        let d = fy * fy + fx * fx;
+        if d < self_dist {
+            self_dist = d;
+            self_slot = slot;
+        }
+    }
+    let teammates: Vec<(f64, f64, f64, f64)> =
+        (0..half).filter(|&s| s != self_slot).map(entity).collect();
+    let opponents: Vec<(f64, f64, f64, f64)> =
+        (half..SOCCER_NEURAL_FIELD_MOTION_PLAYERS).map(entity).collect();
+    let (td, tw, tc, te) = soccer_relational_attention_group(&teammates);
+    let (od, ow, oc, oe) = soccer_relational_attention_group(&opponents);
+    out[0] = td;
+    out[1] = tw;
+    out[2] = tc;
+    out[3] = te;
+    out[4] = od;
+    out[5] = ow;
+    out[6] = oc;
+    out[7] = oe;
+    out
+}
+
 fn soccer_neural_target_and_priority(
     adjusted_reward: f64,
     gamma: f64,
@@ -38483,6 +38695,21 @@ fn soccer_neural_transition_features_with_action(
     );
     features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT] =
         soccer_neural_unit(obs.pending_pass_receiver_approach_kinematic_fit);
+    // Relational attention readout (graph-style neighbourhood pooling over the whole-field motion
+    // block). Computed from the same actor-relative motion slice already laid into the feature
+    // vector; left all-zeros unless `DD_SOCCER_ENABLE_RELATIONAL_ATTENTION` is set, so old nets
+    // zero-pad-migrate and an A/B is a clean on/off within identical network dimensions.
+    if soccer_relational_attention_enabled() {
+        let readout = soccer_relational_attention_readout(field_player_motion);
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH] = readout[0];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_WIDTH] = readout[1];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_CLOSING] = readout[2];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_ENTROPY] = readout[3];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_DEPTH] = readout[4];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_WIDTH] = readout[5];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING] = readout[6];
+        features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY] = readout[7];
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -49959,9 +50186,18 @@ fn xavi_turn_enabled(config: &MatchConfig) -> bool {
 }
 
 fn dd_soccer_enable_obstacle_aware_intercept() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT"))
+    }
 }
 
 /// Whether obstacle-aware loose-ball intercept feasibility is live for this match: OFF unless the
