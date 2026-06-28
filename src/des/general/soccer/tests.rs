@@ -13707,6 +13707,10 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
     assert_eq!(
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -16726,6 +16730,121 @@ fn contested_receiver_approach_decision_reaches_mdp_pomdp_and_neural_features() 
     assert!(features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_PRESSURE] > 0.45);
     assert!(features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET] > 0.05);
     assert!(features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT] > 0.50);
+}
+
+#[test]
+fn graph_temporal_observation_reaches_neural_features() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.2,
+        seed: 18_411,
+        ..Default::default()
+    });
+    let actor_index = sim
+        .players
+        .iter()
+        .position(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+        .expect("home midfielder");
+    let forward_index = sim
+        .players
+        .iter()
+        .position(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home forward");
+    let reset_index = sim
+        .players
+        .iter()
+        .position(|player| player.team == Team::Home && player.role == PlayerRole::Defender)
+        .expect("home defender");
+    let marker_index = sim
+        .players
+        .iter()
+        .position(|player| player.team == Team::Away && player.role == PlayerRole::Midfielder)
+        .expect("away midfielder");
+    let actor = sim.players[actor_index].id;
+    let forward_support = sim.players[forward_index].id;
+    let reset_support = sim.players[reset_index].id;
+    let marker = sim.players[marker_index].id;
+    park_players_except(&mut sim, &[actor, forward_support, reset_support, marker]);
+
+    sim.players[actor_index].position = Vec2::new(40.0, 50.0);
+    sim.players[actor_index].position_history =
+        vec![Vec2::new(40.0, 45.0), Vec2::new(40.0, 50.0)].into();
+    sim.players[actor_index].velocity = Vec2::new(0.0, 2.5);
+    sim.players[forward_index].position = Vec2::new(42.0, 62.0);
+    sim.players[reset_index].position = Vec2::new(35.0, 45.0);
+    sim.players[marker_index].position = Vec2::new(37.0, 47.0);
+    sim.players[marker_index].velocity = Vec2::new(-0.5, -4.0);
+    sim.players[marker_index].acceleration = Vec2::new(-0.1, -2.0);
+    sim.ball.holder = Some(actor);
+    sim.ball.position = sim.players[actor_index].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    snapshot.home_team_possession_seconds = 6.0;
+    snapshot.away_team_possession_seconds = 2.0;
+    snapshot.ball_holder_possession_seconds = 3.0;
+    snapshot.away_directive.press_intensity = 0.85;
+
+    let observation = snapshot.observation_for(actor);
+    let graph = observation.neural_extended;
+    assert!(graph.graph_forward_support_edge_weight > 0.10);
+    assert!(graph.graph_reset_support_edge_weight > 0.10);
+    assert!(graph.graph_opponent_pressure_edge_weight > 0.30);
+    assert!(graph.graph_cover_shadow_edge_weight > 0.10);
+    assert!(graph.temporal_possession_memory_score > 0.50);
+    assert!(graph.temporal_actor_run_memory_score > 0.10);
+    assert!(graph.temporal_opponent_press_memory_score > 0.40);
+
+    let state = snapshot.mdp_state_for_player(actor);
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: actor,
+        team: Team::Home,
+        role: sim.players[actor_index].role,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "support-shape".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(actor),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE],
+        soccer_neural_unit(graph.graph_forward_support_edge_weight)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_GRAPH_RESET_SUPPORT_EDGE],
+        soccer_neural_unit(graph.graph_reset_support_edge_weight)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_GRAPH_OPPONENT_PRESSURE_EDGE],
+        soccer_neural_unit(graph.graph_opponent_pressure_edge_weight)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_GRAPH_COVER_SHADOW_EDGE],
+        soccer_neural_unit(graph.graph_cover_shadow_edge_weight)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_GRAPH_TEAM_COMPACTNESS_EDGE],
+        soccer_neural_unit(graph.graph_team_compactness_edge_weight)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY],
+        soccer_neural_unit(graph.temporal_possession_memory_score)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY],
+        soccer_neural_signed_unit(graph.temporal_actor_run_memory_score)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY],
+        soccer_neural_unit(graph.temporal_opponent_press_memory_score)
+    );
 }
 
 #[test]
@@ -48304,10 +48423,15 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
+    assert_eq!(SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM, 8);
     // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
         .contains(&(SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1)));
@@ -48468,6 +48592,10 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -48512,6 +48640,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_TEAM_CENTER_FEATURE_DIM));
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM)
     );
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -66253,6 +66384,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
     );
@@ -66294,6 +66429,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM),
         "the pre-reception-approach total must be a recognised legacy dim so old nets migrate"
     );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM),
+        "the pre-graph-temporal total must be a recognised legacy dim so old nets migrate"
+    );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_PERCEPTION_LATENCY + 1,
         SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_FORWARD
@@ -66316,6 +66455,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT + 1,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);

@@ -22,6 +22,15 @@ const SOCCER_POLICY_RANK_SALT_EXPLORATION: u64 = 0x4558_504c_4f52_4552;
 const SOCCER_POLICY_EPSILON_SALT_EXPLORATION: u64 = 0x4558_504c_4741_5445;
 const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE: f64 = 0.35;
 const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER: f64 = 4.0;
+const SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT: usize = 6;
+const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
+    if SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT > POLICY_SELECTION_TOP_RANK_LIMIT {
+        SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT
+    } else {
+        POLICY_SELECTION_TOP_RANK_LIMIT
+    };
+const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.10;
+const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.65;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
 const OWN_HALF_TINY_PASS_MAX_YARDS: f64 = 3.0;
 const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
@@ -946,44 +955,78 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
     ranked: &[SoccerLearnedActionTrace],
     draw: f64,
 ) -> Option<SoccerPolicyActionChoice> {
-    let legal = ranked
+    let mut legal = [None; SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT];
+    let mut candidate_count = 0usize;
+    for action in ranked
         .iter()
         .filter(|action| action.legal)
-        .take(POLICY_SELECTION_TOP_RANK_LIMIT)
-        .collect::<Vec<_>>();
-    let candidate_count = legal.len();
+        .take(SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT)
+    {
+        legal[candidate_count] = Some(action);
+        candidate_count += 1;
+    }
     if candidate_count == 0 {
         return None;
     }
-    let max_visits = legal.iter().map(|action| action.visits).max().unwrap_or(0) as f64;
+    let max_visits = legal[..candidate_count]
+        .iter()
+        .filter_map(|action| action.map(|action| action.visits))
+        .max()
+        .unwrap_or(0) as f64;
     let rank_weights = soccer_policy_top_rank_weights();
-    let mut weights = [0.0; POLICY_SELECTION_TOP_RANK_LIMIT];
+    let mut weights = [0.0; SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT];
+    let mut tail_raw_weights = [0.0; SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT];
     let mut total = 0.0;
-    for (rank, action) in legal.iter().enumerate() {
+    for (rank, action) in legal[..candidate_count].iter().enumerate() {
+        let action = action.expect("legal candidate slot filled");
         let visits = action.visits as f64;
         let relative_uncertainty = ((max_visits + 1.0) / (visits + 1.0)).sqrt();
         let multiplier = (1.0
             + SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE * (relative_uncertainty - 1.0).max(0.0))
         .clamp(1.0, SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER);
-        let weight = rank_weights[rank] * multiplier;
-        weights[rank] = weight;
-        total += weight;
+        if rank < POLICY_SELECTION_TOP_RANK_LIMIT {
+            let weight = rank_weights[rank] * multiplier;
+            weights[rank] = weight;
+            total += weight;
+        } else if multiplier > 1.0 && action.value.is_finite() {
+            let tail_rank = rank - POLICY_SELECTION_TOP_RANK_LIMIT;
+            let rank_decay = SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY.powi(tail_rank as i32);
+            let raw = (multiplier - 1.0) * rank_decay;
+            if raw.is_finite() && raw > 0.0 {
+                tail_raw_weights[rank] = raw;
+            }
+        }
+    }
+    let tail_raw_total: f64 = tail_raw_weights[..candidate_count].iter().sum();
+    if tail_raw_total.is_finite() && tail_raw_total > 1e-9 {
+        let tail_mass = SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT
+            .min(rank_weights[POLICY_SELECTION_TOP_RANK_LIMIT - 1].max(0.0));
+        for (rank, raw) in tail_raw_weights[..candidate_count].iter().enumerate() {
+            if *raw <= 0.0 {
+                continue;
+            }
+            let weight = tail_mass * *raw / tail_raw_total;
+            weights[rank] = weight;
+            total += weight;
+        }
     }
     if !total.is_finite() || total <= 1e-9 {
-        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
-        return legal
-            .get(selected_rank)
+        let selected_rank = soccer_policy_weighted_rank_index(
+            candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT),
+            draw,
+        );
+        return legal[selected_rank]
             .map(|action| SoccerPolicyActionChoice {
                 label: action.label.clone(),
                 behavior_probability: soccer_policy_rank_probability(
-                    candidate_count,
+                    candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT),
                     selected_rank,
                 ),
             });
     }
     let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
     let mut selected_rank = 0usize;
-    for (rank, weight) in weights.iter().take(candidate_count).enumerate() {
+    for (rank, weight) in weights[..candidate_count].iter().enumerate() {
         if threshold < *weight {
             selected_rank = rank;
             break;
@@ -991,8 +1034,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
         threshold -= *weight;
         selected_rank = rank;
     }
-    legal
-        .get(selected_rank)
+    legal[selected_rank]
         .map(|action| SoccerPolicyActionChoice {
             label: action.label.clone(),
             behavior_probability: (weights[selected_rank] / total).clamp(0.0, 1.0),
@@ -1249,6 +1291,36 @@ mod tests {
         assert_eq!(choice.label, "pass");
         assert!(choice.behavior_probability > 0.20);
         assert!(choice.behavior_probability < 0.70);
+    }
+
+    #[test]
+    fn policy_uncertainty_exploration_reaches_under_visited_tail_action() {
+        let ranked = vec![
+            learned_action_trace("shoot", 100),
+            learned_action_trace("pass", 100),
+            learned_action_trace("dribble", 100),
+            learned_action_trace("switch-play", 0),
+            learned_action_trace("hold", 100),
+        ];
+        let choice =
+            soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, 0.95).expect("choice");
+        assert_eq!(choice.label, "switch-play");
+        assert!(choice.behavior_probability > 0.08);
+        assert!(choice.behavior_probability < 0.10);
+    }
+
+    #[test]
+    fn policy_uncertainty_exploration_does_not_touch_tail_when_visits_match() {
+        let ranked = vec![
+            learned_action_trace("shoot", 10),
+            learned_action_trace("pass", 10),
+            learned_action_trace("dribble", 10),
+            learned_action_trace("switch-play", 10),
+        ];
+        let choice =
+            soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, 0.95).expect("choice");
+        assert_eq!(choice.label, "dribble");
+        assert!((choice.behavior_probability - 0.10).abs() < 1e-9);
     }
 
     #[test]

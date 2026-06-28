@@ -3787,6 +3787,10 @@ const SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM: usize = 6;
 /// into the approaching ball, the signed approach/retreat amount, race margin, and
 /// current position/velocity/acceleration/jerk fit for that move.
 const SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM: usize = 4;
+/// Append-only graph-temporal block: compact edge/attention summaries over the
+/// 22-player+ball graph plus short memory signals. This is the live substrate for
+/// graph-temporal policy/value models while preserving the existing MLP path.
+const SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM: usize = 8;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3804,8 +3808,10 @@ const SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4181,6 +4187,22 @@ const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_TARGET + 1;
 const SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT: usize =
     SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_RACE + 1;
+const SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE: usize =
+    SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_GRAPH_RESET_SUPPORT_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_GRAPH_OPPONENT_PRESSURE_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_GRAPH_RESET_SUPPORT_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_GRAPH_COVER_SHADOW_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_GRAPH_OPPONENT_PRESSURE_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_GRAPH_TEAM_COMPACTNESS_EDGE: usize =
+    SOCCER_NEURAL_FEATURE_GRAPH_COVER_SHADOW_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY: usize =
+    SOCCER_NEURAL_FEATURE_GRAPH_TEAM_COMPACTNESS_EDGE + 1;
+const SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY: usize =
+    SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY + 1;
+const SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY: usize =
+    SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4297,6 +4319,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM,
     // Same schema with killer over-top pass channels, before reception-approach control.
     SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM,
+    // Same schema with reception-approach channels, before graph-temporal features.
+    SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5612,6 +5636,35 @@ pub struct SoccerNeuralExtendedObservation {
     /// Opponent learned forward-intent (their value-head formation pull), in
     /// [0, 1]; 0 unless they run the neural blend.
     pub opponent_neural_intent_attack: f64,
+    // --- Graph-temporal encoder summary (typed relation/memory features) ---
+    /// Best attack-direction teammate support edge, [0, 1]. High means a nearby
+    /// teammate is ahead in a useful receiving lane.
+    #[serde(default)]
+    pub graph_forward_support_edge_weight: f64,
+    /// Best reset/recycle support edge, [0, 1]. High means a nearby teammate is
+    /// behind or square in a viable pressure-release lane.
+    #[serde(default)]
+    pub graph_reset_support_edge_weight: f64,
+    /// Nearest-opponent pressure edge, [0, 1], blending distance and closing speed.
+    #[serde(default)]
+    pub graph_opponent_pressure_edge_weight: f64,
+    /// Cover-shadow weight, [0, 1], when the nearest opponent blocks the strongest
+    /// support edge between this actor and a teammate.
+    #[serde(default)]
+    pub graph_cover_shadow_edge_weight: f64,
+    /// Local teammate-vs-opponent density balance, [0, 1], as a compact team
+    /// graph/compactness signal.
+    #[serde(default)]
+    pub graph_team_compactness_edge_weight: f64,
+    /// Short memory of own-team possession control, [0, 1].
+    #[serde(default)]
+    pub temporal_possession_memory_score: f64,
+    /// Signed memory of this actor's recent attack-direction run, [-1, 1].
+    #[serde(default)]
+    pub temporal_actor_run_memory_score: f64,
+    /// Short memory of opponent press pressure, [0, 1].
+    #[serde(default)]
+    pub temporal_opponent_press_memory_score: f64,
     // --- Back-four average-y line model (team aggregate, attack-direction frame) ---
     /// Raw average `y` position of the team's defenders, in yards.
     #[serde(default)]
@@ -37111,6 +37164,9 @@ fn soccer_neural_extended_observation(
 
     // --- Relational (single pass over the other 21 players) ---
     const LOCAL_RADIUS_YARDS: f64 = 10.0;
+    const GRAPH_SUPPORT_EDGE_DISTANCE_YARDS: f64 = 36.0;
+    const GRAPH_RESET_SUPPORT_REFERENCE_YARDS: f64 = 14.0;
+    const GRAPH_COVER_SHADOW_WIDTH_YARDS: f64 = 5.0;
     // Dribble-lane sampling: opponents ahead-and-around the carrier, classified into the
     // left / centre / right forward sectors, proximity-weighted — so the value/policy net
     // learns WHICH WAY there is room to dribble/cut, not just how much space is straight
@@ -37123,6 +37179,9 @@ fn soccer_neural_extended_observation(
     let mut nearest_teammate_forward_offset = 0.0;
     let mut local_opponent_count = 0.0;
     let mut local_teammate_count = 0.0;
+    let mut graph_forward_support_edge_weight = 0.0;
+    let mut graph_reset_support_edge_weight = 0.0;
+    let mut graph_strongest_support_edge: Option<(Vec2, f64)> = None;
     let mut lane_density = [0.0f64; 3]; // [left, centre, right]
     for other in &snapshot.players {
         if other.id == me.id {
@@ -37131,9 +37190,39 @@ fn soccer_neural_extended_observation(
         let other_position = snapshot.player_snapshot_position(other);
         let distance = (other_position - me_position).len();
         if other.team == team {
+            let forward_offset = (other_position.y - me_position.y) * attack_dir;
+            let distance_fit = if distance.is_finite() {
+                (1.0 - distance / GRAPH_SUPPORT_EDGE_DISTANCE_YARDS).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let forward_edge =
+                (distance_fit * (forward_offset / 18.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            let reset_depth_fit = if (-18.0..=3.0).contains(&forward_offset) {
+                (1.0
+                    - (forward_offset + 5.0).abs() / GRAPH_RESET_SUPPORT_REFERENCE_YARDS)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let reset_edge = (distance_fit * reset_depth_fit).clamp(0.0, 1.0);
+            if forward_edge > graph_forward_support_edge_weight {
+                graph_forward_support_edge_weight = forward_edge;
+            }
+            if reset_edge > graph_reset_support_edge_weight {
+                graph_reset_support_edge_weight = reset_edge;
+            }
+            let support_edge = forward_edge.max(reset_edge);
+            if support_edge
+                > graph_strongest_support_edge
+                    .map(|(_, edge)| edge)
+                    .unwrap_or(0.0)
+            {
+                graph_strongest_support_edge = Some((other_position, support_edge));
+            }
             if distance < nearest_teammate_dist {
                 nearest_teammate_dist = distance;
-                nearest_teammate_forward_offset = (other_position.y - me_position.y) * attack_dir;
+                nearest_teammate_forward_offset = forward_offset;
             }
             if distance <= LOCAL_RADIUS_YARDS {
                 local_teammate_count += 1.0;
@@ -37279,12 +37368,44 @@ fn soccer_neural_extended_observation(
     } else {
         40.0
     };
+    let nearest_opponent_distance = nearest_opp
+        .map(|(distance, _, _, _, _, _)| distance)
+        .unwrap_or(40.0);
+    let pressure_distance_fit =
+        (1.0 - nearest_opponent_distance / LOCAL_RADIUS_YARDS.max(1.0)).clamp(0.0, 1.0);
+    let pressure_closing_fit = (nearest_opponent_closing_rate_yps / 7.0).clamp(0.0, 1.0);
+    let graph_opponent_pressure_edge_weight =
+        (pressure_distance_fit * 0.65 + pressure_closing_fit * 0.35).clamp(0.0, 1.0);
+    let graph_cover_shadow_edge_weight = match (graph_strongest_support_edge, nearest_opp) {
+        (Some((support_position, support_edge)), Some((_, opponent_position, _, _, _, _)))
+            if support_edge > 0.0 && me_position.distance(support_position) > 1.0 =>
+        {
+            let shadow_fit = (1.0
+                - segment_distance_to_point(me_position, support_position, opponent_position)
+                    / GRAPH_COVER_SHADOW_WIDTH_YARDS)
+                .clamp(0.0, 1.0);
+            (shadow_fit * support_edge).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    };
+    let graph_team_compactness_edge_weight =
+        (0.5_f64 + (local_teammate_count - local_opponent_count) / 6.0_f64).clamp(0.0, 1.0);
 
     // --- Opponent intent (the other team's directive on the snapshot) ---
     let opponent_directive = match team {
         Team::Home => &snapshot.away_directive,
         Team::Away => &snapshot.home_directive,
     };
+    let temporal_possession_memory_score =
+        (0.7 * (own_possession_seconds / 8.0).clamp(0.0, 1.0)
+            + 0.3 * (snapshot.ball_holder_possession_seconds / 4.0).clamp(0.0, 1.0))
+        .clamp(0.0, 1.0);
+    let temporal_actor_run_memory_score =
+        (own_recent_forward_progress_yards / 18.0).clamp(-1.0, 1.0);
+    let temporal_opponent_press_memory_score = (opponent_directive.press_intensity * 0.45
+        + graph_opponent_pressure_edge_weight * 0.35
+        + (opponent_possession_seconds / 8.0).clamp(0.0, 1.0) * 0.20)
+        .clamp(0.0, 1.0);
     // Defensive line height from the actor's perspective: how far the opponent's
     // line sits up the pitch toward the actor's own goal (positive = high press).
     let opponent_defensive_line_offset =
@@ -37328,6 +37449,14 @@ fn soccer_neural_extended_observation(
         opponent_neural_intent_attack: finite_metric(
             opponent_directive.neural_formation_attack_score,
         ),
+        graph_forward_support_edge_weight: finite_metric(graph_forward_support_edge_weight),
+        graph_reset_support_edge_weight: finite_metric(graph_reset_support_edge_weight),
+        graph_opponent_pressure_edge_weight: finite_metric(graph_opponent_pressure_edge_weight),
+        graph_cover_shadow_edge_weight: finite_metric(graph_cover_shadow_edge_weight),
+        graph_team_compactness_edge_weight: finite_metric(graph_team_compactness_edge_weight),
+        temporal_possession_memory_score: finite_metric(temporal_possession_memory_score),
+        temporal_actor_run_memory_score: finite_metric(temporal_actor_run_memory_score),
+        temporal_opponent_press_memory_score: finite_metric(temporal_opponent_press_memory_score),
         back_four_line_y: back_four_line.line_y,
         back_four_line_target_delta_yards: back_four_line.target_delta_yards,
         back_four_line_forward_velocity_yps: back_four_line.line_forward_velocity_yps,
@@ -38483,6 +38612,23 @@ fn soccer_neural_transition_features_with_action(
     );
     features[SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT] =
         soccer_neural_unit(obs.pending_pass_receiver_approach_kinematic_fit);
+    let graph_temporal = &obs.neural_extended;
+    features[SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE] =
+        soccer_neural_unit(graph_temporal.graph_forward_support_edge_weight);
+    features[SOCCER_NEURAL_FEATURE_GRAPH_RESET_SUPPORT_EDGE] =
+        soccer_neural_unit(graph_temporal.graph_reset_support_edge_weight);
+    features[SOCCER_NEURAL_FEATURE_GRAPH_OPPONENT_PRESSURE_EDGE] =
+        soccer_neural_unit(graph_temporal.graph_opponent_pressure_edge_weight);
+    features[SOCCER_NEURAL_FEATURE_GRAPH_COVER_SHADOW_EDGE] =
+        soccer_neural_unit(graph_temporal.graph_cover_shadow_edge_weight);
+    features[SOCCER_NEURAL_FEATURE_GRAPH_TEAM_COMPACTNESS_EDGE] =
+        soccer_neural_unit(graph_temporal.graph_team_compactness_edge_weight);
+    features[SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY] =
+        soccer_neural_unit(graph_temporal.temporal_possession_memory_score);
+    features[SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY] =
+        soccer_neural_signed_unit(graph_temporal.temporal_actor_run_memory_score);
+    features[SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY] =
+        soccer_neural_unit(graph_temporal.temporal_opponent_press_memory_score);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
