@@ -50139,9 +50139,17 @@ fn dd_soccer_disable_slide_tackle() -> bool {
 /// `None`, every new observation field stays zero, the new action option is inert, and the
 /// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
 fn dd_soccer_enable_blindside_steal() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
+    #[cfg(test)]
+    {
+        // Read fresh under test so a single process can A/B the gate per test.
+        std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
+    }
 }
 
 /// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
