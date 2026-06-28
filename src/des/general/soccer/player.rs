@@ -2488,6 +2488,134 @@ pub(crate) fn forward_pass_first_enabled() -> bool {
     }
 }
 
+/// Whether the **isolated attacking-carrier drive** is active this process. This is the fix for
+/// the "no teammate ahead ⇒ panic backward pass" blunder: the carrier instead either drives at
+/// goal solo or holds the ball up moving forward while support arrives, with a backward recycle
+/// as the very last resort. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE=0/false` is the kill switch); default-OFF under test
+/// so the option-scoring parity suite stays byte-identical. See
+/// [`isolated_attacking_carrier_drive_mode`].
+pub(crate) fn isolated_carrier_drive_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE"))
+    }
+}
+
+/// What an isolated attacking carrier (no teammate ahead, no open forward pass) should do
+/// INSTEAD of panicking into a backward pass. See [`isolated_attacking_carrier_drive_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IsolatedCarrierDriveMode {
+    /// Few defenders are goal-side of the ball, OR there's space + a speed advantage to run into:
+    /// drive at goal at a sprint and shoot once inside [`ISOLATED_CARRIER_SHOOT_YARDS`].
+    SoloGoalDrive,
+    /// A solo goal does not look promising: keep the ball, carry it forward / on an angle at a
+    /// CONTROLLED pace (not a sprint), and wait for teammates to push up into the attack. A
+    /// backward/square recycle is the very last resort.
+    HoldUp,
+}
+
+/// "Fewer than 4 defenders behind the ball" (the user's threshold): with this many or more
+/// opponents goal-side of the ball a solo run is into a packed block, so prefer hold-up.
+const ISOLATED_CARRIER_MAX_DEFENDERS_BEHIND_BALL: usize = 4;
+/// Forward dribble space (yards) that counts as "a lot of space to run into" for the solo drive.
+const ISOLATED_CARRIER_SOLO_OPEN_SPACE_YARDS: f64 = 12.0;
+/// Nearest-opponent distance (yards) clear of the carrier that counts as runway for the solo run.
+const ISOLATED_CARRIER_SOLO_RUNWAY_YARDS: f64 = 6.0;
+/// Closing rate (yards/sec) at/below which the nearest opponent is NOT catching the carrier — a
+/// favourable speed differential. Negative means the defender is falling behind.
+const ISOLATED_CARRIER_SOLO_CLOSING_CUTOFF_YPS: f64 = 0.5;
+/// Once the solo driver is within this range of goal he should look to shoot (the user's 25 yards).
+const ISOLATED_CARRIER_SHOOT_YARDS: f64 = 25.0;
+/// A forward pass option this open means the carrier is NOT actually isolated — let the normal
+/// forward-pass-first / killer-pass logic play it instead of forcing a drive/hold-up.
+const ISOLATED_CARRIER_FORWARD_OPTION_OPEN_CUTOFF: f64 = 0.45;
+
+/// A clear runway + favourable speed differential for the solo goal drive: lots of forward space,
+/// the nearest opponent is not on top of the carrier, and is not closing the gap. Pure + RNG-free.
+pub(crate) fn isolated_carrier_solo_speed_space_advantage(
+    observation: &SoccerPomdpObservation,
+) -> bool {
+    let big_space =
+        observation.forward_dribble_space_yards >= ISOLATED_CARRIER_SOLO_OPEN_SPACE_YARDS;
+    let runway = observation.nearest_opponent_distance >= ISOLATED_CARRIER_SOLO_RUNWAY_YARDS;
+    let pulling_away = observation
+        .neural_extended
+        .nearest_opponent_closing_rate_yps
+        <= ISOLATED_CARRIER_SOLO_CLOSING_CUTOFF_YPS;
+    big_space && runway && pulling_away
+}
+
+/// Recognise the "isolated attacking carrier" picture and choose the response. Returns `None`
+/// unless THIS carrier is an attacker (a Forward, or a wide / outside midfielder — i.e. a winger)
+/// who has the ball in the ATTACKING half with NO teammate ahead of him AND no genuinely open
+/// forward pass on. That is precisely the state that used to deteriorate into a panicked backward
+/// pass. When it holds, the carrier should DRIVE at goal ([`SoloGoalDrive`]) when few defenders
+/// are behind the ball or there's space + a speed advantage, otherwise hold the ball up
+/// ([`HoldUp`]) and wait for support — never recycle backwards as a first instinct. Pure +
+/// RNG-free so it can be unit-tested and shared by the scoring and gait paths.
+///
+/// [`SoloGoalDrive`]: IsolatedCarrierDriveMode::SoloGoalDrive
+/// [`HoldUp`]: IsolatedCarrierDriveMode::HoldUp
+pub(crate) fn isolated_attacking_carrier_drive_mode(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    is_outside_midfielder: bool,
+) -> Option<IsolatedCarrierDriveMode> {
+    // Only the attacking carriers who actually get stranded up top: strikers AND wide midfielders
+    // (wingers), per the report that outside mids exhibit the same bug.
+    if !(role == PlayerRole::Forward || is_outside_midfielder) {
+        return None;
+    }
+    if !observation.has_ball {
+        return None;
+    }
+    // Only when attacking (in the opponent half / past the half-way line). Never override the
+    // own-half retention / build-up / clearance logic, where a safe backward ball is correct.
+    if observation.yards_to_goal >= observation.yards_to_own_goal {
+        return None;
+    }
+    // The bug's precondition: nobody ahead of the carrier to play, and no genuinely open forward
+    // pass option on. (When a forward man IS open, the forward-pass-first / killer-pass paths
+    // handle it — this recogniser stays out of the way.)
+    let no_teammate_ahead =
+        observation.field_teammates_ahead == 0 && observation.teammates_ahead == 0;
+    if !no_teammate_ahead {
+        return None;
+    }
+    let forward_option_open = observation.visible_forward_pass_options > 0
+        && observation
+            .best_forward_pass_option_quality
+            .max(observation.best_forward_pass_receiver_openness)
+            >= ISOLATED_CARRIER_FORWARD_OPTION_OPEN_CUTOFF;
+    if forward_option_open {
+        return None;
+    }
+    // Solo goal vs hold-up: few defenders goal-side of the ball, OR space + a speed advantage.
+    let defenders_behind_ball = observation.field_opponents_ahead;
+    let solo = defenders_behind_ball < ISOLATED_CARRIER_MAX_DEFENDERS_BEHIND_BALL
+        || isolated_carrier_solo_speed_space_advantage(observation);
+    Some(if solo {
+        IsolatedCarrierDriveMode::SoloGoalDrive
+    } else {
+        IsolatedCarrierDriveMode::HoldUp
+    })
+}
+
+/// Whether `role` at home-x `home_x` is an outside (wide) midfielder — a winger. Matches the
+/// `outside_midfielder` test used inside [`possession_action_options`], factored out so the gait
+/// resolver can reuse it for [`isolated_attacking_carrier_drive_mode`].
+pub(crate) fn is_outside_midfielder_role(role: PlayerRole, home_x: f64, field_width: f64) -> bool {
+    role == PlayerRole::Midfielder
+        && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
+}
+
 /// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
 /// released early instead of dwelt on (the user's "if that option is forward and sufficiently
 /// open"). Below this the carrier keeps his normal patience.
@@ -4415,19 +4543,7 @@ impl PlayerAgent {
             low_pressure_pass_release_multiplier(observation, PassFlight::Floor);
         let aerial_pass_patience_multiplier =
             low_pressure_pass_release_multiplier(observation, PassFlight::Aerial);
-        // Slip-and-break-the-offside-trap release: when a teammate has STARTED a timed break and
-        // is ~2–3 yd before the line (still onside, sprinting), the firm forward ground ball must
-        // be slipped NOW — the pass comes after the run. Lift the forward pass score and raise the
-        // release cap so the slip isn't clamped away into a hold/dribble. Gated; 0 (inert) when
-        // off ⇒ byte-identical. See `slip_break_release_now` / `dd_soccer_enable_slip_break_offside`.
-        let slip_break_release = if dd_soccer_enable_slip_break_offside() {
-            observation.slip_break_release_now.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let slip_break_pass_multiplier = 1.0 + slip_break_release * SLIP_BREAK_RELEASE_PASS_LIFT;
-        let hold_release_score_cap = (1.22 * hold_release_multiplier.clamp(1.0, 1.38))
-            * (1.0 + slip_break_release * SLIP_BREAK_RELEASE_CAP_LIFT);
+        let hold_release_score_cap = 1.22 * hold_release_multiplier.clamp(1.0, 1.38);
         let aerial_forward_runner_multiplier = observation
             .aerial_forward_runner_pass_multiplier
             .clamp(1.0, 1.50);
@@ -4772,7 +4888,6 @@ impl PlayerAgent {
                 * crowded_pass_lift
                 * pressured_release_multiplier
                 * panic_pass_damp
-                * slip_break_pass_multiplier
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
             options.push(AgentActionOptionTrace::new(
@@ -5257,6 +5372,30 @@ impl PlayerAgent {
                 for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
                     scale_legal_option_score(&mut options, label, dwell_damp);
                 }
+            }
+        }
+        // Blindside-steal ESCAPE (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`; OFF ⇒ the threat
+        // field is always 0 ⇒ no-op, byte-identical). Once the carrier has GLANCED and
+        // RECOGNISED a defender sneaking up on its blind side, it should break away NOW —
+        // accelerate forward into space or release early — rather than dwell with a slow
+        // shielded dribble the thief nicks from behind. Escalates with the perceived threat.
+        let blindside_escape = observation.blindside_threat_from_behind.clamp(0.0, 1.0);
+        if blindside_escape > 0.0 {
+            let accel_floor = (0.18 + 0.52 * blindside_escape).clamp(0.0, 0.82);
+            for label in ["carry-forward", "vertical-attack"] {
+                ensure_min_legal_option_probability(&mut options, label, accel_floor);
+            }
+            if pass_target_count > 0 {
+                ensure_min_legal_option_probability(
+                    &mut options,
+                    "pass1",
+                    (0.28 + 0.42 * blindside_escape).clamp(0.0, 0.78),
+                );
+            }
+            // Stop standing still / shielding INTO the thief — exactly what gets robbed.
+            let dwell_damp = (1.0 - 0.58 * blindside_escape).clamp(0.35, 1.0);
+            for label in ["protect-ball", "hold-up-flank", "side-step", "nutmeg"] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
             }
         }
         let mut options = normalize_action_options(options);
@@ -6157,6 +6296,24 @@ impl PlayerAgent {
             AgentActionOptionTrace::new("defend-roam", roam_score, true),
             AgentActionOptionTrace::new("press-cover", press_cover_score, press_cover_legal),
         ];
+        // Surprise steal from behind (gated; the assessment is `None` when the gate is off OR
+        // there is no live blind-arc chance, so the option is APPENDED only for a real
+        // opportunity — keeping the option set byte-identical in the common/off case). When
+        // this defender has crept behind a slow forward-dribbler it believes it can catch,
+        // creeping in to nick the ball becomes a live choice ∝ opportunity × press appetite.
+        if self.role != PlayerRole::Goalkeeper {
+            if let Some(assessment) = snapshot.blindside_steal_assessment(self.id) {
+                let blindside_score = ((0.06 + assessment.opportunity * 0.40)
+                    * (0.60 + press * 0.40)
+                    * (0.70 + defending * 0.30))
+                    .clamp(0.01, 0.55);
+                options.push(AgentActionOptionTrace::new(
+                    "blindside-steal",
+                    blindside_score,
+                    true,
+                ));
+            }
+        }
         if self.role == PlayerRole::Goalkeeper {
             ensure_min_legal_option_probability(&mut options, "defend-shape", 0.97);
         }
@@ -6275,7 +6432,21 @@ impl PlayerAgent {
         let wrong_side_emergency_contact = !goal_side_or_level
             && distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
             && defender_steal_skill + 0.20 >= holder_security;
-        if !goal_side_or_level && !wrong_side_emergency_contact {
+        // Surprise steal from behind (gated; OFF ⇒ assessment is `None`). A defender that has
+        // crept into a slow, forward-dribbling carrier's blind arc and is now at contact range
+        // nicks the ball — the one case a steal from behind is won, because an unaware carrier
+        // at a walk/jog is not shielding the led ball. It is deliberately the wrong-side (not
+        // goal-side) exception, so it must be evaluated BEFORE the goal-side early-out below.
+        // The catch-belief / slowness / blind-arc gating all lives in `blindside_steal_assessment`.
+        let blindside_contact = snapshot
+            .blindside_steal_assessment(self.id)
+            .map(|assessment| {
+                assessment.target == holder
+                    && assessment.gap_yards <= BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS
+                    && assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD
+            })
+            .unwrap_or(false);
+        if !goal_side_or_level && !wrong_side_emergency_contact && !blindside_contact {
             return None;
         }
         let clean_contact = distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
@@ -6308,7 +6479,8 @@ impl PlayerAgent {
             && ball_protection < CONTESTABLE_PROTECTION_THRESHOLD
             && goal_side_or_level;
 
-        (clean_contact || exposed_dribble || contestable_close).then_some(holder)
+        (clean_contact || exposed_dribble || contestable_close || blindside_contact)
+            .then_some(holder)
     }
 
     fn loose_ball_action_options(
