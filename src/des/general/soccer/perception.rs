@@ -47,10 +47,16 @@ pub const OCCLUSION_MIN_DEPTH_YARDS: f64 = 0.5;
 /// target as not visible (a fully-screened man).
 pub const OCCLUSION_BLOCK_THRESHOLD: f64 = 0.6;
 
-/// Largest position error (yards) injected at zero confidence. Scales linearly
-/// with `(1 - confidence)`, so a clearly-seen target (confidence → 1) is perceived
-/// essentially where it is.
+/// Largest position error (yards) injected at zero confidence. The error radius is
+/// `(1 - confidence) · this · sqrt(u)` for a uniform `u`, i.e. sampled across the
+/// uncertainty disk (not pinned to its rim), so a clearly-seen target
+/// (confidence → 1) is perceived essentially where it is.
 pub const PERCEPTION_MAX_POSITION_ERROR_YARDS: f64 = 4.0;
+/// Largest staleness (seconds of the target's own motion) the belief lags by at
+/// zero confidence. Scales with `(1 - confidence)`: an uncertain observer tracks a
+/// motion-extrapolated *past* position rather than the live one — the AV
+/// "track through the gap with the prediction" behaviour.
+pub const PERCEPTION_MAX_LAG_SECONDS: f64 = 0.4;
 /// Ticks a perceived mis-location is held before it refreshes. Bucketing the seed
 /// by this keeps a player committed to one (wrong) estimate for ~a reaction window
 /// instead of dithering a fresh error every tick. ~0.27 s at 15 ticks/s.
@@ -138,12 +144,13 @@ pub fn sightline_occlusion_fraction(
 }
 
 /// Deterministic, bounded position error injected for a target seen at
-/// `confidence`. The error magnitude is `(1 - confidence) ·
-/// PERCEPTION_MAX_POSITION_ERROR_YARDS` and its direction is a stable hash of
-/// `seed` (e.g. `observer_id`, `target_id`, and a coarse time bucket), so within a
-/// tick the same pair always mis-locates the same way (no per-call jitter / dithered
-/// shaking) yet different pairs and moments differ. Returns `true_pos` unchanged at
-/// full confidence or on non-finite input.
+/// `confidence`, sampled across the uncertainty **disk** (not its rim): the radius
+/// is `(1 - confidence) · PERCEPTION_MAX_POSITION_ERROR_YARDS · sqrt(u)` and the
+/// angle is `2π·u'`, both from a stable hash of `seed` (e.g. `observer_id`,
+/// `target_id`, a coarse time bucket). So within a tick the same pair always
+/// mis-locates the same way (no per-call jitter), different pairs/moments differ,
+/// and the error is distributed in magnitude rather than always at the maximum.
+/// Returns `true_pos` unchanged at full confidence or on non-finite input.
 pub fn perceived_position(true_pos: Vec2, confidence: f64, seed: u64) -> Vec2 {
     if !true_pos.x.is_finite() || !true_pos.y.is_finite() {
         return true_pos;
@@ -153,18 +160,47 @@ pub fn perceived_position(true_pos: Vec2, confidence: f64, seed: u64) -> Vec2 {
     } else {
         1.0
     };
-    let error = (1.0 - conf) * PERCEPTION_MAX_POSITION_ERROR_YARDS;
-    if error <= 1e-6 {
+    let max_radius = (1.0 - conf) * PERCEPTION_MAX_POSITION_ERROR_YARDS;
+    if max_radius <= 1e-6 {
         return true_pos;
     }
-    // Stable angle from the seed via mulberry32 (the engine's PRNG), used as a
-    // pure hash here — seeded once, one draw, no retained state.
+    // Two stable draws from mulberry32 (the engine's PRNG), used as a pure hash
+    // here — seeded once, no retained state. `sqrt(u)` for the radius makes the
+    // sample uniform over the disk rather than concentrated on its edge.
     let mut rng = mulberry32((seed ^ (seed >> 32)) as u32 ^ 0x9E37_79B9);
     let angle = rng.next_float() * std::f64::consts::TAU;
+    let radius = max_radius * rng.next_float().sqrt();
     Vec2::new(
-        true_pos.x + angle.cos() * error,
-        true_pos.y + angle.sin() * error,
+        true_pos.x + angle.cos() * radius,
+        true_pos.y + angle.sin() * radius,
     )
+}
+
+/// Like [`perceived_position`] but first lags the belief along the target's own
+/// motion: an uncertain observer tracks where the target *was* up to
+/// `(1 - confidence) · PERCEPTION_MAX_LAG_SECONDS` ago, then the disk error is
+/// added on top. This is the faithful AV behaviour — when a measurement is poor
+/// you coast on the last good track — and it makes fast movers harder to mark
+/// precisely (the staleness is proportional to their speed). Returns
+/// [`perceived_position`] (no lag) at full confidence or on non-finite velocity.
+pub fn perceived_position_lagged(
+    true_pos: Vec2,
+    velocity: Vec2,
+    confidence: f64,
+    seed: u64,
+) -> Vec2 {
+    let conf = if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let lag = (1.0 - conf) * PERCEPTION_MAX_LAG_SECONDS;
+    let believed = if lag > 1e-6 && velocity.x.is_finite() && velocity.y.is_finite() {
+        Vec2::new(true_pos.x - velocity.x * lag, true_pos.y - velocity.y * lag)
+    } else {
+        true_pos
+    };
+    perceived_position(believed, conf, seed)
 }
 
 #[cfg(test)]
@@ -261,6 +297,43 @@ mod tests {
             perceived_position(p, 0.3, 99),
             perceived_position(p, 0.3, 100),
             "different seeds mis-locate differently"
+        );
+    }
+
+    #[test]
+    fn perceived_error_is_disk_distributed_not_a_fixed_ring() {
+        // A ring model would give the SAME magnitude for every seed at a fixed
+        // confidence; the disk sampling must produce DIFFERENT magnitudes.
+        let p = Vec2::new(10.0, 10.0);
+        let m1 = perceived_position(p, 0.2, 1).distance(p);
+        let m2 = perceived_position(p, 0.2, 2).distance(p);
+        let m3 = perceived_position(p, 0.2, 3).distance(p);
+        assert!(
+            (m1 - m2).abs() > 1e-6 || (m1 - m3).abs() > 1e-6,
+            "error magnitude must vary with the seed (disk, not ring): {m1} {m2} {m3}"
+        );
+        for m in [m1, m2, m3] {
+            assert!(m <= 0.8 * PERCEPTION_MAX_POSITION_ERROR_YARDS + 1e-9, "bounded: {m}");
+        }
+    }
+
+    #[test]
+    fn lagged_belief_trails_a_fast_mover_and_is_exact_when_sure() {
+        let true_pos = Vec2::new(0.0, 50.0);
+        let velocity = Vec2::new(0.0, 20.0); // sprinting up-field (+y)
+        // Fully uncertain: belief lags ~v·MAX_LAG (8yd back), dominating the ≤3.2yd
+        // disk error, so the perceived y is clearly behind the true y.
+        let unsure = perceived_position_lagged(true_pos, velocity, 0.0, 5);
+        assert!(
+            unsure.y < true_pos.y,
+            "an uncertain observer tracks a stale (trailing) position: {} < {}",
+            unsure.y,
+            true_pos.y
+        );
+        // Fully confident: no lag and no error ⇒ exact.
+        assert_eq!(
+            perceived_position_lagged(true_pos, velocity, 1.0, 5),
+            true_pos
         );
     }
 }

@@ -26212,13 +26212,19 @@ impl WorldSnapshot {
             }
         }
         let Some((target, target_position, _)) = matched_target else {
-            return Some(measurement_confidence);
+            return Some(self.occlusion_scaled_confidence(
+                observer_id,
+                observer_position,
+                point,
+                None,
+                measurement_confidence,
+            ));
         };
         let to_target = target_position - observer_position;
         let in_front = facing
             .map(|facing| facing.normalized().dot(to_target.normalized()) >= 0.0)
             .unwrap_or(false);
-        Some(kalman_perception_position_confidence(
+        let kalman = kalman_perception_position_confidence(
             measurement_confidence,
             target_position,
             target.velocity,
@@ -26226,7 +26232,44 @@ impl WorldSnapshot {
             self.dt_seconds,
             in_front,
             observer_has_ball,
+        );
+        Some(self.occlusion_scaled_confidence(
+            observer_id,
+            observer_position,
+            point,
+            Some(target.id),
+            kalman,
         ))
+    }
+
+    /// Multiply a perception `confidence` down by how screened the sightline
+    /// `observer → point` is (excluding `target_id` itself as a blocker). Gated by
+    /// `DD_SOCCER_ENABLE_OCCLUSION`; OFF ⇒ returns `confidence` unchanged so the
+    /// confidence model is byte-identical. This makes body-occlusion grade the
+    /// SAME confidence every consumer reads, consistent with the hard visibility
+    /// cut in `player_can_see_point` (which fires once the screen is near-total).
+    fn occlusion_scaled_confidence(
+        &self,
+        observer_id: usize,
+        observer_position: Vec2,
+        point: Vec2,
+        target_id: Option<usize>,
+        confidence: f64,
+    ) -> f64 {
+        if !occlusion_enabled() {
+            return confidence;
+        }
+        let blockers = self.players.iter().filter_map(|p| {
+            (p.id != observer_id && Some(p.id) != target_id)
+                .then(|| self.player_snapshot_position(p))
+        });
+        let occ = sightline_occlusion_fraction(
+            observer_position,
+            point,
+            blockers,
+            OCCLUSION_BODY_RADIUS_YARDS,
+        );
+        (confidence * (1.0 - occ)).clamp(0.0, 1.0)
     }
 
     /// The position `observer_id` PERCEIVES `target_id` at: the true position
@@ -26246,32 +26289,24 @@ impl WorldSnapshot {
         if !perception_noise_enabled() || observer_id == target_id {
             return Some(true_pos);
         }
-        let mut confidence = self
+        // `player_position_confidence_for_point` is already occlusion-aware (it folds
+        // the sightline screen into the confidence), so there is no second occlusion
+        // multiply here — avoiding the earlier double-count.
+        let confidence = self
             .player_position_confidence_for_point(observer_id, true_pos)
             .unwrap_or(1.0);
-        if occlusion_enabled() {
-            if let Some(observer) = self.players.iter().find(|p| p.id == observer_id) {
-                let observer_position = self
-                    .player_position(observer.id)
-                    .unwrap_or(observer.position);
-                let blockers = self.players.iter().filter_map(|p| {
-                    (p.id != observer_id && p.id != target_id)
-                        .then(|| self.player_snapshot_position(p))
-                });
-                let occ = sightline_occlusion_fraction(
-                    observer_position,
-                    true_pos,
-                    blockers,
-                    OCCLUSION_BODY_RADIUS_YARDS,
-                );
-                confidence *= 1.0 - occ;
-            }
-        }
         let bucket = self.tick / PERCEPTION_REFRESH_TICKS.max(1);
         let seed = (observer_id as u64).wrapping_mul(0x9E37_79B1)
             ^ (target_id as u64).wrapping_mul(0x85EB_CA77).rotate_left(17)
             ^ bucket.wrapping_mul(0xC2B2_AE3D);
-        Some(perceived_position(true_pos, confidence, seed))
+        // Lag the belief along the target's own motion (stale track when uncertain),
+        // then add the disk error on top.
+        Some(perceived_position_lagged(
+            true_pos,
+            target.velocity,
+            confidence,
+            seed,
+        ))
     }
 
     pub fn player_position_confidence_entry(
