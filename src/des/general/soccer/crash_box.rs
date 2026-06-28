@@ -36,13 +36,19 @@ use super::*;
 pub(crate) const FLANK_CRASH_BOX_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_FLANK_CRASH_BOX";
 
 /// Master gate. Default-ON in production (set the env to `0`/`false`/`no`/`off` to kill it);
-/// default-OFF under `cfg(test)` so the suite stays byte-identical.
+/// default-OFF under `cfg(test)` so the suite stays byte-identical. Tests re-read the env each
+/// call (so an A/B can toggle it within the process); production caches the decision once.
 pub(crate) fn flank_crash_box_enabled() -> bool {
     #[cfg(test)]
     {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var(FLANK_CRASH_BOX_ENABLE_ENV).is_ok())
+        std::env::var(FLANK_CRASH_BOX_ENABLE_ENV)
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
     }
     #[cfg(not(test))]
     {
