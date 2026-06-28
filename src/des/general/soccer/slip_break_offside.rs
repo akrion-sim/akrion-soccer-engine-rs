@@ -57,6 +57,15 @@ pub(crate) const SLIP_BREAK_SEAM_IDEAL_BEHIND_YARDS: f64 = 15.0;
 /// the breaking runner) and how far to nudge it laterally away from the keeper.
 pub(crate) const SLIP_BREAK_BEHIND_TARGET_YARDS: f64 = 7.0;
 pub(crate) const SLIP_BREAK_KEEPER_AVOID_NUDGE_YARDS: f64 = 4.0;
+/// How close (yd, in the line-normal direction) an opponent outfielder must be to the second-last
+/// defender line to count as part of the line whose seams we slip through (the back four / whoever
+/// is holding the trap).
+pub(crate) const SLIP_BREAK_LINE_BAND_YARDS: f64 = 12.0;
+/// Shared (passer + runner) reward in points for executing a clean slip-break: a firm forward
+/// ground ball slipped through a two-defender seam to an onside runner who timed his break, scaled
+/// by [`slip_break_opportunity_quality`]. Sized as a modest dense shaping term (well under a shot's
+/// reward), split across the two cooperating agents by the involved-team-reward path.
+pub(crate) const SLIP_BREAK_REWARD_POINTS: f64 = 4.0;
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
