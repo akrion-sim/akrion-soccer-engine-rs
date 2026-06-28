@@ -69,6 +69,11 @@ pub(crate) const SLIP_BREAK_LINE_BAND_YARDS: f64 = 12.0;
 /// by [`slip_break_opportunity_quality`]. Sized as a modest dense shaping term (well under a shot's
 /// reward), split across the two cooperating agents by the involved-team-reward path.
 pub(crate) const SLIP_BREAK_REWARD_POINTS: f64 = 4.0;
+/// Multiplicative lift on a forward floor-pass score (and on the hold/release score cap) at full
+/// slip-break release strength, so the carrier slips the ball at the right moment instead of
+/// holding or dribbling it. Decision-side bias only (no reward); gated.
+pub(crate) const SLIP_BREAK_RELEASE_PASS_LIFT: f64 = 0.6;
+pub(crate) const SLIP_BREAK_RELEASE_CAP_LIFT: f64 = 0.5;
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
