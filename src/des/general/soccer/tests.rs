@@ -13682,7 +13682,8 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
+            + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -30850,6 +30851,113 @@ fn player_mdp_state_includes_hierarchical_pitch_grid_and_facing() {
 }
 
 #[test]
+fn q_state_uses_ball_fine_grid_lane_row_for_learning_context() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 142,
+        ..Default::default()
+    });
+    let player = 5;
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    sim.players[player].position = Vec2::new(38.0, 66.0);
+    sim.players[player].home_position = sim.players[player].position;
+
+    let lane_center = |lane: usize| {
+        let (left, right) = vertical_lane_bounds(lane, DEFAULT_FIELD_WIDTH_YARDS);
+        (left + right) * 0.5
+    };
+    let left_ball = Vec2::new(lane_center(4), 66.0);
+    let right_ball = Vec2::new(lane_center(5), 66.0);
+    let left_grid = pitch_grid_address(
+        left_ball,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    let right_grid = pitch_grid_address(
+        right_ball,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    assert_eq!(left_grid.tactical.x, right_grid.tactical.x);
+    assert_ne!(left_grid.fine.x, right_grid.fine.x);
+
+    sim.ball.position = left_ball;
+    let left_snapshot = WorldSnapshot::from_match(&sim);
+    let left_state = left_snapshot.mdp_state_for_player(player);
+    let left_observation = left_snapshot.observation_for(player);
+    let left_key = SoccerQStateKey::from_parts(
+        &left_state,
+        &left_observation,
+        Team::Home,
+        sim.players[player].role,
+    );
+
+    sim.ball.position = right_ball;
+    let right_snapshot = WorldSnapshot::from_match(&sim);
+    let right_state = right_snapshot.mdp_state_for_player(player);
+    let right_observation = right_snapshot.observation_for(player);
+    let right_key = SoccerQStateKey::from_parts(
+        &right_state,
+        &right_observation,
+        Team::Home,
+        sim.players[player].role,
+    );
+
+    assert_eq!(left_key.ball_zone_x, right_key.ball_zone_x);
+    assert_eq!(left_key.ball_zone_y, right_key.ball_zone_y);
+    assert_eq!(left_key.ball_fine_lane, left_grid.fine.x as u8);
+    assert_eq!(right_key.ball_fine_lane, right_grid.fine.x as u8);
+    assert_ne!(left_key.ball_fine_lane, right_key.ball_fine_lane);
+    assert!(
+        !left_key.matches_learning_context(&right_key),
+        "fine 12-lane ball address must separate exact MDP/POMDP learning contexts"
+    );
+
+    let mut legacy_state = left_state.clone();
+    legacy_state.ball_grid = PitchGridAddress::default();
+    let observation_fallback_key = SoccerQStateKey::from_parts(
+        &legacy_state,
+        &left_observation,
+        Team::Home,
+        sim.players[player].role,
+    );
+    assert_eq!(
+        observation_fallback_key.ball_fine_lane,
+        left_grid.fine.x as u8
+    );
+    assert_eq!(
+        observation_fallback_key.ball_fine_row,
+        left_grid.fine.y as u8
+    );
+
+    let mut legacy_observation = left_observation.clone();
+    legacy_observation.ball_grid = PitchGridAddress::default();
+    let tactical_fallback_key = SoccerQStateKey::from_parts(
+        &legacy_state,
+        &legacy_observation,
+        Team::Home,
+        sim.players[player].role,
+    );
+    assert_eq!(
+        tactical_fallback_key.ball_fine_lane,
+        tactical_zone_center_fine_coord(
+            legacy_state.ball_zone_x,
+            PITCH_TACTICAL_GRID_COLUMNS,
+            PITCH_FINE_GRID_COLUMNS
+        )
+    );
+    assert_eq!(
+        tactical_fallback_key.ball_fine_row,
+        tactical_zone_center_fine_coord(
+            legacy_state.ball_zone_y,
+            PITCH_TACTICAL_GRID_ROWS,
+            PITCH_FINE_GRID_ROWS
+        )
+    );
+}
+
+#[test]
 fn pitch_grid_address_clamps_noisy_tracking_boundaries_and_keeps_parent_links() {
     let samples = [
         Vec2::new(-3.0, -2.0),
@@ -46087,6 +46195,53 @@ fn forwards_have_light_dynamic_lane_affinity_prior() {
 }
 
 #[test]
+fn dynamic_lane_affinity_establishes_home_width_for_all_eleven_players() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.ball.holder = None;
+    sim.ball.last_touch_team = None;
+    sim.ball.position = Vec2::new(
+        DEFAULT_FIELD_WIDTH_YARDS * 0.5,
+        DEFAULT_FIELD_LENGTH_YARDS * 0.5,
+    );
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.jerk = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let lane_center = |lane: usize| {
+        let (left, right) = vertical_lane_bounds(lane, snapshot.field_width);
+        (left + right) * 0.5
+    };
+    let mut checked = 0usize;
+    for player in snapshot.players.iter().filter(|p| p.team == Team::Home) {
+        let home_grid = pitch_grid_address(
+            player.home_position,
+            snapshot.field_width,
+            snapshot.field_length,
+        )
+        .fine;
+        let cross_lane = if home_grid.x < PITCH_FINE_GRID_COLUMNS / 2 {
+            PITCH_FINE_GRID_COLUMNS - 1
+        } else {
+            0
+        };
+        let home_target = Vec2::new(lane_center(home_grid.x), player.home_position.y);
+        let cross_target = Vec2::new(lane_center(cross_lane), player.home_position.y);
+        let home_affinity = snapshot.dynamic_lane_affinity_for_player_target(player, home_target);
+        let cross_affinity = snapshot.dynamic_lane_affinity_for_player_target(player, cross_target);
+
+        assert!(
+            home_affinity > cross_affinity + 0.04,
+            "player {} {:?} should prefer its own 12-lane width identity: home={home_affinity:.3} cross={cross_affinity:.3}",
+            player.id,
+            player.role
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 11);
+}
+
+#[test]
 fn dynamic_lane_affinity_dampens_for_team_in_possession_until_turnover() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 1;
@@ -47400,7 +47555,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM
+        SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
+            + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     // The previous six-channel motion totals stay recognised legacy input dims.
@@ -47561,7 +47717,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
+            + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));

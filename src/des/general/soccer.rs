@@ -8329,6 +8329,10 @@ pub struct SoccerQStateKey {
     pub possession_relative: i8,
     pub ball_zone_x: usize,
     pub ball_zone_y: usize,
+    #[serde(default)]
+    pub ball_fine_lane: u8,
+    #[serde(default)]
+    pub ball_fine_row: u8,
     // NOTE: player pitch-grid cell IDs (fine/tactical/macro/root) were removed
     // from the tabular Q-key. Per-position discretization fragmented the table
     // (hundreds of cells × every other field) for ~1 visit/row; the player's
@@ -8748,6 +8752,50 @@ pub struct SoccerQStateKey {
     pub open_space_bin: u8,
 }
 
+fn q_state_grid_has_policy_fine_cell(grid: &PitchGridAddress) -> bool {
+    grid.fine.level == PitchGridLevel::Fine
+        && grid.fine.columns == PITCH_FINE_GRID_COLUMNS
+        && grid.fine.rows == PITCH_FINE_GRID_ROWS
+}
+
+fn tactical_zone_center_fine_coord(zone: usize, tactical_count: usize, fine_count: usize) -> u8 {
+    let tactical_count = tactical_count.max(1);
+    let fine_count = fine_count.max(1);
+    let zone = zone.min(tactical_count.saturating_sub(1));
+    (((zone as f64 + 0.5) * fine_count as f64 / tactical_count as f64).floor() as usize)
+        .min(fine_count.saturating_sub(1)) as u8
+}
+
+fn q_state_ball_fine_lane_row(
+    state: &SoccerMdpState,
+    observation: &SoccerPomdpObservation,
+) -> (u8, u8) {
+    if q_state_grid_has_policy_fine_cell(&state.ball_grid) {
+        return (
+            state.ball_grid.fine.x.min(PITCH_FINE_GRID_COLUMNS - 1) as u8,
+            state.ball_grid.fine.y.min(PITCH_FINE_GRID_ROWS - 1) as u8,
+        );
+    }
+    if q_state_grid_has_policy_fine_cell(&observation.ball_grid) {
+        return (
+            observation.ball_grid.fine.x.min(PITCH_FINE_GRID_COLUMNS - 1) as u8,
+            observation.ball_grid.fine.y.min(PITCH_FINE_GRID_ROWS - 1) as u8,
+        );
+    }
+    (
+        tactical_zone_center_fine_coord(
+            state.ball_zone_x,
+            PITCH_TACTICAL_GRID_COLUMNS,
+            PITCH_FINE_GRID_COLUMNS,
+        ),
+        tactical_zone_center_fine_coord(
+            state.ball_zone_y,
+            PITCH_TACTICAL_GRID_ROWS,
+            PITCH_FINE_GRID_ROWS,
+        ),
+    )
+}
+
 impl SoccerQStateKey {
     pub fn from_parts(
         state: &SoccerMdpState,
@@ -8774,12 +8822,15 @@ impl SoccerQStateKey {
         } else {
             state.action_facing
         };
+        let (ball_fine_lane, ball_fine_row) = q_state_ball_fine_lane_row(state, observation);
         SoccerQStateKey {
             phase: state.phase,
             role,
             possession_relative,
             ball_zone_x: state.ball_zone_x,
             ball_zone_y: state.ball_zone_y,
+            ball_fine_lane,
+            ball_fine_row,
             ball_schedule_order: observation.ball_schedule_order.clamp(-1, 1),
             movement_gait: observation.movement_gait,
             actor_speed_bin: distance_bucket(
@@ -9523,6 +9574,8 @@ impl SoccerQStateKey {
             && self.possession_relative == other.possession_relative
             && self.ball_zone_x == other.ball_zone_x
             && self.ball_zone_y == other.ball_zone_y
+            && self.ball_fine_lane == other.ball_fine_lane
+            && self.ball_fine_row == other.ball_fine_row
             && self.ball_schedule_order == other.ball_schedule_order
             && self.movement_gait == other.movement_gait
             && self.actor_speed_bin == other.actor_speed_bin
@@ -37212,13 +37265,7 @@ fn soccer_neural_transition_features_with_action(
     } else {
         transition.state.player_grid
     };
-    let ball_grid = if transition.state.ball_grid.fine.level == PitchGridLevel::WholePitch
-        && obs.ball_grid.fine.level != PitchGridLevel::WholePitch
-    {
-        obs.ball_grid
-    } else {
-        transition.state.ball_grid
-    };
+    let (ball_fine_lane, ball_fine_row) = q_state_ball_fine_lane_row(&transition.state, obs);
     let action_label = normalize_soccer_action_label(action);
     let (action_attack, action_defense, action_support) =
         soccer_neural_action_family_features(action);
@@ -37661,10 +37708,10 @@ fn soccer_neural_transition_features_with_action(
         // 24-row ball address in the MDP/POMDP neural input without putting the
         // high-cardinality ball cell in the tabular Q-key.
         soccer_neural_scaled(
-            ball_grid.fine.x as f64,
+            ball_fine_lane as f64,
             PITCH_FINE_GRID_COLUMNS as f64 - 1.0,
         ),
-        soccer_neural_scaled(ball_grid.fine.y as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
+        soccer_neural_scaled(ball_fine_row as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
         // Pass receipt learning (indices 182-185): chosen-target completion plus
         // the MPC/QP reach prior from the 22-player + ball configuration. These
         // let the critic learn which pass target actually gets controlled rather

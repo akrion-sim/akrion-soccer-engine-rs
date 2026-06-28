@@ -22621,7 +22621,20 @@ impl WorldSnapshot {
     ) -> f64 {
         let lane_tunables = &tunables().lane_affinity;
         if player.role == PlayerRole::Goalkeeper {
-            return lane_tunables.goalkeeper_neutral_score.clamp(0.0, 1.0);
+            let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
+            let fallback = self.player_snapshot_position(player);
+            let target = finite_pitch_point(target, width, length, fallback);
+            let home = finite_pitch_point(player.home_position, width, length, fallback);
+            let home_lane = pitch_grid_address(home, width, length).fine.x;
+            let target_lane = pitch_grid_address(target, width, length).fine.x;
+            let home_width_affinity = (1.0
+                - home_lane.abs_diff(target_lane) as f64
+                    / lane_tunables.home_lane_match_span_lanes.max(1e-6))
+            .clamp(0.0, 1.0);
+            let home_lane_weight = lane_tunables.goalkeeper_home_lane_weight.clamp(0.0, 1.0);
+            return (lane_tunables.goalkeeper_neutral_score
+                * (1.0 - home_lane_weight * (1.0 - home_width_affinity)))
+            .clamp(0.0, 1.0);
         }
         let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
         let fallback = self.player_snapshot_position(player);
@@ -22724,21 +22737,29 @@ impl WorldSnapshot {
         let field_config_score = (teammate_space * lane_tunables.field_teammate_space_weight
             + open_space * lane_tunables.field_open_space_weight)
             .clamp(0.0, 1.0);
+        let home_width_affinity = (1.0
+            - home_lane.abs_diff(target_lane) as f64
+                / lane_tunables.home_lane_match_span_lanes.max(1e-6))
+        .clamp(0.0, 1.0);
         let lane_score = if player.role == PlayerRole::Forward {
-            static_fit.affinity_score * lane_tunables.forward_static_fit_weight
+            let base_score = static_fit.affinity_score * lane_tunables.forward_static_fit_weight
                 + player_to_ball_lane * lane_tunables.forward_player_ball_weight
                 + target_to_ball_lane * lane_tunables.forward_target_ball_weight
                 + row_coherence_score * lane_tunables.forward_row_coherence_weight
                 + flow_score * lane_tunables.forward_flow_weight
-                + field_config_score * lane_tunables.forward_field_config_weight
+                + field_config_score * lane_tunables.forward_field_config_weight;
+            let home_lane_weight = lane_tunables.forward_home_lane_weight.clamp(0.0, 1.0);
+            base_score * (1.0 - home_lane_weight * (1.0 - home_width_affinity))
         } else {
-            markov_lane_affinity * lane_tunables.role_markov_weight
+            let base_score = markov_lane_affinity * lane_tunables.role_markov_weight
                 + static_fit.affinity_score * lane_tunables.role_static_fit_weight
                 + player_to_ball_lane * lane_tunables.role_player_ball_weight
                 + target_to_ball_lane * lane_tunables.role_target_ball_weight
                 + row_coherence_score * lane_tunables.role_row_coherence_weight
                 + flow_score * lane_tunables.role_flow_weight
-                + field_config_score * lane_tunables.role_field_config_weight
+                + field_config_score * lane_tunables.role_field_config_weight;
+            let home_lane_weight = lane_tunables.role_home_lane_weight.clamp(0.0, 1.0);
+            base_score * (1.0 - home_lane_weight * (1.0 - home_width_affinity))
         };
         // Global lane-discipline strength: the one knob every consumer of this
         // affinity feels (1.0 / identity when v2 is off).

@@ -868,6 +868,7 @@ impl Default for GoalkeeperTunables {
 #[serde(default)]
 pub struct LaneAffinityTunables {
     pub goalkeeper_neutral_score: f64,
+    pub goalkeeper_home_lane_weight: f64,
     pub defender_lane_radius_possession: usize,
     pub defender_lane_radius_defense: usize,
     pub midfielder_lane_radius_possession: usize,
@@ -893,6 +894,7 @@ pub struct LaneAffinityTunables {
     pub lookahead_max_seconds: f64,
     pub lane_match_span_lanes: f64,
     pub row_match_span_rows: f64,
+    pub home_lane_match_span_lanes: f64,
     pub player_predicted_lane_weight: f64,
     pub home_predicted_lane_weight: f64,
     pub player_current_lane_weight: f64,
@@ -915,6 +917,7 @@ pub struct LaneAffinityTunables {
     pub forward_row_coherence_weight: f64,
     pub forward_flow_weight: f64,
     pub forward_field_config_weight: f64,
+    pub forward_home_lane_weight: f64,
     pub role_markov_weight: f64,
     pub role_static_fit_weight: f64,
     pub role_player_ball_weight: f64,
@@ -922,6 +925,7 @@ pub struct LaneAffinityTunables {
     pub role_row_coherence_weight: f64,
     pub role_flow_weight: f64,
     pub role_field_config_weight: f64,
+    pub role_home_lane_weight: f64,
     pub open_space_dynamic_lane_bonus_weight: f64,
     pub movement_shape_dynamic_lane_weight: f64,
 }
@@ -930,6 +934,7 @@ impl Default for LaneAffinityTunables {
     fn default() -> Self {
         LaneAffinityTunables {
             goalkeeper_neutral_score: 0.5,
+            goalkeeper_home_lane_weight: 0.35,
             defender_lane_radius_possession: 2,
             defender_lane_radius_defense: 1,
             midfielder_lane_radius_possession: 2,
@@ -955,6 +960,7 @@ impl Default for LaneAffinityTunables {
             lookahead_max_seconds: 1.35,
             lane_match_span_lanes: 5.0,
             row_match_span_rows: 8.0,
+            home_lane_match_span_lanes: 3.0,
             player_predicted_lane_weight: 0.48,
             home_predicted_lane_weight: 0.34,
             player_current_lane_weight: 0.18,
@@ -977,6 +983,7 @@ impl Default for LaneAffinityTunables {
             forward_row_coherence_weight: 0.08,
             forward_flow_weight: 0.06,
             forward_field_config_weight: 0.10,
+            forward_home_lane_weight: 0.16,
             role_markov_weight: 0.34,
             role_static_fit_weight: 0.30,
             role_player_ball_weight: 0.16,
@@ -984,6 +991,7 @@ impl Default for LaneAffinityTunables {
             role_row_coherence_weight: 0.06,
             role_flow_weight: 0.03,
             role_field_config_weight: 0.03,
+            role_home_lane_weight: 0.20,
             open_space_dynamic_lane_bonus_weight: 1.05,
             movement_shape_dynamic_lane_weight: 0.36,
         }
@@ -1535,6 +1543,15 @@ impl LaneAffinityTunables {
             0.25,
             0.75,
         );
+        sanitize_f64(
+            "lane_affinity.goalkeeper_home_lane_weight",
+            &mut self.goalkeeper_home_lane_weight,
+            default.goalkeeper_home_lane_weight,
+            0.0,
+            1.0,
+            0.0,
+            0.70,
+        );
         sanitize_usize(
             "lane_affinity.defender_lane_radius_possession",
             &mut self.defender_lane_radius_possession,
@@ -1761,6 +1778,15 @@ impl LaneAffinityTunables {
             12.0,
         );
         sanitize_f64(
+            "lane_affinity.home_lane_match_span_lanes",
+            &mut self.home_lane_match_span_lanes,
+            default.home_lane_match_span_lanes,
+            1.0,
+            12.0,
+            2.0,
+            6.0,
+        );
+        sanitize_f64(
             "lane_affinity.player_predicted_lane_weight",
             &mut self.player_predicted_lane_weight,
             default.player_predicted_lane_weight,
@@ -1959,6 +1985,15 @@ impl LaneAffinityTunables {
             1.5,
         );
         sanitize_f64(
+            "lane_affinity.forward_home_lane_weight",
+            &mut self.forward_home_lane_weight,
+            default.forward_home_lane_weight,
+            0.0,
+            1.0,
+            0.0,
+            0.45,
+        );
+        sanitize_f64(
             "lane_affinity.role_markov_weight",
             &mut self.role_markov_weight,
             default.role_markov_weight,
@@ -2022,6 +2057,15 @@ impl LaneAffinityTunables {
             1.5,
         );
         sanitize_f64(
+            "lane_affinity.role_home_lane_weight",
+            &mut self.role_home_lane_weight,
+            default.role_home_lane_weight,
+            0.0,
+            1.0,
+            0.0,
+            0.55,
+        );
+        sanitize_f64(
             "lane_affinity.open_space_dynamic_lane_bonus_weight",
             &mut self.open_space_dynamic_lane_bonus_weight,
             default.open_space_dynamic_lane_bonus_weight,
@@ -2057,6 +2101,14 @@ impl LaneAffinityTunables {
             prefix,
             "goalkeeper_neutral_score",
             self.goalkeeper_neutral_score,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "goalkeeper_home_lane_weight",
+            self.goalkeeper_home_lane_weight,
             0.0,
             1.0,
             errors,
@@ -2263,6 +2315,14 @@ impl LaneAffinityTunables {
         );
         validate_f64(
             prefix,
+            "home_lane_match_span_lanes",
+            self.home_lane_match_span_lanes,
+            1.0,
+            12.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
             "player_predicted_lane_weight",
             self.player_predicted_lane_weight,
             0.0,
@@ -2439,6 +2499,14 @@ impl LaneAffinityTunables {
         );
         validate_f64(
             prefix,
+            "forward_home_lane_weight",
+            self.forward_home_lane_weight,
+            0.0,
+            1.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
             "role_markov_weight",
             self.role_markov_weight,
             0.0,
@@ -2491,6 +2559,14 @@ impl LaneAffinityTunables {
             self.role_field_config_weight,
             0.0,
             5.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "role_home_lane_weight",
+            self.role_home_lane_weight,
+            0.0,
+            1.0,
             errors,
         );
         validate_f64(
@@ -3971,6 +4047,9 @@ mod tests {
         assert_eq!(t.lane_affinity.defender_commitment_possession, 0.80);
         assert_eq!(t.lane_affinity.possession_factor, 0.80);
         assert_eq!(t.lane_affinity.row_match_span_rows, 8.0);
+        assert_eq!(t.lane_affinity.home_lane_match_span_lanes, 3.0);
+        assert_eq!(t.lane_affinity.forward_home_lane_weight, 0.16);
+        assert_eq!(t.lane_affinity.role_home_lane_weight, 0.20);
         assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.05);
         assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
         assert_eq!(t.policy_selection.top1_weight, 0.70);
@@ -4055,7 +4134,9 @@ mod tests {
                 "corridor_half_width_yards": 2.6
             },
             "lane_affinity": {
+                "goalkeeper_home_lane_weight": 0.42,
                 "possession_factor": 0.74,
+                "role_home_lane_weight": 0.44,
                 "open_space_dynamic_lane_bonus_weight": 1.3
             },
             "pomdp_perception": {
@@ -4078,7 +4159,9 @@ mod tests {
         assert_eq!(t.fresh_possession_escape.initial_push_yps, 1.8);
         assert_eq!(t.fresh_possession_escape.min_forward_space_yards, 3.5);
         assert_eq!(t.fresh_possession_escape.corridor_half_width_yards, 2.6);
+        assert_eq!(t.lane_affinity.goalkeeper_home_lane_weight, 0.42);
         assert_eq!(t.lane_affinity.possession_factor, 0.74);
+        assert_eq!(t.lane_affinity.role_home_lane_weight, 0.44);
         assert_eq!(t.lane_affinity.open_space_dynamic_lane_bonus_weight, 1.3);
         assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 0.30);
         assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 2.0);
@@ -4094,6 +4177,8 @@ mod tests {
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 0.86);
         assert_eq!(t.carrier_keep_rolling.carry_target_yards, 4.2);
         assert_eq!(t.fresh_possession_escape.target_yards, 4.8);
+        assert_eq!(t.lane_affinity.home_lane_match_span_lanes, 3.0);
+        assert_eq!(t.lane_affinity.forward_home_lane_weight, 0.16);
         assert_eq!(t.lane_affinity.movement_shape_dynamic_lane_weight, 0.36);
         assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 0.10);
         assert_eq!(t.pomdp_perception.ball_holder_rear_scan_confidence, 0.38);
@@ -4150,8 +4235,11 @@ mod tests {
                 "crowded_min_opponents": 99
             },
             "lane_affinity": {
+                "goalkeeper_home_lane_weight": 9.0,
                 "possession_factor": 4.0,
                 "forward_lane_radius": 99,
+                "home_lane_match_span_lanes": 99.0,
+                "role_home_lane_weight": -1.0,
                 "lookahead_min_seconds": 2.0,
                 "lookahead_max_seconds": 0.5
             },
@@ -4192,8 +4280,11 @@ mod tests {
         assert_eq!(t.fresh_possession_escape.min_cushion_gain_yards, 2.0);
         assert_eq!(t.fresh_possession_escape.initial_push_yps, 8.0);
         assert_eq!(t.fresh_possession_escape.crowded_min_opponents, 8);
+        assert_eq!(t.lane_affinity.goalkeeper_home_lane_weight, 1.0);
         assert_eq!(t.lane_affinity.possession_factor, 1.0);
         assert_eq!(t.lane_affinity.forward_lane_radius, 6);
+        assert_eq!(t.lane_affinity.home_lane_match_span_lanes, 12.0);
+        assert_eq!(t.lane_affinity.role_home_lane_weight, 0.0);
         assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
         assert_eq!(t.lane_affinity.lookahead_max_seconds, 2.0);
         // Negative rank weight clamps up to the 0.0 hard floor; an absurd
@@ -4249,7 +4340,10 @@ mod tests {
         t.fresh_possession_escape.target_yards = 0.6;
         t.fresh_possession_escape.min_cushion_gain_yards = 1.2;
         t.lane_affinity.possession_factor = 1.2;
+        t.lane_affinity.goalkeeper_home_lane_weight = -0.1;
         t.lane_affinity.forward_lane_radius = 9;
+        t.lane_affinity.home_lane_match_span_lanes = 0.5;
+        t.lane_affinity.forward_home_lane_weight = 6.0;
         t.pomdp_perception.player_reaction_min_seconds = 0.8;
         t.pomdp_perception.player_reaction_max_seconds = 0.2;
         t.pomdp_perception.ball_holder_head_scan_min_seconds = 2.5;
@@ -4264,7 +4358,10 @@ mod tests {
         assert!(err.contains("carrier_keep_rolling.carry_min_step_yards >"));
         assert!(err.contains("fresh_possession_escape.target_yards <"));
         assert!(err.contains("lane_affinity.possession_factor"));
+        assert!(err.contains("lane_affinity.goalkeeper_home_lane_weight"));
         assert!(err.contains("lane_affinity.forward_lane_radius"));
+        assert!(err.contains("lane_affinity.home_lane_match_span_lanes"));
+        assert!(err.contains("lane_affinity.forward_home_lane_weight"));
         assert!(err.contains(
             "pomdp_perception.player_reaction_max_seconds < pomdp_perception.player_reaction_min_seconds"
         ));
