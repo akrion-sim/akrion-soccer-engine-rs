@@ -57389,6 +57389,12 @@ fn pass_risk_appetite_for_passer(role: PlayerRole, passer_in_attacking_third: bo
     if !dd_soccer_enable_role_pass_risk_appetite() {
         return PassRiskAppetite::NEUTRAL;
     }
+    pass_risk_appetite_table(role, passer_in_attacking_third)
+}
+
+/// Pure role/zone → appetite mapping (no gate read), so it is unit-testable without touching the
+/// process-global gate env var. See [`pass_risk_appetite_for_passer`] for the gated entry point.
+fn pass_risk_appetite_table(role: PlayerRole, passer_in_attacking_third: bool) -> PassRiskAppetite {
     match role {
         // The keeper must not gamble in build-up: amplify risk everywhere, prefer the safe ball.
         PlayerRole::Goalkeeper => PassRiskAppetite {
