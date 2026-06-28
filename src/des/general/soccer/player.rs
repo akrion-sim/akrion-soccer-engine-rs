@@ -6138,11 +6138,26 @@ impl PlayerAgent {
             + tackle_contact_fit * 0.18)
             * (0.70 + defensive_mindedness * 0.30))
             .clamp(0.02, 0.92);
+        // Surprise steal from behind (gated; OFF ⇒ assessment is `None` ⇒ inert option that
+        // never wins). When this defender has crept into the blind arc of a slow, forward-
+        // dribbling carrier it believes it can catch, creeping in to nick the ball becomes a
+        // live choice scaled by the opportunity strength and the press appetite.
+        let blindside = snapshot.blindside_steal_assessment(self.id);
+        let blindside_legal = blindside.is_some() && self.role != PlayerRole::Goalkeeper;
+        let blindside_score = blindside
+            .map(|assessment| {
+                ((0.06 + assessment.opportunity * 0.40)
+                    * (0.60 + press * 0.40)
+                    * (0.70 + defending * 0.30))
+                    .clamp(0.01, 0.55)
+            })
+            .unwrap_or(0.0);
         let mut options = vec![
             AgentActionOptionTrace::new("tackle", tackle_score, tackle_legal),
             AgentActionOptionTrace::new("defend-shape", shape_score, true),
             AgentActionOptionTrace::new("defend-roam", roam_score, true),
             AgentActionOptionTrace::new("press-cover", press_cover_score, press_cover_legal),
+            AgentActionOptionTrace::new("blindside-steal", blindside_score, blindside_legal),
         ];
         if self.role == PlayerRole::Goalkeeper {
             ensure_min_legal_option_probability(&mut options, "defend-shape", 0.97);

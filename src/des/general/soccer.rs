@@ -2667,6 +2667,52 @@ const BALL_PROTECTION_LEAD_REF_YARDS: f64 = 2.5;
 const BALL_PROTECTION_FAST_DRIBBLE_REF_YPS: f64 = 6.0;
 const CONTESTABLE_STEAL_RADIUS_YARDS: f64 = 1.0;
 const CONTESTABLE_PROTECTION_THRESHOLD: f64 = 0.5;
+// --- Blindside surprise-steal (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`) ---
+// A defender drifting into the carrier's blind arc considers a steal from behind while
+// still this far back; the catch-belief model decides whether closing is feasible.
+const BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS: f64 = 4.25;
+// The carrier's bearing relative to its own facing/motion below which the defender is
+// "behind the eyes" (out of the look-forward cone): cos of ~100° back from dead-ahead.
+const BLINDSIDE_BEHIND_DOT: f64 = -0.17;
+// At/below this carrier speed the dribble is a walk/jog/skip — fully exploitable; the
+// opportunity fades to zero as the carrier accelerates toward the getaway speed (a
+// sprinting carrier simply runs away from the thief).
+const BLINDSIDE_CARRIER_JOG_SPEED_YPS: f64 = 4.0;
+const BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS: f64 = 7.5;
+// The carrier must actually be going forward (toward its own attack goal) for this to be
+// a "dribbling forward, can't see behind" situation rather than a shielded turn.
+const BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS: f64 = 0.6;
+// Catch-belief: the defender must close the gap within this horizon, and needs at least
+// this much real chase-speed margin over the carrier's getaway pace to believe it.
+const BLINDSIDE_CATCH_HORIZON_SECONDS: f64 = 1.5;
+const BLINDSIDE_CHASE_SPEED_MARGIN_YPS: f64 = 0.4;
+// Contact band within which a believed blindside approach actually nicks the ball.
+const BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.55;
+// The carrier's side-glance (head-scan) control-drift cost while dribbling forward,
+// scaled by carrier speed (a quicker carrier glancing loses more control). This is the
+// physical price of looking: it rides the same ball-control drift channel as the
+// existing look-behind scan.
+const BLINDSIDE_GLANCE_DRIFT_RISK_BASE: f64 = 0.12;
+const BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN: f64 = 0.22;
+
+/// A defender's "surprise steal from behind" opportunity against the current opponent
+/// ball-carrier (see [`WorldSnapshot::blindside_steal_assessment`]). Every field is in
+/// `[0, 1]`; `opportunity` is the overall strength the decision/observation reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlindsideStealAssessment {
+    /// The opponent carrier being crept up on.
+    pub target: usize,
+    /// Overall blindside-steal strength (blends the parts below), `[0, 1]`.
+    pub opportunity: f64,
+    /// How far the defender sits behind the carrier's eyes (1 = dead behind).
+    pub carrier_unaware: f64,
+    /// How exploitable the carrier's pace is (1 = walk/jog/skip, 0 = sprinting clear).
+    pub carrier_slow: f64,
+    /// The defender's belief it can catch the carrier before it reacts, `[0, 1]`.
+    pub catch_belief: f64,
+    /// Straight-line gap to the carrier, yards (for the contact test).
+    pub gap_yards: f64,
+}
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
@@ -5964,6 +6010,32 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
+    /// Blindside surprise-steal opportunity this DEFENDER has against the opponent carrier
+    /// in `[0, 1]` — high when it has crept into the carrier's blind arc, the carrier is
+    /// dribbling forward slowly, and it believes it can catch them (see
+    /// [`WorldSnapshot::blindside_steal_assessment`]). `0.0` unless this player is an
+    /// off-ball defender with a live chance and `DD_SOCCER_ENABLE_BLINDSIDE_STEAL` is on.
+    /// Decision-only — NOT part of the neural feature vector (`FEATURE_DIM` unchanged).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_steal_opportunity: f64,
+    /// The opponent carrier id this defender's blindside opportunity targets, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blindside_steal_target: Option<usize>,
+    /// What this CARRIER (perceptually) believes about a defender sneaking up on its blind
+    /// side, `[0, 1]`. Built from rear opponents discounted by the carrier's perception
+    /// confidence on them — so it stays low until the carrier GLANCES (a head-scan that
+    /// raises rear confidence at a control-drift cost), then rises and drives the escape
+    /// (accelerate forward / release early). `0.0` off the ball or with the gate off.
+    /// Decision-only — NOT a neural feature.
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_threat_from_behind: f64,
+    /// Whether this carrier is actively side-glancing this tick to check its blind side.
+    #[serde(default)]
+    pub blindside_scan_active: bool,
+    /// Ball-control drift risk `[0, 1]` this carrier incurs for the side-glance — the
+    /// physical price of looking (the same drift channel as the look-behind scan).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_scan_drift_risk: f64,
     /// Previous settled run-time-step decision/action summary for this player.
     /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
     /// current observation stays current-state-first, while this optional payload
@@ -50054,6 +50126,20 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
+}
+
+/// Set `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=1` to enable the "surprise steal from behind".
+/// A defender that has crept into the blind arc of an opponent dribbling *forward and
+/// slowly* (walk/jog/skip) — and that believes it can actually catch the carrier (a real
+/// closing-speed margin) — can nick the ball from behind before the carrier reacts; the
+/// carrier in turn glances to its blind side (a head-scan with a real control-drift cost)
+/// to RECOGNISE the threat and break away. Default off ⇒ the assessment short-circuits to
+/// `None`, every new observation field stays zero, the new action option is inert, and the
+/// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
+fn dd_soccer_enable_blindside_steal() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
 }
 
 /// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
