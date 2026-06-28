@@ -12820,6 +12820,13 @@ impl SoccerMatch {
                     self.stat_pass_attempt(player_team);
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
+                    self.register_flank_crash_box_cross(
+                        player_team,
+                        player_id,
+                        player_pos,
+                        is_cross,
+                        flight,
+                    );
                 }
                 self.move_player_towards(player_id, self.players[player_id].home_position, false);
                 if release_facing != FacingBucket::Unknown {
