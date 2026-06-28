@@ -161,7 +161,12 @@ Same machinery (factored → mask → dither). Bucket counts tentative.
 - **Off-ball movement**: make-run / hold / check-to-ball / overlap / underlap /
   drop (≈6), run timing (now/delay), target lane.
 - **Defending**: press intensity 1–3, jockey/contain vs commit-tackle (2),
-  intercept-lane (bool), tactical-foul (bool, gated).
+  intercept-lane (bool), tactical-foul (bool, gated), blindside-steal (bool,
+  gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`): creep into a slow forward-dribbler's
+  blind arc and nick it from behind *only when the steal is believed catchable*
+  (closing-speed margin). The carrier's countermeasure is a side-glance head-scan
+  (`blindside_threat_from_behind` obs at a control-drift cost) that drives a
+  break-away escape.
 - **Goalkeeping**: set-position, come/stay (2), save-style, distribution
   (throw/roll/short/long × the kick core).
 
