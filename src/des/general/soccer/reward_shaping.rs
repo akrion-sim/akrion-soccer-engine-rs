@@ -78,7 +78,8 @@ pub fn shaping_discipline_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(shaping_discipline_env)
+        // Promoted to default-ON in production (reward shaping-discipline; training-time only).
+        *ENABLED.get_or_init(|| super::gate_default_on(SHAPING_DISCIPLINE_ENABLE_ENV))
     }
 }
 

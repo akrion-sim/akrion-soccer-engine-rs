@@ -898,7 +898,13 @@ let playerMenuPlayerId = null;
 let lastSemanticBallAction = null;
 let stickyHolder = { id: null, team: null };
 let stickyPassTarget = { playerId: null, point: null, urgency: 0 };
-const LIVE_STEP_INTERVAL_MS = 100;
+// Target gap between step starts. Matched to the backend sim timestep (1/15 s ≈ 67 ms)
+// so a real-time pulse advances EXACTLY ONE tick per frame: at 10 Hz the 1/15 s sim
+// rounded to ~2 ticks/pulse, doubling the per-frame jump and making motion look steppy.
+// One tick/frame at 15 Hz is the finest, smoothest real-time cadence (the 60 fps
+// interpolation below fills between them). Local steps are ~16 ms so 15 Hz is cheap; the
+// WS-driven deployed path pushes over a persistent socket, so the higher rate is fine.
+const LIVE_STEP_INTERVAL_MS = 67;
 // Single fallback for the simulation timestep when a frame/config somehow omits it.
 // Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
 // keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
@@ -3515,6 +3521,12 @@ let interpTargetFrame = null;
 let interpStart = 0;
 let interpDuration = LIVE_STEP_INTERVAL_MS;
 let interpLastArrival = 0;
+// EMA of wall-clock time PER SIM TICK (not per frame). A frame that advances 2 ticks
+// must take twice as long to draw as a 1-tick frame, or its on-screen velocity doubles
+// and the motion pulses. Tracking per-tick cost and scaling each frame's interp window
+// by the ticks it actually advanced keeps velocity uniform across uneven pulses while
+// staying paced to real arrivals (jitter-robust).
+let interpPerTickMs = LIVE_STEP_INTERVAL_MS;
 
 function registerFrameForInterpolation(frame) {
   if (!frame) return;
@@ -3523,10 +3535,14 @@ function registerFrameForInterpolation(frame) {
     interpTargetFrame = frame; // same tick re-rendered (UI toggle); keep the lerp
     return;
   }
+  const prevTick = interpTargetFrame ? Number(interpTargetFrame.tick) : Number(frame.tick) - 1;
+  const tickDelta = clamp(Number(frame.tick) - prevTick, 1, 30);
   const measured = interpLastArrival ? now - interpLastArrival : LIVE_STEP_INTERVAL_MS;
-  // EMA of the real wall-clock gap between frames -> motion paced to actual
-  // arrivals (robust to network jitter), not the nominal step interval.
-  interpDuration = clamp(0.6 * interpDuration + 0.4 * clamp(measured, 30, 1500), 30, 1500);
+  // Normalize the measured wall gap to a per-tick cost, EMA it (robust to jitter), then
+  // scale this frame's window by how many ticks it advanced -> uniform on-screen velocity.
+  const measuredPerTick = clamp(measured / tickDelta, 20, 1000);
+  interpPerTickMs = clamp(0.6 * interpPerTickMs + 0.4 * measuredPerTick, 20, 1000);
+  interpDuration = clamp(interpPerTickMs * tickDelta, 30, 1500);
   interpLastArrival = now;
   interpPrevFrame = interpTargetFrame || frame;
   interpTargetFrame = frame;

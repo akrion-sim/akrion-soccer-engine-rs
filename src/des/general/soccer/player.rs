@@ -2458,9 +2458,63 @@ const DECISION_REFRACTORY_WINDOW_TICKS: u64 = 7;
 /// momentum). The new `PlayerAgent` continuity fields stay empty while disabled, so serialized
 /// snapshots are unchanged too.
 pub(crate) fn decision_refractory_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DECISION_REFRACTORY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DECISION_REFRACTORY").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_DECISION_REFRACTORY"))
+    }
+}
+
+/// Whether the **forward-pass-first release** is active this process. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_FORWARD_PASS_FIRST=0/false` is the kill switch);
+/// default-OFF under test so the option-scoring parity suite stays byte-identical.
+pub(crate) fn forward_pass_first_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST"))
+    }
+}
+
+/// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
+/// released early instead of dwelt on (the user's "if that option is forward and sufficiently
+/// open"). Below this the carrier keeps his normal patience.
+const FORWARD_PASS_FIRST_OPEN_THRESHOLD: f64 = 0.45;
+/// Seconds of dwell on the ball at which the forward-release urgency saturates: a carrier
+/// sitting this long on an open forward option is pushed fully toward releasing it ("passing
+/// sooner rather than later"). The bias already applies (weaker) the instant he has the ball.
+const FORWARD_PASS_FIRST_DWELL_FULL_SECONDS: f64 = 0.9;
+
+/// Release strength in `[0, 1]` for the forward-pass-first bias: how strongly to prioritise the
+/// forward ball (floor it) and damp the hold/dribble/shield family. Returns 0 below the openness
+/// threshold; otherwise rises with how open the forward receiver is *and* with how long the
+/// carrier has already dwelt on the ball, so deliberation actively converts into a forward
+/// release rather than a late, pressured square/back blunder. Pure + RNG-free for unit testing.
+pub(crate) fn forward_pass_first_release_strength(
+    forward_open: f64,
+    time_on_ball_seconds: f64,
+) -> f64 {
+    let fwd = forward_open.clamp(0.0, 1.0);
+    if fwd < FORWARD_PASS_FIRST_OPEN_THRESHOLD {
+        return 0.0;
+    }
+    let open_strength = ((fwd - FORWARD_PASS_FIRST_OPEN_THRESHOLD)
+        / (1.0 - FORWARD_PASS_FIRST_OPEN_THRESHOLD))
+        .clamp(0.0, 1.0);
+    let dwell = (time_on_ball_seconds.max(0.0) / FORWARD_PASS_FIRST_DWELL_FULL_SECONDS).clamp(0.0, 1.0);
+    ((0.45 + 0.55 * dwell) * (0.55 + 0.45 * open_strength)).clamp(0.0, 1.0)
 }
 
 /// True when the refractory forbids committing a changed decision at tick `now`, given the ticks
@@ -5152,6 +5206,33 @@ impl PlayerAgent {
             let dwell_damp = (1.0 - quick_value * 0.34).clamp(0.62, 1.0);
             for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
                 scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+        }
+        // Forward-pass-first release: when a forward teammate is sufficiently open, prioritise
+        // releasing the ball forward and do it SOONER the longer the carrier has dwelt on it — so
+        // he plays the open forward man instead of deliberating into a late, pressured square/back
+        // pass (the reported "held forever then passed backward to the opponent" blunder). Floors
+        // the best (forward-biased ranking) pass above the hold/dribble family and damps that dwell
+        // family in proportion to openness × dwell. Broader than the narrow ~5-8m quick-forward
+        // band above (any open forward option qualifies). Deferred to real shot/killer logic. Gate
+        // OFF (default under test) ⇒ strength clamps to 0 ⇒ byte-identical no-op.
+        if forward_pass_first_enabled()
+            && pass_target_count > 0
+            && !goal_attack_shot_blocks_alternatives
+            && !observation.threaded_goal_pass_available
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let strength = forward_pass_first_release_strength(
+                observation.best_forward_pass_receiver_openness,
+                observation.perceived_time_on_ball_seconds,
+            );
+            if strength > 0.0 {
+                let floor = (0.42 + 0.50 * strength).clamp(0.40, 0.95);
+                ensure_min_legal_option_probability(&mut options, "pass1", floor);
+                let dwell_damp = (1.0 - 0.50 * strength).clamp(0.45, 1.0);
+                for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
+                    scale_legal_option_score(&mut options, label, dwell_damp);
+                }
             }
         }
         let mut options = normalize_action_options(options);
@@ -12501,6 +12582,42 @@ mod decision_refractory_tests {
             }
         }
         assert_eq!(allowed, vec![1, 4, 8]);
+    }
+}
+
+#[cfg(test)]
+mod forward_pass_first_tests {
+    use super::{
+        forward_pass_first_release_strength, FORWARD_PASS_FIRST_DWELL_FULL_SECONDS,
+        FORWARD_PASS_FIRST_OPEN_THRESHOLD,
+    };
+
+    #[test]
+    fn below_open_threshold_is_inert() {
+        // A covered / square forward option carries no early-release pressure.
+        assert_eq!(
+            forward_pass_first_release_strength(FORWARD_PASS_FIRST_OPEN_THRESHOLD - 0.01, 2.0),
+            0.0
+        );
+        assert_eq!(forward_pass_first_release_strength(0.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn release_strength_climbs_with_dwell_and_openness() {
+        let open = 0.8;
+        let early = forward_pass_first_release_strength(open, 0.0);
+        let mid = forward_pass_first_release_strength(open, FORWARD_PASS_FIRST_DWELL_FULL_SECONDS * 0.5);
+        let late = forward_pass_first_release_strength(open, FORWARD_PASS_FIRST_DWELL_FULL_SECONDS);
+        assert!(early > 0.0, "an open forward option pressures release immediately: {early}");
+        assert!(mid > early && late > mid, "dwelling raises urgency: {early} {mid} {late}");
+        // Saturates (doesn't keep climbing past the full-dwell point).
+        let beyond = forward_pass_first_release_strength(open, FORWARD_PASS_FIRST_DWELL_FULL_SECONDS * 3.0);
+        assert!((beyond - late).abs() < 1e-9, "dwell saturates: {late} vs {beyond}");
+        // A more open receiver is a stronger release than a marginal one.
+        let marginal = forward_pass_first_release_strength(FORWARD_PASS_FIRST_OPEN_THRESHOLD + 0.02, 1.0);
+        let wide_open = forward_pass_first_release_strength(0.95, 1.0);
+        assert!(wide_open > marginal, "more open ⇒ stronger: {marginal} vs {wide_open}");
+        assert!((0.0..=1.0).contains(&wide_open));
     }
 }
 

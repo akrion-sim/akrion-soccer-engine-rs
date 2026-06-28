@@ -20267,7 +20267,7 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok())
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS"))
     }
 }
 
@@ -20356,16 +20356,25 @@ pub(crate) fn soccer_mappo_epochs() -> usize {
 /// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
 /// to opt in) — leaving the default training run byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
-            .map(|raw| {
-                let raw = raw.trim();
-                raw == "1" || raw.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION"))
+    }
 }
 
 /// Whether a policy batch's advantages must be standardized (zero-mean / unit-variance)
@@ -20400,16 +20409,25 @@ pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f6
 /// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
 /// Read once per process.
 pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
-            .map(|raw| {
-                let raw = raw.trim();
-                raw == "1" || raw.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT"))
+    }
 }
 
 // While an aerial 50:50 is in flight TOWARD the opponent's goal (no settled holder), the
@@ -20477,9 +20495,18 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
 /// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
 /// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
 fn dd_soccer_enable_defensive_shepherd() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD"))
+    }
 }
 
 /// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
@@ -20487,9 +20514,18 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
 /// second pressure rather than a clean run at the back line. See
 /// [`WorldSnapshot::press_cover_target_for`].
 fn dd_soccer_enable_press_cover() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_COVER"))
+    }
 }
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
@@ -20603,18 +20639,38 @@ pub(crate) fn own_half_short_pass_liability_penalty_factor(
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
 /// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY"))
+    }
 }
 /// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
 /// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
 /// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
 /// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
 pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok()
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY"))
+    }
 }
 /// True when either wasted-energy variant is active. Both share the windowed-sample +
 /// ball-interaction-tracking machinery; the sustained variant additionally requires a long
@@ -20627,9 +20683,18 @@ pub(crate) fn wasted_energy_tracking_active() -> bool {
 /// Far-from-ball off-ball energy conservation throttle. OFF by default; set
 /// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION"))
+    }
 }
 /// Team → fixed history-array index (`Home` = 0, `Away` = 1).
 pub(crate) fn team_index(team: Team) -> usize {
@@ -20740,9 +20805,18 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
 /// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
 /// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
 fn dd_soccer_enable_off_ball_space_discipline() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
+    }
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
@@ -20780,9 +20854,18 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
 /// retrospective concede penalty (byte-identical baseline / A/B). See
 /// [`SoccerSimulation::record_keeper_save_reward`].
 fn dd_soccer_enable_keeper_save_reward() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD"))
+    }
 }
 
 /// Full reward points for a clean shot-stop (catch/save) of a maximally dangerous effort.

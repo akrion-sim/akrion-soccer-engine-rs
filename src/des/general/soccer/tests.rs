@@ -33704,10 +33704,19 @@ fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
         .iter()
         .find(|player| player.id == behind_teammate)
         .expect("behind player snapshot");
-    assert_eq!(
+    // The agent-decision snapshot must carry AT LEAST the Kalman minimum so the perception
+    // belief activates, while staying a trimmed tail (not the full position history). Other
+    // decision-time consumers (e.g. the loose-ball-contest stall window) may legitimately lift
+    // the retained count above the Kalman minimum, so this is a lower-bound invariant, not an
+    // exact-equality one.
+    assert!(
+        target.position_history.len() >= perception.kalman_min_history_samples
+            && target.position_history.len() < PLAYER_POSITION_HISTORY_LIMIT,
+        "agent-decision snapshot should carry a trimmed history tail >= the Kalman minimum \
+         (got {}, kalman min {}, full limit {})",
         target.position_history.len(),
         perception.kalman_min_history_samples,
-        "agent-decision snapshots should carry only the history tail needed for Kalman belief"
+        PLAYER_POSITION_HISTORY_LIMIT
     );
     let posterior_behind = prior_snapshot
         .observation_for(observer)
@@ -66195,9 +66204,20 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM),
+        "the pre-relational-attention total must be a recognised legacy dim so old nets migrate"
     );
     assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM, 2);
     assert_eq!(SOCCER_NEURAL_DRIBBLE_BEAT_FEATURE_DIM, 4);
@@ -84792,4 +84812,113 @@ fn policy_advantage_standardization_zero_means_and_skips_degenerate_batches() {
     let new_var = standardized.iter().map(|a| (a - new_mean).powi(2)).sum::<f64>()
         / standardized.len() as f64;
     assert!((new_var - 1.0).abs() < 1e-3, "standardized batch is ~unit-variance");
+}
+
+// ---------------------------------------------------------------------------
+// Relational attention readout (graph-style neighbourhood pooling) — the gated
+// learned-feature analogue of a GNN/attention encoder over the whole-field motion
+// block. See `soccer_relational_attention_readout` / `..._group`.
+// ---------------------------------------------------------------------------
+
+/// Build a full-length whole-field motion block from teammate then opponent
+/// `(forward, lateral, vel_forward, vel_lateral)` tuples (acc/jerk left zero, ball zero).
+fn relational_test_motion_block(
+    teammates: &[(f64, f64, f64, f64)],
+    opponents: &[(f64, f64, f64, f64)],
+) -> Vec<f32> {
+    let per = SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+    let half = SOCCER_NEURAL_FIELD_MOTION_PLAYERS / 2;
+    let mut block = vec![0.0f32; SOCCER_NEURAL_FIELD_MOTION_DIM];
+    for (i, &(fy, fx, vy, vx)) in teammates.iter().take(half).enumerate() {
+        let b = i * per;
+        block[b] = fy as f32;
+        block[b + 1] = fx as f32;
+        block[b + 2] = vy as f32;
+        block[b + 3] = vx as f32;
+    }
+    for (i, &(fy, fx, vy, vx)) in opponents.iter().take(half).enumerate() {
+        let b = (half + i) * per;
+        block[b] = fy as f32;
+        block[b + 1] = fx as f32;
+        block[b + 2] = vy as f32;
+        block[b + 3] = vx as f32;
+    }
+    block
+}
+
+#[test]
+fn relational_attention_readout_is_zeros_for_wrong_length() {
+    assert_eq!(
+        soccer_relational_attention_readout(&[]),
+        [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM]
+    );
+    assert_eq!(
+        soccer_relational_attention_readout(&[0.0f32; 7]),
+        [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM]
+    );
+}
+
+#[test]
+fn relational_attention_block_indices_are_contiguous_and_in_range() {
+    // The eight named indices must be consecutive and land inside the feature vector.
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM
+            - 1
+    );
+    assert!(SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY < SOCCER_NEURAL_FEATURE_DIM);
+}
+
+#[test]
+fn relational_attention_group_is_permutation_invariant() {
+    // Same set of opponents in two different orders yields the identical readout — the
+    // structural property a flat fixed-order list cannot give the MLP.
+    let a = [(0.2, 0.1, -0.3, 0.0), (0.5, -0.4, 0.2, 0.1), (-0.1, 0.3, 0.0, -0.2)];
+    let b = [a[2], a[0], a[1]];
+    let ra = soccer_relational_attention_group(&a);
+    let rb = soccer_relational_attention_group(&b);
+    assert!((ra.0 - rb.0).abs() < 1e-9);
+    assert!((ra.1 - rb.1).abs() < 1e-9);
+    assert!((ra.2 - rb.2).abs() < 1e-9);
+    assert!((ra.3 - rb.3).abs() < 1e-9);
+}
+
+#[test]
+fn relational_attention_closing_sign_tracks_approach() {
+    // One opponent dead ahead moving toward the actor (negative forward velocity) ⇒ positive
+    // closing (pressure arriving); the same opponent moving away ⇒ negative closing.
+    let approaching = soccer_relational_attention_group(&[(0.3, 0.0, -0.4, 0.0)]);
+    let retreating = soccer_relational_attention_group(&[(0.3, 0.0, 0.4, 0.0)]);
+    assert!(approaching.2 > 0.0, "approaching member closes: {}", approaching.2);
+    assert!(retreating.2 < 0.0, "retreating member opens: {}", retreating.2);
+}
+
+#[test]
+fn relational_attention_entropy_low_when_one_member_dominates() {
+    // A single very-near member next to several far members ⇒ peaked attention ⇒ low entropy.
+    let peaked =
+        soccer_relational_attention_group(&[(0.02, 0.0, 0.0, 0.0), (0.9, 0.0, 0.0, 0.0), (-0.9, 0.0, 0.0, 0.0)]);
+    // Three members at equal distance ⇒ uniform attention ⇒ entropy near 1.
+    let flat = soccer_relational_attention_group(&[(0.3, 0.0, 0.0, 0.0), (-0.3, 0.0, 0.0, 0.0), (0.0, 0.3, 0.0, 0.0)]);
+    assert!(peaked.3 < 0.5, "peaked entropy {} should be low", peaked.3);
+    assert!(flat.3 > 0.9, "flat entropy {} should be high", flat.3);
+}
+
+#[test]
+fn relational_attention_readout_excludes_self_and_separates_teams() {
+    // Actor at origin (self slot), one teammate ahead, one opponent behind closing in.
+    let teammates = [(0.0, 0.0, 0.0, 0.0), (0.4, 0.1, 0.0, 0.0)];
+    let opponents = [(-0.3, 0.0, 0.4, 0.0)];
+    let motion = relational_test_motion_block(&teammates, &opponents);
+    let r = soccer_relational_attention_readout(&motion);
+    // Teammate depth is positive (support ahead), excluding the self slot at origin.
+    assert!(r[0] > 0.0, "teammate depth {} should be forward", r[0]);
+    // Opponent depth is negative (behind), and the opponent moving toward the actor closes in.
+    assert!(r[4] < 0.0, "opponent depth {} should be behind", r[4]);
+    assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
