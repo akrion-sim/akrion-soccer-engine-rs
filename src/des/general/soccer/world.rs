@@ -12334,6 +12334,57 @@ impl SoccerMatch {
         obstacles
     }
 
+    /// Offside line (the second-last defender's `y`, GK included) for
+    /// `attacking_team`, computed from the live players. `None` when the defending
+    /// side has fewer than two players. Used to keep the xT terminal shaping onside.
+    fn live_offside_line_for(&self, attacking_team: Team) -> Option<f64> {
+        let attack = attacking_team.attack_dir();
+        // Progress toward the opponent goal; the two largest are the last and
+        // second-last defenders, and the offside line sits at the second-last.
+        let mut progress: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team != attacking_team && p.position.y.is_finite())
+            .map(|p| p.position.y * attack)
+            .collect();
+        if progress.len() < 2 {
+            return None;
+        }
+        progress.sort_by(|a, b| b.total_cmp(a));
+        Some(progress[1] * attack)
+    }
+
+    /// Cap the xT-`shaped` reference so its attack-direction progress never exceeds
+    /// the larger of the original (onside) target's progress and the offside line —
+    /// i.e. the nudge may pull sideways/back freely but cannot advance an attacker
+    /// past the line the support search kept it behind. No-op for non-attackers,
+    /// when the line is unknown, or when the shaped point is already onside.
+    fn xt_onside_capped_reference(
+        &self,
+        player_id: usize,
+        my_team: Team,
+        original: Vec2,
+        shaped: Vec2,
+    ) -> Vec2 {
+        let is_attacker = self
+            .players
+            .get(player_id)
+            .map_or(false, |p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder));
+        if !is_attacker {
+            return shaped;
+        }
+        let Some(line_y) = self.live_offside_line_for(my_team) else {
+            return shaped;
+        };
+        let attack = my_team.attack_dir();
+        let cap_progress = (original.y * attack).max(line_y * attack);
+        if shaped.y * attack > cap_progress {
+            Vec2::new(shaped.x, cap_progress * attack)
+        } else {
+            shaped
+        }
+    }
+
     /// The desired velocity actually executed this tick, after the MPC execution
     /// and (optionally) MDP↔MPC reconciliation layers. The "MDP" decision is the
     /// learned-policy/heuristic [`Self::collision_aware_desired_velocity`]; the
@@ -12522,7 +12573,15 @@ impl SoccerMatch {
                     top_speed: player_top_speed_yps(p.role, &p.skills),
                 })
                 .collect();
-            xt_terminal_shaped_target(&points, my_team, reference_target, fw, fl)
+            let shaped = xt_terminal_shaped_target(&points, my_team, reference_target, fw, fl);
+            // Onside discipline: the support search already held this reference
+            // onside; the goalward pull of the xT gradient must not undo that and
+            // park an attacker offside. Cap the shaped reference's attack-direction
+            // progress so it never advances FURTHER beyond the offside line than the
+            // assigned target already was (a sanctioned in-behind run keeps its lead,
+            // but the nudge can't extend it). Applies only to forwards/midfielders,
+            // matching `clamp_forward_onside_support`.
+            self.xt_onside_capped_reference(player_id, my_team, reference_target, shaped)
         } else {
             reference_target
         };
