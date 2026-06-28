@@ -21067,6 +21067,32 @@ fn dd_soccer_disable_winger_byline_option() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
 }
+/// Wide-defender "hold width when the ball is advanced" rule. ON by default: once the ball is
+/// 10+ yds AHEAD of our back-four line average, a wide defender pushes up WITH the play but no
+/// longer bombs out to the touchline to open up — opening wide from behind an advanced ball only
+/// isolates him and vacates the flank he covers. The exception is a live ground-pass outlet (he
+/// is within ~20yd of the ball on a clear lane), where getting wide to receive is correct. Set
+/// `DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH=1` to restore the always-open behaviour
+/// byte-for-byte. See `wingback_advanced_ball_should_hold_width`.
+fn dd_soccer_disable_wingback_advanced_ball_hold_width() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH").is_ok()
+    })
+}
+/// Outside-mid ball-lane attacking width. ON by default: a wide attacker opens to his touchline
+/// by an amount that scales SMOOTHLY with how close the ball's lane is to his own flank (closest
+/// ⇒ widest), instead of a binary "ball is on my half of the pitch" switch. Set
+/// `DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH=1` to restore the legacy binary boost
+/// byte-for-byte. See `wide_possession_outlet_target_for`.
+fn outside_mid_ball_lane_width_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        !std::env::var("DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH").is_ok()
+    })
+}
 /// Long-pass run requirement (Part B of the long-pass-option-runs feature). ON by default: a
 /// DEEP carrier may only pre-empt-commit a long aerial to a teammate who actually made the run
 /// (`backfield_long_pass_run_invite_for > 0`), so a calm backfield holder picks out a runner
