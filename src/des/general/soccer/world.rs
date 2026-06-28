@@ -29698,7 +29698,9 @@ impl WorldSnapshot {
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - own_half_short_pass_liability
-                    - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
+                    - pass_quality.lane_interception_risk
+                        * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
+                        * appetite_risk_penalty_mult
                     - safe_pass_overrisk_penalty
                     + over_the_top_invite_bonus * goal_entry_pass_learning
                     + own_box_play_out_adjustment
