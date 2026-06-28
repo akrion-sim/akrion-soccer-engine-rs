@@ -94,7 +94,7 @@ pub(crate) fn dd_soccer_enable_slip_break_offside() -> bool {
     }
     #[cfg(not(test))]
     {
-        static V: OnceLock<bool> = OnceLock::new();
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| env_truthy("DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE"))
     }
 }
@@ -110,7 +110,7 @@ pub(crate) fn dd_soccer_enable_slip_break_offside_reward() -> bool {
     }
     #[cfg(not(test))]
     {
-        static V: OnceLock<bool> = OnceLock::new();
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| env_truthy("DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE_REWARD"))
     }
 }
