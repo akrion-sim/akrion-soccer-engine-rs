@@ -255,25 +255,44 @@ mod tests {
     }
 
     #[test]
+    fn speed_advantage_rewards_a_faster_runner_and_a_line_stepping_up() {
+        // No edge (runner no faster than the line) ⇒ no advantage.
+        assert_eq!(slip_break_speed_advantage(0.0, 0.0), 0.0);
+        assert_eq!(slip_break_speed_advantage(2.0, 4.0), 0.0);
+        // A sprinting runner against a static line, and even more against a line stepping UP
+        // (negative forward), reads as a strong advantage.
+        let vs_static = slip_break_speed_advantage(4.0, 0.0);
+        let vs_stepping_up = slip_break_speed_advantage(4.0, -2.0);
+        assert!(vs_static > 0.0 && vs_stepping_up > vs_static);
+        assert!((slip_break_speed_advantage(8.0, 0.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn opportunity_quality_is_bounded_and_monotonic() {
         for &s in &[0.0, 0.5, 1.0] {
             for &t in &[0.0, 0.5, 1.0] {
                 for &o in &[0.0, 0.5, 1.0] {
-                    let q = slip_break_opportunity_quality(s, t, o);
-                    assert!((0.0..=1.0).contains(&q), "s={s} t={t} o={o} q={q}");
+                    for &p in &[0.0, 0.5, 1.0] {
+                        let q = slip_break_opportunity_quality(s, t, o, p);
+                        assert!((0.0..=1.0).contains(&q), "s={s} t={t} o={o} p={p} q={q}");
+                    }
                 }
             }
         }
-        // No seam ⇒ no opportunity, whatever the timing.
-        assert_eq!(slip_break_opportunity_quality(0.0, 1.0, 1.0), 0.0);
-        // Better timing and more openness only help.
+        // No seam ⇒ no opportunity, whatever the timing/pace.
+        assert_eq!(slip_break_opportunity_quality(0.0, 1.0, 1.0, 1.0), 0.0);
+        // Better timing, more openness, and a bigger speed edge each only help.
         assert!(
-            slip_break_opportunity_quality(0.8, 0.4, 0.5)
-                < slip_break_opportunity_quality(0.8, 0.9, 0.5)
+            slip_break_opportunity_quality(0.8, 0.4, 0.5, 0.5)
+                < slip_break_opportunity_quality(0.8, 0.9, 0.5, 0.5)
         );
         assert!(
-            slip_break_opportunity_quality(0.8, 0.6, 0.2)
-                < slip_break_opportunity_quality(0.8, 0.6, 0.9)
+            slip_break_opportunity_quality(0.8, 0.6, 0.2, 0.5)
+                < slip_break_opportunity_quality(0.8, 0.6, 0.9, 0.5)
+        );
+        assert!(
+            slip_break_opportunity_quality(0.8, 0.6, 0.5, 0.1)
+                < slip_break_opportunity_quality(0.8, 0.6, 0.5, 0.9)
         );
     }
 }
