@@ -19700,6 +19700,92 @@ fn v2_sim_ab_report() {
     );
 }
 
+/// Press-cover hardening: with a lone presser stepping to an opponent carrier in our
+/// own half, the single nearest other defender is assigned a cover point goal-side
+/// behind the presser. Gate-free direct call (race-free).
+#[test]
+fn press_cover_assigns_a_second_defender_goal_side_behind_the_lone_presser() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("an away forward");
+    let carrier_pos = Vec2::new(40.0, 30.0); // Home defends y=0 ⇒ 30yd into Home's half
+    sim.players[carrier_id].position = carrier_pos;
+    sim.ball.holder = Some(carrier_id);
+    sim.ball.position = carrier_pos;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    assert!(home_def.len() >= 2, "need a back line");
+    let presser = home_def[0];
+    let cover = home_def[1];
+    // Park every other Home outfielder far away so the two test defenders are the
+    // deterministic nearest presser + cover.
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home
+            && p.role != PlayerRole::Goalkeeper
+            && p.id != presser
+            && p.id != cover
+        {
+            p.position = Vec2::new(5.0, 115.0);
+        }
+    }
+    sim.players[presser].position = Vec2::new(40.0, 25.0); // goal-side of carrier, nearest
+    sim.players[cover].position = Vec2::new(40.0, 20.0); // behind the presser
+    let snap = WorldSnapshot::from_match(&sim);
+    let presser_snap = snap.players.iter().find(|p| p.id == presser).unwrap();
+    let cover_snap = snap.players.iter().find(|p| p.id == cover).unwrap();
+
+    // The presser is never its own cover.
+    assert!(
+        snap.press_cover_target_for(presser_snap).is_none(),
+        "the presser must not be assigned as its own cover"
+    );
+    // The cover defender gets a goal-side point ~PRESS_COVER_DEPTH behind the carrier.
+    let target = snap
+        .press_cover_target_for(cover_snap)
+        .expect("the second defender should be assigned cover");
+    assert!(target.y < carrier_pos.y, "cover must sit goal-side of carrier: {target:?}");
+    assert!(
+        (carrier_pos.y - target.y - 6.0).abs() < 1.5,
+        "cover should tuck ~6yd goal-side of the carrier: {target:?}"
+    );
+}
+
+#[test]
+fn press_cover_is_inactive_when_the_carrier_is_in_our_attacking_half() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("an away forward");
+    let carrier_pos = Vec2::new(40.0, 95.0); // Home's attacking half — no cover needed
+    sim.players[carrier_id].position = carrier_pos;
+    sim.ball.holder = Some(carrier_id);
+    sim.ball.position = carrier_pos;
+    sim.ball.last_touch_team = Some(Team::Away);
+    let snap = WorldSnapshot::from_match(&sim);
+    let any_home_def = snap
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .unwrap();
+    assert!(
+        snap.press_cover_target_for(any_home_def).is_none(),
+        "no press-cover when the carrier is in our attacking half"
+    );
+}
+
 #[test]
 fn defensive_line_cushion_suspends_band_inside_own_twenty_yards() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {

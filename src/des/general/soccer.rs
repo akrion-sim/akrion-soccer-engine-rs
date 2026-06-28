@@ -75,6 +75,8 @@ mod run_prediction;
 pub use run_prediction::*;
 mod perception;
 pub use perception::*;
+mod head_scan;
+pub use head_scan::*;
 mod spacing_target;
 pub use spacing_target::*;
 mod aerial_reception;
@@ -597,6 +599,13 @@ const HOLDER_PRESS_MAX_DISTANCE_YARDS: f64 = 16.0;
 /// Tight standoff the presser closes to: within tackle/contest range, a half-step off
 /// so it is a contain-press that forces a decision, not a committed lunge.
 const HOLDER_PRESS_STANDOFF_YARDS: f64 = 1.8;
+/// Press-cover hardening (gated `DD_SOCCER_ENABLE_PRESS_COVER`): how far goal-side of
+/// the carrier the single COVER defender tucks in behind the lone presser, so a beaten
+/// press meets immediate second pressure instead of a clean break.
+const PRESS_COVER_DEPTH_YARDS: f64 = 6.0;
+/// A cover defender only commits when it is already within this of the cover point —
+/// don't drag a distant defender out of the block to provide cover from range.
+const PRESS_COVER_MAX_DISTANCE_YARDS: f64 = 18.0;
 /// Advancement-scaled steal urgency (mechanism 13: stop a defender backing off
 /// forever and letting a carrier dribble 20–30yd to the box). A carrier who is NOT
 /// advancing toward our goal is merely contained; the more they drive at goal, the
@@ -51806,6 +51815,10 @@ fn position_confidence_for_observer(
     point: Vec2,
     facing: Option<Vec2>,
     observer_has_ball: bool,
+    // Carrier's continuous time on the ball (seconds) for the head-scan confidence
+    // lift; `0.0` for non-holders. Inert unless `DD_SOCCER_ENABLE_HEAD_SCAN` is on,
+    // so callers passing `0.0` (or the gate being off) keep the flat blind-side floor.
+    scan_seconds: f64,
 ) -> f64 {
     let to_point = point - observer_position;
     let distance = to_point.len();
@@ -51829,10 +51842,26 @@ fn position_confidence_for_observer(
                     <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES
                 {
                     BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE
-                } else if dot >= 0.0 {
-                    0.42
                 } else {
-                    0.24
+                    // Beyond the 90° shoulder arc — behind the carrier. A flat blind-side
+                    // floor without head-scan; with it (gated; OFF ⇒ identical), a bearing
+                    // the carrier has had time on the ball to sweep is read more confidently
+                    // — a glance, still capped below a clean shoulder-check.
+                    let base = if dot >= 0.0 { 0.42 } else { 0.24 };
+                    if head_scan_enabled() && scan_seconds > 0.0 {
+                        let fov_half = (BALL_HOLDER_CORE_VISION_DEGREES * 0.5
+                            + BALL_HOLDER_SHOULDER_VISION_DEGREES)
+                            .to_radians();
+                        let coverage = scan_coverage(
+                            angle.to_radians(),
+                            fov_half,
+                            scan_seconds,
+                            ability01(observer.skills.vision),
+                        );
+                        scanned_confidence(coverage, base)
+                    } else {
+                        base
+                    }
                 }
             } else {
                 let half_fov_cos = (player_field_of_view(observer).to_radians() * 0.5).cos();
