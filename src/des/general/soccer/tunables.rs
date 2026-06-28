@@ -233,7 +233,8 @@ impl PomdpPerceptionTunables {
 /// deterministic argmax and these values are never read, so an unconfigured
 /// process is byte-identical to before this group existed.
 ///
-/// Defaults are the requested **70 / 20 / 10**.
+/// Defaults are the requested **70 / 20 / 10** rank split with the value-weighted
+/// path off (`boltzmann_temperature = 0`).
 pub const POLICY_SELECTION_TOP_RANK_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1031,8 +1032,8 @@ impl Tunables {
         self.fresh_possession_escape.sanitize();
         self.killer_pass_over_top.sanitize();
         self.lane_affinity.sanitize();
-        self.policy_selection.sanitize();
         self.pomdp_perception.sanitize();
+        self.policy_selection.sanitize();
         self
     }
 
@@ -3975,8 +3976,8 @@ mod tests {
         assert_eq!(t.policy_selection.top1_weight, 0.70);
         assert_eq!(t.policy_selection.top2_weight, 0.20);
         assert_eq!(t.policy_selection.top3_weight, 0.10);
-        assert_eq!(t.policy_selection.boltzmann_temperature, 0.0);
         assert_eq!(t.policy_selection.rank_weights(), [0.70, 0.20, 0.10]);
+        assert_eq!(t.policy_selection.boltzmann_temperature, 0.0);
         assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 0.10);
         assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 0.25);
         assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 100.0);

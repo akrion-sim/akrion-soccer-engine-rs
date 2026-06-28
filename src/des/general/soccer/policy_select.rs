@@ -274,8 +274,12 @@ pub fn sampled_rank(
 /// action was actually drawn from. Ranks past the available candidates (or past
 /// the three weighted ranks) get a small positive floor so an importance ratio
 /// never divides by zero. `n <= 1` ⇒ `1.0` (forced choice).
-pub fn behavior_probability_for_rank(n: usize, weights: [f64; 3], rank: usize) -> f64 {
-    let k = n.min(3);
+pub fn behavior_probability_for_rank(
+    n: usize,
+    weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT],
+    rank: usize,
+) -> f64 {
+    let k = n.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if k <= 1 {
         return 1.0;
     }

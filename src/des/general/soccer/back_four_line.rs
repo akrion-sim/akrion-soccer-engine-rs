@@ -72,7 +72,7 @@ const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MOD
 /// anchor, sticks at the 6 inside it, and trails a dynamic
 /// [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`]..[`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
 /// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
-/// the existing ball-relative 10-30yd band + halfway+5 cap.
+/// the existing ball-relative 20-40yd band + halfway+5 cap.
 const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
 
 /// Own-goal depth (yd) the back-four AVERAGE is anchored to while the ball is

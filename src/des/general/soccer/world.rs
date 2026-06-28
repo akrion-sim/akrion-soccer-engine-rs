@@ -20993,7 +20993,7 @@ impl WorldSnapshotOptions {
         use_configured_pomdp_history_samples: true,
         include_shared_histories: false,
         include_player_decisions: false,
-        include_ball_history: false,
+        include_ball_history: true,
         trace_mdp_mpc_comparison: false,
     };
 
@@ -21170,8 +21170,10 @@ impl WorldSnapshot {
     pub(crate) fn from_match_with_options(m: &SoccerMatch, options: WorldSnapshotOptions) -> Self {
         let mut options = options;
         if options.use_configured_pomdp_history_samples {
-            options.player_history_samples =
-                tunables().pomdp_perception.kalman_min_history_samples;
+            options.player_history_samples = tunables()
+                .pomdp_perception
+                .kalman_min_history_samples
+                .max(LOOSE_BALL_TEAM_STALL_WINDOW_TICKS + 1);
         }
         let schedule_index_lookup = AgentScheduleIndexLookup::from_entries(&m.last_agent_schedule);
         let shared_positions = if options.include_shared_histories {
@@ -33298,6 +33300,92 @@ impl WorldSnapshot {
         elapsed >= LOOSE_BALL_MAX_UNCONTESTED_SECONDS
     }
 
+    pub(crate) fn loose_ball_urgency_active_for_team(&self, team: Team) -> bool {
+        if self.active_set_play.is_some() {
+            return false;
+        }
+        self.loose_ball_urgency_active() || self.loose_ball_team_stalled_for(team)
+    }
+
+    pub(crate) fn loose_ball_team_stalled_for(&self, team: Team) -> bool {
+        if dd_soccer_disable_loose_ball_urgency()
+            || self.ball.holder.is_some()
+            || self.pending_pass.is_some()
+            || self.active_set_play.is_some()
+        {
+            return false;
+        }
+
+        let needed_samples = LOOSE_BALL_TEAM_STALL_WINDOW_TICKS + 1;
+        let has_ball_window = self.ball_history.len() >= needed_samples;
+        let mut saw_outfielder = false;
+        let mut saw_history_window = false;
+        for player in self
+            .players
+            .iter()
+            .filter(|player| player.team == team && player.role != PlayerRole::Goalkeeper)
+        {
+            saw_outfielder = true;
+            let current = self.player_snapshot_position(player);
+            let current_distance = current.distance(self.ball.position);
+            if current_distance <= LOOSE_BALL_TEAM_STALL_CLOSE_RADIUS_YARDS
+                || self.loose_ball_player_currently_closing_on_ball(player, current)
+            {
+                return false;
+            }
+            if has_ball_window && player.position_history.len() >= needed_samples {
+                saw_history_window = true;
+                if self.loose_ball_player_closed_recently_on_ball(
+                    player,
+                    current_distance,
+                    needed_samples,
+                ) {
+                    return false;
+                }
+            }
+        }
+        saw_outfielder && saw_history_window
+    }
+
+    fn loose_ball_player_closed_recently_on_ball(
+        &self,
+        player: &PlayerSnapshot,
+        current_distance: f64,
+        needed_samples: usize,
+    ) -> bool {
+        let previous_index = player.position_history.len().saturating_sub(needed_samples);
+        let previous_position = player.position_history[previous_index];
+        let previous_ball_position = self
+            .ball_history
+            .iter()
+            .rev()
+            .nth(LOOSE_BALL_TEAM_STALL_WINDOW_TICKS)
+            .map(|sample| sample.position)
+            .unwrap_or(self.ball.position);
+        let previous_distance = previous_position.distance(previous_ball_position);
+        if previous_distance.is_finite() && current_distance.is_finite() {
+            return previous_distance - current_distance >= LOOSE_BALL_TEAM_STALL_MIN_CLOSING_YARDS;
+        }
+        false
+    }
+
+    fn loose_ball_player_currently_closing_on_ball(
+        &self,
+        player: &PlayerSnapshot,
+        current: Vec2,
+    ) -> bool {
+        let to_ball = self.ball.position - current;
+        let dist = to_ball.len();
+        if dist <= LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS && dist > 1e-3 {
+            let closing_speed = self
+                .player_velocity(player.id)
+                .unwrap_or(player.velocity)
+                .dot(to_ball * (1.0 / dist));
+            return closing_speed >= LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS * 0.25;
+        }
+        false
+    }
+
     pub(crate) fn projected_loose_ball_target(&self) -> Option<Vec2> {
         if self.ball.holder.is_some() || self.pending_pass.is_some() {
             return None;
@@ -33558,13 +33646,18 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let team_urgency = self.loose_ball_urgency_active_for_team(player.team);
         let best_arrival = self
             .players
             .iter()
-            .filter(|candidate| candidate.role != PlayerRole::Goalkeeper)
+            .filter(|candidate| {
+                candidate.team == player.team && candidate.role != PlayerRole::Goalkeeper
+            })
             .map(|candidate| loose_ball_arrival_time_seconds(self, candidate, target))
             .fold(f64::INFINITY, f64::min);
-        let uncontested_urgency = if best_arrival.is_finite() {
+        let uncontested_urgency = if team_urgency {
+            1.0
+        } else if best_arrival.is_finite() {
             ((best_arrival - LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS) / 0.75).clamp(0.0, 1.0)
         } else {
             0.0
@@ -33630,6 +33723,9 @@ impl WorldSnapshot {
     pub(crate) fn loose_ball_contester_count(&self, me: &PlayerSnapshot, target: Vec2) -> usize {
         let my_dist = self.player_snapshot_position(me).distance(target);
         if my_dist > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS {
+            return 1;
+        }
+        if self.loose_ball_team_stalled_for(me.team) {
             return 1;
         }
         // Nearest opponent (the team that played the ball) to the drop, and how fast it is
@@ -34103,7 +34199,7 @@ impl WorldSnapshot {
         // retriever must attack it NOW (trap at the earliest reachable point) rather than
         // wait for a cleaner, slower reception — a loose ball does not linger unchallenged
         // in real soccer. Same effect as opponent-denial, just driven by elapsed neglect.
-        if self.loose_ball_urgency_active() {
+        if self.loose_ball_urgency_active_for_team(me.team) {
             return (early, true, early_speed);
         }
         // Miscontrol risk of taking the EARLY ball: rises with ball speed past a clean-control
@@ -35418,7 +35514,16 @@ impl WorldSnapshot {
         let offside_suspended = self.offside_currently_suspended();
         let (lower, upper, _, _, _) =
             self.defensive_line_band_bounds_fwd(me.team, offside_suspended);
-        let line_band_avg_fwd = |avg: f64| avg.clamp(lower, upper);
+        // v2 field-anchored line (gated): the desired AVERAGE is the v2 centre
+        // (15yd anchor + dynamic 20-40yd gap + sticky-6 + halfway cap) rather than
+        // the ball-relative band clamp. All projected-average corrections and the
+        // flat-line clamp below then target that single centre. Off ⇒ byte-identical.
+        let v2_centre_fwd =
+            back_four_line_depth_v2_enabled().then(|| self.back_four_line_v2_centre_fwd(me.team));
+        let line_band_avg_fwd = |avg: f64| match v2_centre_fwd {
+            Some(centre) => centre,
+            None => avg.clamp(lower, upper),
+        };
         let desired_avg_fwd = line_band_avg_fwd(avg_fwd);
         let current_fwd = fwd(self.player_snapshot_position(me));
         let target_fwd = fwd(target);
@@ -41233,6 +41338,99 @@ impl WorldSnapshot {
                 .is_some()
     }
 
+    /// The dynamic trailing gap (yd, in `[BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS,
+    /// BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS]`) the v2 line wants behind a deep ball.
+    /// Read from the learned line-depth head once trained + enabled, else the
+    /// analytic seed; `frac` 0 = a higher line (min gap), 1 = a deeper line (max).
+    fn back_four_desired_gap_yards(&self, team: Team) -> f64 {
+        let frac = self
+            .build_back_four_line_inputs(team)
+            .map(|inputs| {
+                self.line_depth_head
+                    .as_ref()
+                    .filter(|head| {
+                        back_four_line_model_enabled()
+                            && head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS
+                    })
+                    .and_then(|head| head.predict(&inputs))
+                    .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs))
+            })
+            .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
+            .clamp(0.0, 1.0);
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac
+    }
+
+    /// The v2 line-CENTRE forward-coordinate (attack frame) for `team`'s back four:
+    /// `own_goal_fwd + ` the pure [`back_four_line_target_depth_v2`] depth (anchor on
+    /// the 15yd line, track to parity inside it, stick at the keeper's 6, trail a
+    /// dynamic 20-40yd behind a deep ball, capped at halfway + the into-opp-half
+    /// allowance). Shared by both live line chokepoints so they agree on the centre.
+    /// Leads the ball by the standard lookahead so a fast carrier pulls it early.
+    pub(crate) fn back_four_line_v2_centre_fwd(&self, team: Team) -> f64 {
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let predicted_fwd = self
+            .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
+            .y
+            * attack;
+        let ball_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, self.field_length);
+        let desired_gap = self.back_four_desired_gap_yards(team);
+        let six = self.back_four_six_yard_line_target_depth(team);
+        let max_depth = self.field_length * 0.5
+            + tunables()
+                .defensive_shape
+                .defensive_line_max_into_opp_half_yards;
+        let centre_depth = back_four_line_target_depth_v2(
+            ball_depth,
+            desired_gap,
+            BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS,
+            six,
+            max_depth,
+        );
+        own_goal_fwd + centre_depth
+    }
+
+    /// v2 field-anchored back-four line target for `me` (gated by
+    /// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2`). The CENTRE comes from
+    /// [`Self::back_four_line_v2_centre_fwd`]. The ≤2yd flat offside clamp is kept
+    /// around that centre; the ~3s movement grace (handled by the caller's shape
+    /// easing) lets individuals sit transiently off the line and converge. Mirrors
+    /// the flatten tail of [`Self::defender_line_band_average_adjusted_y`].
+    pub(crate) fn back_four_line_depth_v2_adjusted_y(
+        &self,
+        me: &PlayerSnapshot,
+        compact_y: f64,
+    ) -> f64 {
+        let attack = me.team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(me.team) * attack;
+        let centre_fwd = self.back_four_line_v2_centre_fwd(me.team);
+        let level_half_band = BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5;
+        // The line may always drop DEEPER (cover/retreat) but never step ahead of
+        // the centre by more than the half-band (that plays runners onside).
+        let shallowest_fwd = centre_fwd + level_half_band;
+        let deepest_fwd = own_goal_fwd;
+        let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
+        // The flat trap is lifted while WE control (centre-backs split / full-backs
+        // overlap), while a pass is in flight (offside already judged; lane-cutters
+        // must be free to step), and when the offside law is suspended (a restart in
+        // behind — nothing to trap). Unlike the legacy line the v2 trap is NOT gated
+        // off deep in our own third: holding the flat 15yd line there is the point.
+        let controls_ball = self.controlled_possession_team() == Some(me.team);
+        if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
+            return clamped_fwd * attack;
+        }
+        let ahead_cap = centre_fwd + level_half_band;
+        // While a carrier breaks through, the line must be free to DROP and cover, so
+        // the pull-up (lower edge) is suspended and the four re-level once it clears.
+        let leveled_fwd = if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
+            clamped_fwd.min(ahead_cap)
+        } else {
+            clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
+        };
+        leveled_fwd * attack
+    }
+
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
     /// connected: a 15yd shelf near our own box, opening into a 20-40yd cushion once the ball is
     /// at least 35yd from goal (measured to where the ball is HEADED, so the line retreats early
@@ -41257,6 +41455,12 @@ impl WorldSnapshot {
         }
         if ball_from_own_goal <= DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS {
             return compact_y;
+        }
+        // v2 field-anchored line depth (gated). Takes over the band+flatten below
+        // with a 15yd-anchored centre + dynamic 20-40yd trailing gap; off ⇒ the
+        // legacy ball-relative 20-40yd band + halfway+5 cap stands (byte-identical).
+        if back_four_line_depth_v2_enabled() {
+            return self.back_four_line_depth_v2_adjusted_y(me, compact_y);
         }
         // No offside in force (the ball is being played directly from a throw-in &c.): the line
         // cannot trap a high line — an attacker may legally lurk goal-side of it — so it drops OFF
