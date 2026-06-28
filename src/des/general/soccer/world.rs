@@ -39421,6 +39421,7 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut best_forward_pass_option_quality = 0.0f64;
         let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
