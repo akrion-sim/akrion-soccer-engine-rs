@@ -4772,6 +4772,7 @@ impl PlayerAgent {
                 * crowded_pass_lift
                 * pressured_release_multiplier
                 * panic_pass_damp
+                * slip_break_pass_multiplier
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
             options.push(AgentActionOptionTrace::new(
