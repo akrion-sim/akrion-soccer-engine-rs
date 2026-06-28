@@ -5246,6 +5246,30 @@ impl PlayerAgent {
                 }
             }
         }
+        // Blindside-steal ESCAPE (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`; OFF ⇒ the threat
+        // field is always 0 ⇒ no-op, byte-identical). Once the carrier has GLANCED and
+        // RECOGNISED a defender sneaking up on its blind side, it should break away NOW —
+        // accelerate forward into space or release early — rather than dwell with a slow
+        // shielded dribble the thief nicks from behind. Escalates with the perceived threat.
+        let blindside_escape = observation.blindside_threat_from_behind.clamp(0.0, 1.0);
+        if blindside_escape > 0.0 {
+            let accel_floor = (0.18 + 0.52 * blindside_escape).clamp(0.0, 0.82);
+            for label in ["carry-forward", "vertical-attack"] {
+                ensure_min_legal_option_probability(&mut options, label, accel_floor);
+            }
+            if pass_target_count > 0 {
+                ensure_min_legal_option_probability(
+                    &mut options,
+                    "pass1",
+                    (0.28 + 0.42 * blindside_escape).clamp(0.0, 0.78),
+                );
+            }
+            // Stop standing still / shielding INTO the thief — exactly what gets robbed.
+            let dwell_damp = (1.0 - 0.58 * blindside_escape).clamp(0.35, 1.0);
+            for label in ["protect-ball", "hold-up-flank", "side-step", "nutmeg"] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+        }
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
