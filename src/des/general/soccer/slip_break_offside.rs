@@ -164,17 +164,34 @@ pub(crate) fn slip_break_runner_in_staging_band(runner_yards_to_line: f64) -> bo
     runner_yards_to_line > 0.0 && runner_yards_to_line <= SLIP_BREAK_STAGE_MAX_DEPTH_YARDS
 }
 
+/// The runner's speed advantage `[0,1]` over the back line: how much faster he is moving toward
+/// goal than the line is (both measured in the attacking direction, so a line that steps up to
+/// spring the trap — moving *against* the attack — increases the advantage). This is the
+/// ball-holder's core recognition cue: a runner with a real pace advantage will beat the line into
+/// the space behind, so the slip is on. Zero when the runner has no edge. Pure.
+pub(crate) fn slip_break_speed_advantage(
+    runner_forward_yps: f64,
+    line_forward_yps: f64,
+) -> f64 {
+    let differential = runner_forward_yps - line_forward_yps;
+    (differential / SLIP_BREAK_SPEED_ADVANTAGE_REFERENCE_YPS).clamp(0.0, 1.0)
+}
+
 /// Combined opportunity quality `[0,1]` of a slip-break for ranking/reward: a real seam, a
-/// well-timed break, and a receiver with some space. Monotonic and bounded. Pure.
+/// well-timed break, a receiver with some space, and a runner who is winning the race against the
+/// line (the [`slip_break_speed_advantage`]). Even at pace parity a well-found seam retains some
+/// value, but a clear speed edge is what tips recognition. Monotonic and bounded. Pure.
 pub(crate) fn slip_break_opportunity_quality(
     seam_quality: f64,
     release_timing: f64,
     runner_openness: f64,
+    speed_advantage: f64,
 ) -> f64 {
     let seam = seam_quality.clamp(0.0, 1.0);
     let timing = release_timing.clamp(0.0, 1.0);
     let openness = runner_openness.clamp(0.0, 1.0);
-    seam * (0.35 + 0.65 * timing) * (0.6 + 0.4 * openness)
+    let pace = speed_advantage.clamp(0.0, 1.0);
+    seam * (0.35 + 0.65 * timing) * (0.6 + 0.4 * openness) * (0.45 + 0.55 * pace)
 }
 
 #[cfg(test)]
