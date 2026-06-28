@@ -10022,7 +10022,119 @@ impl SoccerMatch {
         }
     }
 
+    /// Latch a "live cross" window when an **aerial cross is released from the flank in the
+    /// attacking final third** under the situational crash-the-box recognizer, and pay the small
+    /// bounded shaped reward to attackers already crashed into the box for the delivery. A no-op
+    /// (byte-identical) unless `DD_SOCCER_ENABLE_FLANK_CRASH_BOX` is on. See [`crash_box`].
+    fn register_flank_crash_box_cross(
+        &mut self,
+        team: Team,
+        crosser: usize,
+        origin: Vec2,
+        is_cross: bool,
+        flight: PassFlight,
+    ) {
+        if !crash_box::flank_crash_box_enabled()
+            || self.active_set_play.is_some()
+            || !(is_cross && flight.is_aerial())
+        {
+            return;
+        }
+        let length = self.config.field_length_yards;
+        let width = self.config.field_width_yards;
+        if !crash_box::flank_final_third_crash_box_geometry(
+            origin,
+            team.goal_y(length),
+            width,
+            length,
+        ) {
+            return;
+        }
+        self.flank_crash_box_cross = Some(crash_box::FlankCrashBoxCross {
+            team,
+            crosser,
+            released_tick: self.tick,
+        });
+        self.reward_flank_crash_box_arrivals(team, crosser);
+    }
+
+    /// Pay [`crash_box::CRASH_BOX_ARRIVAL_SHAPED_POINTS`] (budget-bounded, split evenly) to this
+    /// team's attackers already inside the opponent box as the cross is released, when at least
+    /// [`crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS`] of them have crashed in. Deterministic.
+    fn reward_flank_crash_box_arrivals(&mut self, team: Team, crosser: usize) {
+        let opponent_box_team = team.other();
+        let mut crashers: Vec<usize> = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == team
+                    && player.id != crosser
+                    && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && self.point_in_own_penalty_area(opponent_box_team, player.position)
+            })
+            .map(|player| player.id)
+            .collect();
+        crashers.sort_unstable();
+        if crashers.len() < crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS {
+            return;
+        }
+        let total = apply_dense_shaping_budget(
+            crash_box::CRASH_BOX_ARRIVAL_SHAPED_POINTS,
+            tunables().reward.dense_shaping_budget_points,
+        );
+        let share = total / crashers.len() as f64;
+        for id in crashers {
+            self.record_reward_event_with_kind(id, share, SoccerRewardEventKind::CrashBoxArrival);
+        }
+    }
+
+    /// Credit the terminal [`crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS`] bonus when the goal
+    /// just scored was a **headed finish off a live flank crash-the-box cross**: the bonus is
+    /// split between the header scorer and the deliverer of the cross (its assist share), so
+    /// MARL/MAPPO reinforces the entire wide-delivery → bodies-in-the-box → header pattern.
+    /// Returns `true` when the bonus was paid. A no-op unless the feature is on.
+    fn record_flank_crash_box_header_goal(&mut self, scoring_team: Team, shooter: Option<usize>) -> bool {
+        if !crash_box::flank_crash_box_enabled() {
+            return false;
+        }
+        let Some(cross) = self.flank_crash_box_cross else {
+            return false;
+        };
+        let Some(shooter) = shooter else {
+            return false;
+        };
+        let dt = self.config.dt_seconds;
+        let aerial_finish_now = self
+            .pending_aerial_finish
+            .is_some_and(|(id, tick)| id == shooter && tick == self.tick);
+        if cross.team != scoring_team
+            || !cross.is_open_at(self.tick, dt)
+            || !aerial_finish_now
+        {
+            return false;
+        }
+        let assist = (crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS
+            * crash_box::HEADER_GOAL_FROM_CROSS_ASSIST_SHARE)
+            .max(0.0);
+        let finisher = (crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS - assist).max(0.0);
+        self.record_reward_event_with_kind(
+            shooter,
+            finisher,
+            SoccerRewardEventKind::HeaderGoalFromCross,
+        );
+        if cross.crosser != shooter {
+            self.record_reward_event_with_kind(
+                cross.crosser,
+                assist,
+                SoccerRewardEventKind::HeaderGoalFromCross,
+            );
+        }
+        self.flank_crash_box_cross = None;
+        true
+    }
+
     pub(crate) fn record_goal_rewards(&mut self, scoring_team: Team, shooter: Option<usize>) {
+        self.record_flank_crash_box_header_goal(scoring_team, shooter);
         let previous_touch_team = self.previous_touch_team_for_goal();
         if let Some(shooter) = shooter {
             self.record_possession_touch(shooter);
