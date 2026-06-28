@@ -2686,8 +2686,9 @@ fn immediate_steal_wins_ball_from_behind_only_under_blindside_gate() {
     // Thief at contact range directly behind a jogging carrier. Normally a steal from
     // behind is blocked (the body shields the led ball); the blindside gate is the one
     // exception against a slow, unaware, catchable carrier.
-    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
-    let thief = snapshot
+    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let thief = sim
         .players
         .iter()
         .find(|p| p.id == 14)
