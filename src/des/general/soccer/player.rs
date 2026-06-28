@@ -2616,6 +2616,54 @@ pub(crate) fn is_outside_midfielder_role(role: PlayerRole, home_x: f64, field_wi
         && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
 }
 
+/// Re-weight the carrier's possession options for the isolated-carrier `mode` so a forward DRIVE
+/// (or hold-up carry) floats above the panicked backward/square recycle. `pass1` is a
+/// backward/square ball in this state by construction (no teammate is ahead), so it is damped too;
+/// nothing is made illegal, so a backward outlet still survives when nothing else is on. Pure +
+/// RNG-free (operates only on the option scores) so it is unit-testable without the env gate.
+pub(crate) fn apply_isolated_carrier_drive_bias(
+    options: &mut Vec<AgentActionOptionTrace>,
+    mode: IsolatedCarrierDriveMode,
+    in_shot_range: bool,
+    shot_legal: bool,
+) {
+    // Square / backward outlets that become a last resort in both modes.
+    let backward_outlets = ["recycle-reset", "switch-play", "route-one"];
+    match mode {
+        IsolatedCarrierDriveMode::SoloGoalDrive => {
+            let mut drive_family = vec!["vertical-attack", "turnover-burst", "carry-forward"];
+            if in_shot_range && shot_legal {
+                drive_family.push("shoot");
+            }
+            ensure_min_legal_option_family_probability(options, &drive_family, 0.72);
+            for label in backward_outlets {
+                scale_legal_option_score(options, label, 0.28);
+            }
+            // Don't square it to a covered man, and don't stall on a shield/turn when the lane to
+            // goal is there to be driven.
+            scale_legal_option_score(options, "pass1", 0.40);
+            for label in ["protect-ball", "hold-up-flank", "side-step"] {
+                scale_legal_option_score(options, label, 0.58);
+            }
+        }
+        IsolatedCarrierDriveMode::HoldUp => {
+            // Carry forward / on an angle at a controlled pace (the sprint resolver keeps it off a
+            // sprint) and wait for support to arrive.
+            ensure_min_legal_option_family_probability(
+                options,
+                &["carry-forward", "carry-out-left", "carry-out-right"],
+                0.60,
+            );
+            // Backward is the very last resort: damp it hard. Shielding while you wait
+            // (protect-ball) is fine, so it is intentionally left alone.
+            for label in backward_outlets {
+                scale_legal_option_score(options, label, 0.20);
+            }
+            scale_legal_option_score(options, "pass1", 0.32);
+        }
+    }
+}
+
 /// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
 /// released early instead of dwelt on (the user's "if that option is forward and sufficiently
 /// open"). Below this the carrier keeps his normal patience.
