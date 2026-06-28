@@ -461,6 +461,11 @@ pub struct SoccerMatch {
     /// energy sample at tick `t` is "wasted" iff this is `< t` when the 10s window closes.
     /// Maintained only while the wasted-energy penalty is enabled.
     pub(crate) player_last_ball_interaction_tick: HashMap<usize, u64>,
+    /// Per-team (`[Home, Away]`, indexed by `team_index`) tick of the most recent genuine
+    /// positive outcome — a won ball, shot, goal, beaten defender, or 2+ forward-pass
+    /// sequence. The sustained-effort variant treats a windowed sprint as "paid off" when this
+    /// is `>= ` the sample tick. Maintained only while that variant is enabled.
+    pub(crate) team_last_positive_outcome_tick: [Option<u64>; 2],
     pub(crate) defensive_delay_clocks: HashMap<usize, f64>,
     pub(crate) defensive_beat_clocks: HashMap<usize, f64>,
     pub(crate) offside_clocks: HashMap<usize, f64>,
@@ -2607,6 +2612,7 @@ impl SoccerMatch {
             last_turnover_penalty_tick: None,
             wasted_energy_history: VecDeque::new(),
             player_last_ball_interaction_tick: HashMap::new(),
+            team_last_positive_outcome_tick: [None, None],
             defensive_delay_clocks: HashMap::new(),
             defensive_beat_clocks: HashMap::new(),
             offside_clocks: HashMap::new(),
@@ -7913,7 +7919,7 @@ impl SoccerMatch {
         // The current holder is interacting with the ball this tick (covers a long dribble,
         // where `record_possession_touch` only fired at the receive). No-op when the feature
         // is off. Touch/interception/receive events are timestamped in `record_possession_touch`.
-        if dd_soccer_enable_wasted_energy_penalty() {
+        if wasted_energy_tracking_active() {
             if let Some(holder) = self.ball.holder {
                 self.player_last_ball_interaction_tick.insert(holder, self.tick);
             }
@@ -8586,6 +8592,16 @@ impl SoccerMatch {
         if !amount.is_finite() || amount.abs() <= 1e-9 || player_id >= self.players.len() {
             return;
         }
+        // Sustained-effort variant: stamp the scoring team's most-recent positive-outcome tick
+        // so a teammate's windowed sprint counts as "paid off" even when the sprinter never
+        // personally touches the ball. Gated; zero-cost & byte-identical when off.
+        if dd_soccer_enable_sustained_effort_no_outcome_penalty() && kind.is_positive_team_outcome()
+        {
+            let idx = team_index(self.players[player_id].team);
+            if self.team_last_positive_outcome_tick[idx].map_or(true, |stamp| stamp < tick) {
+                self.team_last_positive_outcome_tick[idx] = Some(tick);
+            }
+        }
         self.reward_events.push(SoccerRewardEvent {
             tick,
             player_id,
@@ -8602,7 +8618,7 @@ impl SoccerMatch {
         if player_id >= self.players.len() {
             return;
         }
-        if dd_soccer_enable_wasted_energy_penalty() {
+        if wasted_energy_tracking_active() {
             self.player_last_ball_interaction_tick
                 .insert(player_id, self.tick);
         }
@@ -13694,6 +13710,30 @@ impl SoccerMatch {
         // freely.
         let pacing_factor =
             effort_pacing_factor(self.players[player_id].anaerobic_load, proximity_urgency);
+        // Far-from-ball off-ball energy conservation: a player with no urgent reason to run who
+        // is well clear of the ball eases off by up to ~20% (smooth, no cliff) to bank energy
+        // rather than drifting around at full pace. Every real movement cue — being chased, a
+        // counter-break, joining the attack, a loose-ball scramble, an incoming pass to receive,
+        // a flat-out defensive recovery, a transition push-up, the ball carrier itself, the
+        // keeper (it tracks the goal line continuously), and a human-controlled player — is
+        // exempt, so it only ever quiets a player with no reason to keep sprinting. Gated;
+        // byte-identical & zero-cost when off. See `far_offball_conservation_factor`.
+        let far_offball_factor = if dd_soccer_enable_far_offball_energy_conservation()
+            && !chased
+            && !on_break
+            && !attack_support
+            && !loose_ball_attack
+            && !incoming_pass
+            && recover_effort < DEFENSIVE_RECOVERY_SPRINT_THRESHOLD
+            && push_up_urgency <= 0.0
+            && self.ball.holder != Some(player_id)
+            && self.players[player_id].controller_slot.is_none()
+            && self.players[player_id].role != PlayerRole::Goalkeeper
+        {
+            far_offball_conservation_factor(me_pos.distance(self.ball.position))
+        } else {
+            1.0
+        };
         let speed = player_top_speed_yps(
             self.players[player_id].role,
             &self.players[player_id].skills,
@@ -13704,7 +13744,8 @@ impl SoccerMatch {
             * proximity_urgency
             // Decisiveness: an unsure player (low belief-grounded confidence) commits less
             // pace; a confident one moves full speed.
-            * movement_decisiveness(self.players[player_id].decision_confidence);
+            * movement_decisiveness(self.players[player_id].decision_confidence)
+            * far_offball_factor;
         // MPC execution + MDP↔MPC reconciliation layer. For the active subset
         // (carrier + nearby contesters) a short-horizon point-mass MPC plans a
         // dynamically-feasible movement; depending on config it either refines the
@@ -17973,18 +18014,30 @@ impl SoccerMatch {
         }
         // Wasted-energy window: retain this tick's "moving a lot" transitions, then settle any
         // whose 10s lookahead has now closed. Gated so it adds zero cost when off.
-        if dd_soccer_enable_wasted_energy_penalty() && self.config.learning_enabled {
+        if wasted_energy_tracking_active() && self.config.learning_enabled {
+            // Sustained variant: a sample is only worth tracking if the player was in a long,
+            // flat-out sprint (the legacy variant retains every hard-running tick).
+            let sustained_mode = dd_soccer_enable_sustained_effort_no_outcome_penalty();
             for transition in transitions {
-                let joules = self
-                    .players
-                    .get(transition.player_id)
-                    .map_or(0.0, |player| player.last_tick_locomotion_joules);
-                if joules.is_finite() && joules >= WASTED_ENERGY_MIN_JOULES_PER_TICK {
-                    self.wasted_energy_history.push_back(WastedEnergySample {
-                        transition: transition.clone(),
-                        joules,
-                    });
+                let Some(player) = self.players.get(transition.player_id) else {
+                    continue;
+                };
+                let joules = player.last_tick_locomotion_joules;
+                if !joules.is_finite() || joules < WASTED_ENERGY_MIN_JOULES_PER_TICK {
+                    continue;
                 }
+                if sustained_mode
+                    && !sustained_sprint_run_qualifies(
+                        player.sustained_sprint_seconds,
+                        player.sustained_sprint_distance_yards,
+                    )
+                {
+                    continue;
+                }
+                self.wasted_energy_history.push_back(WastedEnergySample {
+                    transition: transition.clone(),
+                    joules,
+                });
             }
             while self.wasted_energy_history.len() > WASTED_ENERGY_MAX_PENDING_SAMPLES {
                 self.wasted_energy_history.pop_front();
@@ -18000,6 +18053,14 @@ impl SoccerMatch {
     /// joules it spent, so every gradient learner nudges that state→action pair down a touch.
     /// Samples that DID lead to a touch are simply dropped (no reward change). No-op when disabled.
     pub(crate) fn finalize_wasted_energy_window(&mut self) {
+        self.finalize_wasted_energy_window_with(dd_soccer_enable_sustained_effort_no_outcome_penalty());
+    }
+
+    /// Core of [`Self::finalize_wasted_energy_window`], with the sustained-variant behaviour
+    /// passed explicitly so it is unit-testable without process-global env state. When
+    /// `sustained_mode` is set, a teammate's genuine positive outcome (`team_last_positive_-
+    /// outcome_tick`) within the lookahead pays the run off in addition to a personal touch.
+    pub(crate) fn finalize_wasted_energy_window_with(&mut self, sustained_mode: bool) {
         let window = WASTED_ENERGY_WINDOW_TICKS.max(1);
         let points = wasted_energy_penalty_points();
         // History is tick-ordered (oldest at the front); stop at the first sample still inside
@@ -18018,7 +18079,11 @@ impl SoccerMatch {
             // A touch at or after the sample's tick means the running paid off — drop it.
             let touched_in_window =
                 last_interaction.is_some_and(|interaction| interaction >= sample.transition.tick);
-            if touched_in_window || points <= 0.0 {
+            // Sustained variant: a teammate's positive outcome in the lookahead also pays it off.
+            let team_outcome_in_window = sustained_mode
+                && self.team_last_positive_outcome_tick[team_index(sample.transition.team)]
+                    .is_some_and(|outcome| outcome >= sample.transition.tick);
+            if touched_in_window || team_outcome_in_window || points <= 0.0 {
                 continue;
             }
             let ratio = (sample.joules / WASTED_ENERGY_REFERENCE_JOULES_PER_TICK)
@@ -20541,6 +20606,52 @@ pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+}
+/// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
+/// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
+/// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
+/// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
+pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok())
+}
+/// True when either wasted-energy variant is active. Both share the windowed-sample +
+/// ball-interaction-tracking machinery; the sustained variant additionally requires a long
+/// flat-out sprint to retain a sample and treats a teammate's positive outcome as paying the
+/// run off (`finalize_wasted_energy_window_with`).
+pub(crate) fn wasted_energy_tracking_active() -> bool {
+    dd_soccer_enable_wasted_energy_penalty()
+        || dd_soccer_enable_sustained_effort_no_outcome_penalty()
+}
+/// Far-from-ball off-ball energy conservation throttle. OFF by default; set
+/// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
+pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+}
+/// Team → fixed history-array index (`Home` = 0, `Away` = 1).
+pub(crate) fn team_index(team: Team) -> usize {
+    match team {
+        Team::Home => 0,
+        Team::Away => 1,
+    }
+}
+/// True when a tracked sprint is long and sustained enough to be a candidate "big effort":
+/// held at flat-out pace for ≥ `SUSTAINED_EFFORT_MIN_SECONDS` AND covering
+/// ≥ `SUSTAINED_EFFORT_MIN_DISTANCE_YARDS`. Pure (testable in isolation).
+pub(crate) fn sustained_sprint_run_qualifies(seconds: f64, distance_yards: f64) -> bool {
+    seconds >= SUSTAINED_EFFORT_MIN_SECONDS && distance_yards >= SUSTAINED_EFFORT_MIN_DISTANCE_YARDS
+}
+/// Smooth off-ball energy-conservation throttle as a function of distance from the ball:
+/// `1.0` up to `FAR_OFFBALL_CONSERVE_START_YARDS`, ramping via `smoothstep_unit` (no cliff)
+/// down to `1.0 - FAR_OFFBALL_CONSERVE_MAX_REDUCTION` at `FAR_OFFBALL_CONSERVE_FULL_YARDS` and
+/// held there beyond. Pure (testable in isolation).
+pub(crate) fn far_offball_conservation_factor(ball_distance_yards: f64) -> f64 {
+    let span = (FAR_OFFBALL_CONSERVE_FULL_YARDS - FAR_OFFBALL_CONSERVE_START_YARDS).max(1e-6);
+    let t = ((ball_distance_yards - FAR_OFFBALL_CONSERVE_START_YARDS) / span).clamp(0.0, 1.0);
+    1.0 - FAR_OFFBALL_CONSERVE_MAX_REDUCTION * smoothstep_unit(t)
 }
 /// Per-fully-wasted-sprint-tick penalty points, overridable via
 /// `DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS` for A/B tuning. Falls back to

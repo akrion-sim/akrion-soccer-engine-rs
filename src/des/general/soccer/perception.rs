@@ -181,6 +181,34 @@ mod tests {
     }
 
     #[test]
+    fn field_motion_block_uses_perceived_positions_only_under_gate() {
+        let _l = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var(PERCEPTION_NOISE_ENABLE_ENV);
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let actor = snapshot
+            .players
+            .iter()
+            .find(|p| p.role != PlayerRole::Goalkeeper)
+            .expect("an outfield actor");
+        let (actor_id, actor_team) = (actor.id, actor.team);
+
+        // Gate OFF ⇒ the whole-field block is the true (god-view) positions.
+        let truth = soccer_field_player_motion_block(&snapshot, actor_id, actor_team);
+        // Gate ON ⇒ far / behind players are perceived at a (bounded) wrong place.
+        std::env::set_var(PERCEPTION_NOISE_ENABLE_ENV, "1");
+        let perceived = soccer_field_player_motion_block(&snapshot, actor_id, actor_team);
+        std::env::remove_var(PERCEPTION_NOISE_ENABLE_ENV);
+
+        assert_eq!(truth.len(), perceived.len());
+        assert!(perceived.iter().all(|v| v.is_finite()));
+        assert!(
+            truth != perceived,
+            "perception noise should mislocate at least one far/occluded player in the block"
+        );
+    }
+
+    #[test]
     fn clear_sightline_is_unoccluded() {
         let occ = sightline_occlusion_fraction(
             Vec2::new(0.0, 0.0),

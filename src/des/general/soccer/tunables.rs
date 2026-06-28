@@ -506,6 +506,13 @@ pub struct RewardTunables {
     /// `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD`; the gate keeps an unconfigured
     /// process byte-identical to before this term existed.
     pub pitch_value_threat_delta_points: f64,
+    /// Per-step **dense shaping budget** (P4 / audit follow-up #3): the symmetric
+    /// `±` cap applied to the dense per-step reward so accreted dense shards can't
+    /// dominate the sparse match-outcome signal on a single step. Only active when
+    /// `DD_SOCCER_ENABLE_SHAPING_DISCIPLINE` is set (off ⇒ byte-identical). The
+    /// default is generous (catches pathological spikes without clipping a normal
+    /// stacked action price); tighten it in an A/B to lean on the budget harder.
+    pub dense_shaping_budget_points: f64,
 }
 
 impl Default for RewardTunables {
@@ -520,6 +527,7 @@ impl Default for RewardTunables {
             blocked_lane_floor_pass_penalty_points: 6.0,
             low_pressure_forced_pass_penalty_points: 1.75,
             pitch_value_threat_delta_points: 12.0,
+            dense_shaping_budget_points: 12.0,
         }
     }
 }
@@ -2895,6 +2903,15 @@ impl RewardTunables {
             0.0,
             60.0,
         );
+        sanitize_f64(
+            "reward.dense_shaping_budget_points",
+            &mut self.dense_shaping_budget_points,
+            default.dense_shaping_budget_points,
+            0.0,
+            1000.0,
+            0.0,
+            200.0,
+        );
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
@@ -2968,6 +2985,14 @@ impl RewardTunables {
             self.pitch_value_threat_delta_points,
             0.0,
             500.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "dense_shaping_budget_points",
+            self.dense_shaping_budget_points,
+            0.0,
+            1000.0,
             errors,
         );
     }

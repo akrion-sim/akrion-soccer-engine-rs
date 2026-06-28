@@ -1096,6 +1096,16 @@ pub struct PlayerAgent {
     /// it never feeds a decision, so it leaves the simulation trajectory byte-identical.
     #[serde(default)]
     pub last_tick_locomotion_joules: f64,
+    /// Consecutive seconds the player has been holding a flat-out sprint (≥
+    /// `SUSTAINED_EFFORT_SPEED_FRACTION` of top speed); reset the instant pace drops below it.
+    /// Maintained only while the sustained-effort-no-outcome penalty is enabled; otherwise it
+    /// stays 0 and is read by nothing, so the simulation trajectory is byte-identical.
+    #[serde(default)]
+    pub sustained_sprint_seconds: f64,
+    /// Distance (yards) covered within the current sustained flat-out sprint; companion to
+    /// `sustained_sprint_seconds` (reset together). See its note for the gating contract.
+    #[serde(default)]
+    pub sustained_sprint_distance_yards: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
@@ -2835,6 +2845,20 @@ impl PlayerAgent {
             let locomotion_joules =
                 metabolic_power_demand_w(&self.skills, speed_yps, accel_forward_yps2) * dt;
             self.last_tick_locomotion_joules = finite_metric(locomotion_joules).max(0.0);
+            // Sustained flat-out sprint tracking for the sustained-effort-no-outcome penalty:
+            // accumulate held time + distance while at ≥98% of top speed, and reset the moment
+            // the player eases below it — so only a long, all-out run ever qualifies. Gated; the
+            // fields stay 0 and unread when off, leaving the trajectory byte-identical.
+            if dd_soccer_enable_sustained_effort_no_outcome_penalty() {
+                let top_speed = player_top_speed_yps(self.role, &self.skills).max(1e-6);
+                if speed_yps >= top_speed * SUSTAINED_EFFORT_SPEED_FRACTION {
+                    self.sustained_sprint_seconds += dt;
+                    self.sustained_sprint_distance_yards += speed_yps * dt;
+                } else {
+                    self.sustained_sprint_seconds = 0.0;
+                    self.sustained_sprint_distance_yards = 0.0;
+                }
+            }
         }
 
         if dd_soccer_disable_power_duration_ceiling() {

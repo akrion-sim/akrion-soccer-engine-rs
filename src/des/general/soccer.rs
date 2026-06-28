@@ -1736,6 +1736,34 @@ const WASTED_ENERGY_PENALTY_RATIO_CLAMP: f64 = 1.5;
 // Bound the windowed history (and thus the deferred re-train backlog) the same way the
 // turnover window is bounded — newest samples evict the oldest past this many.
 const WASTED_ENERGY_MAX_PENDING_SAMPLES: usize = 1024;
+// --- Sustained-effort-no-outcome refinement -------------------------------------
+// (`DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY`) A stricter, team-aware variant
+// of the wasted-energy penalty. A windowed sample is only RETAINED when the player was in a
+// genuine SUSTAINED flat-out sprint (≥ SUSTAINED_EFFORT_SPEED_FRACTION of top speed, held for
+// ≥ SUSTAINED_EFFORT_MIN_SECONDS and covering ≥ SUSTAINED_EFFORT_MIN_DISTANCE_YARDS), and that
+// run only counts as "paid off" if the sprinter touched the ball OR the player's team produced
+// a real positive outcome in the lookahead — winning the ball back, a shot, a goal, beating a
+// defender on the dribble, or a 2+ forward-pass sequence (see
+// `SoccerRewardEventKind::is_positive_team_outcome`). Otherwise the big effort bought nothing,
+// so the run is docked ever so slightly (same tiny per-tick points as the base penalty). OFF
+// ⇒ the joules-only / touch-only legacy behaviour, byte-identical & zero-cost.
+// 98% of the player's top speed = a true flat-out sprint, not an honest run.
+const SUSTAINED_EFFORT_SPEED_FRACTION: f64 = 0.98;
+// Held this long before the sprint is "sustained" — a couple of seconds of all-out effort,
+// not a single explosive step.
+const SUSTAINED_EFFORT_MIN_SECONDS: f64 = 2.0;
+// ...and covering this far — "really sprints a long way". ~18yd ≈ 2s at a top-end pace.
+const SUSTAINED_EFFORT_MIN_DISTANCE_YARDS: f64 = 18.0;
+// --- Far-from-ball off-ball energy conservation ---------------------------------
+// (`DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION`) A player with no urgent reason to run
+// who is well clear of the ball eases off to bank energy instead of drifting about at full
+// pace. The output throttle ramps SMOOTHLY (smoothstep, no cliff) from no reduction at
+// FAR_OFFBALL_CONSERVE_START_YARDS to a FAR_OFFBALL_CONSERVE_MAX_REDUCTION cut by
+// FAR_OFFBALL_CONSERVE_FULL_YARDS. Every real movement cue is exempt (see
+// `far_offball_conservation_factor`). OFF ⇒ byte-identical & zero-cost.
+const FAR_OFFBALL_CONSERVE_START_YARDS: f64 = 40.0;
+const FAR_OFFBALL_CONSERVE_FULL_YARDS: f64 = 60.0;
+const FAR_OFFBALL_CONSERVE_MAX_REDUCTION: f64 = 0.20;
 // --- Slide tackle (a committed, high-variance defensive challenge) ---------------
 // A slide tackle is a LAST-DITCH lunge a defender throws at a ball-carrier who is
 // moving too fast to be contained on foot. It reaches further than a standing
@@ -12152,7 +12180,10 @@ fn soccer_outcome_credit_pitch_value_shaping(transition: &SoccerLearningTransiti
     }
     let before = soccer_replay_pitch_value_potential(&transition.state, transition.team);
     let after = soccer_replay_pitch_value_potential(&transition.next_state, transition.team);
-    potential_based_shaping(1.0, before, after) * scale
+    // P3 (discount alignment): use the learner's γ when the shaping-discipline is on,
+    // else γ=1.0 (byte-identical). PBRS is only policy-invariant when its γ matches the
+    // discount the returns use; `disciplined_gamma` closes that gap behind the gate.
+    potential_based_shaping(disciplined_gamma(), before, after) * scale
 }
 
 fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f64 {
@@ -16947,6 +16978,23 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::MatchResult
         )
     }
+
+    /// The genuinely positive attacking / turnover outcomes that "pay off" a teammate's hard
+    /// off-ball sprint: winning the ball back (a defensive dispossession), a shot on target, a
+    /// goal, beating a defender on the dribble, or a 2+ forward-pass sequence. Keeper saves and
+    /// match-result bookkeeping are intentionally excluded — they are not the product of an
+    /// off-ball run. Drives the sustained-effort-no-outcome penalty.
+    pub(crate) fn is_positive_team_outcome(self) -> bool {
+        matches!(
+            self,
+            SoccerRewardEventKind::DribbleBeat
+                | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::TwoForwardPasses
+                | SoccerRewardEventKind::ThreePassForwardNetGain
+                | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::Goal
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -19863,7 +19911,21 @@ fn soccer_field_player_motion_block(
         if player_slots >= SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
             break;
         }
-        let pos = snapshot.player_position(id).unwrap_or(actor_pos);
+        // POMDP hardening: feed the actor's PERCEIVED position of each other player
+        // (mislocated for low-confidence / occluded targets via the Kalman perception
+        // model) rather than ground truth, so the neural policy/value condition on what
+        // the actor can actually see — not a privileged god-view of all 22. Gated by the
+        // existing `DD_SOCCER_ENABLE_PERCEPTION_NOISE`; OFF (default) keeps the exact true
+        // position (byte-identical). The actor sees itself exactly (the method returns the
+        // true position for `observer == target`); motion (vel/acc/jerk) stays exact, as
+        // the perception model only estimates position.
+        let pos = if perception_noise_enabled() {
+            snapshot
+                .perceived_player_position(actor_id, id)
+                .unwrap_or(actor_pos)
+        } else {
+            snapshot.player_position(id).unwrap_or(actor_pos)
+        };
         let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
         let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
         let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
@@ -20996,8 +21058,17 @@ fn soccer_transition_reward_with_tactics(
     tactical_learning: &SoccerTacticalLearningWeights,
 ) -> f64 {
     let action = normalize_soccer_action_label(&decision.action);
-    let mut reward =
-        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning);
+    // P4 (single shaping budget): cap the per-step DENSE reward so accreted dense
+    // shards can't, on one step, dominate the sparse match-outcome signal. The live
+    // training path calls this with `infer_discrete_events = false`, so the value
+    // returned here is dense-only — goal/concede/pass-completion events are summed
+    // separately and uncapped downstream (see `learning_transitions_for`). Inert
+    // (byte-identical) unless `DD_SOCCER_ENABLE_SHAPING_DISCIPLINE` is on with a finite
+    // positive `reward.dense_shaping_budget_points`.
+    let mut reward = apply_dense_shaping_budget(
+        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning),
+        tunables().reward.dense_shaping_budget_points,
+    );
 
     if !infer_discrete_events {
         return reward;
@@ -49485,6 +49556,8 @@ fn player_agent_from_snapshot(player: &PlayerSnapshot) -> PlayerAgent {
         dizziness: 0.0,
         anaerobic_load: 0.0,
         last_tick_locomotion_joules: 0.0,
+        sustained_sprint_seconds: 0.0,
+        sustained_sprint_distance_yards: 0.0,
         incoming_ball: player.incoming_ball.clone(),
         skills: player.skills.clone(),
         fatigue: player.fatigue.clamp(0.0, 1.0),
@@ -58495,6 +58568,8 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 dizziness: 0.0,
                 anaerobic_load: 0.0,
                 last_tick_locomotion_joules: 0.0,
+                sustained_sprint_seconds: 0.0,
+                sustained_sprint_distance_yards: 0.0,
                 incoming_ball: None,
                 // Deterministic, position-only skills: every player is the same
                 // overall standard, shaped by their shirt (1-11) and identical

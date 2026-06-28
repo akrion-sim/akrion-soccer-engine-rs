@@ -29123,6 +29123,130 @@ fn wasted_energy_penalty_is_inert_when_disabled() {
 }
 
 #[test]
+fn sustained_sprint_run_qualifies_requires_long_and_sustained() {
+    // Below either threshold ⇒ not a candidate "big effort".
+    assert!(!sustained_sprint_run_qualifies(0.0, 0.0));
+    assert!(!sustained_sprint_run_qualifies(
+        SUSTAINED_EFFORT_MIN_SECONDS - 0.1,
+        SUSTAINED_EFFORT_MIN_DISTANCE_YARDS + 5.0
+    ));
+    assert!(!sustained_sprint_run_qualifies(
+        SUSTAINED_EFFORT_MIN_SECONDS + 1.0,
+        SUSTAINED_EFFORT_MIN_DISTANCE_YARDS - 0.1
+    ));
+    // Long AND sustained ⇒ qualifies.
+    assert!(sustained_sprint_run_qualifies(
+        SUSTAINED_EFFORT_MIN_SECONDS,
+        SUSTAINED_EFFORT_MIN_DISTANCE_YARDS
+    ));
+    assert!(sustained_sprint_run_qualifies(4.0, 30.0));
+}
+
+#[test]
+fn far_offball_conservation_factor_is_smooth_with_no_cliff() {
+    // No reduction up to the start distance.
+    assert!((far_offball_conservation_factor(0.0) - 1.0).abs() < 1e-12);
+    assert!((far_offball_conservation_factor(FAR_OFFBALL_CONSERVE_START_YARDS) - 1.0).abs() < 1e-12);
+    // Full ~20% reduction at/after the full distance, held flat beyond.
+    let floor = 1.0 - FAR_OFFBALL_CONSERVE_MAX_REDUCTION;
+    assert!((far_offball_conservation_factor(FAR_OFFBALL_CONSERVE_FULL_YARDS) - floor).abs() < 1e-12);
+    assert!((far_offball_conservation_factor(120.0) - floor).abs() < 1e-12);
+    // Monotonically non-increasing and continuous (no cliff): step the ramp finely and assert
+    // each step moves by a small amount only.
+    let mut prev = far_offball_conservation_factor(FAR_OFFBALL_CONSERVE_START_YARDS);
+    let mut d = FAR_OFFBALL_CONSERVE_START_YARDS;
+    while d <= FAR_OFFBALL_CONSERVE_FULL_YARDS {
+        let f = far_offball_conservation_factor(d);
+        assert!(f <= prev + 1e-12, "factor must not increase across the ramp");
+        assert!((prev - f).abs() < 0.02, "ramp must be smooth (no cliff): {prev} -> {f}");
+        prev = f;
+        d += 0.25;
+    }
+    // Halfway through the ramp the cut is strictly between 0 and the max (a genuine ramp).
+    let mid = far_offball_conservation_factor(
+        (FAR_OFFBALL_CONSERVE_START_YARDS + FAR_OFFBALL_CONSERVE_FULL_YARDS) / 2.0,
+    );
+    assert!(mid < 1.0 && mid > floor);
+}
+
+#[test]
+fn sustained_effort_window_spared_by_team_positive_outcome() {
+    // sustained_mode: a hard, long sprint that produced NO personal touch is still spared when
+    // the player's TEAM produced a genuine positive outcome inside the lookahead; an identical
+    // run by a team that produced nothing is docked.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(0);
+    let base = SoccerLearningTransition {
+        tick: 0,
+        player_id: 0,
+        team: Team::Home,
+        role: sim.players[0].role,
+        state: snapshot.mdp_state_for_player(0),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "run".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(0),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let sample = |tick: u64, player_id: usize, team: Team| WastedEnergySample {
+        transition: SoccerLearningTransition {
+            tick,
+            player_id,
+            team,
+            ..base.clone()
+        },
+        joules: WASTED_ENERGY_REFERENCE_JOULES_PER_TICK,
+    };
+
+    sim.tick = WASTED_ENERGY_WINDOW_TICKS + 100;
+    // p0 (Home): a teammate won the ball / scored at tick 50, inside p0's [10, ..] window.
+    sim.wasted_energy_history.push_back(sample(10, 0, Team::Home));
+    sim.team_last_positive_outcome_tick[team_index(Team::Home)] = Some(50);
+    // p1 (Away): no positive outcome anywhere ⇒ the big effort is docked.
+    sim.wasted_energy_history.push_back(sample(20, 1, Team::Away));
+    // p2 (Home): the only Home outcome (tick 50) is BEFORE its sample tick (60) ⇒ still docked.
+    sim.wasted_energy_history.push_back(sample(60, 2, Team::Home));
+
+    sim.finalize_wasted_energy_window_with(true);
+
+    let penalized: std::collections::HashMap<usize, f64> = sim
+        .deferred_reward_transitions
+        .iter()
+        .map(|t| (t.player_id, t.reward))
+        .collect();
+    assert!(!penalized.contains_key(&0), "team outcome in window spares the run");
+    assert!(penalized.get(&1).is_some_and(|r| *r < 0.0), "no outcome ⇒ docked");
+    assert!(penalized.get(&2).is_some_and(|r| *r < 0.0), "earlier outcome does not spare it");
+
+    // Legacy mode (sustained_mode = false) ignores the team tracker: p0 is docked too because it
+    // never personally touched the ball.
+    let mut legacy = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    legacy.tick = WASTED_ENERGY_WINDOW_TICKS + 100;
+    legacy.wasted_energy_history.push_back(sample(10, 0, Team::Home));
+    legacy.team_last_positive_outcome_tick[team_index(Team::Home)] = Some(50);
+    legacy.finalize_wasted_energy_window_with(false);
+    assert!(
+        legacy
+            .deferred_reward_transitions
+            .iter()
+            .any(|t| t.player_id == 0 && t.reward < 0.0),
+        "legacy mode ignores team outcomes — an untouched run is still docked"
+    );
+}
+
+#[test]
 fn learning_episode_records_transition_per_player_per_tick() {
     let dataset = run_learning_episode(MatchConfig {
         duration_seconds: 0.2,
