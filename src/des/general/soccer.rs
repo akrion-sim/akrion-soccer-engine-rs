@@ -57221,6 +57221,98 @@ fn pitch_grid_address(position: Vec2, field_width: f64, field_length: f64) -> Pi
     }
 }
 
+/// Cell-centre pitch position (yards) for a per-player genome anchor on the
+/// `PITCH_GENOME_LANES × PITCH_GENOME_ROWS` (12 lanes × 24 rows) grid, oriented
+/// for `team` (anchor `row` 0 = that team's OWN goal line, increasing toward the
+/// opponent goal).
+///
+/// This is the exact inverse of the [`zone`] bucketing used by [`pitch_grid_cell`]:
+/// a `(lane, row)` maps to the CENTRE of its fine cell, so feeding the result back
+/// through [`pitch_grid_address`] lands in the same fine cell. It is the bridge
+/// that lets the 12×24 grid be the single source of each player's field-position
+/// affinity — especially by width, since `lane` is the x-axis and the existing
+/// role lane band ([`role_vertical_lane_range`]) keys off `home_position.x`.
+fn genome_anchor_home_position(
+    lane: u8,
+    row: u8,
+    team: Team,
+    field_width: f64,
+    field_length: f64,
+) -> Vec2 {
+    let (field_width, field_length) = sane_pitch_dimensions(field_width, field_length);
+    let lanes = PITCH_GENOME_LANES.max(1) as f64;
+    let rows = PITCH_GENOME_ROWS.max(1) as f64;
+    let lane = lane.min(PITCH_GENOME_LANES.saturating_sub(1)) as f64;
+    let row = row.min(PITCH_GENOME_ROWS.saturating_sub(1)) as f64;
+    let x = (lane + 0.5) / lanes * field_width;
+    let own_goal_relative_y = (row + 0.5) / rows * field_length;
+    let y = match team {
+        Team::Home => own_goal_relative_y,
+        Team::Away => field_length - own_goal_relative_y,
+    };
+    Vec2::new(x, y).clamp_to_pitch(field_width, field_length)
+}
+
+#[cfg(test)]
+mod genome_anchor_home_position_tests {
+    use super::*;
+
+    const W: f64 = 80.0;
+    const L: f64 = 120.0;
+
+    #[test]
+    fn anchor_round_trips_to_the_same_fine_cell() {
+        // Every (lane, row) maps to a position that re-buckets to that exact fine
+        // cell — the grid<->position bridge is loss-free over the 12×24 basis.
+        for lane in 0..PITCH_GENOME_LANES {
+            for row in 0..PITCH_GENOME_ROWS {
+                let home = genome_anchor_home_position(lane, row, Team::Home, W, L);
+                let fine = pitch_grid_address(home, W, L).fine;
+                assert_eq!(fine.x, lane as usize, "lane {lane} row {row} x round-trip");
+                assert_eq!(fine.y, row as usize, "lane {lane} row {row} y round-trip");
+                // Away mirrors the row (own goal at the far end) but keeps the lane.
+                let away = genome_anchor_home_position(lane, row, Team::Away, W, L);
+                let away_fine = pitch_grid_address(away, W, L).fine;
+                assert_eq!(away_fine.x, lane as usize, "away keeps the lane (width)");
+                assert_eq!(
+                    away_fine.y,
+                    (PITCH_GENOME_ROWS - 1 - row) as usize,
+                    "away mirrors the row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn width_is_monotonic_in_lane() {
+        let left = genome_anchor_home_position(2, 5, Team::Home, W, L);
+        let right = genome_anchor_home_position(9, 5, Team::Home, W, L);
+        assert!(right.x > left.x, "a higher lane sits further across the width");
+        // Lane is team-independent: away keeps the same x for the same lane.
+        let away_left = genome_anchor_home_position(2, 5, Team::Away, W, L);
+        assert!((away_left.x - left.x).abs() < 1e-9, "lane→x is team-invariant");
+    }
+
+    #[test]
+    fn row_zero_sits_by_the_teams_own_goal() {
+        // Home defends y≈0, Away defends y≈L, so an own-half (low-row) anchor is
+        // deep for each team's own goal.
+        let home_deep = genome_anchor_home_position(6, 0, Team::Home, W, L);
+        let away_deep = genome_anchor_home_position(6, 0, Team::Away, W, L);
+        assert!(home_deep.y < L * 0.1, "home row 0 hugs y≈0");
+        assert!(away_deep.y > L * 0.9, "away row 0 hugs y≈L");
+    }
+
+    #[test]
+    fn out_of_range_anchor_is_clamped_not_panicking() {
+        let pos = genome_anchor_home_position(250, 250, Team::Home, W, L);
+        assert!(pos.x >= 0.0 && pos.x <= W && pos.y >= 0.0 && pos.y <= L);
+        let fine = pitch_grid_address(pos, W, L).fine;
+        assert_eq!(fine.x, (PITCH_GENOME_LANES - 1) as usize);
+        assert_eq!(fine.y, (PITCH_GENOME_ROWS - 1) as usize);
+    }
+}
+
 fn facing_bucket_from_vector(v: Vec2) -> FacingBucket {
     if v.len() <= 1e-6 {
         return FacingBucket::Unknown;
