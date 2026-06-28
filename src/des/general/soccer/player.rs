@@ -10815,6 +10815,18 @@ impl PlayerAgent {
             // `open_pass_lane_sprint_for_action`. The round-goalkeeper carry keeps its own
             // plan-specific burst decision (pressure/space decides glide-around vs explode-past).
             let is_dribble_action = matches!(action, SoccerAction::DribbleMove { .. });
+            // Isolated attacking carrier: a SOLO goal drive sprints at goal; a HOLD-UP carry is a
+            // controlled run/jog (never a sprint) so the carrier doesn't run AWAY from the support
+            // he's waiting on. Gated identically to the scoring bias; `None` ⇒ untouched.
+            let isolated_carrier_mode = if isolated_carrier_drive_enabled() {
+                isolated_attacking_carrier_drive_mode(
+                    &observation,
+                    self.role,
+                    is_outside_midfielder_role(self.role, self.home_position.x, snapshot.field_width),
+                )
+            } else {
+                None
+            };
             let sprint = if runaround_sprint {
                 true
             } else if !is_dribble_action {
@@ -10831,6 +10843,8 @@ impl PlayerAgent {
                     &action_label,
                     &action,
                 )
+            } else if let Some(mode) = isolated_carrier_mode {
+                matches!(mode, IsolatedCarrierDriveMode::SoloGoalDrive)
             } else {
                 self.role == PlayerRole::Forward
                     || observation.forward_dribble_space_yards > 3.0
