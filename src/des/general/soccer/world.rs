@@ -29655,9 +29655,18 @@ impl WorldSnapshot {
                 // pass, steeply penalise lanes an opponent already owns so the policy stops
                 // gifting the ball to the opposition. Killer/threaded balls keep their priced-in
                 // risk (no extra penalty).
+                // Role-aware risk pricing: a defender values the SAME interception risk as more
+                // costly; a forward going FORWARD values it as cheaper (sideways/back balls keep
+                // ~full price). NEUTRAL = 1.0 ⇒ byte-identical when the gate is off.
+                let appetite_risk_penalty_mult = if forward > 1.25 {
+                    pass_risk_appetite.forward_risk_penalty_mult
+                } else {
+                    pass_risk_appetite.sideways_risk_penalty_mult
+                };
                 let safe_pass_overrisk_penalty = if require_reception_won {
                     (pass_quality.lane_interception_risk - PASS_LANE_DYNAMIC_RISK_HIGH).max(0.0)
                         * PASS_LANE_SAFE_PASS_OVERRISK_PENALTY
+                        * appetite_risk_penalty_mult
                 } else {
                     0.0
                 };
