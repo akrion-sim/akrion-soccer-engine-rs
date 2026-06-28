@@ -118,6 +118,15 @@ spec:
               sync_ref "${source_repo}" "${source_ref}" "${soccer}"
 
               cd "${soccer}"
+              # Turn ON every DD_SOCCER_* feature gate for this (separate) experiment
+              # lineage — kitchen-sink all-on training. Guarded so a checkout WITHOUT the
+              # script is a harmless no-op (the gates just stay default-off). The unknown
+              # new-gate vars are no-ops on older builds. See scripts/all-gates-on.sh for
+              # the retrain / serving-must-match caveats.
+              if [ -f scripts/all-gates-on.sh ]; then
+                # shellcheck disable=SC1091
+                source scripts/all-gates-on.sh
+              fi
               actual_commit="$(git rev-parse HEAD)"
               engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
@@ -171,8 +180,11 @@ spec:
               value: http://dd-soccer-otel-collector.default.svc.cluster.local:4318/v1/traces
             - name: SOCCER_SOURCE_REPO
               value: https://github.com/ORESoftware/soccer-sim-game-engine.rs.git
+            # Dedicated branch for the all-gates-on lineage so it builds the
+            # source that contains scripts/all-gates-on.sh + this session's new gates,
+            # WITHOUT disturbing the `learning` branch the gen-372 deployment builds from.
             - name: SOCCER_SOURCE_REF
-              value: learning
+              value: learning-all-gates-on
             - name: SOCCER_ENGINE_SOURCE_REPO
               value: https://github.com/ORESoftware/discrete-event-system.rs.git
             - name: SOCCER_ENGINE_SOURCE_REF
@@ -192,10 +204,13 @@ spec:
               value: "2026"
             - name: SOCCER_SEED_STRIDE
               value: "1000"
+            # Fresh lineage: all-gates-on trains its OWN slug so it does not clobber
+            # the gen-372 `soccer-self-play-k8s-overnight` weights (the encoding/reward
+            # gates change feature & objective semantics — incompatible to resume).
             - name: SOCCER_EXPERIMENT_SLUG
-              value: soccer-self-play-k8s-overnight
+              value: soccer-all-gates-on
             - name: SOCCER_EXPERIMENT_NAME
-              value: Soccer self-play k8s overnight evolutionary learning
+              value: Soccer all-gates-on kitchen-sink learning lineage
             - name: SOCCER_GAMES
               value: "100"
             - name: SOCCER_PARALLEL_GAMES
