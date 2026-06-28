@@ -33205,6 +33205,45 @@ fn pomdp_occlusion_increases_perception_noise_and_latency() {
 }
 
 #[test]
+fn kalman_perception_confidence_stays_bounded_under_adversarial_inputs() {
+    // The Kalman perception filter must never emit a non-finite or out-of-range confidence, and
+    // must never drop BELOW the raw measurement (prediction can only add confidence), regardless
+    // of degenerate inputs (NaN measurement/position, dt==0, absurd innovation).
+    let hist = vec![Vec2::new(10.0, 10.0), Vec2::new(10.5, 10.0)];
+    let bounded = |c: f64| c.is_finite() && (0.0..=1.0).contains(&c);
+
+    let normal = kalman_perception_position_confidence(
+        0.6, Vec2::new(11.0, 10.0), Vec2::new(5.0, 0.0), &hist, 0.1, true, false,
+    );
+    assert!(bounded(normal) && normal >= 0.6 - 1e-9, "normal: {normal}");
+
+    let nan_meas = kalman_perception_position_confidence(
+        f64::NAN, Vec2::new(11.0, 10.0), Vec2::new(5.0, 0.0), &hist, 0.1, false, false,
+    );
+    assert!(bounded(nan_meas), "nan measurement: {nan_meas}");
+
+    let zero_dt = kalman_perception_position_confidence(
+        0.5, Vec2::new(11.0, 10.0), Vec2::new(5.0, 0.0), &hist, 0.0, false, false,
+    );
+    assert!(bounded(zero_dt), "zero dt: {zero_dt}");
+
+    let far = kalman_perception_position_confidence(
+        0.5, Vec2::new(1.0e6, 1.0e6), Vec2::new(5.0, 0.0), &hist, 0.1, false, false,
+    );
+    assert!(bounded(far) && far >= 0.5 - 1e-9, "far prediction: {far}");
+
+    let nan_pos = kalman_perception_position_confidence(
+        0.5, Vec2::new(f64::NAN, 10.0), Vec2::new(5.0, 0.0), &hist, 0.1, false, false,
+    );
+    assert!((nan_pos - 0.5).abs() < 1e-9, "nan position: {nan_pos}");
+
+    let short = kalman_perception_position_confidence(
+        0.7, Vec2::new(11.0, 10.0), Vec2::new(5.0, 0.0), &[Vec2::new(1.0, 1.0)], 0.1, false, false,
+    );
+    assert!((short - 0.7).abs() < 1e-9, "short history: {short}");
+}
+
+#[test]
 fn pomdp_position_confidence_carries_motion_belief_for_occluded_player() {
     fn configured_match(with_motion_history: bool) -> SoccerMatch {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -33330,10 +33369,19 @@ fn agent_decision_snapshot_carries_minimal_kalman_belief_history() {
         .iter()
         .find(|player| player.id == behind_teammate)
         .expect("behind player snapshot");
-    assert_eq!(
+    // The agent-decision snapshot must carry AT LEAST the Kalman minimum so the perception
+    // belief activates, while staying a trimmed tail (not the full position history). Other
+    // decision-time consumers (e.g. the loose-ball-contest stall window) may legitimately lift
+    // the retained count above the Kalman minimum, so this is a lower-bound invariant, not an
+    // exact-equality one.
+    assert!(
+        target.position_history.len() >= perception.kalman_min_history_samples
+            && target.position_history.len() < PLAYER_POSITION_HISTORY_LIMIT,
+        "agent-decision snapshot should carry a trimmed history tail >= the Kalman minimum \
+         (got {}, kalman min {}, full limit {})",
         target.position_history.len(),
         perception.kalman_min_history_samples,
-        "agent-decision snapshots should carry only the history tail needed for Kalman belief"
+        PLAYER_POSITION_HISTORY_LIMIT
     );
     let posterior_behind = prior_snapshot
         .observation_for(observer)
