@@ -19815,16 +19815,12 @@ struct ForwardSupportContext {
 pub(crate) struct SlipBreakOpportunity {
     /// In-behind target point to slip the ball into (angled away from the keeper).
     pub(crate) seam_target: Vec2,
-    /// Quality of the seam between the two defenders (gap + space behind).
-    pub(crate) seam_quality: f64,
     /// How well the release moment fits the ~2–3-yd-before-the-line window given the runner's
     /// sprint (0 if offside or not closing).
     pub(crate) timing: f64,
     /// Openness of the carrier→seam ground-pass lane.
     pub(crate) lane_openness: f64,
-    /// The runner's pace advantage over the back line (the holder's core recognition cue).
-    pub(crate) speed_advantage: f64,
-    /// Combined opportunity quality used for ranking/reward.
+    /// Combined opportunity quality (seam × timing × lane × pace advantage) for ranking/reward.
     pub(crate) opportunity: f64,
 }
 
