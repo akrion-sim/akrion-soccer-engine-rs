@@ -50056,6 +50056,20 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
 }
 
+/// Set `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=1` to enable the "surprise steal from behind".
+/// A defender that has crept into the blind arc of an opponent dribbling *forward and
+/// slowly* (walk/jog/skip) — and that believes it can actually catch the carrier (a real
+/// closing-speed margin) — can nick the ball from behind before the carrier reacts; the
+/// carrier in turn glances to its blind side (a head-scan with a real control-drift cost)
+/// to RECOGNISE the threat and break away. Default off ⇒ the assessment short-circuits to
+/// `None`, every new observation field stays zero, the new action option is inert, and the
+/// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
+fn dd_soccer_enable_blindside_steal() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
+}
+
 /// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
 /// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off ⇒
 /// the block stays all-zero and the actor sees only the broad role one-hot, so the policy
