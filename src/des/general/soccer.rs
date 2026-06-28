@@ -5885,13 +5885,6 @@ pub struct SoccerPomdpObservation {
     pub threaded_goal_pass_over_top_goalkeeper_avoidance_yards: f64,
     #[serde(default)]
     pub best_forward_pass_receiver_openness: f64,
-    /// Lane-aware recognition of the best forward pass option (see
-    /// [`forward_pass_option_quality`]) — `>=` [`best_forward_pass_receiver_openness`].
-    /// Consumed by the forward-pass-first release and pass-target ranking under
-    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`. Not part of the neural feature
-    /// encoder (FEATURE_DIM unchanged).
-    #[serde(default)]
-    pub best_forward_pass_option_quality: f64,
     #[serde(default)]
     pub nearest_forward_teammate_distance_yards: f64,
     #[serde(default)]
@@ -54564,56 +54557,6 @@ fn pass_progress_along_path(pass: &PendingPass, ball_position: Vec2) -> f64 {
 
 fn receiver_openness_from_nearest_opponent_distance(distance: f64) -> f64 {
     ((distance - 2.5) / 7.5).clamp(0.0, 1.0)
-}
-
-/// How heavily raw receiver openness (space around the receiver) weighs in the
-/// recognition blend vs. lane completability; the remainder weights completion.
-/// Kept low so a CLEAR, completable lane can carry the recognition even when the
-/// receiver's nearest-opponent openness is only moderate.
-const FORWARD_OPTION_OPENNESS_WEIGHT: f64 = 0.30;
-/// Recognised forward-option quality at/above which a backward/square pass target is
-/// demoted in the ranking (a genuinely good forward ball existed, so recycling back is
-/// the reported blunder).
-const FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD: f64 = 0.50;
-/// Score demotion per unit of recognised forward-option quality ABOVE the threshold,
-/// applied to a backward pass target. Sized against the own-half short-pass liability
-/// (3.4) so a wide-open forward option (~1.0) outweighs a safe recycle.
-const FORWARD_OPTION_RECOGNITION_BACKWARD_DEMOTION: f64 = 6.0;
-
-/// Recognition score in `[0, 1]` for how GOOD a forward pass option actually is — a
-/// richer signal than raw receiver openness. The legacy `receiver_openness` is only the
-/// nearest-opponent distance to the receiver's CURRENT spot, so an advanced teammate on a
-/// clear, threadable lane (a trailing/already-beaten defender nominally close) reads as
-/// "not open" and the carrier wrongly recycles the ball backward. Blend openness with the
-/// lane-aware `expected_completion`, and never report BELOW raw openness so a
-/// legacy-open receiver is unaffected (the change only ADDS recognition, never removes).
-/// Pure + RNG-free for unit testing.
-pub(crate) fn forward_pass_option_quality(receiver_openness: f64, expected_completion: f64) -> f64 {
-    let open = receiver_openness.clamp(0.0, 1.0);
-    let completion = expected_completion.clamp(0.0, 1.0);
-    let lane_aware =
-        FORWARD_OPTION_OPENNESS_WEIGHT * open + (1.0 - FORWARD_OPTION_OPENNESS_WEIGHT) * completion;
-    open.max(lane_aware)
-}
-
-/// Whether the **forward-option recognition** revision is active this process: a richer
-/// definition of a "good forward pass option" (lane-aware, not just nearest-opponent
-/// distance) feeding the forward-pass-first release and the pass-target ranking, so the
-/// carrier recognises and plays an open forward man instead of recycling backward.
-/// Default-ON in production (env `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION=0/false` is
-/// the kill switch); default-OFF under test so the option-scoring parity suite stays
-/// byte-identical.
-pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
-    #[cfg(test)]
-    {
-        std::env::var("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION").is_ok()
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION"))
-    }
 }
 
 fn pass_receiver_openness_for_agents(
