@@ -2566,6 +2566,8 @@ impl SoccerMatch {
             suppress_generic_oob_turnover: false,
             pending_shot: None,
             pending_rebound: None,
+            flank_crash_box_cross: None,
+            pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
             episode_learning_transitions: Vec::new(),
