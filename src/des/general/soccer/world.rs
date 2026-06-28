@@ -27012,6 +27012,8 @@ impl WorldSnapshot {
                 .best_forward_pass_receiver_openness,
             best_forward_pass_option_quality: forward_support_context
                 .best_forward_pass_option_quality,
+            slip_break_seam_quality,
+            slip_break_release_now,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
