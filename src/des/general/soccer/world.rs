@@ -12820,6 +12820,22 @@ impl SoccerMatch {
                     self.stat_pass_attempt(player_team);
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
+                    // PENALTY: an isolated attacking carrier who panicked a backward/square ball
+                    // instead of driving at goal or holding it up. Trains the policy off the bug.
+                    if isolated_carrier_drive_enabled()
+                        && self.isolated_carrier_panic_back_pass(
+                            player_id,
+                            player_pos,
+                            release_target,
+                            attempt_own_half,
+                        )
+                    {
+                        self.record_reward_event_with_kind(
+                            player_id,
+                            -ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS,
+                            SoccerRewardEventKind::IsolatedCarrierPanicBackPass,
+                        );
+                    }
                     self.register_flank_crash_box_cross(
                         player_team,
                         player_id,
