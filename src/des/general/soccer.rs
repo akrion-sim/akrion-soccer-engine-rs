@@ -8445,6 +8445,15 @@ pub struct SoccerQStateKey {
     pub team_center_acceleration_forward_gap_bin: u8,
     #[serde(default)]
     pub team_center_acceleration_lateral_gap_bin: u8,
+    /// Compact bins derived directly from the canonical 22-player + ball field
+    /// motion vector. The full vector stays in POMDP/neural inputs; these low-cardinality
+    /// bins make tabular MDP decisions field-vector-aware without keying on all channels.
+    #[serde(default)]
+    pub field_motion_shape_bin: u8,
+    #[serde(default)]
+    pub field_motion_ball_relation_bin: u8,
+    #[serde(default)]
+    pub field_motion_intensity_bin: u8,
     #[serde(default)]
     pub formation_lp_guidance: bool,
     #[serde(default)]
@@ -8796,6 +8805,51 @@ fn q_state_ball_fine_lane_row(
     )
 }
 
+fn q_state_field_motion_bins(observation: &SoccerPomdpObservation) -> (u8, u8, u8) {
+    let motion = observation.field_player_motion.as_slice();
+    if motion.len() != SOCCER_NEURAL_FIELD_MOTION_DIM || motion.iter().any(|v| !v.is_finite()) {
+        return (0, 0, 0);
+    }
+    let per = SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+    let own_slots = SOCCER_NEURAL_FIELD_MOTION_PLAYERS / 2;
+    let opponent_slots = SOCCER_NEURAL_FIELD_MOTION_PLAYERS.saturating_sub(own_slots);
+    let own_forward_mean = (0..own_slots)
+        .map(|slot| motion[slot * per] as f64)
+        .sum::<f64>()
+        / own_slots.max(1) as f64;
+    let opponent_forward_mean = (own_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS)
+        .map(|slot| motion[slot * per] as f64)
+        .sum::<f64>()
+        / opponent_slots.max(1) as f64;
+    let ball_slot = SOCCER_NEURAL_FIELD_MOTION_PLAYERS * per;
+    let ball_forward = motion[ball_slot] as f64;
+    let mut intensity = 0.0;
+    let mut intensity_channels = 0usize;
+    for slot in 0..(SOCCER_NEURAL_FIELD_MOTION_PLAYERS + SOCCER_NEURAL_FIELD_MOTION_BALLS) {
+        let start = slot * per;
+        for channel in 2..per {
+            intensity += (motion[start + channel] as f64).abs();
+            intensity_channels += 1;
+        }
+    }
+    let intensity = if intensity_channels > 0 {
+        intensity / intensity_channels as f64
+    } else {
+        0.0
+    };
+    (
+        distance_bucket(
+            opponent_forward_mean - own_forward_mean,
+            &[-0.55, -0.25, -0.08, 0.08, 0.25, 0.55],
+        ),
+        distance_bucket(
+            ball_forward - own_forward_mean,
+            &[-0.50, -0.22, -0.06, 0.06, 0.22, 0.50],
+        ),
+        distance_bucket(intensity, &[0.03, 0.08, 0.16, 0.30, 0.55]),
+    )
+}
+
 impl SoccerQStateKey {
     pub fn from_parts(
         state: &SoccerMdpState,
@@ -8823,6 +8877,8 @@ impl SoccerQStateKey {
             state.action_facing
         };
         let (ball_fine_lane, ball_fine_row) = q_state_ball_fine_lane_row(state, observation);
+        let (field_motion_shape_bin, field_motion_ball_relation_bin, field_motion_intensity_bin) =
+            q_state_field_motion_bins(observation);
         SoccerQStateKey {
             phase: state.phase,
             role,
@@ -8998,6 +9054,9 @@ impl SoccerQStateKey {
                 observation.team_center_acceleration_lateral_gap_yps2,
                 &[-7.0, -3.0, -0.75, 0.75, 3.0, 7.0],
             ),
+            field_motion_shape_bin,
+            field_motion_ball_relation_bin,
+            field_motion_intensity_bin,
             formation_lp_guidance: observation.formation_lp_guidance_present,
             formation_lp_move_bin: distance_bucket(
                 observation.formation_lp_recommended_move_yards,
@@ -9636,6 +9695,9 @@ impl SoccerQStateKey {
                 == other.team_center_acceleration_forward_gap_bin
             && self.team_center_acceleration_lateral_gap_bin
                 == other.team_center_acceleration_lateral_gap_bin
+            && self.field_motion_shape_bin == other.field_motion_shape_bin
+            && self.field_motion_ball_relation_bin == other.field_motion_ball_relation_bin
+            && self.field_motion_intensity_bin == other.field_motion_intensity_bin
             && self.formation_lp_guidance == other.formation_lp_guidance
             && self.formation_lp_move_bin == other.formation_lp_move_bin
             && self.formation_lp_pair_error_bin == other.formation_lp_pair_error_bin

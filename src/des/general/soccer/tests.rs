@@ -13470,6 +13470,29 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
             PITCH_FINE_GRID_ROWS as f64 - 1.0
         )
     );
+
+    let vector_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(actor_id),
+        &pomdp_observation,
+        actor_team,
+        sim.players[actor].role,
+    );
+    let mut zero_vector_observation = pomdp_observation.clone();
+    zero_vector_observation.field_player_motion = vec![0.0; SOCCER_NEURAL_FIELD_MOTION_DIM];
+    let zero_vector_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(actor_id),
+        &zero_vector_observation,
+        actor_team,
+        sim.players[actor].role,
+    );
+    assert!(
+        vector_key.field_motion_intensity_bin > zero_vector_key.field_motion_intensity_bin,
+        "tabular MDP context should include a compact bin derived from the 22-player + ball motion vector"
+    );
+    assert!(
+        !vector_key.matches_learning_context(&zero_vector_key),
+        "MDP/Q decisions must separate otherwise-identical contexts with different whole-field vectors"
+    );
 }
 
 #[test]
@@ -13836,6 +13859,83 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         defender_decision_observation.decision_urgency
             >= defender_decision_observation.defensive_urgency
     );
+}
+
+#[test]
+fn player_decision_repairs_stale_grid_and_field_vector_context() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 913,
+        ..Default::default()
+    });
+    let actor = 6;
+    sim.players[actor].position = Vec2::new(37.0, 63.0);
+    sim.players[actor].velocity = Vec2::new(0.8, 1.6);
+    sim.players[actor].acceleration = Vec2::new(0.2, 0.4);
+    sim.players[actor].jerk = Vec2::new(0.1, 0.2);
+    sim.ball.holder = Some(actor);
+    sim.ball.position = Vec2::new(43.0, 72.0);
+    sim.ball.velocity = Vec2::new(0.5, 7.0);
+    sim.ball.acceleration = Vec2::new(0.2, 3.0);
+    sim.ball.jerk = Vec2::new(0.1, 12.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let expected_state = snapshot.mdp_state_for_player(actor);
+    let expected_observation = snapshot.observation_for(actor);
+    let expected_motion =
+        soccer_field_player_motion_block(&snapshot, actor, sim.players[actor].team);
+
+    let mut stale_state = expected_state.clone();
+    stale_state.ball_zone_x = 0;
+    stale_state.ball_zone_y = 0;
+    stale_state.ball_grid = PitchGridAddress::default();
+    stale_state.player_grid = PitchGridAddress::default();
+    stale_state.receive_facing = FacingBucket::Unknown;
+    stale_state.action_facing = FacingBucket::Unknown;
+
+    let mut stale_observation = expected_observation.clone();
+    stale_observation.ball_grid = PitchGridAddress::default();
+    stale_observation.player_grid = PitchGridAddress::default();
+    stale_observation.receive_facing = FacingBucket::Unknown;
+    stale_observation.action_facing = FacingBucket::Unknown;
+    stale_observation.field_player_motion = vec![f32::NAN; SOCCER_NEURAL_FIELD_MOTION_DIM];
+
+    let mut player = sim.players[actor].clone();
+    let _intent = player.run_time_step_with_context(
+        &snapshot,
+        stale_state,
+        stale_observation,
+        None,
+        None,
+        &mut SeededRandom::new(913),
+    );
+
+    let decision = player.last_decision.as_ref().expect("decision trace");
+    assert_eq!(decision.mdp_state.ball_zone_x, expected_state.ball_zone_x);
+    assert_eq!(decision.mdp_state.ball_zone_y, expected_state.ball_zone_y);
+    assert_eq!(decision.mdp_state.ball_grid, expected_state.ball_grid);
+    assert_eq!(decision.mdp_state.player_grid, expected_state.player_grid);
+    assert_eq!(decision.mdp_state.receive_facing, expected_state.receive_facing);
+    assert_eq!(decision.mdp_state.action_facing, expected_state.action_facing);
+    assert_eq!(decision.observation.ball_grid, expected_observation.ball_grid);
+    assert_eq!(decision.observation.player_grid, expected_observation.player_grid);
+    assert_eq!(
+        decision.observation.field_player_motion, expected_motion,
+        "live player decisions must repair stale POMDP vectors to the canonical 22-player + ball field vector"
+    );
+
+    let q_key = SoccerQStateKey::from_parts(
+        &decision.mdp_state,
+        &decision.observation,
+        sim.players[actor].team,
+        sim.players[actor].role,
+    );
+    assert_eq!(
+        q_key.ball_fine_lane,
+        expected_state.ball_grid.fine.x as u8
+    );
+    assert_eq!(q_key.ball_fine_row, expected_state.ball_grid.fine.y as u8);
 }
 
 #[test]

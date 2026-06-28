@@ -7174,7 +7174,7 @@ impl PlayerAgent {
     fn run_time_step_with_context_inner(
         &mut self,
         snapshot: &WorldSnapshot,
-        mdp_state: SoccerMdpState,
+        mut mdp_state: SoccerMdpState,
         mut observation: SoccerPomdpObservation,
         human_input: Option<&HumanInputFrame>,
         learned_plan: Option<&SoccerLearnedPlan>,
@@ -7183,7 +7183,7 @@ impl PlayerAgent {
         let human_input = human_input
             .filter(|input| human_input_matches_player(input, self.id, self.controller_slot));
         annotate_human_control_observation(&mut observation, self.controller_slot, human_input);
-        Self::apply_field_vector_context(self, snapshot, &mut observation);
+        Self::apply_field_vector_context(self, snapshot, &mut mdp_state, &mut observation);
         // Clear last tick's stochastic-selection relay; each ranker that fires
         // this tick sets it to the behaviour probability of the option it
         // promoted (or leaves it `None` for a deterministic argmax).
@@ -11009,8 +11009,10 @@ impl PlayerAgent {
     fn apply_field_vector_context(
         &self,
         snapshot: &WorldSnapshot,
+        mdp_state: &mut SoccerMdpState,
         observation: &mut SoccerPomdpObservation,
     ) {
+        let canonical_state = snapshot.mdp_state_for_player(self.id);
         let canonical = snapshot.observation_for(self.id);
         let mut field_player_motion = canonical.field_player_motion.clone();
         if field_player_motion.len() != SOCCER_NEURAL_FIELD_MOTION_DIM
@@ -11021,6 +11023,17 @@ impl PlayerAgent {
         debug_assert_eq!(field_player_motion.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
         debug_assert!(field_player_motion.iter().all(|value| value.is_finite()));
 
+        mdp_state.ball_zone_x = canonical_state.ball_zone_x;
+        mdp_state.ball_zone_y = canonical_state.ball_zone_y;
+        mdp_state.ball_grid = canonical_state.ball_grid;
+        mdp_state.player_grid = canonical_state.player_grid;
+        mdp_state.receive_facing = canonical_state.receive_facing;
+        mdp_state.action_facing = canonical_state.action_facing;
+
+        observation.player_grid = canonical.player_grid;
+        observation.ball_grid = canonical.ball_grid;
+        observation.receive_facing = canonical.receive_facing;
+        observation.action_facing = canonical.action_facing;
         observation.field_player_motion = field_player_motion;
         observation.field_players_ahead = canonical.field_players_ahead;
         observation.field_players_behind = canonical.field_players_behind;
