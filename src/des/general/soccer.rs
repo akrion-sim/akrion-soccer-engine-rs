@@ -4558,6 +4558,12 @@ const WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL: usize = 4;
 const WINGBACK_ATTACK_COVER_FULL_OTHER_PLAYERS_BEHIND_BALL: usize = 6;
 const WINGBACK_COVERED_ATTACK_FLANK_SCORE_BONUS: f64 = 3.2;
 const WINGBACK_COVERED_ATTACK_PUSH_BONUS_YARDS: f64 = 4.0;
+// Outside-mid attacking width as a smooth function of the ball's lane: the closer the ball
+// is to a winger's OWN touchline, the harder he is pulled to that touchline to offer the
+// ball-side wide outlet (and the ball-far winger barely opens). A `closeness` ∈ [0, 1]
+// (1 = ball sitting on his touchline, 0 = ball on the far touchline) scales this weight
+// into the wide-outlet score, replacing the old binary same-flank switch.
+const OUTSIDE_MID_BALL_LANE_WIDTH_WEIGHT: f64 = 3.2;
 const SOCCER_PLAYBACK_INTENT_LIMIT: usize = 3;
 
 fn default_ball_drag_per_tick() -> f64 {
