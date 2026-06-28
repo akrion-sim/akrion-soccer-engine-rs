@@ -19114,6 +19114,137 @@ fn wingback_opens_to_the_flank_in_possession_scaled_by_cover() {
 }
 
 #[test]
+fn wide_defender_holds_width_when_ball_far_ahead_unless_reachable() {
+    // When the ball is 10+ yds ahead of the back-four line average, a wide DEFENDER pushes up
+    // with the play but should NOT bomb out to the touchline to "open up" — UNLESS he is a live
+    // ground-pass outlet (within ~20yd of the ball on a clear lane). This pins both the rule and
+    // its exception on `wingback_width_adjusted_target`.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 77,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home)
+        .map(|p| p.id)
+        .collect();
+    let left_wb = home
+        .iter()
+        .copied()
+        .filter(|&id| sim.players[id].role == PlayerRole::Defender)
+        .min_by(|&a, &b| {
+            sim.players[a]
+                .home_position
+                .x
+                .total_cmp(&sim.players[b].home_position.x)
+        })
+        .unwrap();
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    // Back four sits deep (line average ~y=44); the left wing-back is tucked in at x=25, y=60.
+    for &h in &home {
+        if sim.players[h].role == PlayerRole::Defender {
+            sim.players[h].position = Vec2::new(sim.players[h].home_position.x, 44.0);
+        }
+    }
+    sim.players[left_wb].position = Vec2::new(25.0, 60.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.ball.holder = Some(holder);
+    // Opponents parked far away so the ground-pass lane is clean when the ball is near.
+    for away in sim.players.iter().map(|p| p.id).collect::<Vec<_>>() {
+        if sim.players[away].team == Team::Away {
+            sim.players[away].position = Vec2::new(40.0, 110.0);
+        }
+    }
+    let target = Vec2::new(25.0, 60.0);
+
+    // (A) Ball far ahead (y=85, 41yd beyond the line) and the wing-back ~29yd away ⇒ NOT a live
+    // outlet ⇒ hold width: he keeps his lane instead of bombing out to the touchline.
+    sim.ball.position = Vec2::new(40.0, 85.0);
+    sim.players[holder].position = sim.ball.position;
+    let held = WorldSnapshot::from_match(&sim).wingback_width_adjusted_target(left_wb, target);
+    assert!(
+        held.x > 24.0,
+        "ball far ahead and unreachable ⇒ wing-back holds his lane, does not open wide: {held:?}"
+    );
+
+    // (B) Same advanced phase, but now the ball is within ~16yd on a clear lane ⇒ he IS a live
+    // outlet ⇒ the exception applies and he opens out toward the touchline (smaller x).
+    sim.ball.position = Vec2::new(35.0, 72.0);
+    sim.players[holder].position = sim.ball.position;
+    let opened = WorldSnapshot::from_match(&sim).wingback_width_adjusted_target(left_wb, target);
+    assert!(
+        opened.x < held.x - 1.0,
+        "ball advanced but a reachable ground-pass outlet ⇒ wing-back opens wide: \
+         opened={opened:?} held={held:?}"
+    );
+}
+
+#[test]
+fn outside_mid_opens_wider_when_the_ball_is_on_his_flank() {
+    // A wide attacker's possession outlet hugs his touchline more when the ball's lane is close
+    // to his flank, and tucks in toward the half-space when the ball is on the far flank.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 91,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home)
+        .map(|p| p.id)
+        .collect();
+    // Make a clean left-wide midfielder and a separate carrier.
+    let wide_mid = home
+        .iter()
+        .copied()
+        .find(|&id| sim.players[id].role == PlayerRole::Midfielder)
+        .unwrap();
+    let holder = home
+        .iter()
+        .copied()
+        .find(|&id| sim.players[id].role == PlayerRole::Forward)
+        .unwrap();
+    let wide_home = Vec2::new(12.0, 50.0);
+    sim.players[wide_mid].home_position = wide_home;
+    sim.players[wide_mid].position = Vec2::new(18.0, 55.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.ball.holder = Some(holder);
+    for away in sim.players.iter().map(|p| p.id).collect::<Vec<_>>() {
+        if sim.players[away].team == Team::Away {
+            sim.players[away].position = Vec2::new(40.0, 112.0);
+        }
+    }
+
+    // Ball on the wide mid's OWN (left) flank ⇒ hug the touchline (small x).
+    sim.ball.position = Vec2::new(8.0, 60.0);
+    sim.players[holder].position = sim.ball.position;
+    let ball_on_flank = WorldSnapshot::from_match(&sim)
+        .wide_possession_outlet_target_for(wide_mid, wide_home)
+        .expect("a left-wide midfielder in possession should have a wide outlet");
+
+    // Ball on the FAR (right) flank ⇒ tuck in toward the half-space (larger x).
+    sim.ball.position = Vec2::new(72.0, 60.0);
+    sim.players[holder].position = sim.ball.position;
+    let ball_far = WorldSnapshot::from_match(&sim)
+        .wide_possession_outlet_target_for(wide_mid, wide_home)
+        .expect("a left-wide midfielder in possession should have a wide outlet");
+
+    assert!(
+        ball_on_flank.x < ball_far.x - 3.0,
+        "the closer the ball is to his flank, the wider the winger opens: \
+         on_flank={ball_on_flank:?} far={ball_far:?}"
+    );
+}
+
+#[test]
 fn role_line_shape_consistency_is_more_urgent_near_the_ball() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
