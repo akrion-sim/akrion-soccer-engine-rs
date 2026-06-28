@@ -716,6 +716,61 @@ mod tests {
     }
 
     #[test]
+    fn boltzmann_pick_empirical_frequencies_track_softmax() {
+        // Sweep the unit interval on a fine grid and confirm each candidate is
+        // selected at its softmax frequency, and that the *reported* probability
+        // equals that empirical frequency (the sampler and its self-reported
+        // behaviour probability are mutually consistent).
+        let scores = [2.0, 1.0, 0.0, -1.0];
+        let temperature: f64 = 0.8;
+        let exps: Vec<f64> = scores.iter().map(|s| (s / temperature).exp()).collect();
+        let z: f64 = exps.iter().sum();
+        let expected: Vec<f64> = exps.iter().map(|e| e / z).collect();
+
+        let n = 200_000usize;
+        let mut counts = [0u64; 4];
+        let mut reported = [0.0f64; 4];
+        for i in 0..n {
+            let draw = (i as f64 + 0.5) / n as f64;
+            let (idx, prob) = boltzmann_pick(&scores, temperature, draw);
+            counts[idx] += 1;
+            reported[idx] = prob; // same idx ⇒ same prob (pure fn)
+        }
+        for k in 0..4 {
+            let freq = counts[k] as f64 / n as f64;
+            assert!(
+                (freq - expected[k]).abs() < 1e-3,
+                "cand {k}: empirical {freq} vs softmax {}",
+                expected[k]
+            );
+            assert!(
+                (reported[k] - expected[k]).abs() < 1e-9,
+                "cand {k}: reported {} vs softmax {}",
+                reported[k],
+                expected[k]
+            );
+        }
+    }
+
+    #[test]
+    fn boltzmann_pick_temperature_monotonically_increases_exploration() {
+        // The probability mass on the *non-best* candidate must rise monotonically
+        // with temperature (hotter = flatter = more exploration), spanning from
+        // near-greedy to near-uniform.
+        let scores = [1.0, 0.0];
+        let mut prev = -1.0;
+        for &t in &[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 20.0] {
+            let p_second = boltzmann_pick(&scores, t, 1.0).1;
+            assert!(
+                p_second > prev,
+                "temp {t}: p(2nd)={p_second} did not exceed previous {prev}"
+            );
+            assert!(p_second < 0.5, "temp {t}: p(2nd)={p_second} should stay < 0.5");
+            prev = p_second;
+        }
+    }
+
+    #[test]
     fn value_weighted_reorder_falls_back_to_rank_weighted_at_zero_temperature() {
         // With temperature 0 the scored reorder must reproduce the rank-weighted
         // reorder exactly (same front element and behaviour probability), so the

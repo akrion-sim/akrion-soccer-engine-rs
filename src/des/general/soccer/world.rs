@@ -14686,9 +14686,11 @@ impl SoccerMatch {
         let previous_acceleration = self.ball.acceleration;
         // Altitude when the receiver reaches the ball — drives the aerial header below.
         let control_altitude = self.ball.altitude_yards;
+        let dummy_let_through_guard = self.pass_lane_dummy_guard();
         let context = BallStepContext {
             tick: self.tick,
             double_touch_guard: self.restart_double_touch_guard,
+            dummy_let_through_guard,
             clock_seconds: self.clock_seconds,
             dt_seconds,
             ball_drag_per_tick: self.config.ball_drag_per_tick,
@@ -18986,6 +18988,7 @@ impl BallAgent {
                         same_tick_long_ball_launcher,
                         self.altitude_yards,
                         context.double_touch_guard,
+                        context.dummy_let_through_guard,
                         rng,
                     )
             {
@@ -20320,6 +20323,16 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+}
+
+/// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
+/// defender tucks goal-side behind the lone presser so a beaten press meets immediate
+/// second pressure rather than a clean run at the back line. See
+/// [`WorldSnapshot::press_cover_target_for`].
+fn dd_soccer_enable_press_cover() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
 }
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
@@ -24353,6 +24366,85 @@ impl WorldSnapshot {
         )
     }
 
+    /// Press-cover hardening: a single COVER defender tucks goal-side behind the lone
+    /// presser so a beaten press (a dribble past, a one-two, a lay-off) meets immediate
+    /// second pressure instead of a clean run at the back line. Returns the cover target
+    /// for `me` only when (1) an opponent carrier is in our own half, (2) the nearest
+    /// outfielder to it is an ACTIVE presser, and (3) `me` is the single nearest defender
+    /// other than that presser to the cover point and already within range; otherwise
+    /// `None` so the rest hold shape. Gate-free + pure (no env read) so it is unit
+    /// testable; the caller guards it with [`dd_soccer_enable_press_cover`].
+    pub(crate) fn press_cover_target_for(&self, me: &PlayerSnapshot) -> Option<Vec2> {
+        if me.role != PlayerRole::Defender {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|p| p.id == holder_id)?;
+        if holder.team == me.team {
+            return None;
+        }
+        let carrier = self.player_snapshot_position(holder);
+        // Only cover while the carrier is in our own half — a beaten press there runs at
+        // our goal; in their half normal shape/containment applies.
+        let own_goal_y = self.own_goal_y_for(me.team);
+        if (carrier.y - own_goal_y).abs() > self.field_length * 0.5 {
+            return None;
+        }
+        // The lone presser = nearest outfielder to the carrier (matches the press
+        // producers' selection). There must be an ACTIVE press on it, else nothing to cover.
+        let presser = self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.role != PlayerRole::Goalkeeper)
+            .min_by(|a, b| {
+                self.lane_biased_player_target_score(a, carrier, 1.10)
+                    .total_cmp(&self.lane_biased_player_target_score(b, carrier, 1.10))
+                    .then(a.id.cmp(&b.id))
+            })?;
+        if presser.id == me.id {
+            return None;
+        }
+        let presser_pos = self.player_snapshot_position(presser);
+        let press_active = self.fast_carrier_engage_target_for(presser).is_some()
+            || self.holder_press_target_for(presser).is_some()
+            || self
+                .advancing_carrier_stepup_target_for(presser, presser_pos)
+                .is_some();
+        if !press_active {
+            return None;
+        }
+        // Cover point: goal-side of the carrier, behind the presser's tight standoff.
+        let own_goal = Vec2::new(self.field_width * 0.5, own_goal_y);
+        let to_goal = own_goal - carrier;
+        let goal_side = if to_goal.len() > 1e-6 {
+            to_goal.normalized()
+        } else {
+            Vec2::new(0.0, -me.team.attack_dir())
+        };
+        let cover_point = (carrier + goal_side * PRESS_COVER_DEPTH_YARDS)
+            .clamp_to_pitch(self.field_width, self.field_length);
+        // Only the single nearest defender (other than the presser) covers; the rest hold shape.
+        let cover_man = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == me.team && p.role == PlayerRole::Defender && p.id != presser.id
+            })
+            .min_by(|a, b| {
+                self.lane_biased_player_target_score(a, cover_point, 1.05)
+                    .total_cmp(&self.lane_biased_player_target_score(b, cover_point, 1.05))
+                    .then(a.id.cmp(&b.id))
+            })?;
+        if cover_man.id != me.id {
+            return None;
+        }
+        // Don't drag a distant defender out of the block to cover from range.
+        if self.player_snapshot_position(me).distance(cover_point) > PRESS_COVER_MAX_DISTANCE_YARDS {
+            return None;
+        }
+        Some(cover_point)
+    }
+
     /// Defensive shepherding / "show one way" (gated; `dd_soccer_enable_defensive_shepherd`).
     ///
     /// Transforms the lone presser's already-computed engage target so the defender approaches
@@ -25450,6 +25542,7 @@ impl WorldSnapshot {
                 self.ball.position,
                 self.player_facing_direction(me),
                 false,
+                0.0,
             ))
             .clamp(0.0, 1.0)
                 * (1.0 - ball_occlusion_score * PERCEPTION_OCCLUSION_CONFIDENCE_PENALTY)
@@ -29053,7 +29146,13 @@ impl WorldSnapshot {
             let half_fov_cos = (fov.to_radians() * 0.5).cos();
             facing.dot(to_point.normalized()) >= half_fov_cos
         };
-        if !visible_by_fov {
+        // Head-scan (gated; OFF ⇒ the `&& !..` is always true, so the fixed cone alone
+        // decides — byte-identical). A ball-carrier that has had time on the ball to
+        // swivel its head/shoulders can pick up a teammate outside the instantaneous
+        // cone, so the option is no longer hard-hidden.
+        if !visible_by_fov
+            && !self.head_scan_brings_into_view(observer, observer_id, facing, to_point)
+        {
             return false;
         }
         if self.point_occlusion_score_for_observer(observer_id, point, ignored_player_id)
@@ -29079,6 +29178,42 @@ impl WorldSnapshot {
             }
         }
         true
+    }
+
+    /// Head-scan visibility widening (gated `DD_SOCCER_ENABLE_HEAD_SCAN`; OFF ⇒
+    /// always `false`, so the fixed FOV cone alone decides candidacy). A ball-carrier
+    /// that has had time on the ball to swivel its head/shoulders recognises a teammate
+    /// outside the instantaneous cone once its accumulated scan has plausibly swept that
+    /// bearing — turning more teammates into candidate pass targets. The scan clock is
+    /// the carrier's continuous time on the ball; off-ball observers carry no clock here
+    /// (`scan_seconds = 0`) so their vision is unchanged — this targets the passer's
+    /// "find more options" problem. See [`head_scan`](crate::des::general::soccer).
+    fn head_scan_brings_into_view(
+        &self,
+        observer: &PlayerSnapshot,
+        observer_id: usize,
+        facing: Vec2,
+        to_point: Vec2,
+    ) -> bool {
+        if !head_scan_enabled() {
+            return false;
+        }
+        let scan_seconds = if self.ball.holder == Some(observer_id) {
+            self.ball_holder_possession_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        if scan_seconds <= 0.0 {
+            return false;
+        }
+        let off_axis = angle_between_vectors_degrees(facing, to_point).to_radians();
+        let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
+        scan_coverage(
+            off_axis,
+            fov_half,
+            scan_seconds,
+            ability01(observer.skills.vision),
+        ) >= HEAD_SCAN_VISIBLE_COVERAGE
     }
 
     pub(crate) fn point_occlusion_score_for_observer(
@@ -29169,6 +29304,11 @@ impl WorldSnapshot {
             point,
             facing,
             observer_has_ball,
+            if observer_has_ball {
+                self.ball_holder_possession_seconds.max(0.0)
+            } else {
+                0.0
+            },
         ))
         .clamp(0.0, 1.0);
         let mut matched_target: Option<(&PlayerSnapshot, Vec2, f64)> = None;
@@ -29281,6 +29421,11 @@ impl WorldSnapshot {
             target_position,
             facing,
             observer_has_ball,
+            if observer_has_ball {
+                self.ball_holder_possession_seconds.max(0.0)
+            } else {
+                0.0
+            },
         ))
         .clamp(0.0, 1.0);
         measurement_confidence *=
@@ -42235,6 +42380,13 @@ impl WorldSnapshot {
                 return self.shepherd_show_wide_adjusted_target(me, carrier, stepup);
             }
             return stepup;
+        }
+        // Press-cover hardening (gated): a beaten lone press should meet a second body.
+        // Only the designated cover defender is reassigned; the rest fall through to shape.
+        if dd_soccer_enable_press_cover() {
+            if let Some(cover) = self.press_cover_target_for(me) {
+                return cover;
+            }
         }
         self.goal_side_defensive_target_for_player(me, guarded)
     }

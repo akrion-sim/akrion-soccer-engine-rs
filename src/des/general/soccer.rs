@@ -75,6 +75,8 @@ mod run_prediction;
 pub use run_prediction::*;
 mod perception;
 pub use perception::*;
+mod head_scan;
+pub use head_scan::*;
 mod spacing_target;
 pub use spacing_target::*;
 mod aerial_reception;
@@ -87,6 +89,8 @@ mod field_numbers;
 pub use field_numbers::*;
 mod policy_select;
 pub use policy_select::*;
+mod pass_lane_yield;
+pub use pass_lane_yield::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -588,6 +592,13 @@ const HOLDER_PRESS_MAX_DISTANCE_YARDS: f64 = 16.0;
 /// Tight standoff the presser closes to: within tackle/contest range, a half-step off
 /// so it is a contain-press that forces a decision, not a committed lunge.
 const HOLDER_PRESS_STANDOFF_YARDS: f64 = 1.8;
+/// Press-cover hardening (gated `DD_SOCCER_ENABLE_PRESS_COVER`): how far goal-side of
+/// the carrier the single COVER defender tucks in behind the lone presser, so a beaten
+/// press meets immediate second pressure instead of a clean break.
+const PRESS_COVER_DEPTH_YARDS: f64 = 6.0;
+/// A cover defender only commits when it is already within this of the cover point —
+/// don't drag a distant defender out of the block to provide cover from range.
+const PRESS_COVER_MAX_DISTANCE_YARDS: f64 = 18.0;
 /// Advancement-scaled steal urgency (mechanism 13: stop a defender backing off
 /// forever and letting a carrier dribble 20–30yd to the box). A carrier who is NOT
 /// advancing toward our goal is merely contained; the more they drive at goal, the
@@ -16758,6 +16769,11 @@ struct BallStepContext<'a> {
     /// Restart taker who may not re-control the ball until another player touches
     /// it (no double-touch on restarts); `None` outside that window.
     double_touch_guard: Option<usize>,
+    /// Team-mate who has elected to **dummy** the in-flight pass — let it run through to a
+    /// farther man rather than trapping it. Excluded from control candidacy this tick, like
+    /// `double_touch_guard`. `None` unless the pass-lane-yield feature is on and a clean
+    /// dummy is on (see [`SoccerMatch::pass_lane_dummy_guard`]).
+    dummy_let_through_guard: Option<usize>,
     clock_seconds: f64,
     dt_seconds: f64,
     ball_drag_per_tick: f64,
@@ -51959,6 +51975,10 @@ fn position_confidence_for_observer(
     point: Vec2,
     facing: Option<Vec2>,
     observer_has_ball: bool,
+    // Carrier's continuous time on the ball (seconds) for the head-scan confidence
+    // lift; `0.0` for non-holders. Inert unless `DD_SOCCER_ENABLE_HEAD_SCAN` is on,
+    // so callers passing `0.0` (or the gate being off) keep the flat blind-side floor.
+    scan_seconds: f64,
 ) -> f64 {
     let to_point = point - observer_position;
     let distance = to_point.len();
@@ -51976,7 +51996,27 @@ fn position_confidence_for_observer(
             let dot = facing.dot(to_point.normalized());
             if observer_has_ball {
                 let angle = dot.clamp(-1.0, 1.0).acos().to_degrees();
-                ball_holder_head_scan_position_confidence(angle, observer.skills.vision)
+                // Main's always-on tunables rear/shoulder/core confidence is the
+                // base. With head-scan gated on (OFF ⇒ identical), a rear bearing
+                // the carrier has had time on the ball to sweep is read more
+                // confidently — a glance lifts (never lowers) the base, still
+                // capped below a clean shoulder-check.
+                let base = ball_holder_head_scan_position_confidence(angle, observer.skills.vision);
+                if head_scan_enabled()
+                    && scan_seconds > 0.0
+                    && angle > ball_holder_shoulder_scan_limit_degrees()
+                {
+                    let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
+                    let coverage = scan_coverage(
+                        angle.to_radians(),
+                        fov_half,
+                        scan_seconds,
+                        ability01(observer.skills.vision),
+                    );
+                    scanned_confidence(coverage, base)
+                } else {
+                    base
+                }
             } else {
                 let half_fov_cos = (player_field_of_view(observer).to_radians() * 0.5).cos();
                 if dot >= half_fov_cos {
@@ -55896,6 +55936,7 @@ fn nearest_ball_controller_for_segment(
         same_tick_long_ball_launcher,
         ball_altitude_yards,
         None,
+        None,
         rng,
     )
 }
@@ -55911,6 +55952,7 @@ fn nearest_ball_controller_for_segment_with_guard(
     same_tick_long_ball_launcher: Option<usize>,
     ball_altitude_yards: f64,
     double_touch_guard: Option<usize>,
+    dummy_let_through_guard: Option<usize>,
     rng: &mut SeededRandom,
 ) -> Option<(usize, Team, Vec2)> {
     let ball_speed = ball_velocity.len();
@@ -55929,6 +55971,11 @@ fn nearest_ball_controller_for_segment_with_guard(
         // player — a team-mate receiving the restart — then collects it, instead of the ball
         // stalling at the taker's feet whenever the taker happens to be the closest player.
         if double_touch_guard == Some(p.id) {
+            continue;
+        }
+        // A team-mate dummying the ball lets it run through to the man behind — exclude it
+        // from control candidacy this tick so it does not trap a pass aimed past it.
+        if dummy_let_through_guard == Some(p.id) {
             continue;
         }
         if let Some(pass) = pending_pass {
