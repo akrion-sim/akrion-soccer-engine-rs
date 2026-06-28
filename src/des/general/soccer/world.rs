@@ -19792,6 +19792,11 @@ struct ForwardSupportContext {
     teammates_ahead: usize,
     visible_forward_pass_options: usize,
     best_forward_pass_receiver_openness: f64,
+    /// Lane-aware recognition of the best forward pass option (see
+    /// [`forward_pass_option_quality`]): blends receiver openness with completability so a
+    /// clear ball to an advanced runner is recognised even when raw openness is moderate.
+    /// `>=` [`best_forward_pass_receiver_openness`] by construction.
+    best_forward_pass_option_quality: f64,
     nearest_forward_teammate_distance_yards: f64,
     /// Value [0,1] of the best QUICK FORWARD ground pass available — a short progressive
     /// ball (≈5–8 m, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
@@ -19930,12 +19935,6 @@ fn forward_floor_outlet_assessment(
         && completion_or_stride_fit
         && quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT;
 
-    if std::env::var("DBG_OUTLET").is_ok() && forward_yards > 10.0 && forward_yards < 14.0 {
-        eprintln!("DBG_OUTLET fwd={forward_yards:.2} dist={distance_yards:.2} open={:.3} compl={:.3} lane_risk={:.3} stride={:.3} | lane_safe={lane_safe} half_open={half_open_forward} progressive={progressive_floor_outlet} open_for_score={receiver_openness_for_score:.3}>=0.30?{} compl_or_stride={completion_or_stride_fit} quality_fit={quality_fit:.3}>=0.34?{} => actionable={actionable}",
-            quality.receiver_openness, quality.expected_completion, quality.lane_interception_risk, quality.stride_fit,
-            receiver_openness_for_score >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS,
-            quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT);
-    }
     ForwardFloorOutletAssessment {
         actionable,
         receiver_openness_for_score,
@@ -25638,6 +25637,7 @@ impl WorldSnapshot {
                 threaded_goal_pass_over_top_back_line_clearance_yards: 0.0,
                 threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
@@ -27001,6 +27001,8 @@ impl WorldSnapshot {
                 .unwrap_or(0.0),
             best_forward_pass_receiver_openness: forward_support_context
                 .best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality: forward_support_context
+                .best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
@@ -28580,6 +28582,44 @@ impl WorldSnapshot {
                         .actionable
                     }
             });
+        // Forward-option recognition (computed ONCE per decision): the best lane-aware
+        // quality across visible forward teammates. A backward/square target is demoted
+        // below when a genuinely good forward ball existed, so the carrier stops recycling
+        // backward after "failing to recognise" an open forward man (see
+        // `forward_pass_option_quality`). Gated; 0 (inert) when off.
+        let forward_option_recognition = dd_soccer_enable_forward_option_recognition();
+        let best_forward_option_quality = if forward_option_recognition {
+            self.players
+                .iter()
+                .filter(|p| {
+                    p.team == me.team && p.id != me.id && p.role != PlayerRole::Goalkeeper
+                })
+                .filter_map(|p| {
+                    let position = self.player_snapshot_position(p);
+                    let forward = (position.y - me_position.y) * me.team.attack_dir();
+                    if forward <= 1.25 {
+                        return None;
+                    }
+                    if visible_only && !self.player_can_see_player(me.id, p.id) {
+                        return None;
+                    }
+                    let quality = pass_target_quality_for_snapshot(
+                        self,
+                        me,
+                        me_position,
+                        p,
+                        position,
+                        PassFlight::Floor,
+                    );
+                    Some(forward_pass_option_quality(
+                        quality.receiver_openness,
+                        quality.expected_completion,
+                    ))
+                })
+                .fold(0.0f64, f64::max)
+        } else {
+            0.0
+        };
         let mut ranked = self
             .players
             .iter()
@@ -29194,9 +29234,23 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Forward-option recognition: when a genuinely good forward ball exists,
+                // demote a backward/square target so the carrier plays the open forward man
+                // instead of recycling backward (the reported blunder). Gated; the precomputed
+                // `best_forward_option_quality` is 0 when off, so this stays inert.
+                let backward_when_forward_available_penalty = if forward
+                    < -BACKWARD_PASS_MIN_FORWARD_YARDS
+                    && best_forward_option_quality >= FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD
+                {
+                    (best_forward_option_quality - FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD)
+                        * FORWARD_OPTION_RECOGNITION_BACKWARD_DEMOTION
+                } else {
+                    0.0
+                };
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
                     - anticipation_penalty
@@ -39486,6 +39540,7 @@ impl WorldSnapshot {
                 teammates_ahead: 0,
                 visible_forward_pass_options: 0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 best_quick_forward_open_value: 0.0,
                 best_quick_forward_target: None,
@@ -39511,9 +39566,22 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut best_forward_pass_option_quality = 0.0f64;
         let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
+        // Count a forward option whenever the receiver is a genuinely playable visible target
+        // that is ahead of the ball — NOT only when a straight floor lane is uncontested. An
+        // advanced, OPEN runner with a trailing/already-beaten defender nominally near the lane
+        // (high `lane_interception_risk`, so a strict reception-won `actionable` reads false) is
+        // exactly the "good forward option the carrier failed to recognise" this revision fixes;
+        // demanding strict actionability here would re-introduce that blindness and would also
+        // diverge from the established option-scoring parity baseline. So the COUNT and the
+        // nearest-distance follow every forward visible target in both modes; only the openness/
+        // quality AGGREGATION takes the richer lane-aware (`forward_floor_outlet_assessment`)
+        // recognition under `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION` — gate OFF reproduces
+        // the legacy raw-openness aggregation byte-for-byte (parity suite default-off).
+        let recognition_on = dd_soccer_enable_forward_option_recognition();
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -39523,6 +39591,10 @@ impl WorldSnapshot {
             if forward <= 1.25 {
                 continue;
             }
+            visible_forward_pass_options += 1;
+            let distance = current.distance(target_position);
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(distance);
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -39531,27 +39603,49 @@ impl WorldSnapshot {
                 target_position,
                 PassFlight::Floor,
             );
-            let distance = current.distance(target_position);
-            let outlet =
-                forward_floor_outlet_assessment(forward, distance, &quality, true);
-            if !outlet.actionable {
-                continue;
-            }
-            visible_forward_pass_options += 1;
-            nearest_visible_forward_pass_distance_yards =
-                nearest_visible_forward_pass_distance_yards.min(distance);
-            best_forward_pass_receiver_openness =
-                best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
-            // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
-            // advanced teammate. Reward openness × completion most, weight the in-band
-            // distance, and add a modest upfield-gain term so a more advanced open runner
-            // edges a square one. The ranked execution targets this player when the value
-            // wins (see `quick_forward_pass_target`).
-            if outlet.distance_fit > 0.0 {
-                let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
-                if value > best_quick_forward_open_value {
-                    best_quick_forward_open_value = value;
-                    best_quick_forward_target = Some(*target_id);
+            if recognition_on {
+                let outlet = forward_floor_outlet_assessment(forward, distance, &quality, true);
+                best_forward_pass_receiver_openness =
+                    best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
+                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                    forward_pass_option_quality(
+                        outlet.receiver_openness_for_score,
+                        quality.expected_completion,
+                    ),
+                );
+                // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
+                // advanced teammate. The lane-aware `quality_fit` already blends openness,
+                // completion, stride and upfield gain; weight it by the in-band distance fit.
+                if outlet.distance_fit > 0.0 {
+                    let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
+                    if value > best_quick_forward_open_value {
+                        best_quick_forward_open_value = value;
+                        best_quick_forward_target = Some(*target_id);
+                    }
+                }
+            } else {
+                best_forward_pass_receiver_openness =
+                    best_forward_pass_receiver_openness.max(quality.receiver_openness);
+                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                    forward_pass_option_quality(
+                        quality.receiver_openness,
+                        quality.expected_completion,
+                    ),
+                );
+                // Legacy quick-forward value (raw openness × completion × upfield gain), kept
+                // byte-identical so the option-scoring parity suite is unchanged with the gate off.
+                let band_fit = quick_forward_pass_band_fit(distance);
+                if band_fit > 0.0 {
+                    let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+                    let openness = quality.receiver_openness.clamp(0.0, 1.0);
+                    let completion = quality.expected_completion.clamp(0.0, 1.0);
+                    let value = (band_fit
+                        * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
+                        .clamp(0.0, 1.0);
+                    if value > best_quick_forward_open_value {
+                        best_quick_forward_open_value = value;
+                        best_quick_forward_target = Some(*target_id);
+                    }
                 }
             }
         }
@@ -39560,6 +39654,7 @@ impl WorldSnapshot {
             teammates_ahead,
             visible_forward_pass_options,
             best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: if nearest_forward_teammate_distance_yards
                 .is_finite()
             {
