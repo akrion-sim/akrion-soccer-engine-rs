@@ -1085,6 +1085,69 @@ mod tests {
     }
 
     #[test]
+    fn genome_anchor_home_positions_reanchor_only_when_gated() {
+        use crate::des::general::soccer_genome::{GenomeRole, SoccerTeamGenome};
+
+        std::env::remove_var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS");
+        let config = MatchConfig::default();
+        let mut sim = SoccerMatch::default_11v11(config.clone());
+
+        let gk_id = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .expect("home keeper");
+        let gk_home = |sim: &SoccerMatch| {
+            sim.players
+                .iter()
+                .find(|p| p.id == gk_id)
+                .unwrap()
+                .home_position
+        };
+        let default_home = gk_home(&sim);
+
+        // Gate OFF ⇒ installing a genome leaves home positions byte-identical.
+        sim.set_team_tactical_genome(Team::Home, SoccerTeamGenome::default());
+        assert_eq!(default_home, gk_home(&sim), "gate off ⇒ home unchanged");
+
+        // Gate ON ⇒ the keeper snaps to its genome anchor's fine-cell centre.
+        std::env::set_var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS", "1");
+        let genome = SoccerTeamGenome::default();
+        let gk_anchor = genome
+            .anchors
+            .iter()
+            .find(|a| a.role == GenomeRole::Goalkeeper)
+            .copied()
+            .expect("keeper anchor");
+        let expected = genome_anchor_home_position(
+            gk_anchor.lane,
+            gk_anchor.row,
+            Team::Home,
+            config.field_width_yards,
+            config.field_length_yards,
+        );
+        sim.set_team_tactical_genome(Team::Home, genome);
+        let snapped = gk_home(&sim);
+        std::env::remove_var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS");
+
+        assert!(
+            (snapped.x - expected.x).abs() < 1e-9 && (snapped.y - expected.y).abs() < 1e-9,
+            "gate on ⇒ keeper homed on its 12×24 anchor cell"
+        );
+        // Every re-anchored player must still re-bucket to its anchor's fine cell.
+        for player in sim.players.iter().filter(|p| p.team == Team::Home) {
+            let fine = pitch_grid_address(
+                player.home_position,
+                config.field_width_yards,
+                config.field_length_yards,
+            )
+            .fine;
+            assert!(fine.x < PITCH_FINE_GRID_COLUMNS && fine.y < PITCH_FINE_GRID_ROWS);
+        }
+    }
+
+    #[test]
     fn policy_weighted_rank_selector_uses_top_three_split() {
         assert_eq!(soccer_policy_weighted_rank_index(3, 0.0), 0);
         assert_eq!(soccer_policy_weighted_rank_index(3, 0.699_999), 0);
@@ -2735,6 +2798,71 @@ impl SoccerMatch {
         match team {
             Team::Home => self.home_genome = genome,
             Team::Away => self.away_genome = genome,
+        }
+        // Optionally let the (now-installed) genome's per-player grid anchors drive
+        // each player's field-position affinity — see the gate's doc comment. Off by
+        // default ⇒ home positions stay the hard-coded formation (byte-identical).
+        if dd_soccer_enable_genome_anchor_home_positions() {
+            self.apply_genome_anchor_home_positions(team);
+        }
+    }
+
+    /// Re-anchor `team`'s players' home positions from the (sanitized, 11-slot)
+    /// genome anchors on the 12×24 grid. Players are matched to anchors per role,
+    /// left→right by lane (width), so the leftmost defender takes the leftmost
+    /// defender anchor and so on — making lane (x) affinity per-player. A role whose
+    /// spawned count differs from the genome's (e.g. a 4-4-2 lineup against a 4-3-3
+    /// genome) re-anchors as many as the two share and leaves the remainder on their
+    /// default home; it never panics or leaves a player un-homed. Runs at match setup
+    /// (before kickoff), so it snaps the current position + history to the new home
+    /// too, keeping the opening shape consistent with the anchors.
+    fn apply_genome_anchor_home_positions(&mut self, team: Team) {
+        use crate::des::general::soccer_genome::GenomeRole;
+        let width = self.config.field_width_yards;
+        let length = self.config.field_length_yards;
+        let anchors = match team {
+            Team::Home => self.home_genome.anchors.clone(),
+            Team::Away => self.away_genome.anchors.clone(),
+        };
+        for (player_role, genome_role) in [
+            (PlayerRole::Goalkeeper, GenomeRole::Goalkeeper),
+            (PlayerRole::Defender, GenomeRole::Defender),
+            (PlayerRole::Midfielder, GenomeRole::Midfielder),
+            (PlayerRole::Forward, GenomeRole::Forward),
+        ] {
+            // Anchors for this role, ordered left→right by lane (the width axis).
+            let mut role_anchors: Vec<(u8, u8)> = anchors
+                .iter()
+                .filter(|a| a.role == genome_role)
+                .map(|a| (a.lane, a.row))
+                .collect();
+            role_anchors.sort_by_key(|&(lane, _)| lane);
+            // This team's players of that role, ordered left→right by current home x,
+            // so the spatial pairing is stable regardless of spawn / roster order.
+            let mut player_idx: Vec<usize> = self
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.team == team && p.role == player_role)
+                .map(|(i, _)| i)
+                .collect();
+            player_idx.sort_by(|&a, &b| {
+                self.players[a]
+                    .home_position
+                    .x
+                    .partial_cmp(&self.players[b].home_position.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (slot, &pi) in player_idx.iter().enumerate() {
+                let Some(&(lane, row)) = role_anchors.get(slot) else {
+                    break;
+                };
+                let pos = genome_anchor_home_position(lane, row, team, width, length);
+                let player = &mut self.players[pi];
+                player.home_position = pos;
+                player.position = pos;
+                player.position_history = VecDeque::from([pos]);
+            }
         }
     }
 
@@ -19980,6 +20108,28 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok())
+    }
+}
+
+/// Seed each of the 11 players' `home_position` — their field-position affinity
+/// anchor, which the lane-discipline band, support scorer, and shape cohesion all
+/// pull toward — from the team's evolved genome anchors on the 12×24 pitch grid,
+/// instead of the hard-coded default formation literals. OFF by default ⇒ the
+/// genome's per-player `anchors` stay advisory and home positions are
+/// byte-identical to before. When ON, per-player WIDTH (lane = x) affinity becomes
+/// grid-derived AND heritable: the tournament GA already mutates / crosses the
+/// anchors, so evolving a team's shape now actually moves its players. See
+/// [`SoccerMatch::apply_genome_anchor_home_positions`].
+pub(crate) fn dd_soccer_enable_genome_anchor_home_positions() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS").is_ok())
     }
 }
 
