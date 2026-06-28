@@ -25574,6 +25574,7 @@ impl WorldSnapshot {
                 threaded_goal_pass_over_top_back_line_clearance_yards: 0.0,
                 threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
