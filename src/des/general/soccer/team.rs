@@ -5197,18 +5197,6 @@ impl CentralBrain {
                 _ => {}
             }
         }
-        // Situational "crash the box" from the flank: when we hold the ball in the opponent's
-        // final third with it out on the touchline lanes, force an aerial-cross delivery on top
-        // of whatever maneuver the brain committed. The carrier's `flank-high-cross` bias and the
-        // off-ball box-flood both key off `flank_attack_policy.prefers_high_cross()`, so flipping
-        // this one directive switch wires the whole move while leaving the learned strategy-value
-        // credit untouched. Recomputed each tick ⇒ never compounds; a no-op when the gate is off.
-        if snapshot.flank_final_third_crash_box_active(team) {
-            directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
-            directive.flank_overlap_run_probability = directive
-                .flank_overlap_run_probability
-                .max(NESTED_OVERLAP_RUN_PROBABILITY);
-        }
         {
             use TeamDefenseStrategy::*;
             match directive.defense_strategy {
