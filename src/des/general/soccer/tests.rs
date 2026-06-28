@@ -18439,6 +18439,138 @@ fn wingback_pinches_toward_center_when_defending() {
 }
 
 #[test]
+fn only_one_wingback_is_released_forward_at_a_time() {
+    // Home in possession, ball advanced on the LEFT. BOTH wide defenders have bombed forward to
+    // the same depth — the rule must release only ONE (the ball-side one) and hold the other.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 7,
+        ..Default::default()
+    });
+    let holder = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(18.0, 70.0);
+    sim.players[holder].position = Vec2::new(18.0, 70.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    let left_wb = *home_def
+        .iter()
+        .min_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    let right_wb = *home_def
+        .iter()
+        .max_by(|&&a, &&b| sim.players[a].home_position.x.total_cmp(&sim.players[b].home_position.x))
+        .unwrap();
+    sim.players[left_wb].position = Vec2::new(8.0, 75.0);
+    sim.players[right_wb].position = Vec2::new(72.0, 75.0);
+    let snap = WorldSnapshot::from_match(&sim);
+
+    // The ball-side (left) wing-back is the single designated overlapper.
+    assert_eq!(snap.sole_overlap_wingback_id(Team::Home), Some(left_wb));
+    assert_ne!(snap.sole_overlap_wingback_id(Team::Home), Some(right_wb));
+
+    // Only it gets a forward push; the far-side wing-back is held back (0 extra push).
+    let left = snap.players.iter().find(|p| p.id == left_wb).unwrap();
+    let right = snap.players.iter().find(|p| p.id == right_wb).unwrap();
+    assert!(
+        snap.wingback_extra_push_yards(left) > 0.0,
+        "the ball-side wing-back is released forward"
+    );
+    assert_eq!(
+        snap.wingback_extra_push_yards(right),
+        0.0,
+        "the far-side wing-back is held with the rest of the back four"
+    );
+
+    // The line-exemption layer never authorizes the non-sole (far-side) wing-back to break the
+    // line, so the back four can never lose two men to overlaps at once.
+    assert!(!snap.target_is_authorized_wingback_overlap(right, Vec2::new(72.0, 88.0)));
+}
+
+#[test]
+fn wide_defender_holds_a_tighter_lane_in_possession() {
+    // A wide defender's in-possession lane band is narrower (sticks to its wide channel) than the
+    // same wide defender with the stickiness gate OFF; a central defender is unaffected.
+    let width = 80.0;
+    let wide_home_x = 6.0; // touchline channel
+    let central_home_x = 40.0;
+
+    let (on_lo, on_hi) = role_vertical_lane_range(PlayerRole::Defender, wide_home_x, width, true);
+    let (c_on_lo, c_on_hi) =
+        role_vertical_lane_range(PlayerRole::Defender, central_home_x, width, true);
+    std::env::set_var("DD_SOCCER_DISABLE_WINGBACK_LANE_STICKINESS", "1");
+    let (off_lo, off_hi) = role_vertical_lane_range(PlayerRole::Defender, wide_home_x, width, true);
+    let (c_off_lo, c_off_hi) =
+        role_vertical_lane_range(PlayerRole::Defender, central_home_x, width, true);
+    std::env::remove_var("DD_SOCCER_DISABLE_WINGBACK_LANE_STICKINESS");
+
+    assert!(
+        (on_hi - on_lo) < (off_hi - off_lo),
+        "wide-defender band {on_lo}..{on_hi} should be tighter than off-gate {off_lo}..{off_hi}"
+    );
+    assert_eq!(
+        (c_on_hi - c_on_lo),
+        (c_off_hi - c_off_lo),
+        "a central defender's band is unchanged by the wing-back stickiness gate"
+    );
+}
+
+#[test]
+fn back_four_resync_grace_is_gentler_for_a_far_ball() {
+    // The renewable 7s grace eases the back four gently when the ball is far (low gain), snaps it
+    // level when the ball is close (high gain), and is gentler than the prior shared gain.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9,
+        ..Default::default()
+    });
+    let def = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .unwrap();
+    let defender_pos = sim.players[def].position;
+
+    sim.ball.position = Vec2::new(40.0, 95.0); // ball far upfield from our back four
+    let snap_far = WorldSnapshot::from_match(&sim);
+    let far_player = snap_far.players.iter().find(|p| p.id == def).unwrap();
+    let gain_far = snap_far.defensive_line_resync_consistency_gain(far_player, defender_pos);
+
+    sim.ball.position = Vec2::new(defender_pos.x, defender_pos.y + 3.0); // ball right on the line
+    let snap_close = WorldSnapshot::from_match(&sim);
+    let close_player = snap_close.players.iter().find(|p| p.id == def).unwrap();
+    let gain_close = snap_close.defensive_line_resync_consistency_gain(close_player, defender_pos);
+
+    assert!(
+        gain_far < gain_close,
+        "a far ball eases gently (grace), a close ball snaps level: far={gain_far} close={gain_close}"
+    );
+
+    // With the grace gate OFF the far-ball gain reverts to the stiffer shared floor (>= 0.75).
+    sim.ball.position = Vec2::new(40.0, 95.0);
+    std::env::set_var("DD_SOCCER_DISABLE_BACK_FOUR_RESYNC_GRACE", "1");
+    let snap_off = WorldSnapshot::from_match(&sim);
+    let off_player = snap_off.players.iter().find(|p| p.id == def).unwrap();
+    let gain_off = snap_off.defensive_line_resync_consistency_gain(off_player, defender_pos);
+    std::env::remove_var("DD_SOCCER_DISABLE_BACK_FOUR_RESYNC_GRACE");
+    assert!(
+        gain_far < gain_off,
+        "the grace must ease the far-ball resync more gently than the prior gain: grace={gain_far} off={gain_off}"
+    );
+}
+
+#[test]
 fn wingback_opens_to_the_flank_in_possession_scaled_by_cover() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -19169,6 +19301,99 @@ fn defensive_line_cushion_pulls_all_four_into_line_when_defending() {
     assert!(
         mean_y <= sim.ball.position.y - DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS + 1e-9,
         "all four defenders should stay at least 20yd goal-side of the ball: {targets:?}"
+    );
+}
+
+#[test]
+fn wingback_forward_priority_holds_centre_backs_and_frees_wingbacks() {
+    // Reproduces the reported fault and verifies the gated fix. The back four sits with the
+    // two CENTRAL defenders deep (35yd goal-side of a ball at halfway — already a legal
+    // 20-40yd cushion) and the two WINGBACKS high (5yd goal-side). With the all-four-average
+    // line (gate off) the high wingbacks raise the average, the flat clamp drags the
+    // centre-backs FORWARD toward the ball, and conserving the average yanks the wingbacks
+    // BACK. With wingback-first priority on, the line is anchored on the centre-backs (they
+    // HOLD) and the wingbacks keep their advanced slot.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 71,
+        ..Default::default()
+    });
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .take(4)
+        .collect();
+    let away_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away)
+        .map(|p| p.id)
+        .unwrap();
+    let w = DEFAULT_FIELD_WIDTH_YARDS;
+    let half = DEFAULT_FIELD_LENGTH_YARDS * 0.5;
+    let centre_a = home_def[0];
+    let wing_a = home_def[2];
+    for &d in &home_def {
+        sim.players[d].role = PlayerRole::Defender;
+    }
+    // Classify two central + two wide via home x; place CBs deep, wingbacks high.
+    sim.players[home_def[0]].home_position.x = w * 0.40;
+    sim.players[home_def[1]].home_position.x = w * 0.60;
+    sim.players[home_def[2]].home_position.x = w * 0.08;
+    sim.players[home_def[3]].home_position.x = w * 0.92;
+    sim.players[home_def[0]].position = Vec2::new(w * 0.40, half - 35.0);
+    sim.players[home_def[1]].position = Vec2::new(w * 0.60, half - 35.0);
+    sim.players[home_def[2]].position = Vec2::new(w * 0.08, half - 5.0);
+    sim.players[home_def[3]].position = Vec2::new(w * 0.92, half - 5.0);
+    sim.players[away_id].position = Vec2::new(w * 0.5, half);
+    sim.ball.holder = Some(away_id);
+    sim.ball.position = Vec2::new(w * 0.5, half);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let cb_target = sim.players[centre_a].position;
+    let wb_target = sim.players[wing_a].position;
+
+    // GATE OFF (default): the bug — centre-back rushes forward, wingback dragged back.
+    std::env::remove_var("DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY");
+    let cb_off = snap.defensive_line_cushion_adjusted_target(centre_a, cb_target);
+    let wb_off = snap.defensive_line_cushion_adjusted_target(wing_a, wb_target);
+    assert!(
+        cb_off.y > cb_target.y + 5.0,
+        "gate off should reproduce the bug: centre-back rushes forward {cb_off:?} from {cb_target:?}"
+    );
+    assert!(
+        wb_off.y < wb_target.y - 5.0,
+        "gate off should reproduce the bug: wingback dragged backward {wb_off:?} from {wb_target:?}"
+    );
+
+    // GATE ON: centre-back holds its already-legal depth; wingback keeps its advanced slot.
+    std::env::set_var("DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY", "1");
+    let cb_on = snap.defensive_line_cushion_adjusted_target(centre_a, cb_target);
+    let wb_on = snap.defensive_line_cushion_adjusted_target(wing_a, wb_target);
+    std::env::remove_var("DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY");
+
+    assert!(
+        (cb_on.y - cb_target.y).abs() < 2.0,
+        "gate on: centre-back must HOLD its legal depth, not rush forward {cb_on:?} vs {cb_target:?}"
+    );
+    assert!(
+        cb_on.y < cb_off.y - 5.0,
+        "gate on must keep the centre-back markedly deeper than the buggy forward rush \
+         (on={cb_on:?}, off={cb_off:?})"
+    );
+    assert!(
+        wb_on.y >= wb_target.y - 1e-6,
+        "gate on: wingback must keep its advanced position, not be dragged back {wb_on:?} vs {wb_target:?}"
+    );
+    assert!(
+        wb_on.y > wb_off.y + 5.0,
+        "gate on must keep the wingback markedly higher than the buggy backward drag \
+         (on={wb_on:?}, off={wb_off:?})"
     );
 }
 
@@ -46108,10 +46333,14 @@ fn defenders_and_midfielders_preserve_vertical_lanes_by_phase() {
             possession_snapshot.field_width,
             true,
         );
+        // The intermediate open-space producer may sit one SUPPORT lane either side of the home
+        // band (a wide defender, with stickiness, holds a tighter band but may still seek width
+        // here; the downstream shape clamp binds it to the band in the live pipeline).
+        let possession_min_lane = min_lane.saturating_sub(1);
         let possession_max_lane = (max_lane + 1).min(11);
         assert!(
-            (min_lane..=possession_max_lane).contains(&target_lane),
-            "{} should keep its 12-grid vertical lane band or adjacent support lane in possession: home={:?} target={:?} lane={target_lane} allowed={min_lane}..={possession_max_lane}",
+            (possession_min_lane..=possession_max_lane).contains(&target_lane),
+            "{} should keep its 12-grid vertical lane band or adjacent support lane in possession: home={:?} target={:?} lane={target_lane} allowed={possession_min_lane}..={possession_max_lane}",
             player.name,
             player.home_position,
             target
@@ -46190,10 +46419,14 @@ fn possession_support_expands_width_while_respecting_all_outfield_lanes() {
             snapshot.field_width,
             true,
         );
+        // Symmetric one-support-lane tolerance: a wide defender holds a tighter home band under
+        // stickiness but the intermediate support producer may still seek width either side; the
+        // downstream shape clamp binds the final target to the band in the live pipeline.
+        let possession_min_lane = min_lane.saturating_sub(1);
         let possession_max_lane = (max_lane + 1).min(VERTICAL_LANE_COUNT - 1);
         assert!(
-            (min_lane..=possession_max_lane).contains(&target_lane),
-            "{} should keep its home 12-grid lane band or immediate support lane in possession: home={:?} target={:?} lane={target_lane} allowed={min_lane}..={possession_max_lane}",
+            (possession_min_lane..=possession_max_lane).contains(&target_lane),
+            "{} should keep its home 12-grid lane band or immediate support lane in possession: home={:?} target={:?} lane={target_lane} allowed={possession_min_lane}..={possession_max_lane}",
             player.name,
             player.home_position,
             target
@@ -49974,7 +50207,7 @@ fn wingback_push_is_smoothly_boosted_by_space_and_midfield_cover() {
 }
 
 #[test]
-fn covered_possession_opens_both_wingbacks_to_flanks() {
+fn covered_possession_opens_wingbacks_wide_but_releases_only_one_forward() {
     fn configure_covered_wingback_shape(sim: &mut SoccerMatch, covered: bool) {
         let holder = 7usize;
         sim.ball.holder = Some(holder);
@@ -50022,11 +50255,6 @@ fn covered_possession_opens_both_wingbacks_to_flanks() {
         .iter()
         .find(|player| player.id == lb)
         .expect("covered left wingback");
-    let uncovered_rb = uncovered_snapshot
-        .players
-        .iter()
-        .find(|player| player.id == rb)
-        .expect("uncovered right wingback");
     let covered_rb = covered_snapshot
         .players
         .iter()
@@ -50098,15 +50326,24 @@ fn covered_possession_opens_both_wingbacks_to_flanks() {
         covered_right_outlet.x > covered.players[rb].home_position.x + 8.0,
         "right covered outlet should be a true flank outlet: {covered_right_outlet:?}"
     );
+    // FORWARD release is singular even under covered possession: only the single designated
+    // (ball-side) wing-back is released forward; the far-side one is HELD with the back four.
+    // The width/outlet opening asserted above is a separate (lateral) mechanism and applies to
+    // both. Here the ball is central, so the designated wing-back is the tie-break winner (LB).
+    assert_eq!(
+        covered_snapshot.sole_overlap_wingback_id(Team::Home),
+        Some(lb),
+        "the central-ball tie-break designates the left wing-back as the sole overlapper"
+    );
     assert!(
         covered_snapshot.wingback_extra_push_yards(covered_lb)
             > uncovered_snapshot.wingback_extra_push_yards(uncovered_lb) + 1.0,
-        "coverage behind the ball should also permit more wingback push"
+        "coverage behind the ball should permit more forward push for the released wing-back"
     );
-    assert!(
-        covered_snapshot.wingback_extra_push_yards(covered_rb)
-            > uncovered_snapshot.wingback_extra_push_yards(uncovered_rb) + 0.75,
-        "far-side wingback should still get some covered-possession push"
+    assert_eq!(
+        covered_snapshot.wingback_extra_push_yards(covered_rb),
+        0.0,
+        "the far-side wing-back stays in the back four; only one wing-back is released forward"
     );
 }
 

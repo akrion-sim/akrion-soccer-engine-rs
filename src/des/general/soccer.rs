@@ -2041,6 +2041,12 @@ const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
 const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
 const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
 const SHAPE_CONSISTENCY_FAR_SECONDS: f64 = 5.0;
+// Back-four resync grace: the far-ball horizon ceiling (s) and the per-tick easing-gain floor
+// for pulling the back four back into shape. The longer ceiling + lower floor (vs the shared
+// 5s / 0.75) give the line a gentle, renewable ~7s window to ease back when the ball is far,
+// while a close ball still snaps it level. See `defensive_line_resync_consistency_gain`.
+const BACK_FOUR_RESYNC_GRACE_SECONDS: f64 = 7.0;
+const BACK_FOUR_RESYNC_GAIN_FLOOR: f64 = 0.40;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
 // project the ball forward by this many seconds (position + velocity + accel + jerk)
 // and never sit more than the not-in-possession max gap behind that predicted point.
@@ -5012,6 +5018,21 @@ fn vertical_lane_bounds(lane: usize, field_width: f64) -> (f64, f64) {
     (lane as f64 * lane_width, (lane + 1) as f64 * lane_width)
 }
 
+/// In-possession lane radius (in lanes) a wide defender (wing-back) is held to when
+/// [`wingback_lane_stickiness_enabled`] is on — tighter than the shared defender band so the
+/// wing-back keeps its wide channel and does not drift infield. Defense already holds a ±1
+/// band, so only the looser in-possession band is tightened.
+const WINGBACK_LANE_RADIUS_POSSESSION: isize = 1;
+
+/// Whether a defender whose HOME x sits in the outer ~28% of the pitch is a wide defender
+/// (wing-back). Mirrors [`WorldSnapshot::is_wide_defender`]'s threshold but as a free helper
+/// usable from the lane math (which only has `home_x` / `field_width`).
+fn is_wide_defender_home_x(home_x: f64, field_width: f64) -> bool {
+    field_width > 0.0
+        && home_x.is_finite()
+        && (home_x < field_width * 0.28 || home_x > field_width * 0.72)
+}
+
 fn role_vertical_lane_range(
     role: PlayerRole,
     home_x: f64,
@@ -5029,7 +5050,15 @@ fn role_vertical_lane_range(
             clamp_lane(home_lane as isize + radius),
         )
     };
+    // Wing-back lane stickiness: a wide defender in possession holds a narrower lane band so it
+    // keeps its width instead of drifting infield. Off ⇒ the shared defender band.
+    let wide_defender = wingback_lane_stickiness_enabled()
+        && role == PlayerRole::Defender
+        && is_wide_defender_home_x(home_x, field_width);
     match role {
+        PlayerRole::Defender if in_possession && wide_defender => {
+            centered_band(WINGBACK_LANE_RADIUS_POSSESSION)
+        }
         // Forwards keep their freedom to drift and make runs, but not across the
         // WHOLE pitch: a generous home-centred band (±3 of 12 lanes ≈ ±20yd) lets a
         // striker work the centre and both half-spaces while still stopping it from
@@ -49855,6 +49884,57 @@ fn dd_soccer_disable_dribble_cushion_discipline() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_CUSHION_DISCIPLINE").is_ok())
 }
+/// Default-ON: at most ONE wing-back (wide defender) is released forward at a time; the
+/// other three of the back four stay back in line. Set
+/// `DD_SOCCER_DISABLE_SINGLE_WINGBACK_OVERLAP` to revert to the prior behaviour (the
+/// far-side wing-back could also push when there was covered attack, and the line-exemption
+/// layer could exempt both wide defenders simultaneously).
+pub(crate) fn single_wingback_overlap_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_DISABLE_SINGLE_WINGBACK_OVERLAP").is_err()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SINGLE_WINGBACK_OVERLAP").is_err())
+    }
+}
+
+/// Default-ON: wide defenders (wing-backs) hold their wide vertical lane more tightly — a
+/// narrower in-possession lane band so they don't drift infield and empty the team's width.
+/// Set `DD_SOCCER_DISABLE_WINGBACK_LANE_STICKINESS` to revert to the shared defender band.
+pub(crate) fn wingback_lane_stickiness_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_DISABLE_WINGBACK_LANE_STICKINESS").is_err()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGBACK_LANE_STICKINESS").is_err())
+    }
+}
+
+/// Default-ON: the back four resyncs into shape over a renewable ~7s grace window rather than
+/// the prior ~3-5s — gentle easing when the ball is far (there is time), snappy when it is
+/// close (urgent). Recomputed every tick, so the window renews and can span longer than 7s
+/// under repeated disruption. Set `DD_SOCCER_DISABLE_BACK_FOUR_RESYNC_GRACE` to revert.
+pub(crate) fn back_four_resync_grace_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_DISABLE_BACK_FOUR_RESYNC_GRACE").is_err()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BACK_FOUR_RESYNC_GRACE").is_err())
+    }
+}
+
 /// Mirror of the world/player first-touch-escape gate for the reward side — same env var so the
 /// escape carry geometry, the shield demotion, and this escape-retain reward toggle together.
 /// Default-off (escape ON); OFF zeroes the extra reward so learning is byte-identical.
