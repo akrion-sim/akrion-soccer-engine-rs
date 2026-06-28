@@ -32789,7 +32789,9 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         advantage: 2.0,
         old_action_probability: Some(current_probability / 10.0),
     };
-    let positive = head.clipped_mappo_advantage(&positive_sample, 0.2);
+    let positive = head
+        .clipped_mappo_advantage(&positive_sample, 0.2)
+        .expect("valid MAPPO old-policy probability");
     assert!(
         (positive - 2.4).abs() < 1e-9,
         "positive MAPPO advantage must clip high ratios: {positive}"
@@ -32801,10 +32803,56 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         advantage: -2.0,
         old_action_probability: Some(current_probability * 10.0),
     };
-    let negative = head.clipped_mappo_advantage(&negative_sample, 0.2);
+    let negative = head
+        .clipped_mappo_advantage(&negative_sample, 0.2)
+        .expect("valid MAPPO old-policy probability");
     assert!(
         (negative + 1.6).abs() < 1e-9,
         "negative MAPPO advantage must clip low ratios: {negative}"
+    );
+}
+
+#[test]
+fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
+    let mut head = SoccerPolicyHead::new(23);
+    let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
+    critic_state[0] = 0.35;
+    critic_state[8] = 0.65;
+    let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
+    let action_index = soccer_policy_action_index("pass").expect("pass policy action");
+    let sample = |old_action_probability| SoccerPolicySample {
+        state_features: state,
+        action_index,
+        advantage: 2.0,
+        old_action_probability,
+    };
+
+    for old_action_probability in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
+        assert!(
+            head.clipped_mappo_advantage(&sample(old_action_probability), 0.2)
+                .is_none(),
+            "MAPPO must skip poisoned old-policy probability {old_action_probability:?}"
+        );
+    }
+
+    head.train(
+        &[
+            sample(None),
+            sample(Some(0.0)),
+            sample(Some(f64::NAN)),
+            sample(Some(f64::INFINITY)),
+        ],
+        Some(0.2),
+    );
+    assert_eq!(
+        head.training_steps, 0,
+        "MAPPO must not silently fall back to unclipped policy-gradient samples"
+    );
+
+    head.train(&[sample(None)], None);
+    assert!(
+        head.training_steps > 0,
+        "legacy/unclipped actor training may still use samples without old-policy probabilities"
     );
 }
 

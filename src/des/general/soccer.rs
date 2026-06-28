@@ -34326,21 +34326,15 @@ impl SoccerPolicyRoleHead {
         Some(probs)
     }
 
-    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
-        let Some(old_prob) = sample.old_action_probability else {
-            return sample.advantage;
-        };
+    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> Option<f64> {
+        let old_prob = sample.old_action_probability?;
         if !old_prob.is_finite() || old_prob <= 1e-9 {
-            return sample.advantage;
+            return None;
         }
-        let Some(current_probs) = self.action_distribution(&sample.state_features) else {
-            return sample.advantage;
-        };
-        let Some(current_prob) = current_probs.get(sample.action_index).copied() else {
-            return sample.advantage;
-        };
+        let current_probs = self.action_distribution(&sample.state_features)?;
+        let current_prob = current_probs.get(sample.action_index).copied()?;
         if !current_prob.is_finite() || current_prob <= 0.0 {
-            return 0.0;
+            return None;
         }
         let epsilon = clip_epsilon.clamp(0.01, 1.0);
         let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
@@ -34350,7 +34344,7 @@ impl SoccerPolicyRoleHead {
         } else {
             ratio.max(clipped)
         };
-        sample.advantage * ppo_ratio
+        Some(sample.advantage * ppo_ratio)
     }
 
     fn train(
@@ -34368,7 +34362,7 @@ impl SoccerPolicyRoleHead {
             })
             .filter_map(|sample| {
                 let advantage = match mappo_clip_epsilon {
-                    Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon),
+                    Some(epsilon) => self.clipped_mappo_advantage(sample, epsilon)?,
                     None => sample.advantage,
                 };
                 advantage.is_finite().then_some((sample, advantage))
@@ -34498,11 +34492,10 @@ impl SoccerPolicyHead {
             .action_distribution(state_features)
     }
 
-    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> f64 {
+    fn clipped_mappo_advantage(&self, sample: &SoccerPolicySample, clip_epsilon: f64) -> Option<f64> {
         let role = soccer_policy_role_from_features(&sample.state_features);
         self.role_head_for_role(role)
-            .map(|head| head.clipped_mappo_advantage(sample, clip_epsilon))
-            .unwrap_or(sample.advantage)
+            .and_then(|head| head.clipped_mappo_advantage(sample, clip_epsilon))
     }
 
     /// One advantage policy-gradient pass over a batch of samples.
