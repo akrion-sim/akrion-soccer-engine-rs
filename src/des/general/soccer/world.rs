@@ -26924,6 +26924,13 @@ impl WorldSnapshot {
             .map(|guidance| finite_metric(guidance.speed_match_weight))
             .unwrap_or(0.0);
         let urgency_elapsed = phase_started.elapsed();
+        // Slip-and-break-the-offside-trap recognition for the carrier: the best seam to slip a
+        // firm forward ground ball through to a teammate who has STARTED a timed break, and how
+        // strongly the moment to release has arrived (the runner ~2–3 yd before the line). Both
+        // are 0 when the gate is off, so the observation stays byte-identical. See
+        // `slip_break_carrier_recognition`.
+        let (slip_break_seam_quality, slip_break_release_now) =
+            self.slip_break_carrier_recognition(me, me_position);
         let mut observation = SoccerPomdpObservation {
             player_id,
             player_grid,
