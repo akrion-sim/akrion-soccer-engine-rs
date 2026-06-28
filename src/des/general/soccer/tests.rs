@@ -50905,7 +50905,11 @@ fn covered_possession_opens_wingbacks_wide_but_releases_only_one_forward() {
     fn configure_covered_wingback_shape(sim: &mut SoccerMatch, covered: bool) {
         let holder = 7usize;
         sim.ball.holder = Some(holder);
-        sim.ball.position = Vec2::new(40.0, 62.0);
+        // Build-up phase: the ball sits just ahead of the back four (line ~y=44), NOT 10+ yds
+        // beyond it — so this exercises the covered-overlap WIDTH release, not the separate
+        // "hold width when the ball is far advanced" guard (see
+        // `wingback_advanced_ball_should_hold_width`).
+        sim.ball.position = Vec2::new(40.0, 52.0);
         sim.ball.velocity = Vec2::zero();
         sim.ball.acceleration = Vec2::zero();
         sim.ball.last_touch_team = Some(Team::Home);
