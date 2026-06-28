@@ -6301,7 +6301,21 @@ impl PlayerAgent {
         let wrong_side_emergency_contact = !goal_side_or_level
             && distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
             && defender_steal_skill + 0.20 >= holder_security;
-        if !goal_side_or_level && !wrong_side_emergency_contact {
+        // Surprise steal from behind (gated; OFF ⇒ assessment is `None`). A defender that has
+        // crept into a slow, forward-dribbling carrier's blind arc and is now at contact range
+        // nicks the ball — the one case a steal from behind is won, because an unaware carrier
+        // at a walk/jog is not shielding the led ball. It is deliberately the wrong-side (not
+        // goal-side) exception, so it must be evaluated BEFORE the goal-side early-out below.
+        // The catch-belief / slowness / blind-arc gating all lives in `blindside_steal_assessment`.
+        let blindside_contact = snapshot
+            .blindside_steal_assessment(self.id)
+            .map(|assessment| {
+                assessment.target == holder
+                    && assessment.gap_yards <= BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS
+                    && assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD
+            })
+            .unwrap_or(false);
+        if !goal_side_or_level && !wrong_side_emergency_contact && !blindside_contact {
             return None;
         }
         let clean_contact = distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
