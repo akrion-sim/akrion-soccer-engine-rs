@@ -2670,7 +2670,8 @@ fn blindside_steal_recognises_slow_unaware_catchable_carrier() {
 fn blindside_steal_declines_when_carrier_is_sprinting_clear() {
     // Same blind-arc geometry, but the carrier is flat-out sprinting — it simply runs
     // away from the thief, so there is no surprise-steal chance even behind the eyes.
-    let snapshot = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
+    let sim = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
+    let snapshot = WorldSnapshot::from_match(&sim);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
     let assessment = snapshot.blindside_steal_assessment(14);
     std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
