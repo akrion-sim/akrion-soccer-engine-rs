@@ -9155,6 +9155,7 @@ fn headed_goal_off_a_flank_cross_pays_the_finisher_and_the_crosser() {
 /// A foot finish (ball on the ground) in the same window does *not* earn the headed-goal bonus.
 #[test]
 fn ground_finish_in_the_window_earns_no_header_bonus() {
+    let _env = crash_box_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.players[9].role = PlayerRole::Forward;
     let crosser = 8;
