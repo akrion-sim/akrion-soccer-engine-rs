@@ -1,0 +1,73 @@
+# Soccer AI architecture audit (policy / neural / planning layer)
+
+Grounded in the actual `soccer-sim-game-engine.rs` code (not a generic guess). The
+trigger was an external design audit that assumed a "vanilla feedforward NN mapping
+snapshot → action scores." That premise is **out of date for this engine**: the NN is
+not the solver. The engine is a **hybrid heuristic + tabular-RL + feedforward-neural-head**
+system in which the learned layer **re-ranks a small heuristic candidate set**
+(`SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT = 12`, stochastic top-k), executed by MPC.
+
+## What the engine already has (vs the 8 audit checkpoints)
+
+| # | Audit concern | Reality in this engine | Where |
+|---|---|---|---|
+| 1 | Stateless NN (no POMDP belief)? | **Belief exists** (analytic, not recurrent): opponent press beliefs, FOV vision-gating + Kalman confidence, perception-noise / occlusion (gated), intended-pass-target belief | `update_opponent_press_beliefs`, `opponent_belief_enabled`, `INTENDED_PASS_TARGET_BELIEF_CONFIDENCE` (world.rs) |
+| 2 | Probs vs Q-values? | Both + tabular value: `FeedForwardNetwork` policy/value heads over a tabular `value_micros` retrieval prior | soccer.rs neural heads + `des_soccer_learning_policy_entries` |
+| 3 | Behavior prob stored for PPO? | **Yes** — `old_action_probability`, comment: *"PPO/MAPPO importance weighting must use THIS as the behaviour [prob]"* | soccer.rs:6744, 34136 |
+| 4 | Reward too sparse? | **No — densely shaped**: `PITCH_VALUE` (xT-like), `REWARD_PER_YARD`, half-field weighting, `REWARD_MIN_PRESSURE`, possession progression, `EFFORT_REWARD`, shot/pass ladders | soccer.rs reward consts |
+| 5 | 11 independent NNs? | **No — MARL/MAPPO**: team reward weight 0.35 / intermediate 1.0, centralized lane-discipline, balanced-team component, MAPPO feature channels | `DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT`, `field_numbers` |
+| 6 | Player relationships modeled? | **Engineered, not learned**: 22-body `field_numbers` vector, relational shape (neighbors), lane affinity, nearest-opponent/marking | `mod field_numbers`, `RELATIONAL_SHAPE_NEIGHBORS` |
+| 7 | Sequence search? | **Analytic lookahead only** (pass-lane 2s, reactive 1.4s, energy 10s) + MPC — **no MCTS/rollout/learned-model search** | `*_LOOKAHEAD_SECONDS` consts |
+| 8 | MPC = execution only? | **Yes (correct)** — MPC/QP gates ball control + pass execution; tactics decided upstream | `bounded_accel_qp_control_fit`, "MPC pass execution" |
+
+## What is genuinely missing (the audit's valid points)
+
+1. **Learned representation.** The heads are `FeedForwardNetwork` MLPs over **hand-crafted**
+   features (`SOCCER_NEURAL_BASE_FEATURE_DIM = 192` + appended channels). No learned
+   GNN/attention over the player graph; no learned RNN/Transformer temporal belief. The
+   relational + temporal signal is *feature-engineered in*.
+2. **Learned-model search.** No MuZero/MCTS/POMCP. Planning is analytic lookahead + MPC, not
+   tree search over a learned transition model.
+
+## The reality check the external audit missed (decisive here)
+
+This engine runs **22 agents at a 66.7 ms / tick (15 Hz) soft-real-time budget** — the whole
+recent perf effort was keeping ticks under that. A per-tick **GNN + RNN + MCTS** for 22
+players would blow the budget by 10–100×. The current design — *engineered relational/belief
+features + lightweight MLP heads + analytic lookahead + MPC* — is largely a **deliberate
+response to that constraint**. The cited references (MuZero, MADDPG, GRF-GNN) are
+offline / turn-based / batch-trained; none carries a 15 Hz × 22-agent inference budget.
+So "upgrade the neural net" must be read as "upgrade *without* adding per-tick learned
+graph/recurrent/tree-search cost."
+
+## Pragmatic roadmap (ranked by value / effort for THIS engine)
+
+1. **Keep MDP/POMDP + MPC + heuristic re-rank.** Right backbone for real-time. No change.
+2. **Small learned relational encoder, offline-distilled (captures audit #1 at ~zero runtime cost).**
+   - Train a tiny GNN/attention encoder *offline* on the existing engineered features +
+     logged transitions (`des_soccer_learning_run_deltas`).
+   - **Distill** its output into the *same MLP head input shape* the engine already consumes,
+     so runtime inference cost is unchanged (still one dense forward pass).
+   - First step: export a feature+outcome dataset from PG; train encoder→head offline;
+     ship only the distilled dense weights through the existing neural-snapshot path
+     (append at tail, zero-pad old snapshots — already supported, see "new variables").
+3. **Bounded learned-model rollout over the top-k only (captures audit #7 within budget).**
+   - Not full MCTS. 1–2 ply lookahead over the existing ≤12 candidates using a learned
+     one-step outcome head (reuse the pass/shot/carry outcome heads already present).
+   - Cost is bounded: `≤12 candidates × 1–2 ply × cheap outcome head` — fits the tick budget.
+4. **Lean into the CTDE you already have.** Strengthen the centralized critic *offline*
+   (MAPPO team reward already wired); runtime stays decentralized per-player.
+5. **New-variable discipline (already-correct pattern).** Append features at the tail and
+   zero-pad old neural snapshots (engine already migrates this way — soccer.rs:3675/3685).
+   Keep new variables OUT of the tabular `state_key` (`soccer_policy_postgres_state_key`)
+   unless you are prepared to re-accumulate that experiment, because changing the key
+   encoding orphans existing tabular entries.
+
+## Notes / landmines
+
+- `visits` in `des_soccer_learning_policy_entries` is **saturated at i32-max** for most rows
+  (overflow bug), so `SOCCER_LIVE_POLICY_MIN_VISITS` can't trim the policy load — gen-308 is
+  1.32M entries with no usable visit filter. Worth fixing (i64 / capped counter) to enable
+  fast partial loads.
+- Tip generations (2026-06-28): `soccer-self-play-k8s-overnight` gen 308 (actively training,
+  +17 gens/24h), `…-deterministic` gen 372 (stalled ~3 days), `…-queue` gen 38 (stalled).
