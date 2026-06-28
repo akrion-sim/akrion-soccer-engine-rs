@@ -9186,6 +9186,7 @@ fn ground_finish_in_the_window_earns_no_header_bonus() {
 /// pulls attackers into the box even when the team brain never rolled the `CrashTheBox` strategy.
 #[test]
 fn situational_recognizer_floods_the_box_independent_of_strategy() {
+    let _env = crash_box_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.ball.holder = Some(8);
     sim.ball.position = Vec2::new(8.0, 100.0); // wide flank, attacking final third for Home.
