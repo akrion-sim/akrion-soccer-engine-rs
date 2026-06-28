@@ -2694,6 +2694,25 @@ const BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 
 // existing look-behind scan.
 const BLINDSIDE_GLANCE_DRIFT_RISK_BASE: f64 = 0.12;
 const BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN: f64 = 0.22;
+
+/// A defender's "surprise steal from behind" opportunity against the current opponent
+/// ball-carrier (see [`WorldSnapshot::blindside_steal_assessment`]). Every field is in
+/// `[0, 1]`; `opportunity` is the overall strength the decision/observation reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlindsideStealAssessment {
+    /// The opponent carrier being crept up on.
+    pub target: usize,
+    /// Overall blindside-steal strength (blends the parts below), `[0, 1]`.
+    pub opportunity: f64,
+    /// How far the defender sits behind the carrier's eyes (1 = dead behind).
+    pub carrier_unaware: f64,
+    /// How exploitable the carrier's pace is (1 = walk/jog/skip, 0 = sprinting clear).
+    pub carrier_slow: f64,
+    /// The defender's belief it can catch the carrier before it reacts, `[0, 1]`.
+    pub catch_belief: f64,
+    /// Straight-line gap to the carrier, yards (for the contact test).
+    pub gap_yards: f64,
+}
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
