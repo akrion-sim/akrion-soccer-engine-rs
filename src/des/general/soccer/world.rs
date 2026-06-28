@@ -10026,7 +10026,7 @@ impl SoccerMatch {
     /// attacking final third** under the situational crash-the-box recognizer, and pay the small
     /// bounded shaped reward to attackers already crashed into the box for the delivery. A no-op
     /// (byte-identical) unless `DD_SOCCER_ENABLE_FLANK_CRASH_BOX` is on. See [`crash_box`].
-    fn register_flank_crash_box_cross(
+    pub(crate) fn register_flank_crash_box_cross(
         &mut self,
         team: Team,
         crosser: usize,
