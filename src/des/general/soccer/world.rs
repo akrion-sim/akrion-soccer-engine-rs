@@ -38209,15 +38209,42 @@ impl WorldSnapshot {
     /// across the box instead of clumping. Assignment is fully deterministic (sorted by x then
     /// id, no RNG) so it is parity-safe. Returns this player's assigned box target, or `None`
     /// when no box-crash is on.
+    /// Situational "crash the box" recognizer: we are in possession in the opponent's attacking
+    /// final third with the ball out on the flanks (the three outermost lanes of the 12-lane fine
+    /// grid). When this fires, the high-cross delivery and the box-flood are switched on as a
+    /// *reaction to the geometry*, independent of whichever attack strategy the team brain rolled.
+    /// Gated by [`flank_crash_box_enabled`] (default-OFF under test ⇒ byte-identical).
+    pub(crate) fn flank_final_third_crash_box_active(&self, team: Team) -> bool {
+        if !flank_crash_box_enabled() || self.active_set_play.is_some() {
+            return false;
+        }
+        if self
+            .controlled_possession_team()
+            .or_else(|| self.possession_team())
+            != Some(team)
+        {
+            return false;
+        }
+        flank_final_third_crash_box_geometry(
+            self.ball.position,
+            team.goal_y(self.field_length),
+            self.field_width,
+            self.field_length,
+        )
+    }
+
     pub(crate) fn crash_the_box_target_for(&self, player: &PlayerSnapshot) -> Option<Vec2> {
         if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
             return None;
         }
         // Unified with the feature-level box-flood in `flank_cross_arrival_target_for`: runners
-        // start catching up during the byline drive and stay committed through the release.
+        // start catching up during the byline drive and stay committed through the release. The
+        // situational flank crash-the-box recognizer ALSO opens the box-flood as a reaction to a
+        // wide-and-high ball, regardless of the committed strategy.
         let attack_strategy = self.tactical_directive(player.team).attack_strategy;
         if attack_strategy != TeamAttackStrategy::CrashTheBox
             && !is_byline_cross_drive_strategy(attack_strategy)
+            && !self.flank_final_third_crash_box_active(player.team)
         {
             return None;
         }
