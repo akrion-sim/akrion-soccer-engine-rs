@@ -1,0 +1,255 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dd-soccer-otel-collector
+  namespace: default
+  labels:
+    app: dd-soccer-otel-collector
+    app.kubernetes.io/name: dd-soccer-otel-collector
+    app.kubernetes.io/part-of: des-soccer-learning
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dd-soccer-otel-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dd-soccer-otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dd-soccer-otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: dd-soccer-otel-collector
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dd-soccer-otel-collector
+  namespace: default
+  labels:
+    app: dd-soccer-otel-collector
+    app.kubernetes.io/name: dd-soccer-otel-collector
+    app.kubernetes.io/part-of: des-soccer-learning
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      file_storage:
+        directory: /var/lib/otelcol/storage
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      filelog:
+        include:
+          - /var/log/pods/default_*/*/*.log
+        exclude:
+          - /var/log/pods/default_dd-soccer-otel-collector-*/*/*.log
+        start_at: end
+        include_file_path: true
+        include_file_name: false
+        operators:
+          - type: container
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 384
+        spike_limit_mib: 96
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.container.name
+            - k8s.node.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+      resource/soccer:
+        attributes:
+          - key: service.namespace
+            value: soccer
+            action: upsert
+          - key: deployment.environment
+            value: "${env:SOCCER_CLUSTER_NAME}"
+            action: upsert
+      attributes/redact:
+        actions:
+          - key: db.connection_string
+            action: delete
+          - key: db.statement
+            action: delete
+          - key: http.request.header.authorization
+            action: delete
+          - key: authorization
+            action: delete
+          - key: x-api-key
+            action: delete
+      probabilistic_sampler/traces:
+        sampling_percentage: ${env:SOCCER_OTEL_TRACE_SAMPLE_PERCENT}
+      batch:
+        send_batch_size: 1024
+        timeout: 5s
+
+    exporters:
+      otlphttp/upstream:
+        endpoint: ${env:SOCCER_OTEL_UPSTREAM_ENDPOINT}
+        compression: gzip
+        timeout: 10s
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 10m
+        sending_queue:
+          enabled: true
+          storage: file_storage
+          queue_size: 4096
+      debug:
+        verbosity: basic
+
+    service:
+      extensions: [health_check, file_storage]
+      telemetry:
+        logs:
+          level: info
+      pipelines:
+        logs:
+          receivers: [filelog, otlp]
+          processors: [memory_limiter, k8sattributes, resource/soccer, attributes/redact, batch]
+          exporters: [otlphttp/upstream]
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/soccer, attributes/redact, probabilistic_sampler/traces, batch]
+          exporters: [otlphttp/upstream]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/soccer, attributes/redact, batch]
+          exporters: [otlphttp/upstream]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dd-soccer-otel-collector
+  namespace: default
+  labels:
+    app: dd-soccer-otel-collector
+    app.kubernetes.io/name: dd-soccer-otel-collector
+    app.kubernetes.io/part-of: des-soccer-learning
+spec:
+  type: ClusterIP
+  selector:
+    app: dd-soccer-otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: health
+      port: 13133
+      targetPort: 13133
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dd-soccer-otel-collector
+  namespace: default
+  labels:
+    app: dd-soccer-otel-collector
+    app.kubernetes.io/name: dd-soccer-otel-collector
+    app.kubernetes.io/part-of: des-soccer-learning
+spec:
+  selector:
+    matchLabels:
+      app: dd-soccer-otel-collector
+  template:
+    metadata:
+      labels:
+        app: dd-soccer-otel-collector
+        app.kubernetes.io/name: dd-soccer-otel-collector
+        app.kubernetes.io/part-of: des-soccer-learning
+    spec:
+      serviceAccountName: dd-soccer-otel-collector
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.155.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/conf/collector.yaml
+          env:
+            - name: SOCCER_CLUSTER_NAME
+              value: dd-soccer-k8s
+            - name: SOCCER_OTEL_TRACE_SAMPLE_PERCENT
+              value: "20"
+            - name: SOCCER_OTEL_UPSTREAM_ENDPOINT
+              value: http://dd-soccer-otel-gateway.default.svc.cluster.local:4318
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: storage
+              mountPath: /var/lib/otelcol
+      volumes:
+        - name: config
+          configMap:
+            name: dd-soccer-otel-collector
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: storage
+          hostPath:
+            path: /var/cache/dd-soccer-otel-collector
+            type: DirectoryOrCreate

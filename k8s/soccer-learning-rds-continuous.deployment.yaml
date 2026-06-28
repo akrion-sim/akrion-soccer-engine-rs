@@ -159,6 +159,16 @@ spec:
               value: "5"
             - name: RUST_BACKTRACE
               value: "1"
+            - name: SOCCER_TELEMETRY_ENABLED
+              value: "true"
+            - name: SOCCER_LOG_JSON
+              value: "true"
+            - name: SOCCER_RUST_LOG
+              value: info,soccer_engine=info
+            - name: SOCCER_CLUSTER_NAME
+              value: dd-soccer-k8s
+            - name: SOCCER_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: http://dd-soccer-otel-collector.default.svc.cluster.local:4318/v1/traces
             - name: SOCCER_SOURCE_REPO
               value: https://github.com/ORESoftware/soccer-sim-game-engine.rs.git
             - name: SOCCER_SOURCE_REF

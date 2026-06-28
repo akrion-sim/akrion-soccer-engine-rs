@@ -45,6 +45,18 @@ or unset, is **off**.
 > the fast default; the remaining per-tick cost is the per-player decision (scales with
 > how congested play is).
 
+### Telemetry and structured logs
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `SOCCER_TELEMETRY_ENABLED` | auto | Enables the shared tracing subscriber; cluster jobs set this explicitly. |
+| `SOCCER_LOG_JSON` | off | Emit tracing events as newline-delimited JSON for OTel filelog collection. |
+| `SOCCER_RUST_LOG` | `info,soccer_engine=info` | Soccer-specific tracing filter; falls back to `RUST_LOG`. |
+| `SOCCER_CLUSTER_NAME` | local/unset | Cluster resource attribute for logs/traces. |
+| `SOCCER_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP trace endpoint when trace export is enabled. |
+
+See `docs/observability.md` for the collector manifest and CockroachDB TTL schema.
+
 ### Live server
 
 | Flag | Default | Effect |
