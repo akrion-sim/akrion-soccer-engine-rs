@@ -38308,13 +38308,29 @@ impl WorldSnapshot {
         let center_x = self.field_width * 0.5;
         let touchline_x = if wingback_outlet {
             self.wingback_attacking_flank_x(me, wingback_coverage_fit)
-        } else if home.x <= center_x {
-            (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
-                .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
         } else {
-            self.field_width
-                - (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
-                    .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
+            // Wide attacker (outside mid / wide forward): open to the touchline by an amount
+            // that scales with how close the BALL'S LANE is to this player's own flank. A
+            // `closeness` ∈ [0, 1] (1 = ball sitting in his touchline lane, 0 = ball on the far
+            // touchline) hugs the line when the ball is on his flank and tucks him toward the
+            // half-space when the ball is away — modelling "the closer the ball is to your
+            // flank, the wider you should be". OFF ⇒ the legacy fixed near-touchline buffer.
+            let base_buffer = (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS);
+            let buffer = if outside_mid_ball_lane_width_enabled() {
+                let my_touchline_x = if home.x <= center_x { 0.0 } else { self.field_width };
+                let ball_to_my_touchline = (self.ball.position.x - my_touchline_x).abs();
+                let closeness =
+                    (1.0 - ball_to_my_touchline / self.field_width.max(1.0)).clamp(0.0, 1.0);
+                base_buffer + OUTSIDE_MID_BALL_LANE_MAX_TUCK_YARDS * (1.0 - closeness)
+            } else {
+                base_buffer
+            };
+            if home.x <= center_x {
+                buffer
+            } else {
+                self.field_width - buffer
+            }
         };
         // When the ball holder has time (low pressure) and this supporting player is
         // within ~20 yds, the holder "directs" them into wide open space — pull harder
