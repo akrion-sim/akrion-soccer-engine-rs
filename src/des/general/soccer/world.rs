@@ -28471,6 +28471,44 @@ impl WorldSnapshot {
                     && (!visible_only || self.player_can_see_player(me.id, p.id))
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
             });
+        // Forward-option recognition (computed ONCE per decision): the best lane-aware
+        // quality across visible forward teammates. A backward/square target is demoted
+        // below when a genuinely good forward ball existed, so the carrier stops recycling
+        // backward after "failing to recognise" an open forward man (see
+        // `forward_pass_option_quality`). Gated; 0 (inert) when off.
+        let forward_option_recognition = dd_soccer_enable_forward_option_recognition();
+        let best_forward_option_quality = if forward_option_recognition {
+            self.players
+                .iter()
+                .filter(|p| {
+                    p.team == me.team && p.id != me.id && p.role != PlayerRole::Goalkeeper
+                })
+                .filter_map(|p| {
+                    let position = self.player_snapshot_position(p);
+                    let forward = (position.y - me_position.y) * me.team.attack_dir();
+                    if forward <= 1.25 {
+                        return None;
+                    }
+                    if visible_only && !self.player_can_see_player(me.id, p.id) {
+                        return None;
+                    }
+                    let quality = pass_target_quality_for_snapshot(
+                        self,
+                        me,
+                        me_position,
+                        p,
+                        position,
+                        PassFlight::Floor,
+                    );
+                    Some(forward_pass_option_quality(
+                        quality.receiver_openness,
+                        quality.expected_completion,
+                    ))
+                })
+                .fold(0.0f64, f64::max)
+        } else {
+            0.0
+        };
         let mut ranked = self
             .players
             .iter()
