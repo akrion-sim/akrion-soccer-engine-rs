@@ -5387,49 +5387,12 @@ impl PlayerAgent {
             if let Some(mode) =
                 isolated_attacking_carrier_drive_mode(observation, self.role, outside_midfielder)
             {
-                // Square / backward outlets that become a last resort in both modes. `pass1` is a
-                // backward/square ball here by construction (no teammate is ahead).
-                let backward_outlets = ["recycle-reset", "switch-play", "route-one"];
-                match mode {
-                    IsolatedCarrierDriveMode::SoloGoalDrive => {
-                        let mut drive_family =
-                            vec!["vertical-attack", "turnover-burst", "carry-forward"];
-                        let in_shot_range =
-                            observation.yards_to_goal <= ISOLATED_CARRIER_SHOOT_YARDS;
-                        if in_shot_range && shot_legal {
-                            drive_family.push("shoot");
-                        }
-                        ensure_min_legal_option_family_probability(
-                            &mut options,
-                            &drive_family,
-                            0.72,
-                        );
-                        for label in backward_outlets {
-                            scale_legal_option_score(&mut options, label, 0.28);
-                        }
-                        // Don't square it to a covered man, and don't stall on a shield/turn when
-                        // the lane to goal is there to be driven.
-                        scale_legal_option_score(&mut options, "pass1", 0.40);
-                        for label in ["protect-ball", "hold-up-flank", "side-step"] {
-                            scale_legal_option_score(&mut options, label, 0.58);
-                        }
-                    }
-                    IsolatedCarrierDriveMode::HoldUp => {
-                        // Carry forward / on an angle at a controlled pace (the sprint resolver
-                        // keeps it off a sprint) and wait for support to arrive.
-                        ensure_min_legal_option_family_probability(
-                            &mut options,
-                            &["carry-forward", "carry-out-left", "carry-out-right"],
-                            0.60,
-                        );
-                        // Backward is the very last resort: damp it hard. Shielding while you wait
-                        // (protect-ball) is fine, so it is intentionally left alone.
-                        for label in backward_outlets {
-                            scale_legal_option_score(&mut options, label, 0.20);
-                        }
-                        scale_legal_option_score(&mut options, "pass1", 0.32);
-                    }
-                }
+                apply_isolated_carrier_drive_bias(
+                    &mut options,
+                    mode,
+                    observation.yards_to_goal <= ISOLATED_CARRIER_SHOOT_YARDS,
+                    shot_legal,
+                );
             }
         }
         // Blindside-steal ESCAPE (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`; OFF ⇒ the threat
