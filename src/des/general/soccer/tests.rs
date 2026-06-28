@@ -9102,6 +9102,7 @@ fn flank_crash_box_window_requires_a_wide_aerial_cross() {
 /// between the header scorer and the deliverer of the cross.
 #[test]
 fn headed_goal_off_a_flank_cross_pays_the_finisher_and_the_crosser() {
+    let _env = crash_box_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     sim.players[9].role = PlayerRole::Forward;
     sim.players[10].role = PlayerRole::Forward;
