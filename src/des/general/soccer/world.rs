@@ -38200,7 +38200,49 @@ impl WorldSnapshot {
             .count()
     }
 
+    /// When the ball has advanced 10+ yds AHEAD of our back-four line average, a wide DEFENDER
+    /// should push up WITH the play but NOT bomb out to the touchline to "open up": opening wide
+    /// from behind an advanced ball only isolates him and vacates the flank he is meant to cover.
+    /// The one exception is a live outlet — a ground pass could actually reach him (within ~20yd
+    /// on a clear lane) — where getting wide to receive is the correct play. Returns true ⇒ the
+    /// wingback's lateral flank-opening is suppressed (his forward push is unaffected, since that
+    /// is driven separately by the line/push machinery, not by this width fit). Gated default-ON
+    /// via `dd_soccer_disable_wingback_advanced_ball_hold_width`.
+    fn wingback_advanced_ball_should_hold_width(&self, player: &PlayerSnapshot) -> bool {
+        if dd_soccer_disable_wingback_advanced_ball_hold_width() || !self.is_wide_defender(player) {
+            return false;
+        }
+        let attack = player.team.attack_dir();
+        let line_fwds: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == player.team && p.role == PlayerRole::Defender)
+            .map(|p| self.player_snapshot_position(p).y * attack)
+            .collect();
+        if line_fwds.is_empty() {
+            return false;
+        }
+        let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
+        let ball_fwd = self.ball.position.y * attack;
+        // Only engages once the ball is well in front of the back line.
+        if ball_fwd - line_avg_fwd < WINGBACK_BALL_AHEAD_HOLD_WIDTH_YARDS {
+            return false;
+        }
+        // Live ground-pass outlet exception: within range AND on a clear (un-intercepted) lane.
+        let me_pos = self.player_snapshot_position(player);
+        let ground_pass_reachable = self.ball.position.distance(me_pos)
+            <= WINGBACK_GROUND_PASS_OUTLET_YARDS
+            && self.clear_line(self.ball.position, me_pos, player.team.other(), 2.0);
+        !ground_pass_reachable
+    }
+
     fn wingback_covered_attack_fit(&self, player: &PlayerSnapshot) -> f64 {
+        // The ball is well ahead of the back four and we are not a live ground-pass outlet ⇒ hold
+        // width: push up with the play but do not treat this as a covered-attacking-wingback that
+        // bombs out to the touchline (this fit gates every lateral flank-opening path).
+        if self.wingback_advanced_ball_should_hold_width(player) {
+            return 0.0;
+        }
         let cover_count = self.wingback_attacking_cover_count(player);
         if cover_count <= WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL {
             return 0.0;
