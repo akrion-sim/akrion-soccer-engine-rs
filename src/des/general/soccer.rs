@@ -54749,6 +54749,28 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
     }
 }
 
+/// Role-aware pass risk/safety appetite. The MPC/POMDP lane-interception risk
+/// (`pass_lane_interception_risk`, a 2-second lookahead — see
+/// [`PASS_LANE_DECISION_LOOKAHEAD_SECONDS`]) already QUANTIFIES how dangerous a pass is; this
+/// gate changes how that quantity is VALUED by WHO is on the ball and WHERE. Defenders lean
+/// into safety (amplify the risk penalty), forwards lean into a slightly higher appetite for a
+/// FORWARD ball (mute the risk penalty for forward passes and lift forward-progress weight),
+/// especially in the opponent's final third. Sideways/backward balls keep ~full risk pricing so
+/// "brave" never means a loose square ball. Default-OFF and byte-identical when off; opt-in via
+/// env, then A/B before promoting to [`gate_default_on`].
+pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok())
+    }
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
