@@ -2831,8 +2831,8 @@ pub fn evaluate_soccer_pomdp_features(
             let p = schedule.assignment[t][pos] as usize;
             reliability += problem.affinity[p][pos][t] * (0.65 + 0.35 * belief[p]);
         }
-        let mean_belief_entropy =
-            belief.iter().map(|&p| binary_entropy(p)).sum::<f64>() / belief.len() as f64;
+        let mean_belief_entropy = belief.iter().map(|&p| binary_entropy(p)).sum::<f64>()
+            / 1.0_f64.max(belief.len() as f64);
         per_period.push(SoccerPOMDPPeriodFeature {
             period: t,
             expected_fresh_on_field,

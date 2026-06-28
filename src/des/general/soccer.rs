@@ -49994,6 +49994,19 @@ fn dd_soccer_opponent_belief_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_OPPONENT_BELIEF").is_ok())
 }
 
+/// Operational escape hatch for the Bayesian/Kalman perception-confidence filter
+/// ([`kalman_perception_position_confidence`]). The filter is ON by default (it refines every
+/// position-confidence query and the learner already trains with it); setting
+/// `DD_SOCCER_DISABLE_KALMAN_PERCEPTION` makes the filter return the raw measurement confidence
+/// instead — the pre-filter behavior — so it can be disabled or A/B'd without a rebuild if it
+/// ever misbehaves in production. Mirrors the gating its sibling perception features
+/// (`DD_SOCCER_ENABLE_PERCEPTION_NOISE`, occlusion) already have.
+fn kalman_perception_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_KALMAN_PERCEPTION").is_err())
+}
+
 /// Whether the Bayesian opponent-press belief is live for this match: off unless the
 /// per-match config opts in or the process-wide `DD_SOCCER_OPPONENT_BELIEF` env flag is
 /// set. Defined on the parent module so both the per-tick update and the consuming
@@ -52414,6 +52427,11 @@ fn kalman_perception_position_confidence(
     observer_has_ball: bool,
 ) -> f64 {
     let measurement = finite_metric(measurement_confidence).clamp(0.0, 1.0);
+    // Escape hatch: when disabled, fall back to the raw (finite-guarded) measurement so the
+    // whole filter can be turned off in prod without a rebuild. Default on.
+    if !kalman_perception_enabled() {
+        return measurement;
+    }
     let perception = &tunables().pomdp_perception;
     if target_history.len() < perception.kalman_min_history_samples {
         return measurement;

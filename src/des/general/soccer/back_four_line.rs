@@ -88,6 +88,17 @@ const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LIN
 const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
 
+/// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
+/// under wingback-first priority. Decoupling the wingbacks from the line average removed the
+/// (incidental) restoring pull that deep-dropping wingbacks used to give the four-man
+/// average, letting the centre-back line ride up onto the 20yd edge and break inside it. So
+/// the central line is floored DEEPER than this gap (never closer to the ball), keeping it
+/// off the 20yd edge and firmly inside the legal 20-40yd band, while still capped at 40 by
+/// the band itself. Only ever pulls the line DEEPER — a line already sitting deeper than this
+/// is left alone — and only bites when the ball is upfield (in our own third the shelf / 6yd
+/// floor take over). Active ball-challengers are already exempt upstream.
+pub const DEFENSIVE_LINE_CENTRAL_RESTING_GAP_YARDS: f64 = 27.0;
+
 /// Own-goal depth (yd) the back-four AVERAGE is anchored to while the ball is
 /// upfield of it: the line holds here (offside trap) until the ball penetrates
 /// inside it, then tracks the ball back to parity, then sticks at the keeper's 6.

@@ -36027,10 +36027,15 @@ impl WorldSnapshot {
                 // than the band line.
                 target_fwd.max(desired_avg_fwd)
             } else {
-                // Defending: hold the flat band line (the offside line). If a centre-back had
-                // drifted high (e.g. just after a turnover) this DROPS it back onto the line,
-                // never forward toward the ball.
-                desired_avg_fwd
+                // Defending: hold the flat band line (the offside line), but floored DEEPER
+                // than a comfortable resting gap so the central line never rides up onto the
+                // 20yd edge (it sits firmly inside 20-40 rather than tight to the ball). The
+                // floor only ever pulls DEEPER (`min` in the attacking frame); a line already
+                // deeper than the resting gap is left where it is. If a centre-back had drifted
+                // high (e.g. just after a turnover) this DROPS it back, never forward.
+                let resting_fwd = (ball_fwd - DEFENSIVE_LINE_CENTRAL_RESTING_GAP_YARDS)
+                    .clamp(lower, upper);
+                desired_avg_fwd.min(resting_fwd)
             };
             let adjusted_y = (adjusted_fwd * attack_dir).clamp(0.0, self.field_length);
             let in_possession = self
