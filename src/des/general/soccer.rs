@@ -17140,6 +17140,13 @@ pub(crate) enum SoccerRewardEventKind {
     /// Bounded shaped credit for an attacker having crashed into the box as a flank aerial
     /// cross is released — the off-ball "be there for the delivery" signal.
     CrashBoxArrival,
+    /// PENALTY (negative): a Forward / winger isolated in the attacking half with no teammate
+    /// ahead played a panicked BACKWARD/square pass instead of driving at goal or holding the
+    /// ball up for support. The direct learning signal that trains the policy off the
+    /// "no outlet ⇒ pass backwards" blunder. Emitted only when
+    /// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` is on. See
+    /// [`isolated_attacking_carrier_drive_mode`](crate::des::general::soccer::player::isolated_attacking_carrier_drive_mode).
+    IsolatedCarrierPanicBackPass,
     MatchResult,
 }
 
