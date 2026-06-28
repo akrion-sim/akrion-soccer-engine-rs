@@ -19789,6 +19789,11 @@ struct ForwardSupportContext {
     teammates_ahead: usize,
     visible_forward_pass_options: usize,
     best_forward_pass_receiver_openness: f64,
+    /// Lane-aware recognition of the best forward pass option (see
+    /// [`forward_pass_option_quality`]): blends receiver openness with completability so a
+    /// clear ball to an advanced runner is recognised even when raw openness is moderate.
+    /// `>=` [`best_forward_pass_receiver_openness`] by construction.
+    best_forward_pass_option_quality: f64,
     nearest_forward_teammate_distance_yards: f64,
     /// Value [0,1] of the best QUICK FORWARD ground pass available — a short progressive
     /// ball (≈5–8 m, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
