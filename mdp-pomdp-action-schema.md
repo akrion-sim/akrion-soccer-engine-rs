@@ -109,6 +109,26 @@ passing and dribbling directly; shooting inherits it via this shared core.
 
 Targeting resolves to `PassIntent { ToPlayer(id) | ToSpace(Vec2) | ToLead(id,amt) | ToNobody }`.
 
+**Forward-option recognition (anti–backward-recycle).** A "good forward option" is
+**not** defined by the receiver's nearest-opponent openness at their current spot
+alone: an advanced runner on a clear, completable lane — with a trailing or
+already-beaten defender nominally close — reads as "not open" under raw openness, so
+the carrier exhausts its forward search and recycles the ball backward even though a
+genuine forward ball existed. The POMDP observation `O` therefore also carries
+`best_forward_pass_option_quality` (≥ `best_forward_pass_receiver_openness` by
+construction): `forward_pass_option_quality(receiver_openness, expected_completion)`
+blends openness with the lane-aware completion so recognition can only **add**, never
+remove, options. It drives two decisions: (a) the **forward-pass-first release** floors
+`pass1` and damps the hold/dribble family when a forward option clears the bar — sooner
+the longer the carrier has dwelt; (b) **pass-target ranking** demotes a backward/square
+target once a genuinely good forward option exists. The forward-option *count*
+(`visible_forward_pass_options`) follows every playable forward visible target — it is
+**not** gated on an uncontested straight floor lane, so a contested-lane ball to an open
+runner still registers as a recognised option. Gate
+`DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION` (default-ON in prod, kill-switch `=0`;
+default-OFF under test ⇒ byte-identical option-scoring parity). Not part of the neural
+feature encoder, so `FEATURE_DIM` is unchanged.
+
 ### 3.3 Shooting
 
 | Axis | Buckets | Status | Mask / notes |
@@ -141,7 +161,12 @@ Same machinery (factored → mask → dither). Bucket counts tentative.
 - **Off-ball movement**: make-run / hold / check-to-ball / overlap / underlap /
   drop (≈6), run timing (now/delay), target lane.
 - **Defending**: press intensity 1–3, jockey/contain vs commit-tackle (2),
-  intercept-lane (bool), tactical-foul (bool, gated).
+  intercept-lane (bool), tactical-foul (bool, gated), blindside-steal (bool,
+  gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`): creep into a slow forward-dribbler's
+  blind arc and nick it from behind *only when the steal is believed catchable*
+  (closing-speed margin). The carrier's countermeasure is a side-glance head-scan
+  (`blindside_threat_from_behind` obs at a control-drift cost) that drives a
+  break-away escape.
 - **Goalkeeping**: set-position, come/stay (2), save-style, distribution
   (throw/roll/short/long × the kick core).
 
