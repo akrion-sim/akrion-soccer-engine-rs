@@ -4155,6 +4155,10 @@ mod tests {
                 "lookahead_min_seconds": 2.0,
                 "lookahead_max_seconds": 0.5
             },
+            "policy_selection": {
+                "top1_weight": -0.5,
+                "boltzmann_temperature": 5000.0
+            },
             "pomdp_perception": {
                 "player_reaction_min_seconds": 2.0,
                 "player_reaction_max_seconds": -1.0,
@@ -4171,10 +4175,6 @@ mod tests {
                 "kalman_current_sample_epsilon_yards": -2.0,
                 "kalman_base_sigma_yards": 0.0,
                 "kalman_visible_max_confidence": 3.0
-            },
-            "policy_selection": {
-                "top1_weight": -0.5,
-                "boltzmann_temperature": 5000.0
             }
         })]);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
@@ -4196,6 +4196,10 @@ mod tests {
         assert_eq!(t.lane_affinity.forward_lane_radius, 6);
         assert_eq!(t.lane_affinity.lookahead_min_seconds, 0.5);
         assert_eq!(t.lane_affinity.lookahead_max_seconds, 2.0);
+        // Negative rank weight clamps up to the 0.0 hard floor; an absurd
+        // temperature clamps down to the 1000.0 hard ceiling.
+        assert_eq!(t.policy_selection.top1_weight, 0.0);
+        assert_eq!(t.policy_selection.boltzmann_temperature, 1_000.0);
         assert_eq!(t.pomdp_perception.player_reaction_min_seconds, 1.0);
         assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 1.0);
         assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 1.0);
@@ -4232,10 +4236,6 @@ mod tests {
         );
         assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.01);
         assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 1.0);
-        // Negative rank weight clamps up to the 0.0 hard floor; an absurd
-        // temperature clamps down to the 1000.0 hard ceiling.
-        assert_eq!(t.policy_selection.top1_weight, 0.0);
-        assert_eq!(t.policy_selection.boltzmann_temperature, 1_000.0);
     }
 
     #[test]

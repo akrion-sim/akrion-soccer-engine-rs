@@ -3033,6 +3033,9 @@ const LOOSE_BALL_SHIELD_CLOSING_YPS: f64 = 3.0;
 const LOOSE_BALL_URGENCY_CONTEST_RADIUS_YARDS: f64 = 2.25;
 const LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS: f64 = 7.0;
 const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
+const LOOSE_BALL_TEAM_STALL_CLOSE_RADIUS_YARDS: f64 = 2.0;
+const LOOSE_BALL_TEAM_STALL_WINDOW_TICKS: usize = 3;
+const LOOSE_BALL_TEAM_STALL_MIN_CLOSING_YARDS: f64 = 0.10;
 // ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
 // touch, they do not stand off it.
 const LOOSE_BALL_MAX_UNCONTESTED_SECONDS: f64 = 0.25;

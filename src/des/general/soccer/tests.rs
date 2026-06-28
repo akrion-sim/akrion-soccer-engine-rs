@@ -17906,6 +17906,133 @@ fn shape_safe_loose_ball_attacker_goes_before_quarter_second_dead_zone() {
 }
 
 #[test]
+fn stalled_team_loose_ball_pomdp_elects_one_primary_chaser_after_three_ticks_without_closing() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 74,
+        ..Default::default()
+    });
+    let ball_pos = Vec2::new(40.0, 60.0);
+    let home_a = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+        .map(|p| p.id)
+        .expect("home midfielder");
+    let home_b = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.id != home_a && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("second home outfielder");
+    let away_contester = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away outfielder");
+    park_players_except(&mut sim, &[home_a, home_b, away_contester]);
+
+    sim.ball.holder = None;
+    sim.pending_pass = None;
+    sim.active_set_play = None;
+    sim.ball.position = ball_pos;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let home_a_idx = sim.player_index_for_id(home_a).expect("home_a index");
+    let home_b_idx = sim.player_index_for_id(home_b).expect("home_b index");
+    let away_idx = sim
+        .player_index_for_id(away_contester)
+        .expect("away contester index");
+    let home_a_pos = Vec2::new(40.0, 54.0);
+    let home_b_pos = Vec2::new(43.0, 54.0);
+    sim.players[home_a_idx].position = home_a_pos;
+    sim.players[home_b_idx].position = home_b_pos;
+    sim.players[away_idx].position = Vec2::new(40.0, 59.0);
+    for &idx in &[home_a_idx, home_b_idx, away_idx] {
+        sim.players[idx].velocity = Vec2::zero();
+        sim.players[idx].acceleration = Vec2::zero();
+    }
+    sim.players[home_a_idx].position_history =
+        std::collections::VecDeque::from([home_a_pos, home_a_pos, home_a_pos, home_a_pos]);
+    sim.players[home_b_idx].position_history =
+        std::collections::VecDeque::from([home_b_pos, home_b_pos, home_b_pos, home_b_pos]);
+
+    sim.ball.position_history.clear();
+    for tick in 0..=LOOSE_BALL_TEAM_STALL_WINDOW_TICKS {
+        sim.tick = tick as u64;
+        sim.clock_seconds = tick as f64 * sim.config.dt_seconds;
+        sim.record_ball_position_history();
+    }
+    sim.loose_ball_uncontested_since_tick = Some(0);
+    let global_contested = WorldSnapshot::from_match(&sim);
+    sim.update_loose_ball_urgency(&global_contested);
+    assert!(
+        sim.loose_ball_uncontested_since_tick.is_none(),
+        "an opponent right on the ball should still clear the legacy global uncontested clock"
+    );
+
+    let snapshot = WorldSnapshot::from_match_for_defensive_or_loose_agent_decision(&sim);
+    assert!(
+        !snapshot.loose_ball_urgency_active(),
+        "the legacy global clock should remain inactive while the opponent contests"
+    );
+    assert!(
+        snapshot.loose_ball_team_stalled_for(Team::Home),
+        "home should be team-stalled: no teammate within 2 yd and no teammate closed over 3 ticks"
+    );
+    assert!(
+        snapshot.loose_ball_urgency_active_for_team(Team::Home),
+        "team-specific stall should raise the POMDP urgency for Home"
+    );
+
+    let committed: Vec<usize> = [home_a, home_b]
+        .into_iter()
+        .filter(|id| snapshot.is_committed_loose_ball_chaser(*id))
+        .collect();
+    assert_eq!(
+        committed.len(),
+        1,
+        "a stalled team should elect exactly one full loose-ball chaser, not a swarm"
+    );
+    let primary = committed[0];
+    let support = if primary == home_a { home_b } else { home_a };
+    let primary_profile = snapshot.loose_ball_attack_profile_for(primary);
+    assert!(
+        primary_profile.attack_candidate >= 0.9 && primary_profile.uncontested_urgency >= 0.9,
+        "primary chaser should carry the team-stall attack signal into POMDP/Q/neural features: {primary_profile:?}"
+    );
+    assert!(
+        snapshot.loose_ball_control_plan_for(primary).1,
+        "primary chaser should trap/attack now once the team-stall signal fires"
+    );
+    let support_profile = snapshot.loose_ball_attack_profile_for(support);
+    assert!(
+        support_profile.attack_candidate <= 0.1,
+        "non-primary teammate should peel into support/cover instead of also fully honing in: {support_profile:?}"
+    );
+    let support_target = snapshot.loose_ball_recovery_target_for(support);
+    assert!(
+        support_target.distance(ball_pos) > LOOSE_BALL_TEAM_STALL_CLOSE_RADIUS_YARDS,
+        "non-primary loose-ball teammate should not be assigned the ball itself: target={support_target:?}"
+    );
+
+    sim.players[home_a_idx].position_history = std::collections::VecDeque::from([
+        Vec2::new(40.0, 50.0),
+        Vec2::new(40.0, 51.5),
+        Vec2::new(40.0, 53.0),
+        home_a_pos,
+    ]);
+    let progressing = WorldSnapshot::from_match_for_defensive_or_loose_agent_decision(&sim);
+    assert!(
+        !progressing.loose_ball_team_stalled_for(Team::Home),
+        "recent 3-tick closing progress by one teammate should suppress the stalled-team trigger"
+    );
+}
+
+#[test]
 fn loose_ball_uncontested_too_long_forces_the_retriever_to_attack_now() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -19748,168 +19875,35 @@ fn back_four_average_never_presses_past_five_yards_into_opponent_half() {
     }
 }
 
-/// v2 field-anchored line CENTRE geometry (gate-independent: calls the helper
-/// directly). Home defends y=0 attacking +y, so a centre's forward-coordinate
-/// equals its depth from our own goal.
+/// The back-four line band is measured from the CURRENT ball (15yd shelf + 20-40yd
+/// cushion), and crucially stays 20-40yd from the ball at halfway EVEN when the ball
+/// is moving toward our goal — the regression where a 4s-predicted ball collapsed the
+/// band onto the 15yd shelf (line ~45yd off the ball). Home defends y=0 attacking +y,
+/// so a forward bound equals its depth from our own goal.
 #[test]
-fn v2_line_centre_anchors_at_fifteen_tracks_inside_and_sticks_at_six() {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    sim.ball.holder = None;
-    let cap = sim.config.field_length_yards * 0.5
-        + tunables()
-            .defensive_shape
-            .defensive_line_max_into_opp_half_yards;
-    // Move the (stationary, so predicted == current) ball to a depth and read the
-    // v2 centre depth from our own goal.
-    let centre_at = |sim: &mut SoccerMatch, depth: f64| -> f64 {
-        let x = sim.ball.position.x;
-        sim.ball.position = Vec2::new(x, depth);
-        sim.ball.velocity = Vec2::zero();
-        WorldSnapshot::from_match(sim).back_four_line_v2_centre_fwd(Team::Home)
+fn defensive_line_band_holds_twenty_to_forty_from_the_ball_even_when_it_moves() {
+    let band_at = |ball_depth: f64, ball_vy: f64| -> (f64, f64) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        sim.ball.holder = None;
+        sim.ball.position = Vec2::new(sim.ball.position.x, ball_depth);
+        sim.ball.velocity = Vec2::new(0.0, ball_vy);
+        let (lower, upper, _, _, _) =
+            WorldSnapshot::from_match(&sim).defensive_line_band_bounds_fwd(Team::Home, false);
+        (lower, upper)
     };
 
-    // Ball outside the 15yd anchor ⇒ the centre HOLDS the anchor (the plateau),
-    // independent of the dynamic 20-40 gap — it is not dragged up to the ball.
+    // Ball at halfway, stationary: band is exactly [ball-40, ball-20] = [20, 40].
+    let (lo, hi) = band_at(60.0, 0.0);
+    assert!((lo - 20.0).abs() < 1e-6 && (hi - 40.0).abs() < 1e-6, "halfway stationary -> [{lo},{hi}]");
+    // Ball at halfway, sprinting toward our goal: band must NOT sag toward the shelf.
+    let (lo_m, hi_m) = band_at(60.0, -9.0 * Team::Home.attack_dir());
     assert!(
-        (centre_at(&mut sim, 30.0) - 15.0).abs() < 1e-6,
-        "ball 30 -> centre {}",
-        centre_at(&mut sim, 30.0)
+        (lo_m - 20.0).abs() < 1e-6 && (hi_m - 40.0).abs() < 1e-6,
+        "halfway, ball moving at goal -> [{lo_m},{hi_m}] (must stay 20-40 from the ball)"
     );
-    assert!(
-        (centre_at(&mut sim, 25.0) - 15.0).abs() < 1e-6,
-        "ball 25 -> centre {}",
-        centre_at(&mut sim, 25.0)
-    );
-    // Between the 6 and the 15 the centre tracks the ball back to parity.
-    assert!(
-        (centre_at(&mut sim, 12.0) - 12.0).abs() < 1e-6,
-        "ball 12 -> centre {}",
-        centre_at(&mut sim, 12.0)
-    );
-    // Inside the 6 the centre sticks at the keeper's line (~6), never deeper.
-    let c4 = centre_at(&mut sim, 4.0);
-    assert!((6.0..=8.0).contains(&c4), "ball 4 -> centre {c4} (want ~6)");
-    // Deep in the opponent half the centre never crosses the high cap (halfway+5).
-    let c_deep = centre_at(&mut sim, 110.0);
-    assert!((c_deep - cap).abs() < 1e-6, "ball 110 -> centre {c_deep}, cap {cap}");
-    // In the rising regime the line trails a 20-40yd gap behind a deep ball.
-    let c80 = centre_at(&mut sim, 80.0);
-    let trailing_gap = 80.0 - c80;
-    assert!(
-        (20.0..=40.0).contains(&trailing_gap),
-        "ball 80 -> centre {c80}, trailing gap {trailing_gap} out of [20,40]"
-    );
-}
-
-/// v2 flatten end-to-end: a defender caught far upfield is pulled back onto the
-/// anchored flat line (it may never sit ahead of the centre by more than the
-/// half-band), exercising `back_four_line_depth_v2_adjusted_y` directly.
-#[test]
-fn v2_adjusted_y_pulls_an_upfield_defender_back_onto_the_anchor() {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    sim.ball.holder = None;
-    sim.ball.position = Vec2::new(sim.ball.position.x, 25.0); // ball on the plateau
-    sim.ball.velocity = Vec2::zero();
-    let snap = WorldSnapshot::from_match(&sim);
-    let me = snap
-        .players
-        .iter()
-        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
-        .expect("a home defender");
-    let centre = snap.back_four_line_v2_centre_fwd(Team::Home); // ~15
-    let level_half_band = 0.5 * 2.0; // BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS * 0.5
-    // Ask for a target 40yd upfield (well ahead of the ~15yd anchor).
-    let adjusted = snap.back_four_line_depth_v2_adjusted_y(me, 40.0);
-    assert!(
-        adjusted <= centre + level_half_band + 1e-6,
-        "a defender at 40 must be pulled back to <= centre+halfband: adjusted {adjusted}, centre {centre}"
-    );
-    assert!(adjusted < 25.0, "must be pulled well back from the 40yd ask: {adjusted}");
-}
-
-/// A/B sim report for the v2 line (run explicitly, isolated from the parallel
-/// suite so the process-wide env gate can't race):
-///   cargo test --lib v2_sim_ab_report -- --ignored --nocapture --exact \
-///     des::general::soccer::tests::v2_sim_ab_report
-/// Simulates the same seeds with the gate off then on and prints how deep the home
-/// back four sits, how often it strays into the opponent half, and the scoreline.
-#[test]
-#[ignore]
-fn v2_sim_ab_report() {
-    const ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
-    let seeds = [7_777u32, 13_013, 24_601];
-    let secs = 300.0;
-    let ticks = (secs * 15.0) as usize; // DEFAULT_DT_SECONDS = 1/15
-
-    // Returns (avg home back-four depth, fraction of ticks in opp half, gh, ga).
-    let run = |on: bool| -> (f64, f64, u32, u32) {
-        if on {
-            std::env::set_var(ENV, "1");
-        } else {
-            std::env::remove_var(ENV);
-        }
-        let (mut depth_sum, mut samples, mut opp_half, mut gh, mut ga) =
-            (0.0f64, 0u64, 0u64, 0u32, 0u32);
-        for &seed in &seeds {
-            let mut m = SoccerMatch::default_11v11(MatchConfig {
-                seed,
-                duration_seconds: secs + 50.0,
-                ..Default::default()
-            });
-            let halfway = m.config.field_length_yards * 0.5;
-            for _ in 0..ticks {
-                m.run_time_step();
-                let (mut s, mut n) = (0.0, 0.0);
-                for p in m.players.iter() {
-                    if p.team == Team::Home && p.role == PlayerRole::Defender {
-                        s += p.position.y; // Home own goal at y=0 ⇒ depth == y
-                        n += 1.0;
-                    }
-                }
-                if n > 0.0 {
-                    let avg = s / n;
-                    depth_sum += avg;
-                    samples += 1;
-                    if avg > halfway {
-                        opp_half += 1;
-                    }
-                }
-            }
-            gh += m.score_home;
-            ga += m.score_away;
-        }
-        std::env::remove_var(ENV);
-        (
-            depth_sum / samples.max(1) as f64,
-            opp_half as f64 / samples.max(1) as f64,
-            gh,
-            ga,
-        )
-    };
-
-    let (off_depth, off_opp, off_gh, off_ga) = run(false);
-    let (on_depth, on_opp, on_gh, on_ga) = run(true);
-    eprintln!("\n=== v2 back-four line A/B ({} seeds, {secs}s each) ===", seeds.len());
-    eprintln!(
-        "OFF: home back-four avg depth {off_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{off_gh}-A{off_ga}",
-        off_opp * 100.0
-    );
-    eprintln!(
-        "ON : home back-four avg depth {on_depth:6.2}yd | in opp half {:5.1}% of ticks | score H{on_gh}-A{on_ga}",
-        on_opp * 100.0
-    );
-    eprintln!(
-        "Δ  : depth {:+.2}yd (negative = deeper line) | opp-half {:+.1}pp\n",
-        on_depth - off_depth,
-        (on_opp - off_opp) * 100.0
-    );
-
-    assert!(off_depth.is_finite() && on_depth.is_finite());
-    // The whole point: v2 keeps the back four deeper / out of the opponent half.
-    assert!(
-        on_opp <= off_opp + 1e-3,
-        "v2 should not spend MORE time in the opponent half (on {on_opp:.3} vs off {off_opp:.3})"
-    );
+    // Ball 35yd out: the shelf floors the line at 15 (= 20yd from the ball).
+    let (lo35, hi35) = band_at(35.0, 0.0);
+    assert!((lo35 - 15.0).abs() < 1e-6 && (hi35 - 15.0).abs() < 1e-6, "ball 35 -> [{lo35},{hi35}]");
 }
 
 #[test]
@@ -62568,7 +62562,7 @@ fn player_decision_context_classifies_holder_support_defense_and_loose() {
 }
 
 #[test]
-fn defensive_and_loose_decision_snapshots_skip_ball_history_clone() {
+fn defensive_and_loose_decision_snapshots_keep_ball_history_for_loose_ball_pomdp() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.8,
         seed: 22_409,
@@ -62593,9 +62587,10 @@ fn defensive_and_loose_decision_snapshots_skip_ball_history_clone() {
         "support/possession decisions keep settled-possession ball history"
     );
     assert!(
-        light.ball_history.is_empty(),
-        "defensive/loose decisions should not clone ball history"
+        !light.ball_history.is_empty(),
+        "defensive/loose decisions keep ball history for history-aware loose-ball POMDP choices"
     );
+    assert_eq!(rich.ball_history.len(), light.ball_history.len());
     assert_eq!(rich.ball.position, light.ball.position);
     assert_eq!(rich.players.len(), light.players.len());
     assert_eq!(
@@ -62648,7 +62643,7 @@ fn defensive_and_loose_decision_snapshots_skip_ball_history_clone() {
     sim.pending_pass = None;
     let rich_loose = WorldSnapshot::from_match_for_agent_decision(&sim);
     let light_loose = WorldSnapshot::from_match_for_defensive_or_loose_agent_decision(&sim);
-    assert!(light_loose.ball_history.is_empty());
+    assert!(!light_loose.ball_history.is_empty());
     assert_eq!(
         rich_loose.loose_ball_recovery_target_for(chaser),
         light_loose.loose_ball_recovery_target_for(chaser)

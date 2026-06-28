@@ -20843,7 +20843,7 @@ impl WorldSnapshotOptions {
         use_configured_pomdp_history_samples: true,
         include_shared_histories: false,
         include_player_decisions: false,
-        include_ball_history: false,
+        include_ball_history: true,
         trace_mdp_mpc_comparison: false,
     };
 
@@ -21020,8 +21020,10 @@ impl WorldSnapshot {
     pub(crate) fn from_match_with_options(m: &SoccerMatch, options: WorldSnapshotOptions) -> Self {
         let mut options = options;
         if options.use_configured_pomdp_history_samples {
-            options.player_history_samples =
-                tunables().pomdp_perception.kalman_min_history_samples;
+            options.player_history_samples = tunables()
+                .pomdp_perception
+                .kalman_min_history_samples
+                .max(LOOSE_BALL_TEAM_STALL_WINDOW_TICKS + 1);
         }
         let schedule_index_lookup = AgentScheduleIndexLookup::from_entries(&m.last_agent_schedule);
         let shared_positions = if options.include_shared_histories {
@@ -33148,6 +33150,92 @@ impl WorldSnapshot {
         elapsed >= LOOSE_BALL_MAX_UNCONTESTED_SECONDS
     }
 
+    pub(crate) fn loose_ball_urgency_active_for_team(&self, team: Team) -> bool {
+        if self.active_set_play.is_some() {
+            return false;
+        }
+        self.loose_ball_urgency_active() || self.loose_ball_team_stalled_for(team)
+    }
+
+    pub(crate) fn loose_ball_team_stalled_for(&self, team: Team) -> bool {
+        if dd_soccer_disable_loose_ball_urgency()
+            || self.ball.holder.is_some()
+            || self.pending_pass.is_some()
+            || self.active_set_play.is_some()
+        {
+            return false;
+        }
+
+        let needed_samples = LOOSE_BALL_TEAM_STALL_WINDOW_TICKS + 1;
+        let has_ball_window = self.ball_history.len() >= needed_samples;
+        let mut saw_outfielder = false;
+        let mut saw_history_window = false;
+        for player in self
+            .players
+            .iter()
+            .filter(|player| player.team == team && player.role != PlayerRole::Goalkeeper)
+        {
+            saw_outfielder = true;
+            let current = self.player_snapshot_position(player);
+            let current_distance = current.distance(self.ball.position);
+            if current_distance <= LOOSE_BALL_TEAM_STALL_CLOSE_RADIUS_YARDS
+                || self.loose_ball_player_currently_closing_on_ball(player, current)
+            {
+                return false;
+            }
+            if has_ball_window && player.position_history.len() >= needed_samples {
+                saw_history_window = true;
+                if self.loose_ball_player_closed_recently_on_ball(
+                    player,
+                    current_distance,
+                    needed_samples,
+                ) {
+                    return false;
+                }
+            }
+        }
+        saw_outfielder && saw_history_window
+    }
+
+    fn loose_ball_player_closed_recently_on_ball(
+        &self,
+        player: &PlayerSnapshot,
+        current_distance: f64,
+        needed_samples: usize,
+    ) -> bool {
+        let previous_index = player.position_history.len().saturating_sub(needed_samples);
+        let previous_position = player.position_history[previous_index];
+        let previous_ball_position = self
+            .ball_history
+            .iter()
+            .rev()
+            .nth(LOOSE_BALL_TEAM_STALL_WINDOW_TICKS)
+            .map(|sample| sample.position)
+            .unwrap_or(self.ball.position);
+        let previous_distance = previous_position.distance(previous_ball_position);
+        if previous_distance.is_finite() && current_distance.is_finite() {
+            return previous_distance - current_distance >= LOOSE_BALL_TEAM_STALL_MIN_CLOSING_YARDS;
+        }
+        false
+    }
+
+    fn loose_ball_player_currently_closing_on_ball(
+        &self,
+        player: &PlayerSnapshot,
+        current: Vec2,
+    ) -> bool {
+        let to_ball = self.ball.position - current;
+        let dist = to_ball.len();
+        if dist <= LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS && dist > 1e-3 {
+            let closing_speed = self
+                .player_velocity(player.id)
+                .unwrap_or(player.velocity)
+                .dot(to_ball * (1.0 / dist));
+            return closing_speed >= LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS * 0.25;
+        }
+        false
+    }
+
     pub(crate) fn projected_loose_ball_target(&self) -> Option<Vec2> {
         if self.ball.holder.is_some() || self.pending_pass.is_some() {
             return None;
@@ -33408,13 +33496,18 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let team_urgency = self.loose_ball_urgency_active_for_team(player.team);
         let best_arrival = self
             .players
             .iter()
-            .filter(|candidate| candidate.role != PlayerRole::Goalkeeper)
+            .filter(|candidate| {
+                candidate.team == player.team && candidate.role != PlayerRole::Goalkeeper
+            })
             .map(|candidate| loose_ball_arrival_time_seconds(self, candidate, target))
             .fold(f64::INFINITY, f64::min);
-        let uncontested_urgency = if best_arrival.is_finite() {
+        let uncontested_urgency = if team_urgency {
+            1.0
+        } else if best_arrival.is_finite() {
             ((best_arrival - LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS) / 0.75).clamp(0.0, 1.0)
         } else {
             0.0
@@ -33480,6 +33573,9 @@ impl WorldSnapshot {
     pub(crate) fn loose_ball_contester_count(&self, me: &PlayerSnapshot, target: Vec2) -> usize {
         let my_dist = self.player_snapshot_position(me).distance(target);
         if my_dist > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS {
+            return 1;
+        }
+        if self.loose_ball_team_stalled_for(me.team) {
             return 1;
         }
         // Nearest opponent (the team that played the ball) to the drop, and how fast it is
@@ -33953,7 +34049,7 @@ impl WorldSnapshot {
         // retriever must attack it NOW (trap at the earliest reachable point) rather than
         // wait for a cleaner, slower reception — a loose ball does not linger unchallenged
         // in real soccer. Same effect as opponent-denial, just driven by elapsed neglect.
-        if self.loose_ball_urgency_active() {
+        if self.loose_ball_urgency_active_for_team(me.team) {
             return (early, true, early_speed);
         }
         // Miscontrol risk of taking the EARLY ball: rises with ball speed past a clean-control
@@ -35090,7 +35186,7 @@ impl WorldSnapshot {
         (baseline_seconds.max(1e-6) / horizon).clamp(0.75, 1.0)
     }
 
-    fn defensive_line_band_bounds_fwd(
+    pub(crate) fn defensive_line_band_bounds_fwd(
         &self,
         team: Team,
         offside_suspended: bool,
@@ -35100,6 +35196,12 @@ impl WorldSnapshot {
         let own_goal_fwd = self.own_goal_y_for(team) * attack;
         let field_length = self.field_length.max(1.0);
         let ball_depth = (ball_fwd - own_goal_fwd).clamp(0.0, field_length);
+        // The predicted ball is used ONLY to let the line retreat under the shelf when the
+        // ball is genuinely headed in toward our box (the `threat_depth`/floor logic). The
+        // deep edge of the 20-40yd cushion is anchored to the CURRENT ball (see
+        // `deepest_fwd` below) so "20-40yd from the ball" stays literal: anchoring the deep
+        // edge to the 4s-predicted ball let a ball merely moving toward our goal at halfway
+        // collapse the band onto the 15yd shelf (the line ~45yd off the ball — far too deep).
         let predicted_fwd = self
             .predicted_ball_position(DEFENSIVE_LINE_BALL_LOOKAHEAD_SECONDS)
             .y
@@ -35143,7 +35245,11 @@ impl WorldSnapshot {
             .min(gap_room_to_floor)
             .max(min_gap);
         let shelf_fwd = own_goal_fwd + floor_depth;
-        let deepest_fwd = (predicted_fwd - max_gap).max(shelf_fwd);
+        // Deep edge anchored to the CURRENT ball (not the prediction) so the line never sits
+        // more than `max_gap` behind where the ball ACTUALLY is — keeps "20-40yd from the
+        // ball" literal at halfway even as the ball moves. The shelf floor (predicted) still
+        // lets it drop lower when a ball is headed in under the shelf.
+        let deepest_fwd = (ball_fwd - max_gap).max(shelf_fwd);
         let shallowest_fwd = (ball_fwd - min_gap).min(opp_half_ceiling_fwd);
         (
             deepest_fwd.min(shallowest_fwd),
