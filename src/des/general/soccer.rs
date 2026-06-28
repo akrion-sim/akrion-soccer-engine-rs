@@ -57355,6 +57355,89 @@ fn backward_pass_length_preference(dist: f64) -> f64 {
     }
 }
 
+/// Per-passer risk/safety appetite used to shade the (already-quantified) MPC/POMDP pass-lane
+/// interception risk when ranking pass options. This does NOT recompute risk — it scales how a
+/// given risk value is PRICED for the player on the ball:
+///   * `forward_risk_penalty_mult` — multiplier on the interception-risk penalty for a FORWARD
+///     ball (`> 1` = more risk-averse, `< 1` = braver going forward).
+///   * `sideways_risk_penalty_mult` — same, but for a lateral/backward ball, so a higher forward
+///     appetite never loosens square/back balls.
+///   * `forward_preference_lift` — additive bump to the forward-progress weight, so a forward is
+///     nudged to prefer a forward ball over a lateral/backward one even when it is riskier.
+#[derive(Clone, Copy, Debug)]
+struct PassRiskAppetite {
+    forward_risk_penalty_mult: f64,
+    sideways_risk_penalty_mult: f64,
+    forward_preference_lift: f64,
+}
+
+impl PassRiskAppetite {
+    /// Identity appetite: prices risk exactly as the baseline does (gate OFF ⇒ byte-identical).
+    const NEUTRAL: PassRiskAppetite = PassRiskAppetite {
+        forward_risk_penalty_mult: 1.0,
+        sideways_risk_penalty_mult: 1.0,
+        forward_preference_lift: 0.0,
+    };
+}
+
+/// Resolve the [`PassRiskAppetite`] for the passer's role and field zone. Returns
+/// [`PassRiskAppetite::NEUTRAL`] (byte-identical) unless
+/// [`dd_soccer_enable_role_pass_risk_appetite`] is enabled. Defenders/keeper lean SAFE; forwards
+/// lean BRAVE on the FORWARD ball, escalating in the attacking third; midfielders are roughly
+/// neutral with a small final-third nudge.
+fn pass_risk_appetite_for_passer(role: PlayerRole, passer_in_attacking_third: bool) -> PassRiskAppetite {
+    if !dd_soccer_enable_role_pass_risk_appetite() {
+        return PassRiskAppetite::NEUTRAL;
+    }
+    match role {
+        // The keeper must not gamble in build-up: amplify risk everywhere, prefer the safe ball.
+        PlayerRole::Goalkeeper => PassRiskAppetite {
+            forward_risk_penalty_mult: 1.50,
+            sideways_risk_penalty_mult: 1.55,
+            forward_preference_lift: -0.10,
+        },
+        // Defenders only make safer passes — lean into safety in every direction.
+        PlayerRole::Defender => PassRiskAppetite {
+            forward_risk_penalty_mult: 1.30,
+            sideways_risk_penalty_mult: 1.22,
+            forward_preference_lift: -0.05,
+        },
+        // Midfielders are the pivot: ~neutral, with a small forward nudge in the final third.
+        PlayerRole::Midfielder => {
+            if passer_in_attacking_third {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.90,
+                    sideways_risk_penalty_mult: 1.04,
+                    forward_preference_lift: 0.08,
+                }
+            } else {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 1.0,
+                    sideways_risk_penalty_mult: 1.0,
+                    forward_preference_lift: 0.02,
+                }
+            }
+        }
+        // Forwards may play slightly riskier — and in the opponent's final third should prefer a
+        // forward ball over a safe lateral/backward one even when it is high-risk.
+        PlayerRole::Forward => {
+            if passer_in_attacking_third {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.66,
+                    sideways_risk_penalty_mult: 1.12,
+                    forward_preference_lift: 0.22,
+                }
+            } else {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.82,
+                    sideways_risk_penalty_mult: 1.06,
+                    forward_preference_lift: 0.10,
+                }
+            }
+        }
+    }
+}
+
 fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     if !forward_yards.is_finite() || !weight.is_finite() {
         return 0.0;
