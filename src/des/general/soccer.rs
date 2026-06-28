@@ -37258,6 +37258,154 @@ fn soccer_neural_transition_features(
 /// from `action` instead of `transition.action`. Lets the policy head build
 /// state-only features (a null action) from a *borrowed* transition without
 /// cloning the (heavy) transition just to blank its action string.
+const DD_SOCCER_BALL_ZONE_TACTICAL_SCALE_ENV: &str = "DD_SOCCER_ENABLE_BALL_ZONE_TACTICAL_SCALE";
+const DD_SOCCER_PLAYER_GRID_XY_FEATURES_ENV: &str = "DD_SOCCER_ENABLE_PLAYER_GRID_XY_FEATURES";
+
+/// Fix B: normalize the coarse `ball_zone_x/y` neural features (base indices 8-9) by
+/// the TACTICAL grid maxima they are actually indexed on (6×8 ⇒ 0..5 / 0..7), instead
+/// of the legacy MACRO maxima (÷2 / ÷3) that — through `soccer_neural_scaled`'s [-1,1]
+/// clamp — collapsed ~⅔ of the pitch to a saturated `1.0`. OFF ⇒ the legacy divisor,
+/// byte-identical for nets trained before this fix; flip + retrain that lineage to
+/// adopt the restored coarse ball-position resolution. (The fine 12×24 ball address at
+/// base indices 180-181 is always present and unaffected.)
+fn dd_soccer_enable_ball_zone_tactical_scale() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(DD_SOCCER_BALL_ZONE_TACTICAL_SCALE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_BALL_ZONE_TACTICAL_SCALE_ENV))
+    }
+}
+
+/// Fix C: encode the player position (base indices 10-11) as its separate normalized
+/// fine LANE (x) and ROW (y) instead of two FLATTENED row-major cell ids. Row-major id
+/// is spatially discontinuous — `fine.id` 11 = (lane 11, row 0) and 12 = (lane 0, row
+/// 1) are adjacent in the feature but opposite corners — so the width (x) signal is
+/// entangled. Separate x/y exposes width and depth as smooth, axis-aligned inputs (same
+/// `SOCCER_NEURAL_BASE_FEATURE_DIM`). OFF ⇒ the legacy flattened-id encoding,
+/// byte-identical for nets trained before this fix; flip + retrain to adopt.
+fn dd_soccer_enable_player_grid_xy_features() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(DD_SOCCER_PLAYER_GRID_XY_FEATURES_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_PLAYER_GRID_XY_FEATURES_ENV))
+    }
+}
+
+/// Coarse ball-zone neural features (base indices 8-9). `tactical_scale` selects the
+/// Fix-B (de-saturated) divisor; `false` reproduces the legacy macro-scaled formula.
+fn soccer_neural_ball_zone_features(
+    ball_zone_x: usize,
+    ball_zone_y: usize,
+    tactical_scale: bool,
+) -> (f64, f64) {
+    let (scale_x, scale_y) = if tactical_scale {
+        (
+            PITCH_TACTICAL_GRID_COLUMNS as f64 - 1.0,
+            PITCH_TACTICAL_GRID_ROWS as f64 - 1.0,
+        )
+    } else {
+        (
+            PITCH_MACRO_GRID_COLUMNS as f64 - 1.0,
+            PITCH_MACRO_GRID_ROWS as f64 - 1.0,
+        )
+    };
+    (
+        soccer_neural_scaled(ball_zone_x as f64, scale_x),
+        soccer_neural_scaled(ball_zone_y as f64, scale_y),
+    )
+}
+
+/// Player-position neural features (base indices 10-11). `separate_xy` selects the
+/// Fix-C (axis-separated fine lane/row) encoding; `false` reproduces the legacy
+/// flattened-id encoding.
+fn soccer_neural_player_grid_features(player_grid: &PitchGridAddress, separate_xy: bool) -> (f64, f64) {
+    if separate_xy {
+        (
+            soccer_neural_scaled(
+                player_grid.fine.x as f64,
+                PITCH_FINE_GRID_COLUMNS as f64 - 1.0,
+            ),
+            soccer_neural_scaled(player_grid.fine.y as f64, PITCH_FINE_GRID_ROWS as f64 - 1.0),
+        )
+    } else {
+        (
+            soccer_neural_scaled(
+                player_grid.fine.id as f64,
+                (PITCH_FINE_GRID_COLUMNS * PITCH_FINE_GRID_ROWS) as f64 - 1.0,
+            ),
+            soccer_neural_scaled(
+                player_grid.tactical.id as f64,
+                (PITCH_TACTICAL_GRID_COLUMNS * PITCH_TACTICAL_GRID_ROWS) as f64 - 1.0,
+            ),
+        )
+    }
+}
+
+#[cfg(test)]
+mod grid_neural_feature_tests {
+    use super::*;
+
+    const W: f64 = 80.0;
+    const L: f64 = 120.0;
+
+    #[test]
+    fn legacy_ball_zone_saturates_and_tactical_scale_restores_width() {
+        // Legacy (macro) scale: tactical column index ÷ (3-1)=2, then clamped to 1.0.
+        // Columns 2..=5 all map to the SAME saturated value ⇒ width info is lost.
+        let (c2, _) = soccer_neural_ball_zone_features(2, 0, false);
+        let (c5, _) = soccer_neural_ball_zone_features(5, 0, false);
+        assert_eq!(c2, c5, "legacy macro scale saturates the attacking-half width");
+        // Tactical scale: columns 0..=5 spread monotonically across [0, 1].
+        let (t2, _) = soccer_neural_ball_zone_features(2, 0, true);
+        let (t5, _) = soccer_neural_ball_zone_features(5, 0, true);
+        assert!(t5 > t2, "tactical scale keeps the ball width monotone");
+        assert!((t5 - 1.0).abs() < 1e-9, "last tactical column reaches exactly 1.0");
+        // Gate OFF is byte-identical to the historical inline formula.
+        assert_eq!(
+            soccer_neural_ball_zone_features(3, 4, false),
+            (
+                soccer_neural_scaled(3.0, PITCH_MACRO_GRID_COLUMNS as f64 - 1.0),
+                soccer_neural_scaled(4.0, PITCH_MACRO_GRID_ROWS as f64 - 1.0),
+            )
+        );
+    }
+
+    #[test]
+    fn player_grid_xy_separates_width_from_depth() {
+        // Two cells five lanes apart in the SAME row.
+        let a = pitch_grid_address(genome_anchor_home_position(3, 10, Team::Home, W, L), W, L);
+        let b = pitch_grid_address(genome_anchor_home_position(8, 10, Team::Home, W, L), W, L);
+        let (ax, ay) = soccer_neural_player_grid_features(&a, true);
+        let (bx, by) = soccer_neural_player_grid_features(&b, true);
+        assert!(bx > ax, "higher lane ⇒ larger x (width) feature");
+        assert!((ay - by).abs() < 1e-9, "same row ⇒ identical y (depth) feature");
+        // Gate OFF is byte-identical to the legacy flattened-id encoding.
+        assert_eq!(
+            soccer_neural_player_grid_features(&a, false),
+            (
+                soccer_neural_scaled(
+                    a.fine.id as f64,
+                    (PITCH_FINE_GRID_COLUMNS * PITCH_FINE_GRID_ROWS) as f64 - 1.0,
+                ),
+                soccer_neural_scaled(
+                    a.tactical.id as f64,
+                    (PITCH_TACTICAL_GRID_COLUMNS * PITCH_TACTICAL_GRID_ROWS) as f64 - 1.0,
+                ),
+            )
+        );
+    }
+}
+
 fn soccer_neural_transition_features_with_action(
     transition: &SoccerLearningTransition,
     action: &str,
@@ -37282,6 +37430,16 @@ fn soccer_neural_transition_features_with_action(
         transition.state.player_grid
     };
     let (ball_fine_lane, ball_fine_row) = q_state_ball_fine_lane_row(&transition.state, obs);
+    // Coarse ball-zone (indices 8-9, Fix B) and player position (indices 10-11, Fix C)
+    // features. Both default to their legacy formula (gate off ⇒ byte-identical) and
+    // keep the same slot count, so `SOCCER_NEURAL_BASE_FEATURE_DIM` is unchanged.
+    let (ball_zone_x_feature, ball_zone_y_feature) = soccer_neural_ball_zone_features(
+        state.ball_zone_x,
+        state.ball_zone_y,
+        dd_soccer_enable_ball_zone_tactical_scale(),
+    );
+    let (player_grid_feature_a, player_grid_feature_b) =
+        soccer_neural_player_grid_features(&player_grid, dd_soccer_enable_player_grid_xy_features());
     let action_label = normalize_soccer_action_label(action);
     let (action_attack, action_defense, action_support) =
         soccer_neural_action_family_features(action);
@@ -37296,19 +37454,10 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bool(state.has_ball),
         soccer_neural_bool(state.visible_ball),
         soccer_neural_bool(state.shot_lane_open),
-        soccer_neural_scaled(
-            state.ball_zone_x as f64,
-            PITCH_MACRO_GRID_COLUMNS as f64 - 1.0,
-        ),
-        soccer_neural_scaled(state.ball_zone_y as f64, PITCH_MACRO_GRID_ROWS as f64 - 1.0),
-        soccer_neural_scaled(
-            player_grid.fine.id as f64,
-            (PITCH_FINE_GRID_COLUMNS * PITCH_FINE_GRID_ROWS) as f64 - 1.0,
-        ),
-        soccer_neural_scaled(
-            player_grid.tactical.id as f64,
-            (PITCH_TACTICAL_GRID_COLUMNS * PITCH_TACTICAL_GRID_ROWS) as f64 - 1.0,
-        ),
+        ball_zone_x_feature,
+        ball_zone_y_feature,
+        player_grid_feature_a,
+        player_grid_feature_b,
         soccer_neural_facing_feature(state.receive_facing),
         soccer_neural_facing_feature(state.action_facing),
         soccer_neural_bin(state.visible_pass_options_bin, 5.0),

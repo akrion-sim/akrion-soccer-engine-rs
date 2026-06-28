@@ -1135,7 +1135,17 @@ mod tests {
             (snapped.x - expected.x).abs() < 1e-9 && (snapped.y - expected.y).abs() < 1e-9,
             "gate on ⇒ keeper homed on its 12×24 anchor cell"
         );
-        // Every re-anchored player must still re-bucket to its anchor's fine cell.
+
+        // Fix D: every player maps 1:1 onto an anchor cell, and the team's role counts
+        // now equal the genome's per-role anchor counts (the default genome is F433 —
+        // 3 mid / 3 fwd — re-roled from the 4-4-2 spawn lineup).
+        let reference = SoccerTeamGenome::default();
+        let anchor_cells: std::collections::HashSet<(usize, usize)> = reference
+            .anchors
+            .iter()
+            .map(|a| (a.lane as usize, a.row as usize))
+            .collect();
+        let mut role_counts = std::collections::HashMap::new();
         for player in sim.players.iter().filter(|p| p.team == Team::Home) {
             let fine = pitch_grid_address(
                 player.home_position,
@@ -1143,8 +1153,32 @@ mod tests {
                 config.field_length_yards,
             )
             .fine;
-            assert!(fine.x < PITCH_FINE_GRID_COLUMNS && fine.y < PITCH_FINE_GRID_ROWS);
+            // Away anchors mirror the row, but this is the Home team — fine cell == anchor.
+            assert!(
+                anchor_cells.contains(&(fine.x, fine.y)),
+                "home {:?} re-anchored onto a genome cell",
+                player.role
+            );
+            *role_counts.entry(player.role).or_insert(0usize) += 1;
         }
+        let genome_role_count = |want: GenomeRole| {
+            reference.anchors.iter().filter(|a| a.role == want).count()
+        };
+        assert_eq!(
+            role_counts.get(&PlayerRole::Defender).copied().unwrap_or(0),
+            genome_role_count(GenomeRole::Defender)
+        );
+        assert_eq!(
+            role_counts.get(&PlayerRole::Midfielder).copied().unwrap_or(0),
+            genome_role_count(GenomeRole::Midfielder),
+            "midfielders reconciled to the genome's count"
+        );
+        assert_eq!(
+            role_counts.get(&PlayerRole::Forward).copied().unwrap_or(0),
+            genome_role_count(GenomeRole::Forward),
+            "forwards reconciled to the genome's count"
+        );
+        assert_eq!(role_counts.values().sum::<usize>(), 11, "all 11 assigned");
     }
 
     #[test]
@@ -2807,63 +2841,121 @@ impl SoccerMatch {
         }
     }
 
-    /// Re-anchor `team`'s players' home positions from the (sanitized, 11-slot)
-    /// genome anchors on the 12×24 grid. Players are matched to anchors per role,
-    /// left→right by lane (width), so the leftmost defender takes the leftmost
-    /// defender anchor and so on — making lane (x) affinity per-player. A role whose
-    /// spawned count differs from the genome's (e.g. a 4-4-2 lineup against a 4-3-3
-    /// genome) re-anchors as many as the two share and leaves the remainder on their
-    /// default home; it never panics or leaves a player un-homed. Runs at match setup
-    /// (before kickoff), so it snaps the current position + history to the new home
-    /// too, keeping the opening shape consistent with the anchors.
+    /// Re-anchor `team`'s players' home positions from the (sanitized, 11-slot) genome
+    /// anchors on the 12×24 grid, so the grid is the single source of each player's
+    /// field-position affinity — especially WIDTH, since `lane` is x and the existing
+    /// role lane band keys off `home_position.x`.
+    ///
+    /// Two passes give a 1:1 anchor↔player mapping for ANY formation (Fix D):
+    /// 1. Within each role, match same-role players to anchors left→right by lane,
+    ///    preserving the natural layout (leftmost defender ↔ leftmost defender anchor).
+    /// 2. Reconcile a genome whose role split differs from the spawned lineup (e.g. an
+    ///    F433 genome — 3 mid / 3 fwd — against a 4-4-2 lineup): each still-unfilled
+    ///    anchor takes the NEAREST unassigned outfield player and re-roles it to that
+    ///    anchor's role. The keeper is always 1:1 and never reassigned. The result's
+    ///    role counts therefore equal the genome's, and every anchor maps to a player.
+    ///
+    /// Runs at match setup (before kickoff), so it snaps current position + history to
+    /// the new home too, keeping the opening shape consistent with the anchors.
     fn apply_genome_anchor_home_positions(&mut self, team: Team) {
         use crate::des::general::soccer_genome::GenomeRole;
+        use std::cmp::Ordering::Equal;
         let width = self.config.field_width_yards;
         let length = self.config.field_length_yards;
         let anchors = match team {
             Team::Home => self.home_genome.anchors.clone(),
             Team::Away => self.away_genome.anchors.clone(),
         };
-        for (player_role, genome_role) in [
-            (PlayerRole::Goalkeeper, GenomeRole::Goalkeeper),
-            (PlayerRole::Defender, GenomeRole::Defender),
-            (PlayerRole::Midfielder, GenomeRole::Midfielder),
-            (PlayerRole::Forward, GenomeRole::Forward),
+        let role_of = |role: GenomeRole| match role {
+            GenomeRole::Goalkeeper => PlayerRole::Goalkeeper,
+            GenomeRole::Defender => PlayerRole::Defender,
+            GenomeRole::Midfielder => PlayerRole::Midfielder,
+            GenomeRole::Forward => PlayerRole::Forward,
+        };
+        // Resolve each anchor to its (role, target home position) once.
+        let targets: Vec<(PlayerRole, Vec2)> = anchors
+            .iter()
+            .map(|a| {
+                (
+                    role_of(a.role),
+                    genome_anchor_home_position(a.lane, a.row, team, width, length),
+                )
+            })
+            .collect();
+
+        let mut assigned = vec![false; self.players.len()];
+        let mut leftover_targets: Vec<(PlayerRole, Vec2)> = Vec::new();
+
+        // Pass 1: same-role match, left→right by lane (target) / current home x (player).
+        for role in [
+            PlayerRole::Goalkeeper,
+            PlayerRole::Defender,
+            PlayerRole::Midfielder,
+            PlayerRole::Forward,
         ] {
-            // Anchors for this role, ordered left→right by lane (the width axis).
-            let mut role_anchors: Vec<(u8, u8)> = anchors
+            let mut role_targets: Vec<Vec2> = targets
                 .iter()
-                .filter(|a| a.role == genome_role)
-                .map(|a| (a.lane, a.row))
+                .filter(|(r, _)| *r == role)
+                .map(|(_, p)| *p)
                 .collect();
-            role_anchors.sort_by_key(|&(lane, _)| lane);
-            // This team's players of that role, ordered left→right by current home x,
-            // so the spatial pairing is stable regardless of spawn / roster order.
-            let mut player_idx: Vec<usize> = self
+            role_targets.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Equal));
+            let mut role_players: Vec<usize> = self
                 .players
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.team == team && p.role == player_role)
+                .filter(|(_, p)| p.team == team && p.role == role)
                 .map(|(i, _)| i)
                 .collect();
-            player_idx.sort_by(|&a, &b| {
+            role_players.sort_by(|&a, &b| {
                 self.players[a]
                     .home_position
                     .x
                     .partial_cmp(&self.players[b].home_position.x)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or(Equal)
             });
-            for (slot, &pi) in player_idx.iter().enumerate() {
-                let Some(&(lane, row)) = role_anchors.get(slot) else {
-                    break;
-                };
-                let pos = genome_anchor_home_position(lane, row, team, width, length);
-                let player = &mut self.players[pi];
-                player.home_position = pos;
-                player.position = pos;
-                player.position_history = VecDeque::from([pos]);
+            let shared = role_targets.len().min(role_players.len());
+            for k in 0..shared {
+                let pi = role_players[k];
+                self.snap_player_home(pi, role_targets[k]);
+                assigned[pi] = true;
+            }
+            for &target in role_targets.iter().skip(shared) {
+                leftover_targets.push((role, target));
             }
         }
+
+        // Pass 2: reconcile formation-shape differences (Fix D) — give each unfilled
+        // anchor the nearest unassigned outfield player and re-role it.
+        for (target_role, target_pos) in leftover_targets {
+            let pick = self
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    !assigned[*i] && p.team == team && p.role != PlayerRole::Goalkeeper
+                })
+                .min_by(|(_, a), (_, b)| {
+                    a.home_position
+                        .distance(target_pos)
+                        .partial_cmp(&b.home_position.distance(target_pos))
+                        .unwrap_or(Equal)
+                })
+                .map(|(i, _)| i);
+            if let Some(pi) = pick {
+                self.players[pi].role = target_role;
+                self.snap_player_home(pi, target_pos);
+                assigned[pi] = true;
+            }
+        }
+    }
+
+    /// Snap a player to a new home: the affinity anchor plus the current position and
+    /// history (so a setup-time re-anchor starts the player on its new home).
+    fn snap_player_home(&mut self, player_index: usize, home: Vec2) {
+        let player = &mut self.players[player_index];
+        player.home_position = home;
+        player.position = home;
+        player.position_history = VecDeque::from([home]);
     }
 
     pub fn set_team_neural_brain(
