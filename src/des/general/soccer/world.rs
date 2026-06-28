@@ -29145,9 +29145,23 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Forward-option recognition: when a genuinely good forward ball exists,
+                // demote a backward/square target so the carrier plays the open forward man
+                // instead of recycling backward (the reported blunder). Gated; the precomputed
+                // `best_forward_option_quality` is 0 when off, so this stays inert.
+                let backward_when_forward_available_penalty = if forward
+                    < -BACKWARD_PASS_MIN_FORWARD_YARDS
+                    && best_forward_option_quality >= FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD
+                {
+                    (best_forward_option_quality - FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD)
+                        * FORWARD_OPTION_RECOGNITION_BACKWARD_DEMOTION
+                } else {
+                    0.0
+                };
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
                     - anticipation_penalty
