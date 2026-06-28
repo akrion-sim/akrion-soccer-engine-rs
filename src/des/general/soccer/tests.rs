@@ -2685,6 +2685,22 @@ fn blindside_surprise_steal_and_carrier_glance_recognition() {
         .find(|p| p.id == 14)
         .cloned()
         .expect("thief present");
+    {
+        let hp = contact_snapshot.player_snapshot_position(
+            contact_snapshot.players.iter().find(|p| p.id == 7).unwrap(),
+        );
+        let my_depth = contact_snapshot.depth_from_own_goal_y(Team::Away, thief.position.y);
+        let holder_depth = contact_snapshot.depth_from_own_goal_y(Team::Away, hp.y);
+        eprintln!(
+            "PROBE thief.y={} holder.y={} dist={} my_depth={} holder_depth={} goal_side={}",
+            thief.position.y,
+            hp.y,
+            thief.position.distance(hp),
+            my_depth,
+            holder_depth,
+            my_depth <= holder_depth + 0.65
+        );
+    }
     let steal_off = thief.immediate_defensive_steal_target(&contact_snapshot);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
     let steal_on = thief.immediate_defensive_steal_target(&contact_snapshot);
