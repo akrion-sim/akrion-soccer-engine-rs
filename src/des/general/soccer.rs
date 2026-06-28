@@ -2534,6 +2534,15 @@ const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
 const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 8.0;
 const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 2;
+// When the ball is this many yards or more AHEAD of our back-four line average, a wide
+// DEFENDER pushes up with the play but stops bombing out to the touchline to "open up":
+// opening wide from behind an advanced ball only isolates him and vacates the flank he
+// covers. He keeps his width only while he is still a live ground-pass outlet (below).
+const WINGBACK_BALL_AHEAD_HOLD_WIDTH_YARDS: f64 = 10.0;
+// The "live outlet" exception to the hold-width rule: a wide defender keeps opening wide
+// even with the ball advanced when a ground pass could actually reach him — i.e. he is
+// within this range of the ball with a clear (un-intercepted) lane.
+const WINGBACK_GROUND_PASS_OUTLET_YARDS: f64 = 20.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
