@@ -85800,85 +85800,62 @@ fn isolated_carrier_panic_back_pass_detector_truth_table() {
     assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
 }
 
-/// Serialise the tests that toggle `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` (the gate re-reads
-/// the env each call under `cfg(test)`).
-fn isolated_carrier_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
+/// The option-biasing transform is tested as a PURE function (no process-global env toggling,
+/// which would race the parallel suite) over a hand-built option set. The env gate is exercised
+/// only as a boolean by `isolated_carrier_drive_enabled`; the behaviour it switches on lives here.
 #[test]
-fn isolated_carrier_drive_floors_forward_and_damps_backward_recycle() {
-    let _lock = isolated_carrier_env_lock();
-    let mut sim = SoccerMatch::default_11v11(MatchConfig {
-        duration_seconds: 0.1,
-        seed: 51_219,
-        ..Default::default()
-    });
-    let carrier = 9;
-    park_players_except(&mut sim, &[carrier]);
-    sim.players[carrier].role = PlayerRole::Forward;
-    sim.players[carrier].position = Vec2::new(40.0, 85.0);
-    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
-    sim.ball.holder = Some(carrier);
-    sim.ball.position = sim.players[carrier].position;
-    sim.ball.last_touch_team = Some(Team::Home);
-
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let mut observation = snapshot.observation_for(carrier);
-    make_isolated(&mut observation);
-    // Out past shooting range so this is a pure DRIVE scenario (no shot blocking the carry
-    // alternatives), keeping the comparison about forward-drive vs backward-recycle.
-    observation.yards_to_goal = 40.0;
-    observation.field_opponents_ahead = 2; // few behind the ball ⇒ solo-goal drive
-    observation.forward_dribble_space_yards = 8.0;
-    observation.shot_lane_open = false;
-    observation.shot_on_frame_probability = 0.0;
-    observation.shot_beat_goalkeeper_probability = 0.0;
-    observation.goal_attack_window_score = 0.0;
-    // A square/backward outlet exists and is open so recycle-reset / pass1 are legal options.
-    observation.best_pass_receiver_openness = 0.6;
-    observation.expected_pass_completion = 0.6;
-
-    let directive = snapshot.tactical_directive(Team::Home);
+fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
     let score = |opts: &[AgentActionOptionTrace], label: &str| {
         opts.iter()
             .find(|o| o.label == label && o.legal)
             .map(|o| o.score)
             .unwrap_or(0.0)
     };
+    let base = || {
+        vec![
+            AgentActionOptionTrace::new("carry-forward", 0.30, true),
+            AgentActionOptionTrace::new("vertical-attack", 0.30, true),
+            AgentActionOptionTrace::new("turnover-burst", 0.20, true),
+            AgentActionOptionTrace::new("recycle-reset", 1.00, true),
+            AgentActionOptionTrace::new("switch-play", 0.80, true),
+            AgentActionOptionTrace::new("pass1", 1.00, true),
+            AgentActionOptionTrace::new("protect-ball", 0.50, true),
+        ]
+    };
 
-    std::env::set_var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE", "1");
-    let on = sim.players[carrier].possession_action_options(
-        &observation,
-        &directive,
-        1,
-        0,
-        false,
-        snapshot.dt_seconds,
-        snapshot.field_width,
+    // Solo-goal drive: a forward carry must out-score the (damped) backward recycle and the
+    // panicked square pass1, both of which started far higher.
+    let mut solo = base();
+    apply_isolated_carrier_drive_bias(&mut solo, IsolatedCarrierDriveMode::SoloGoalDrive, false, false);
+    let drive = score(&solo, "carry-forward").max(score(&solo, "vertical-attack"));
+    assert!(
+        drive > score(&solo, "recycle-reset"),
+        "solo drive {drive:.4} should beat recycle {:.4}",
+        score(&solo, "recycle-reset")
     );
-    std::env::remove_var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE");
-    let off = sim.players[carrier].possession_action_options(
-        &observation,
-        &directive,
-        1,
-        0,
-        false,
-        snapshot.dt_seconds,
-        snapshot.field_width,
+    assert!(
+        drive > score(&solo, "pass1"),
+        "solo drive {drive:.4} should beat the panic square pass {:.4}",
+        score(&solo, "pass1")
+    );
+    assert!(
+        score(&solo, "recycle-reset") < 1.00 && score(&solo, "pass1") < 1.00,
+        "backward outlets must be damped from their starting scores"
     );
 
-    let drive_on = score(&on, "carry-forward").max(score(&on, "vertical-attack"));
-    let recycle_on = score(&on, "recycle-reset");
+    // Hold-up: the controlled forward carry likewise out-ranks the backward outlets.
+    let mut hold = base();
+    apply_isolated_carrier_drive_bias(&mut hold, IsolatedCarrierDriveMode::HoldUp, false, false);
     assert!(
-        drive_on > recycle_on,
-        "isolated solo carrier should prefer driving at goal ({drive_on:.4}) over recycling backward ({recycle_on:.4})"
+        score(&hold, "carry-forward") > score(&hold, "recycle-reset"),
+        "hold-up carry {:.4} should beat recycle {:.4}",
+        score(&hold, "carry-forward"),
+        score(&hold, "recycle-reset")
     );
-    // The gate must actually damp the backward recycle relative to the un-gated baseline.
-    let recycle_off = score(&off, "recycle-reset");
-    assert!(
-        recycle_off > 0.0 && recycle_on < recycle_off,
-        "gate should damp the backward recycle: on {recycle_on:.4} vs off {recycle_off:.4}"
+    // Shielding while waiting for support is left intact (not damped) under hold-up.
+    assert_eq!(
+        score(&hold, "protect-ball"),
+        0.50,
+        "hold-up must not damp shielding while waiting for support"
     );
 }
