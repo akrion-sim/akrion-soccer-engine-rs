@@ -85,6 +85,8 @@ mod shot_decision;
 pub use shot_decision::*;
 mod reward_shaping;
 pub use reward_shaping::*;
+mod crash_box;
+pub(crate) use crash_box::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod policy_select;
