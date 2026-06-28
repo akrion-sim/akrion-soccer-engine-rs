@@ -5222,8 +5222,19 @@ impl PlayerAgent {
             && !observation.threaded_goal_pass_available
             && !must_shoot_near_goal(observation, self.role)
         {
+            // Recognise a good forward option by its lane-aware quality, not just the
+            // receiver's nearest-opponent openness, so a clear ball to an advanced runner
+            // triggers the early release instead of a deliberated backward recycle. The
+            // recognition value is `>=` the legacy openness, so it can only ADD releases.
+            let forward_open = if dd_soccer_enable_forward_option_recognition() {
+                observation
+                    .best_forward_pass_option_quality
+                    .max(observation.best_forward_pass_receiver_openness)
+            } else {
+                observation.best_forward_pass_receiver_openness
+            };
             let strength = forward_pass_first_release_strength(
-                observation.best_forward_pass_receiver_openness,
+                forward_open,
                 observation.perceived_time_on_ball_seconds,
             );
             if strength > 0.0 {
