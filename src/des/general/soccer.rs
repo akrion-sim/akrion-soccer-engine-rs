@@ -2667,6 +2667,33 @@ const BALL_PROTECTION_LEAD_REF_YARDS: f64 = 2.5;
 const BALL_PROTECTION_FAST_DRIBBLE_REF_YPS: f64 = 6.0;
 const CONTESTABLE_STEAL_RADIUS_YARDS: f64 = 1.0;
 const CONTESTABLE_PROTECTION_THRESHOLD: f64 = 0.5;
+// --- Blindside surprise-steal (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`) ---
+// A defender drifting into the carrier's blind arc considers a steal from behind while
+// still this far back; the catch-belief model decides whether closing is feasible.
+const BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS: f64 = 4.25;
+// The carrier's bearing relative to its own facing/motion below which the defender is
+// "behind the eyes" (out of the look-forward cone): cos of ~100° back from dead-ahead.
+const BLINDSIDE_BEHIND_DOT: f64 = -0.17;
+// At/below this carrier speed the dribble is a walk/jog/skip — fully exploitable; the
+// opportunity fades to zero as the carrier accelerates toward the getaway speed (a
+// sprinting carrier simply runs away from the thief).
+const BLINDSIDE_CARRIER_JOG_SPEED_YPS: f64 = 4.0;
+const BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS: f64 = 7.5;
+// The carrier must actually be going forward (toward its own attack goal) for this to be
+// a "dribbling forward, can't see behind" situation rather than a shielded turn.
+const BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS: f64 = 0.6;
+// Catch-belief: the defender must close the gap within this horizon, and needs at least
+// this much real chase-speed margin over the carrier's getaway pace to believe it.
+const BLINDSIDE_CATCH_HORIZON_SECONDS: f64 = 1.5;
+const BLINDSIDE_CHASE_SPEED_MARGIN_YPS: f64 = 0.4;
+// Contact band within which a believed blindside approach actually nicks the ball.
+const BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.55;
+// The carrier's side-glance (head-scan) control-drift cost while dribbling forward,
+// scaled by carrier speed (a quicker carrier glancing loses more control). This is the
+// physical price of looking: it rides the same ball-control drift channel as the
+// existing look-behind scan.
+const BLINDSIDE_GLANCE_DRIFT_RISK_BASE: f64 = 0.12;
+const BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN: f64 = 0.22;
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
