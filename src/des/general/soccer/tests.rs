@@ -2631,18 +2631,22 @@ fn blindside_steal_scenario(carrier_velocity: Vec2, defender_gap: f64) -> Soccer
     sim
 }
 
+// One consolidated test so only a single test toggles `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`
+// (process-global env ⇒ separate parallel tests touching the same var would race).
 #[test]
-fn blindside_steal_recognises_slow_unaware_catchable_carrier() {
+fn blindside_surprise_steal_and_carrier_glance_recognition() {
+    // --- 1. Assessment: a slow forward carrier with a catchable thief dead behind. ---
     let sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 2.0);
     let snapshot = WorldSnapshot::from_match(&sim);
-    let thief = 14;
+
+    let off = snapshot.blindside_steal_assessment(14);
+    assert!(off.is_none(), "gate off must short-circuit to None (byte-identical)");
 
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
-    let on = snapshot.blindside_steal_assessment(thief);
+    let assessment = snapshot
+        .blindside_steal_assessment(14)
+        .expect("a slow forward carrier with a catchable thief behind is exploitable");
     std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
-    let off = snapshot.blindside_steal_assessment(thief);
-
-    let assessment = on.expect("a slow forward carrier with a catchable thief behind is exploitable");
     assert_eq!(assessment.target, 7);
     assert!(
         assessment.carrier_unaware > 0.9,
@@ -2663,62 +2667,46 @@ fn blindside_steal_recognises_slow_unaware_catchable_carrier() {
         "opportunity {} should clear the commit threshold",
         assessment.opportunity
     );
-    assert!(off.is_none(), "gate off must short-circuit to None (byte-identical)");
-}
 
-#[test]
-fn blindside_steal_declines_when_carrier_is_sprinting_clear() {
-    // Same blind-arc geometry, but the carrier is flat-out sprinting — it simply runs
-    // away from the thief, so there is no surprise-steal chance even behind the eyes.
-    let sim = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
-    let snapshot = WorldSnapshot::from_match(&sim);
+    // --- 2. A flat-out sprinting carrier simply runs away ⇒ no chance even behind. ---
+    let fast_sim = blindside_steal_scenario(Vec2::new(0.0, 9.0), 2.0);
+    let fast_snapshot = WorldSnapshot::from_match(&fast_sim);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
-    let assessment = snapshot.blindside_steal_assessment(14);
+    let fast = fast_snapshot.blindside_steal_assessment(14);
     std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
-    assert!(
-        assessment.is_none(),
-        "a sprinting carrier is not robbed from behind, got {assessment:?}"
-    );
-}
+    assert!(fast.is_none(), "a sprinting carrier is not robbed from behind, got {fast:?}");
 
-#[test]
-fn immediate_steal_wins_ball_from_behind_only_under_blindside_gate() {
-    // Thief at contact range directly behind a jogging carrier. Normally a steal from
-    // behind is blocked (the body shields the led ball); the blindside gate is the one
-    // exception against a slow, unaware, catchable carrier.
-    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let thief = sim
+    // --- 3. Ball is actually won from behind only under the gate (normally blocked). ---
+    let contact_sim = blindside_steal_scenario(Vec2::new(0.0, 2.2), 1.1);
+    let contact_snapshot = WorldSnapshot::from_match(&contact_sim);
+    let thief = contact_sim
         .players
         .iter()
         .find(|p| p.id == 14)
         .cloned()
         .expect("thief present");
-
-    let off = thief.immediate_defensive_steal_target(&snapshot);
+    let steal_off = thief.immediate_defensive_steal_target(&contact_snapshot);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
-    let on = thief.immediate_defensive_steal_target(&snapshot);
+    let steal_on = thief.immediate_defensive_steal_target(&contact_snapshot);
     std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
+    assert_eq!(steal_off, None, "gate off: a steal from behind stays blocked");
+    assert_eq!(steal_on, Some(7), "gate on: the blindside nick wins the ball from behind");
 
-    assert_eq!(off, None, "gate off: a steal from behind stays blocked");
-    assert_eq!(on, Some(7), "gate on: the blindside nick wins the ball from behind");
-}
-
-#[test]
-fn carrier_glance_recognises_blindside_threat_and_biases_escape() {
-    let sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let carrier = sim
+    // --- 4. The carrier glances (physics cost), recognises the threat, and escapes. ---
+    let glance_sim = blindside_steal_scenario(Vec2::new(0.0, 2.5), 3.0);
+    let glance_snapshot = WorldSnapshot::from_match(&glance_sim);
+    let carrier = glance_sim
         .players
         .iter()
         .find(|p| p.id == 7)
         .cloned()
         .expect("carrier present");
-    let directive = snapshot.tactical_directive(Team::Home);
+    let directive = glance_snapshot.tactical_directive(Team::Home);
 
-    let obs_off = snapshot.observation_for(7);
+    let obs_off = glance_snapshot.observation_for(7);
     std::env::set_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL", "1");
-    let obs_on = snapshot.observation_for(7);
+    let obs_on = glance_snapshot.observation_for(7);
+    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
 
     // Gate off ⇒ the carrier neither glances nor perceives the rear threat (byte-identical).
     assert_eq!(obs_off.blindside_threat_from_behind, 0.0);
@@ -2747,8 +2735,8 @@ fn carrier_glance_recognises_blindside_threat_and_biases_escape() {
         obs_on.visible_pass_options,
         obs_on.visible_aerial_pass_options,
         false,
-        snapshot.dt_seconds,
-        snapshot.field_width,
+        glance_snapshot.dt_seconds,
+        glance_snapshot.field_width,
     );
     let dwell = carrier.possession_action_options(
         &obs_off,
@@ -2756,10 +2744,9 @@ fn carrier_glance_recognises_blindside_threat_and_biases_escape() {
         obs_off.visible_pass_options,
         obs_off.visible_aerial_pass_options,
         false,
-        snapshot.dt_seconds,
-        snapshot.field_width,
+        glance_snapshot.dt_seconds,
+        glance_snapshot.field_width,
     );
-    std::env::remove_var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL");
     let prob = |opts: &[AgentActionOptionTrace], label: &str| {
         opts.iter()
             .find(|o| o.label == label)
