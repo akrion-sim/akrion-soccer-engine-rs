@@ -24753,7 +24753,7 @@ impl WorldSnapshot {
         // pace away from it. A real closing margin AND a reachable gap, or no creep.
         let chase_speed =
             player_top_speed_yps(me.role, &me.skills) * MovementGait::Sprint.speed_multiplier();
-        let carrier_getaway = carrier_velocity.dot(to_def * -1.0).max(0.0);
+        let carrier_getaway = (-carrier_velocity.dot(to_def)).max(0.0);
         let closing = chase_speed - carrier_getaway;
         if closing < BLINDSIDE_CHASE_SPEED_MARGIN_YPS {
             return None;
