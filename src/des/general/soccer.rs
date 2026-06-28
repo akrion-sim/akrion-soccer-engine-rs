@@ -6010,6 +6010,32 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
+    /// Blindside surprise-steal opportunity this DEFENDER has against the opponent carrier
+    /// in `[0, 1]` — high when it has crept into the carrier's blind arc, the carrier is
+    /// dribbling forward slowly, and it believes it can catch them (see
+    /// [`WorldSnapshot::blindside_steal_assessment`]). `0.0` unless this player is an
+    /// off-ball defender with a live chance and `DD_SOCCER_ENABLE_BLINDSIDE_STEAL` is on.
+    /// Decision-only — NOT part of the neural feature vector (`FEATURE_DIM` unchanged).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_steal_opportunity: f64,
+    /// The opponent carrier id this defender's blindside opportunity targets, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blindside_steal_target: Option<usize>,
+    /// What this CARRIER (perceptually) believes about a defender sneaking up on its blind
+    /// side, `[0, 1]`. Built from rear opponents discounted by the carrier's perception
+    /// confidence on them — so it stays low until the carrier GLANCES (a head-scan that
+    /// raises rear confidence at a control-drift cost), then rises and drives the escape
+    /// (accelerate forward / release early). `0.0` off the ball or with the gate off.
+    /// Decision-only — NOT a neural feature.
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_threat_from_behind: f64,
+    /// Whether this carrier is actively side-glancing this tick to check its blind side.
+    #[serde(default)]
+    pub blindside_scan_active: bool,
+    /// Ball-control drift risk `[0, 1]` this carrier incurs for the side-glance — the
+    /// physical price of looking (the same drift channel as the look-behind scan).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_scan_drift_risk: f64,
     /// Previous settled run-time-step decision/action summary for this player.
     /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
     /// current observation stays current-state-first, while this optional payload
