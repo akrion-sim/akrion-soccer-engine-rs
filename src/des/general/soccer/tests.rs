@@ -1734,6 +1734,43 @@ fn pass_release_pulls_opponent_aimed_floor_ball_back_to_receiver() {
 }
 
 #[test]
+fn role_pass_risk_appetite_table_leans_defenders_safe_and_forwards_brave() {
+    // Pure mapping (no gate read), so this is free of the process-global env-var race.
+    let def = pass_risk_appetite_table(PlayerRole::Defender, false);
+    let mid = pass_risk_appetite_table(PlayerRole::Midfielder, false);
+    let fwd_mid_third = pass_risk_appetite_table(PlayerRole::Forward, false);
+    let fwd_final_third = pass_risk_appetite_table(PlayerRole::Forward, true);
+    let keeper = pass_risk_appetite_table(PlayerRole::Goalkeeper, false);
+
+    // Defenders/keeper price a forward ball's interception risk HIGHER than neutral; forwards LOWER.
+    assert!(def.forward_risk_penalty_mult > 1.0, "defender leans safe: {def:?}");
+    assert!(keeper.forward_risk_penalty_mult > def.forward_risk_penalty_mult, "keeper safest: {keeper:?}");
+    assert!(fwd_mid_third.forward_risk_penalty_mult < 1.0, "forward leans brave: {fwd_mid_third:?}");
+
+    // The opponent's final third makes a forward even braver on the FORWARD ball...
+    assert!(
+        fwd_final_third.forward_risk_penalty_mult < fwd_mid_third.forward_risk_penalty_mult,
+        "final third = braver forward ball: {fwd_final_third:?} vs {fwd_mid_third:?}"
+    );
+    // ...but braveness never loosens a sideways/backward ball (kept at/above neutral).
+    assert!(
+        fwd_final_third.sideways_risk_penalty_mult >= 1.0,
+        "forward keeps square/back balls disciplined: {fwd_final_third:?}"
+    );
+
+    // Forward-progress preference ordering: forward (final third) > forward > mid > defender.
+    assert!(fwd_final_third.forward_preference_lift > fwd_mid_third.forward_preference_lift);
+    assert!(fwd_mid_third.forward_preference_lift > mid.forward_preference_lift);
+    assert!(mid.forward_preference_lift > def.forward_preference_lift);
+
+    // Gate OFF (default) ⇒ NEUTRAL identity, so play is byte-identical until opted in.
+    let neutral = PassRiskAppetite::NEUTRAL;
+    assert_eq!(neutral.forward_risk_penalty_mult, 1.0);
+    assert_eq!(neutral.sideways_risk_penalty_mult, 1.0);
+    assert_eq!(neutral.forward_preference_lift, 0.0);
+}
+
+#[test]
 fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
