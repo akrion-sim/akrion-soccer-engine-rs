@@ -1020,6 +1020,7 @@ fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
                 | "press-cover"
                 | "recover"
                 | "tackle"
+                | "blindside-steal"
                 | "vacate-space"
                 | "support-shape"
                 | "support-roam"
