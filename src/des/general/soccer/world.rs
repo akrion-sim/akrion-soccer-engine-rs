@@ -24669,6 +24669,125 @@ impl WorldSnapshot {
         }
     }
 
+    /// The "surprise steal from behind" opportunity this defender has against the current
+    /// opponent ball-carrier, or `None`. The gate is deliberately narrow — every one of the
+    /// user's conditions must hold:
+    ///
+    /// * an opponent (not a keeper holding in his box) is on the ball;
+    /// * the defender sits in the carrier's BLIND arc — behind the carrier's facing/motion,
+    ///   where a player dribbling forward genuinely cannot see them;
+    /// * the carrier is dribbling FORWARD and SLOWLY (walk/jog/skip) — a sprinting carrier
+    ///   simply runs away, a shielding/turning one is not "looking the wrong way";
+    /// * **the defender believes it can actually catch the carrier** (the critical aspect):
+    ///   its flat-out chase pace must beat the carrier's getaway pace by a real margin AND
+    ///   close the gap inside the catch horizon. No catch belief ⇒ `None` (no creep).
+    ///
+    /// Returns `None` (drawing no RNG, touching no decision) whenever the gate is off or any
+    /// condition fails, so an unconfigured process is byte-identical.
+    pub(crate) fn blindside_steal_assessment(
+        &self,
+        defender_id: usize,
+    ) -> Option<BlindsideStealAssessment> {
+        if !dd_soccer_enable_blindside_steal() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == defender_id)?;
+        if me.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|p| p.id == holder_id)?;
+        if holder.team != me.team.other() {
+            return None;
+        }
+        let carrier_pos = self.player_snapshot_position(holder);
+        if holder.role == PlayerRole::Goalkeeper
+            && self.point_in_own_penalty_area(holder.team, carrier_pos)
+        {
+            return None;
+        }
+        let my_pos = self.player_snapshot_position(me);
+        let gap = my_pos.distance(carrier_pos);
+        if !(gap.is_finite()) || gap > BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS || gap < 1e-3 {
+            return None;
+        }
+        let carrier_velocity = self.player_velocity(holder_id).unwrap_or(holder.velocity);
+        let carrier_speed = carrier_velocity.len();
+        // Must be progressing FORWARD (toward the carrier's own attack goal), not standing
+        // or shielding a turn.
+        let carrier_attack = holder.team.attack_dir();
+        let carrier_forward = carrier_velocity.y * carrier_attack;
+        if carrier_forward < BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS {
+            return None;
+        }
+        // Carrier behind the eyes: bearing to the defender is outside the carrier's
+        // look-forward cone (facing falls back to the forward motion/attack direction).
+        let carrier_facing = self
+            .player_facing_direction(holder)
+            .filter(|f| f.len() > 1e-6)
+            .unwrap_or_else(|| {
+                if carrier_velocity.len() > 0.5 {
+                    carrier_velocity
+                } else {
+                    Vec2::new(0.0, carrier_attack)
+                }
+            })
+            .normalized();
+        let to_def = (my_pos - carrier_pos).normalized();
+        let facing_dot = to_def.dot(carrier_facing);
+        if facing_dot >= BLINDSIDE_BEHIND_DOT {
+            return None;
+        }
+        let carrier_unaware = ((BLINDSIDE_BEHIND_DOT - facing_dot)
+            / (BLINDSIDE_BEHIND_DOT + 1.0).max(1e-6))
+        .clamp(0.0, 1.0);
+        // Walk/jog/skip exploitability: full at/below the jog pace, fading to zero as the
+        // carrier accelerates toward a clean getaway sprint.
+        let carrier_slow = ((BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - carrier_speed)
+            / (BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - BLINDSIDE_CARRIER_JOG_SPEED_YPS).max(1e-6))
+        .clamp(0.0, 1.0);
+        if carrier_slow <= 0.0 {
+            return None;
+        }
+        // Catch-belief (critical): the defender's flat-out chase pace versus the carrier's
+        // pace away from it. A real closing margin AND a reachable gap, or no creep.
+        let chase_speed =
+            player_top_speed_yps(me.role, &me.skills) * MovementGait::Sprint.speed_multiplier();
+        let carrier_getaway = (-carrier_velocity.dot(to_def)).max(0.0);
+        let closing = chase_speed - carrier_getaway;
+        if closing < BLINDSIDE_CHASE_SPEED_MARGIN_YPS {
+            return None;
+        }
+        let time_to_close = gap / closing.max(1e-6);
+        let catch_belief =
+            (1.0 - time_to_close / BLINDSIDE_CATCH_HORIZON_SECONDS.max(1e-6)).clamp(0.0, 1.0);
+        if catch_belief <= 0.0 {
+            return None;
+        }
+        let closeness = (1.0 - gap / BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS).clamp(0.0, 1.0);
+        let steal_skill = (0.55
+            + ability01(me.skills.defending) * 0.30
+            + ability01(me.skills.aggression) * 0.15)
+            .clamp(0.0, 1.0);
+        let opportunity = ((carrier_unaware * 0.30
+            + carrier_slow * 0.26
+            + catch_belief * 0.32
+            + closeness * 0.12)
+            * steal_skill)
+            .clamp(0.0, 1.0);
+        if opportunity <= 0.0 {
+            return None;
+        }
+        Some(BlindsideStealAssessment {
+            target: holder_id,
+            opportunity,
+            carrier_unaware,
+            carrier_slow,
+            catch_belief,
+            gap_yards: gap,
+        })
+    }
+
     pub(crate) fn defensive_carrier_channel_profile_for(&self, team: Team) -> (f64, f64, usize) {
         let Some(holder_id) = self.ball.holder else {
             return (0.0, 0.0, 0);
@@ -25669,6 +25788,11 @@ impl WorldSnapshot {
                 look_behind_scan_seconds: 0.0,
                 look_behind_confidence_bonus: 0.0,
                 look_behind_drift_risk: 0.0,
+                blindside_steal_opportunity: 0.0,
+                blindside_steal_target: None,
+                blindside_threat_from_behind: 0.0,
+                blindside_scan_active: false,
+                blindside_scan_drift_risk: 0.0,
                 previous_tick_carryover: None,
                 scheduled_index: None,
                 ball_scheduled_index: None,
@@ -26062,6 +26186,73 @@ impl WorldSnapshot {
                 look_behind_scan.drift_risk = (perception.ball_holder_head_scan_drift_risk_base
                     + scan_fit * perception.ball_holder_head_scan_drift_risk_span)
                     .clamp(0.0, 1.0);
+            }
+        }
+        // Blindside surprise-steal POMDP wiring (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`;
+        // OFF ⇒ no mutation, all four fields stay zero ⇒ byte-identical). Two halves:
+        //  * CARRIER: while driving forward it side-glances to check its blind arc. The
+        //    glance has a real ball-control drift COST (rides the head-scan drift channel)
+        //    and a BENEFIT — it lifts perceived confidence on rear opponents — so the
+        //    carrier only RECOGNISES (and then escapes) a sneaking thief once it has looked.
+        //  * DEFENDER: reads its own `blindside_steal_assessment` (behind + slow + catchable).
+        let mut blindside_steal_opportunity = 0.0_f64;
+        let mut blindside_steal_target: Option<usize> = None;
+        let mut blindside_threat_from_behind = 0.0_f64;
+        let mut blindside_scan_active = false;
+        let mut blindside_scan_drift_risk = 0.0_f64;
+        if dd_soccer_enable_blindside_steal() {
+            if has_ball {
+                let carrier_velocity = self.player_velocity(me.id).unwrap_or(me.velocity);
+                let carrier_speed = carrier_velocity.len();
+                let carrier_forward = carrier_velocity.y * me.team.attack_dir();
+                if carrier_forward >= BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS {
+                    // Driving forward ⇒ the carrier sweeps its blind side this tick.
+                    blindside_scan_active = true;
+                    let speed_fit =
+                        (carrier_speed / BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS).clamp(0.0, 1.0);
+                    blindside_scan_drift_risk = (BLINDSIDE_GLANCE_DRIFT_RISK_BASE
+                        + speed_fit * BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN)
+                        .clamp(0.0, 1.0);
+                    let glance_bonus =
+                        (0.16 + ability01(me.skills.vision) * 0.22).clamp(0.0, 0.40);
+                    let glance_radius = BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS + 2.0;
+                    // Only fast carriers are safe; a walking/jogging carrier that does spot a
+                    // thief feels the threat fully.
+                    let carrier_slow = ((BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - carrier_speed)
+                        / (BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - BLINDSIDE_CARRIER_JOG_SPEED_YPS)
+                            .max(1e-6))
+                    .clamp(0.0, 1.0);
+                    for entry in &mut player_position_confidences {
+                        if entry.team != me.team.other()
+                            || entry.in_front
+                            || !entry.distance_yards.is_finite()
+                            || entry.distance_yards > glance_radius
+                        {
+                            continue;
+                        }
+                        // The glance lifts (never lowers) rear-opponent confidence at the
+                        // drift cost booked above.
+                        entry.confidence = (entry.confidence + glance_bonus).clamp(0.0, 1.0);
+                        entry.noise_yards = self.perception_noise_yards_for(
+                            entry.confidence,
+                            entry.distance_yards,
+                            entry.occlusion_score,
+                        );
+                        entry.latency_seconds = self.perception_latency_seconds_for(
+                            me,
+                            entry.confidence,
+                            entry.occlusion_score,
+                        );
+                        let closeness =
+                            (1.0 - entry.distance_yards / glance_radius).clamp(0.0, 1.0);
+                        let perceived = entry.confidence.clamp(0.0, 1.0);
+                        blindside_threat_from_behind = blindside_threat_from_behind
+                            .max((closeness * perceived * carrier_slow).clamp(0.0, 1.0));
+                    }
+                }
+            } else if let Some(assessment) = self.blindside_steal_assessment(me.id) {
+                blindside_steal_opportunity = assessment.opportunity;
+                blindside_steal_target = Some(assessment.target);
             }
         }
         let teammate_position_confidence =
