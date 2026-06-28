@@ -308,14 +308,6 @@ pub struct SoccerMatch {
     pub(crate) suppress_generic_oob_turnover: bool,
     pub(crate) pending_shot: Option<PendingShot>,
     pub(crate) pending_rebound: Option<PendingRebound>,
-    /// Latched "live cross" window for the situational flank crash-the-box play: set when an
-    /// aerial cross is released into the box under the recognizer, consumed to credit a headed
-    /// finish (and the box-crash arrivals) back to the move. Runtime-only; `None` unless
-    /// `DD_SOCCER_ENABLE_FLANK_CRASH_BOX` is on. See [`crash_box`].
-    pub(crate) flank_crash_box_cross: Option<crash_box::FlankCrashBoxCross>,
-    /// `(shooter, tick)` stamped when a shot is taken with the ball aerial in the heading band,
-    /// so a goal on the same tick can be recognised as a headed finish. Runtime-only.
-    pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
@@ -1028,7 +1020,6 @@ fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
                 | "press-cover"
                 | "recover"
                 | "tackle"
-                | "blindside-steal"
                 | "vacate-space"
                 | "support-shape"
                 | "support-roam"
@@ -2566,8 +2557,6 @@ impl SoccerMatch {
             suppress_generic_oob_turnover: false,
             pending_shot: None,
             pending_rebound: None,
-            flank_crash_box_cross: None,
-            pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
             episode_learning_transitions: Vec::new(),
@@ -5623,7 +5612,7 @@ impl SoccerMatch {
         }
         let current = snapshot.player_snapshot_position(player);
         let target = match label {
-            "tackle" | "blindside-steal" => snapshot
+            "tackle" => snapshot
                 .ball
                 .holder
                 .and_then(|holder| snapshot.player_position(holder)),
@@ -10022,119 +10011,7 @@ impl SoccerMatch {
         }
     }
 
-    /// Latch a "live cross" window when an **aerial cross is released from the flank in the
-    /// attacking final third** under the situational crash-the-box recognizer, and pay the small
-    /// bounded shaped reward to attackers already crashed into the box for the delivery. A no-op
-    /// (byte-identical) unless `DD_SOCCER_ENABLE_FLANK_CRASH_BOX` is on. See [`crash_box`].
-    pub(crate) fn register_flank_crash_box_cross(
-        &mut self,
-        team: Team,
-        crosser: usize,
-        origin: Vec2,
-        is_cross: bool,
-        flight: PassFlight,
-    ) {
-        if !crash_box::flank_crash_box_enabled()
-            || self.active_set_play.is_some()
-            || !(is_cross && flight.is_aerial())
-        {
-            return;
-        }
-        let length = self.config.field_length_yards;
-        let width = self.config.field_width_yards;
-        if !crash_box::flank_final_third_crash_box_geometry(
-            origin,
-            team.goal_y(length),
-            width,
-            length,
-        ) {
-            return;
-        }
-        self.flank_crash_box_cross = Some(crash_box::FlankCrashBoxCross {
-            team,
-            crosser,
-            released_tick: self.tick,
-        });
-        self.reward_flank_crash_box_arrivals(team, crosser);
-    }
-
-    /// Pay [`crash_box::CRASH_BOX_ARRIVAL_SHAPED_POINTS`] (budget-bounded, split evenly) to this
-    /// team's attackers already inside the opponent box as the cross is released, when at least
-    /// [`crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS`] of them have crashed in. Deterministic.
-    fn reward_flank_crash_box_arrivals(&mut self, team: Team, crosser: usize) {
-        let opponent_box_team = team.other();
-        let mut crashers: Vec<usize> = self
-            .players
-            .iter()
-            .filter(|player| {
-                player.team == team
-                    && player.id != crosser
-                    && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
-                    && self.point_in_own_penalty_area(opponent_box_team, player.position)
-            })
-            .map(|player| player.id)
-            .collect();
-        crashers.sort_unstable();
-        if crashers.len() < crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS {
-            return;
-        }
-        let total = apply_dense_shaping_budget(
-            crash_box::CRASH_BOX_ARRIVAL_SHAPED_POINTS,
-            tunables().reward.dense_shaping_budget_points,
-        );
-        let share = total / crashers.len() as f64;
-        for id in crashers {
-            self.record_reward_event_with_kind(id, share, SoccerRewardEventKind::CrashBoxArrival);
-        }
-    }
-
-    /// Credit the terminal [`crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS`] bonus when the goal
-    /// just scored was a **headed finish off a live flank crash-the-box cross**: the bonus is
-    /// split between the header scorer and the deliverer of the cross (its assist share), so
-    /// MARL/MAPPO reinforces the entire wide-delivery → bodies-in-the-box → header pattern.
-    /// Returns `true` when the bonus was paid. A no-op unless the feature is on.
-    fn record_flank_crash_box_header_goal(&mut self, scoring_team: Team, shooter: Option<usize>) -> bool {
-        if !crash_box::flank_crash_box_enabled() {
-            return false;
-        }
-        let Some(cross) = self.flank_crash_box_cross else {
-            return false;
-        };
-        let Some(shooter) = shooter else {
-            return false;
-        };
-        let dt = self.config.dt_seconds;
-        let aerial_finish_now = self
-            .pending_aerial_finish
-            .is_some_and(|(id, tick)| id == shooter && tick == self.tick);
-        if cross.team != scoring_team
-            || !cross.is_open_at(self.tick, dt)
-            || !aerial_finish_now
-        {
-            return false;
-        }
-        let assist = (crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS
-            * crash_box::HEADER_GOAL_FROM_CROSS_ASSIST_SHARE)
-            .max(0.0);
-        let finisher = (crash_box::HEADER_GOAL_FROM_CROSS_BONUS_POINTS - assist).max(0.0);
-        self.record_reward_event_with_kind(
-            shooter,
-            finisher,
-            SoccerRewardEventKind::HeaderGoalFromCross,
-        );
-        if cross.crosser != shooter {
-            self.record_reward_event_with_kind(
-                cross.crosser,
-                assist,
-                SoccerRewardEventKind::HeaderGoalFromCross,
-            );
-        }
-        self.flank_crash_box_cross = None;
-        true
-    }
-
     pub(crate) fn record_goal_rewards(&mut self, scoring_team: Team, shooter: Option<usize>) {
-        self.record_flank_crash_box_header_goal(scoring_team, shooter);
         let previous_touch_team = self.previous_touch_team_for_goal();
         if let Some(shooter) = shooter {
             self.record_possession_touch(shooter);
@@ -12771,6 +12648,9 @@ impl SoccerMatch {
                     self.players[player_id].incoming_ball = None;
                     let offside = target_id
                         .and_then(|target| snapshot.pending_offside_for_pass(player_id, target));
+                    // Captured before `offside` is moved into the pending pass below; the
+                    // slip-break reward only fires when the runner was onside (trap beaten).
+                    let pass_is_onside = offside.is_none();
                     let offside_candidates = snapshot.offside_candidates_for_pass(player_id);
                     let receiver_position_at_launch = target_id.and_then(|target| {
                         snapshot.player_position(target).or_else(|| {
@@ -12815,18 +12695,40 @@ impl SoccerMatch {
                             flight,
                         ),
                     });
+                    // Shared (centralized MAPPO) reward for executing a slip-and-break-the-trap:
+                    // a firm forward GROUND ball slipped to an ONSIDE runner who timed his break
+                    // into a two-defender seam. The passer AND the runner split the credit (the
+                    // cooperative team-reward path), so the learner reinforces the coordinated
+                    // pattern — the runner starting first, the carrier slipping it through at the
+                    // right moment. Gated; off ⇒ never fires (byte-identical). A pass flagged
+                    // offside earns nothing: the trap was not beaten.
+                    if dd_soccer_enable_slip_break_offside_reward()
+                        && !flight.is_aerial()
+                        && !is_cross
+                        && pass_is_onside
+                    {
+                        if let Some(runner) = target_id {
+                            if let Some(opportunity) = snapshot.slip_break_runner_opportunity(
+                                player_team,
+                                player_id,
+                                player_pos,
+                                runner,
+                            ) {
+                                let amount = opportunity.opportunity * SLIP_BREAK_REWARD_POINTS;
+                                self.record_involved_team_reward_at(
+                                    self.tick,
+                                    player_team,
+                                    amount,
+                                    &[player_id, runner],
+                                );
+                            }
+                        }
+                    }
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
-                    self.register_flank_crash_box_cross(
-                        player_team,
-                        player_id,
-                        player_pos,
-                        is_cross,
-                        flight,
-                    );
                 }
                 self.move_player_towards(player_id, self.players[player_id].home_position, false);
                 if release_facing != FacingBucket::Unknown {
@@ -12850,16 +12752,6 @@ impl SoccerMatch {
             SoccerAction::Shoot { power } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
-                    // The ball altitude before this contact overwrites it: a finish struck while
-                    // the ball is up in the heading band is an aerial (headed) finish — the signal
-                    // the flank crash-the-box bonus keys off.
-                    let incoming_ball_altitude = self.ball.altitude_yards;
-                    self.pending_aerial_finish =
-                        if incoming_ball_altitude >= AERIAL_HEADER_MIN_ALTITUDE_YARDS {
-                            Some((player_id, self.tick))
-                        } else {
-                            None
-                        };
                     let snapshot = WorldSnapshot::from_match(self);
                     let observation = snapshot.observation_for(player_id);
                     let pressure = pressure_from_observation(&observation);
@@ -19949,6 +19841,19 @@ struct ForwardSupportContext {
     best_quick_forward_target: Option<usize>,
 }
 
+/// A slip-and-break-the-offside-trap opportunity for one runner, as seen from a passer (see
+/// [`WorldSnapshot::slip_break_runner_opportunity`]). All scalar factors are `[0,1]`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlipBreakOpportunity {
+    /// How well the release moment fits the ~2–3-yd-before-the-line window given the runner's
+    /// sprint (0 if offside or not closing).
+    pub(crate) timing: f64,
+    /// Openness of the carrier→seam ground-pass lane.
+    pub(crate) lane_openness: f64,
+    /// Combined opportunity quality (seam × timing × lane × pace advantage) for ranking/reward.
+    pub(crate) opportunity: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FieldFrontBehindContext {
     field_players_ahead: usize,
@@ -21066,32 +20971,6 @@ fn dd_soccer_disable_winger_byline_option() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WINGER_BYLINE_OPTION").is_ok())
-}
-/// Wide-defender "hold width when the ball is advanced" rule. ON by default: once the ball is
-/// 10+ yds AHEAD of our back-four line average, a wide defender pushes up WITH the play but no
-/// longer bombs out to the touchline to open up — opening wide from behind an advanced ball only
-/// isolates him and vacates the flank he covers. The exception is a live ground-pass outlet (he
-/// is within ~20yd of the ball on a clear lane), where getting wide to receive is correct. Set
-/// `DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH=1` to restore the always-open behaviour
-/// byte-for-byte. See `wingback_advanced_ball_should_hold_width`.
-fn dd_soccer_disable_wingback_advanced_ball_hold_width() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH").is_ok()
-    })
-}
-/// Outside-mid ball-lane attacking width. ON by default: a wide attacker opens to his touchline
-/// by an amount that scales SMOOTHLY with how close the ball's lane is to his own flank (closest
-/// ⇒ widest), instead of a binary "ball is on my half of the pitch" switch. Set
-/// `DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH=1` to restore the legacy binary boost
-/// byte-for-byte. See `wide_possession_outlet_target_for`.
-fn outside_mid_ball_lane_width_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        !std::env::var("DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH").is_ok()
-    })
 }
 /// Long-pass run requirement (Part B of the long-pass-option-runs feature). ON by default: a
 /// DEEP carrier may only pre-empt-commit a long aerial to a teammate who actually made the run
@@ -24835,125 +24714,6 @@ impl WorldSnapshot {
         }
     }
 
-    /// The "surprise steal from behind" opportunity this defender has against the current
-    /// opponent ball-carrier, or `None`. The gate is deliberately narrow — every one of the
-    /// user's conditions must hold:
-    ///
-    /// * an opponent (not a keeper holding in his box) is on the ball;
-    /// * the defender sits in the carrier's BLIND arc — behind the carrier's facing/motion,
-    ///   where a player dribbling forward genuinely cannot see them;
-    /// * the carrier is dribbling FORWARD and SLOWLY (walk/jog/skip) — a sprinting carrier
-    ///   simply runs away, a shielding/turning one is not "looking the wrong way";
-    /// * **the defender believes it can actually catch the carrier** (the critical aspect):
-    ///   its flat-out chase pace must beat the carrier's getaway pace by a real margin AND
-    ///   close the gap inside the catch horizon. No catch belief ⇒ `None` (no creep).
-    ///
-    /// Returns `None` (drawing no RNG, touching no decision) whenever the gate is off or any
-    /// condition fails, so an unconfigured process is byte-identical.
-    pub(crate) fn blindside_steal_assessment(
-        &self,
-        defender_id: usize,
-    ) -> Option<BlindsideStealAssessment> {
-        if !dd_soccer_enable_blindside_steal() {
-            return None;
-        }
-        let me = self.players.iter().find(|p| p.id == defender_id)?;
-        if me.role == PlayerRole::Goalkeeper {
-            return None;
-        }
-        let holder_id = self.ball.holder?;
-        let holder = self.players.iter().find(|p| p.id == holder_id)?;
-        if holder.team != me.team.other() {
-            return None;
-        }
-        let carrier_pos = self.player_snapshot_position(holder);
-        if holder.role == PlayerRole::Goalkeeper
-            && self.point_in_own_penalty_area(holder.team, carrier_pos)
-        {
-            return None;
-        }
-        let my_pos = self.player_snapshot_position(me);
-        let gap = my_pos.distance(carrier_pos);
-        if !(gap.is_finite()) || gap > BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS || gap < 1e-3 {
-            return None;
-        }
-        let carrier_velocity = self.player_velocity(holder_id).unwrap_or(holder.velocity);
-        let carrier_speed = carrier_velocity.len();
-        // Must be progressing FORWARD (toward the carrier's own attack goal), not standing
-        // or shielding a turn.
-        let carrier_attack = holder.team.attack_dir();
-        let carrier_forward = carrier_velocity.y * carrier_attack;
-        if carrier_forward < BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS {
-            return None;
-        }
-        // Carrier behind the eyes: bearing to the defender is outside the carrier's
-        // look-forward cone (facing falls back to the forward motion/attack direction).
-        let carrier_facing = self
-            .player_facing_direction(holder)
-            .filter(|f| f.len() > 1e-6)
-            .unwrap_or_else(|| {
-                if carrier_velocity.len() > 0.5 {
-                    carrier_velocity
-                } else {
-                    Vec2::new(0.0, carrier_attack)
-                }
-            })
-            .normalized();
-        let to_def = (my_pos - carrier_pos).normalized();
-        let facing_dot = to_def.dot(carrier_facing);
-        if facing_dot >= BLINDSIDE_BEHIND_DOT {
-            return None;
-        }
-        let carrier_unaware = ((BLINDSIDE_BEHIND_DOT - facing_dot)
-            / (BLINDSIDE_BEHIND_DOT + 1.0).max(1e-6))
-        .clamp(0.0, 1.0);
-        // Walk/jog/skip exploitability: full at/below the jog pace, fading to zero as the
-        // carrier accelerates toward a clean getaway sprint.
-        let carrier_slow = ((BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - carrier_speed)
-            / (BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - BLINDSIDE_CARRIER_JOG_SPEED_YPS).max(1e-6))
-        .clamp(0.0, 1.0);
-        if carrier_slow <= 0.0 {
-            return None;
-        }
-        // Catch-belief (critical): the defender's flat-out chase pace versus the carrier's
-        // pace away from it. A real closing margin AND a reachable gap, or no creep.
-        let chase_speed =
-            player_top_speed_yps(me.role, &me.skills) * MovementGait::Sprint.speed_multiplier();
-        let carrier_getaway = (-carrier_velocity.dot(to_def)).max(0.0);
-        let closing = chase_speed - carrier_getaway;
-        if closing < BLINDSIDE_CHASE_SPEED_MARGIN_YPS {
-            return None;
-        }
-        let time_to_close = gap / closing.max(1e-6);
-        let catch_belief =
-            (1.0 - time_to_close / BLINDSIDE_CATCH_HORIZON_SECONDS.max(1e-6)).clamp(0.0, 1.0);
-        if catch_belief <= 0.0 {
-            return None;
-        }
-        let closeness = (1.0 - gap / BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS).clamp(0.0, 1.0);
-        let steal_skill = (0.55
-            + ability01(me.skills.defending) * 0.30
-            + ability01(me.skills.aggression) * 0.15)
-            .clamp(0.0, 1.0);
-        let opportunity = ((carrier_unaware * 0.30
-            + carrier_slow * 0.26
-            + catch_belief * 0.32
-            + closeness * 0.12)
-            * steal_skill)
-            .clamp(0.0, 1.0);
-        if opportunity <= 0.0 {
-            return None;
-        }
-        Some(BlindsideStealAssessment {
-            target: holder_id,
-            opportunity,
-            carrier_unaware,
-            carrier_slow,
-            catch_belief,
-            gap_yards: gap,
-        })
-    }
-
     pub(crate) fn defensive_carrier_channel_profile_for(&self, team: Team) -> (f64, f64, usize) {
         let Some(holder_id) = self.ball.holder else {
             return (0.0, 0.0, 0);
@@ -25923,6 +25683,8 @@ impl WorldSnapshot {
                 threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
                 best_forward_pass_option_quality: 0.0,
+                slip_break_seam_quality: 0.0,
+                slip_break_release_now: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
@@ -25954,11 +25716,6 @@ impl WorldSnapshot {
                 look_behind_scan_seconds: 0.0,
                 look_behind_confidence_bonus: 0.0,
                 look_behind_drift_risk: 0.0,
-                blindside_steal_opportunity: 0.0,
-                blindside_steal_target: None,
-                blindside_threat_from_behind: 0.0,
-                blindside_scan_active: false,
-                blindside_scan_drift_risk: 0.0,
                 previous_tick_carryover: None,
                 scheduled_index: None,
                 ball_scheduled_index: None,
@@ -26352,73 +26109,6 @@ impl WorldSnapshot {
                 look_behind_scan.drift_risk = (perception.ball_holder_head_scan_drift_risk_base
                     + scan_fit * perception.ball_holder_head_scan_drift_risk_span)
                     .clamp(0.0, 1.0);
-            }
-        }
-        // Blindside surprise-steal POMDP wiring (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`;
-        // OFF ⇒ no mutation, all four fields stay zero ⇒ byte-identical). Two halves:
-        //  * CARRIER: while driving forward it side-glances to check its blind arc. The
-        //    glance has a real ball-control drift COST (rides the head-scan drift channel)
-        //    and a BENEFIT — it lifts perceived confidence on rear opponents — so the
-        //    carrier only RECOGNISES (and then escapes) a sneaking thief once it has looked.
-        //  * DEFENDER: reads its own `blindside_steal_assessment` (behind + slow + catchable).
-        let mut blindside_steal_opportunity = 0.0_f64;
-        let mut blindside_steal_target: Option<usize> = None;
-        let mut blindside_threat_from_behind = 0.0_f64;
-        let mut blindside_scan_active = false;
-        let mut blindside_scan_drift_risk = 0.0_f64;
-        if dd_soccer_enable_blindside_steal() {
-            if has_ball {
-                let carrier_velocity = self.player_velocity(me.id).unwrap_or(me.velocity);
-                let carrier_speed = carrier_velocity.len();
-                let carrier_forward = carrier_velocity.y * me.team.attack_dir();
-                if carrier_forward >= BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS {
-                    // Driving forward ⇒ the carrier sweeps its blind side this tick.
-                    blindside_scan_active = true;
-                    let speed_fit =
-                        (carrier_speed / BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS).clamp(0.0, 1.0);
-                    blindside_scan_drift_risk = (BLINDSIDE_GLANCE_DRIFT_RISK_BASE
-                        + speed_fit * BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN)
-                        .clamp(0.0, 1.0);
-                    let glance_bonus =
-                        (0.16 + ability01(me.skills.vision) * 0.22).clamp(0.0, 0.40);
-                    let glance_radius = BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS + 2.0;
-                    // Only fast carriers are safe; a walking/jogging carrier that does spot a
-                    // thief feels the threat fully.
-                    let carrier_slow = ((BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - carrier_speed)
-                        / (BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS - BLINDSIDE_CARRIER_JOG_SPEED_YPS)
-                            .max(1e-6))
-                    .clamp(0.0, 1.0);
-                    for entry in &mut player_position_confidences {
-                        if entry.team != me.team.other()
-                            || entry.in_front
-                            || !entry.distance_yards.is_finite()
-                            || entry.distance_yards > glance_radius
-                        {
-                            continue;
-                        }
-                        // The glance lifts (never lowers) rear-opponent confidence at the
-                        // drift cost booked above.
-                        entry.confidence = (entry.confidence + glance_bonus).clamp(0.0, 1.0);
-                        entry.noise_yards = self.perception_noise_yards_for(
-                            entry.confidence,
-                            entry.distance_yards,
-                            entry.occlusion_score,
-                        );
-                        entry.latency_seconds = self.perception_latency_seconds_for(
-                            me,
-                            entry.confidence,
-                            entry.occlusion_score,
-                        );
-                        let closeness =
-                            (1.0 - entry.distance_yards / glance_radius).clamp(0.0, 1.0);
-                        let perceived = entry.confidence.clamp(0.0, 1.0);
-                        blindside_threat_from_behind = blindside_threat_from_behind
-                            .max((closeness * perceived * carrier_slow).clamp(0.0, 1.0));
-                    }
-                }
-            } else if let Some(assessment) = self.blindside_steal_assessment(me.id) {
-                blindside_steal_opportunity = assessment.opportunity;
-                blindside_steal_target = Some(assessment.target);
             }
         }
         let teammate_position_confidence =
@@ -27279,6 +26969,13 @@ impl WorldSnapshot {
             .map(|guidance| finite_metric(guidance.speed_match_weight))
             .unwrap_or(0.0);
         let urgency_elapsed = phase_started.elapsed();
+        // Slip-and-break-the-offside-trap recognition for the carrier: the best seam to slip a
+        // firm forward ground ball through to a teammate who has STARTED a timed break, and how
+        // strongly the moment to release has arrived (the runner ~2–3 yd before the line). Both
+        // are 0 when the gate is off, so the observation stays byte-identical. See
+        // `slip_break_carrier_recognition`.
+        let (slip_break_seam_quality, slip_break_release_now) =
+            self.slip_break_carrier_recognition(me, me_position);
         let mut observation = SoccerPomdpObservation {
             player_id,
             player_grid,
@@ -27360,6 +27057,8 @@ impl WorldSnapshot {
                 .best_forward_pass_receiver_openness,
             best_forward_pass_option_quality: forward_support_context
                 .best_forward_pass_option_quality,
+            slip_break_seam_quality,
+            slip_break_release_now,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
@@ -27392,11 +27091,6 @@ impl WorldSnapshot {
             look_behind_scan_seconds: look_behind_scan.duration_seconds,
             look_behind_confidence_bonus: look_behind_scan.confidence_bonus,
             look_behind_drift_risk: look_behind_scan.drift_risk,
-            blindside_steal_opportunity,
-            blindside_steal_target,
-            blindside_threat_from_behind,
-            blindside_scan_active,
-            blindside_scan_drift_risk,
             previous_tick_carryover,
             scheduled_index,
             ball_scheduled_index,
@@ -30526,6 +30220,226 @@ impl WorldSnapshot {
         defender_ys.get(1).copied()
     }
 
+    /// Find the best **seam** to slip a firm ground ball through for a runner staged near
+    /// `runner_position`: a lateral gap between two adjacent opponent defenders on the line, with
+    /// open space behind to run into. Returns the in-behind target point (nudged laterally away
+    /// from the keeper, per the usual angled slip) and the seam quality `[0,1]`. The seam closest
+    /// to the runner's lane wins. Used by the runner's timed-break target, the carrier's
+    /// recognition, and the shared reward. Pure read; no gate (callers gate).
+    pub(crate) fn slip_break_seam_for(
+        &self,
+        attacking_team: Team,
+        runner_position: Vec2,
+    ) -> Option<(Vec2, f64)> {
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let mut line_defenders: Vec<Vec2> = self
+            .players
+            .iter()
+            .filter(|p| p.team == attacking_team.other() && p.role != PlayerRole::Goalkeeper)
+            .filter_map(|p| self.player_position(p.id))
+            .filter(|pos| (pos.y - line_y).abs() <= SLIP_BREAK_LINE_BAND_YARDS)
+            .collect();
+        if line_defenders.len() < 2 {
+            return None;
+        }
+        line_defenders.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        let behind_space = ((attacking_team.goal_y(self.field_length) - line_y) * attack_dir)
+            .max(0.0);
+        let keeper_x = self
+            .goalkeeper_for(attacking_team.other())
+            .and_then(|id| self.player_position(id))
+            .map(|p| p.x)
+            .unwrap_or(self.field_width * 0.5);
+        let mut best: Option<(Vec2, f64)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for pair in line_defenders.windows(2) {
+            let gap = pair[1].x - pair[0].x;
+            let seam_quality = defender_seam_quality(gap, behind_space);
+            if seam_quality <= 0.0 {
+                continue;
+            }
+            let seam_center = (pair[0].x + pair[1].x) * 0.5;
+            // Angle the slip away from the keeper (usual through-ball line); for a central seam
+            // under a central keeper, break toward the nearer touchline's open side.
+            let away_dir = if (seam_center - keeper_x).abs() < 1e-3 {
+                if seam_center < self.field_width * 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            } else {
+                (seam_center - keeper_x).signum()
+            };
+            let target_x = (seam_center + away_dir * SLIP_BREAK_KEEPER_AVOID_NUDGE_YARDS)
+                .clamp(4.0, self.field_width - 4.0);
+            let target_y = line_y + attack_dir * SLIP_BREAK_BEHIND_TARGET_YARDS;
+            let target =
+                Vec2::new(target_x, target_y).clamp_to_pitch(self.field_width, self.field_length);
+            // Prefer the seam nearest the runner's lane (he has to be able to reach it).
+            let lane_penalty = (seam_center - runner_position.x).abs() * 0.02;
+            let score = seam_quality - lane_penalty;
+            if score > best_score {
+                best_score = score;
+                best = Some((target, seam_quality));
+            }
+        }
+        best
+    }
+
+    /// Evaluate a teammate `runner_id` as a slip-break receiver for a pass from `passer_pos`:
+    /// he must be staged 5–10 yd onside of the line (not yet across it) with a real seam to break
+    /// into. Bundles the seam target, seam quality, release timing (how well *now* fits the
+    /// ~2–3-yd-before-the-line window given his sprint), the carrier→seam lane openness, and his
+    /// pace advantage over the back line (the holder's core recognition cue). Returns `None` if
+    /// he is not a valid slip-break runner. Pure read; no gate (callers gate).
+    pub(crate) fn slip_break_runner_opportunity(
+        &self,
+        attacking_team: Team,
+        passer_id: usize,
+        passer_pos: Vec2,
+        runner_id: usize,
+    ) -> Option<SlipBreakOpportunity> {
+        if runner_id == passer_id {
+            return None;
+        }
+        let runner = self.players.iter().find(|p| p.id == runner_id)?;
+        if runner.team != attacking_team
+            || !matches!(runner.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let runner_pos = self.player_snapshot_position(runner);
+        let yards_to_line = (line_y - runner_pos.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let onside = yards_to_line > 0.0;
+        let runner_vel = self
+            .player_velocity(runner_id)
+            .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+        let runner_forward_yps = runner_vel.y * attack_dir;
+        let (seam_target, seam_quality) = self.slip_break_seam_for(attacking_team, runner_pos)?;
+        // The back line's forward velocity (attacking frame): a line stepping up to spring the
+        // trap moves AGAINST the attack, increasing the runner's effective speed advantage.
+        let line_forward_yps = self.slip_break_line_forward_velocity(attacking_team, line_y);
+        let speed_advantage = slip_break_speed_advantage(runner_forward_yps, line_forward_yps);
+        let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
+        let lane_openness = if lane_open { 1.0 } else { 0.35 };
+        let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
+        let opportunity = slip_break_opportunity_quality(
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+        );
+        Some(SlipBreakOpportunity {
+            timing,
+            lane_openness,
+            opportunity,
+        })
+    }
+
+    /// Mean forward velocity (yd/s, attacking frame) of the opponent defenders forming the line —
+    /// negative when the line is stepping up to spring the offside trap. Zero if the line cannot
+    /// be sampled.
+    fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
+        let attack_dir = attacking_team.attack_dir();
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == attacking_team.other() && p.role != PlayerRole::Goalkeeper)
+        {
+            let Some(pos) = self.player_position(p.id) else {
+                continue;
+            };
+            if (pos.y - line_y).abs() > SLIP_BREAK_LINE_BAND_YARDS {
+                continue;
+            }
+            let vel = self
+                .player_velocity(p.id)
+                .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+            total += vel.y * attack_dir;
+            count += 1.0;
+        }
+        if count > 0.0 {
+            total / count
+        } else {
+            0.0
+        }
+    }
+
+    /// Carrier-side recognition of a slip-break opportunity (only the ball-holder recognizes a
+    /// slip): the best seam-opportunity quality across teammates who have STARTED a timed break,
+    /// and how strongly the release moment has arrived (a runner ~2–3 yd before the line,
+    /// sprinting, onside). Returns `(seam_quality, release_now)`, both `0` when the gate is off or
+    /// this player is not on the ball — so the observation stays byte-identical with the gate off.
+    pub(crate) fn slip_break_carrier_recognition(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+    ) -> (f64, f64) {
+        if !dd_soccer_enable_slip_break_offside() || self.ball.holder != Some(me.id) {
+            return (0.0, 0.0);
+        }
+        let mut best_seam = 0.0f64;
+        let mut best_release = 0.0f64;
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.id != me.id)
+        {
+            if let Some(o) =
+                self.slip_break_runner_opportunity(me.team, me.id, me_position, p.id)
+            {
+                best_seam = best_seam.max(o.opportunity);
+                best_release = best_release.max(o.timing * o.lane_openness);
+            }
+        }
+        (best_seam, best_release)
+    }
+
+    /// Runner-initiated timed break to slip in behind through a defender seam (the heart of the
+    /// pattern): a forward/attacking-mid staged 5–10 yd onside of the line, in possession, with a
+    /// real seam, breaks toward that seam channel — staying onside (targeting the line) until the
+    /// ball is actually slipped, then breaking beyond into the space to run onto it. Gated; `None`
+    /// when off ⇒ byte-identical.
+    pub(crate) fn slip_break_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        if !dd_soccer_enable_slip_break_offside() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.possession_team() != Some(me.team)
+            || self.ball.holder == Some(player_id)
+            || !matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(me.team)?;
+        let attack_dir = me.team.attack_dir();
+        let current = self.player_snapshot_position(me);
+        let yards_to_line = (line_y - current.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let (seam_target, _quality) = self.slip_break_seam_for(me.team, current)?;
+        // Offside is judged when the ball is played: hold the run to the line (the shoulder, at
+        // the seam's lane) until our ball is actually in flight, THEN break beyond into the space.
+        let ball_released = self.pending_pass.is_some();
+        let run_y = if ball_released {
+            seam_target.y
+        } else {
+            line_y
+        };
+        let target_x = (current.x * 0.45 + seam_target.x * 0.55)
+            .clamp(4.0, self.field_width - 4.0);
+        Some(Vec2::new(target_x, run_y).clamp_to_pitch(self.field_width, self.field_length))
+    }
+
     fn neutral_in_behind_window(&self, team: Team) -> bool {
         let progress_from_midfield =
             (self.ball.position.y - self.field_length * 0.5) * team.attack_dir();
@@ -31064,6 +30978,13 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn in_behind_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        // Slip-and-break-the-offside-trap (gated): a runner staged onside who has a seam to break
+        // into takes priority over the generic in-behind cadence — he initiates the sprint into
+        // the seam channel and the carrier then slips the ball through. `None` (so the generic
+        // logic below runs) when off or no seam is on. See `slip_break_run_target_for`.
+        if let Some(target) = self.slip_break_run_target_for(player_id) {
+            return Some(target);
+        }
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let backfield_long_pass_invite = self.backfield_long_pass_run_invite_for(player_id);
         if self.possession_team() != Some(me.team)
@@ -37302,12 +37223,6 @@ impl WorldSnapshot {
                 _ => box_edge_x,
             }
         } else {
-            // Ball well ahead of the back four and we are not a live ground-pass outlet ⇒ hold
-            // width: stay in our current lane and push up with the play rather than bombing out
-            // to the touchline from behind an advanced ball.
-            if self.wingback_advanced_ball_should_hold_width(me) {
-                return target;
-            }
             // Open OUT toward the touchline; bomb wide when there is cover behind the ball.
             let attack = me.team.attack_dir();
             let ball_fwd = self.ball.position.y * attack;
@@ -38206,49 +38121,7 @@ impl WorldSnapshot {
             .count()
     }
 
-    /// When the ball has advanced 10+ yds AHEAD of our back-four line average, a wide DEFENDER
-    /// should push up WITH the play but NOT bomb out to the touchline to "open up": opening wide
-    /// from behind an advanced ball only isolates him and vacates the flank he is meant to cover.
-    /// The one exception is a live outlet — a ground pass could actually reach him (within ~20yd
-    /// on a clear lane) — where getting wide to receive is the correct play. Returns true ⇒ the
-    /// wingback's lateral flank-opening is suppressed (his forward push is unaffected, since that
-    /// is driven separately by the line/push machinery, not by this width fit). Gated default-ON
-    /// via `dd_soccer_disable_wingback_advanced_ball_hold_width`.
-    fn wingback_advanced_ball_should_hold_width(&self, player: &PlayerSnapshot) -> bool {
-        if dd_soccer_disable_wingback_advanced_ball_hold_width() || !self.is_wide_defender(player) {
-            return false;
-        }
-        let attack = player.team.attack_dir();
-        let line_fwds: Vec<f64> = self
-            .players
-            .iter()
-            .filter(|p| p.team == player.team && p.role == PlayerRole::Defender)
-            .map(|p| self.player_snapshot_position(p).y * attack)
-            .collect();
-        if line_fwds.is_empty() {
-            return false;
-        }
-        let line_avg_fwd = line_fwds.iter().sum::<f64>() / line_fwds.len() as f64;
-        let ball_fwd = self.ball.position.y * attack;
-        // Only engages once the ball is well in front of the back line.
-        if ball_fwd - line_avg_fwd < WINGBACK_BALL_AHEAD_HOLD_WIDTH_YARDS {
-            return false;
-        }
-        // Live ground-pass outlet exception: within range AND on a clear (un-intercepted) lane.
-        let me_pos = self.player_snapshot_position(player);
-        let ground_pass_reachable = self.ball.position.distance(me_pos)
-            <= WINGBACK_GROUND_PASS_OUTLET_YARDS
-            && self.clear_line(self.ball.position, me_pos, player.team.other(), 2.0);
-        !ground_pass_reachable
-    }
-
     fn wingback_covered_attack_fit(&self, player: &PlayerSnapshot) -> f64 {
-        // The ball is well ahead of the back four and we are not a live ground-pass outlet ⇒ hold
-        // width: push up with the play but do not treat this as a covered-attacking-wingback that
-        // bombs out to the touchline (this fit gates every lateral flank-opening path).
-        if self.wingback_advanced_ball_should_hold_width(player) {
-            return 0.0;
-        }
         let cover_count = self.wingback_attacking_cover_count(player);
         if cover_count <= WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL {
             return 0.0;
@@ -38308,33 +38181,13 @@ impl WorldSnapshot {
         let center_x = self.field_width * 0.5;
         let touchline_x = if wingback_outlet {
             self.wingback_attacking_flank_x(me, wingback_coverage_fit)
+        } else if home.x <= center_x {
+            (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
         } else {
-            // Wide attacker (outside mid / wide forward): open to the touchline by an amount
-            // that scales with how close the BALL'S LANE is to this player's own flank. He hugs
-            // the touchline when the ball is in his flank lane and eases back only as far as his
-            // own home lane as the ball drifts to the far flank — "the closer the ball is to
-            // your flank, the wider you should be", while still always offering a flank outlet
-            // wider than (or level with) his resting lane. OFF ⇒ the legacy fixed near-touchline
-            // buffer. `closeness` ∈ [0, 1] is 1 with the ball on his touchline, 0 on the far one.
-            let hug_buffer = (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
-                .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS);
-            let buffer = if outside_mid_ball_lane_width_enabled() {
-                let my_touchline_x = if home.x <= center_x { 0.0 } else { self.field_width };
-                let home_offset = (home.x - my_touchline_x).abs().max(hug_buffer);
-                let ball_to_my_touchline = (self.ball.position.x - my_touchline_x).abs();
-                let closeness =
-                    (1.0 - ball_to_my_touchline / self.field_width.max(1.0)).clamp(0.0, 1.0);
-                // Lerp from the home lane (ball far ⇒ closeness 0) to the touchline hug (ball on
-                // his flank ⇒ closeness 1).
-                home_offset + (hug_buffer - home_offset) * closeness
-            } else {
-                hug_buffer
-            };
-            if home.x <= center_x {
-                buffer
-            } else {
-                self.field_width - buffer
-            }
+            self.field_width
+                - (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
+                    .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
         };
         // When the ball holder has time (low pressure) and this supporting player is
         // within ~20 yds, the holder "directs" them into wide open space — pull harder
@@ -38442,42 +38295,15 @@ impl WorldSnapshot {
     /// across the box instead of clumping. Assignment is fully deterministic (sorted by x then
     /// id, no RNG) so it is parity-safe. Returns this player's assigned box target, or `None`
     /// when no box-crash is on.
-    /// Situational "crash the box" recognizer: we are in possession in the opponent's attacking
-    /// final third with the ball out on the flanks (the three outermost lanes of the 12-lane fine
-    /// grid). When this fires, the high-cross delivery and the box-flood are switched on as a
-    /// *reaction to the geometry*, independent of whichever attack strategy the team brain rolled.
-    /// Gated by [`flank_crash_box_enabled`] (default-OFF under test ⇒ byte-identical).
-    pub(crate) fn flank_final_third_crash_box_active(&self, team: Team) -> bool {
-        if !flank_crash_box_enabled() || self.active_set_play.is_some() {
-            return false;
-        }
-        if self
-            .controlled_possession_team()
-            .or_else(|| self.possession_team())
-            != Some(team)
-        {
-            return false;
-        }
-        flank_final_third_crash_box_geometry(
-            self.ball.position,
-            team.goal_y(self.field_length),
-            self.field_width,
-            self.field_length,
-        )
-    }
-
     pub(crate) fn crash_the_box_target_for(&self, player: &PlayerSnapshot) -> Option<Vec2> {
         if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
             return None;
         }
         // Unified with the feature-level box-flood in `flank_cross_arrival_target_for`: runners
-        // start catching up during the byline drive and stay committed through the release. The
-        // situational flank crash-the-box recognizer ALSO opens the box-flood as a reaction to a
-        // wide-and-high ball, regardless of the committed strategy.
+        // start catching up during the byline drive and stay committed through the release.
         let attack_strategy = self.tactical_directive(player.team).attack_strategy;
         if attack_strategy != TeamAttackStrategy::CrashTheBox
             && !is_byline_cross_drive_strategy(attack_strategy)
-            && !self.flank_final_third_crash_box_active(player.team)
         {
             return None;
         }
@@ -40027,18 +39853,6 @@ impl WorldSnapshot {
         let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
-        // Count a forward option whenever the receiver is a genuinely playable visible target
-        // that is ahead of the ball — NOT only when a straight floor lane is uncontested. An
-        // advanced, OPEN runner with a trailing/already-beaten defender nominally near the lane
-        // (high `lane_interception_risk`, so a strict reception-won `actionable` reads false) is
-        // exactly the "good forward option the carrier failed to recognise" this revision fixes;
-        // demanding strict actionability here would re-introduce that blindness and would also
-        // diverge from the established option-scoring parity baseline. So the COUNT and the
-        // nearest-distance follow every forward visible target in both modes; only the openness/
-        // quality AGGREGATION takes the richer lane-aware (`forward_floor_outlet_assessment`)
-        // recognition under `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION` — gate OFF reproduces
-        // the legacy raw-openness aggregation byte-for-byte (parity suite default-off).
-        let recognition_on = dd_soccer_enable_forward_option_recognition();
         for target_id in visible_pass_targets {
             let Some(target) = self.players.iter().find(|player| player.id == *target_id) else {
                 continue;
@@ -40048,10 +39862,6 @@ impl WorldSnapshot {
             if forward <= 1.25 {
                 continue;
             }
-            visible_forward_pass_options += 1;
-            let distance = current.distance(target_position);
-            nearest_visible_forward_pass_distance_yards =
-                nearest_visible_forward_pass_distance_yards.min(distance);
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -40060,49 +39870,33 @@ impl WorldSnapshot {
                 target_position,
                 PassFlight::Floor,
             );
-            if recognition_on {
-                let outlet = forward_floor_outlet_assessment(forward, distance, &quality, true);
-                best_forward_pass_receiver_openness =
-                    best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
-                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
-                    forward_pass_option_quality(
-                        outlet.receiver_openness_for_score,
-                        quality.expected_completion,
-                    ),
-                );
-                // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
-                // advanced teammate. The lane-aware `quality_fit` already blends openness,
-                // completion, stride and upfield gain; weight it by the in-band distance fit.
-                if outlet.distance_fit > 0.0 {
-                    let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
-                    if value > best_quick_forward_open_value {
-                        best_quick_forward_open_value = value;
-                        best_quick_forward_target = Some(*target_id);
-                    }
-                }
-            } else {
-                best_forward_pass_receiver_openness =
-                    best_forward_pass_receiver_openness.max(quality.receiver_openness);
-                best_forward_pass_option_quality = best_forward_pass_option_quality.max(
-                    forward_pass_option_quality(
-                        quality.receiver_openness,
-                        quality.expected_completion,
-                    ),
-                );
-                // Legacy quick-forward value (raw openness × completion × upfield gain), kept
-                // byte-identical so the option-scoring parity suite is unchanged with the gate off.
-                let band_fit = quick_forward_pass_band_fit(distance);
-                if band_fit > 0.0 {
-                    let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
-                    let openness = quality.receiver_openness.clamp(0.0, 1.0);
-                    let completion = quality.expected_completion.clamp(0.0, 1.0);
-                    let value = (band_fit
-                        * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
-                        .clamp(0.0, 1.0);
-                    if value > best_quick_forward_open_value {
-                        best_quick_forward_open_value = value;
-                        best_quick_forward_target = Some(*target_id);
-                    }
+            let distance = current.distance(target_position);
+            let outlet =
+                forward_floor_outlet_assessment(forward, distance, &quality, true);
+            if !outlet.actionable {
+                continue;
+            }
+            visible_forward_pass_options += 1;
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(distance);
+            best_forward_pass_receiver_openness =
+                best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
+            best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                forward_pass_option_quality(
+                    outlet.receiver_openness_for_score,
+                    quality.expected_completion,
+                ),
+            );
+            // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
+            // advanced teammate. Reward openness × completion most, weight the in-band
+            // distance, and add a modest upfield-gain term so a more advanced open runner
+            // edges a square one. The ranked execution targets this player when the value
+            // wins (see `quick_forward_pass_target`).
+            if outlet.distance_fit > 0.0 {
+                let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
+                if value > best_quick_forward_open_value {
+                    best_quick_forward_open_value = value;
+                    best_quick_forward_target = Some(*target_id);
                 }
             }
         }
