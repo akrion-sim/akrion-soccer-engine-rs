@@ -39396,6 +39396,7 @@ impl WorldSnapshot {
                 teammates_ahead: 0,
                 visible_forward_pass_options: 0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 best_quick_forward_open_value: 0.0,
                 best_quick_forward_target: None,
