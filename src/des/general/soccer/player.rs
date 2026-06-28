@@ -12633,6 +12633,56 @@ mod forward_pass_first_tests {
 }
 
 #[cfg(test)]
+mod forward_option_recognition_tests {
+    use crate::des::general::soccer::forward_pass_option_quality;
+
+    #[test]
+    fn never_reports_below_raw_openness() {
+        // The revision only ADDS recognition; a legacy-open receiver is never downgraded,
+        // whatever the completability (so no existing forward read is lost).
+        for &open in &[0.0, 0.2, 0.45, 0.7, 1.0] {
+            for &completion in &[0.0, 0.3, 0.6, 1.0] {
+                let q = forward_pass_option_quality(open, completion);
+                assert!(q >= open - 1e-9, "open={open} completion={completion} q={q}");
+                assert!((0.0..=1.0).contains(&q), "q out of range: {q}");
+            }
+        }
+    }
+
+    #[test]
+    fn clear_lane_lifts_a_moderately_open_runner_above_threshold() {
+        // The defect case: an advanced runner with only MODERATE nearest-opponent openness
+        // but a clear, completable lane should now read as a GOOD forward option (>= 0.5),
+        // whereas raw openness alone (0.30) would have it dismissed.
+        let raw_open = 0.30;
+        let recognised = forward_pass_option_quality(raw_open, 0.95);
+        assert!(raw_open < 0.45, "precondition: raw openness is below the release threshold");
+        assert!(
+            recognised >= 0.5,
+            "a clear lane to an advanced runner is recognised: {recognised}"
+        );
+    }
+
+    #[test]
+    fn blocked_lane_does_not_manufacture_a_false_option() {
+        // A receiver with space around them but a BLOCKED lane (low completion) must not be
+        // inflated into a good option beyond what their own openness already implies.
+        let open = 0.40;
+        let q = forward_pass_option_quality(open, 0.05);
+        assert!((q - open).abs() < 1e-9, "blocked lane keeps the raw openness: {q}");
+    }
+
+    #[test]
+    fn rises_monotonically_with_completability() {
+        let open = 0.30;
+        let low = forward_pass_option_quality(open, 0.2);
+        let mid = forward_pass_option_quality(open, 0.6);
+        let high = forward_pass_option_quality(open, 0.95);
+        assert!(low <= mid && mid <= high, "more completable ⇒ better: {low} {mid} {high}");
+    }
+}
+
+#[cfg(test)]
 mod shot_foot_choice_tests {
     use super::shot_foot_choice;
     use crate::des::general::soccer::{tunables, SkillProfile};
