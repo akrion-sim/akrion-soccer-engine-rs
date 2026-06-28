@@ -18049,7 +18049,7 @@ impl SoccerMatch {
             other.team == passer.team
                 && other.id != player_id
                 && other.role != PlayerRole::Goalkeeper
-                && (self.player_snapshot_position(other).y - origin.y) * attack_dir > 0.0
+                && (other.position.y - origin.y) * attack_dir > 0.0
         });
         !teammate_ahead
     }
