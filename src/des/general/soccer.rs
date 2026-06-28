@@ -17145,7 +17145,7 @@ pub(crate) enum SoccerRewardEventKind {
     /// ball up for support. The direct learning signal that trains the policy off the
     /// "no outlet ⇒ pass backwards" blunder. Emitted only when
     /// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` is on. See
-    /// [`isolated_attacking_carrier_drive_mode`](crate::des::general::soccer::player::isolated_attacking_carrier_drive_mode).
+    /// `isolated_attacking_carrier_drive_mode` in the `player` module.
     IsolatedCarrierPanicBackPass,
     MatchResult,
 }
