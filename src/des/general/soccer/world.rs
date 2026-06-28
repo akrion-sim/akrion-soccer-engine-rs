@@ -26937,6 +26937,8 @@ impl WorldSnapshot {
                 .unwrap_or(0.0),
             best_forward_pass_receiver_openness: forward_support_context
                 .best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality: forward_support_context
+                .best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
