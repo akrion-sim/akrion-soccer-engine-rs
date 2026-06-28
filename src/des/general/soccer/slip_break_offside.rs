@@ -35,6 +35,9 @@ pub(crate) const SLIP_BREAK_RELEASE_WINDOW_YARDS: f64 = 2.5;
 /// A forward closing speed (yd/s) at/above which the runner is clearly *sprinting* onto the ball;
 /// the release-timing strength scales up to full at this speed.
 pub(crate) const SLIP_BREAK_SPRINT_REFERENCE_YPS: f64 = 6.0;
+/// Speed differential (yd/s, runner-vs-line in the attacking direction) at which the runner's
+/// advantage over the back line saturates: he will clearly win the race into the space behind.
+pub(crate) const SLIP_BREAK_SPEED_ADVANTAGE_REFERENCE_YPS: f64 = 4.0;
 
 /// Firm ground-pass speed band for the slip: 25–35 mph. Short slips sit near the floor; longer
 /// threaded balls are driven harder so they beat the recovering defender to the space.
