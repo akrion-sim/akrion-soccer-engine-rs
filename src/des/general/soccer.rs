@@ -114,9 +114,6 @@ pub const DEFAULT_BALL_GRASS_RESISTANCE_YPS2: f64 = 0.96;
 pub const DEFAULT_BALL_STOP_SPEED_YPS: f64 = 0.55;
 pub const DEFAULT_PLAYER_VISION_SKILL: f64 = 7.6;
 pub const DEFAULT_CONTROLLER_DEBOUNCE_MS: u64 = 4;
-const ACTION_LABEL_RECOVER: &str = "recover";
-const TRACE_REACTIVE_GROUND_PASS: &str = "reactive-ground-pass";
-const TRACE_TRAP_CONTROLLABLE_TRAJECTORY: &str = "trap-controllable-trajectory";
 const PLAYER_CONTROL_RADIUS_YARDS: f64 = 1.55;
 // First-touch settle cap: when a player gains control of a ball from a distance
 // (within the control radius but not at their feet), the held ball is drawn in to
@@ -151,10 +148,6 @@ const KINEMATIC_GATE_MIN_BALL_SPEED_YPS: f64 = 10.0;
 // predicts the same sprint-reach interceptions the physics resolver makes (a defender
 // stationary NOW but able to step into the lane), minus a beat for human reaction.
 const PASS_LANE_INTERCEPT_REACTION_SECONDS: f64 = 0.22;
-/// Per-player POMDP reaction window. Everyone carries a bounded human response delay; defenders
-/// with better tracking and fresher legs sit nearer 100ms, tired/low-read defenders nearer 250ms.
-const PLAYER_POMDP_REACTION_MIN_SECONDS: f64 = 0.10;
-const PLAYER_POMDP_REACTION_MAX_SECONDS: f64 = 0.25;
 // Cap on the interception sprint window. A defender only realistically steps into a lane in
 // the brief moment the ball is passing near them — they cannot read a pass and hold a perfect
 // perpendicular sprint for the WHOLE flight of a long ball. Without this cap, a far-along lane
@@ -725,20 +718,6 @@ const PLAYER_BASE_VISION_RANGE_YARDS: f64 = 28.0;
 const PLAYER_VISION_RANGE_BONUS_YARDS: f64 = 28.0;
 const PLAYER_BASE_FIELD_OF_VIEW_DEGREES: f64 = 168.0;
 const PLAYER_FIELD_OF_VIEW_BONUS_DEGREES: f64 = 64.0;
-const BALL_HOLDER_CORE_VISION_DEGREES: f64 = 100.0;
-const BALL_HOLDER_SHOULDER_VISION_DEGREES: f64 = 40.0;
-const BALL_HOLDER_CORE_POSITION_CONFIDENCE: f64 = 0.90;
-const BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE: f64 = 0.70;
-const KALMAN_PERCEPTION_POINT_MATCH_RADIUS_YARDS: f64 = 0.35;
-const KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES: usize = 2;
-const KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS: f64 = 0.15;
-const KALMAN_PERCEPTION_BASE_SIGMA_YARDS: f64 = 0.85;
-const KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS: f64 = 0.10;
-const KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS: f64 = 0.14;
-const KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE: f64 = 0.96;
-const KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE: f64 = 0.88;
-const KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE: f64 = 0.68;
-const KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE: f64 = 0.58;
 const PERCEPTION_OCCLUSION_BODY_RADIUS_YARDS: f64 = 1.15;
 const PERCEPTION_OCCLUSION_FULL_BLOCK_YARDS: f64 = 0.42;
 const PERCEPTION_OCCLUSION_VISIBILITY_CUTOFF: f64 = 0.82;
@@ -1930,26 +1909,22 @@ const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
 const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
-// along the attacking axis; the line normally sits BEHIND the ball). The live contract is simple:
-// keep the line 10-30yd goal-side of the ball. The LP/formation nudge shifts the whole line to
-// restore the band. Near our own goal the band is relaxed (the minimum standoff is waived within
-// 20yd so the line may sit level with the ball on top of the box) and fully suspended inside the
-// team's own emergency 5-yard goal-line zone where parity with the ball is allowed.
+// along the attacking axis; the line normally sits BEHIND the ball). Past the 15+20yd shelf the
+// line holds 20-40yd goal-side of the ball. From 15-35yd out, that band compresses onto the
+// 15-yard line unless the ball is already behind it or clearly headed there; inside 6yd the
+// six-yard sticky floor takes over because the keeper controls the space behind it.
 const DEFENSIVE_LINE_MAX_GAP_IN_POSSESSION_YARDS: f64 = 15.0;
 // The line nudge is receding-horizon: every tick it aims the non-exempt defenders at
 // the average correction that would make the back four legal within this many seconds.
 const DEFENSIVE_LINE_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
-// THE rule: the back four's average sits 10-30yd behind (goal-side of) the ball, always,
-// outside the near-goal relaxation below. The deep edge (30) matches the emergency break-cover
-// cap `DEFENSIVE_MAX_BEHIND_BALL_YARDS`, so a line-break retreat is never clamped shallower than
-// the cover it is trying to provide. (Tournament genomes permute the min/max within this band.)
-const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 10.0;
-const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 30.0;
-// ...but the 10yd MINIMUM standoff is waived once the ball is this close to our own goal:
-// defending on top of our own box we hold level with / goal-side of the ball rather than
-// being forced a full 10yd off it (which would shove the line into the six-yard box / off
-// the end-line). The 30yd maximum (capped by room to our own goal) still applies.
-const DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS: f64 = 20.0;
+// THE rule: the back four's average sits 20-40yd behind (goal-side of) the ball once
+// the ball is far enough upfield. The 15yd shelf below prevents that cushion from
+// dragging the whole line too deep around the top of the box.
+const DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS: f64 = 20.0;
+const DEFENSIVE_LINE_MAX_BEHIND_BALL_YARDS: f64 = 40.0;
+const DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS: f64 = 15.0;
+const DEFENSIVE_LINE_FULL_CUSHION_DEPTH_FROM_OWN_GOAL_YARDS: f64 =
+    DEFENSIVE_LINE_SHELF_DEPTH_FROM_OWN_GOAL_YARDS + DEFENSIVE_LINE_MIN_BEHIND_BALL_YARDS;
 // When the offside law is NOT in force — the ball is being played DIRECTLY from a throw-in (the
 // common case), goal kick, or corner kick (Law 11) — the back four cannot hold a high offside
 // trap: an attacker may legally lurk goal-side of the line, so trapping leaves a runner free in
@@ -1969,16 +1944,14 @@ const DEFENSIVE_LINE_GRACE_JOG_YARDS: f64 = 7.0;
 const LINE_SHAPE_SPRINT_TRAVEL_YARDS: f64 = 8.0;
 // Hard cap on how far the back four's AVERAGE may press upfield now lives in
 // `tunables().defensive_shape.defensive_line_max_into_opp_half_yards`.
-// The back-four band is FULLY suspended only inside the defending team's own 5-yard emergency
-// zone (a ball on the goal-line may be played at parity rather than forcing the line off the
-// end-line). Between there and DEFENSIVE_LINE_MIN_RELAX_NEAR_OWN_GOAL_YARDS the band still holds,
-// but with its minimum standoff relaxed (the line may sit level with the ball, just not ahead).
+// The back-four band is fully suspended only inside the defending team's own 5-yard emergency
+// zone. Above that, the 15yd shelf holds until the ball crosses it or is clearly headed under it.
 const DEFENSIVE_LINE_BAND_OWN_GOAL_EXEMPT_YARDS: f64 = 5.0;
 const DEFENSIVE_LINE_MIN_GAP_GROUNDED_YARDS: f64 = 2.0;
 const DEFENSIVE_LINE_MIN_GAP_TRANSIT_YARDS: f64 = 2.0;
 // Neutral evolved maximum when not in possession; used as the scale anchor for
 // the tighter in-possession cap.
-const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 30.0;
+const DEFENSIVE_LINE_MAX_GAP_NOT_IN_POSSESSION_YARDS: f64 = 40.0;
 // Offside line flatness: when defending, the back four holds a FLAT line so it presents a clean
 // offside trap — the total fore-aft (along-attacking-axis) spread between the four is kept within
 // this many yards (each defender within ±half of it of the line average). Eased toward level over
@@ -2029,8 +2002,6 @@ const SHAPE_CONSISTENCY_CLOSE_BALL_YARDS: f64 = 18.0;
 const SHAPE_CONSISTENCY_FAR_BALL_YARDS: f64 = 58.0;
 const SHAPE_CONSISTENCY_CLOSE_SECONDS: f64 = 1.0;
 const SHAPE_CONSISTENCY_FAR_SECONDS: f64 = 5.0;
-// In possession the line may push up, but no more than ~5yd past the halfway line.
-const DEFENSIVE_LINE_MAX_PAST_HALFWAY_YARDS: f64 = 5.0;
 // The back-four line anchors to where the ball is HEADED, not just where it is now:
 // project the ball forward by this many seconds (position + velocity + accel + jerk)
 // and never sit more than the not-in-possession max gap behind that predicted point.
@@ -2839,6 +2810,15 @@ const GUARANTEED_FLOOR_TRAP_RADIUS_YARDS: f64 = 1.5;
 // touch that player before continuing to a later receiver. This is deliberately a
 // segment-level contact radius, not a scored reception preference.
 const LOW_PASS_BODY_INTERCEPT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.20;
+const TEAMMATE_DUMMY_PASS_MIN_TOTAL_YARDS: f64 = 14.0;
+const TEAMMATE_DUMMY_PASS_MIN_FROM_PASSER_YARDS: f64 = 4.0;
+const TEAMMATE_DUMMY_PASS_MIN_BEYOND_YARDS: f64 = 7.0;
+const TEAMMATE_DUMMY_PASS_LANE_GAP_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.35;
+const TEAMMATE_CLEAR_PASS_LANE_DETECTION_RADIUS_YARDS: f64 =
+    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS + 0.50;
+const TEAMMATE_CLEAR_PASS_LANE_TARGET_GAP_YARDS: f64 =
+    REACTIVE_GROUND_PASS_CONTROL_RADIUS_YARDS + 1.10;
+const TEAMMATE_DUMMY_PASS_MIN_RECEIVER_OPENNESS: f64 = 0.22;
 // Ground passes within this two-yard lane are controllable when reaction-delayed
 // reach says the player can trap them. Wider than body contact: it covers the step
 // or lunge onto a rolling pass that would otherwise ghost through a nearby player.
@@ -12280,6 +12260,8 @@ fn is_attacking_support_action_label(action: &str) -> bool {
                 | SupportScreen
                 | VerticalAttack
                 | VacateSpace
+                | DummyClearLane
+                | DummyLetRun
                 | OneTwoRun
         )
     )
@@ -36318,7 +36300,7 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         WallPass => "wall-pass",
         CornerFlagCross => "corner-flag-cross",
         VerticalAttack | RunInBehind | ExploitSpaceRun => "vertical-attack",
-        VacateSpace | SupportScreen => "vacate-space",
+        VacateSpace | SupportScreen | DummyClearLane | DummyLetRun => "vacate-space",
         SurprisePass => "surprise-pass",
         ScoopPass => "scoop-pass",
         FlickOn => "flick-on",
@@ -36989,9 +36971,9 @@ fn soccer_neural_extended_observation(
             if distance.is_finite() =>
         {
             let reaction_delay = player_pomdp_reaction_delay_seconds(read_skill, fatigue);
-            let reaction_fit = ((reaction_delay - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS)
-                    .max(1e-6))
+            let perception = &tunables().pomdp_perception;
+            let reaction_fit = ((reaction_delay - perception.player_reaction_min_seconds)
+                / perception.player_reaction_span_seconds())
             .clamp(0.0, 1.0);
             let on_ball = snapshot.ball.holder == Some(me.id);
             let forward_off = (position.y - me_position.y) * attack_dir;
@@ -37996,9 +37978,10 @@ fn soccer_neural_transition_features_with_action(
             soccer_neural_unit(lane_norm);
         features[SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK] = soccer_neural_unit(freeze_risk);
     }
+    let perception = &tunables().pomdp_perception;
     let reaction_norm = ((obs.neural_extended.nearest_defender_reaction_delay_seconds
-        - PLAYER_POMDP_REACTION_MIN_SECONDS)
-        / (PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS).max(1e-6))
+        - perception.player_reaction_min_seconds)
+        / perception.player_reaction_span_seconds())
     .clamp(0.0, 1.0);
     features[SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT] =
         soccer_neural_unit(obs.neural_extended.nearest_defender_overcommit_score);
@@ -38026,7 +38009,10 @@ fn soccer_neural_transition_features_with_action(
         PERCEPTION_NOISE_MAX_YARDS,
     );
     features[SOCCER_NEURAL_FEATURE_PERCEPTION_LATENCY] =
-        soccer_neural_scaled(obs.perception_latency_seconds.max(0.0), 0.25);
+        soccer_neural_scaled(
+            obs.perception_latency_seconds.max(0.0),
+            perception_latency_upper_bound_seconds(),
+        );
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_FORWARD] =
         soccer_neural_scaled(obs.own_team_center_of_mass_forward_yards, 60.0);
     features[SOCCER_NEURAL_FEATURE_OWN_TEAM_COM_LATERAL] =
@@ -51736,6 +51722,59 @@ fn player_field_of_view(player: &PlayerSnapshot) -> f64 {
     }
 }
 
+fn ball_holder_shoulder_scan_limit_degrees() -> f64 {
+    tunables()
+        .pomdp_perception
+        .ball_holder_shoulder_scan_limit_degrees()
+}
+
+fn ball_holder_head_scan_fraction(angle_degrees: f64) -> f64 {
+    let shoulder_limit = ball_holder_shoulder_scan_limit_degrees();
+    let span = (180.0 - shoulder_limit).max(1.0);
+    ((angle_degrees - shoulder_limit) / span).clamp(0.0, 1.0)
+}
+
+fn ball_holder_head_scan_delay_seconds(angle_degrees: f64, vision: f64) -> f64 {
+    if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
+        return 0.0;
+    }
+    let perception = &tunables().pomdp_perception;
+    let scan = ball_holder_head_scan_fraction(angle_degrees);
+    let max_seconds = perception.ball_holder_head_scan_max_seconds
+        - ability01(vision) * perception.ball_holder_head_scan_vision_relief_seconds;
+    (perception.ball_holder_head_scan_min_seconds
+        + scan * (max_seconds - perception.ball_holder_head_scan_min_seconds).max(0.0))
+    .clamp(
+        perception.ball_holder_head_scan_min_seconds,
+        perception.ball_holder_head_scan_max_seconds,
+    )
+}
+
+fn ball_holder_head_scan_position_confidence(angle_degrees: f64, vision: f64) -> f64 {
+    let perception = &tunables().pomdp_perception;
+    if angle_degrees <= perception.ball_holder_core_degrees * 0.5 {
+        perception.ball_holder_core_confidence
+    } else if angle_degrees <= ball_holder_shoulder_scan_limit_degrees() {
+        perception.ball_holder_shoulder_confidence
+    } else {
+        let scan = ball_holder_head_scan_fraction(angle_degrees);
+        let base = perception.ball_holder_side_scan_confidence
+            + (perception.ball_holder_rear_scan_confidence
+                - perception.ball_holder_side_scan_confidence)
+                * scan;
+        (base + ability01(vision) * perception.ball_holder_scan_confidence_vision_bonus).clamp(
+            perception.ball_holder_rear_scan_confidence,
+            perception.ball_holder_scan_confidence_cap,
+        )
+    }
+}
+
+fn perception_latency_upper_bound_seconds() -> f64 {
+    tunables()
+        .pomdp_perception
+        .perception_latency_upper_bound_seconds()
+}
+
 fn average_player_position_confidence<I>(
     snapshot: &WorldSnapshot,
     observer_id: usize,
@@ -51844,17 +51883,7 @@ fn position_confidence_for_observer(
             let dot = facing.dot(to_point.normalized());
             if observer_has_ball {
                 let angle = dot.clamp(-1.0, 1.0).acos().to_degrees();
-                if angle <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 {
-                    BALL_HOLDER_CORE_POSITION_CONFIDENCE
-                } else if angle
-                    <= BALL_HOLDER_CORE_VISION_DEGREES * 0.5 + BALL_HOLDER_SHOULDER_VISION_DEGREES
-                {
-                    BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE
-                } else if dot >= 0.0 {
-                    0.42
-                } else {
-                    0.24
-                }
+                ball_holder_head_scan_position_confidence(angle, observer.skills.vision)
             } else {
                 let half_fov_cos = (player_field_of_view(observer).to_radians() * 0.5).cos();
                 if dot >= half_fov_cos {
@@ -51888,7 +51917,8 @@ fn kalman_perception_position_confidence(
     observer_has_ball: bool,
 ) -> f64 {
     let measurement = finite_metric(measurement_confidence).clamp(0.0, 1.0);
-    if target_history.len() < KALMAN_PERCEPTION_MIN_HISTORY_SAMPLES {
+    let perception = &tunables().pomdp_perception;
+    if target_history.len() < perception.kalman_min_history_samples {
         return measurement;
     }
 
@@ -51912,17 +51942,17 @@ fn kalman_perception_position_confidence(
     let target_velocity = finite_vec2(target_velocity, history_velocity);
     let blended_velocity = history_velocity * 0.65 + target_velocity * 0.35;
     let prediction =
-        if latest.distance(target_position) <= KALMAN_PERCEPTION_CURRENT_SAMPLE_EPSILON_YARDS {
+        if latest.distance(target_position) <= perception.kalman_current_sample_epsilon_yards {
             previous + history_velocity * dt
         } else {
             latest + blended_velocity * dt
         };
     let innovation_yards = prediction.distance(target_position);
     let velocity_disagreement = history_velocity.distance(target_velocity);
-    let sigma_yards = (KALMAN_PERCEPTION_BASE_SIGMA_YARDS
-        + history_velocity.len().clamp(0.0, 12.0) * KALMAN_PERCEPTION_SPEED_SIGMA_PER_YPS * dt
+    let sigma_yards = (perception.kalman_base_sigma_yards
+        + history_velocity.len().clamp(0.0, 12.0) * perception.kalman_speed_sigma_per_yps * dt
         + velocity_disagreement.clamp(0.0, 12.0)
-            * KALMAN_PERCEPTION_VELOCITY_DISAGREEMENT_SIGMA_YARDS
+            * perception.kalman_velocity_disagreement_sigma_yards
             * dt)
         .clamp(0.55, 5.0);
     let prediction_fit = (1.0 / (1.0 + (innovation_yards / sigma_yards).powi(2))).clamp(0.0, 1.0);
@@ -51930,14 +51960,14 @@ fn kalman_perception_position_confidence(
         return measurement;
     }
 
-    let prediction_cap = if measurement >= BALL_HOLDER_SHOULDER_POSITION_CONFIDENCE {
-        KALMAN_PERCEPTION_VISIBLE_MAX_CONFIDENCE
+    let prediction_cap = if measurement >= perception.ball_holder_shoulder_confidence {
+        perception.kalman_visible_max_confidence
     } else if in_front {
-        KALMAN_PERCEPTION_FRONT_MAX_CONFIDENCE
+        perception.kalman_front_max_confidence
     } else if observer_has_ball {
-        KALMAN_PERCEPTION_BALL_HOLDER_OCCLUDED_MAX_CONFIDENCE
+        perception.kalman_ball_holder_occluded_max_confidence
     } else {
-        KALMAN_PERCEPTION_OCCLUDED_MAX_CONFIDENCE
+        perception.kalman_occluded_max_confidence
     };
     let predicted_confidence = prediction_fit.min(prediction_cap);
     let prediction_uncertainty = (1.0 - predicted_confidence).clamp(0.04, 0.96);
@@ -55639,13 +55669,79 @@ fn goalkeeper_for_players(players: &[PlayerAgent], team: Team) -> Option<usize> 
 fn last_recover_target_for_player(player: &PlayerAgent) -> Option<Vec2> {
     let decision = player.last_decision.as_ref()?;
     let label = normalize_soccer_action_label(&decision.action);
-    if !matches!(label, ACTION_LABEL_RECOVER | "fifty-fifty-duel") {
+    if !matches!(label, ACTION_LABEL_RECOVER | FIFTY_FIFTY_DUEL_ACTION_LABEL) {
         return None;
     }
     decision
         .action_target
         .as_ref()
         .and_then(|target| target.point)
+}
+
+fn teammate_dummy_pass_lane_geometry_applies(
+    from: Vec2,
+    to: Vec2,
+    middle: Vec2,
+    receiver_openness: f64,
+    lane_gap_yards: f64,
+) -> bool {
+    let lane = to - from;
+    let lane_len = lane.len();
+    if lane_len < TEAMMATE_DUMMY_PASS_MIN_TOTAL_YARDS {
+        return false;
+    }
+    let projection = segment_projection_factor(from, to, middle);
+    if !(0.0..1.0).contains(&projection) {
+        return false;
+    }
+    let along = lane_len * projection;
+    let beyond = lane_len - along;
+    if along < TEAMMATE_DUMMY_PASS_MIN_FROM_PASSER_YARDS
+        || beyond < TEAMMATE_DUMMY_PASS_MIN_BEYOND_YARDS
+    {
+        return false;
+    }
+    if segment_distance_to_point(from, to, middle) > lane_gap_yards {
+        return false;
+    }
+    receiver_openness >= TEAMMATE_DUMMY_PASS_MIN_RECEIVER_OPENNESS
+}
+
+fn pending_pass_dummy_through_applies_for_agent(
+    player: &PlayerAgent,
+    players: &[PlayerAgent],
+    pass: &PendingPass,
+    control_point: Vec2,
+) -> bool {
+    if player.team != pass.team
+        || player.role == PlayerRole::Goalkeeper
+        || pass.from == player.id
+        || pass.target == Some(player.id)
+        || !matches!(pass.flight, PassFlight::Floor)
+    {
+        return false;
+    }
+    let Some(receiver_id) = pass.target else {
+        return false;
+    };
+    let Some(receiver) = players.iter().find(|p| p.id == receiver_id) else {
+        return false;
+    };
+    if receiver.team != pass.team || receiver.role == PlayerRole::Goalkeeper {
+        return false;
+    }
+    if segment_distance_to_point(pass.origin, pass.intended_target, control_point)
+        > TEAMMATE_CLEAR_PASS_LANE_DETECTION_RADIUS_YARDS
+    {
+        return false;
+    }
+    teammate_dummy_pass_lane_geometry_applies(
+        pass.origin,
+        pass.intended_target,
+        player.position,
+        pass.receiver_openness,
+        TEAMMATE_DUMMY_PASS_LANE_GAP_YARDS,
+    )
 }
 
 fn nearest_opponent_distance_to_point(players: &[PlayerAgent], team: Team, point: Vec2) -> f64 {
@@ -55757,6 +55853,11 @@ fn nearest_ball_controller_for_segment_with_guard(
         } else {
             ball_pos
         };
+        if pending_pass.is_some_and(|pass| {
+            pending_pass_dummy_through_applies_for_agent(p, players, pass, control_point)
+        }) {
+            continue;
+        }
         if let Some(pass) = pending_pass {
             let is_target = pass.target == Some(p.id);
             let progress = pass_progress_along_path(pass, control_point);
@@ -56784,6 +56885,16 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                     .wide_possession_outlet_target_for(player_id, player.home_position)
                     .is_some()
         }
+        "dummy-clear-lane" => {
+            !observation.has_ball
+                && snapshot.controlled_possession_team() == Some(player.team)
+                && snapshot
+                    .teammate_pass_lane_clearance_target_for(player_id)
+                    .is_some()
+        }
+        "dummy-let-run" => {
+            !observation.has_ball && snapshot.teammate_dummy_let_run_target_for(player_id).is_some()
+        }
         "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
         | "support-screen" | "vacate-space" | "support-shape" | "support-roam" => {
             !observation.has_ball && snapshot.controlled_possession_team() == Some(player.team)
@@ -57497,10 +57608,11 @@ pub(crate) fn dd_soccer_enable_aerobic_anaerobic_speed_split() -> bool {
 fn player_pomdp_reaction_delay_seconds(read_skill: f64, fatigue: f64) -> f64 {
     let read = ability01(read_skill);
     let fatigue_drag = fatigue.clamp(0.0, 1.0);
-    let span = PLAYER_POMDP_REACTION_MAX_SECONDS - PLAYER_POMDP_REACTION_MIN_SECONDS;
-    (PLAYER_POMDP_REACTION_MAX_SECONDS - span * read + fatigue_drag * span * 0.36).clamp(
-        PLAYER_POMDP_REACTION_MIN_SECONDS,
-        PLAYER_POMDP_REACTION_MAX_SECONDS,
+    let perception = &tunables().pomdp_perception;
+    let span = perception.player_reaction_span_seconds();
+    (perception.player_reaction_max_seconds - span * read + fatigue_drag * span * 0.36).clamp(
+        perception.player_reaction_min_seconds,
+        perception.player_reaction_max_seconds,
     )
 }
 

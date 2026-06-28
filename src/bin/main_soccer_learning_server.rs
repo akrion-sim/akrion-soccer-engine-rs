@@ -1266,10 +1266,15 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() {
+    let service_name = "main_soccer_learning_server";
+    let _telemetry = soccer_engine::telemetry::init_soccer_telemetry(service_name);
+    soccer_engine::telemetry::emit_process_start(service_name);
     if let Err(err) = run() {
+        soccer_engine::telemetry::emit_process_error(service_name, &err.to_string());
         eprintln!("main_soccer_learning_server: {err}");
         std::process::exit(1);
     }
+    soccer_engine::telemetry::emit_process_complete(service_name);
 }
 
 #[cfg(test)]

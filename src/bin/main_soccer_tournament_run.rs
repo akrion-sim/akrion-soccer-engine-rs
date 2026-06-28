@@ -553,7 +553,7 @@ fn promote_salvaged_brain(
     Ok(policy_version_id)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
 
     // Tournament shape: defaults to the 128-team format (32 groups of 4, top-2 →
@@ -1009,6 +1009,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     release_tournament_run_lock_if_held(&mut store, tournament_lock_held, &tournament_lock_key);
 
     Ok(())
+}
+
+fn main() {
+    let service_name = "main_soccer_tournament_run";
+    let _telemetry = soccer_engine::telemetry::init_soccer_telemetry(service_name);
+    soccer_engine::telemetry::emit_process_start(service_name);
+    if let Err(error) = run() {
+        soccer_engine::telemetry::emit_process_error(service_name, &error.to_string());
+        eprintln!("main_soccer_tournament_run: {error}");
+        std::process::exit(1);
+    }
+    soccer_engine::telemetry::emit_process_complete(service_name);
 }
 
 #[cfg(test)]
