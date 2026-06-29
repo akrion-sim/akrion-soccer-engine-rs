@@ -22182,6 +22182,27 @@ fn dense_soccer_transition_reward(
         let after_fit = attacking_support_shape_fit(&after_obs);
         reward += (after_fit - before_fit).clamp(-1.0, 1.0) * ATTACK_SUPPORT_SPACING_SHAPE_REWARD;
     }
+    // TEAM UPFIELD ADVANCE (MARL / MAPPO): when we control the ball and the carrier has space to
+    // advance into, reward the WHOLE team for pushing forward as a unit — the carrier for driving
+    // the ball on into the space ("take the space"), and every off-ball teammate for making a
+    // forward supporting run ("whole team moves forward"). The cue is evaluated on the BEFORE
+    // snapshot so the reward credits the action that advanced the team, and progress is clamped to
+    // a reference distance so a single burst can't farm reward. Gated (default-on) by
+    // `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`; OFF ⇒ this term vanishes (byte-identical parity).
+    if team_advance_upfield_enabled()
+        && before_possession == Some(player.team)
+        && before.team_advance_upfield_active(player.team).is_some()
+    {
+        if before.ball.holder == Some(player.id) {
+            if ball_forward > 0.0 {
+                reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                    * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
+            }
+        } else if player.role != PlayerRole::Goalkeeper && player_forward > 0.0 {
+            reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+        }
+    }
     if player.role == PlayerRole::Midfielder
         && (before.ball.holder == Some(player.id) || after.ball.holder == Some(player.id))
         && (before_possession == Some(player.team) || after_possession == Some(player.team))
