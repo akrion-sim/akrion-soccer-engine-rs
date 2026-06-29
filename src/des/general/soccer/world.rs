@@ -46837,3 +46837,27 @@ impl WorldSnapshot {
             || (self.ball.holder.is_none() && self.ball.last_touch_player == Some(player_id))
     }
 }
+
+/// Decision-compute cadence (max, window) in ticks: a player runs the expensive planning pass
+/// (MDP/POMDP + MPC/QP) on at most `max` of every `window` ticks; in between it executes its held
+/// optimal plan (movement + ball still advance every tick). Default 3-of-7 (~150ms reaction floor
+/// at dt=1/15, back-to-back allowed) — the MPC receding-horizon "plan slow, execute fast" pattern,
+/// so control stays optimal for the live game (learning off, frozen-policy inference + MPC). Set
+/// `window <= max` (or `SOCCER_DECISION_CADENCE_WINDOW_TICKS=0`) to disable (plan every tick).
+/// Tunable: `SOCCER_DECISION_CADENCE_MAX`, `SOCCER_DECISION_CADENCE_WINDOW_TICKS`.
+pub(crate) fn soccer_decision_cadence_max_window() -> (u64, u64) {
+    use std::sync::OnceLock;
+    static V: OnceLock<(u64, u64)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let max = std::env::var("SOCCER_DECISION_CADENCE_MAX")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3);
+        let window = std::env::var("SOCCER_DECISION_CADENCE_WINDOW_TICKS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(7);
+        (max, window)
+    })
+}
