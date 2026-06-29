@@ -45123,10 +45123,20 @@ impl WorldSnapshot {
         let ball_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, self.field_length);
         let desired_gap = self.back_four_desired_gap_yards(team);
         let six = self.back_four_six_yard_line_target_depth(team);
-        let max_depth = self.field_length * 0.5
+        let mut max_depth = self.field_length * 0.5
             + tunables()
                 .defensive_shape
                 .defensive_line_max_into_opp_half_yards;
+        // Team upfield advance: while WE control the ball and are advancing as a unit in the
+        // opponent half, let the back four step up beyond its normal into-opp-half cap so the team
+        // stays compact and connected behind the attack instead of leaving a stretched gap. Bounded
+        // by `TEAM_ADVANCE_LINE_PUSH_YARDS`; the flat offside trap is already lifted while we hold
+        // (see `back_four_line_depth_v2_adjusted_y`), and this reverts the instant possession ends.
+        if ball_depth > self.field_length * 0.5
+            && self.team_advance_upfield_active(team).is_some()
+        {
+            max_depth += TEAM_ADVANCE_LINE_PUSH_YARDS;
+        }
         let centre_depth = back_four_line_target_depth_v2(
             ball_depth,
             desired_gap,
