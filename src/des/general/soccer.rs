@@ -60081,8 +60081,19 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 // retained only for signature compatibility; it no longer drives
                 // live-match randomness.
                 skills: {
-                    let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
-                    SkillProfile::for_shirt(shirt, role)
+                    if seed_varied_skills_enabled() {
+                        // A/B MEASUREMENT ONLY: the heuristic match is otherwise fully
+                        // deterministic (skills/positions keyed on player id, `config.seed`
+                        // inert), so multi-seed runs are byte-identical — n=1 scenario. Mixing
+                        // `config.seed` into the skill jitter makes each seed an INDEPENDENT
+                        // match. Both A/B arms share a seed ⇒ identical skills ⇒ the feature
+                        // gate is the only difference. Off (default) ⇒ byte-identical to the
+                        // deterministic build (same `blended` rng draw is still consumed).
+                        SkillProfile::blended((id as u64 ^ config.seed as u64) as usize, role, _rng)
+                    } else {
+                        let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
+                        SkillProfile::for_shirt(shirt, role)
+                    }
                 },
                 fatigue: 0.0,
                 controller_slot: None,
