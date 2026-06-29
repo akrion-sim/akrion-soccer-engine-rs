@@ -23233,6 +23233,7 @@ impl WorldSnapshot {
             || self.front_line_carrier_support_cue(team).is_some()
             || self.uncontested_carrier_advancing(team).is_some()
             || self.carrier_is_foremost_teammate(team).is_some()
+            || self.team_advance_upfield_active(team).is_some()
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
