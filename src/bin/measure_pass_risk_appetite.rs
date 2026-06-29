@@ -124,7 +124,7 @@ fn main() {
 
     for s in 0..seeds {
         let config = MatchConfig {
-            seed: 0x5EED_0000u32.wrapping_add(s as u32),
+            seed: seed_base.wrapping_add(s as u32),
             ..MatchConfig::default()
         };
         let mut sim = SoccerMatch::default_11v11(config);
