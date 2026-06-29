@@ -23799,7 +23799,8 @@ impl WorldSnapshot {
         let flow_score = (lane_tunables.flow_base_score
             + (current_gap - predicted_gap) * lane_tunables.flow_gap_weight)
             .clamp(lane_tunables.flow_min_score, lane_tunables.flow_max_score);
-        let occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
+        let occupancy = precomputed_occupancy
+            .unwrap_or_else(|| self.candidate_occupancy_at(player.team, target, Some(player.id)));
         let teammate_space = (1.0 - occupancy.teammate_occupied_space_pressure()).clamp(0.0, 1.0);
         let open_space = (occupancy.open_space_score
             / lane_tunables.field_open_space_normalizer_yards)
