@@ -30359,6 +30359,12 @@ impl WorldSnapshot {
                     .unwrap_or(position);
                 let forward = (anticipated_position.y - me_position.y) * me.team.attack_dir();
                 let receiver_distance = me_position.distance(position);
+                // A sub-3yd pass is illegal: a needless touch that neither escapes pressure nor
+                // progresses, and a frequent source of turnovers. Filter it out entirely rather
+                // than relying on a soft down-weight. Gated default-ON (byte-identical when off).
+                if dd_soccer_enable_min_pass_distance() && receiver_distance < MIN_LEGAL_PASS_YARDS {
+                    return None;
+                }
                 if own_half
                     && own_half_progressive_floor_outlet_available
                     && receiver_distance < OWN_HALF_TINY_PASS_MAX_YARDS
