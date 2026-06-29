@@ -1,5 +1,41 @@
 # Future Work
 
+## Graph-Temporal Policy/Value Model
+
+The current neural stack is a feedforward actor/critic family over engineered
+whole-field, belief, temporal, relational, and opponent-intent features. That is
+the compatibility baseline, not the final soccer representation. The next major
+model upgrade should add a graph-temporal encoder ahead of the existing policy,
+value, specialist, and world-model heads.
+
+Target shape:
+
+- Represent the 22 players plus ball as typed nodes, with role, team, possession,
+  kinematic, stamina, and belief/confidence channels.
+- Represent passes, marking, pressure, support, cover-shadow, offside-line, and
+  ball-trajectory relationships as edges or attention biases instead of only
+  fixed scalar aggregates.
+- Add memory with a small recurrent or transformer-style belief state so the
+  policy can infer opponent intent, fatigue, decoy runs, goalkeeper commitment,
+  and recent pressing patterns from history rather than one snapshot.
+- Keep centralized-training/decentralized-execution intact: the critic may see
+  the whole field and team returns, while the runtime actor still emits one
+  player's legal action distribution.
+- Preserve the existing contracts first: `behavior_policy_probability` remains
+  the PPO/MAPPO denominator, bounded MCTS may only rerank already-legal
+  candidates, and MPC remains the physical executor/reconciler.
+
+Rollout path:
+
+- Use the existing MLP feature path as the fallback and distillation teacher.
+- Add feature-importance or ablation telemetry for the current temporal,
+  relational, belief, and whole-field blocks before replacing them.
+- Introduce a graph-temporal snapshot version behind migration gates, then A/B it
+  against the MLP baseline over fixed seeds and comparable wall-clock budgets.
+- Start with policy/value improvement; only deepen target-level search or
+  imitation/offline-RL training once the encoder is finite-safe and demonstrably
+  better than the baseline.
+
 ## Neural-Guided MCTS
 
 The live engine can use MCTS, but only in a bounded action-selection role. Full
