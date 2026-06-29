@@ -96,7 +96,7 @@ pub use pass_lane_yield::*;
 mod slip_break_offside;
 pub(crate) use slip_break_offside::*;
 
-pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
+pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 30.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
 /// default timestep. This is the SINGLE place tick durations derive from the timestep — change
 /// `DEFAULT_DT_SECONDS` above and every `secs_to_ticks(..)`-defined window rescales with it
@@ -1328,9 +1328,9 @@ const DRIBBLE_DWELL_RELEASE_LIFT: f64 = 0.22;
 // commitments (1st, 4th, 8th ticks). This keeps players from changing strategy
 // faster than reaction/mental processing speed while still allowing genuine
 // reflex branches elsewhere in the player logic.
-const PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS: u64 = 3;
+const PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS: u64 = 6; // dt=1/30 ×2 (was 3 @1/15)
 const PLAYER_DECISION_COMMITMENT_MAX_IN_SHORT_WINDOW: usize = 1;
-const PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS: u64 = 7;
+const PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS: u64 = 14; // dt=1/30 ×2 (was 7 @1/15)
 const PLAYER_DECISION_COMMITMENT_MAX_IN_LONG_WINDOW: usize = 2;
 // Anti-spasm: a holder commits to one dribble move-kind (and its touch) for this window
 // instead of re-evaluating a fresh cut/feint/swivel every single tick. Without it the ball
@@ -3185,7 +3185,7 @@ const LOOSE_BALL_URGENCY_CONTEST_RADIUS_YARDS: f64 = 2.25;
 const LOOSE_BALL_URGENCY_APPROACH_RADIUS_YARDS: f64 = 7.0;
 const LOOSE_BALL_URGENCY_APPROACH_CLOSING_YPS: f64 = 2.5;
 const LOOSE_BALL_TEAM_STALL_CLOSE_RADIUS_YARDS: f64 = 2.0;
-const LOOSE_BALL_TEAM_STALL_WINDOW_TICKS: usize = 3;
+const LOOSE_BALL_TEAM_STALL_WINDOW_TICKS: usize = 6; // dt=1/30 ×2 (was 3 @1/15)
 const LOOSE_BALL_TEAM_STALL_MIN_CLOSING_YARDS: f64 = 0.10;
 // ¼ second at the 15 Hz default tick: real players step toward a loose ball within a
 // touch, they do not stand off it.
@@ -3215,7 +3215,8 @@ const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
 // dynamically-feasible run (point-mass MPC, bending around opponents), forward-models the ball's
 // decelerating flight, and picks the rendezvous (lead point + launch speed) the receiver meets in
 // time and defenders can't cut out. Horizon ~1.6s at dt=1/15; steps below MIN are too close to lead.
-const MPC_PASS_HORIZON_STEPS: usize = 24;
+// dt=1/30 rescale (×2 from 24 → preserve the ~1.6s real-time pass-interception horizon).
+const MPC_PASS_HORIZON_STEPS: usize = 48;
 const MPC_PASS_MIN_STEP: usize = 3;
 // A candidate rendezvous is only accepted when the ball's predicted arrival time and the receiver's
 // predicted arrival time agree within this tolerance (seconds) — i.e. the ball actually meets the run.
@@ -3685,7 +3686,7 @@ const SOCCER_MOMENT_HISTORY_LIMIT: usize = 24;
 const SOCCER_MOMENT_ACTION_LIMIT: usize = 12;
 const SOCCER_MOMENT_FEATURE_FRAME_SAMPLES: usize = 8;
 const SOCCER_MOMENT_EMBEDDER_VERSION: &str = "soccer-moment-local-v5";
-const ADVERSARIAL_EMBEDDING_SIGNAL_REFRESH_TICKS: u64 = 5;
+const ADVERSARIAL_EMBEDDING_SIGNAL_REFRESH_TICKS: u64 = 10; // dt=1/30 ×2 (was 5 @1/15)
 const SOCCER_MOMENT_ROLE_ALIGNED_PLAYERS: usize = 22;
 const SOCCER_MOMENT_FEATURES_PER_ENTITY: usize = 8;
 const SOCCER_MOMENT_FEATURES_PER_FRAME: usize =
@@ -3702,7 +3703,7 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // Formation targets are tactical priors, not collision physics; refreshing them
 // every other tick keeps first-tick guidance immediate while avoiding needless
 // LP problem rebuilds at full 15Hz.
-const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
+const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 4; // dt=1/30 ×2 (was 2 @1/15)
 const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
 /// Iteration cap for the deterministic Bland's-rule simplex that solves the formation
 /// LP (see `SoccerFormationLpBrain::solve_exact_formation_lp`). Generous enough that the
@@ -55604,17 +55605,6 @@ pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     }
 }
 
-/// A/B MEASUREMENT KNOB (not a gameplay gate). The heuristic match is fully deterministic —
-/// skills/positions are keyed on player id and `MatchConfig.seed` is effectively inert — so a
-/// multi-seed measurement run produces byte-identical matches (n=1 scenario, no statistical
-/// power). When `SOCCER_SEED_VARIED_SKILLS` is set, `default_players` mixes `config.seed` into
-/// the per-player skill jitter so each seed is an INDEPENDENT match. Off (default) ⇒
-/// byte-identical to the deterministic build. Both A/B arms run with this ON and the same seeds,
-/// so skills cancel and the only off-vs-on difference is the feature gate under test.
-fn seed_varied_skills_enabled() -> bool {
-    std::env::var("SOCCER_SEED_VARIED_SKILLS").is_ok()
-}
-
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
@@ -60092,19 +60082,8 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 // retained only for signature compatibility; it no longer drives
                 // live-match randomness.
                 skills: {
-                    if seed_varied_skills_enabled() {
-                        // A/B MEASUREMENT ONLY: the heuristic match is otherwise fully
-                        // deterministic (skills/positions keyed on player id, `config.seed`
-                        // inert), so multi-seed runs are byte-identical — n=1 scenario. Mixing
-                        // `config.seed` into the skill jitter makes each seed an INDEPENDENT
-                        // match. Both A/B arms share a seed ⇒ identical skills ⇒ the feature
-                        // gate is the only difference. Off (default) ⇒ byte-identical to the
-                        // deterministic build (same `blended` rng draw is still consumed).
-                        SkillProfile::blended((id as u64 ^ config.seed as u64) as usize, role, _rng)
-                    } else {
-                        let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
-                        SkillProfile::for_shirt(shirt, role)
-                    }
+                    let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
+                    SkillProfile::for_shirt(shirt, role)
                 },
                 fatigue: 0.0,
                 controller_slot: None,

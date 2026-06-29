@@ -2454,11 +2454,11 @@ fn mpc_reselects_candidate(
 
 /// Minimum ticks between two consecutive deliberative decisions (≈0.20 s at 15 Hz): at most one
 /// changed decision per 3 ticks. See [`PlayerAgent::apply_decision_refractory`].
-const DECISION_REFRACTORY_MIN_GAP_TICKS: u64 = 3;
+const DECISION_REFRACTORY_MIN_GAP_TICKS: u64 = 6; // dt=1/30 ×2 (was 3 @1/15; still ≈0.20s)
 /// The second-to-last decision must be this many ticks old before a third may commit (≈0.47 s):
 /// at most two changed decisions per 7-tick window. Combined with the 3-tick min gap this gives
 /// the 3,4,3,4-tick cadence (decisions on ticks 1, 4, 8, 11, 15…).
-const DECISION_REFRACTORY_WINDOW_TICKS: u64 = 7;
+const DECISION_REFRACTORY_WINDOW_TICKS: u64 = 14; // dt=1/30 ×2 (was 7 @1/15; still ≈0.47s)
 
 /// Master switch for the deliberative-decision refractory. OFF by default ⇒ players re-decide
 /// freely every tick exactly as before (byte-identical); set `DD_SOCCER_ENABLE_DECISION_REFRACTORY`
@@ -7695,7 +7695,7 @@ impl PlayerAgent {
     /// Only *sustainable* held actions can be continued tick-to-tick; a ball-release one-shot
     /// (pass/shot/clearance) or a committed challenge (tackle) returns `None` — the ball state
     /// has moved on, so the new decision must be allowed instead.
-    fn continuation_intent(&self) -> Option<PlayerIntent> {
+    pub(crate) fn continuation_intent(&self) -> Option<PlayerIntent> {
         let held = self.last_intent.as_ref()?;
         match held.action {
             SoccerAction::HoldShape

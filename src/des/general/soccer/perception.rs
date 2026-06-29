@@ -60,7 +60,7 @@ pub const PERCEPTION_MAX_LAG_SECONDS: f64 = 0.4;
 /// Ticks a perceived mis-location is held before it refreshes. Bucketing the seed
 /// by this keeps a player committed to one (wrong) estimate for ~a reaction window
 /// instead of dithering a fresh error every tick. ~0.27 s at 15 ticks/s.
-pub const PERCEPTION_REFRESH_TICKS: u64 = 4;
+pub const PERCEPTION_REFRESH_TICKS: u64 = 8; // dt=1/30 ×2 (was 4 @1/15; still ≈0.27s)
 
 fn env_on(name: &str) -> bool {
     std::env::var(name)

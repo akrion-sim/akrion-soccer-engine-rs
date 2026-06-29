@@ -5,8 +5,9 @@ use crate::des::general::soccer::{
 };
 
 pub const SOCCER_LIVE_REVIVAL_PORT: u16 = 5056;
-const LIVE_MPC_DEFAULT_PLAYER_HORIZON: usize = 12;
-const LIVE_MPC_MAX_PLAYER_HORIZON: usize = 45;
+// dt=1/30 rescale (×2 from the 1/15 values 12 / 45 → preserve ~0.8s / ~3.0s real-time horizons).
+const LIVE_MPC_DEFAULT_PLAYER_HORIZON: usize = 24;
+const LIVE_MPC_MAX_PLAYER_HORIZON: usize = 90;
 const LIVE_MPC_DEFAULT_ACTIVE_RADIUS_YARDS: f64 = 5.0;
 const LIVE_LOCAL_MPC_DEFAULT_ENABLED: bool = false;
 const LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM: usize = 1;

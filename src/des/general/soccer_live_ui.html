@@ -909,6 +909,14 @@ const LIVE_STEP_INTERVAL_MS = 67;
 // Mirrors the backend's one source of truth, soccer.rs `DEFAULT_DT_SECONDS` (1/15 s);
 // keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
 const FALLBACK_DT_SECONDS = 1 / 15;
+// Live render/step cadence must TRACK the backend timestep so we advance exactly ONE tick per
+// rendered frame (smooth) instead of N ticks per fixed 67ms frame. At dt=1/30 this is ~33ms (30fps);
+// at 1/15 it stays ~67ms. Falls back to LIVE_STEP_INTERVAL_MS before the first state arrives. Without
+// this, a 1/30 backend renders 2 ticks per 67ms frame → real-time speed but visibly jumpy.
+function liveStepIntervalMs() {
+  const dt = Number(state?.config?.dtSeconds);
+  return (Number.isFinite(dt) && dt > 0) ? Math.round(dt * 1000) : LIVE_STEP_INTERVAL_MS;
+}
 const LIVE_DEFAULT_TICKS_PER_PULSE = 1;
 const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
 const LIVE_INPUT_RETRY_MIN_MS = 120;
