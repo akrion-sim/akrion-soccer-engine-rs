@@ -95,6 +95,8 @@ mod pass_lane_yield;
 pub use pass_lane_yield::*;
 mod slip_break_offside;
 pub(crate) use slip_break_offside::*;
+mod press_or_contain;
+pub(crate) use press_or_contain::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -600,6 +602,20 @@ const HOLDER_PRESS_MAX_DISTANCE_YARDS: f64 = 16.0;
 /// Tight standoff the presser closes to: within tackle/contest range, a half-step off
 /// so it is a contain-press that forces a decision, not a committed lunge.
 const HOLDER_PRESS_STANDOFF_YARDS: f64 = 1.8;
+/// Press-or-contain standoff endpoints (yd, goal-side of the carrier) the
+/// [`WorldSnapshot::press_or_contain_aggression_for`] MDP blends between. At full aggression the
+/// defender presses tight (the `_PRESS_` value); at zero it sits off and contains (the `_CONTAIN_`
+/// value), giving the carrier space in front rather than diving in. Two pairs: one for the
+/// fast-carrier box contest (kept tighter — a box threat must still be met), one for the general
+/// holder-press / advancing-carrier jockey across the rest of the pitch. Gated default-ON.
+const PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS: f64 = 0.3;
+const PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS: f64 = 2.6;
+const PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS: f64 = 0.8;
+const PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS: f64 = 5.0;
+/// Multiplicative jockey-gap scaling applied to the advancing-carrier step-up standoff: at full
+/// aggression the gap tightens to `_PRESS_SCALE`, at zero it widens to `_CONTAIN_SCALE` (back off).
+const PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE: f64 = 0.7;
+const PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE: f64 = 2.1;
 /// Press-cover hardening (gated `DD_SOCCER_ENABLE_PRESS_COVER`): how far goal-side of
 /// the carrier the single COVER defender tucks in behind the lone presser, so a beaten
 /// press meets immediate second pressure instead of a clean break.
@@ -1598,6 +1614,26 @@ const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
 const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
 const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
 const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
+// Exponential backward-pass risk. A backward ball is not just LINEARLY worse the further it
+// goes (that is `long_backward_pass_penalty`): the danger COMPOUNDS — a deep retreat invites a
+// charge-down, concedes territory, and launches the counter, each worse than the last yard.
+// Calibrated so the demerit GROWS 5x for every `..._REF_YARDS` (10yd) played backward, i.e. a
+// 20yd backward pass is priced ~5x the risk of a 10yd one, a 30yd ~25x, etc. Short resets up to
+// the free allowance carry no exponential demerit (the linear/short-reset curves still apply).
+// Gated default-ON in prod (`DD_SOCCER_ENABLE_BACKWARD_EXP_RISK`), neutral (0) in tests.
+const BACKWARD_EXP_RISK_FREE_YARDS: f64 = 6.0;
+const BACKWARD_EXP_RISK_REF_YARDS: f64 = 10.0;
+const BACKWARD_EXP_RISK_GROWTH_PER_REF: f64 = 5.0;
+// Scale chosen so the EXPONENTIAL term is the dominant backward demerit (it outgrows the linear
+// `long_backward_pass_penalty` past ~12yd), making the 5x-per-10yd escalation actually felt rather
+// than diluted by the gentler linear ramp. Cap keeps a pathological deep ball from overflowing.
+const BACKWARD_EXP_RISK_SCALE: f64 = 0.55;
+const BACKWARD_EXP_RISK_CAP: f64 = 30.0;
+// Minimum legal pass distance. A sub-3yd pass neither escapes pressure nor progresses and is
+// almost always a needless touch that invites a turnover — it is made ILLEGAL (filtered out of
+// the pass-target ranking entirely) rather than merely down-weighted. Gated default-ON in prod
+// (`DD_SOCCER_ENABLE_MIN_PASS_DISTANCE`), inert in tests.
+const MIN_LEGAL_PASS_YARDS: f64 = 3.0;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -58443,6 +58479,27 @@ fn wall_pass_leg_backward_risk(forward_yards: f64, opponents_on_path: usize) -> 
     let backward_yards = -forward_yards;
     (backward_yards * (1.0 + opponents_on_path as f64) * WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY)
         .min(WALL_PASS_BACKWARD_RISK_MAX)
+}
+
+/// Exponential risk demerit for a BACKWARD pass, layered ON TOP of the linear
+/// [`long_backward_pass_penalty`]. Returns 0 for forward/square balls and for short backward
+/// resets up to [`BACKWARD_EXP_RISK_FREE_YARDS`]; beyond that the demerit grows as
+/// `SCALE * GROWTH_PER_REF^(backward_yards / REF_YARDS)`, so the penalty multiplies by
+/// `GROWTH_PER_REF` (5x) for every `REF_YARDS` (10yd) of extra retreat — a 20yd backward pass is
+/// priced ~5x a 10yd one. Capped so it never overflows or fully dominates the score. `forward_yards`
+/// is signed attacking-direction progress (negative = backward). Pure / RNG-free.
+fn backward_pass_exponential_risk_penalty(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= -BACKWARD_EXP_RISK_FREE_YARDS {
+        return 0.0;
+    }
+    let backward_yards = -forward_yards;
+    let exponent = backward_yards / BACKWARD_EXP_RISK_REF_YARDS.max(1e-6);
+    let penalty = BACKWARD_EXP_RISK_SCALE * BACKWARD_EXP_RISK_GROWTH_PER_REF.powf(exponent);
+    if penalty.is_finite() {
+        penalty.min(BACKWARD_EXP_RISK_CAP)
+    } else {
+        BACKWARD_EXP_RISK_CAP
+    }
 }
 
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {

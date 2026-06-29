@@ -98,6 +98,14 @@ const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
 /// entirely for any genuine movement cue (see the exemptions at the call site).
 const OFFBALL_SETTLE_REFERENCE_YARDS: f64 = 6.5;
 const OFFBALL_SETTLE_STAND_YARDS: f64 = 2.0;
+/// Receive-in-stride / anti-overrun tuning. A FREE receiver who would reach the reception point
+/// more than `(1 - EARLY_MARGIN)` ahead of the ball is "early" — sprinting on would carry them
+/// past the spot so the ball arrives behind their run. Such a receiver eases to a pace that lands
+/// them ~with the ball (receive it in stride), floored at `MIN_FACTOR` of nominal so they keep
+/// drifting onto it. Only applies to a moving ball (≥ `MIN_BALL_SPEED_YPS`).
+const RECEIVE_IN_STRIDE_EARLY_MARGIN: f64 = 0.92;
+pub(crate) const RECEIVE_IN_STRIDE_MIN_FACTOR: f64 = 0.30;
+const RECEIVE_IN_STRIDE_MIN_BALL_SPEED_YPS: f64 = 1.0;
 const INTENDED_PASS_TARGET_AWARENESS_PROBABILITY: f64 = 0.80;
 const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
 const BALL_RECEIPT_SHAPE_TIE_WINDOW_SECONDS: f64 = 0.45;
@@ -14358,6 +14366,29 @@ impl SoccerMatch {
             * movement_decisiveness(self.players[player_id].decision_confidence)
             * far_offball_factor
             * side_glance_speed_factor;
+        // Receive in stride (anti-overrun): the named receiver of an incoming ground ball who is
+        // collecting it FREE (`!sprint` ⇒ the reception election deemed it uncontested/unpressured;
+        // a contested or pressured reception keeps `sprint` set and must still attack the ball)
+        // eases to a pace that lands them ~with the ball instead of sprinting through the spot so
+        // the ball runs on behind them. Gated default-ON; factor is 1.0 (byte-identical) when off,
+        // when sprinting, or when the receiver is not actually early. See
+        // `receive_in_stride_speed_factor`.
+        let speed = if dd_soccer_enable_receive_in_stride()
+            && incoming_pass
+            && !sprint
+            && self.ball.holder.is_none()
+            && self.players[player_id].controller_slot.is_none()
+        {
+            speed
+                * receive_in_stride_speed_factor(
+                    to_target_len,
+                    speed,
+                    self.ball.position.distance(target),
+                    self.ball.velocity.len(),
+                )
+        } else {
+            speed
+        };
         // MPC execution + MDP↔MPC reconciliation layer. For the active subset
         // (carrier + nearby contesters) a short-horizon point-mass MPC plans a
         // dynamically-feasible movement; depending on config it either refines the
@@ -21750,6 +21781,57 @@ pub(crate) fn far_offball_conservation_factor(ball_distance_yards: f64) -> f64 {
     let t = ((ball_distance_yards - FAR_OFFBALL_CONSERVE_START_YARDS) / span).clamp(0.0, 1.0);
     1.0 - FAR_OFFBALL_CONSERVE_MAX_REDUCTION * smoothstep_unit(t)
 }
+/// True when a receiver moving at `nominal_speed_yps` would reach the reception point
+/// meaningfully BEFORE the ball does — i.e. they would overrun the spot if they kept going, so
+/// the ball arrives behind their run. Pure / testable. Returns false for a stationary/near-static
+/// ball or degenerate inputs (nothing to sync to).
+pub(crate) fn receive_in_stride_would_overrun(
+    distance_to_target_yards: f64,
+    nominal_speed_yps: f64,
+    ball_distance_to_target_yards: f64,
+    ball_speed_yps: f64,
+) -> bool {
+    if !(distance_to_target_yards.is_finite()
+        && nominal_speed_yps.is_finite()
+        && ball_distance_to_target_yards.is_finite()
+        && ball_speed_yps.is_finite())
+    {
+        return false;
+    }
+    if nominal_speed_yps <= 1e-3 || ball_speed_yps <= RECEIVE_IN_STRIDE_MIN_BALL_SPEED_YPS {
+        return false;
+    }
+    let ball_time = ball_distance_to_target_yards / ball_speed_yps;
+    if ball_time <= 1e-3 {
+        return false;
+    }
+    let self_time = distance_to_target_yards / nominal_speed_yps;
+    self_time < ball_time * RECEIVE_IN_STRIDE_EARLY_MARGIN
+}
+
+/// Speed multiplier for a free receiver settling to take an incoming ball IN STRIDE rather than
+/// overrunning it. `1.0` when the receiver is not early (would arrive with/after the ball); when
+/// early, the pace that lands them ~as the ball arrives (`distance / ball_time`), as a fraction of
+/// nominal, floored at [`RECEIVE_IN_STRIDE_MIN_FACTOR`] so they keep drifting onto the ball. Pure.
+pub(crate) fn receive_in_stride_speed_factor(
+    distance_to_target_yards: f64,
+    nominal_speed_yps: f64,
+    ball_distance_to_target_yards: f64,
+    ball_speed_yps: f64,
+) -> f64 {
+    if !receive_in_stride_would_overrun(
+        distance_to_target_yards,
+        nominal_speed_yps,
+        ball_distance_to_target_yards,
+        ball_speed_yps,
+    ) {
+        return 1.0;
+    }
+    let ball_time = ball_distance_to_target_yards / ball_speed_yps;
+    let required_speed = distance_to_target_yards / ball_time;
+    (required_speed / nominal_speed_yps).clamp(RECEIVE_IN_STRIDE_MIN_FACTOR, 1.0)
+}
+
 /// Per-fully-wasted-sprint-tick penalty points, overridable via
 /// `DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS` for A/B tuning. Falls back to
 /// [`WASTED_ENERGY_PENALTY_POINTS`]; a non-finite/negative override is ignored.
@@ -21773,6 +21855,78 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
+/// Exponentially-escalating risk demerit for a long backward pass (see
+/// [`backward_pass_exponential_risk_penalty`]). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_BACKWARD_EXP_RISK=0`); default-OFF in tests so the pass-ranking suite is
+/// byte-identical unless a test opts in.
+pub(crate) fn dd_soccer_enable_backward_exp_risk() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK"))
+    }
+}
+/// Make a sub-[`MIN_LEGAL_PASS_YARDS`] pass ILLEGAL — filtered out of the pass-target ranking
+/// entirely rather than merely down-weighted. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_MIN_PASS_DISTANCE=0`); default-OFF in tests for byte-identical ranking.
+pub(crate) fn dd_soccer_enable_min_pass_distance() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE"))
+    }
+}
+/// Receive-in-stride / anti-overrun: a FREE receiver who would reach the reception point well
+/// before the ball eases off (settles to a controlled pace) so the ball arrives in stride rather
+/// than running on behind them. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE=0`); default-OFF in tests for byte-identical movement.
+pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
+    }
+}
+/// Press-or-contain MDP: a defender (esp. a central defender) deciding whether to PRESS the
+/// ball-carrier to win it / cut a lane, or BACK OFF and contain (hold a goal-side gap, shepherd
+/// them away from danger) as a function of the likelihood of winning vs being beaten / a runner
+/// getting in behind. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_PRESS_OR_CONTAIN=0`);
+/// default-OFF in tests so the existing fixed-standoff behaviour is byte-identical.
+pub(crate) fn dd_soccer_enable_press_or_contain() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN"))
+    }
 }
 /// "Drive to the corner flag and cross" for a wide carrier. ON by default: a committed run at the
 /// byline corner (then a low cutback / high cross) instead of slowing 32-38yd out or cutting into
@@ -25263,11 +25417,22 @@ impl WorldSnapshot {
             return None;
         }
         // Meet the ball a touch on the goal side so we arrive at it rather than
-        // ball-watch, but step level enough to actually contest.
+        // ball-watch, but step level enough to actually contest. The press-or-contain MDP shades
+        // the standoff: press tighter when we can win it, sit off (give space, jockey) when we'd
+        // likely be beaten or would release a runner in behind. Gated default-ON; the fixed
+        // standoff is used (byte-identical) when off.
         let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
         let goal_side = (own_goal - carrier_position).normalized();
+        let standoff = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => press_or_contain_standoff_yards(
+                PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS,
+                PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS,
+                aggression,
+            ),
+            None => CONTAIN_ENGAGE_GOAL_SIDE_YARDS,
+        };
         Some(
-            (carrier_position + goal_side * CONTAIN_ENGAGE_GOAL_SIDE_YARDS)
+            (carrier_position + goal_side * standoff)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
     }
@@ -25321,11 +25486,21 @@ impl WorldSnapshot {
             return None;
         }
         // Close to a tight standoff on the goal side: within contest range, a half-step
-        // off so it forces the holder to act rather than committing to a lunge.
+        // off so it forces the holder to act rather than committing to a lunge. The
+        // press-or-contain MDP shades the standoff (press tight to win / cut a lane, or sit off
+        // and contain when a press would likely be beaten). Gated default-ON; fixed standoff off.
         let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
         let goal_side = (own_goal - holder_position).normalized();
+        let standoff = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => press_or_contain_standoff_yards(
+                PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS,
+                PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS,
+                aggression,
+            ),
+            None => HOLDER_PRESS_STANDOFF_YARDS,
+        };
         Some(
-            (holder_position + goal_side * HOLDER_PRESS_STANDOFF_YARDS)
+            (holder_position + goal_side * standoff)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
     }
@@ -25896,6 +26071,24 @@ impl WorldSnapshot {
             channel_stepup_fraction
         } else {
             close_stepup_fraction
+        };
+        // Press-or-contain MDP: when the duel favours winning the ball, tighten the jockey gap and
+        // step up further (press); when a press would likely be beaten or release a runner in
+        // behind, widen the gap and hold off (contain — give the carrier space in front rather
+        // than diving in). Gated default-ON; byte-identical (unscaled) when off.
+        let (standoff_yards, stepup_fraction) = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => {
+                let scale = press_or_contain_standoff_yards(
+                    PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE,
+                    PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE,
+                    aggression,
+                );
+                (
+                    standoff_yards * scale,
+                    stepup_fraction * (0.55 + 0.45 * aggression),
+                )
+            }
+            None => (standoff_yards, stepup_fraction),
         };
         // Press to jockeying distance (edge of tackle range), not onto the ball.
         let channel_block = if channel_stepup && channel_side.abs() > 0.0 {
@@ -30287,6 +30480,19 @@ impl WorldSnapshot {
                     .unwrap_or(position);
                 let forward = (anticipated_position.y - me_position.y) * me.team.attack_dir();
                 let receiver_distance = me_position.distance(position);
+                // A sub-3yd pass is illegal: a needless touch that neither escapes pressure nor
+                // progresses, and a frequent source of turnovers. Filter it out entirely rather
+                // than relying on a soft down-weight. Gated default-ON (byte-identical when off).
+                // Judged on the ACTUAL ball travel: a tiny pass is one where BOTH the receiver's
+                // current feet AND the led/anticipated reception point are inside 3yd — so a ball
+                // genuinely led 3+yd onto a checking/breaking runner (who is momentarily close)
+                // is NOT wrongly outlawed.
+                if dd_soccer_enable_min_pass_distance()
+                    && receiver_distance < MIN_LEGAL_PASS_YARDS
+                    && me_position.distance(anticipated_position) < MIN_LEGAL_PASS_YARDS
+                {
+                    return None;
+                }
                 if own_half
                     && own_half_progressive_floor_outlet_available
                     && receiver_distance < OWN_HALF_TINY_PASS_MAX_YARDS
@@ -30874,6 +31080,15 @@ impl WorldSnapshot {
                     .score
                     * SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT;
                 let long_backward_penalty = long_backward_pass_penalty(forward);
+                // Exponentially-escalating backward-pass risk (on top of the linear penalty): the
+                // danger of a deep retreat compounds, so a 20yd backward ball is priced ~5x a
+                // 10yd one. Gated default-ON; 0 (inert) when off. See
+                // `backward_pass_exponential_risk_penalty`.
+                let backward_exponential_risk_penalty = if dd_soccer_enable_backward_exp_risk() {
+                    backward_pass_exponential_risk_penalty(forward)
+                } else {
+                    0.0
+                };
                 // A backward ball played through opponents is doubly dangerous. The path
                 // traffic is already counted in `pass_quality` and scaled by backward depth
                 // for both floor and aerial candidates, so use that single source of truth.
@@ -30923,6 +31138,7 @@ impl WorldSnapshot {
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_exponential_risk_penalty
                     - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
@@ -31040,6 +31256,15 @@ impl WorldSnapshot {
                     .projected_in_behind_pass_point(me.id, p.id)
                     .unwrap_or(anticipated_position);
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
+                // Sub-3yd passes are illegal (see floor ranking): only when BOTH the receiver's
+                // feet AND the projected reception point are inside 3yd, so a ball lofted onto a
+                // breaking runner is not wrongly outlawed. Gated default-ON; inert off.
+                if dd_soccer_enable_min_pass_distance()
+                    && me_position.distance(position) < MIN_LEGAL_PASS_YARDS
+                    && me_position.distance(pass_point) < MIN_LEGAL_PASS_YARDS
+                {
+                    return None;
+                }
                 if me.role == PlayerRole::Goalkeeper
                     && forward < -1.25
                     && !goalkeeper_backward_emergency_release_allowed(
@@ -31348,6 +31573,13 @@ impl WorldSnapshot {
                     + role_risk.forward_risk_bonus * pass_target_learning
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
+                    // Exponentially-escalating backward-pass risk (a deep backward loft compounds
+                    // the danger); gated default-ON, inert off. See the floor ranking.
+                    - if dd_soccer_enable_backward_exp_risk() {
+                        backward_pass_exponential_risk_penalty(forward)
+                    } else {
+                        0.0
+                    }
                     // A backward loft still has to clear opponents on the path; this
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
@@ -34803,6 +35035,28 @@ impl WorldSnapshot {
             || moving_pass_needs_attack
             || bound_one_two_wall
             || aerial_plan.map(|p| p.sprint).unwrap_or(false);
+        // Receive in stride (anti-overrun): when the reception is genuinely FREE (no defender can
+        // contest it, no pressure, not a bound one-two return) and the receiver would otherwise
+        // sprint to the spot WELL ahead of the ball, drop the sprint so they settle and take it in
+        // stride instead of overrunning it (the ball then arriving behind their run). The fine
+        // pace-matching is applied in `move_player_towards`. Gated default-ON; byte-identical off.
+        // A contested/pressured reception keeps `sprint` and still attacks the ball.
+        let sprint = if dd_soccer_enable_receive_in_stride()
+            && sprint
+            && !pressured_reception
+            && !defender_can_contest
+            && !bound_one_two_wall
+            && aerial_plan.is_none()
+            && receive_in_stride_would_overrun(
+                current.distance(target),
+                receiver_sprint_speed,
+                self.ball.position.distance(target),
+                self.ball.velocity.len(),
+            ) {
+            false
+        } else {
+            sprint
+        };
         Some((target, sprint))
     }
 
