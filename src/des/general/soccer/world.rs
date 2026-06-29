@@ -30483,7 +30483,14 @@ impl WorldSnapshot {
                 // A sub-3yd pass is illegal: a needless touch that neither escapes pressure nor
                 // progresses, and a frequent source of turnovers. Filter it out entirely rather
                 // than relying on a soft down-weight. Gated default-ON (byte-identical when off).
-                if dd_soccer_enable_min_pass_distance() && receiver_distance < MIN_LEGAL_PASS_YARDS {
+                // Judged on the ACTUAL ball travel: a tiny pass is one where BOTH the receiver's
+                // current feet AND the led/anticipated reception point are inside 3yd — so a ball
+                // genuinely led 3+yd onto a checking/breaking runner (who is momentarily close)
+                // is NOT wrongly outlawed.
+                if dd_soccer_enable_min_pass_distance()
+                    && receiver_distance < MIN_LEGAL_PASS_YARDS
+                    && me_position.distance(anticipated_position) < MIN_LEGAL_PASS_YARDS
+                {
                     return None;
                 }
                 if own_half
