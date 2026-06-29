@@ -46809,3 +46809,81 @@ impl WorldSnapshot {
             || (self.ball.holder.is_none() && self.ball.last_touch_player == Some(player_id))
     }
 }
+
+/// Result of one player's decision computed against a FIXED snapshot, on a clone of the player —
+/// so the computation is read-only on the `SoccerMatch` and safe to run in parallel across players.
+/// The serial apply phase swaps `player_after` back in (in canonical schedule order) and applies
+/// `intent`. See `docs/parallel-decision-plan.md`.
+#[allow(dead_code)]
+pub(crate) struct DecisionOutput {
+    pub(crate) player_id: usize,
+    pub(crate) player_after: PlayerAgent,
+    pub(crate) intent: PlayerIntent,
+}
+
+impl SoccerMatch {
+    /// Independent, deterministic per-player RNG stream for the parallel decision phase. Mixing the
+    /// match seed with the tick and player id gives every player its own reproducible stream that is
+    /// independent of thread count or completion order (the parallel analogue of the shared serial
+    /// `self.rng` draw). Schedule/shuffle RNG stays on `self.rng` in the serial setup phase; this is
+    /// only for the per-player decision draws.
+    #[allow(dead_code)]
+    pub(crate) fn decision_rng_for(&self, tick: u64, player_id: usize) -> SeededRandom {
+        let mut h = (self.config.seed as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3).wrapping_add(tick);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3).wrapping_add(player_id as u64);
+        SeededRandom::new((((h >> 32) ^ h) & 0xFFFF_FFFF) as u32)
+    }
+
+    /// Pure per-player decision (no mutation of `self`): clone the player, run the EXISTING decision
+    /// pipeline on the clone against `snapshot` + a caller-supplied per-player `rng`, and return the
+    /// decided clone + its intent. Read-only on `&self`, so this is the body of the parallel decide
+    /// phase. Human-controlled players are NOT handled here — they keep the serial path that drains
+    /// input. Returns `None` for a player that makes no decision this tick (prone after a missed
+    /// slide), matching the serial loop's `continue`.
+    #[allow(dead_code)]
+    pub(crate) fn decide_player_on_snapshot(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        rng: &mut SeededRandom,
+    ) -> Option<DecisionOutput> {
+        let actor = self.player_index_for_id(player_id)?;
+        if self.players[actor].slide_recovery_seconds > 0.0 {
+            return None;
+        }
+        let mut player = self.players[actor].clone();
+        let mdp_state = snapshot.mdp_state_for_player(player_id);
+        let observation = snapshot.observation_for(player_id);
+        let learned_decision = if self.learned_policy_inference_enabled() {
+            self.learned_action_for_player_with_context(
+                snapshot,
+                player_id,
+                &mdp_state,
+                &observation,
+            )
+        } else {
+            None
+        };
+        let intent = player.run_time_step_with_context(
+            snapshot,
+            mdp_state,
+            observation,
+            None,
+            learned_decision.as_ref().map(|decision| &decision.plan),
+            rng,
+        );
+        if let Some(learned_decision) = learned_decision.as_ref() {
+            Self::stamp_learned_policy_behavior_probability(
+                &mut player,
+                learned_decision.behavior_probability,
+            );
+        }
+        let intent = player.apply_post_decision_movement_discipline(snapshot, self, intent);
+        Some(DecisionOutput {
+            player_id,
+            player_after: player,
+            intent,
+        })
+    }
+}
