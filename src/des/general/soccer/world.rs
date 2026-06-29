@@ -26072,6 +26072,24 @@ impl WorldSnapshot {
         } else {
             close_stepup_fraction
         };
+        // Press-or-contain MDP: when the duel favours winning the ball, tighten the jockey gap and
+        // step up further (press); when a press would likely be beaten or release a runner in
+        // behind, widen the gap and hold off (contain — give the carrier space in front rather
+        // than diving in). Gated default-ON; byte-identical (unscaled) when off.
+        let (standoff_yards, stepup_fraction) = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => {
+                let scale = press_or_contain_standoff_yards(
+                    PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE,
+                    PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE,
+                    aggression,
+                );
+                (
+                    standoff_yards * scale,
+                    stepup_fraction * (0.55 + 0.45 * aggression),
+                )
+            }
+            None => (standoff_yards, stepup_fraction),
+        };
         // Press to jockeying distance (edge of tackle range), not onto the ball.
         let channel_block = if channel_stepup && channel_side.abs() > 0.0 {
             Vec2::new(-channel_side.signum(), 0.0)
