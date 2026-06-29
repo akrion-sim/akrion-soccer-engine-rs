@@ -95,24 +95,10 @@ fn role_label(role: PlayerRole) -> &'static str {
 }
 
 fn main() {
-    // The deterministic simplex makes a given seed byte-reproducible but is ~10x slower than the
-    // default Clarabel solve. With `SOCCER_SEED_VARIED_SKILLS` providing the cross-seed variance,
-    // per-seed byte-reproducibility is no longer required, so allow opting out for throughput:
-    // set `SOCCER_FAST_NONDETERMINISTIC=1` to use the fast solver and run many more matches.
-    let fast = std::env::var("SOCCER_FAST_NONDETERMINISTIC").is_ok();
-    if !fast {
-        enable_deterministic_formation_lp();
-    }
+    enable_deterministic_formation_lp();
     let args: Vec<String> = std::env::args().collect();
     let ticks: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9000);
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
-    // Optional seed-base (hex) so independent processes can shard disjoint seed ranges and run in
-    // parallel — each ~4min match is single-threaded, so sharding is the only way to scale the A/B.
-    let seed_base: u32 = args
-        .get(3)
-        .map(|s| s.trim_start_matches("0x"))
-        .and_then(|s| u32::from_str_radix(s, 16).ok())
-        .unwrap_or(0x5EED_0000);
 
     let gate_on = std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok();
 
@@ -124,7 +110,7 @@ fn main() {
 
     for s in 0..seeds {
         let config = MatchConfig {
-            seed: seed_base.wrapping_add(s as u32),
+            seed: 0x5EED_0000u32.wrapping_add(s as u32),
             ..MatchConfig::default()
         };
         let mut sim = SoccerMatch::default_11v11(config);
@@ -184,16 +170,6 @@ fn main() {
         "total goals: home {goals_home} / away {goals_away} (sum {})   unique pass decisions: {unique_pass_decisions}",
         goals_home + goals_away
     );
-    // Machine-readable raw sums for cross-process (sharded) aggregation. One line per bucket:
-    //   RAW\t<role|zone>\tpasses\tfwd\tlat\tback\tsum_fwd_yds\tsum_completion\tsum_openness
-    // Plus a totals line. A summing script can fold many shards' RAW lines into one A/B table.
-    println!("RAW\tGOALS\t{goals_home}\t{goals_away}\t{unique_pass_decisions}");
-    for (key, b) in &buckets {
-        println!(
-            "RAW\t{key}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            b.passes, b.fwd, b.lat, b.back, b.sum_fwd_yds, b.sum_completion, b.sum_openness
-        );
-    }
     println!(
         "\n{:<26}{:>7}{:>7}{:>7}{:>7}{:>11}{:>10}{:>10}",
         "role | zone", "passes", "fwd%", "lat%", "back%", "avgFwdYds", "avgComp", "avgOpen"
