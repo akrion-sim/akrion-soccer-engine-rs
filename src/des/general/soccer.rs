@@ -4519,13 +4519,10 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM,
     // Same schema with slip-break/offside-trap channels, before the relational attention readout.
     SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
-<<<<<<< HEAD
     // Same schema with relational attention, before isolated-carrier solo/hold-up channels.
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM,
-=======
-    // Same schema with relational attention readout, before graph-temporal features.
+    // Same schema with isolated-carrier channels, before graph-temporal features.
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
->>>>>>> upstream/main
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
