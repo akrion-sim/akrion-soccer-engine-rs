@@ -97,9 +97,16 @@ pub(crate) fn analytic_press_aggression(inputs: &PressOrContainInputs) -> f64 {
         + inputs.tackling * 0.18
         + inputs.carrier_slowness * 0.20
         + inputs.forward_lane_danger * 0.18;
-    let risk = inputs.pace_disadvantage * 0.45
-        + inputs.runner_in_behind * 0.38
-        + inputs.exposed_behind * (1.0 - inputs.cover_behind) * 0.30;
+    // The cost of being BEATEN is dominated by the in-behind RUNNER: getting done by the dribble
+    // releases that runner into the space, and the danger of that space scales with how exposed it
+    // is (proximity to our own goal) and is mitigated by cover. Crucially the space term is GATED
+    // by the runner — a lone carrier driving at goal with NO runner behind is NOT a reason to sit
+    // off (backing off there just concedes a shot); you still engage, the duel decided by win vs
+    // the dribbler's pace. A bare runner with no exposed space / full cover is only a mild worry.
+    let runner_release_risk = inputs.runner_in_behind
+        * (0.40 + 0.60 * inputs.exposed_behind)
+        * (1.0 - 0.5 * inputs.cover_behind);
+    let risk = inputs.pace_disadvantage * 0.45 + runner_release_risk * 0.72;
     (PRESS_OR_CONTAIN_BASE_AGGRESSION + win - risk).clamp(0.0, 1.0)
 }
 
