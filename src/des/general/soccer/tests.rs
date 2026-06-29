@@ -86785,7 +86785,6 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
 
-<<<<<<< HEAD
 // --- Isolated attacking carrier: drive / hold-up instead of a panic backward pass --------------
 // (gate `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; see `isolated_attacking_carrier_drive_mode`).
 
