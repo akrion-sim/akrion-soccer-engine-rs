@@ -17960,6 +17960,96 @@ fn long_backward_pass_penalty_grows_linearly_with_retreat() {
 }
 
 #[test]
+fn backward_pass_exponential_risk_compounds_with_retreat() {
+    // Forward, square, and short-reset (within the free allowance) balls carry no exponential
+    // demerit — only the linear/short-reset curves apply there.
+    assert_eq!(backward_pass_exponential_risk_penalty(8.0), 0.0);
+    assert_eq!(backward_pass_exponential_risk_penalty(0.0), 0.0);
+    assert_eq!(backward_pass_exponential_risk_penalty(-BACKWARD_EXP_RISK_FREE_YARDS), 0.0);
+    assert_eq!(backward_pass_exponential_risk_penalty(-4.0), 0.0);
+    // The demerit GROWS, and grows by ~5x for every 10yd of extra retreat: a 20yd backward pass
+    // is priced ~5x a 10yd one, a 30yd ~25x (the user's "exponentially more risky" requirement).
+    let p10 = backward_pass_exponential_risk_penalty(-10.0);
+    let p20 = backward_pass_exponential_risk_penalty(-20.0);
+    assert!(p10 > 0.0 && p20 > p10);
+    assert!(
+        (p20 / p10 - BACKWARD_EXP_RISK_GROWTH_PER_REF).abs() < 1e-6,
+        "20yd backward pass must be ~5x the risk of a 10yd one (got {})",
+        p20 / p10
+    );
+    // It is capped so a pathological deep ball never overflows or fully dominates the score.
+    assert_eq!(
+        backward_pass_exponential_risk_penalty(-200.0),
+        BACKWARD_EXP_RISK_CAP
+    );
+    // Non-finite input is safe.
+    assert_eq!(backward_pass_exponential_risk_penalty(f64::NAN), 0.0);
+}
+
+#[test]
+fn receive_in_stride_eases_an_early_free_receiver() {
+    // A receiver 4yd from the spot moving at 8 yps would arrive in 0.5s; a ball 16yd out at 8 yps
+    // arrives in 2.0s — the receiver is well early and would overrun, so they ease off.
+    assert!(receive_in_stride_would_overrun(4.0, 8.0, 16.0, 8.0));
+    let factor = receive_in_stride_speed_factor(4.0, 8.0, 16.0, 8.0);
+    assert!(factor < 1.0, "an early receiver must slow to take it in stride");
+    assert!(factor >= RECEIVE_IN_STRIDE_MIN_FACTOR);
+    // A receiver who would arrive WITH or AFTER the ball keeps full pace (no overrun).
+    assert!(!receive_in_stride_would_overrun(16.0, 8.0, 16.0, 8.0));
+    assert_eq!(receive_in_stride_speed_factor(16.0, 8.0, 16.0, 8.0), 1.0);
+    // A near-static ball (nothing to sync to) is a no-op.
+    assert!(!receive_in_stride_would_overrun(4.0, 8.0, 16.0, 0.2));
+    assert_eq!(receive_in_stride_speed_factor(4.0, 8.0, 16.0, 0.2), 1.0);
+}
+
+#[test]
+fn press_or_contain_standoff_blends_press_to_contain() {
+    // Full aggression presses tight (the press endpoint); zero aggression sits off (contain).
+    assert!((press_or_contain_standoff_yards(0.3, 2.6, 1.0) - 0.3).abs() < 1e-9);
+    assert!((press_or_contain_standoff_yards(0.3, 2.6, 0.0) - 2.6).abs() < 1e-9);
+    // Monotonic: more aggression ⇒ tighter standoff.
+    assert!(
+        press_or_contain_standoff_yards(0.3, 2.6, 0.8)
+            < press_or_contain_standoff_yards(0.3, 2.6, 0.2)
+    );
+}
+
+#[test]
+fn analytic_press_aggression_presses_when_winnable_contains_when_beaten() {
+    // A set, close, goal-side defender with cover and a slow carrier should commit to the press.
+    let winnable = PressOrContainInputs {
+        proximity: 0.9,
+        set: 1.0,
+        goal_side: 1.0,
+        cover_behind: 1.0,
+        tackling: 0.8,
+        carrier_slowness: 0.9,
+        pace_disadvantage: 0.0,
+        runner_in_behind: 0.0,
+        forward_lane_danger: 0.2,
+        exposed_behind: 0.2,
+    };
+    // A faster carrier bearing down with a runner in behind and no cover should be contained.
+    let beaten = PressOrContainInputs {
+        proximity: 0.4,
+        set: 0.1,
+        goal_side: 0.0,
+        cover_behind: 0.0,
+        tackling: 0.3,
+        carrier_slowness: 0.0,
+        pace_disadvantage: 1.0,
+        runner_in_behind: 1.0,
+        forward_lane_danger: 0.0,
+        exposed_behind: 1.0,
+    };
+    let press = analytic_press_aggression(&winnable);
+    let contain = analytic_press_aggression(&beaten);
+    assert!(press > 0.75, "should press a winnable duel (got {press})");
+    assert!(contain < 0.25, "should contain when likely beaten (got {contain})");
+    assert!(press > contain);
+}
+
+#[test]
 fn backward_pass_path_risk_scales_with_retreat_and_opponents() {
     // No opponents on the path, or a forward/near-square ball, carries no path risk.
     assert_eq!(backward_pass_path_risk_penalty(-12.0, 0), 0.0);
