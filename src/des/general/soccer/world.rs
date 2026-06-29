@@ -27753,18 +27753,15 @@ impl WorldSnapshot {
             look_behind_scan_seconds: look_behind_scan.duration_seconds,
             look_behind_confidence_bonus: look_behind_scan.confidence_bonus,
             look_behind_drift_risk: look_behind_scan.drift_risk,
-<<<<<<< HEAD
             blindside_steal_opportunity,
             blindside_steal_target,
             blindside_threat_from_behind,
             blindside_scan_active,
             blindside_scan_drift_risk,
-=======
             side_glance_scan_active: surprise_behind_steal.holder_glance_scan_rate_hz > 0.0,
             side_glance_scan_rate_hz: surprise_behind_steal.holder_glance_scan_rate_hz,
             side_glance_surprise_recognition: surprise_behind_steal.holder_glance_recognition,
             side_glance_control_cost: surprise_behind_steal.holder_glance_control_cost,
->>>>>>> origin/main
             previous_tick_carryover,
             scheduled_index,
             ball_scheduled_index,
