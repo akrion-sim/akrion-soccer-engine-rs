@@ -23131,6 +23131,42 @@ impl WorldSnapshot {
         Some((holder_id, holder_pos))
     }
 
+    /// The unifying **advance-upfield-in-possession** cue: our team is in *controlled* possession
+    /// through an outfield carrier who has room to take the ball forward — either a clear open lane
+    /// to dribble into (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS`, the
+    /// "received a pass with a lot of space forward" case) or simply no committed presser
+    /// (`nearest_opponent >= UNCONTESTED_CARRIER_SPACE_YARDS`). When it holds the whole team should
+    /// advance as a unit: off-ball runners push forward in support (wired into
+    /// [`Self::attacking_support_sprint_active`] / [`Self::apply_attacking_forward_intent_floor`]),
+    /// the back four steps up to stay compact behind the attack (wired into
+    /// [`Self::back_four_line_v2_centre_fwd`]), and the MARL/MAPPO policy is rewarded for the
+    /// territorial gain (`dense_soccer_transition_reward`). Returns `(carrier_id, carrier_pos,
+    /// forward_space_yards)`. Gated (default-on) by `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`.
+    pub(crate) fn team_advance_upfield_active(&self, team: Team) -> Option<(usize, Vec2, f64)> {
+        if !team_advance_upfield_enabled() {
+            return None;
+        }
+        // A genuinely loose / in-flight ball doesn't qualify — we want a teammate actually in
+        // control so the advance is committed, not speculative.
+        if self.controlled_possession_team() != Some(team) {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team || holder.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        let forward_space = self.forward_dribble_space_yards(holder_id);
+        let unpressured =
+            self.nearest_opponent_distance_at(team, holder_pos) >= UNCONTESTED_CARRIER_SPACE_YARDS;
+        if forward_space >= TEAM_ADVANCE_FORWARD_SPACE_YARDS || unpressured {
+            Some((holder_id, holder_pos, forward_space))
+        } else {
+            None
+        }
+    }
+
     /// The team's ball-carrier is at the FRONT LINE — at most
     /// `FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD` outfield teammates are ahead of it. The cue
     /// for everyone else to push/sprint forward in support so the carrier is not left isolated up
