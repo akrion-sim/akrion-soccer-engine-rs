@@ -23052,8 +23052,20 @@ fn fatigue_accumulates_from_repeated_sprints_and_recovers_at_rest() {
 
     // Sprint for a sustained burst (dt=1s steps). With realistic all-match
     // anaerobic rates the per-second gap between a weak and an elite engine is
-    // modest, so accumulate enough seconds to surface a clear, stable gap.
+    // modest, so accumulate enough seconds to surface a clear, stable gap. The
+    // sprint target is far up-pitch but `move_player_towards` clamps it to the
+    // touchline, so loop each runner back to its start once it has covered most of
+    // the pitch — this keeps them genuinely SPRINTING for all 48 seconds instead of
+    // arriving and STANDING, which would recover the very fatigue we are measuring.
+    let high_start = sim.players[high_stamina].position;
+    let low_start = sim.players[low_stamina].position;
     for _ in 0..48 {
+        if sim.players[high_stamina].position.y >= 100.0 {
+            sim.players[high_stamina].position = high_start;
+        }
+        if sim.players[low_stamina].position.y >= 100.0 {
+            sim.players[low_stamina].position = low_start;
+        }
         sim.move_player_towards(high_stamina, Vec2::new(25.0, 220.0), true);
         sim.move_player_towards(low_stamina, Vec2::new(35.0, 220.0), true);
     }
