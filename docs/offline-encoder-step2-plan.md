@@ -52,3 +52,22 @@ budget. Larger effort; gated and eval-gated identically.
 ## Non-goals (explicit)
 - No per-tick GNN/RNN/MCTS (blows the 22-agent / 66 ms budget — see architecture-audit.md).
 - No change to the tabular `state_key` encoding (would orphan existing tabular entries).
+
+## Findings during implementation (2026-06-28) — must resolve before the Rust bin
+
+1. **Feature-space mismatch (design decision).** The exported dataset's `state_key` is the
+   **tabular discretization (~205 bins)**, NOT the engine's existing **192-dim continuous
+   neural feature vector** (`SOCCER_NEURAL_BASE_FEATURE_DIM`). So the distilled head is a
+   *new* learned value head over the tabular bins (a smooth generalization of the Q-table),
+   **not** a drop-in replacement for an existing 192-dim head. Two options:
+   - (a) Train over the bin features and add a decision-time **bin-feature extractor** +
+     a dedicated consume gate (cleanest first cut — directly generalizes the Q-table).
+   - (b) Re-export the dataset using the engine's 192-dim `neural_extended` features
+     instead of `state_key`, so it distills into an existing-head shape. Requires logging
+     those features in the deltas (they aren't today) or recomputing them from snapshots.
+   Recommend (a) for 2a; revisit (b) with 2b's learned encoder.
+2. **Access.** `neural_network`/`prng` are `pub(crate)` in the engine, so a standalone bin
+   can't reach `FeedForwardNetwork`. Add a single `pub fn soccer_offline_distill_value_head(
+   dataset, out_snapshot, hidden, epochs, lr) -> Report` in the soccer module (uses the
+   internal FFN + `soccer_neural_network_snapshot` + the pub `SoccerNeuralNetworkSnapshot`),
+   and a thin `src/bin/soccer_offline_distill.rs` that calls it. Avoids widening NN's API.

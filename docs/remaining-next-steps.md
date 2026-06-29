@@ -41,8 +41,10 @@ slow WAN load on `:5099`).
   was also refusing connections). Diagnose: `kubectl logs` the failed jobs, check the
   cronjob, confirm the node/SSH. The AWS `dd-soccer-learning-rds-continuous` is healthy;
   the Hetzner queue is the gap.
-- Confirm the latest `learning`-branch roll (`dd-soccer-rs` @ jitter-buffer) reached **1/1
-  on both clusters** (Hetzner monitor; AWS via SSM) — last verified state was mid-roll.
+- Roll status (2026-06-28): **AWS `dd-soccer-rs` = 1/1 with the jitter-buffer build ✓**.
+  **Hetzner SSH is timing out** (banner-exchange timeouts/resets) — can't verify its roll or
+  queue, and that node connectivity issue is almost certainly why the Hetzner learning-queue
+  is failing. First ops step: restore Hetzner node/SSH reachability, then re-check the queue.
 
 ## P4 — Step 2b (later): learned relational encoder
 Only after P1 proves value. Tiny GNN/attention encoder over the raw 22-body graph, trained
