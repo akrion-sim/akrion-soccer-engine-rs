@@ -72,7 +72,18 @@ struct DecisionOutput {
 }
 ```
 
-**Phase C — serial, schedule order (resolve + agree on state).**
+### Canonical-order invariant (the Fisher-Yates point)
+Apply/resolve MUST follow the **scheduler's canonical order**, never the order parallel threads
+finish in. Today that order is the deterministic ball-relevance sort in
+`agent_schedule_for_field_entities` (score → kind → id). The `field_entities_use_fisher_yates`
+flag is currently defined-but-inert (default off, only asserted in tests, no runtime shuffle); if
+it's ever wired on, the FY shuffle runs in **serial Phase A on the main `self.rng`** and *defines*
+the canonical order. Either way: Phase A fixes the order (and consumes the main RNG for any
+shuffle); Phase B is order-free (each player decides from the same tick-start state with its own
+RNG, so completion order is irrelevant); Phase C applies strictly in the Phase-A order. Per-player
+decision RNG is independent of the schedule/shuffle RNG.
+
+**Phase C — serial, canonical schedule order (resolve + agree on state).**
 - Human-controlled players: decide serially via the existing path (input_frame + pending_human_control).
   Few/zero in the live demo.
 - For each AI `DecisionOutput` in **schedule order**: write metadata back to `players[id]`; then run
