@@ -96,7 +96,7 @@ pub use pass_lane_yield::*;
 mod slip_break_offside;
 pub(crate) use slip_break_offside::*;
 
-pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
+pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 30.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
 /// default timestep. This is the SINGLE place tick durations derive from the timestep — change
 /// `DEFAULT_DT_SECONDS` above and every `secs_to_ticks(..)`-defined window rescales with it
