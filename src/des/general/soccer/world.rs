@@ -23761,7 +23761,9 @@ impl WorldSnapshot {
         let target_lane = target_grid.x;
         let ball_lane = ball_grid.x;
         let predicted_lane = predicted_grid.x;
-        let relief = self.positional_shape_exception_relief_for_player_target(player, target);
+        let relief = precomputed_relief.unwrap_or_else(|| {
+            self.positional_shape_exception_relief_for_player_target(player, target)
+        });
         let static_fit = self.vertical_lane_fit_for_player_target(player, target, relief);
         let in_possession = self
             .controlled_possession_team()
