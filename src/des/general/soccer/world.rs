@@ -104,7 +104,7 @@ const OFFBALL_SETTLE_STAND_YARDS: f64 = 2.0;
 /// them ~with the ball (receive it in stride), floored at `MIN_FACTOR` of nominal so they keep
 /// drifting onto it. Only applies to a moving ball (≥ `MIN_BALL_SPEED_YPS`).
 const RECEIVE_IN_STRIDE_EARLY_MARGIN: f64 = 0.92;
-const RECEIVE_IN_STRIDE_MIN_FACTOR: f64 = 0.30;
+pub(crate) const RECEIVE_IN_STRIDE_MIN_FACTOR: f64 = 0.30;
 const RECEIVE_IN_STRIDE_MIN_BALL_SPEED_YPS: f64 = 1.0;
 const INTENDED_PASS_TARGET_AWARENESS_PROBABILITY: f64 = 0.80;
 const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
