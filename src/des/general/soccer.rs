@@ -6160,7 +6160,6 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
-<<<<<<< HEAD
     /// Blindside surprise-steal opportunity this DEFENDER has against the opponent carrier
     /// in `[0, 1]` — high when it has crept into the carrier's blind arc, the carrier is
     /// dribbling forward slowly, and it believes it can catch them (see
