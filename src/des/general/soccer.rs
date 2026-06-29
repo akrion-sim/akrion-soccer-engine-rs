@@ -6187,7 +6187,6 @@ pub struct SoccerPomdpObservation {
     /// physical price of looking (the same drift channel as the look-behind scan).
     #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
     pub blindside_scan_drift_risk: f64,
-=======
     #[serde(default)]
     pub side_glance_scan_active: bool,
     #[serde(default)]
@@ -6196,7 +6195,6 @@ pub struct SoccerPomdpObservation {
     pub side_glance_surprise_recognition: f64,
     #[serde(default)]
     pub side_glance_control_cost: f64,
->>>>>>> origin/main
     /// Previous settled run-time-step decision/action summary for this player.
     /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
     /// current observation stays current-state-first, while this optional payload
