@@ -25486,11 +25486,21 @@ impl WorldSnapshot {
             return None;
         }
         // Close to a tight standoff on the goal side: within contest range, a half-step
-        // off so it forces the holder to act rather than committing to a lunge.
+        // off so it forces the holder to act rather than committing to a lunge. The
+        // press-or-contain MDP shades the standoff (press tight to win / cut a lane, or sit off
+        // and contain when a press would likely be beaten). Gated default-ON; fixed standoff off.
         let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
         let goal_side = (own_goal - holder_position).normalized();
+        let standoff = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => press_or_contain_standoff_yards(
+                PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS,
+                PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS,
+                aggression,
+            ),
+            None => HOLDER_PRESS_STANDOFF_YARDS,
+        };
         Some(
-            (holder_position + goal_side * HOLDER_PRESS_STANDOFF_YARDS)
+            (holder_position + goal_side * standoff)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
     }
