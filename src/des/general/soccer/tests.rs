@@ -87107,6 +87107,5 @@ fn slip_break_seam_and_runner_opportunity_are_recognised() {
             )
             .is_none(),
         "a runner already beyond the line is not a slip-break candidate"
->>>>>>> 378bcd9
     );
 }
