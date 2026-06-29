@@ -6700,11 +6700,7 @@ impl PlayerAgent {
             && ball_protection < CONTESTABLE_PROTECTION_THRESHOLD
             && goal_side_or_level;
 
-<<<<<<< HEAD
-        (clean_contact || exposed_dribble || contestable_close || blindside_contact)
-=======
-        (clean_contact || exposed_dribble || contestable_close || surprise_behind_contact)
->>>>>>> origin/main
+        (clean_contact || exposed_dribble || contestable_close || behind_steal_contact)
             .then_some(holder)
     }
 
