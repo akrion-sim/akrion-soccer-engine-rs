@@ -45010,7 +45010,11 @@ impl WorldSnapshot {
         // carrier should be supported forward in numbers, not left to dribble alone.
         let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
         let front_line_support = self.front_line_carrier_support_cue(me.team).is_some();
-        let forward_support_cue = uncontested_support || front_line_support;
+        // The team is advancing upfield in possession (carrier has space to take the ball on) —
+        // runners must push up with the ball, not hold shape or drop, so the whole team moves
+        // forward as a unit.
+        let team_advance_support = self.team_advance_upfield_active(me.team).is_some();
+        let forward_support_cue = uncontested_support || front_line_support || team_advance_support;
         // In our own half a drop to receive is still valid — unless a teammate is carrying
         // unpressured OR the holder is the front line, which means runners must supply depth.
         if !forward_support_cue
