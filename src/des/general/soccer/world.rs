@@ -39254,38 +39254,13 @@ impl WorldSnapshot {
         let current = self.player_snapshot_position(me);
         let center_x = self.field_width * 0.5;
         let touchline_x = if wingback_outlet {
-<<<<<<< HEAD
-            self.wingback_attacking_flank_x(me, wingback_coverage_fit)
-        } else {
-            // Wide attacker (outside mid / wide forward): open to the touchline by an amount
-            // that scales with how close the BALL'S LANE is to this player's own flank. He hugs
-            // the touchline when the ball is in his flank lane and eases back only as far as his
-            // own home lane as the ball drifts to the far flank — "the closer the ball is to
-            // your flank, the wider you should be", while still always offering a flank outlet
-            // wider than (or level with) his resting lane. OFF ⇒ the legacy fixed near-touchline
-            // buffer. `closeness` ∈ [0, 1] is 1 with the ball on his touchline, 0 on the far one.
-            let hug_buffer = (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
-                .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS);
-            let buffer = if outside_mid_ball_lane_width_enabled() {
-                let my_touchline_x = if home.x <= center_x { 0.0 } else { self.field_width };
-                let home_offset = (home.x - my_touchline_x).abs().max(hug_buffer);
-                let ball_to_my_touchline = (self.ball.position.x - my_touchline_x).abs();
-                let closeness =
-                    (1.0 - ball_to_my_touchline / self.field_width.max(1.0)).clamp(0.0, 1.0);
-                // Lerp from the home lane (ball far ⇒ closeness 0) to the touchline hug (ball on
-                // his flank ⇒ closeness 1).
-                home_offset + (hug_buffer - home_offset) * closeness
-            } else {
-                hug_buffer
-            };
-            if home.x <= center_x {
-                buffer
-            } else {
-                self.field_width - buffer
-            }
-=======
             self.wingback_attacking_flank_x(me, wingback_flank_release_fit)
         } else {
+            // Wide attacker (outside mid / wide forward): open to the touchline by an amount that
+            // scales with how close the BALL'S LANE is to this player's own flank — "the closer
+            // the ball is to your flank, the wider you should be". The ball-lane proximity is
+            // consolidated into `wide_attacker_ball_lane_open_fit`; `open_fit` ∈ [0, 1] is high
+            // with the ball in his flank lane, low on the far flank.
             let open_fit = self.wide_attacker_ball_lane_open_fit(me);
             let buffer = (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * (1.72 - open_fit))
                 .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 1.72);
@@ -39295,7 +39270,6 @@ impl WorldSnapshot {
                 self.field_width - buffer
             };
             home.x + (flank_x - home.x) * open_fit
->>>>>>> origin/main
         };
         // When the ball holder has time (low pressure) and this supporting player is
         // within ~20 yds, the holder "directs" them into wide open space — pull harder
