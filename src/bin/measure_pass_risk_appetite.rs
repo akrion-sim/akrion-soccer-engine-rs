@@ -95,7 +95,14 @@ fn role_label(role: PlayerRole) -> &'static str {
 }
 
 fn main() {
-    enable_deterministic_formation_lp();
+    // The deterministic simplex makes a given seed byte-reproducible but is ~10x slower than the
+    // default Clarabel solve. With `SOCCER_SEED_VARIED_SKILLS` providing the cross-seed variance,
+    // per-seed byte-reproducibility is no longer required, so allow opting out for throughput:
+    // set `SOCCER_FAST_NONDETERMINISTIC=1` to use the fast solver and run many more matches.
+    let fast = std::env::var("SOCCER_FAST_NONDETERMINISTIC").is_ok();
+    if !fast {
+        enable_deterministic_formation_lp();
+    }
     let args: Vec<String> = std::env::args().collect();
     let ticks: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9000);
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
