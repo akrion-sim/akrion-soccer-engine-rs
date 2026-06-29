@@ -2573,8 +2573,6 @@ const WINGBACK_BALL_AHEAD_HOLD_WIDTH_YARDS: f64 = 10.0;
 // even with the ball advanced when a ground pass could actually reach him — i.e. he is
 // within this range of the ball with a clear (un-intercepted) lane.
 const WINGBACK_GROUND_PASS_OUTLET_YARDS: f64 = 20.0;
-=======
->>>>>>> origin/main
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
