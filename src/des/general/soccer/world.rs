@@ -12697,6 +12697,22 @@ impl SoccerMatch {
                     self.stat_pass_attempt(player_team);
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
+                    // PENALTY: an isolated attacking carrier who panicked a backward/square ball
+                    // instead of driving at goal or holding it up. Trains the policy off the bug.
+                    if isolated_carrier_drive_enabled()
+                        && self.isolated_carrier_panic_back_pass(
+                            player_id,
+                            player_pos,
+                            release_target,
+                            attempt_own_half,
+                        )
+                    {
+                        self.record_reward_event_with_kind(
+                            player_id,
+                            -ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS,
+                            SoccerRewardEventKind::IsolatedCarrierPanicBackPass,
+                        );
+                    }
                 }
                 self.move_player_towards(player_id, self.players[player_id].home_position, false);
                 if release_facing != FacingBucket::Unknown {
@@ -17856,6 +17872,46 @@ impl SoccerMatch {
     /// Whether a pass played from `origin` by `team` started in that team's OWN half.
     fn pass_from_own_half(&self, team: Team, origin: Vec2) -> bool {
         pass_origin_in_own_half(team, origin, self.config.field_length_yards)
+    }
+
+    /// Whether the pass just played by `player_id` (from `origin` toward `target`) is the panicked
+    /// backward/square ball of an isolated attacking carrier — a Forward / winger in the ATTACKING
+    /// half with NO teammate ahead who recycled backward instead of driving / holding up. This is
+    /// the world-state analogue of [`isolated_attacking_carrier_drive_mode`]'s precondition, used
+    /// to emit the [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`] training penalty.
+    pub(crate) fn isolated_carrier_panic_back_pass(
+        &self,
+        player_id: usize,
+        origin: Vec2,
+        target: Vec2,
+        attempt_own_half: bool,
+    ) -> bool {
+        if attempt_own_half {
+            return false;
+        }
+        let Some(passer) = self.players.get(player_id) else {
+            return false;
+        };
+        let field_width = self.config.field_width_yards;
+        let is_attacker = passer.role == PlayerRole::Forward
+            || is_outside_midfielder_role(passer.role, passer.home_position.x, field_width);
+        if !is_attacker {
+            return false;
+        }
+        let attack_dir = passer.team.attack_dir();
+        // Meaningfully backward (not a flat square ball within the dead-band).
+        let forward_yards = (target.y - origin.y) * attack_dir;
+        if forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
+            return false;
+        }
+        // No teammate was ahead of the ball — the isolated picture.
+        let teammate_ahead = self.players.iter().any(|other| {
+            other.team == passer.team
+                && other.id != player_id
+                && other.role != PlayerRole::Goalkeeper
+                && (other.position.y - origin.y) * attack_dir > 0.0
+        });
+        !teammate_ahead
     }
 
     fn stat_pass_attempt_half(&mut self, own_half: bool) {

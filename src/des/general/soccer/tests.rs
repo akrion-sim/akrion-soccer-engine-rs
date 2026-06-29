@@ -85149,3 +85149,214 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     assert!(r[4] < 0.0, "opponent depth {} should be behind", r[4]);
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
+
+// --- Isolated attacking carrier: drive / hold-up instead of a panic backward pass --------------
+// (gate `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; see `isolated_attacking_carrier_drive_mode`).
+
+/// A baseline observation for a Home Forward carrying the ball in the attacking half with every
+/// teammate parked behind him. The recognizer-relevant fields are overwritten per assertion so the
+/// pure decision logic is exercised independently of exact pitch geometry.
+fn isolated_attacking_carrier_base_observation() -> SoccerPomdpObservation {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51_217,
+        ..Default::default()
+    });
+    let carrier = 9;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(40.0, 85.0);
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    WorldSnapshot::from_match(&sim).observation_for(carrier)
+}
+
+/// Force the "isolated attacking carrier with no outlet ahead" picture onto a base observation.
+fn make_isolated(observation: &mut SoccerPomdpObservation) {
+    observation.has_ball = true;
+    observation.yards_to_goal = 30.0;
+    observation.yards_to_own_goal = 90.0;
+    observation.field_teammates_ahead = 0;
+    observation.teammates_ahead = 0;
+    observation.visible_forward_pass_options = 0;
+    observation.best_forward_pass_option_quality = 0.0;
+    observation.best_forward_pass_receiver_openness = 0.0;
+    // No solo space/pace advantage by default; defenders count set per assertion.
+    observation.forward_dribble_space_yards = 4.0;
+    observation.nearest_opponent_distance = 4.0;
+    observation.neural_extended.nearest_opponent_closing_rate_yps = 1.5;
+}
+
+#[test]
+fn isolated_attacking_carrier_recognizer_truth_table() {
+    let mut base = isolated_attacking_carrier_base_observation();
+    make_isolated(&mut base);
+
+    // Few defenders goal-side of the ball ⇒ drive at goal solo.
+    let mut solo = base.clone();
+    solo.field_opponents_ahead = 2;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // A packed block behind the ball AND no space/pace ⇒ hold the ball up.
+    let mut hold = base.clone();
+    hold.field_opponents_ahead = 6;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&hold, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::HoldUp)
+    );
+
+    // Packed block but lots of space + a favourable speed differential ⇒ back to a solo drive.
+    let mut solo_space = hold.clone();
+    solo_space.forward_dribble_space_yards = 16.0;
+    solo_space.nearest_opponent_distance = 9.0;
+    solo_space.neural_extended.nearest_opponent_closing_rate_yps = -0.5;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo_space, PlayerRole::Forward, false),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // A winger (outside / wide midfielder) is treated exactly like a forward.
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Midfielder, true),
+        Some(IsolatedCarrierDriveMode::SoloGoalDrive)
+    );
+
+    // --- None cases: the recognizer must stay out of the way. ---
+    // A teammate IS ahead ⇒ a normal forward pass is available.
+    let mut teammate_ahead = solo.clone();
+    teammate_ahead.field_teammates_ahead = 1;
+    teammate_ahead.teammates_ahead = 1;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&teammate_ahead, PlayerRole::Forward, false),
+        None
+    );
+
+    // An open forward pass is on ⇒ let the forward-pass-first / killer-pass logic play it.
+    let mut forward_open = solo.clone();
+    forward_open.visible_forward_pass_options = 1;
+    forward_open.best_forward_pass_receiver_openness = 0.7;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&forward_open, PlayerRole::Forward, false),
+        None
+    );
+
+    // In the OWN half a backward/build-up ball is correct ⇒ never overridden.
+    let mut own_half = solo.clone();
+    own_half.yards_to_goal = 90.0;
+    own_half.yards_to_own_goal = 30.0;
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&own_half, PlayerRole::Forward, false),
+        None
+    );
+
+    // Central midfielders / defenders are not the stranded attackers this targets.
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Midfielder, false),
+        None
+    );
+    assert_eq!(
+        isolated_attacking_carrier_drive_mode(&solo, PlayerRole::Defender, false),
+        None
+    );
+}
+
+#[test]
+fn isolated_carrier_panic_back_pass_detector_truth_table() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 51_218,
+        ..Default::default()
+    });
+    let carrier = 9;
+    park_players_except(&mut sim, &[carrier]);
+    sim.players[carrier].role = PlayerRole::Forward;
+    sim.players[carrier].position = Vec2::new(40.0, 85.0);
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    let origin = sim.players[carrier].position;
+    let attack = Team::Home.attack_dir();
+    let backward = Vec2::new(40.0, origin.y - 15.0 * attack);
+    let forward = Vec2::new(40.0, origin.y + 12.0 * attack);
+
+    // The exact bug: isolated forward in the attacking half plays the ball backward.
+    assert!(sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+    // A forward ball is not the blunder.
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, forward, false));
+    // A backward ball from the OWN half is a legitimate reset.
+    assert!(sim.isolated_carrier_panic_back_pass(carrier, origin, backward, true) == false);
+
+    // A central defender hitting it backward is not penalised by this signal.
+    sim.players[carrier].role = PlayerRole::Defender;
+    sim.players[carrier].home_position = Vec2::new(40.0, 60.0);
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+    sim.players[carrier].role = PlayerRole::Forward;
+
+    // With a teammate ahead of the ball it is no longer the isolated picture.
+    sim.players[8].role = PlayerRole::Forward;
+    sim.players[8].position = Vec2::new(42.0, origin.y + 10.0 * attack);
+    assert!(!sim.isolated_carrier_panic_back_pass(carrier, origin, backward, false));
+}
+
+/// The option-biasing transform is tested as a PURE function (no process-global env toggling,
+/// which would race the parallel suite) over a hand-built option set. The env gate is exercised
+/// only as a boolean by `isolated_carrier_drive_enabled`; the behaviour it switches on lives here.
+#[test]
+fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
+    let score = |opts: &[AgentActionOptionTrace], label: &str| {
+        opts.iter()
+            .find(|o| o.label == label && o.legal)
+            .map(|o| o.score)
+            .unwrap_or(0.0)
+    };
+    let base = || {
+        vec![
+            AgentActionOptionTrace::new("carry-forward", 0.30, true),
+            AgentActionOptionTrace::new("vertical-attack", 0.30, true),
+            AgentActionOptionTrace::new("turnover-burst", 0.20, true),
+            AgentActionOptionTrace::new("recycle-reset", 1.00, true),
+            AgentActionOptionTrace::new("switch-play", 0.80, true),
+            AgentActionOptionTrace::new("pass1", 1.00, true),
+            AgentActionOptionTrace::new("protect-ball", 0.50, true),
+        ]
+    };
+
+    // Solo-goal drive: a forward carry must out-score the (damped) backward recycle and the
+    // panicked square pass1, both of which started far higher.
+    let mut solo = base();
+    apply_isolated_carrier_drive_bias(&mut solo, IsolatedCarrierDriveMode::SoloGoalDrive, false, false);
+    let drive = score(&solo, "carry-forward").max(score(&solo, "vertical-attack"));
+    assert!(
+        drive > score(&solo, "recycle-reset"),
+        "solo drive {drive:.4} should beat recycle {:.4}",
+        score(&solo, "recycle-reset")
+    );
+    assert!(
+        drive > score(&solo, "pass1"),
+        "solo drive {drive:.4} should beat the panic square pass {:.4}",
+        score(&solo, "pass1")
+    );
+    assert!(
+        score(&solo, "recycle-reset") < 1.00 && score(&solo, "pass1") < 1.00,
+        "backward outlets must be damped from their starting scores"
+    );
+
+    // Hold-up: the controlled forward carry likewise out-ranks the backward outlets.
+    let mut hold = base();
+    apply_isolated_carrier_drive_bias(&mut hold, IsolatedCarrierDriveMode::HoldUp, false, false);
+    assert!(
+        score(&hold, "carry-forward") > score(&hold, "recycle-reset"),
+        "hold-up carry {:.4} should beat recycle {:.4}",
+        score(&hold, "carry-forward"),
+        score(&hold, "recycle-reset")
+    );
+    // Shielding while waiting for support is left intact (not damped) under hold-up.
+    assert_eq!(
+        score(&hold, "protect-ball"),
+        0.50,
+        "hold-up must not damp shielding while waiting for support"
+    );
+}
