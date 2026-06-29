@@ -3904,6 +3904,9 @@ const SOCCER_NEURAL_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM: usize = 9;
 /// 22-player+ball graph plus short memory signals. This is the live substrate for
 /// graph-temporal policy/value models while preserving the existing MLP path.
 const SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM: usize = 8;
+/// Append-only forward-option recognition block: exposes the lane-aware good
+/// forward-pass quality used by forward-pass-first decisions to the value head.
+const SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM: usize = 1;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3952,8 +3955,10 @@ const SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM: usize =
 // solo-carrier block) so akrion's existing trained nets migrate by zero-padding the new tail.
 const SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4398,6 +4403,8 @@ const SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY: usize =
     SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY + 1;
 const SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY: usize =
     SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY + 1;
+const SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY: usize =
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4524,6 +4531,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM,
     // Same schema with isolated-carrier solo/hold-up channels, before graph-temporal features.
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
+    // Same schema with graph-temporal features, before forward-option-quality recognition.
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6141,8 +6150,8 @@ pub struct SoccerPomdpObservation {
     /// Lane-aware recognition of the best forward pass option (see
     /// [`forward_pass_option_quality`]) — `>=` [`best_forward_pass_receiver_openness`].
     /// Consumed by the forward-pass-first release and pass-target ranking under
-    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`. Not part of the neural feature
-    /// encoder (FEATURE_DIM unchanged).
+    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`, binned into the Q-state, and
+    /// appended to the neural feature tail.
     #[serde(default)]
     pub best_forward_pass_option_quality: f64,
     /// Slip-and-break-the-offside-trap recognition for the ball-carrier: quality `[0,1]` of the
@@ -8980,6 +8989,8 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub best_forward_pass_receiver_openness_bin: u8,
     #[serde(default)]
+    pub best_forward_pass_option_quality_bin: u8,
+    #[serde(default)]
     pub nearest_forward_teammate_distance_bin: u8,
     #[serde(default)]
     pub floor_pass_lane_score_bin: u8,
@@ -9697,6 +9708,12 @@ impl SoccerQStateKey {
                 observation.best_forward_pass_receiver_openness,
                 &[0.20, 0.40, 0.62, 0.82],
             ),
+            best_forward_pass_option_quality_bin: distance_bucket(
+                observation
+                    .best_forward_pass_option_quality
+                    .max(observation.best_forward_pass_receiver_openness),
+                &[0.20, 0.40, 0.62, 0.82],
+            ),
             nearest_forward_teammate_distance_bin: distance_bucket(
                 observation.nearest_forward_teammate_distance_yards,
                 &[6.0, 12.0, 22.0, 36.0],
@@ -10301,6 +10318,8 @@ impl SoccerQStateKey {
                 == other.slip_break_angled_away_from_goalkeeper
             && self.best_forward_pass_receiver_openness_bin
                 == other.best_forward_pass_receiver_openness_bin
+            && self.best_forward_pass_option_quality_bin
+                == other.best_forward_pass_option_quality_bin
             && self.nearest_forward_teammate_distance_bin
                 == other.nearest_forward_teammate_distance_bin
             && self.floor_pass_lane_score_bin == other.floor_pass_lane_score_bin
@@ -31075,6 +31094,38 @@ pub struct SoccerDecisionModelContract {
     pub near_goal_recycling_dampening_enabled: bool,
     pub shot_killer_pass_family_probability_floor_enabled: bool,
     pub forward_progress_bias_enabled: bool,
+    pub requested_tactical_feature_gates: Vec<String>,
+    pub role_aware_pass_risk_appetite_enabled: bool,
+    pub forward_option_recognition_enabled: bool,
+    pub forward_option_quality_in_pomdp_observation: bool,
+    pub forward_option_quality_binned_in_mdp_state: bool,
+    pub forward_option_quality_in_neural_features: bool,
+    pub forward_pass_first_enabled: bool,
+    pub isolated_carrier_drive_enabled: bool,
+    pub isolated_carrier_solo_hold_up_in_neural_features: bool,
+    pub blindside_surprise_steal_enabled: bool,
+    pub carrier_side_glance_enabled: bool,
+    pub blindside_steal_in_pomdp_observation: bool,
+    pub blindside_steal_binned_in_mdp_state: bool,
+    pub blindside_steal_in_neural_features: bool,
+    pub flank_crash_box_strategy_enabled: bool,
+    pub flank_crash_box_outer_lanes_per_side: usize,
+    pub flank_crash_box_target_min_attackers: usize,
+    pub flank_crash_box_target_max_attackers: usize,
+    pub flank_crash_box_in_pomdp_observation: bool,
+    pub flank_crash_box_binned_in_mdp_state: bool,
+    pub flank_crash_box_in_neural_features: bool,
+    pub loose_ball_uncontested_urgency_enabled: bool,
+    pub loose_ball_uncontested_urgency_binned_in_mdp_state: bool,
+    pub loose_ball_uncontested_urgency_in_neural_features: bool,
+    pub outside_mid_ball_lane_width_enabled: bool,
+    pub wingback_advanced_ball_hold_width_enabled: bool,
+    pub whole_field_motion_vector_enabled: bool,
+    pub whole_field_motion_players: usize,
+    pub whole_field_motion_balls: usize,
+    pub whole_field_motion_channels_per_entity: usize,
+    pub whole_field_motion_in_pomdp_observation: bool,
+    pub whole_field_motion_in_neural_features: bool,
     pub support_target_open_space_metrics_enabled: bool,
     pub support_target_teammate_occupied_pressure_enabled: bool,
     pub playback_intent_target_space_metrics_enabled: bool,
@@ -31898,6 +31949,28 @@ fn soccer_player_physical_trait_contract_fields() -> Vec<String> {
         .collect()
 }
 
+fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
+    [
+        "DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE",
+        "DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION",
+        "DD_SOCCER_ENABLE_FORWARD_PASS_FIRST",
+        "DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE",
+        "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
+        crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
+        "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
+        "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE_REWARD",
+        "DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY",
+        "DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH",
+        "DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH",
+        "DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT",
+        "DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE",
+        "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
     let killer_pass_over_top = tunables().killer_pass_over_top;
     SoccerDecisionModelContract {
@@ -31958,6 +32031,38 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         near_goal_recycling_dampening_enabled: true,
         shot_killer_pass_family_probability_floor_enabled: true,
         forward_progress_bias_enabled: true,
+        requested_tactical_feature_gates: soccer_requested_tactical_feature_gate_names(),
+        role_aware_pass_risk_appetite_enabled: true,
+        forward_option_recognition_enabled: true,
+        forward_option_quality_in_pomdp_observation: true,
+        forward_option_quality_binned_in_mdp_state: true,
+        forward_option_quality_in_neural_features: true,
+        forward_pass_first_enabled: true,
+        isolated_carrier_drive_enabled: true,
+        isolated_carrier_solo_hold_up_in_neural_features: true,
+        blindside_surprise_steal_enabled: true,
+        carrier_side_glance_enabled: true,
+        blindside_steal_in_pomdp_observation: true,
+        blindside_steal_binned_in_mdp_state: true,
+        blindside_steal_in_neural_features: true,
+        flank_crash_box_strategy_enabled: true,
+        flank_crash_box_outer_lanes_per_side: CRASH_BOX_OUTER_FLANK_FINE_LANES,
+        flank_crash_box_target_min_attackers: CRASH_BOX_TARGET_MIN_ATTACKERS,
+        flank_crash_box_target_max_attackers: CRASH_BOX_TARGET_MAX_ATTACKERS,
+        flank_crash_box_in_pomdp_observation: true,
+        flank_crash_box_binned_in_mdp_state: true,
+        flank_crash_box_in_neural_features: true,
+        loose_ball_uncontested_urgency_enabled: true,
+        loose_ball_uncontested_urgency_binned_in_mdp_state: true,
+        loose_ball_uncontested_urgency_in_neural_features: true,
+        outside_mid_ball_lane_width_enabled: true,
+        wingback_advanced_ball_hold_width_enabled: true,
+        whole_field_motion_vector_enabled: true,
+        whole_field_motion_players: SOCCER_NEURAL_FIELD_MOTION_PLAYERS,
+        whole_field_motion_balls: SOCCER_NEURAL_FIELD_MOTION_BALLS,
+        whole_field_motion_channels_per_entity: SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER,
+        whole_field_motion_in_pomdp_observation: true,
+        whole_field_motion_in_neural_features: true,
         support_target_open_space_metrics_enabled: true,
         support_target_teammate_occupied_pressure_enabled: true,
         playback_intent_target_space_metrics_enabled: true,
@@ -39438,6 +39543,10 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_signed_unit(graph_temporal.temporal_actor_run_memory_score);
     features[SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY] =
         soccer_neural_unit(graph_temporal.temporal_opponent_press_memory_score);
+    features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY] = soccer_neural_unit(
+        obs.best_forward_pass_option_quality
+            .max(obs.best_forward_pass_receiver_openness),
+    );
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -50778,14 +50887,13 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
 }
 
-/// Set `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=1` to enable the "surprise steal from behind".
+/// `DD_SOCCER_ENABLE_BLINDSIDE_STEAL` controls the "surprise steal from behind".
 /// A defender that has crept into the blind arc of an opponent dribbling *forward and
 /// slowly* (walk/jog/skip) — and that believes it can actually catch the carrier (a real
 /// closing-speed margin) — can nick the ball from behind before the carrier reacts; the
 /// carrier in turn glances to its blind side (a head-scan with a real control-drift cost)
-/// to RECOGNISE the threat and break away. Default off ⇒ the assessment short-circuits to
-/// `None`, every new observation field stays zero, the new action option is inert, and the
-/// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
+/// to RECOGNIZE the threat and break away. Production is default-on and can be killed with
+/// `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=0`; tests remain default-off for stable A/B coverage.
 fn dd_soccer_enable_blindside_steal() -> bool {
     #[cfg(test)]
     {

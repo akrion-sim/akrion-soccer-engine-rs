@@ -8239,6 +8239,11 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
         "forward outlet openness should clear the learnable good-option threshold: {observation:?}"
     );
     assert!(
+        observation.best_forward_pass_option_quality
+            >= observation.best_forward_pass_receiver_openness,
+        "POMDP should expose the lane-aware forward-option quality: {observation:?}"
+    );
+    assert!(
         observation.nearest_forward_teammate_distance_yards < 10.0,
         "nearest forward distance should follow the actionable outlet"
     );
@@ -8253,6 +8258,10 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
     assert!(
         q_key.best_forward_pass_receiver_openness_bin > 0,
         "Q-state should bucket the forward outlet openness: {q_key:?}"
+    );
+    assert!(
+        q_key.best_forward_pass_option_quality_bin > 0,
+        "Q-state should bucket the lane-aware forward option quality: {q_key:?}"
     );
 
     let transition = SoccerLearningTransition {
@@ -8280,6 +8289,10 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
     assert!(
         features[SOCCER_NEURAL_FEATURE_BEST_FORWARD_OPENNESS] > 0.0,
         "neural features should see forward outlet openness"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY] > 0.0,
+        "neural features should see lane-aware forward-option quality"
     );
     assert!(
         features[SOCCER_NEURAL_FEATURE_FORWARD_SUPPORT_PROXIMITY] > 0.0,
@@ -80868,6 +80881,63 @@ fn assert_soccer_decision_model_contract_json(meta: &serde_json::Value) {
     assert_eq!(model["nearGoalRecyclingDampeningEnabled"], true);
     assert_eq!(model["shotKillerPassFamilyProbabilityFloorEnabled"], true);
     assert_eq!(model["forwardProgressBiasEnabled"], true);
+    assert_eq!(
+        model["requestedTacticalFeatureGates"],
+        serde_json::json!(soccer_requested_tactical_feature_gate_names())
+    );
+    for field in [
+        "roleAwarePassRiskAppetiteEnabled",
+        "forwardOptionRecognitionEnabled",
+        "forwardOptionQualityInPomdpObservation",
+        "forwardOptionQualityBinnedInMdpState",
+        "forwardOptionQualityInNeuralFeatures",
+        "forwardPassFirstEnabled",
+        "isolatedCarrierDriveEnabled",
+        "isolatedCarrierSoloHoldUpInNeuralFeatures",
+        "blindsideSurpriseStealEnabled",
+        "carrierSideGlanceEnabled",
+        "blindsideStealInPomdpObservation",
+        "blindsideStealBinnedInMdpState",
+        "blindsideStealInNeuralFeatures",
+        "flankCrashBoxStrategyEnabled",
+        "flankCrashBoxInPomdpObservation",
+        "flankCrashBoxBinnedInMdpState",
+        "flankCrashBoxInNeuralFeatures",
+        "looseBallUncontestedUrgencyEnabled",
+        "looseBallUncontestedUrgencyBinnedInMdpState",
+        "looseBallUncontestedUrgencyInNeuralFeatures",
+        "outsideMidBallLaneWidthEnabled",
+        "wingbackAdvancedBallHoldWidthEnabled",
+        "wholeFieldMotionVectorEnabled",
+        "wholeFieldMotionInPomdpObservation",
+        "wholeFieldMotionInNeuralFeatures",
+    ] {
+        assert_eq!(model[field], true, "{field}");
+    }
+    assert_eq!(
+        model["flankCrashBoxOuterLanesPerSide"],
+        CRASH_BOX_OUTER_FLANK_FINE_LANES
+    );
+    assert_eq!(
+        model["flankCrashBoxTargetMinAttackers"],
+        CRASH_BOX_TARGET_MIN_ATTACKERS
+    );
+    assert_eq!(
+        model["flankCrashBoxTargetMaxAttackers"],
+        CRASH_BOX_TARGET_MAX_ATTACKERS
+    );
+    assert_eq!(
+        model["wholeFieldMotionPlayers"],
+        SOCCER_NEURAL_FIELD_MOTION_PLAYERS
+    );
+    assert_eq!(
+        model["wholeFieldMotionBalls"],
+        SOCCER_NEURAL_FIELD_MOTION_BALLS
+    );
+    assert_eq!(
+        model["wholeFieldMotionChannelsPerEntity"],
+        SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER
+    );
     assert_eq!(model["supportTargetOpenSpaceMetricsEnabled"], true);
     assert_eq!(model["supportTargetTeammateOccupiedPressureEnabled"], true);
     assert_eq!(model["playbackIntentTargetSpaceMetricsEnabled"], true);
