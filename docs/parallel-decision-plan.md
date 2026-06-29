@@ -9,6 +9,32 @@ reaction that doesn't physically exist. A **simultaneous-move** model (everyone 
 model at this granularity. "State must be agreed upon" is preserved by keeping the **resolve**
 phase serial.
 
+## Do we need dt = 1/30 to parallelize? — No (verified)
+Concern: the ball moves in 1/15 s, so simultaneous decisions could read a stale ball. But the
+**free ball already does not move during the player loop today**: `run_ball_time_step` is scheduled
+*last* (Ball schedule score = 0.0, below every player) and the ball-kinematics integration runs
+*after* the loop. So nearly all players ALREADY decide on the tick-start ball — the simultaneous
+model doesn't add free-ball staleness. The only sequential-vs-parallel difference is mid-loop
+**possession-change** effects (`sync_held_ball_to_holder` / keep-out / shield) seen by the few
+*late-scheduled* players — niche, and quantified by the A/B.
+
+Conclusion: **parallelize at dt = 1/15 first.** dt = 1/30 is *perf-feasible* with parallelism
+(serial floor ~20 ms/tick fits the 33 ms budget; decisions parallelize into the rest) but it's a
+**separate, larger change**: every step-based constant (MPC horizons in *steps*, refractory/cadence
+/refresh ticks) must be rescaled ×2 to preserve real-time behavior, and the trained policy needs
+revalidation at the new dt. Treat 1/30 as an independent fidelity upgrade, pursued only if the A/B
+shows possession-contest regressions or finer physics is wanted for its own sake.
+
+## On Fisher-Yates while parallelizing
+Today the live order is a deterministic ball-relevance *sort* (`agent_schedule_for_field_entities`);
+`field_entities_use_fisher_yates` is inert (default off, only asserted in tests, no runtime shuffle).
+Regardless: **simultaneity makes ordering irrelevant for *decide*** — every agent reads the identical
+tick-start state, so no one has an ordering advantage (that's exactly the fairness FY approximated,
+achieved for free). Ordering only matters for *resolve* (who wins a contest); keep that serial in
+canonical order, and if randomized fairness is wanted there, run the FY shuffle in serial Phase A on
+the main RNG to define the apply order. So: shuffle (optional) for resolve, parallel + order-free for
+decide.
+
 ## Where the time goes (why the per-player layer is the right target)
 | Layer | Share of step | |
 |---|---|---|
