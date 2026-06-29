@@ -1,3 +1,6 @@
+NOTE: Use `~/codes/akrion-sim/akrion-soccer-engine.rs` (the current/canonical
+soccer engine) for this work.
+
 WORK ONLY ON `main`. Do NOT `git checkout` another branch, do NOT create new
 branches, and do NOT create git worktrees on other branches. Stay in this one
 working tree on `main` and commit directly to it. To incorporate another branch's

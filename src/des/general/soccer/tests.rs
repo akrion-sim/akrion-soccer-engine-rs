@@ -7958,6 +7958,120 @@ fn quick_forward_pass_values_open_advanced_teammate_and_stays_inert_when_gated_o
 }
 
 #[test]
+fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
+    let passer = 7;
+    let forward_outlet = 9;
+    let backward_reset = 6;
+    let pressure_defender = 12;
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 58_119,
+        ..Default::default()
+    });
+    park_players_except(&mut sim, &[passer, forward_outlet, backward_reset, pressure_defender]);
+    sim.active_set_play = None;
+    sim.pending_pass = None;
+    sim.pending_shot = None;
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 48.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].skills.passing = 6.4;
+    sim.players[passer].skills.passing_completion_rate = 6.2;
+    sim.players[passer].skills.vision = 6.3;
+    sim.players[forward_outlet].team = Team::Home;
+    sim.players[forward_outlet].role = PlayerRole::Forward;
+    sim.players[forward_outlet].position = Vec2::new(41.2, 56.3);
+    sim.players[forward_outlet].home_position = sim.players[forward_outlet].position;
+    sim.players[forward_outlet].velocity = Vec2::new(0.2, 2.1);
+    sim.players[backward_reset].team = Team::Home;
+    sim.players[backward_reset].role = PlayerRole::Defender;
+    sim.players[backward_reset].position = Vec2::new(38.0, 44.2);
+    sim.players[backward_reset].home_position = sim.players[backward_reset].position;
+    sim.players[backward_reset].velocity = Vec2::zero();
+    sim.players[pressure_defender].team = Team::Away;
+    sim.players[pressure_defender].role = PlayerRole::Defender;
+    sim.players[pressure_defender].position = Vec2::new(44.0, 48.1);
+    sim.players[pressure_defender].home_position = sim.players[pressure_defender].position;
+    sim.players[pressure_defender].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let ranked = snapshot.ranked_visible_pass_targets(passer, 10);
+    assert_eq!(
+        ranked.first().copied(),
+        Some(forward_outlet),
+        "the open forward outlet should outrank the backward reset: {ranked:?}"
+    );
+    assert!(
+        ranked.contains(&backward_reset),
+        "fixture should still leave a backward reset available as a fallback: {ranked:?}"
+    );
+
+    let observation = snapshot.observation_for(passer);
+    assert!(
+        observation.visible_forward_pass_options >= 1,
+        "POMDP should expose the actionable forward outlet: {observation:?}"
+    );
+    assert!(
+        observation.best_forward_pass_receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS,
+        "forward outlet openness should clear the learnable good-option threshold: {observation:?}"
+    );
+    assert!(
+        observation.nearest_forward_teammate_distance_yards < 10.0,
+        "nearest forward distance should follow the actionable outlet"
+    );
+
+    let state = snapshot.mdp_state_for_player(passer);
+    let q_key =
+        SoccerQStateKey::from_parts(&state, &observation, Team::Home, sim.players[passer].role);
+    assert!(
+        q_key.visible_forward_pass_options_bin > 0,
+        "Q-state should bucket the actionable forward option: {q_key:?}"
+    );
+    assert!(
+        q_key.best_forward_pass_receiver_openness_bin > 0,
+        "Q-state should bucket the forward outlet openness: {q_key:?}"
+    );
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: passer,
+        team: Team::Home,
+        role: sim.players[passer].role,
+        state,
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "pass".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(passer),
+        next_observation: observation,
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_VISIBLE_FORWARD_OPTIONS] > 0.0,
+        "neural features should see the actionable forward option"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_BEST_FORWARD_OPENNESS] > 0.0,
+        "neural features should see forward outlet openness"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FORWARD_SUPPORT_PROXIMITY] > 0.0,
+        "neural features should see forward support proximity"
+    );
+}
+
+#[test]
 fn first_touch_mpc_vetoes_unplayable_one_touch_pass_and_controls_first() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -48422,15 +48536,21 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_ENERGY_ECONOMY_FEATURE_DIM + SOCCER_NEURAL_ENERGY_ECONOMY_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
-    );
-    assert_eq!(
-        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
     );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+    );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
+    assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM, 8);
     // The previous six-channel motion totals stay recognised legacy input dims.
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
@@ -48592,6 +48712,11 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     assert_eq!(
         SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
             + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
     );
     assert_eq!(
@@ -66383,13 +66508,29 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_PRE_KILLER_OVER_TOP_FEATURE_DIM + SOCCER_NEURAL_KILLER_OVER_TOP_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
+            + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM
-            + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+    );
+    assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
+    assert_eq!(SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM, 8);
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM),
+        "the pre-relational-attention total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM),
+        "the pre-graph-temporal total must be a recognised legacy dim so old nets migrate"
     );
     assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM, 2);
     assert_eq!(SOCCER_NEURAL_DRIBBLE_BEAT_FEATURE_DIM, 4);
@@ -66455,6 +66596,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT + 1,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY + 1,
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
     );
     assert_eq!(
@@ -84387,15 +84532,51 @@ fn marl_team_component_balanced_only_suppresses_single_team_ticks() {
     // Legacy (unbalanced) behaviour: opponent mean defaults to 0.0, so the "zero-sum" term leaks
     // the full one-sided reward — this is the bias being hardened against.
     assert_eq!(
-        soccer_marl_team_component(home_only, Team::Home, false),
+        soccer_marl_team_component(home_only, Team::Home, false, None),
         30.0,
         "unbalanced term leaks own reward when the opponent is absent"
     );
     // Balanced: a single-team tick contributes no centralized team component.
     assert_eq!(
-        soccer_marl_team_component(home_only, Team::Home, true),
+        soccer_marl_team_component(home_only, Team::Home, true, None),
         0.0,
         "balanced term suppresses single-team ticks"
+    );
+}
+
+#[test]
+fn marl_team_component_clamp_bounds_single_team_spike() {
+    // The same single-team spike (one drained +30 scorer-share row, no opponent sample). The
+    // balanced gate suppresses it to 0; the clamp instead bounds its magnitude. Both are gated
+    // and complementary; None ⇒ unbounded (byte-identical legacy).
+    let mut home_only = SoccerMarlTickReward::default();
+    home_only.record(Team::Home, 30.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false, None),
+        30.0,
+        "no clamp leaves the +30 one-sided spike intact"
+    );
+    assert_eq!(
+        soccer_marl_team_component(home_only, Team::Home, false, Some(12.0)),
+        12.0,
+        "clamp caps the +30 spike at +12"
+    );
+    // Symmetric on the conceding side.
+    let mut away_only = SoccerMarlTickReward::default();
+    away_only.record(Team::Away, 30.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(away_only, Team::Home, false, Some(12.0)),
+        -12.0,
+        "clamp caps the -30 opponent-only spike at -12"
+    );
+    // A small dense differential is BELOW the bound, so the clamp is a no-op there.
+    let mut both = SoccerMarlTickReward::default();
+    both.record(Team::Home, 3.0, 0.0);
+    both.record(Team::Away, 1.0, 0.0);
+    assert_eq!(
+        soccer_marl_team_component(both, Team::Home, false, Some(12.0)),
+        soccer_marl_team_component(both, Team::Home, false, None),
+        "clamp leaves an in-bound dense differential untouched"
     );
 }
 
@@ -84407,8 +84588,8 @@ fn marl_team_component_unchanged_when_both_teams_present() {
     both.record(Team::Home, 4.0, 0.0);
     both.record(Team::Home, 2.0, 0.0); // home mean 3.0
     both.record(Team::Away, 1.0, 0.0); // away mean 1.0
-    let unbalanced = soccer_marl_team_component(both, Team::Home, false);
-    let balanced = soccer_marl_team_component(both, Team::Home, true);
+    let unbalanced = soccer_marl_team_component(both, Team::Home, false, None);
+    let balanced = soccer_marl_team_component(both, Team::Home, true, None);
     assert!(
         (unbalanced - 2.0).abs() < 1e-9,
         "home_mean - away_mean = 3 - 1"
@@ -84418,7 +84599,7 @@ fn marl_team_component_unchanged_when_both_teams_present() {
         "balanced flag is a no-op when both teams are present"
     );
     // Antisymmetric across teams (genuinely zero-sum) when both are present.
-    assert!((soccer_marl_team_component(both, Team::Away, true) + balanced).abs() < 1e-9);
+    assert!((soccer_marl_team_component(both, Team::Away, true, None) + balanced).abs() < 1e-9);
 }
 
 /// Headless A/B for wingback-first forward priority (`DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY`).
@@ -85011,4 +85192,113 @@ fn policy_advantage_standardization_zero_means_and_skips_degenerate_batches() {
     let new_var = standardized.iter().map(|a| (a - new_mean).powi(2)).sum::<f64>()
         / standardized.len() as f64;
     assert!((new_var - 1.0).abs() < 1e-3, "standardized batch is ~unit-variance");
+}
+
+// ---------------------------------------------------------------------------
+// Relational attention readout (graph-style neighbourhood pooling) — the gated
+// learned-feature analogue of a GNN/attention encoder over the whole-field motion
+// block. See `soccer_relational_attention_readout` / `..._group`.
+// ---------------------------------------------------------------------------
+
+/// Build a full-length whole-field motion block from teammate then opponent
+/// `(forward, lateral, vel_forward, vel_lateral)` tuples (acc/jerk left zero, ball zero).
+fn relational_test_motion_block(
+    teammates: &[(f64, f64, f64, f64)],
+    opponents: &[(f64, f64, f64, f64)],
+) -> Vec<f32> {
+    let per = SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+    let half = SOCCER_NEURAL_FIELD_MOTION_PLAYERS / 2;
+    let mut block = vec![0.0f32; SOCCER_NEURAL_FIELD_MOTION_DIM];
+    for (i, &(fy, fx, vy, vx)) in teammates.iter().take(half).enumerate() {
+        let b = i * per;
+        block[b] = fy as f32;
+        block[b + 1] = fx as f32;
+        block[b + 2] = vy as f32;
+        block[b + 3] = vx as f32;
+    }
+    for (i, &(fy, fx, vy, vx)) in opponents.iter().take(half).enumerate() {
+        let b = (half + i) * per;
+        block[b] = fy as f32;
+        block[b + 1] = fx as f32;
+        block[b + 2] = vy as f32;
+        block[b + 3] = vx as f32;
+    }
+    block
+}
+
+#[test]
+fn relational_attention_readout_is_zeros_for_wrong_length() {
+    assert_eq!(
+        soccer_relational_attention_readout(&[]),
+        [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM]
+    );
+    assert_eq!(
+        soccer_relational_attention_readout(&[0.0f32; 7]),
+        [0.0; SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM]
+    );
+}
+
+#[test]
+fn relational_attention_block_indices_are_contiguous_and_in_range() {
+    // The eight named indices must be consecutive and land inside the feature vector.
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_RELATIONAL_TEAMMATE_DEPTH,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY,
+        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
+            + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM
+            - 1
+    );
+    assert!(SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY < SOCCER_NEURAL_FEATURE_DIM);
+}
+
+#[test]
+fn relational_attention_group_is_permutation_invariant() {
+    // Same set of opponents in two different orders yields the identical readout — the
+    // structural property a flat fixed-order list cannot give the MLP.
+    let a = [(0.2, 0.1, -0.3, 0.0), (0.5, -0.4, 0.2, 0.1), (-0.1, 0.3, 0.0, -0.2)];
+    let b = [a[2], a[0], a[1]];
+    let ra = soccer_relational_attention_group(&a);
+    let rb = soccer_relational_attention_group(&b);
+    assert!((ra.0 - rb.0).abs() < 1e-9);
+    assert!((ra.1 - rb.1).abs() < 1e-9);
+    assert!((ra.2 - rb.2).abs() < 1e-9);
+    assert!((ra.3 - rb.3).abs() < 1e-9);
+}
+
+#[test]
+fn relational_attention_closing_sign_tracks_approach() {
+    // One opponent dead ahead moving toward the actor (negative forward velocity) ⇒ positive
+    // closing (pressure arriving); the same opponent moving away ⇒ negative closing.
+    let approaching = soccer_relational_attention_group(&[(0.3, 0.0, -0.4, 0.0)]);
+    let retreating = soccer_relational_attention_group(&[(0.3, 0.0, 0.4, 0.0)]);
+    assert!(approaching.2 > 0.0, "approaching member closes: {}", approaching.2);
+    assert!(retreating.2 < 0.0, "retreating member opens: {}", retreating.2);
+}
+
+#[test]
+fn relational_attention_entropy_low_when_one_member_dominates() {
+    // A single very-near member next to several far members ⇒ peaked attention ⇒ low entropy.
+    let peaked =
+        soccer_relational_attention_group(&[(0.02, 0.0, 0.0, 0.0), (0.9, 0.0, 0.0, 0.0), (-0.9, 0.0, 0.0, 0.0)]);
+    // Three members at equal distance ⇒ uniform attention ⇒ entropy near 1.
+    let flat = soccer_relational_attention_group(&[(0.3, 0.0, 0.0, 0.0), (-0.3, 0.0, 0.0, 0.0), (0.0, 0.3, 0.0, 0.0)]);
+    assert!(peaked.3 < 0.5, "peaked entropy {} should be low", peaked.3);
+    assert!(flat.3 > 0.9, "flat entropy {} should be high", flat.3);
+}
+
+#[test]
+fn relational_attention_readout_excludes_self_and_separates_teams() {
+    // Actor at origin (self slot), one teammate ahead, one opponent behind closing in.
+    let teammates = [(0.0, 0.0, 0.0, 0.0), (0.4, 0.1, 0.0, 0.0)];
+    let opponents = [(-0.3, 0.0, 0.4, 0.0)];
+    let motion = relational_test_motion_block(&teammates, &opponents);
+    let r = soccer_relational_attention_readout(&motion);
+    // Teammate depth is positive (support ahead), excluding the self slot at origin.
+    assert!(r[0] > 0.0, "teammate depth {} should be forward", r[0]);
+    // Opponent depth is negative (behind), and the opponent moving toward the actor closes in.
+    assert!(r[4] < 0.0, "opponent depth {} should be behind", r[4]);
+    assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }

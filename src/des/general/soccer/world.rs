@@ -37,6 +37,9 @@ const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS: f64 = 2.2;
+const GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT: f64 = 0.34;
+const GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION: f64 = 0.30;
+const GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT: f64 = 0.26;
 const TEAMMATE_LANE_GUARD_MIN_PATH_YARDS: f64 = 2.0;
 const TEAMMATE_LANE_GUARD_RADIUS_YARDS: f64 = 2.75;
 const TEAMMATE_LANE_GUARD_SAME_ROLE_RADIUS_YARDS: f64 = 3.35;
@@ -14150,6 +14153,57 @@ impl SoccerMatch {
         obstacles
     }
 
+    /// Offside line (the second-last defender's `y`, GK included) for
+    /// `attacking_team`, computed from the live players. `None` when the defending
+    /// side has fewer than two players. Used to keep the xT terminal shaping onside.
+    fn live_offside_line_for(&self, attacking_team: Team) -> Option<f64> {
+        let attack = attacking_team.attack_dir();
+        // Progress toward the opponent goal; the two largest are the last and
+        // second-last defenders, and the offside line sits at the second-last.
+        let mut progress: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team != attacking_team && p.position.y.is_finite())
+            .map(|p| p.position.y * attack)
+            .collect();
+        if progress.len() < 2 {
+            return None;
+        }
+        progress.sort_by(|a, b| b.total_cmp(a));
+        Some(progress[1] * attack)
+    }
+
+    /// Cap the xT-`shaped` reference so its attack-direction progress never exceeds
+    /// the larger of the original (onside) target's progress and the offside line —
+    /// i.e. the nudge may pull sideways/back freely but cannot advance an attacker
+    /// past the line the support search kept it behind. No-op for non-attackers,
+    /// when the line is unknown, or when the shaped point is already onside.
+    fn xt_onside_capped_reference(
+        &self,
+        player_id: usize,
+        my_team: Team,
+        original: Vec2,
+        shaped: Vec2,
+    ) -> Vec2 {
+        let is_attacker = self
+            .players
+            .get(player_id)
+            .map_or(false, |p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder));
+        if !is_attacker {
+            return shaped;
+        }
+        let Some(line_y) = self.live_offside_line_for(my_team) else {
+            return shaped;
+        };
+        let attack = my_team.attack_dir();
+        let cap_progress = (original.y * attack).max(line_y * attack);
+        if shaped.y * attack > cap_progress {
+            Vec2::new(shaped.x, cap_progress * attack)
+        } else {
+            shaped
+        }
+    }
+
     /// The desired velocity actually executed this tick, after the MPC execution
     /// and (optionally) MDP↔MPC reconciliation layers. The "MDP" decision is the
     /// learned-policy/heuristic [`Self::collision_aware_desired_velocity`]; the
@@ -14569,7 +14623,15 @@ impl SoccerMatch {
                     top_speed: player_top_speed_yps(p.role, &p.skills),
                 })
                 .collect();
-            xt_terminal_shaped_target(&points, my_team, pitch_value_target, fw, fl)
+            let shaped = xt_terminal_shaped_target(&points, my_team, pitch_value_target, fw, fl);
+            // Onside discipline: the support search already held this reference
+            // onside; the goalward pull of the xT gradient must not undo that and
+            // park an attacker offside. Cap the shaped reference's attack-direction
+            // progress so it never advances FURTHER beyond the offside line than the
+            // assigned target already was (a sanctioned in-behind run keeps its lead,
+            // but the nudge can't extend it). Applies only to forwards/midfielders,
+            // matching `clamp_forward_onside_support`.
+            self.xt_onside_capped_reference(player_id, my_team, pitch_value_target, shaped)
         } else {
             pitch_value_target
         };
@@ -19802,6 +19864,11 @@ struct ForwardSupportContext {
     teammates_ahead: usize,
     visible_forward_pass_options: usize,
     best_forward_pass_receiver_openness: f64,
+    /// Lane-aware recognition of the best forward pass option (see
+    /// [`forward_pass_option_quality`]): blends receiver openness with completability so a
+    /// clear ball to an advanced runner is recognised even when raw openness is moderate.
+    /// `>=` [`best_forward_pass_receiver_openness`] by construction.
+    best_forward_pass_option_quality: f64,
     nearest_forward_teammate_distance_yards: f64,
     /// Value [0,1] of the best QUICK FORWARD ground pass available — a short progressive
     /// ball (≈5–8 m, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
@@ -19887,6 +19954,66 @@ pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
     let overshoot = (distance_yards - QUICK_FORWARD_PASS_MAX_YARDS).max(0.0);
     let outside = shortfall.max(overshoot);
     (1.0 - outside / QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS).clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ForwardFloorOutletAssessment {
+    actionable: bool,
+    receiver_openness_for_score: f64,
+    expected_completion_for_score: f64,
+    quality_fit: f64,
+    distance_fit: f64,
+}
+
+fn forward_floor_outlet_assessment(
+    forward_yards: f64,
+    distance_yards: f64,
+    quality: &PassTargetQuality,
+    require_reception_won: bool,
+) -> ForwardFloorOutletAssessment {
+    let half_open_forward = forward_yards >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
+        && quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
+    let lane_safe = !require_reception_won
+        || quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH;
+    let receiver_openness_for_score = if half_open_forward {
+        quality
+            .receiver_openness
+            .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
+    } else {
+        quality.receiver_openness
+    };
+    let expected_completion_for_score = if half_open_forward && lane_safe {
+        quality
+            .expected_completion
+            .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
+    } else {
+        quality.expected_completion
+    };
+    let upfield_fit = (forward_yards / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
+    let quality_fit = (receiver_openness_for_score.clamp(0.0, 1.0) * 0.46
+        + expected_completion_for_score.clamp(0.0, 1.0) * 0.32
+        + quality.stride_fit.clamp(0.0, 1.0) * 0.12
+        + upfield_fit * 0.10)
+        .clamp(0.0, 1.0);
+    let progressive_floor_outlet = forward_yards >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
+        && distance_yards >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS;
+    let completion_or_stride_fit =
+        quality.expected_completion >= GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION
+            || quality.stride_fit >= GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT
+            || expected_completion_for_score >= HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR;
+    let actionable = progressive_floor_outlet
+        && lane_safe
+        && receiver_openness_for_score >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
+        && completion_or_stride_fit
+        && quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT;
+
+    ForwardFloorOutletAssessment {
+        actionable,
+        receiver_openness_for_score,
+        expected_completion_for_score,
+        quality_fit,
+        distance_fit: quick_forward_pass_band_fit(distance_yards),
+    }
 }
 
 fn first_touch_shape_prior_for_snapshot(
@@ -20339,7 +20466,7 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok())
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS"))
     }
 }
 
@@ -20428,16 +20555,25 @@ pub(crate) fn soccer_mappo_epochs() -> usize {
 /// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
 /// to opt in) — leaving the default training run byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
-            .map(|raw| {
-                let raw = raw.trim();
-                raw == "1" || raw.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION"))
+    }
 }
 
 /// Whether a policy batch's advantages must be standardized (zero-mean / unit-variance)
@@ -20472,15 +20608,63 @@ pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f6
 /// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
 /// Read once per process.
 pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+                .map(|raw| {
+                    let raw = raw.trim();
+                    raw == "1" || raw.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT"))
+    }
+}
+
+/// Whether to bound the magnitude of the centralized MAPPO team component (see
+/// [`soccer_marl_team_component`]). The term is `own_mean − opponent_mean` over a tick; on a
+/// single-team tick (e.g. a drained deferred goal/chain-credit row trained apart from its
+/// 22-player cohort) the absent opponent mean reads 0.0, so a sparse +30 scorer share becomes a
+/// one-sided +30 spike that — without advantage standardization (default off) — is a large,
+/// destabilizing policy-gradient step. This clamp caps that spike while leaving the small dense
+/// per-tick differentials untouched; a softer, always-safe complement to the balanced gate (which
+/// suppresses the term entirely on single-team ticks). OFF by default ⇒ byte-identical; set
+/// `DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP=1`. Read once per process.
+pub(crate) fn dd_soccer_enable_marl_team_component_clamp() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT")
+        std::env::var("DD_SOCCER_ENABLE_MARL_TEAM_COMPONENT_CLAMP")
             .map(|raw| {
                 let raw = raw.trim();
                 raw == "1" || raw.eq_ignore_ascii_case("true")
             })
             .unwrap_or(false)
+    })
+}
+
+/// Symmetric bound (in reward points) for the MAPPO team-component clamp when it is enabled.
+/// Defaults to [`MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT`] — about a shot's reward magnitude, so
+/// legitimate dense differentials pass through while a sparse single-team event spike is capped.
+/// Learner/operator override via `DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS` (clamped 1.0-200.0).
+pub(crate) fn marl_team_component_clamp_points() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_MARL_TEAM_COMPONENT_CLAMP_POINTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 200.0))
+            .unwrap_or(MARL_TEAM_COMPONENT_CLAMP_POINTS_DEFAULT)
     })
 }
 
@@ -20549,9 +20733,18 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
 /// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
 /// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
 fn dd_soccer_enable_defensive_shepherd() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD"))
+    }
 }
 
 /// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
@@ -20559,9 +20752,18 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
 /// second pressure rather than a clean run at the back line. See
 /// [`WorldSnapshot::press_cover_target_for`].
 fn dd_soccer_enable_press_cover() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_COVER"))
+    }
 }
 fn dd_soccer_disable_weakside_width_hold() -> bool {
     use std::sync::OnceLock;
@@ -20675,18 +20877,38 @@ pub(crate) fn own_half_short_pass_liability_penalty_factor(
 /// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
 /// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY"))
+    }
 }
 /// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
 /// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
 /// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
 /// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
 pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok()
+        })
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY"))
+    }
 }
 /// True when either wasted-energy variant is active. Both share the windowed-sample +
 /// ball-interaction-tracking machinery; the sustained variant additionally requires a long
@@ -20699,9 +20921,18 @@ pub(crate) fn wasted_energy_tracking_active() -> bool {
 /// Far-from-ball off-ball energy conservation throttle. OFF by default; set
 /// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION"))
+    }
 }
 /// Team → fixed history-array index (`Home` = 0, `Away` = 1).
 pub(crate) fn team_index(team: Team) -> usize {
@@ -20812,9 +21043,18 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
 /// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
 /// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
 fn dd_soccer_enable_off_ball_space_discipline() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
+    }
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
@@ -20852,9 +21092,18 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
 /// retrospective concede penalty (byte-identical baseline / A/B). See
 /// [`SoccerSimulation::record_keeper_save_reward`].
 fn dd_soccer_enable_keeper_save_reward() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD"))
+    }
 }
 
 /// Full reward points for a clean shot-stop (catch/save) of a maximally dangerous effort.
@@ -25460,6 +25709,7 @@ impl WorldSnapshot {
                 threaded_goal_pass_over_top_back_line_clearance_yards: 0.0,
                 threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
@@ -25929,7 +26179,7 @@ impl WorldSnapshot {
         let visibility_elapsed = phase_started.elapsed();
         let phase_started = Instant::now();
         let visible_pass_targets = if has_ball {
-            self.ranked_visible_pass_targets(player_id, 3)
+            self.ranked_visible_pass_targets(player_id, 8)
         } else {
             Vec::new()
         };
@@ -26823,6 +27073,8 @@ impl WorldSnapshot {
                 .unwrap_or(0.0),
             best_forward_pass_receiver_openness: forward_support_context
                 .best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality: forward_support_context
+                .best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
@@ -28347,13 +28599,99 @@ impl WorldSnapshot {
                     return false;
                 }
                 let position = self.player_snapshot_position(p);
-                let forward = (position.y - me_position.y) * me.team.attack_dir();
+                let initial_is_cross = pass_would_be_cross(
+                    me_position,
+                    position,
+                    me.team,
+                    self.field_width,
+                    self.field_length,
+                );
+                let nominal_speed = pass_speed_yps_from_power(
+                    0.68,
+                    PassFlight::Floor,
+                    initial_is_cross,
+                    &me.skills,
+                );
+                let pass_point = self
+                    .anticipated_pass_reception_point(me.id, p.id, PassFlight::Floor, nominal_speed)
+                    .unwrap_or(position);
+                let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 let distance = me_position.distance(position);
-                forward >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
-                    && distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
-                    && (!visible_only || self.player_can_see_player(me.id, p.id))
+                if !visible_only && self.pending_offside_for_pass(me.id, p.id).is_none() {
+                    let quality = pass_target_quality_for_snapshot(
+                        self,
+                        me,
+                        me_position,
+                        p,
+                        position,
+                        PassFlight::Floor,
+                    );
+                    return forward_floor_outlet_assessment(
+                        forward,
+                        distance,
+                        &quality,
+                        require_reception_won,
+                    )
+                    .actionable;
+                }
+                self.player_can_see_player(me.id, p.id)
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
+                    && {
+                        let quality = pass_target_quality_for_snapshot(
+                            self,
+                            me,
+                            me_position,
+                            p,
+                            position,
+                            PassFlight::Floor,
+                        );
+                        forward_floor_outlet_assessment(
+                            forward,
+                            distance,
+                            &quality,
+                            require_reception_won,
+                        )
+                        .actionable
+                    }
             });
+        // Forward-option recognition (computed ONCE per decision): the best lane-aware
+        // quality across visible forward teammates. A backward/square target is demoted
+        // below when a genuinely good forward ball existed, so the carrier stops recycling
+        // backward after "failing to recognise" an open forward man (see
+        // `forward_pass_option_quality`). Gated; 0 (inert) when off.
+        let forward_option_recognition = dd_soccer_enable_forward_option_recognition();
+        let best_forward_option_quality = if forward_option_recognition {
+            self.players
+                .iter()
+                .filter(|p| {
+                    p.team == me.team && p.id != me.id && p.role != PlayerRole::Goalkeeper
+                })
+                .filter_map(|p| {
+                    let position = self.player_snapshot_position(p);
+                    let forward = (position.y - me_position.y) * me.team.attack_dir();
+                    if forward <= 1.25 {
+                        return None;
+                    }
+                    if visible_only && !self.player_can_see_player(me.id, p.id) {
+                        return None;
+                    }
+                    let quality = pass_target_quality_for_snapshot(
+                        self,
+                        me,
+                        me_position,
+                        p,
+                        position,
+                        PassFlight::Floor,
+                    );
+                    Some(forward_pass_option_quality(
+                        quality.receiver_openness,
+                        quality.expected_completion,
+                    ))
+                })
+                .fold(0.0f64, f64::max)
+        } else {
+            0.0
+        };
         let mut ranked = self
             .players
             .iter()
@@ -28514,8 +28852,9 @@ impl WorldSnapshot {
                                     .max(me.skills.passing)
                                     .max(me.skills.vision),
                             );
-                            receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
-                                && passer_skill >= HALF_OPEN_FORWARD_PASS_MIN_SKILL
+                            receiver_openness >= HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR
+                                || (receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS
+                                    && passer_skill >= HALF_OPEN_FORWARD_PASS_MIN_SKILL)
                         } else {
                             false
                         };
@@ -28672,31 +29011,14 @@ impl WorldSnapshot {
                     position,
                     PassFlight::Floor,
                 );
-                let half_open_forward_score = forward >= HALF_OPEN_FORWARD_PASS_MIN_FORWARD_YARDS
-                    && pass_quality.receiver_openness >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS;
-                let receiver_openness_for_score = if half_open_forward_score {
-                    pass_quality
-                        .receiver_openness
-                        .max(HALF_OPEN_FORWARD_PASS_SCORE_OPENNESS_FLOOR)
-                } else {
-                    pass_quality.receiver_openness
-                };
-                // For SAFE passes, a high dynamic lane-interception risk strips the half-open
-                // forward completion floor (we'd rather not score up an interceptable ball).
-                // For THREADED/killer candidates (`require_reception_won == false`) we deliberately
-                // KEEP the floor even under high risk: a killer ball through a congested defence is
-                // risky by nature, and per `ranked_threaded_pass_candidates` that risk is priced
-                // into the score, NOT used to hide (truncate) the option out of the candidate pool.
-                let expected_completion_for_score = if half_open_forward_score
-                    && (!require_reception_won
-                        || pass_quality.lane_interception_risk < PASS_LANE_DYNAMIC_RISK_HIGH)
-                {
-                    pass_quality
-                        .expected_completion
-                        .max(HALF_OPEN_FORWARD_PASS_COMPLETION_FLOOR)
-                } else {
-                    pass_quality.expected_completion
-                };
+                let forward_outlet = forward_floor_outlet_assessment(
+                    forward,
+                    dist,
+                    &pass_quality,
+                    require_reception_won,
+                );
+                let receiver_openness_for_score = forward_outlet.receiver_openness_for_score;
+                let expected_completion_for_score = forward_outlet.expected_completion_for_score;
                 let reception_teammate_penalty =
                     self.teammate_occupied_space_penalty_at(me.team, pass_point, Some(p.id), 0.0);
                 let finishing_window_bonus = self.shooting_window_score_at(p, pass_point)
@@ -28794,15 +29116,9 @@ impl WorldSnapshot {
                     >= PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS
                     && dist >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
                 {
-                    let distance_fit = quick_forward_pass_band_fit(dist);
-                    let upfield_fit = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
-                    let quality_fit = (receiver_openness_for_score.clamp(0.0, 1.0) * 0.46
-                        + expected_completion_for_score.clamp(0.0, 1.0) * 0.32
-                        + pass_quality.stride_fit.clamp(0.0, 1.0) * 0.12
-                        + upfield_fit * 0.10)
-                        .clamp(0.0, 1.0);
-                    distance_fit
-                        * quality_fit
+                    forward_outlet
+                        .distance_fit
+                        * forward_outlet.quality_fit
                         * PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS
                         * if own_half { 1.35 } else { 1.0 }
                 } else {
@@ -28990,9 +29306,23 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                // Forward-option recognition: when a genuinely good forward ball exists,
+                // demote a backward/square target so the carrier plays the open forward man
+                // instead of recycling backward (the reported blunder). Gated; the precomputed
+                // `best_forward_option_quality` is 0 when off, so this stays inert.
+                let backward_when_forward_available_penalty = if forward
+                    < -BACKWARD_PASS_MIN_FORWARD_YARDS
+                    && best_forward_option_quality >= FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD
+                {
+                    (best_forward_option_quality - FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD)
+                        * FORWARD_OPTION_RECOGNITION_BACKWARD_DEMOTION
+                } else {
+                    0.0
+                };
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
                     - anticipation_penalty
@@ -29573,7 +29903,7 @@ impl WorldSnapshot {
             .unwrap_or(observer.position);
         let facing = self.player_facing_direction(observer);
         let observer_has_ball = self.ball.holder == Some(observer_id);
-        let mut measurement_confidence = finite_metric(position_confidence_for_observer(
+        let measurement_confidence = finite_metric(position_confidence_for_observer(
             observer,
             observer_position,
             point,
@@ -29603,20 +29933,19 @@ impl WorldSnapshot {
             }
         }
         let Some((target, target_position, _)) = matched_target else {
-            let occlusion = self.point_occlusion_score_for_observer(observer_id, point, None);
-            measurement_confidence *=
-                (1.0 - occlusion * PERCEPTION_OCCLUSION_CONFIDENCE_PENALTY).clamp(0.0, 1.0);
-            return Some(measurement_confidence);
+            return Some(self.occlusion_scaled_confidence(
+                observer_id,
+                observer_position,
+                point,
+                None,
+                measurement_confidence,
+            ));
         };
-        let occlusion =
-            self.point_occlusion_score_for_observer(observer_id, target_position, Some(target.id));
-        measurement_confidence *=
-            (1.0 - occlusion * PERCEPTION_OCCLUSION_CONFIDENCE_PENALTY).clamp(0.0, 1.0);
         let to_target = target_position - observer_position;
         let in_front = facing
             .map(|facing| facing.normalized().dot(to_target.normalized()) >= 0.0)
             .unwrap_or(false);
-        Some(kalman_perception_position_confidence(
+        let kalman = kalman_perception_position_confidence(
             measurement_confidence,
             target_position,
             target.velocity,
@@ -29624,7 +29953,44 @@ impl WorldSnapshot {
             self.dt_seconds,
             in_front,
             observer_has_ball,
+        );
+        Some(self.occlusion_scaled_confidence(
+            observer_id,
+            observer_position,
+            point,
+            Some(target.id),
+            kalman,
         ))
+    }
+
+    /// Multiply a perception `confidence` down by how screened the sightline
+    /// `observer → point` is (excluding `target_id` itself as a blocker). Gated by
+    /// `DD_SOCCER_ENABLE_OCCLUSION`; OFF ⇒ returns `confidence` unchanged so the
+    /// confidence model is byte-identical. This makes body-occlusion grade the
+    /// SAME confidence every consumer reads, consistent with the hard visibility
+    /// cut in `player_can_see_point` (which fires once the screen is near-total).
+    fn occlusion_scaled_confidence(
+        &self,
+        observer_id: usize,
+        observer_position: Vec2,
+        point: Vec2,
+        target_id: Option<usize>,
+        confidence: f64,
+    ) -> f64 {
+        if !occlusion_enabled() {
+            return confidence;
+        }
+        let blockers = self.players.iter().filter_map(|p| {
+            (p.id != observer_id && Some(p.id) != target_id)
+                .then(|| self.player_snapshot_position(p))
+        });
+        let occ = sightline_occlusion_fraction(
+            observer_position,
+            point,
+            blockers,
+            OCCLUSION_BODY_RADIUS_YARDS,
+        );
+        (confidence * (1.0 - occ)).clamp(0.0, 1.0)
     }
 
     /// The position `observer_id` PERCEIVES `target_id` at: the true position
@@ -29644,32 +30010,24 @@ impl WorldSnapshot {
         if !perception_noise_enabled() || observer_id == target_id {
             return Some(true_pos);
         }
-        let mut confidence = self
+        // `player_position_confidence_for_point` is already occlusion-aware (it folds
+        // the sightline screen into the confidence), so there is no second occlusion
+        // multiply here — avoiding the earlier double-count.
+        let confidence = self
             .player_position_confidence_for_point(observer_id, true_pos)
             .unwrap_or(1.0);
-        if occlusion_enabled() {
-            if let Some(observer) = self.players.iter().find(|p| p.id == observer_id) {
-                let observer_position = self
-                    .player_position(observer.id)
-                    .unwrap_or(observer.position);
-                let blockers = self.players.iter().filter_map(|p| {
-                    (p.id != observer_id && p.id != target_id)
-                        .then(|| self.player_snapshot_position(p))
-                });
-                let occ = sightline_occlusion_fraction(
-                    observer_position,
-                    true_pos,
-                    blockers,
-                    OCCLUSION_BODY_RADIUS_YARDS,
-                );
-                confidence *= 1.0 - occ;
-            }
-        }
         let bucket = self.tick / PERCEPTION_REFRESH_TICKS.max(1);
         let seed = (observer_id as u64).wrapping_mul(0x9E37_79B1)
             ^ (target_id as u64).wrapping_mul(0x85EB_CA77).rotate_left(17)
             ^ bucket.wrapping_mul(0xC2B2_AE3D);
-        Some(perceived_position(true_pos, confidence, seed))
+        // Lag the belief along the target's own motion (stale track when uncertain),
+        // then add the disk error on top.
+        Some(perceived_position_lagged(
+            true_pos,
+            target.velocity,
+            confidence,
+            seed,
+        ))
     }
 
     pub fn player_position_confidence_entry(
@@ -39254,6 +39612,7 @@ impl WorldSnapshot {
                 teammates_ahead: 0,
                 visible_forward_pass_options: 0,
                 best_forward_pass_receiver_openness: 0.0,
+                best_forward_pass_option_quality: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 best_quick_forward_open_value: 0.0,
                 best_quick_forward_target: None,
@@ -39279,6 +39638,7 @@ impl WorldSnapshot {
 
         let mut visible_forward_pass_options = 0usize;
         let mut best_forward_pass_receiver_openness = 0.0f64;
+        let mut best_forward_pass_option_quality = 0.0f64;
         let mut nearest_visible_forward_pass_distance_yards = f64::INFINITY;
         let mut best_quick_forward_open_value = 0.0f64;
         let mut best_quick_forward_target: Option<usize> = None;
@@ -39291,9 +39651,6 @@ impl WorldSnapshot {
             if forward <= 1.25 {
                 continue;
             }
-            visible_forward_pass_options += 1;
-            nearest_visible_forward_pass_distance_yards =
-                nearest_visible_forward_pass_distance_yards.min(current.distance(target_position));
             let quality = pass_target_quality_for_snapshot(
                 self,
                 me,
@@ -39302,22 +39659,30 @@ impl WorldSnapshot {
                 target_position,
                 PassFlight::Floor,
             );
+            let distance = current.distance(target_position);
+            let outlet =
+                forward_floor_outlet_assessment(forward, distance, &quality, true);
+            if !outlet.actionable {
+                continue;
+            }
+            visible_forward_pass_options += 1;
+            nearest_visible_forward_pass_distance_yards =
+                nearest_visible_forward_pass_distance_yards.min(distance);
             best_forward_pass_receiver_openness =
-                best_forward_pass_receiver_openness.max(quality.receiver_openness);
+                best_forward_pass_receiver_openness.max(outlet.receiver_openness_for_score);
+            best_forward_pass_option_quality = best_forward_pass_option_quality.max(
+                forward_pass_option_quality(
+                    outlet.receiver_openness_for_score,
+                    quality.expected_completion,
+                ),
+            );
             // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
             // advanced teammate. Reward openness × completion most, weight the in-band
             // distance, and add a modest upfield-gain term so a more advanced open runner
             // edges a square one. The ranked execution targets this player when the value
             // wins (see `quick_forward_pass_target`).
-            let distance = current.distance(target_position);
-            let band_fit = quick_forward_pass_band_fit(distance);
-            if band_fit > 0.0 {
-                let upfield_gain = (forward / QUICK_FORWARD_PASS_IDEAL_YARDS).clamp(0.0, 1.0);
-                let openness = quality.receiver_openness.clamp(0.0, 1.0);
-                let completion = quality.expected_completion.clamp(0.0, 1.0);
-                let value = (band_fit
-                    * (openness * 0.46 + completion * 0.32 + upfield_gain * 0.22))
-                    .clamp(0.0, 1.0);
+            if outlet.distance_fit > 0.0 {
+                let value = (outlet.distance_fit * outlet.quality_fit).clamp(0.0, 1.0);
                 if value > best_quick_forward_open_value {
                     best_quick_forward_open_value = value;
                     best_quick_forward_target = Some(*target_id);
@@ -39329,6 +39694,7 @@ impl WorldSnapshot {
             teammates_ahead,
             visible_forward_pass_options,
             best_forward_pass_receiver_openness,
+            best_forward_pass_option_quality,
             nearest_forward_teammate_distance_yards: if nearest_forward_teammate_distance_yards
                 .is_finite()
             {
