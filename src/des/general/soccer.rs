@@ -1624,8 +1624,11 @@ const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
 const BACKWARD_EXP_RISK_FREE_YARDS: f64 = 6.0;
 const BACKWARD_EXP_RISK_REF_YARDS: f64 = 10.0;
 const BACKWARD_EXP_RISK_GROWTH_PER_REF: f64 = 5.0;
-const BACKWARD_EXP_RISK_SCALE: f64 = 0.30;
-const BACKWARD_EXP_RISK_CAP: f64 = 22.0;
+// Scale chosen so the EXPONENTIAL term is the dominant backward demerit (it outgrows the linear
+// `long_backward_pass_penalty` past ~12yd), making the 5x-per-10yd escalation actually felt rather
+// than diluted by the gentler linear ramp. Cap keeps a pathological deep ball from overflowing.
+const BACKWARD_EXP_RISK_SCALE: f64 = 0.55;
+const BACKWARD_EXP_RISK_CAP: f64 = 30.0;
 // Minimum legal pass distance. A sub-3yd pass neither escapes pressure nor progresses and is
 // almost always a needless touch that invites a turnover — it is made ILLEGAL (filtered out of
 // the pass-target ranking entirely) rather than merely down-weighted. Gated default-ON in prod
