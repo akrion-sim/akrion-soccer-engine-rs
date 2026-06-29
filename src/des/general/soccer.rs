@@ -1929,6 +1929,29 @@ const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
 /// forward-pass-chain link so it meaningfully discourages the blunder without swamping the
 /// sparse match-outcome signal.
 const ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS: f64 = 6.0;
+/// Clear straight-ahead dribble lane (yards) that counts as "lots of space forward to advance
+/// into" for the team-upfield-advance cue — a player receiving a pass with this much open grass
+/// in front should take it on while the team pushes up behind him. Mirrors the hold-for-support
+/// drive-into-space threshold so the carrier's "decline to wait, drive instead" and the team's
+/// "advance as a unit" recognizers agree on what "open forward grass" means. See
+/// [`WorldSnapshot::team_advance_upfield_active`].
+const TEAM_ADVANCE_FORWARD_SPACE_YARDS: f64 = 6.0;
+/// Extra depth (yards) the back four is allowed to push ABOVE its normal into-opp-half cap while
+/// the team is advancing upfield in controlled possession — the line steps up to keep the team
+/// compact and connected behind the attack instead of leaving a stretched gap. Only applied while
+/// WE hold the ball (the flat offside trap is already lifted in that case) and reverts the instant
+/// possession is lost. See [`WorldSnapshot::back_four_line_v2_centre_fwd`].
+const TEAM_ADVANCE_LINE_PUSH_YARDS: f64 = 12.0;
+/// Forward progress (yards, in one decision transition) that earns the full team-advance dense
+/// shaping reward; progress is clamped to this reference so a single burst can't farm reward.
+const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
+/// Dense shaping reward for the CARRIER driving the ball forward into space while the team advances
+/// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
+/// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
+const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+/// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
+/// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
+const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
