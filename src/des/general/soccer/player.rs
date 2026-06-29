@@ -5606,10 +5606,12 @@ impl PlayerAgent {
         // shielded dribble the thief nicks from behind. Escalates with the perceived threat.
         let blindside_escape = observation.blindside_threat_from_behind.clamp(0.0, 1.0);
         if blindside_escape > 0.0 {
-            let accel_floor = (0.18 + 0.52 * blindside_escape).clamp(0.0, 0.82);
-            for label in ["carry-forward", "vertical-attack"] {
-                ensure_min_legal_option_probability(&mut options, label, accel_floor);
-            }
+            let accel_floor = (0.36 + 0.46 * blindside_escape).clamp(0.0, 0.86);
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &["carry-forward", "vertical-attack"],
+                accel_floor,
+            );
             if pass_target_count > 0 {
                 ensure_min_legal_option_probability(
                     &mut options,
@@ -5622,6 +5624,7 @@ impl PlayerAgent {
             for label in ["protect-ball", "hold-up-flank", "side-step", "nutmeg"] {
                 scale_legal_option_score(&mut options, label, dwell_damp);
             }
+            ensure_min_legal_option_probability(&mut options, "carry-forward", accel_floor);
         }
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
