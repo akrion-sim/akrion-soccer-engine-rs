@@ -7916,7 +7916,17 @@ impl SoccerMatch {
 
         let field_loop_started = Instant::now();
         let phase_started = Instant::now();
-        let field_schedule = self.agent_schedule_for_field_entities();
+        let mut field_schedule = self.agent_schedule_for_field_entities();
+        if dd_soccer_enable_fisher_yates_schedule() {
+            // Fisher-Yates: randomize the per-tick processing order of ALL field entities
+            // (22 players + officials + ball) so no agent has a systematic act-first advantage when
+            // contested events (possession, collisions, keep-out, shielding) resolve in schedule
+            // order. Uses the match RNG, so it stays deterministic for a fixed seed.
+            for i in (1..field_schedule.len()).rev() {
+                let j = ((self.rng.next_float() * ((i + 1) as f64)) as usize).min(i);
+                field_schedule.swap(i, j);
+            }
+        }
         self.last_agent_schedule = vec![AgentScheduleEntry {
             kind: AgentScheduleKind::CentralBrain,
             id: CENTRAL_BRAIN_AGENT_ID,
@@ -7938,6 +7948,47 @@ impl SoccerMatch {
                     // decision RNG while down; this never fires unless a slide has missed.)
                     if self.players[actor].slide_recovery_seconds > 0.0 {
                         continue;
+                    }
+                    // Decision-compute cadence (MPC receding-horizon decomposition): run the
+                    // expensive PLANNING pass (MDP/POMDP + MPC/QP) at most a few times per `window`
+                    // ticks per player, STAGGERED by id; on the other ticks the player EXECUTES its
+                    // existing optimal plan — it replays the held intent and the movement model still
+                    // does optimal approach to the planned target every tick (movement + ball advance
+                    // on ALL ticks). Plan slow, execute fast → control stays optimal while per-tick
+                    // CPU drops, so the loop holds real-time. The budget is ADAPTIVE by ball
+                    // proximity: at most 3 plans / `window` ON or near the ball (where reactions
+                    // matter), 2 at mid range, 1 when far off the ball — capped by `cadence_cap`
+                    // (default 3, window 7 ≈ ≤3 plans per 0.47s, back-to-back allowed). Humans are
+                    // never gated, and a player whose held plan is a spent one-shot
+                    // (`continuation_intent()`==None, e.g. a played pass/shot/tackle) re-plans
+                    // regardless.
+                    let (cadence_cap, cadence_window) = soccer_decision_cadence_max_window();
+                    let ball_distance = self.players[actor].position.distance(self.ball.position);
+                    let proximity_budget = if self.ball.holder == Some(scheduled.id)
+                        || ball_distance <= DECISION_CADENCE_NEAR_YARDS
+                    {
+                        3
+                    } else if ball_distance <= DECISION_CADENCE_MID_YARDS {
+                        2
+                    } else {
+                        1
+                    };
+                    let plan_budget = proximity_budget.min(cadence_cap);
+                    let plan_this_tick = cadence_window <= plan_budget
+                        || self.players[actor].controller_slot.is_some()
+                        || (self.tick.wrapping_add(scheduled.id as u64) % cadence_window) < plan_budget;
+                    if !plan_this_tick {
+                        if let Some(held_intent) = self.players[actor].continuation_intent() {
+                            self.pending_human_control = None;
+                            let intent_player_id = held_intent.player_id;
+                            self.apply_player_intent(held_intent);
+                            if self.ball.holder == Some(intent_player_id) {
+                                self.sync_held_ball_to_holder();
+                            }
+                            self.enforce_restart_keepout_for(intent_player_id);
+                            self.enforce_shield_body_barrier_for(intent_player_id);
+                            continue;
+                        }
                     }
                     let decision_context =
                         self.player_decision_timing_context_for(actor, scheduled.id);
@@ -14531,6 +14582,7 @@ impl SoccerMatch {
             self.config.field_length_yards,
         );
         let half_dt2 = 0.5 * dt * dt;
+        let sixth_dt3 = dt * dt * dt / 6.0; // 3rd-order (jerk) term, matching predicted_ball_position
         let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
         let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
         let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
@@ -14548,13 +14600,15 @@ impl SoccerMatch {
             );
             let velocity = finite_vec2(other.velocity, Vec2::zero());
             let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+            let jerk = finite_vec2(other.jerk, Vec2::zero());
             let center = finite_pitch_point(
-                position + velocity * dt + acceleration * half_dt2,
+                position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
                 field_width,
                 field_length,
                 position,
             );
-            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 28.0);
+            let obstacle_velocity =
+                limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 28.0);
             let opponent = other.team != my_team;
             let holder_bonus = if self.ball.holder == Some(other.id) {
                 0.4
@@ -14589,13 +14643,15 @@ impl SoccerMatch {
             );
             let velocity = finite_vec2(self.ball.velocity, Vec2::zero());
             let acceleration = finite_vec2(self.ball.acceleration, Vec2::zero());
+            let jerk = finite_vec2(self.ball.jerk, Vec2::zero());
             let center = finite_pitch_point(
-                position + velocity * dt + acceleration * half_dt2,
+                position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
                 field_width,
                 field_length,
                 position,
             );
-            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 36.0);
+            let obstacle_velocity =
+                limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 36.0);
             let ball_weight = keepout_weight
                 * 0.15
                 * (1.0
@@ -46807,5 +46863,53 @@ impl WorldSnapshot {
         }
         self.ball.holder == Some(player_id)
             || (self.ball.holder.is_none() && self.ball.last_touch_player == Some(player_id))
+    }
+}
+
+/// Decision-compute cadence (max, window) in ticks: a player runs the expensive planning pass
+/// (MDP/POMDP + MPC/QP) on at most `max` of every `window` ticks; in between it executes its held
+/// optimal plan (movement + ball still advance every tick). Default 3-of-7 (~150ms reaction floor
+/// at dt=1/15, back-to-back allowed) — the MPC receding-horizon "plan slow, execute fast" pattern,
+/// so control stays optimal for the live game (learning off, frozen-policy inference + MPC). Set
+/// `window <= max` (or `SOCCER_DECISION_CADENCE_WINDOW_TICKS=0`) to disable (plan every tick).
+/// Tunable: `SOCCER_DECISION_CADENCE_MAX`, `SOCCER_DECISION_CADENCE_WINDOW_TICKS`.
+pub(crate) fn soccer_decision_cadence_max_window() -> (u64, u64) {
+    use std::sync::OnceLock;
+    static V: OnceLock<(u64, u64)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let max = std::env::var("SOCCER_DECISION_CADENCE_MAX")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3);
+        let window = std::env::var("SOCCER_DECISION_CADENCE_WINDOW_TICKS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(7);
+        (max, window)
+    })
+}
+
+/// Ball-distance (yd) tiers for the adaptive decision cadence: on-ball or within NEAR gets the full
+/// per-window planning budget (3), within MID gets 2, beyond gets 1 — so planning compute is spent
+/// where reactions matter (on/near the ball) and saved on distant off-ball positioning.
+const DECISION_CADENCE_NEAR_YARDS: f64 = 15.0;
+const DECISION_CADENCE_MID_YARDS: f64 = 35.0;
+
+/// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
+/// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
+/// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
+/// → deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's fixed-order
+/// outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+pub(crate) fn dd_soccer_enable_fisher_yates_schedule() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE"))
     }
 }

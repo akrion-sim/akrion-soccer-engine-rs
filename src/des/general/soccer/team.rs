@@ -2705,6 +2705,7 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
     length: f64,
 ) -> Vec<PlanarObstacle> {
     let half_dt2 = 0.5 * dt * dt;
+    let sixth_dt3 = dt * dt * dt / 6.0; // 3rd-order (jerk) term, matching predicted_ball_position
     let mut obstacles = Vec::with_capacity(snapshot.players.len().saturating_add(1));
     for other in &snapshot.players {
         if other.id == player.id {
@@ -2713,13 +2714,15 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
         let position = finite_pitch_point(other.position, width, length, player.position);
         let velocity = finite_vec2(other.velocity, Vec2::zero());
         let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+        let jerk = finite_vec2(other.jerk, Vec2::zero());
         let center = finite_pitch_point(
-            position + velocity * dt + acceleration * half_dt2,
+            position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
             width,
             length,
             position,
         );
-        let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 24.0);
+        let obstacle_velocity =
+            limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 24.0);
         let same_team = other.team == player.team;
         let holder_bonus = if snapshot.ball.holder == Some(other.id) {
             0.55
@@ -2753,13 +2756,15 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
     let ball_position = finite_pitch_point(snapshot.ball.position, width, length, player.position);
     let ball_velocity = finite_vec2(snapshot.ball.velocity, Vec2::zero());
     let ball_acceleration = finite_vec2(snapshot.ball.acceleration, Vec2::zero());
+    let ball_jerk = finite_vec2(snapshot.ball.jerk, Vec2::zero());
     let ball_center = finite_pitch_point(
-        ball_position + ball_velocity * dt + ball_acceleration * half_dt2,
+        ball_position + ball_velocity * dt + ball_acceleration * half_dt2 + ball_jerk * sixth_dt3,
         width,
         length,
         ball_position,
     );
-    let ball_obstacle_velocity = limit_vec2_len(ball_velocity + ball_acceleration * dt, 32.0);
+    let ball_obstacle_velocity =
+        limit_vec2_len(ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2, 32.0);
     let ball_weight = 4.5
         + ball_velocity.len().clamp(0.0, 28.0) / 7.0
         + ball_acceleration.len().clamp(0.0, 28.0) / 14.0;
