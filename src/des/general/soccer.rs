@@ -1891,6 +1891,12 @@ const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+/// Penalty (points, applied negative) for an isolated attacking carrier panicking a
+/// backward/square ball instead of driving at goal or holding it up — see
+/// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
+/// forward-pass-chain link so it meaningfully discourages the blunder without swamping the
+/// sparse match-outcome signal.
+const ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS: f64 = 6.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
