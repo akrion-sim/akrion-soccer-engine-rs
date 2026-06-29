@@ -3215,7 +3215,8 @@ const INTENDED_RECEIVER_DEFER_MARGIN_SECONDS: f64 = 0.55;
 // dynamically-feasible run (point-mass MPC, bending around opponents), forward-models the ball's
 // decelerating flight, and picks the rendezvous (lead point + launch speed) the receiver meets in
 // time and defenders can't cut out. Horizon ~1.6s at dt=1/15; steps below MIN are too close to lead.
-const MPC_PASS_HORIZON_STEPS: usize = 24;
+// dt=1/30 rescale (×2 from 24 → preserve the ~1.6s real-time pass-interception horizon).
+const MPC_PASS_HORIZON_STEPS: usize = 48;
 const MPC_PASS_MIN_STEP: usize = 3;
 // A candidate rendezvous is only accepted when the ball's predicted arrival time and the receiver's
 // predicted arrival time agree within this tolerance (seconds) — i.e. the ball actually meets the run.
