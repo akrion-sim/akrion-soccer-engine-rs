@@ -67796,13 +67796,12 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         "the pre-relational-attention total must be a recognised legacy dim so old nets migrate"
     );
     assert!(
-<<<<<<< HEAD
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM),
         "the pre-solo-carrier total must be a recognised legacy dim so old nets migrate"
-=======
+    );
+    assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM),
         "the pre-graph-temporal total must be a recognised legacy dim so old nets migrate"
->>>>>>> upstream/main
     );
     assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM, 2);
     assert_eq!(SOCCER_NEURAL_DRIBBLE_BEAT_FEATURE_DIM, 4);
