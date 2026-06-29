@@ -31270,7 +31270,10 @@ fn agent_schedule_summary_exposes_full_runtime_loop_contract() {
 }
 
 #[test]
-fn runtime_agent_schedule_orders_field_entities_agentically_each_tick() {
+fn runtime_agent_schedule_uses_fisher_yates_for_all_field_entities_when_enabled() {
+    let _gate = test_force_fisher_yates_schedule(true);
+    assert!(soccer_playback_agent_contract().field_entities_use_fisher_yates);
+
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.8,
         seed: 13_084,
@@ -31347,13 +31350,12 @@ fn runtime_agent_schedule_orders_field_entities_agentically_each_tick() {
     }
 
     assert!(
-        !field_orders.is_empty(),
-        "agentic field entity order should be observable each tick"
+        field_orders.len() > 1,
+        "Fisher-Yates field entity order should vary across ticks: {field_orders:?}"
     );
-    assert_eq!(
-        ball_indexes,
-        [26].into_iter().collect::<HashSet<_>>(),
-        "ball agent should integrate after field agents, got {ball_indexes:?}"
+    assert!(
+        ball_indexes.len() > 1 && ball_indexes.iter().any(|index| *index != 26),
+        "ball agent should be shuffled with players and officials, got {ball_indexes:?}"
     );
 }
 

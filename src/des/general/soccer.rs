@@ -31517,7 +31517,7 @@ fn soccer_playback_agent_contract() -> SoccerPlaybackAgentContract {
         official_run_time_step_enabled: true,
         ball_run_time_step_enabled: true,
         central_brain_runs_before_field_shuffle: true,
-        field_entities_use_fisher_yates: false,
+        field_entities_use_fisher_yates: world::dd_soccer_enable_fisher_yates_schedule(),
         central_brain_operation_order_agentic: true,
         player_operation_order_agentic: true,
         official_operation_order_agentic: true,

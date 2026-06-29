@@ -47420,14 +47420,50 @@ pub(crate) fn soccer_decision_cadence_max_window() -> (u64, u64) {
 const DECISION_CADENCE_NEAR_YARDS: f64 = 15.0;
 const DECISION_CADENCE_MID_YARDS: f64 = 35.0;
 
-/// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
-/// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
-/// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
-/// → deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's fixed-order
-/// outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
+// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
+// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
+// and stays deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's
+// fixed-order outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+#[cfg(test)]
+thread_local! {
+    static TEST_FISHER_YATES_SCHEDULE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        std::cell::Cell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) struct TestFisherYatesScheduleOverrideGuard {
+    prior: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for TestFisherYatesScheduleOverrideGuard {
+    fn drop(&mut self) {
+        TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| override_flag.set(self.prior));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_force_fisher_yates_schedule(
+    enabled: bool,
+) -> TestFisherYatesScheduleOverrideGuard {
+    let prior = TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| {
+        let prior = override_flag.get();
+        override_flag.set(Some(enabled));
+        prior
+    });
+    TestFisherYatesScheduleOverrideGuard { prior }
+}
+
+/// Resolve the Fisher-Yates field-entity schedule gate.
 pub(crate) fn dd_soccer_enable_fisher_yates_schedule() -> bool {
     #[cfg(test)]
     {
+        if let Some(enabled) =
+            TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| override_flag.get())
+        {
+            return enabled;
+        }
         std::env::var("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE").is_ok()
     }
     #[cfg(not(test))]
