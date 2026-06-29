@@ -95,8 +95,6 @@ mod pass_lane_yield;
 pub use pass_lane_yield::*;
 mod slip_break_offside;
 pub(crate) use slip_break_offside::*;
-mod press_or_contain;
-pub(crate) use press_or_contain::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -185,6 +183,10 @@ const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
 // contention. Deliberate threaded/killer balls (`require_reception_won == false`) are exempt —
 // their risk is priced in, not vetoed.
 const PASS_LANE_SAFE_PASS_OVERRISK_PENALTY: f64 = 14.0;
+const PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR: f64 = 0.34;
+const PASS_TURNOVER_SAFETY_RECEIPT_FLOOR: f64 = 0.50;
+const PASS_TURNOVER_SAFETY_DAMP: f64 = 0.74;
+const PASS_TURNOVER_SAFETY_FINAL_THIRD_FORWARD_DAMP: f64 = 0.56;
 // ---------------------------------------------------------------------------
 // Bayesian opponent-press belief (lightweight Beta-Bernoulli filter).
 // ---------------------------------------------------------------------------
@@ -602,20 +604,6 @@ const HOLDER_PRESS_MAX_DISTANCE_YARDS: f64 = 16.0;
 /// Tight standoff the presser closes to: within tackle/contest range, a half-step off
 /// so it is a contain-press that forces a decision, not a committed lunge.
 const HOLDER_PRESS_STANDOFF_YARDS: f64 = 1.8;
-/// Press-or-contain standoff endpoints (yd, goal-side of the carrier) the
-/// [`WorldSnapshot::press_or_contain_aggression_for`] MDP blends between. At full aggression the
-/// defender presses tight (the `_PRESS_` value); at zero it sits off and contains (the `_CONTAIN_`
-/// value), giving the carrier space in front rather than diving in. Two pairs: one for the
-/// fast-carrier box contest (kept tighter — a box threat must still be met), one for the general
-/// holder-press / advancing-carrier jockey across the rest of the pitch. Gated default-ON.
-const PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS: f64 = 0.3;
-const PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS: f64 = 2.6;
-const PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS: f64 = 0.8;
-const PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS: f64 = 5.0;
-/// Multiplicative jockey-gap scaling applied to the advancing-carrier step-up standoff: at full
-/// aggression the gap tightens to `_PRESS_SCALE`, at zero it widens to `_CONTAIN_SCALE` (back off).
-const PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE: f64 = 0.7;
-const PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE: f64 = 2.1;
 /// Press-cover hardening (gated `DD_SOCCER_ENABLE_PRESS_COVER`): how far goal-side of
 /// the carrier the single COVER defender tucks in behind the lone presser, so a beaten
 /// press meets immediate second pressure instead of a clean break.
@@ -1587,53 +1575,32 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
-// A short backward reset (3–5yd back to a supporting player) is a normal, useful ball;
-// slinging it 6+ yards backward concedes real territory and should be distinctly worse.
-// Beyond this backward distance, an escalating per-yard demerit kicks in so a 3–5yd
-// backward pass is preferred over a long backward one whenever both are on offer.
-const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
-// Per-yard demerit for every yard a backward pass travels beyond LONG_BACKWARD_PASS_YARDS.
-// The risk is LINEAR in how far backward (toward our own goal) the ball is played: every
-// extra yard conceded is priced the same, so the ranking strongly prefers a short reset and
-// only tolerates a long retreat when there is genuinely nothing else.
-const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 1.45;
+// Passes below this are removed from ordinary pass candidates and vetoed again at release time.
+// They are not "passes" for now; the carrier should keep/carry/dribble instead.
+const ILLEGAL_SHORT_PASS_MAX_YARDS: f64 = 3.0;
+// Any backward pass is a riskier possession choice than an equal-quality forward/square option.
+// Beyond the short reset band the risk compounds sharply: tuned so a 20yd backward ball carries
+// about 5x the distance-risk units of a 10yd backward ball.
+const BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS: f64 = 10.0;
+const BACKWARD_PASS_DISTANCE_RISK_EXPONENT: f64 = 2.321_928_094_887_362; // log2(5)
+const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 7.6;
+const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.13;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
-// This is intentionally linear in both backward depth and traffic count, and applies to both
-// floor and aerial candidates; short 3-5yd resets stay unpriced.
+// Traffic count stays linear, while backward distance uses the compounding risk curve; short
+// 3-5yd resets stay free from corridor-traffic pricing.
 const BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS: f64 = 4.0;
 const BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS: f64 = 5.0;
 const BACKWARD_PASS_PATH_TRAFFIC_ENDPOINT_FRACTION: f64 = 0.08;
-const BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.012;
-const BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.20;
+const BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT: f64 = 0.07;
+const BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT: f64 = 1.15;
 const BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH: f64 = 0.78;
 // Backward recycling should be a short support bounce, not a retreating outlet.
 // If a backward pass is needed, prefer a 3-5yd reset and increasingly demote
 // balls played more than 5yd back toward our own goal.
 const BACKWARD_PASS_SHORT_RESET_MIN_YARDS: f64 = 3.0;
 const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
-const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
-const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
-const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
-// Exponential backward-pass risk. A backward ball is not just LINEARLY worse the further it
-// goes (that is `long_backward_pass_penalty`): the danger COMPOUNDS — a deep retreat invites a
-// charge-down, concedes territory, and launches the counter, each worse than the last yard.
-// Calibrated so the demerit GROWS 5x for every `..._REF_YARDS` (10yd) played backward, i.e. a
-// 20yd backward pass is priced ~5x the risk of a 10yd one, a 30yd ~25x, etc. Short resets up to
-// the free allowance carry no exponential demerit (the linear/short-reset curves still apply).
-// Gated default-ON in prod (`DD_SOCCER_ENABLE_BACKWARD_EXP_RISK`), neutral (0) in tests.
-const BACKWARD_EXP_RISK_FREE_YARDS: f64 = 6.0;
-const BACKWARD_EXP_RISK_REF_YARDS: f64 = 10.0;
-const BACKWARD_EXP_RISK_GROWTH_PER_REF: f64 = 5.0;
-// Scale chosen so the EXPONENTIAL term is the dominant backward demerit (it outgrows the linear
-// `long_backward_pass_penalty` past ~12yd), making the 5x-per-10yd escalation actually felt rather
-// than diluted by the gentler linear ramp. Cap keeps a pathological deep ball from overflowing.
-const BACKWARD_EXP_RISK_SCALE: f64 = 0.55;
-const BACKWARD_EXP_RISK_CAP: f64 = 30.0;
-// Minimum legal pass distance. A sub-3yd pass neither escapes pressure nor progresses and is
-// almost always a needless touch that invites a turnover — it is made ILLEGAL (filtered out of
-// the pass-target ranking entirely) rather than merely down-weighted. Gated default-ON in prod
-// (`DD_SOCCER_ENABLE_MIN_PASS_DISTANCE`), inert in tests.
-const MIN_LEGAL_PASS_YARDS: f64 = 3.0;
+const BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD: f64 = 0.16;
+const BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT: f64 = 1.15;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -3399,9 +3366,9 @@ const WALL_PASS_GIVE_MIN_FORWARD_YARDS: f64 = -5.0;
 /// Soft risk demerit (in quality units, 0..1) for the BACKWARD component of a one-two leg.
 /// A short backpass is part of the combination, but the further back a leg is played — and
 /// the more opponents sit in its corridor — the riskier it is, so quality is reduced by
-/// `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This demotes (but
-/// never vetoes) a long backward give/return, especially through traffic.
-const WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY: f64 = 0.03;
+/// exponential backward-distance risk units, capped. This demotes (but never vetoes) a long
+/// backward give/return, especially through traffic.
+const WALL_PASS_BACKWARD_RISK_PER_UNIT_PER_BODY: f64 = 0.16;
 const WALL_PASS_BACKWARD_RISK_MAX: f64 = 0.6;
 /// Corridor half-width used to test the give and return lanes are clean.
 const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
@@ -3940,6 +3907,12 @@ const SOCCER_NEURAL_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM: usize = 9;
 /// 22-player+ball graph plus short memory signals. This is the live substrate for
 /// graph-temporal policy/value models while preserving the existing MLP path.
 const SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM: usize = 8;
+/// Append-only forward-option recognition block: exposes the lane-aware good
+/// forward-pass quality used by forward-pass-first decisions to the value head.
+const SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM: usize = 1;
+/// Append-only defender press/contain block: exposes the POMDP action value to
+/// step to the carrier and the risk that doing so opens a dribble/run behind.
+const SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize = 2;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3988,8 +3961,13 @@ const SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM: usize =
 // solo-carrier block) so akrion's existing trained nets migrate by zero-padding the new tail.
 const SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+        + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4434,6 +4412,12 @@ const SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY: usize =
     SOCCER_NEURAL_FEATURE_TEMPORAL_POSSESSION_MEMORY + 1;
 const SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY: usize =
     SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY + 1;
+const SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY: usize =
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4560,6 +4544,10 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM,
     // Same schema with isolated-carrier solo/hold-up channels, before graph-temporal features.
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
+    // Same schema with graph-temporal features, before forward-option-quality recognition.
+    SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM,
+    // Same schema with forward-option quality, before defender press/contain channels.
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6177,8 +6165,8 @@ pub struct SoccerPomdpObservation {
     /// Lane-aware recognition of the best forward pass option (see
     /// [`forward_pass_option_quality`]) — `>=` [`best_forward_pass_receiver_openness`].
     /// Consumed by the forward-pass-first release and pass-target ranking under
-    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`. Not part of the neural feature
-    /// encoder (FEATURE_DIM unchanged).
+    /// `DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION`, binned into the Q-state, and
+    /// appended to the neural feature tail.
     #[serde(default)]
     pub best_forward_pass_option_quality: f64,
     /// Slip-and-break-the-offside-trap recognition for the ball-carrier: quality `[0,1]` of the
@@ -6473,6 +6461,14 @@ pub struct SoccerPomdpObservation {
     pub goalkeeper_ball_goal_line_alignment_score: f64,
     #[serde(default)]
     pub defensive_line_break_threat: f64,
+    /// MDP/POMDP score [0,1] that this defender should step to the opponent carrier:
+    /// likelihood of winning/slowing/redirecting the ball or cutting the live pass lane.
+    #[serde(default)]
+    pub defensive_press_action_score: f64,
+    /// MDP/POMDP score [0,1] that pressing would be punished by a dribble past or a runner
+    /// entering valued space in behind, so contain/back-off/cover is safer.
+    #[serde(default)]
+    pub defensive_contain_risk_score: f64,
     #[serde(default)]
     pub defensive_carrier_channel_pressure: f64,
     #[serde(default)]
@@ -8879,6 +8875,10 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub defensive_line_break_threat_bin: u8,
     #[serde(default)]
+    pub defensive_press_action_bin: u8,
+    #[serde(default)]
+    pub defensive_contain_risk_bin: u8,
+    #[serde(default)]
     pub defensive_carrier_channel_pressure_bin: u8,
     #[serde(default)]
     pub defensive_carrier_channel_side_bin: i8,
@@ -9015,6 +9015,8 @@ pub struct SoccerQStateKey {
     pub slip_break_angled_away_from_goalkeeper: bool,
     #[serde(default)]
     pub best_forward_pass_receiver_openness_bin: u8,
+    #[serde(default)]
+    pub best_forward_pass_option_quality_bin: u8,
     #[serde(default)]
     pub nearest_forward_teammate_distance_bin: u8,
     #[serde(default)]
@@ -9496,6 +9498,14 @@ impl SoccerQStateKey {
                 observation.defensive_line_break_threat,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            defensive_press_action_bin: distance_bucket(
+                observation.defensive_press_action_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            defensive_contain_risk_bin: distance_bucket(
+                observation.defensive_contain_risk_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
             defensive_carrier_channel_pressure_bin: distance_bucket(
                 observation.defensive_carrier_channel_pressure,
                 &[0.15, 0.35, 0.60, 0.82],
@@ -9731,6 +9741,12 @@ impl SoccerQStateKey {
                 .slip_break_angled_away_from_goalkeeper,
             best_forward_pass_receiver_openness_bin: distance_bucket(
                 observation.best_forward_pass_receiver_openness,
+                &[0.20, 0.40, 0.62, 0.82],
+            ),
+            best_forward_pass_option_quality_bin: distance_bucket(
+                observation
+                    .best_forward_pass_option_quality
+                    .max(observation.best_forward_pass_receiver_openness),
                 &[0.20, 0.40, 0.62, 0.82],
             ),
             nearest_forward_teammate_distance_bin: distance_bucket(
@@ -10248,6 +10264,8 @@ impl SoccerQStateKey {
             && self.goalkeeper_ball_goal_line_alignment_bin
                 == other.goalkeeper_ball_goal_line_alignment_bin
             && self.defensive_line_break_threat_bin == other.defensive_line_break_threat_bin
+            && self.defensive_press_action_bin == other.defensive_press_action_bin
+            && self.defensive_contain_risk_bin == other.defensive_contain_risk_bin
             && self.defensive_carrier_channel_pressure_bin
                 == other.defensive_carrier_channel_pressure_bin
             && self.defensive_carrier_channel_side_bin == other.defensive_carrier_channel_side_bin
@@ -10337,6 +10355,8 @@ impl SoccerQStateKey {
                 == other.slip_break_angled_away_from_goalkeeper
             && self.best_forward_pass_receiver_openness_bin
                 == other.best_forward_pass_receiver_openness_bin
+            && self.best_forward_pass_option_quality_bin
+                == other.best_forward_pass_option_quality_bin
             && self.nearest_forward_teammate_distance_bin
                 == other.nearest_forward_teammate_distance_bin
             && self.floor_pass_lane_score_bin == other.floor_pass_lane_score_bin
@@ -31111,6 +31131,38 @@ pub struct SoccerDecisionModelContract {
     pub near_goal_recycling_dampening_enabled: bool,
     pub shot_killer_pass_family_probability_floor_enabled: bool,
     pub forward_progress_bias_enabled: bool,
+    pub requested_tactical_feature_gates: Vec<String>,
+    pub role_aware_pass_risk_appetite_enabled: bool,
+    pub forward_option_recognition_enabled: bool,
+    pub forward_option_quality_in_pomdp_observation: bool,
+    pub forward_option_quality_binned_in_mdp_state: bool,
+    pub forward_option_quality_in_neural_features: bool,
+    pub forward_pass_first_enabled: bool,
+    pub isolated_carrier_drive_enabled: bool,
+    pub isolated_carrier_solo_hold_up_in_neural_features: bool,
+    pub blindside_surprise_steal_enabled: bool,
+    pub carrier_side_glance_enabled: bool,
+    pub blindside_steal_in_pomdp_observation: bool,
+    pub blindside_steal_binned_in_mdp_state: bool,
+    pub blindside_steal_in_neural_features: bool,
+    pub flank_crash_box_strategy_enabled: bool,
+    pub flank_crash_box_outer_lanes_per_side: usize,
+    pub flank_crash_box_target_min_attackers: usize,
+    pub flank_crash_box_target_max_attackers: usize,
+    pub flank_crash_box_in_pomdp_observation: bool,
+    pub flank_crash_box_binned_in_mdp_state: bool,
+    pub flank_crash_box_in_neural_features: bool,
+    pub loose_ball_uncontested_urgency_enabled: bool,
+    pub loose_ball_uncontested_urgency_binned_in_mdp_state: bool,
+    pub loose_ball_uncontested_urgency_in_neural_features: bool,
+    pub outside_mid_ball_lane_width_enabled: bool,
+    pub wingback_advanced_ball_hold_width_enabled: bool,
+    pub whole_field_motion_vector_enabled: bool,
+    pub whole_field_motion_players: usize,
+    pub whole_field_motion_balls: usize,
+    pub whole_field_motion_channels_per_entity: usize,
+    pub whole_field_motion_in_pomdp_observation: bool,
+    pub whole_field_motion_in_neural_features: bool,
     pub support_target_open_space_metrics_enabled: bool,
     pub support_target_teammate_occupied_pressure_enabled: bool,
     pub playback_intent_target_space_metrics_enabled: bool,
@@ -31465,7 +31517,7 @@ fn soccer_playback_agent_contract() -> SoccerPlaybackAgentContract {
         official_run_time_step_enabled: true,
         ball_run_time_step_enabled: true,
         central_brain_runs_before_field_shuffle: true,
-        field_entities_use_fisher_yates: false,
+        field_entities_use_fisher_yates: world::dd_soccer_enable_fisher_yates_schedule(),
         central_brain_operation_order_agentic: true,
         player_operation_order_agentic: true,
         official_operation_order_agentic: true,
@@ -31934,6 +31986,28 @@ fn soccer_player_physical_trait_contract_fields() -> Vec<String> {
         .collect()
 }
 
+fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
+    [
+        "DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE",
+        "DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION",
+        "DD_SOCCER_ENABLE_FORWARD_PASS_FIRST",
+        "DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE",
+        "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
+        crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
+        "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
+        "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE_REWARD",
+        "DD_SOCCER_DISABLE_LOOSE_BALL_URGENCY",
+        "DD_SOCCER_DISABLE_OUTSIDE_MID_BALL_LANE_WIDTH",
+        "DD_SOCCER_DISABLE_WINGBACK_ADVANCED_BALL_HOLD_WIDTH",
+        "DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT",
+        "DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE",
+        "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
     let killer_pass_over_top = tunables().killer_pass_over_top;
     SoccerDecisionModelContract {
@@ -31994,6 +32068,38 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         near_goal_recycling_dampening_enabled: true,
         shot_killer_pass_family_probability_floor_enabled: true,
         forward_progress_bias_enabled: true,
+        requested_tactical_feature_gates: soccer_requested_tactical_feature_gate_names(),
+        role_aware_pass_risk_appetite_enabled: true,
+        forward_option_recognition_enabled: true,
+        forward_option_quality_in_pomdp_observation: true,
+        forward_option_quality_binned_in_mdp_state: true,
+        forward_option_quality_in_neural_features: true,
+        forward_pass_first_enabled: true,
+        isolated_carrier_drive_enabled: true,
+        isolated_carrier_solo_hold_up_in_neural_features: true,
+        blindside_surprise_steal_enabled: true,
+        carrier_side_glance_enabled: true,
+        blindside_steal_in_pomdp_observation: true,
+        blindside_steal_binned_in_mdp_state: true,
+        blindside_steal_in_neural_features: true,
+        flank_crash_box_strategy_enabled: true,
+        flank_crash_box_outer_lanes_per_side: CRASH_BOX_OUTER_FLANK_FINE_LANES,
+        flank_crash_box_target_min_attackers: CRASH_BOX_TARGET_MIN_ATTACKERS,
+        flank_crash_box_target_max_attackers: CRASH_BOX_TARGET_MAX_ATTACKERS,
+        flank_crash_box_in_pomdp_observation: true,
+        flank_crash_box_binned_in_mdp_state: true,
+        flank_crash_box_in_neural_features: true,
+        loose_ball_uncontested_urgency_enabled: true,
+        loose_ball_uncontested_urgency_binned_in_mdp_state: true,
+        loose_ball_uncontested_urgency_in_neural_features: true,
+        outside_mid_ball_lane_width_enabled: true,
+        wingback_advanced_ball_hold_width_enabled: true,
+        whole_field_motion_vector_enabled: true,
+        whole_field_motion_players: SOCCER_NEURAL_FIELD_MOTION_PLAYERS,
+        whole_field_motion_balls: SOCCER_NEURAL_FIELD_MOTION_BALLS,
+        whole_field_motion_channels_per_entity: SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER,
+        whole_field_motion_in_pomdp_observation: true,
+        whole_field_motion_in_neural_features: true,
         support_target_open_space_metrics_enabled: true,
         support_target_teammate_occupied_pressure_enabled: true,
         playback_intent_target_space_metrics_enabled: true,
@@ -39474,6 +39580,14 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_signed_unit(graph_temporal.temporal_actor_run_memory_score);
     features[SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY] =
         soccer_neural_unit(graph_temporal.temporal_opponent_press_memory_score);
+    features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY] = soccer_neural_unit(
+        obs.best_forward_pass_option_quality
+            .max(obs.best_forward_pass_receiver_openness),
+    );
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION] =
+        soccer_neural_unit(obs.defensive_press_action_score);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK] =
+        soccer_neural_unit(obs.defensive_contain_risk_score);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -50814,14 +50928,13 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
 }
 
-/// Set `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=1` to enable the "surprise steal from behind".
+/// `DD_SOCCER_ENABLE_BLINDSIDE_STEAL` controls the "surprise steal from behind".
 /// A defender that has crept into the blind arc of an opponent dribbling *forward and
 /// slowly* (walk/jog/skip) — and that believes it can actually catch the carrier (a real
 /// closing-speed margin) — can nick the ball from behind before the carrier reacts; the
 /// carrier in turn glances to its blind side (a head-scan with a real control-drift cost)
-/// to RECOGNISE the threat and break away. Default off ⇒ the assessment short-circuits to
-/// `None`, every new observation field stays zero, the new action option is inert, and the
-/// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
+/// to RECOGNIZE the threat and break away. Production is default-on and can be killed with
+/// `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=0`; tests remain default-off for stable A/B coverage.
 fn dd_soccer_enable_blindside_steal() -> bool {
     #[cfg(test)]
     {
@@ -54139,8 +54252,10 @@ fn backward_pass_path_traffic_for_snapshot(
     if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
         return BackwardPassPathTraffic::default();
     }
-    let priced_backward_yards = (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
-    if priced_backward_yards <= 0.0 {
+    let priced_risk_units = (backward_pass_distance_risk_units(forward_yards)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0);
+    if priced_risk_units <= 0.0 {
         return BackwardPassPathTraffic::default();
     }
     if passer_position.distance(target_point) <= 1e-6 {
@@ -54165,13 +54280,12 @@ fn backward_pass_path_traffic_for_snapshot(
     if opponent_count == 0 {
         return BackwardPassPathTraffic::default();
     }
-    let scaled = opponent_count as f64 * priced_backward_yards;
+    let scaled = opponent_count as f64 * priced_risk_units;
     BackwardPassPathTraffic {
         opponent_count,
-        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
+        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT)
             .clamp(0.0, 0.95),
-        score_penalty: scaled
-            * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD,
+        score_penalty: scaled * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT,
     }
 }
 
@@ -54652,6 +54766,15 @@ fn dd_soccer_disable_learnable_pass_velocity() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LEARNABLE_PASS_VELOCITY").is_ok())
 }
 
+/// Default-on POMDP pass-safety hardening: when the lane, endpoint, or MPC receipt model says a
+/// floor pass is likely a direct turnover, compress its policy-facing completion estimate so carry
+/// / hold / safer outlets can win. Set `DD_SOCCER_DISABLE_PASS_TURNOVER_SAFETY_HARDENING=1` for A/B.
+fn dd_soccer_disable_pass_turnover_safety_hardening() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PASS_TURNOVER_SAFETY_HARDENING").is_ok())
+}
+
 /// The power buckets the policy considers for a ground/driven pass, weakest→hardest. A
 /// weighted ball (low power) is easy to control but lingers in the lane (high interception
 /// risk); a driven ball (high power) threads a contested corridor but is harder to receive.
@@ -54984,6 +55107,17 @@ fn pass_target_quality_for_snapshot_inner(
         effective_pass_speed,
         anticipated_target,
     );
+    let direct_opponent_control_risk = if flight.is_aerial() {
+        0.0
+    } else {
+        snapshot.pass_point_direct_opponent_control_risk(
+            passer.team,
+            target_position,
+            passer_position,
+            anticipated_target,
+            effective_pass_speed,
+        )
+    };
     let position_confidence = snapshot
         .player_position_confidence_for_point(passer.id, target_position)
         .unwrap_or(0.0);
@@ -55153,6 +55287,40 @@ fn pass_target_quality_for_snapshot_inner(
             }
         }
     }
+    if !dd_soccer_disable_pass_turnover_safety_hardening() && !flight.is_aerial() {
+        let yards_to_goal =
+            (passer.team.goal_y(snapshot.field_length) - anticipated_target.y).abs();
+        let forward_floor = target_forward > 1.25;
+        let final_third_forward = forward_floor && yards_to_goal <= snapshot.field_length / 3.0;
+        let lane_risk_floor = if final_third_forward {
+            0.74
+        } else if forward_floor {
+            0.64
+        } else {
+            0.54
+        };
+        let lane_gift_risk = ((lane_interception_risk - lane_risk_floor)
+            / (1.0 - lane_risk_floor).max(1e-6))
+        .clamp(0.0, 1.0);
+        let direct_gift_risk =
+            ((direct_opponent_control_risk - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR)
+                / (1.0 - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR).max(1e-6))
+            .clamp(0.0, 1.0);
+        let path_gift_risk = lane_gift_risk.max(direct_gift_risk);
+        let receipt_gift_risk = ((PASS_TURNOVER_SAFETY_RECEIPT_FLOOR - mpc_receipt.probability)
+            / PASS_TURNOVER_SAFETY_RECEIPT_FLOOR.max(1e-6))
+            .clamp(0.0, 1.0)
+            * path_gift_risk
+            * 0.72;
+        let gift_risk = path_gift_risk.max(receipt_gift_risk);
+        let damp = if final_third_forward {
+            PASS_TURNOVER_SAFETY_FINAL_THIRD_FORWARD_DAMP
+        } else {
+            PASS_TURNOVER_SAFETY_DAMP
+        };
+        expected_completion *= (1.0 - gift_risk * damp).clamp(0.20, 1.0);
+    }
+    expected_completion *= backward_pass_completion_multiplier(target_forward);
     PassTargetQuality {
         receiver_openness,
         stride_fit,
@@ -58432,16 +58600,40 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     }
 }
 
-/// Escalating demerit for a *long* backward pass. Returns 0 for forward, square, or
-/// short-backward (≤5yd) balls so a 3–5yd reset is untouched, then grows per-yard
-/// for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
+fn dd_soccer_disable_illegal_short_pass_ban() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ILLEGAL_SHORT_PASS_BAN").is_ok())
+}
+
+fn pass_distance_is_illegal_short(distance_yards: f64) -> bool {
+    !dd_soccer_disable_illegal_short_pass_ban()
+        && distance_yards.is_finite()
+        && distance_yards < ILLEGAL_SHORT_PASS_MAX_YARDS
+}
+
+fn backward_pass_distance_risk_units(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= 0.0 {
+        return 0.0;
+    }
+    ((-forward_yards) / BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS.max(1e-6))
+        .max(0.0)
+        .powf(BACKWARD_PASS_DISTANCE_RISK_EXPONENT)
+}
+
+fn backward_pass_completion_multiplier(forward_yards: f64) -> f64 {
+    let risk = backward_pass_distance_risk_units(forward_yards);
+    (1.0 - risk * BACKWARD_PASS_COMPLETION_RISK_PER_UNIT).clamp(0.32, 1.0)
+}
+
+/// Escalating demerit for a backward pass. Returns 0 for forward/square balls, applies a small
+/// demotion even to short resets, then compounds with backward distance.
 /// `forward_yards` is signed attacking-direction progress (negative = backward).
 fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= 0.0 {
         return 0.0;
     }
-    let backward_yards = -forward_yards;
-    (backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD
+    backward_pass_distance_risk_units(forward_yards) * LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT
 }
 
 /// Extra demerit for playing the ball BACKWARD past opponents standing in the pass
@@ -58460,46 +58652,28 @@ fn backward_pass_path_risk_penalty(forward_yards: f64, opponents_on_path: usize)
     {
         return 0.0;
     }
-    let priced_backward_yards = (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
-    priced_backward_yards
+    let priced_risk_units = (backward_pass_distance_risk_units(forward_yards)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0);
+    priced_risk_units
         * opponents_on_path as f64
-        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT
 }
 
 /// Soft risk (in 0..1 quality units) for the BACKWARD component of a one-two leg. A short
 /// backpass is a normal part of a give-and-go, so a forward/square leg carries no risk; the
 /// further BACK the leg is played and the more opponents sit in its corridor, the higher the
-/// demerit — `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This
+/// demerit, using the same exponential distance-risk units as normal backward passes. This
 /// demotes (never vetoes) a long or through-traffic backward give/return. `forward_yards` is
 /// signed attacking-direction progress for the leg (negative = backward).
 fn wall_pass_leg_backward_risk(forward_yards: f64, opponents_on_path: usize) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= 0.0 {
         return 0.0;
     }
-    let backward_yards = -forward_yards;
-    (backward_yards * (1.0 + opponents_on_path as f64) * WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY)
+    (backward_pass_distance_risk_units(forward_yards)
+        * (1.0 + opponents_on_path as f64)
+        * WALL_PASS_BACKWARD_RISK_PER_UNIT_PER_BODY)
         .min(WALL_PASS_BACKWARD_RISK_MAX)
-}
-
-/// Exponential risk demerit for a BACKWARD pass, layered ON TOP of the linear
-/// [`long_backward_pass_penalty`]. Returns 0 for forward/square balls and for short backward
-/// resets up to [`BACKWARD_EXP_RISK_FREE_YARDS`]; beyond that the demerit grows as
-/// `SCALE * GROWTH_PER_REF^(backward_yards / REF_YARDS)`, so the penalty multiplies by
-/// `GROWTH_PER_REF` (5x) for every `REF_YARDS` (10yd) of extra retreat — a 20yd backward pass is
-/// priced ~5x a 10yd one. Capped so it never overflows or fully dominates the score. `forward_yards`
-/// is signed attacking-direction progress (negative = backward). Pure / RNG-free.
-fn backward_pass_exponential_risk_penalty(forward_yards: f64) -> f64 {
-    if !forward_yards.is_finite() || forward_yards >= -BACKWARD_EXP_RISK_FREE_YARDS {
-        return 0.0;
-    }
-    let backward_yards = -forward_yards;
-    let exponent = backward_yards / BACKWARD_EXP_RISK_REF_YARDS.max(1e-6);
-    let penalty = BACKWARD_EXP_RISK_SCALE * BACKWARD_EXP_RISK_GROWTH_PER_REF.powf(exponent);
-    if penalty.is_finite() {
-        penalty.min(BACKWARD_EXP_RISK_CAP)
-    } else {
-        BACKWARD_EXP_RISK_CAP
-    }
 }
 
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
@@ -58510,18 +58684,11 @@ fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
     if (BACKWARD_PASS_SHORT_RESET_MIN_YARDS..=BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
         .contains(&backward_yards)
     {
-        let midpoint =
-            (BACKWARD_PASS_SHORT_RESET_MIN_YARDS + BACKWARD_PASS_SHORT_RESET_MAX_YARDS) * 0.5;
-        let half_band =
-            ((BACKWARD_PASS_SHORT_RESET_MAX_YARDS - BACKWARD_PASS_SHORT_RESET_MIN_YARDS) * 0.5)
-                .max(1e-6);
-        let center_fit = (1.0 - (backward_yards - midpoint).abs() / half_band).clamp(0.0, 1.0);
-        return BACKWARD_PASS_SHORT_RESET_BONUS * (0.80 + center_fit * 0.20);
+        return -(backward_yards * BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD);
     }
     if backward_yards > BACKWARD_PASS_SHORT_RESET_MAX_YARDS {
-        return -((backward_yards - BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
-            * BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD)
-            .min(BACKWARD_PASS_LONG_RESET_PENALTY_CAP);
+        return -(backward_pass_distance_risk_units(forward_yards)
+            * BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT);
     }
     0.0
 }
@@ -59951,6 +60118,12 @@ fn open_support_outlet_fit(observation: &SoccerPomdpObservation) -> f64 {
 /// Multiplier (<=1) that discourages dribbling straight into an opponent: 2yd is
 /// the open-play buffer and 3yd applies in the carrier's own half. The penalty is
 /// soft, lighter near goal, and relieved when the nearest opponent is moving away.
+fn dd_soccer_disable_dribble_turnover_safety_hardening() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_TURNOVER_SAFETY_HARDENING").is_ok())
+}
+
 fn dribble_into_opponent_penalty(
     forward_dribble_space_yards: f64,
     yards_to_goal: f64,
@@ -59974,7 +60147,19 @@ fn dribble_into_opponent_penalty(
     } else {
         0.70
     };
-    (1.0 - closeness * penalty_strength).clamp(0.30, 1.0)
+    let base = (1.0 - closeness * penalty_strength).clamp(0.30, 1.0);
+    if dd_soccer_disable_dribble_turnover_safety_hardening() {
+        return base;
+    }
+    let turnover_safety_strength = if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL {
+        0.10
+    } else if own_half {
+        0.20
+    } else {
+        0.16
+    };
+    let safety_gate = (1.0 - closeness * turnover_safety_strength).clamp(0.76, 1.0);
+    (base * safety_gate).clamp(0.24, 1.0)
 }
 
 fn pressure_release_signal(observation: &SoccerPomdpObservation) -> f64 {

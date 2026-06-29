@@ -12,7 +12,8 @@ const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
 // pass), this branch floored the body-shield independent of dribble skill (lift the correct
 // action). Both fire only under genuine steal-pressure-with-no-outlet and reinforce each other,
 // so keep both.
-const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 10.40;
+const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 16.80;
+const STEAL_RISK_BAD_OUTLET_PANIC_PASS_MIN_MULTIPLIER: f64 = 0.045;
 // Turning your body to SHIELD a pinned ball needs no dribbling skill, so under genuine steal
 // pressure with no good outlet the protect-ball score gets a floor INDEPENDENT of the
 // (pressure-damped) dribble base — otherwise the one correct action collapses with the
@@ -4043,7 +4044,7 @@ impl PlayerAgent {
                 + steal_pressure
                     * bad_escape_outlet_fit.powi(2)
                     * STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH))
-            .clamp(0.14, 1.0);
+            .clamp(STEAL_RISK_BAD_OUTLET_PANIC_PASS_MIN_MULTIPLIER, 1.0);
         let closing_good_outlet_pass_lift =
             (1.0 + pressure_rising * open_outlet_fit * 0.44).clamp(1.0, 1.38);
         let defender_closing_pass_lift = if self.role == PlayerRole::Defender {
@@ -5169,6 +5170,7 @@ impl PlayerAgent {
         if pass_target_count > 0
             && hold_pressure >= 0.12
             && release_pressure >= 0.38
+            && good_escape_outlet_fit >= 0.34
             && dribbling < NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF
             && !goal_attack_shot_blocks_alternatives
             && !(no_teammate_in_front
@@ -5179,6 +5181,7 @@ impl PlayerAgent {
             let release_floor = (0.20
                 + hold_pressure * 0.28
                 + release_pressure * 0.18
+                + good_escape_outlet_fit * 0.12
                 + open_support_fit * 0.18
                 + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.12
                 + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.10)
@@ -5203,6 +5206,7 @@ impl PlayerAgent {
         }
         if pass_target_count > 0
             && short_upfield_ground_pass_fit >= 0.42
+            && good_escape_outlet_fit >= 0.34
             && !goal_attack_shot_blocks_alternatives
         {
             let short_forward_release_floor = (0.24
@@ -5215,6 +5219,7 @@ impl PlayerAgent {
         }
         if pass_target_count > 0
             && observation.pass_and_move_forward_opportunity >= 0.35
+            && good_escape_outlet_fit >= 0.34
             && !goal_attack_shot_blocks_alternatives
             && !(no_teammate_in_front
                 && attacking_ball_carrier
@@ -5550,6 +5555,7 @@ impl PlayerAgent {
         // OFF (default under test) ⇒ strength clamps to 0 ⇒ byte-identical no-op.
         if forward_pass_first_enabled()
             && pass_target_count > 0
+            && good_escape_outlet_fit >= 0.34
             && !goal_attack_shot_blocks_alternatives
             && !observation.threaded_goal_pass_available
             && !must_shoot_near_goal(observation, self.role)

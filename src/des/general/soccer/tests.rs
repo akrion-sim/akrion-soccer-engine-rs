@@ -1837,6 +1837,46 @@ fn pass_ranking_prices_direct_opponent_control_risk_without_hard_veto() {
         direct_risk > 0.15,
         "test setup should create a learnable direct-opponent control risk, got {direct_risk}"
     );
+    let risky_receiver = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == receiver)
+        .expect("risky receiver");
+    let safer_receiver_snapshot = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == safer_receiver)
+        .expect("safer receiver");
+    let risky_quality = pass_target_quality_for_snapshot(
+        &snapshot,
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == passer)
+            .expect("passer"),
+        sim.players[passer].position,
+        risky_receiver,
+        sim.players[receiver].position,
+        PassFlight::Floor,
+    );
+    let safer_quality = pass_target_quality_for_snapshot(
+        &snapshot,
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == passer)
+            .expect("passer"),
+        sim.players[passer].position,
+        safer_receiver_snapshot,
+        sim.players[safer_receiver].position,
+        PassFlight::Floor,
+    );
+    assert!(
+        risky_quality.expected_completion < safer_quality.expected_completion * 0.95,
+        "direct-turnover risk should compress policy-facing pass quality: risky={:.3} safer={:.3} risk={direct_risk:.3}",
+        risky_quality.expected_completion,
+        safer_quality.expected_completion
+    );
 
     let ranked = snapshot.ranked_visible_pass_targets(passer, 11);
     let safer_rank = ranked
@@ -4959,8 +4999,8 @@ fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
         directional_pass_progress_score(-9.0, weight) + backward_pass_depth_adjustment(-9.0);
 
     assert!(
-        backward_pass_depth_adjustment(-4.0) > 0.0,
-        "3-5yd backward releases should get a reset bonus"
+        backward_pass_depth_adjustment(-4.0) < 0.0,
+        "3-5yd backward releases remain legal but must not get a positive reset bonus"
     );
     assert!(
         backward_pass_depth_adjustment(-6.0) < 0.0,
@@ -4973,18 +5013,18 @@ fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
 }
 
 #[test]
-fn long_backward_pass_penalty_grows_linearly_past_short_reset() {
+fn long_backward_pass_penalty_grows_exponentially_past_short_reset() {
     let ten_back = long_backward_pass_penalty(-10.0);
     let twenty_back = long_backward_pass_penalty(-20.0);
 
-    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
+    assert!(long_backward_pass_penalty(-5.0) > 0.0);
     assert!(
         ten_back > 7.0,
         "10yd backward must be a real penalty: {ten_back}"
     );
     assert!(
-        (twenty_back - ten_back * 3.0).abs() < 1e-12,
-        "penalty should be linear in yards beyond 5: 10yd={ten_back} 20yd={twenty_back}"
+        (twenty_back / ten_back - 5.0).abs() < 1e-9,
+        "20yd backward should carry about 5x the distance risk of 10yd: 10yd={ten_back} 20yd={twenty_back}"
     );
 }
 
@@ -5173,23 +5213,24 @@ fn backward_pass_path_traffic_prices_floor_and_aerial_retreats() {
         passer_pos,
         receiver_pos,
     );
+    let forward_yards = (receiver_pos.y - passer_pos.y) * Team::Home.attack_dir();
     let expected_scaled = opponents.len() as f64
-        * ((passer_pos.y - receiver_pos.y) - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS);
+        * (backward_pass_distance_risk_units(forward_yards)
+            - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+        .max(0.0);
     assert_eq!(traffic.opponent_count, 3);
+    let expected_risk =
+        (expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT).clamp(0.0, 0.95);
     assert!(
-        (traffic.risk
-            - expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
-            .abs()
-            < 1e-12,
-        "traffic risk should be count * backward depth"
+        (traffic.risk - expected_risk).abs() < 1e-12,
+        "traffic risk should be count * exponential backward-distance risk with cap"
     );
     assert!(
         (traffic.score_penalty
-            - expected_scaled
-                * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD)
+            - expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT)
             .abs()
             < 1e-12,
-        "traffic score penalty should be count * backward depth"
+        "traffic score penalty should be count * exponential backward-distance risk"
     );
 
     let crowded_floor = pass_target_quality_for_snapshot(
@@ -5853,7 +5894,7 @@ fn forward_pass_aggregate_without_goal_receiver_does_not_become_killer_pass() {
     sim.players[passer].skills.passing = 9.0;
     sim.players[passer].skills.vision = 9.4;
     sim.players[receiver].role = PlayerRole::Forward;
-    sim.players[receiver].position = Vec2::new(42.0, 76.8);
+    sim.players[receiver].position = Vec2::new(44.0, 76.0);
     sim.players[receiver].velocity = Vec2::zero();
     sim.ball.holder = Some(passer);
     sim.ball.position = sim.players[passer].position;
@@ -6646,6 +6687,7 @@ fn blocked_final_third_attacker_falls_back_to_killer_pass() {
         killer_pass_forced_by_goal_pressure(&observation, sim.players[passer].role),
         "blocked final-third threaded lane should force the killer-pass fallback: {observation:?}"
     );
+    let expected_killer_flight = snapshot.killer_pass_flight_for(passer, &visible_targets);
 
     let mut player = sim.players[passer].clone();
     let intent = player.run_time_step(&snapshot, None, None, &mut mulberry32(22_906));
@@ -6656,7 +6698,7 @@ fn blocked_final_third_attacker_falls_back_to_killer_pass() {
             flight,
         } => {
             assert_eq!(target_player, Some(receiver));
-            assert_eq!(flight, PassFlight::Floor);
+            assert_eq!(flight, expected_killer_flight);
             let expected_power = 0.66
                 + 0.24
                     * ability01(sim.players[passer].skills.passing_completion_rate)
@@ -8239,6 +8281,11 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
         "forward outlet openness should clear the learnable good-option threshold: {observation:?}"
     );
     assert!(
+        observation.best_forward_pass_option_quality
+            >= observation.best_forward_pass_receiver_openness,
+        "POMDP should expose the lane-aware forward-option quality: {observation:?}"
+    );
+    assert!(
         observation.nearest_forward_teammate_distance_yards < 10.0,
         "nearest forward distance should follow the actionable outlet"
     );
@@ -8253,6 +8300,10 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
     assert!(
         q_key.best_forward_pass_receiver_openness_bin > 0,
         "Q-state should bucket the forward outlet openness: {q_key:?}"
+    );
+    assert!(
+        q_key.best_forward_pass_option_quality_bin > 0,
+        "Q-state should bucket the lane-aware forward option quality: {q_key:?}"
     );
 
     let transition = SoccerLearningTransition {
@@ -8280,6 +8331,10 @@ fn actionable_forward_outlet_beats_backward_reset_and_reaches_learning_state() {
     assert!(
         features[SOCCER_NEURAL_FEATURE_BEST_FORWARD_OPENNESS] > 0.0,
         "neural features should see forward outlet openness"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY] > 0.0,
+        "neural features should see lane-aware forward-option quality"
     );
     assert!(
         features[SOCCER_NEURAL_FEATURE_FORWARD_SUPPORT_PROXIMITY] > 0.0,
@@ -9939,8 +9994,8 @@ fn dribbling_into_a_close_opponent_is_cut_unless_marker_is_moving_away() {
     let open_mid = dribble_into_opponent_penalty(8.0, 80.0, 40.0, 0.0);
     assert!(cramped_mid < open_mid);
     assert!(
-        cramped_mid <= 0.55,
-        "tight space in open play is cut hard: {cramped_mid}"
+        cramped_mid <= 0.45,
+        "tight space in open play is cut hard enough to avoid cheap dribble turnovers: {cramped_mid}"
     );
     assert_eq!(open_mid, 1.0);
     // Near goal the same guard is softer but no longer fully waived.
@@ -14248,6 +14303,11 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -17933,57 +17993,27 @@ fn backward_pass_length_preference_favours_the_short_drop() {
 }
 
 #[test]
-fn long_backward_pass_penalty_grows_linearly_with_retreat() {
-    // Forward, square and short-backward (<=5yd) balls are untouched.
+fn long_backward_pass_penalty_grows_exponentially_with_retreat() {
+    // Forward and square balls are untouched; every backward ball carries some risk.
     assert_eq!(long_backward_pass_penalty(6.0), 0.0);
     assert_eq!(long_backward_pass_penalty(0.0), 0.0);
-    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
-    // Beyond the 5yd short cap the demerit rises LINEARLY (constant per-yard slope): the
-    // gap from 6->10yd back equals the gap from 10->14yd back.
+    assert!(long_backward_pass_penalty(-5.0) > 0.0);
     let p6 = long_backward_pass_penalty(-6.0);
     let p10 = long_backward_pass_penalty(-10.0);
     let p14 = long_backward_pass_penalty(-14.0);
     assert!(p6 > 0.0 && p10 > p6 && p14 > p10);
     assert!(
-        ((p10 - p6) - (p14 - p10)).abs() < 1e-9,
-        "penalty must be linear in backward distance"
+        p14 - p10 > p10 - p6,
+        "penalty must compound with backward distance"
     );
-    // A >10yd backward ball is heavily demoted, and the ramp keeps growing linearly.
+    // A >10yd backward ball is heavily demoted, and 20yd is tuned to roughly 5x 10yd.
     assert!(p10 >= 6.0);
-    assert!(long_backward_pass_penalty(-40.0) > p14);
+    let p20 = long_backward_pass_penalty(-20.0);
     assert!(
-        (long_backward_pass_penalty(-40.0)
-            - (40.0 - LONG_BACKWARD_PASS_YARDS) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
-            .abs()
-            < 1e-9
+        (p20 / p10 - 5.0).abs() < 1e-9,
+        "20yd backward pass should be ~5x 10yd: p10={p10} p20={p20}"
     );
-}
-
-#[test]
-fn backward_pass_exponential_risk_compounds_with_retreat() {
-    // Forward, square, and short-reset (within the free allowance) balls carry no exponential
-    // demerit — only the linear/short-reset curves apply there.
-    assert_eq!(backward_pass_exponential_risk_penalty(8.0), 0.0);
-    assert_eq!(backward_pass_exponential_risk_penalty(0.0), 0.0);
-    assert_eq!(backward_pass_exponential_risk_penalty(-BACKWARD_EXP_RISK_FREE_YARDS), 0.0);
-    assert_eq!(backward_pass_exponential_risk_penalty(-4.0), 0.0);
-    // The demerit GROWS, and grows by ~5x for every 10yd of extra retreat: a 20yd backward pass
-    // is priced ~5x a 10yd one, a 30yd ~25x (the user's "exponentially more risky" requirement).
-    let p10 = backward_pass_exponential_risk_penalty(-10.0);
-    let p20 = backward_pass_exponential_risk_penalty(-20.0);
-    assert!(p10 > 0.0 && p20 > p10);
-    assert!(
-        (p20 / p10 - BACKWARD_EXP_RISK_GROWTH_PER_REF).abs() < 1e-6,
-        "20yd backward pass must be ~5x the risk of a 10yd one (got {})",
-        p20 / p10
-    );
-    // It is capped so a pathological deep ball never overflows or fully dominates the score.
-    assert_eq!(
-        backward_pass_exponential_risk_penalty(-200.0),
-        BACKWARD_EXP_RISK_CAP
-    );
-    // Non-finite input is safe.
-    assert_eq!(backward_pass_exponential_risk_penalty(f64::NAN), 0.0);
+    assert!(long_backward_pass_penalty(-40.0) > p20);
 }
 
 #[test]
@@ -18090,11 +18120,13 @@ fn backward_pass_path_risk_scales_with_retreat_and_opponents() {
     assert!(backward_pass_path_risk_penalty(-20.0, 2) > backward_pass_path_risk_penalty(-8.0, 2));
     // The MORE opponents sit on the path, the higher the risk for the same distance.
     assert!(backward_pass_path_risk_penalty(-12.0, 3) > backward_pass_path_risk_penalty(-12.0, 1));
-    // A 20yd backward ball through 3 players follows the same uncapped linear traffic formula.
+    // A 20yd backward ball through 3 players follows the exponential distance-risk formula.
     let deep_traffic = backward_pass_path_risk_penalty(-20.0, 3);
-    let expected = (20.0 - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS)
+    let expected = (backward_pass_distance_risk_units(-20.0)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0)
         * 3.0
-        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD;
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT;
     assert!((deep_traffic - expected).abs() < 1e-9);
     assert!(
         backward_pass_path_risk_penalty(-40.0, 3) > deep_traffic,
@@ -31331,7 +31363,10 @@ fn agent_schedule_summary_exposes_full_runtime_loop_contract() {
 }
 
 #[test]
-fn runtime_agent_schedule_orders_field_entities_agentically_each_tick() {
+fn runtime_agent_schedule_uses_fisher_yates_for_all_field_entities_when_enabled() {
+    let _gate = test_force_fisher_yates_schedule(true);
+    assert!(soccer_playback_agent_contract().field_entities_use_fisher_yates);
+
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.8,
         seed: 13_084,
@@ -31408,13 +31443,12 @@ fn runtime_agent_schedule_orders_field_entities_agentically_each_tick() {
     }
 
     assert!(
-        !field_orders.is_empty(),
-        "agentic field entity order should be observable each tick"
+        field_orders.len() > 1,
+        "Fisher-Yates field entity order should vary across ticks: {field_orders:?}"
     );
-    assert_eq!(
-        ball_indexes,
-        [26].into_iter().collect::<HashSet<_>>(),
-        "ball agent should integrate after field agents, got {ball_indexes:?}"
+    assert!(
+        ball_indexes.len() > 1 && ball_indexes.iter().any(|index| *index != 26),
+        "ball agent should be shuffled with players and officials, got {ball_indexes:?}"
     );
 }
 
@@ -49485,7 +49519,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
@@ -49664,6 +49699,11 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -55111,6 +55151,77 @@ fn pressured_pending_pass_receiver_prioritizes_early_intercept_margin() {
         ) < 0.75,
         "pressured receiver target should stay on the moving pass path: {pressured_target:?}"
     );
+}
+
+#[test]
+fn intended_receiver_checks_run_when_unpressured_pass_arrives_behind_stride() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let receiver = 9;
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(0.0, 8.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 52.0);
+    sim.players[receiver].position = Vec2::new(40.0, 68.0);
+    sim.players[receiver].velocity = Vec2::new(0.0, 5.0);
+    sim.players[receiver].skills.top_speed = 8.8;
+    sim.pending_pass = Some(PendingPass {
+        team: Team::Home,
+        from: passer,
+        target: Some(receiver),
+        flight: PassFlight::Floor,
+        is_cross: false,
+        launch_tick: sim.tick,
+        origin: sim.players[passer].position,
+        intended_target: Vec2::new(40.0, 65.0),
+        distance_yards: sim.players[passer].position.distance(Vec2::new(40.0, 65.0)),
+        receiver_openness: pass_receiver_openness_for_agents(
+            &sim.players,
+            Team::Home,
+            sim.players[receiver].position,
+        ),
+        passer_skill: ability01(sim.players[passer].skills.passing_completion_rate),
+        launch_speed_yps: 14.0,
+        receiver_position_at_launch: Some(Vec2::new(40.0, 63.0)),
+        receiver_velocity_at_launch: Some(Vec2::new(0.0, 5.0)),
+        offside: None,
+        offside_candidates: Vec::new(),
+        learn_features: Vec::new(),
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let pass = snapshot.pending_pass.as_ref().expect("pending pass");
+    assert_eq!(pass.nearest_receiver, Some(receiver));
+    assert!(
+        pass.off_target_yards <= 1.25,
+        "fixture should model an in-lane pass the receiver overran, not an errant pass: {pass:?}"
+    );
+    let receiver_pos = snapshot
+        .player_position(receiver)
+        .expect("receiver position");
+    let (target, sprint) = snapshot
+        .pending_pass_reception_target_for(receiver)
+        .expect("named receiver should still collect the pass");
+
+    assert!(
+        !sprint,
+        "unpressured receiver beyond the pass path should check the run instead of sprinting past it: target={target:?}"
+    );
+    assert!(
+        target.y < receiver_pos.y - 0.75,
+        "receiver should be sent back toward the ball path: target={target:?} receiver={receiver_pos:?}"
+    );
+    assert!(
+        target.distance(snapshot.ball.position) < receiver_pos.distance(snapshot.ball.position),
+        "check-run target should meet the rolling ball sooner: target={target:?} ball={:?} receiver={receiver_pos:?}",
+        snapshot.ball.position
+    );
+
+    let mut rng = mulberry32(65_109);
+    let intent = sim.players[receiver].run_time_step(&snapshot, None, None, &mut rng);
+    assert!(!intent.sprint, "live movement intent should preserve the check-run");
 }
 
 #[test]
@@ -67935,7 +68046,8 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
@@ -68036,8 +68148,23 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY + 1,
+        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY + 1,
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM),
+        "the pre-defensive-press/contain total must be a recognised legacy dim so old nets migrate"
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
+    assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -68976,7 +69103,7 @@ fn a_backward_pass_into_coverage_is_vetoed_but_to_an_open_man_is_allowed() {
         .id;
     park_players_except(&mut sim, &[holder, mate, presserr, coverer]);
     // Home attacks +y. Holder pressured (so backward isn't auto-vetoed by "no pressure"),
-    // a teammate 3yd BEHIND, and a short backward ball that wins the arrival race.
+    // a teammate more than 3yd BEHIND, and a short backward ball that wins the arrival race.
     sim.players[holder].position = Vec2::new(40.0, 60.0);
     sim.players[holder].facing_yaw = std::f64::consts::FRAC_PI_2;
     sim.ball.holder = Some(holder);
@@ -68986,7 +69113,7 @@ fn a_backward_pass_into_coverage_is_vetoed_but_to_an_open_man_is_allowed() {
     // backward veto never fires) without being a set interceptor in the backward lane.
     sim.players[presserr].position = Vec2::new(46.0, 59.0);
     sim.players[presserr].velocity = Vec2::new(-3.0, 0.0);
-    sim.players[mate].position = Vec2::new(40.0, 57.0); // 3yd behind the holder
+    sim.players[mate].position = Vec2::new(40.0, 56.5); // 3.5yd behind the holder
 
     // Covered: an opponent 2.8yd off the backward man (within the covered radius).
     sim.players[coverer].position = Vec2::new(40.0, 54.2);
@@ -69213,7 +69340,7 @@ fn own_half_tiny_short_pass_yields_to_upfield_outlet() {
 }
 
 #[test]
-fn own_half_tiny_short_pass_remains_available_without_upfield_outlet() {
+fn own_half_tiny_short_pass_is_illegal_without_upfield_outlet() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mids: Vec<usize> = sim
         .players
@@ -69236,8 +69363,27 @@ fn own_half_tiny_short_pass_remains_available_without_upfield_outlet() {
     let ranked = snapshot.ranked_visible_pass_targets(holder, 5);
 
     assert!(
-        ranked.contains(&tiny_tap),
-        "own-half sub-3yd safety valve should remain available when no upfield floor outlet exists: ranked={ranked:?} tiny={tiny_tap}"
+        !ranked.contains(&tiny_tap),
+        "sub-3yd passes are illegal even without an upfield outlet; carrier should hold/carry instead: ranked={ranked:?} tiny={tiny_tap}"
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: holder,
+        action: SoccerAction::Pass {
+            target_player: Some(tiny_tap),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder,
+        Some(holder),
+        "execution guard should veto the explicit sub-3yd pass and keep possession"
+    );
+    assert!(
+        sim.pending_pass.is_none(),
+        "explicit sub-3yd pass must not create a pending pass"
     );
 }
 
@@ -69613,6 +69759,186 @@ fn force_wide_channel_pressure_steps_defender_to_inside_shoulder_and_reaches_lea
     assert!(
         features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER] > 0.0,
         "neural learner should directly see cover count"
+    );
+}
+
+#[test]
+fn central_defender_press_profile_steps_when_pressure_value_beats_contain_risk() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let cover = 3;
+    let carrier = 17;
+    let lane_receiver = 18;
+    park_players_except(&mut sim, &[defender, cover, carrier, lane_receiver]);
+
+    sim.players[defender].position = Vec2::new(40.0, 30.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.players[defender].skills.defending = 9.0;
+    sim.players[defender].skills.defensive_tracking = 9.0;
+    sim.players[defender].skills.aggression = 8.0;
+    sim.players[cover].position = Vec2::new(45.0, 22.0);
+    sim.players[cover].home_position = sim.players[cover].position;
+
+    sim.players[carrier].position = Vec2::new(40.0, 36.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -2.0);
+    sim.players[carrier].skills.dribbling = 4.5;
+    sim.players[carrier].skills.first_touch = 4.5;
+    sim.players[lane_receiver].position = Vec2::new(42.0, 24.0);
+    sim.players[lane_receiver].velocity = Vec2::zero();
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let profile = snapshot.defensive_press_contain_profile_for(defender);
+    assert!(
+        profile.primary_presser,
+        "central defender should be the designated presser"
+    );
+    assert!(
+        profile.target.is_some(),
+        "press value should produce an active press target: {profile:?}"
+    );
+
+    let carrier_pos = snapshot.player_position(carrier).unwrap();
+    let defender_pos = snapshot.player_position(defender).unwrap();
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.distance(carrier_pos) < defender_pos.distance(carrier_pos),
+        "assignment should close the carrier: defender={defender_pos:?} target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) <= 4.2,
+        "press target should reach jockeying range: target={assignment:?} carrier={carrier_pos:?}"
+    );
+
+    let observation = snapshot.observation_for(defender);
+    assert!(
+        observation.defensive_press_action_score
+            > observation.defensive_contain_risk_score + 0.16,
+        "POMDP should prefer press over contain: press={} contain={}",
+        observation.defensive_press_action_score,
+        observation.defensive_contain_risk_score
+    );
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(defender),
+        &observation,
+        Team::Home,
+        sim.players[defender].role,
+    );
+    assert!(key.defensive_press_action_bin > key.defensive_contain_risk_bin);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: defender,
+        team: Team::Home,
+        role: sim.players[defender].role,
+        state: snapshot.mdp_state_for_player(defender),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "press-cover".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(defender),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION] > 0.25);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION]
+            > features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK]
+    );
+}
+
+#[test]
+fn central_defender_contains_when_press_opens_dribble_or_runner_behind() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let carrier = 17;
+    let runner = 18;
+    for player in sim.players.iter_mut() {
+        player.velocity = Vec2::zero();
+        player.acceleration = Vec2::zero();
+        if player.team == Team::Home {
+            if player.role == PlayerRole::Goalkeeper {
+                player.position = Vec2::new(40.0, 6.0);
+            } else if player.id == defender {
+                player.position = Vec2::new(40.0, 34.0);
+            } else {
+                player.position = Vec2::new(8.0 + player.id as f64, 90.0);
+            }
+        } else if player.id != carrier && player.id != runner {
+            player.position = Vec2::new(70.0, 104.0);
+        }
+        player.home_position = player.position;
+    }
+    sim.players[defender].skills.defending = 3.0;
+    sim.players[defender].skills.defensive_tracking = 3.0;
+    sim.players[defender].skills.top_speed = 3.0;
+    sim.players[defender].skills.acceleration = 3.0;
+
+    sim.players[carrier].position = Vec2::new(40.0, 46.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -4.8);
+    sim.players[carrier].skills.dribbling = 9.5;
+    sim.players[carrier].skills.first_touch = 9.0;
+    sim.players[carrier].skills.acceleration = 9.0;
+    sim.players[runner].position = Vec2::new(42.0, 38.0);
+    sim.players[runner].velocity = Vec2::new(0.0, -5.6);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let me = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == defender)
+        .unwrap();
+    assert!(
+        snapshot.fast_carrier_engage_target_for(me).is_none(),
+        "sub-threshold carrier speed should leave the press/contain profile in charge"
+    );
+
+    let profile = snapshot.defensive_press_contain_profile_for(defender);
+    assert!(
+        profile.primary_presser,
+        "central defender should still own the decision"
+    );
+    assert!(
+        profile.target.is_none(),
+        "high dribble/run-behind risk should withhold the press target: {profile:?}"
+    );
+    assert!(
+        profile.contain_risk > profile.press_score + 0.08,
+        "contain risk should beat press score: {profile:?}"
+    );
+
+    let observation = snapshot.observation_for(defender);
+    assert!(
+        observation.defensive_contain_risk_score
+            > observation.defensive_press_action_score + 0.08,
+        "POMDP should prefer contain/back-off: press={} contain={}",
+        observation.defensive_press_action_score,
+        observation.defensive_contain_risk_score
+    );
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(defender),
+        &observation,
+        Team::Home,
+        sim.players[defender].role,
+    );
+    assert!(key.defensive_contain_risk_bin >= key.defensive_press_action_bin);
+
+    let carrier_pos = snapshot.player_position(carrier).unwrap();
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.distance(carrier_pos) > 5.0,
+        "contain decision should not step into tackle range: target={assignment:?} carrier={carrier_pos:?}"
     );
 }
 
@@ -79073,6 +79399,7 @@ fn blocked_goal_pressure_preempts_recycling_with_single_killer_pass() {
             ) >= 0.54,
             "blocked final-third lane should have a strong preemption chance: observation={observation:?} options={options:?}"
         );
+    let expected_killer_flight = snapshot.killer_pass_flight_for(attacker, &pass_targets);
 
     let mut killer_count = 0;
     let mut recycled_count = 0;
@@ -79086,10 +79413,10 @@ fn blocked_goal_pressure_preempts_recycling_with_single_killer_pass() {
                 "killer-pass",
                 SoccerAction::Pass {
                     target_player: Some(target),
-                    flight: PassFlight::Floor,
+                    flight,
                     ..
                 },
-            ) if target == runner => killer_count += 1,
+            ) if target == runner && flight == expected_killer_flight => killer_count += 1,
             ("pass1" | "pass2" | "pass3" | "dribble" | "carry-forward", _) => recycled_count += 1,
             _ => {}
         }
@@ -80988,6 +81315,63 @@ fn assert_soccer_decision_model_contract_json(meta: &serde_json::Value) {
     assert_eq!(model["nearGoalRecyclingDampeningEnabled"], true);
     assert_eq!(model["shotKillerPassFamilyProbabilityFloorEnabled"], true);
     assert_eq!(model["forwardProgressBiasEnabled"], true);
+    assert_eq!(
+        model["requestedTacticalFeatureGates"],
+        serde_json::json!(soccer_requested_tactical_feature_gate_names())
+    );
+    for field in [
+        "roleAwarePassRiskAppetiteEnabled",
+        "forwardOptionRecognitionEnabled",
+        "forwardOptionQualityInPomdpObservation",
+        "forwardOptionQualityBinnedInMdpState",
+        "forwardOptionQualityInNeuralFeatures",
+        "forwardPassFirstEnabled",
+        "isolatedCarrierDriveEnabled",
+        "isolatedCarrierSoloHoldUpInNeuralFeatures",
+        "blindsideSurpriseStealEnabled",
+        "carrierSideGlanceEnabled",
+        "blindsideStealInPomdpObservation",
+        "blindsideStealBinnedInMdpState",
+        "blindsideStealInNeuralFeatures",
+        "flankCrashBoxStrategyEnabled",
+        "flankCrashBoxInPomdpObservation",
+        "flankCrashBoxBinnedInMdpState",
+        "flankCrashBoxInNeuralFeatures",
+        "looseBallUncontestedUrgencyEnabled",
+        "looseBallUncontestedUrgencyBinnedInMdpState",
+        "looseBallUncontestedUrgencyInNeuralFeatures",
+        "outsideMidBallLaneWidthEnabled",
+        "wingbackAdvancedBallHoldWidthEnabled",
+        "wholeFieldMotionVectorEnabled",
+        "wholeFieldMotionInPomdpObservation",
+        "wholeFieldMotionInNeuralFeatures",
+    ] {
+        assert_eq!(model[field], true, "{field}");
+    }
+    assert_eq!(
+        model["flankCrashBoxOuterLanesPerSide"],
+        CRASH_BOX_OUTER_FLANK_FINE_LANES
+    );
+    assert_eq!(
+        model["flankCrashBoxTargetMinAttackers"],
+        CRASH_BOX_TARGET_MIN_ATTACKERS
+    );
+    assert_eq!(
+        model["flankCrashBoxTargetMaxAttackers"],
+        CRASH_BOX_TARGET_MAX_ATTACKERS
+    );
+    assert_eq!(
+        model["wholeFieldMotionPlayers"],
+        SOCCER_NEURAL_FIELD_MOTION_PLAYERS
+    );
+    assert_eq!(
+        model["wholeFieldMotionBalls"],
+        SOCCER_NEURAL_FIELD_MOTION_BALLS
+    );
+    assert_eq!(
+        model["wholeFieldMotionChannelsPerEntity"],
+        SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER
+    );
     assert_eq!(model["supportTargetOpenSpaceMetricsEnabled"], true);
     assert_eq!(model["supportTargetTeammateOccupiedPressureEnabled"], true);
     assert_eq!(model["playbackIntentTargetSpaceMetricsEnabled"], true);
