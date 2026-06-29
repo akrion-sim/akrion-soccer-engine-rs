@@ -6687,6 +6687,7 @@ fn blocked_final_third_attacker_falls_back_to_killer_pass() {
         killer_pass_forced_by_goal_pressure(&observation, sim.players[passer].role),
         "blocked final-third threaded lane should force the killer-pass fallback: {observation:?}"
     );
+    let expected_killer_flight = snapshot.killer_pass_flight_for(passer, &visible_targets);
 
     let mut player = sim.players[passer].clone();
     let intent = player.run_time_step(&snapshot, None, None, &mut mulberry32(22_906));
@@ -6697,7 +6698,7 @@ fn blocked_final_third_attacker_falls_back_to_killer_pass() {
             flight,
         } => {
             assert_eq!(target_player, Some(receiver));
-            assert_eq!(flight, PassFlight::Floor);
+            assert_eq!(flight, expected_killer_flight);
             let expected_power = 0.66
                 + 0.24
                     * ability01(sim.players[passer].skills.passing_completion_rate)
@@ -79108,6 +79109,7 @@ fn blocked_goal_pressure_preempts_recycling_with_single_killer_pass() {
             ) >= 0.54,
             "blocked final-third lane should have a strong preemption chance: observation={observation:?} options={options:?}"
         );
+    let expected_killer_flight = snapshot.killer_pass_flight_for(attacker, &pass_targets);
 
     let mut killer_count = 0;
     let mut recycled_count = 0;
@@ -79121,10 +79123,10 @@ fn blocked_goal_pressure_preempts_recycling_with_single_killer_pass() {
                 "killer-pass",
                 SoccerAction::Pass {
                     target_player: Some(target),
-                    flight: PassFlight::Floor,
+                    flight,
                     ..
                 },
-            ) if target == runner => killer_count += 1,
+            ) if target == runner && flight == expected_killer_flight => killer_count += 1,
             ("pass1" | "pass2" | "pass3" | "dribble" | "carry-forward", _) => recycled_count += 1,
             _ => {}
         }

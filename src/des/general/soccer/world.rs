@@ -23805,13 +23805,29 @@ impl WorldSnapshot {
             return false;
         }
         // The ball to an opponent's FEET is always a concession (no perception gate). A marked
-        // man is only a vetoable concession if the passer actually perceives the marker.
-        let nearest = self.nearest_opponent_distance_at(passer.team, reception);
+        // man is only a vetoable concession if the passer actually perceives that marker, not just
+        // the receiver/reception point ahead of him.
+        let Some((_, opponent_position, nearest)) = self.nearest_opponent_at(passer.team, reception)
+        else {
+            return false;
+        };
         if nearest <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS {
             return true;
         }
+        if let Some(facing) = self.player_facing_direction(passer) {
+            let to_marker = opponent_position - passer_position;
+            if to_marker.len() > 1e-6 && facing.len() > 1e-6 {
+                let marker_angle = angle_between_vectors_degrees(facing, to_marker);
+                if marker_angle > ball_holder_shoulder_scan_limit_degrees()
+                    && ball_holder_head_scan_delay_seconds(marker_angle, passer.skills.vision)
+                        > self.ball_holder_possession_seconds.max(0.0)
+                {
+                    return false;
+                }
+            }
+        }
         let perceived = self
-            .player_position_confidence_for_point(passer_id, reception)
+            .player_position_confidence_for_point(passer_id, opponent_position)
             .unwrap_or(1.0);
         perceived >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE
     }
@@ -29264,6 +29280,29 @@ impl WorldSnapshot {
         self.ranked_pass_targets_filtered(player_id, limit, true, false)
     }
 
+    fn pass_target_visible_for_decision(
+        &self,
+        passer: &PlayerSnapshot,
+        target: &PlayerSnapshot,
+        target_position: Vec2,
+        forward_yards: f64,
+        visible_only: bool,
+    ) -> bool {
+        if !visible_only || self.player_can_see_player(passer.id, target.id) {
+            return true;
+        }
+        if self.ball.holder != Some(passer.id) || forward_yards <= 1.25 {
+            return false;
+        }
+        let passer_position = self.player_snapshot_position(passer);
+        if passer_position.distance(target_position) > player_vision_range(passer) {
+            return false;
+        }
+        self.player_position_confidence_for_point(passer.id, target_position)
+            .unwrap_or(0.0)
+            >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE * 0.50
+    }
+
     pub fn ranked_visible_aerial_pass_targets(&self, player_id: usize, limit: usize) -> Vec<usize> {
         self.ranked_aerial_pass_targets_filtered(player_id, limit, true)
     }
@@ -29859,7 +29898,7 @@ impl WorldSnapshot {
                 }
                 let target_position = self.player_snapshot_position(target);
                 let slip_break = self.slip_break_offside_trap_profile_for(player_id, target_id);
-                let reception = self
+                let mut reception = self
                     .anticipated_pass_reception_point(
                         player_id,
                         target_id,
@@ -29867,6 +29906,21 @@ impl WorldSnapshot {
                         nominal_speed,
                     )
                     .unwrap_or(target_position);
+                let led_reception_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    target_position,
+                    reception,
+                ) || self.nearest_opponent_distance_at(me.team, reception)
+                    <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                let current_pocket_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    target_position,
+                    target_position,
+                ) || self.nearest_opponent_distance_at(me.team, target_position)
+                    <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                if led_reception_is_gift && !current_pocket_is_gift {
+                    reception = target_position;
+                }
                 let scoring_reception = if slip_break.available {
                     slip_break.aim_point
                 } else {
@@ -29925,8 +29979,36 @@ impl WorldSnapshot {
                 // breaking into clear space has no opponent within the mark radius of the
                 // reception, so genuine killer balls are untouched; only a pass landing on a
                 // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                let over_top_conceded = over_top_aim
+                    .map(|aim| {
+                        let over_top_speed = pass_speed_yps_from_power(
+                            0.82,
+                            PassFlight::OverTop,
+                            false,
+                            &me.skills,
+                        );
+                        self.pass_point_directly_favors_opponent(
+                            me.team,
+                            target_position,
+                            aim.aim_point,
+                        ) || self.pass_reception_conceded_to_opponent(
+                            me.team,
+                            target_position,
+                            me_position,
+                            aim.aim_point,
+                            over_top_speed,
+                            self.attacker_pressure_on_point(me.team, me_position),
+                        )
+                    })
+                    .unwrap_or(false);
                 if !slip_break.available
-                    && self.pass_target_concedes_to_perceived_opponent(player_id, target_id, flight)
+                    && if over_top_aim.is_some() {
+                        over_top_conceded
+                    } else {
+                        self.pass_target_concedes_to_perceived_opponent(
+                            player_id, target_id, flight,
+                        )
+                    }
                 {
                     return None;
                 }
@@ -29941,7 +30023,16 @@ impl WorldSnapshot {
                     target_position,
                     flight,
                 );
-                if (quality.expected_completion < KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                let near_goal_completion_floor_multiplier = if receiver_yards_to_goal <= 8.0 {
+                    0.55
+                } else if receiver_yards_to_goal <= 18.0 {
+                    0.75
+                } else {
+                    1.0
+                };
+                let min_threaded_completion = KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                    * near_goal_completion_floor_multiplier;
+                if (quality.expected_completion < min_threaded_completion
                     && !slip_break.available)
                     || lane_fit < KILLER_PASS_MIN_LANE_FIT
                 {
@@ -30409,6 +30500,22 @@ impl WorldSnapshot {
                         None
                     }
                 };
+                let aim_point_and_anticipation = aim_point_and_anticipation.or_else(|| {
+                    let low_pressure_priced_lane = forward > 1.25
+                        && passer_pressure <= POINTLESS_SHORT_PASS_LOW_PRESSURE
+                        && receiver_distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                        && !self.pass_point_directly_favors_opponent(
+                            me.team,
+                            position,
+                            anticipated_position,
+                        )
+                        && !self.pass_point_directly_favors_opponent(
+                            me.team,
+                            position,
+                            position,
+                        );
+                    low_pressure_priced_lane.then_some((position, false))
+                });
                 // Never recycle a BACKWARD ball into coverage: a backward pass is only safe
                 // to a clearly OPEN teammate. If it goes meaningfully backward AND an opponent
                 // is tight to the receiver, veto it — the holder keeps / shields / clears it
@@ -30532,22 +30639,41 @@ impl WorldSnapshot {
                                 2.5,
                                 threading_speed,
                             );
-                        // `race_won` already includes the qualified half-open forward exception:
-                        // skilled passers keep those options visible. Direct-opponent endpoints
-                        // are priced in the score/learned features below instead of hard-hidden.
-                        (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && !pass_distance_is_illegal_short(me_position.distance(position))
-                            && !pass_distance_is_illegal_short(me_position.distance(*aim_point))
-                            && (!require_reception_won || race_won)
-                            && (!require_reception_won || !marked_under_pressure)
-                            && !committed_cutout
-                            && !backward_into_coverage
-                            && !self.pass_lane_has_unavoidable_set_interceptor_at_speed(
+                        let unavoidable_set_interceptor = self
+                            .pass_lane_has_unavoidable_set_interceptor_at_speed(
                                 me_position,
                                 *aim_point,
                                 me.team,
                                 threading_speed,
-                            )
+                            );
+                        let patient_carry_can_price_lane_risk = forward_pass
+                            && passer_pressure <= POINTLESS_SHORT_PASS_LOW_PRESSURE
+                            && receiver_distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                            && !self.pass_point_directly_favors_opponent(
+                                me.team,
+                                position,
+                                *aim_point,
+                            );
+                        // `race_won` already includes the qualified half-open forward exception:
+                        // skilled passers keep those options visible. Direct-opponent endpoints
+                        // are priced in the score/learned features below instead of hard-hidden.
+                        self.pass_target_visible_for_decision(
+                            me,
+                            p,
+                            position,
+                            forward,
+                            visible_only,
+                        )
+                            && !pass_distance_is_illegal_short(me_position.distance(position))
+                            && !pass_distance_is_illegal_short(me_position.distance(*aim_point))
+                            && (!require_reception_won
+                                || race_won
+                                || patient_carry_can_price_lane_risk)
+                            && (!require_reception_won || !marked_under_pressure)
+                            && !committed_cutout
+                            && !backward_into_coverage
+                            && (!unavoidable_set_interceptor
+                                || patient_carry_can_price_lane_risk)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
                             && !self.final_third_forward_pass_to_nobody(
                                 me.team,
@@ -31079,6 +31205,40 @@ impl WorldSnapshot {
                     }
                     pass_point = anticipated_position;
                 }
+                let projected_point_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    position,
+                    pass_point,
+                ) || self.pass_reception_conceded_to_opponent(
+                    me.team,
+                    position,
+                    me_position,
+                    pass_point,
+                    nominal_speed,
+                    passer_pressure,
+                );
+                if projected_point_is_gift && pass_point.distance(anticipated_position) > 1e-6 {
+                    let anticipated_is_gift = self.pass_point_directly_favors_opponent(
+                        me.team,
+                        position,
+                        anticipated_position,
+                    ) || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        anticipated_position,
+                        nominal_speed,
+                        passer_pressure,
+                    );
+                    if anticipated_is_gift
+                        || pass_distance_is_illegal_short(
+                            me_position.distance(anticipated_position),
+                        )
+                    {
+                        return None;
+                    }
+                    pass_point = anticipated_position;
+                }
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 if me.role == PlayerRole::Goalkeeper
                     && forward < -1.25
@@ -31120,10 +31280,20 @@ impl WorldSnapshot {
                     passer_pressure,
                     forward,
                 );
+                let final_third_aerial_contest = forward > 1.25
+                    && (me.team.goal_y(self.field_length) - pass_point.y).abs()
+                        <= self.field_length / 3.0
+                    && !self.pass_point_directly_favors_opponent(me.team, position, pass_point);
                 (aerial_strikeable
                     && !backward_into_coverage
-                    && !marked_under_pressure
-                    && (!visible_only || self.player_can_see_player(me.id, p.id))
+                    && (!marked_under_pressure || final_third_aerial_contest)
+                    && self.pass_target_visible_for_decision(
+                        me,
+                        p,
+                        position,
+                        forward,
+                        visible_only,
+                    )
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
                     && !self.final_third_forward_pass_to_nobody(
                         me.team,
@@ -45193,9 +45363,21 @@ impl WorldSnapshot {
         }
 
         let zone = self.defensive_shape_for(player_id, home);
+        if let Some(press) = self.holder_press_target_for(me) {
+            return press;
+        }
         let Some(mark_target) = soccer_defensive_mark_target(self, me.team, me.role, zone) else {
             return zone;
         };
+        if me.role == PlayerRole::Defender {
+            if let Some(holder_position) = self.opponent_holder_position_for(me.team) {
+                if mark_target.distance(holder_position)
+                    <= DEFENDER_PRESS_MIDFIELDER_IDEAL_YARDS + 1.0
+                {
+                    return mark_target;
+                }
+            }
+        }
         (mark_target * 0.5 + zone * 0.5).clamp_to_pitch(self.field_width, self.field_length)
     }
 
