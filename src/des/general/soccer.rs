@@ -17069,6 +17069,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::KeeperSave
                 | SoccerRewardEventKind::Goal
+                | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::MatchResult
         )
     }
