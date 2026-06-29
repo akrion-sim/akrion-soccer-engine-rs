@@ -6644,13 +6644,15 @@ impl PlayerAgent {
         let wrong_side_emergency_contact = !goal_side_or_level
             && distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
             && defender_steal_skill + 0.20 >= holder_security;
-<<<<<<< HEAD
         // Surprise steal from behind (gated; OFF ⇒ assessment is `None`). A defender that has
         // crept into a slow, forward-dribbling carrier's blind arc and is now at contact range
         // nicks the ball — the one case a steal from behind is won, because an unaware carrier
         // at a walk/jog is not shielding the led ball. It is deliberately the wrong-side (not
         // goal-side) exception, so it must be evaluated BEFORE the goal-side early-out below.
         // The catch-belief / slowness / blind-arc gating all lives in `blindside_steal_assessment`.
+        // Two recognizers cover this same situation (concurrently developed): the blind-arc
+        // assessment and the back-line `surprise_behind_steal_profile`. Either one is sufficient
+        // to permit the from-behind steal, which still fires exactly once below.
         let blindside_contact = snapshot
             .blindside_steal_assessment(self.id)
             .map(|assessment| {
@@ -6659,15 +6661,13 @@ impl PlayerAgent {
                     && assessment.opportunity >= BLINDSIDE_STEAL_COMMIT_THRESHOLD
             })
             .unwrap_or(false);
-        if !goal_side_or_level && !wrong_side_emergency_contact && !blindside_contact {
-=======
         let surprise_behind_steal = snapshot.surprise_behind_steal_profile_for(self.id);
         let surprise_behind_contact = surprise_behind_steal.available
             && distance <= DEFENSIVE_IMMEDIATE_STEAL_RADIUS_YARDS
             && self.position.distance(snapshot.ball.position)
                 <= SURPRISE_BEHIND_STEAL_BALL_REACH_YARDS;
-        if !goal_side_or_level && !wrong_side_emergency_contact && !surprise_behind_contact {
->>>>>>> origin/main
+        let behind_steal_contact = blindside_contact || surprise_behind_contact;
+        if !goal_side_or_level && !wrong_side_emergency_contact && !behind_steal_contact {
             return None;
         }
         let clean_contact = distance <= DEFENSIVE_IMMEDIATE_STEAL_CLEAN_RADIUS_YARDS
