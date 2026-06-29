@@ -87599,6 +87599,37 @@ fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
 }
 
 #[test]
+fn team_advance_upfield_space_qualifies_truth_table() {
+    // The cue fires when the carrier has an open forward lane to dribble into (the "received a
+    // pass with a lot of space forward" case)...
+    assert!(
+        team_advance_upfield_space_qualifies(TEAM_ADVANCE_FORWARD_SPACE_YARDS, 0.0),
+        "an open forward lane at the threshold should qualify even under pressure"
+    );
+    assert!(
+        team_advance_upfield_space_qualifies(20.0, 1.0),
+        "lots of forward grass qualifies regardless of a trailing presser"
+    );
+    // ...OR when the carrier simply has no committed presser (free to advance the ball)...
+    assert!(
+        team_advance_upfield_space_qualifies(0.0, UNCONTESTED_CARRIER_SPACE_YARDS),
+        "an unpressured carrier qualifies even with no clear straight lane"
+    );
+    // ...but NOT when boxed in: no forward lane AND a presser committed.
+    assert!(
+        !team_advance_upfield_space_qualifies(
+            TEAM_ADVANCE_FORWARD_SPACE_YARDS - 0.1,
+            UNCONTESTED_CARRIER_SPACE_YARDS - 0.1
+        ),
+        "a pressed carrier with no forward lane must not trigger a team advance"
+    );
+    assert!(
+        !team_advance_upfield_space_qualifies(0.0, 0.0),
+        "a fully boxed-in carrier must not trigger a team advance"
+    );
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
