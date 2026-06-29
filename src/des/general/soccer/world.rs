@@ -31256,9 +31256,12 @@ impl WorldSnapshot {
                     .projected_in_behind_pass_point(me.id, p.id)
                     .unwrap_or(anticipated_position);
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
-                // Sub-3yd passes are illegal (see floor ranking). Gated default-ON; inert off.
+                // Sub-3yd passes are illegal (see floor ranking): only when BOTH the receiver's
+                // feet AND the projected reception point are inside 3yd, so a ball lofted onto a
+                // breaking runner is not wrongly outlawed. Gated default-ON; inert off.
                 if dd_soccer_enable_min_pass_distance()
                     && me_position.distance(position) < MIN_LEGAL_PASS_YARDS
+                    && me_position.distance(pass_point) < MIN_LEGAL_PASS_YARDS
                 {
                     return None;
                 }
