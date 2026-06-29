@@ -2488,6 +2488,182 @@ pub(crate) fn forward_pass_first_enabled() -> bool {
     }
 }
 
+/// Whether the **isolated attacking-carrier drive** is active this process. This is the fix for
+/// the "no teammate ahead ⇒ panic backward pass" blunder: the carrier instead either drives at
+/// goal solo or holds the ball up moving forward while support arrives, with a backward recycle
+/// as the very last resort. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE=0/false` is the kill switch); default-OFF under test
+/// so the option-scoring parity suite stays byte-identical. See
+/// [`isolated_attacking_carrier_drive_mode`].
+pub(crate) fn isolated_carrier_drive_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE"))
+    }
+}
+
+/// What an isolated attacking carrier (no teammate ahead, no open forward pass) should do
+/// INSTEAD of panicking into a backward pass. See [`isolated_attacking_carrier_drive_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IsolatedCarrierDriveMode {
+    /// Few defenders are goal-side of the ball, OR there's space + a speed advantage to run into:
+    /// drive at goal at a sprint and shoot once inside [`ISOLATED_CARRIER_SHOOT_YARDS`].
+    SoloGoalDrive,
+    /// A solo goal does not look promising: keep the ball, carry it forward / on an angle at a
+    /// CONTROLLED pace (not a sprint), and wait for teammates to push up into the attack. A
+    /// backward/square recycle is the very last resort.
+    HoldUp,
+}
+
+/// "Fewer than 4 defenders behind the ball" (the user's threshold): with this many or more
+/// opponents goal-side of the ball a solo run is into a packed block, so prefer hold-up.
+const ISOLATED_CARRIER_MAX_DEFENDERS_BEHIND_BALL: usize = 4;
+/// Forward dribble space (yards) that counts as "a lot of space to run into" for the solo drive.
+const ISOLATED_CARRIER_SOLO_OPEN_SPACE_YARDS: f64 = 12.0;
+/// Nearest-opponent distance (yards) clear of the carrier that counts as runway for the solo run.
+const ISOLATED_CARRIER_SOLO_RUNWAY_YARDS: f64 = 6.0;
+/// Closing rate (yards/sec) at/below which the nearest opponent is NOT catching the carrier — a
+/// favourable speed differential. Negative means the defender is falling behind.
+const ISOLATED_CARRIER_SOLO_CLOSING_CUTOFF_YPS: f64 = 0.5;
+/// Once the solo driver is within this range of goal he should look to shoot (the user's 25 yards).
+const ISOLATED_CARRIER_SHOOT_YARDS: f64 = 25.0;
+/// A forward pass option this open means the carrier is NOT actually isolated — let the normal
+/// forward-pass-first / killer-pass logic play it instead of forcing a drive/hold-up.
+const ISOLATED_CARRIER_FORWARD_OPTION_OPEN_CUTOFF: f64 = 0.45;
+
+/// A clear runway + favourable speed differential for the solo goal drive: lots of forward space,
+/// the nearest opponent is not on top of the carrier, and is not closing the gap. Pure + RNG-free.
+pub(crate) fn isolated_carrier_solo_speed_space_advantage(
+    observation: &SoccerPomdpObservation,
+) -> bool {
+    let big_space =
+        observation.forward_dribble_space_yards >= ISOLATED_CARRIER_SOLO_OPEN_SPACE_YARDS;
+    let runway = observation.nearest_opponent_distance >= ISOLATED_CARRIER_SOLO_RUNWAY_YARDS;
+    let pulling_away = observation
+        .neural_extended
+        .nearest_opponent_closing_rate_yps
+        <= ISOLATED_CARRIER_SOLO_CLOSING_CUTOFF_YPS;
+    big_space && runway && pulling_away
+}
+
+/// Recognise the "isolated attacking carrier" picture and choose the response. Returns `None`
+/// unless THIS carrier is an attacker (a Forward, or a wide / outside midfielder — i.e. a winger)
+/// who has the ball in the ATTACKING half with NO teammate ahead of him AND no genuinely open
+/// forward pass on. That is precisely the state that used to deteriorate into a panicked backward
+/// pass. When it holds, the carrier should DRIVE at goal ([`SoloGoalDrive`]) when few defenders
+/// are behind the ball or there's space + a speed advantage, otherwise hold the ball up
+/// ([`HoldUp`]) and wait for support — never recycle backwards as a first instinct. Pure +
+/// RNG-free so it can be unit-tested and shared by the scoring and gait paths.
+///
+/// [`SoloGoalDrive`]: IsolatedCarrierDriveMode::SoloGoalDrive
+/// [`HoldUp`]: IsolatedCarrierDriveMode::HoldUp
+pub(crate) fn isolated_attacking_carrier_drive_mode(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    is_outside_midfielder: bool,
+) -> Option<IsolatedCarrierDriveMode> {
+    // Only the attacking carriers who actually get stranded up top: strikers AND wide midfielders
+    // (wingers), per the report that outside mids exhibit the same bug.
+    if !(role == PlayerRole::Forward || is_outside_midfielder) {
+        return None;
+    }
+    if !observation.has_ball {
+        return None;
+    }
+    // Only when attacking (in the opponent half / past the half-way line). Never override the
+    // own-half retention / build-up / clearance logic, where a safe backward ball is correct.
+    if observation.yards_to_goal >= observation.yards_to_own_goal {
+        return None;
+    }
+    // The bug's precondition: nobody ahead of the carrier to play, and no genuinely open forward
+    // pass option on. (When a forward man IS open, the forward-pass-first / killer-pass paths
+    // handle it — this recogniser stays out of the way.)
+    let no_teammate_ahead =
+        observation.field_teammates_ahead == 0 && observation.teammates_ahead == 0;
+    if !no_teammate_ahead {
+        return None;
+    }
+    let forward_option_open = observation.visible_forward_pass_options > 0
+        && observation
+            .best_forward_pass_option_quality
+            .max(observation.best_forward_pass_receiver_openness)
+            >= ISOLATED_CARRIER_FORWARD_OPTION_OPEN_CUTOFF;
+    if forward_option_open {
+        return None;
+    }
+    // Solo goal vs hold-up: few defenders goal-side of the ball, OR space + a speed advantage.
+    let defenders_behind_ball = observation.field_opponents_ahead;
+    let solo = defenders_behind_ball < ISOLATED_CARRIER_MAX_DEFENDERS_BEHIND_BALL
+        || isolated_carrier_solo_speed_space_advantage(observation);
+    Some(if solo {
+        IsolatedCarrierDriveMode::SoloGoalDrive
+    } else {
+        IsolatedCarrierDriveMode::HoldUp
+    })
+}
+
+/// Whether `role` at home-x `home_x` is an outside (wide) midfielder — a winger. Matches the
+/// `outside_midfielder` test used inside [`possession_action_options`], factored out so the gait
+/// resolver can reuse it for [`isolated_attacking_carrier_drive_mode`].
+pub(crate) fn is_outside_midfielder_role(role: PlayerRole, home_x: f64, field_width: f64) -> bool {
+    role == PlayerRole::Midfielder
+        && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
+}
+
+/// Re-weight the carrier's possession options for the isolated-carrier `mode` so a forward DRIVE
+/// (or hold-up carry) floats above the panicked backward/square recycle. `pass1` is a
+/// backward/square ball in this state by construction (no teammate is ahead), so it is damped too;
+/// nothing is made illegal, so a backward outlet still survives when nothing else is on. Pure +
+/// RNG-free (operates only on the option scores) so it is unit-testable without the env gate.
+pub(crate) fn apply_isolated_carrier_drive_bias(
+    options: &mut Vec<AgentActionOptionTrace>,
+    mode: IsolatedCarrierDriveMode,
+    in_shot_range: bool,
+    shot_legal: bool,
+) {
+    // Square / backward outlets that become a last resort in both modes.
+    let backward_outlets = ["recycle-reset", "switch-play", "route-one"];
+    match mode {
+        IsolatedCarrierDriveMode::SoloGoalDrive => {
+            let mut drive_family = vec!["vertical-attack", "turnover-burst", "carry-forward"];
+            if in_shot_range && shot_legal {
+                drive_family.push("shoot");
+            }
+            ensure_min_legal_option_family_probability(options, &drive_family, 0.72);
+            for label in backward_outlets {
+                scale_legal_option_score(options, label, 0.28);
+            }
+            // Don't square it to a covered man, and don't stall on a shield/turn when the lane to
+            // goal is there to be driven.
+            scale_legal_option_score(options, "pass1", 0.40);
+            for label in ["protect-ball", "hold-up-flank", "side-step"] {
+                scale_legal_option_score(options, label, 0.58);
+            }
+        }
+        IsolatedCarrierDriveMode::HoldUp => {
+            // Carry forward / on an angle at a controlled pace (the sprint resolver keeps it off a
+            // sprint) and wait for support to arrive.
+            ensure_min_legal_option_family_probability(
+                options,
+                &["carry-forward", "carry-out-left", "carry-out-right"],
+                0.60,
+            );
+            // Backward is the very last resort: damp it hard. Shielding while you wait
+            // (protect-ball) is fine, so it is intentionally left alone.
+            for label in backward_outlets {
+                scale_legal_option_score(options, label, 0.20);
+            }
+            scale_legal_option_score(options, "pass1", 0.32);
+        }
+    }
+}
+
 /// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
 /// released early instead of dwelt on (the user's "if that option is forward and sufficiently
 /// open"). Below this the carrier keeps his normal patience.
