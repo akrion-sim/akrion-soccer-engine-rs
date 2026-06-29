@@ -34986,6 +34986,28 @@ impl WorldSnapshot {
             || moving_pass_needs_attack
             || bound_one_two_wall
             || aerial_plan.map(|p| p.sprint).unwrap_or(false);
+        // Receive in stride (anti-overrun): when the reception is genuinely FREE (no defender can
+        // contest it, no pressure, not a bound one-two return) and the receiver would otherwise
+        // sprint to the spot WELL ahead of the ball, drop the sprint so they settle and take it in
+        // stride instead of overrunning it (the ball then arriving behind their run). The fine
+        // pace-matching is applied in `move_player_towards`. Gated default-ON; byte-identical off.
+        // A contested/pressured reception keeps `sprint` and still attacks the ball.
+        let sprint = if dd_soccer_enable_receive_in_stride()
+            && sprint
+            && !pressured_reception
+            && !defender_can_contest
+            && !bound_one_two_wall
+            && aerial_plan.is_none()
+            && receive_in_stride_would_overrun(
+                current.distance(target),
+                receiver_sprint_speed,
+                self.ball.position.distance(target),
+                self.ball.velocity.len(),
+            ) {
+            false
+        } else {
+            sprint
+        };
         Some((target, sprint))
     }
 
