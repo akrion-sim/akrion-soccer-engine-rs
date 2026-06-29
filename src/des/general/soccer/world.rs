@@ -1083,6 +1083,139 @@ fn stamp_learned_policy_behavior_probability_on_decision(
 mod tests {
     use super::*;
 
+    fn pass_role_risk_test_quality(
+        expected_completion: f64,
+        lane_interception_risk: f64,
+        mpc_receipt_probability: f64,
+        backward_path_traffic_risk: f64,
+        long_aerial_bounds_risk: f64,
+    ) -> PassTargetQuality {
+        PassTargetQuality {
+            expected_completion,
+            lane_interception_risk,
+            mpc_receipt_probability,
+            backward_path_traffic_risk,
+            long_aerial_bounds_risk,
+            ..PassTargetQuality::default()
+        }
+    }
+
+    #[test]
+    fn pass_role_risk_composite_orders_safe_and_risky() {
+        let safe = pass_role_risk_test_quality(0.94, 0.03, 0.92, 0.0, 0.0);
+        let risky = pass_role_risk_test_quality(0.35, 0.70, 0.35, 0.55, 0.40);
+
+        let safe_risk = pass_target_risk_from_quality(&safe);
+        let risky_risk = pass_target_risk_from_quality(&risky);
+        let safe_safety = pass_target_safety_from_quality(&safe);
+        let risky_safety = pass_target_safety_from_quality(&risky);
+
+        assert!(safe_risk < 0.10, "safe pass risk was {safe_risk}");
+        assert!(
+            risky_risk > safe_risk + 0.35,
+            "risky pass risk {risky_risk} should clear safe {safe_risk}"
+        );
+        assert!(
+            safe_safety > risky_safety,
+            "safe pass safety {safe_safety} should clear risky {risky_safety}"
+        );
+    }
+
+    #[test]
+    fn pass_role_risk_penalizes_defenders_more_than_forwards() {
+        let risky = pass_role_risk_test_quality(0.35, 0.70, 0.35, 0.55, 0.40);
+        let origin = Vec2::new(34.0, 58.0);
+        let target = Vec2::new(38.0, 64.0);
+        let defender = pass_role_risk_score_adjustment(
+            PlayerRole::Defender,
+            Team::Home,
+            origin,
+            target,
+            120.0,
+            6.0,
+            &risky,
+            0.0,
+        );
+        let forward = pass_role_risk_score_adjustment(
+            PlayerRole::Forward,
+            Team::Home,
+            origin,
+            target,
+            120.0,
+            6.0,
+            &risky,
+            0.0,
+        );
+
+        assert!(
+            defender.penalty > forward.penalty * 2.0,
+            "defender penalty {} should clearly exceed forward penalty {}",
+            defender.penalty,
+            forward.penalty
+        );
+        assert!(
+            defender.safety_bonus > forward.safety_bonus,
+            "defender safety bonus {} should exceed forward safety bonus {}",
+            defender.safety_bonus,
+            forward.safety_bonus
+        );
+    }
+
+    #[test]
+    fn pass_role_risk_final_third_forward_relief_is_forward_led() {
+        let risky = pass_role_risk_test_quality(0.35, 0.70, 0.35, 0.55, 0.40);
+        let origin = Vec2::new(40.0, 92.0);
+        let forward_target = Vec2::new(42.0, 106.0);
+        let backward_target = Vec2::new(42.0, 84.0);
+        let attacking_forward = pass_role_risk_score_adjustment(
+            PlayerRole::Forward,
+            Team::Home,
+            origin,
+            forward_target,
+            120.0,
+            14.0,
+            &risky,
+            0.0,
+        );
+        let recycling_forward = pass_role_risk_score_adjustment(
+            PlayerRole::Forward,
+            Team::Home,
+            origin,
+            backward_target,
+            120.0,
+            -8.0,
+            &risky,
+            0.0,
+        );
+        let attacking_defender = pass_role_risk_score_adjustment(
+            PlayerRole::Defender,
+            Team::Home,
+            origin,
+            forward_target,
+            120.0,
+            14.0,
+            &risky,
+            0.0,
+        );
+
+        assert!(
+            attacking_forward.forward_risk_bonus > 0.0,
+            "forward final-third risk bonus should be active"
+        );
+        assert!(
+            attacking_forward.penalty < recycling_forward.penalty,
+            "forward target penalty {} should be below backward target penalty {}",
+            attacking_forward.penalty,
+            recycling_forward.penalty
+        );
+        assert!(
+            attacking_defender.forward_risk_bonus < attacking_forward.forward_risk_bonus * 0.25,
+            "defender bonus {} should stay much smaller than forward bonus {}",
+            attacking_defender.forward_risk_bonus,
+            attacking_forward.forward_risk_bonus
+        );
+    }
+
     fn learned_action_trace(label: &str, visits: u32) -> SoccerLearnedActionTrace {
         SoccerLearnedActionTrace {
             label: label.to_string(),
@@ -20066,6 +20199,145 @@ fn forward_floor_outlet_assessment(
     }
 }
 
+const PASS_TARGET_RISK_COMPLETION_WEIGHT: f64 = 0.34;
+const PASS_TARGET_RISK_LANE_WEIGHT: f64 = 0.30;
+const PASS_TARGET_RISK_MPC_RECEIPT_WEIGHT: f64 = 0.18;
+const PASS_TARGET_RISK_BACKWARD_TRAFFIC_WEIGHT: f64 = 0.12;
+const PASS_TARGET_RISK_AERIAL_BOUNDS_WEIGHT: f64 = 0.06;
+const PASS_ROLE_RISK_DEFENDER_PENALTY_WEIGHT: f64 = 3.35;
+const PASS_ROLE_RISK_MIDFIELDER_PENALTY_WEIGHT: f64 = 2.05;
+const PASS_ROLE_RISK_FORWARD_PENALTY_WEIGHT: f64 = 1.15;
+const PASS_ROLE_RISK_GOALKEEPER_PENALTY_WEIGHT: f64 = 3.85;
+const PASS_ROLE_RISK_TACTICAL_RELIEF_MAX: f64 = 0.22;
+const PASS_ROLE_RISK_FINAL_THIRD_RELIEF_MAX: f64 = 0.55;
+const PASS_ROLE_RISK_FINAL_THIRD_PROGRESS_YARDS: f64 = 18.0;
+const PASS_ROLE_RISK_FINAL_THIRD_BLEND_YARDS: f64 = 18.0;
+const PASS_ROLE_RISK_FINAL_THIRD_ENTRY_BUFFER_YARDS: f64 = 6.0;
+const PASS_ROLE_RISK_FINAL_THIRD_FORWARD_BONUS_WEIGHT: f64 = 1.35;
+const PASS_ROLE_SAFETY_DEFENDER_BONUS_WEIGHT: f64 = 0.30;
+const PASS_ROLE_SAFETY_MIDFIELDER_BONUS_WEIGHT: f64 = 0.18;
+const PASS_ROLE_SAFETY_FORWARD_BONUS_WEIGHT: f64 = 0.07;
+const PASS_ROLE_SAFETY_GOALKEEPER_BONUS_WEIGHT: f64 = 0.34;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PassRoleRiskScoreAdjustment {
+    safety_bonus: f64,
+    penalty: f64,
+    forward_risk_bonus: f64,
+}
+
+fn pass_quality_unit_interval(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn pass_target_risk_from_quality(quality: &PassTargetQuality) -> f64 {
+    let completion_risk = 1.0 - pass_quality_unit_interval(quality.expected_completion);
+    let mpc_receipt_risk = 1.0 - pass_quality_unit_interval(quality.mpc_receipt_probability);
+    (completion_risk * PASS_TARGET_RISK_COMPLETION_WEIGHT
+        + pass_quality_unit_interval(quality.lane_interception_risk) * PASS_TARGET_RISK_LANE_WEIGHT
+        + mpc_receipt_risk * PASS_TARGET_RISK_MPC_RECEIPT_WEIGHT
+        + pass_quality_unit_interval(quality.backward_path_traffic_risk)
+            * PASS_TARGET_RISK_BACKWARD_TRAFFIC_WEIGHT
+        + pass_quality_unit_interval(quality.long_aerial_bounds_risk)
+            * PASS_TARGET_RISK_AERIAL_BOUNDS_WEIGHT)
+        .clamp(0.0, 1.0)
+}
+
+fn pass_target_safety_from_quality(quality: &PassTargetQuality) -> f64 {
+    1.0 - pass_target_risk_from_quality(quality)
+}
+
+fn pass_role_risk_penalty_weight(role: PlayerRole) -> f64 {
+    match role {
+        PlayerRole::Goalkeeper => PASS_ROLE_RISK_GOALKEEPER_PENALTY_WEIGHT,
+        PlayerRole::Defender => PASS_ROLE_RISK_DEFENDER_PENALTY_WEIGHT,
+        PlayerRole::Midfielder => PASS_ROLE_RISK_MIDFIELDER_PENALTY_WEIGHT,
+        PlayerRole::Forward => PASS_ROLE_RISK_FORWARD_PENALTY_WEIGHT,
+    }
+}
+
+fn pass_role_safety_bonus_weight(role: PlayerRole) -> f64 {
+    match role {
+        PlayerRole::Goalkeeper => PASS_ROLE_SAFETY_GOALKEEPER_BONUS_WEIGHT,
+        PlayerRole::Defender => PASS_ROLE_SAFETY_DEFENDER_BONUS_WEIGHT,
+        PlayerRole::Midfielder => PASS_ROLE_SAFETY_MIDFIELDER_BONUS_WEIGHT,
+        PlayerRole::Forward => PASS_ROLE_SAFETY_FORWARD_BONUS_WEIGHT,
+    }
+}
+
+fn pass_role_final_third_forward_appetite(role: PlayerRole) -> f64 {
+    match role {
+        PlayerRole::Forward => 1.0,
+        PlayerRole::Midfielder => 0.45,
+        PlayerRole::Defender => 0.12,
+        PlayerRole::Goalkeeper => 0.0,
+    }
+}
+
+fn pass_final_third_forward_fit(
+    role: PlayerRole,
+    team: Team,
+    origin: Vec2,
+    field_length: f64,
+    forward_yards: f64,
+) -> f64 {
+    if !field_length.is_finite() || field_length <= 0.0 || !forward_yards.is_finite() {
+        return 0.0;
+    }
+    let forward_fit = (forward_yards / PASS_ROLE_RISK_FINAL_THIRD_PROGRESS_YARDS).clamp(0.0, 1.0);
+    if forward_fit <= 0.0 {
+        return 0.0;
+    }
+    let yards_to_goal = (team.goal_y(field_length) - origin.y).abs();
+    let final_third_depth = (field_length / 3.0).max(1.0);
+    if yards_to_goal > final_third_depth {
+        return 0.0;
+    }
+    let final_third_fit = ((final_third_depth - yards_to_goal)
+        + PASS_ROLE_RISK_FINAL_THIRD_ENTRY_BUFFER_YARDS)
+        / PASS_ROLE_RISK_FINAL_THIRD_BLEND_YARDS;
+    (pass_role_final_third_forward_appetite(role) * forward_fit * final_third_fit.clamp(0.0, 1.0))
+        .clamp(0.0, 1.0)
+}
+
+fn pass_role_risk_score_adjustment(
+    role: PlayerRole,
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    field_length: f64,
+    forward_yards: f64,
+    quality: &PassTargetQuality,
+    directive_risk_tolerance: f64,
+) -> PassRoleRiskScoreAdjustment {
+    let risk = pass_target_risk_from_quality(quality);
+    let safety = 1.0 - risk;
+    let final_third_forward_fit =
+        pass_final_third_forward_fit(role, team, origin, field_length, forward_yards);
+    let tactical_relief =
+        pass_quality_unit_interval(directive_risk_tolerance) * PASS_ROLE_RISK_TACTICAL_RELIEF_MAX;
+    let final_third_relief = final_third_forward_fit * PASS_ROLE_RISK_FINAL_THIRD_RELIEF_MAX;
+    let risk_relief = (tactical_relief + final_third_relief).clamp(0.0, 0.68);
+    let penalty = risk * pass_role_risk_penalty_weight(role) * (1.0 - risk_relief).max(0.32);
+    let safety_bonus = safety * pass_role_safety_bonus_weight(role);
+    let target_forward_yards = ((target.y - origin.y) * team.attack_dir()).max(0.0);
+    let target_progress_fit =
+        (target_forward_yards / PASS_ROLE_RISK_FINAL_THIRD_PROGRESS_YARDS).clamp(0.0, 1.0);
+    let forward_risk_bonus = risk
+        * final_third_forward_fit
+        * target_progress_fit
+        * PASS_ROLE_RISK_FINAL_THIRD_FORWARD_BONUS_WEIGHT;
+    PassRoleRiskScoreAdjustment {
+        safety_bonus,
+        penalty,
+        forward_risk_bonus,
+    }
+}
+
 fn first_touch_shape_prior_for_snapshot(
     directive: &TeamTacticalDirective,
     team_shape: TeamShapeObservation,
@@ -29930,6 +30202,16 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let role_risk = pass_role_risk_score_adjustment(
+                    me.role,
+                    me.team,
+                    me_position,
+                    pass_point,
+                    self.field_length,
+                    forward,
+                    &pass_quality,
+                    directive.risk_tolerance,
+                );
                 // Forward-option recognition: when a genuinely good forward ball exists,
                 // demote a backward/square target so the carrier plays the open forward man
                 // instead of recycling backward (the reported blunder). Gated; the precomputed
@@ -29960,8 +30242,11 @@ impl WorldSnapshot {
                     - own_half_short_pass_liability
                     - pass_quality.lane_interception_risk * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                     - safe_pass_overrisk_penalty
+                    - role_risk.penalty
                     + over_the_top_invite_bonus * goal_entry_pass_learning
                     + own_box_play_out_adjustment
+                    + role_risk.safety_bonus
+                    + role_risk.forward_risk_bonus * pass_target_learning
                     + forward_open_bonus * pass_target_learning
                     + progressive_floor_outlet_bonus * pass_target_learning
                     + wing_overload_bonus * pass_target_learning
@@ -30327,6 +30612,16 @@ impl WorldSnapshot {
                         / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
                         .clamp(0.0, 1.0)
                         * 1.2;
+                let role_risk = pass_role_risk_score_adjustment(
+                    me.role,
+                    me.team,
+                    me_position,
+                    pass_point,
+                    self.field_length,
+                    forward,
+                    &pass_quality,
+                    directive.risk_tolerance,
+                );
                 let score = directional_progress_score
                     + self.space_score_at(pass_point, me.team) * 0.65
                     - dist * 0.018
@@ -30345,6 +30640,8 @@ impl WorldSnapshot {
                     + receiver_openness_for_score * 0.38 * pass_target_learning
                     + pass_quality.stride_fit * 0.46 * pass_target_learning
                     + keeper_distribution_bonus
+                    + role_risk.safety_bonus
+                    + role_risk.forward_risk_bonus * pass_target_learning
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
                     // A backward loft still has to clear opponents on the path; this
@@ -30352,6 +30649,7 @@ impl WorldSnapshot {
                     - pass_quality.backward_path_traffic_penalty
                     - lateral_penalty
                     - bounds_penalty
+                    - role_risk.penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
                     - marked_receiver_penalty
