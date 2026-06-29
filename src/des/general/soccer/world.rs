@@ -31010,6 +31010,7 @@ impl WorldSnapshot {
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_exponential_risk_penalty
                     - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
