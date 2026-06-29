@@ -55604,6 +55604,17 @@ pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     }
 }
 
+/// A/B MEASUREMENT KNOB (not a gameplay gate). The heuristic match is fully deterministic —
+/// skills/positions are keyed on player id and `MatchConfig.seed` is effectively inert — so a
+/// multi-seed measurement run produces byte-identical matches (n=1 scenario, no statistical
+/// power). When `SOCCER_SEED_VARIED_SKILLS` is set, `default_players` mixes `config.seed` into
+/// the per-player skill jitter so each seed is an INDEPENDENT match. Off (default) ⇒
+/// byte-identical to the deterministic build. Both A/B arms run with this ON and the same seeds,
+/// so skills cancel and the only off-vs-on difference is the feature gate under test.
+fn seed_varied_skills_enabled() -> bool {
+    std::env::var("SOCCER_SEED_VARIED_SKILLS").is_ok()
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
