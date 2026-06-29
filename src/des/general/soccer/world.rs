@@ -13058,18 +13058,47 @@ impl SoccerMatch {
                                         * 0.56);
                         }
                     }
-                    let release = kick_release_clamped_to_pitch(
-                        KickReleaseSpec {
-                            origin: player_pos,
-                            intended_target: aimed_target,
-                            speed_yps: speed,
+                    let elevation = DiscretizedKickElevation::from_pass_flight(flight);
+                    // Phase 0 of the discretized kick action (roadmap Priority 1): when the
+                    // gate is on, route this heuristic pass through the DISCRETE kick
+                    // representation — quantize its power + aim direction into buckets, then
+                    // lower. Off (default) ⇒ the continuous release below, byte-identical.
+                    // Buckets here come from the heuristic; later phases swap that source for
+                    // learned heads. See docs/discretized-kick-action-plan.md.
+                    let release = if dd_soccer_enable_discretized_kick() {
+                        let envelope_min = mph_to_yps(DISCRETIZED_KICK_PASS_MIN_SPEED_MPH);
+                        let envelope_max = mph_to_yps(DISCRETIZED_KICK_PASS_MAX_SPEED_MPH);
+                        let action = DiscretizedKickAction::from_power_direction(
+                            discretized_kick_power_for_speed(speed, envelope_min, envelope_max),
+                            aimed_target - player_pos,
                             curve,
+                            elevation,
+                        );
+                        discretized_kick_release_clamped_to_pitch(
+                            player_pos,
+                            action,
+                            envelope_min,
+                            envelope_max,
+                            distance,
                             curve_bend_yards,
-                            elevation: DiscretizedKickElevation::from_pass_flight(flight),
-                        },
-                        self.config.field_width_yards,
-                        self.config.field_length_yards,
-                    );
+                            DiscretizedKickDither::none(),
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
+                    } else {
+                        kick_release_clamped_to_pitch(
+                            KickReleaseSpec {
+                                origin: player_pos,
+                                intended_target: aimed_target,
+                                speed_yps: speed,
+                                curve,
+                                curve_bend_yards,
+                                elevation,
+                            },
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
+                    };
                     let release_target = release.intended_target;
                     let release_distance = player_pos.distance(release_target);
                     let launch_target = release.launch_target;
