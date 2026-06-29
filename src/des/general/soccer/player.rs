@@ -7695,7 +7695,7 @@ impl PlayerAgent {
     /// Only *sustainable* held actions can be continued tick-to-tick; a ball-release one-shot
     /// (pass/shot/clearance) or a committed challenge (tackle) returns `None` — the ball state
     /// has moved on, so the new decision must be allowed instead.
-    pub(crate) fn continuation_intent(&self) -> Option<PlayerIntent> {
+    fn continuation_intent(&self) -> Option<PlayerIntent> {
         let held = self.last_intent.as_ref()?;
         match held.action {
             SoccerAction::HoldShape

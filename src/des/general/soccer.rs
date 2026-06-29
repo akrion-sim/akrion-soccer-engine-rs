@@ -96,7 +96,7 @@ pub use pass_lane_yield::*;
 mod slip_break_offside;
 pub(crate) use slip_break_offside::*;
 
-pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 30.0;
+pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
 /// default timestep. This is the SINGLE place tick durations derive from the timestep — change
 /// `DEFAULT_DT_SECONDS` above and every `secs_to_ticks(..)`-defined window rescales with it
@@ -55604,6 +55604,17 @@ pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     }
 }
 
+/// A/B MEASUREMENT KNOB (not a gameplay gate). The heuristic match is fully deterministic —
+/// skills/positions are keyed on player id and `MatchConfig.seed` is effectively inert — so a
+/// multi-seed measurement run produces byte-identical matches (n=1 scenario, no statistical
+/// power). When `SOCCER_SEED_VARIED_SKILLS` is set, `default_players` mixes `config.seed` into
+/// the per-player skill jitter so each seed is an INDEPENDENT match. Off (default) ⇒
+/// byte-identical to the deterministic build. Both A/B arms run with this ON and the same seeds,
+/// so skills cancel and the only off-vs-on difference is the feature gate under test.
+fn seed_varied_skills_enabled() -> bool {
+    std::env::var("SOCCER_SEED_VARIED_SKILLS").is_ok()
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
@@ -60081,8 +60092,19 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 // retained only for signature compatibility; it no longer drives
                 // live-match randomness.
                 skills: {
-                    let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
-                    SkillProfile::for_shirt(shirt, role)
+                    if seed_varied_skills_enabled() {
+                        // A/B MEASUREMENT ONLY: the heuristic match is otherwise fully
+                        // deterministic (skills/positions keyed on player id, `config.seed`
+                        // inert), so multi-seed runs are byte-identical — n=1 scenario. Mixing
+                        // `config.seed` into the skill jitter makes each seed an INDEPENDENT
+                        // match. Both A/B arms share a seed ⇒ identical skills ⇒ the feature
+                        // gate is the only difference. Off (default) ⇒ byte-identical to the
+                        // deterministic build (same `blended` rng draw is still consumed).
+                        SkillProfile::blended((id as u64 ^ config.seed as u64) as usize, role, _rng)
+                    } else {
+                        let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
+                        SkillProfile::for_shirt(shirt, role)
+                    }
                 },
                 fatigue: 0.0,
                 controller_slot: None,
