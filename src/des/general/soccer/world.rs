@@ -23672,21 +23672,6 @@ impl WorldSnapshot {
         player: &PlayerSnapshot,
         target: Vec2,
     ) -> f64 {
-        self.dynamic_lane_affinity_for_player_target_with(player, target, None, None)
-    }
-
-    /// Same as [`Self::dynamic_lane_affinity_for_player_target`], but a caller that has
-    /// ALREADY computed the positional-shape relief and candidate occupancy for this exact
-    /// `(player, target)` can pass them in to skip a duplicate recomputation (relief is
-    /// ~O(players^2), occupancy O(players); both are top leaves in the live CPU profile).
-    /// `None` recomputes them, so the public wrapper above stays identical.
-    pub(crate) fn dynamic_lane_affinity_for_player_target_with(
-        &self,
-        player: &PlayerSnapshot,
-        target: Vec2,
-        precomputed_relief: Option<f64>,
-        precomputed_occupancy: Option<CandidateOccupancy>,
-    ) -> f64 {
         let lane_tunables = &tunables().lane_affinity;
         if player.role == PlayerRole::Goalkeeper {
             let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
@@ -23761,9 +23746,7 @@ impl WorldSnapshot {
         let target_lane = target_grid.x;
         let ball_lane = ball_grid.x;
         let predicted_lane = predicted_grid.x;
-        let relief = precomputed_relief.unwrap_or_else(|| {
-            self.positional_shape_exception_relief_for_player_target(player, target)
-        });
+        let relief = self.positional_shape_exception_relief_for_player_target(player, target);
         let static_fit = self.vertical_lane_fit_for_player_target(player, target, relief);
         let in_possession = self
             .controlled_possession_team()
@@ -23799,8 +23782,7 @@ impl WorldSnapshot {
         let flow_score = (lane_tunables.flow_base_score
             + (current_gap - predicted_gap) * lane_tunables.flow_gap_weight)
             .clamp(lane_tunables.flow_min_score, lane_tunables.flow_max_score);
-        let occupancy = precomputed_occupancy
-            .unwrap_or_else(|| self.candidate_occupancy_at(player.team, target, Some(player.id)));
+        let occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
         let teammate_space = (1.0 - occupancy.teammate_occupied_space_pressure()).clamp(0.0, 1.0);
         let open_space = (occupancy.open_space_score
             / lane_tunables.field_open_space_normalizer_yards)
@@ -44965,19 +44947,15 @@ impl WorldSnapshot {
             TeamSpacingMode::InPossession
         };
         let relief = self.positional_shape_exception_relief_for_player_target(player, target);
-        // `candidate_occupancy_at` (an O(players) scan, and the single hottest leaf in the
-        // live CPU profile) was being recomputed with identical arguments by BOTH the
-        // team-spacing score AND the teammate-crowding penalty below (and again inside
-        // `dynamic_lane_affinity_for_player_target`). Compute it once per candidate and
-        // reuse it — byte-identical, since both consumers read the same struct fields.
-        let candidate_occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
-        let spacing = candidate_occupancy.team_spacing_score(spacing_mode);
+        let spacing = self.team_spacing_score_for_candidate(
+            player.team,
+            Some(player.id),
+            target,
+            spacing_mode,
+        );
         let space = (self.space_score_at(target, player.team) / 18.0).clamp(0.0, 1.0);
-        // Parenthesised to match `teammate_occupied_space_penalty_at` exactly
-        // (MAX * (pressure * (1 - relief))) so the result is bit-for-bit unchanged.
-        let teammate_penalty = TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY
-            * (candidate_occupancy.teammate_occupied_space_pressure()
-                * (1.0 - relief.clamp(0.0, 0.78)));
+        let teammate_penalty =
+            self.teammate_occupied_space_penalty_at(player.team, target, Some(player.id), relief);
         let lane_penalty = self.vertical_lane_penalty_for_player_target(player, target, relief);
         let line_penalty = self.role_line_penalty_for_player_target(player, target, relief);
         let offside_penalty = if possession == Some(player.team) {
@@ -44993,14 +44971,7 @@ impl WorldSnapshot {
         };
         let in_possession = possession == Some(player.team);
         let dynamic_lane_fit = if player.role != PlayerRole::Goalkeeper {
-            // Reuse the relief + occupancy already computed above for this candidate instead
-            // of recomputing them inside (they are identical for this exact player/target).
-            self.dynamic_lane_affinity_for_player_target_with(
-                player,
-                target,
-                Some(relief),
-                Some(candidate_occupancy),
-            )
+            self.dynamic_lane_affinity_for_player_target(player, target)
         } else {
             0.0
         };

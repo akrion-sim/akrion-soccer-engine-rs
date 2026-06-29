@@ -86785,6 +86785,7 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
 
+<<<<<<< HEAD
 // --- Isolated attacking carrier: drive / hold-up instead of a panic backward pass --------------
 // (gate `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; see `isolated_attacking_carrier_drive_mode`).
 
@@ -86993,9 +86994,7 @@ fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
         score(&hold, "protect-ball"),
         0.50,
         "hold-up must not damp shielding while waiting for support"
-    );
-}
-
+=======
 #[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
@@ -87107,5 +87106,6 @@ fn slip_break_seam_and_runner_opportunity_are_recognised() {
             )
             .is_none(),
         "a runner already beyond the line is not a slip-break candidate"
+>>>>>>> 378bcd9
     );
 }
