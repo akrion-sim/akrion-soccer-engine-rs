@@ -171,10 +171,71 @@ gates the candidate before it replaces the incumbent.
 
 ---
 
-## 7. Status
+## 7. Results — run 1 (2026-06-28)
 
-- [ ] 3a quick directional A/B with `measure_offense` (existing tool)
-- [ ] 3b write `measure_pass_risk_appetite` binary
-- [ ] 3c write `scripts/run_pass_risk_appetite_ab.sh`
-- [ ] Run Section 4, fill Section 5 verdict
+Tooling built: `src/bin/measure_pass_risk_appetite.rs` (3b). Ran 9000 ticks × 3 seeds per arm,
+gate OFF vs ON, deterministic LP. **~3m47s per full match.**
+
+### Critical methodology finding: the engine is seed-deterministic
+`MatchConfig.seed` did **not** perturb the match — all 3 seeds produced **byte-identical**
+matches (counts exactly 3×, every mean identical to 3dp, all 1–1). So this run is effectively
+**one scenario**, not 3 independent samples. It tests **direction**, NOT significance. A real
+verdict on goals/turnovers (H4/H5) needs a perturbation that actually varies the match (jittered
+initial positions / kickoff). **This is the #1 follow-up before any promote decision.**
+
+### Baseline (OFF) → Treatment (ON), by passer role × zone
+
+| role \| zone | fwd% | avgFwdYds | avgComp (inverse-risk) | back% |
+|---|---|---|---|---|
+| Defender \| own | 99→99 | 31.3→27.3 | 0.669→0.675 | 0→1 |
+| Defender \| mid | 97→97 | 17.3→23.5 | 0.485→**0.527** | 3→1 |
+| Midfielder \| own | 86→**59** | 12.3→7.7 | 0.388→0.401 | 12→**37** |
+| Midfielder \| mid | 74→80 | 9.8→**16.1** | 0.392→0.350 | 23→16 |
+| Midfielder \| final | 67→73 | 6.2→9.8 | 0.433→**0.278** | 33→19 |
+| Forward \| mid | 71→72 | 8.6→10.1 | 0.343→**0.261** | 28→26 |
+| Forward \| final | 26→**22** | -3.3→-4.0 | 0.376→0.408 | 67→**78** |
+
+Goals (one scenario): baseline 3–3 (6) → treatment 3–0 (3).
+
+### Verdict per hypothesis
+- **H2 (forward balls are riskier) — PASS.** Forward\|mid avgComp 0.343→0.261, Mid\|mid
+  0.392→0.350, Mid\|final 0.433→0.278: forward balls in build-up/middle third are notably
+  riskier (lower completion) under treatment. The risk-repricing works.
+- **H3 (defenders safer) — PASS (weak).** Def\|mid completion 0.485→0.527 (safer), own-third
+  forward balls shorter (31→27 yd). Directionally right, small.
+- **H1 (forwards more forward in the final third) — FAIL.** Forward\|final went the WRONG way:
+  fwd% 26→22, back% 67→78, avgFwd -3.3→-4.0. Second-order shape effect: the forward-preference
+  lift pushed the **midfielders** much higher (Mid\|mid avgFwd 9.8→16.1, +64%), isolating
+  forwards higher up with *fewer* outlets ahead, so they lay off backward to arriving mids more.
+  The appetite can't manufacture a forward outlet that the run patterns don't provide.
+- **H4 (goals same/better) — FAIL in this scenario** (6→3 total), but **n=1**, both teams share
+  the gate, and the drop is asymmetric (away 3→0). **Not interpretable** without varied scenarios.
+- **H5 (own-half discipline) — CONCERN.** Mid\|own back% 12→37 (much more own-third backward
+  recycling). Could be safer retention or negative recycling — ambiguous without turnover data.
+
+### Decision: DO NOT PROMOTE. Keep gate default-OFF.
+The mechanism does what it says on risk *pricing* (H2/H3), but the **global forward-preference
+lift has an unintended team-shape side-effect** (mids surge upfield, forwards isolated → H1
+backfires) and goals dropped in the single scenario tested. Net: not a clear win.
+
+### Next steps (in priority order)
+1. **Add a match perturbation** (initial-position / kickoff jitter keyed on seed) so the A/B has
+   real variance, then re-run with 20+ varied scenarios for an H4/H5 verdict with turnovers.
+2. **Retune toward risk-pricing over shape-pushing:** shrink / remove `forward_preference_lift`
+   (it's what shifts team shape via the mids) and lean on the direction-aware
+   `*_risk_penalty_mult` instead, which gave the clean H2/H3 signal without the shape blowback.
+   Re-check that Forward\|final no longer regresses.
+3. Extend the harness to attribute **realized interceptions and shots/xG** by passer role (3b
+   follow-up) so H4/H5 are measured, not proxied.
+4. Only if a varied-scenario run shows H1–H3 right with H4/H5 guards holding → flip to
+   `gate_default_on`, retrain, and gate via `soccer_eval_gate_run` (Section 6).
+
+## 8. Status
+
+- [x] 3a quick directional A/B with `measure_offense` — superseded by 3b (richer, role-resolved)
+- [x] 3b write `measure_pass_risk_appetite` binary
+- [ ] 3c write `scripts/run_pass_risk_appetite_ab.sh` (deferred — single binary sufficed)
+- [x] Run Section 4, fill Section 7 verdict → **mixed, do not promote, retune + vary scenarios**
+- [ ] Add match perturbation for real variance (next step #1)
+- [ ] Retune (drop forward_preference_lift), re-run varied A/B
 - [ ] If promote: flip to `gate_default_on` + retrain + `soccer_eval_gate_run`
