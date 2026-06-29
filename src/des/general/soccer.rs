@@ -18350,6 +18350,22 @@ pub(crate) fn gate_default_on(name: &str) -> bool {
     }
 }
 
+/// Pure space/pressure test for the team-upfield-advance cue: a controlled-possession outfield
+/// carrier is "advancing into space" when he either has an open forward lane to dribble into
+/// (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS` — the "received a pass with a
+/// lot of space forward" case) OR simply has no committed presser
+/// (`nearest_opponent_distance_yards >= UNCONTESTED_CARRIER_SPACE_YARDS`). Extracted as a pure free
+/// function so the threshold logic is unit-tested directly, WITHOUT toggling the process-global
+/// `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD` gate env (which would race the parallel suite). See
+/// [`WorldSnapshot::team_advance_upfield_active`].
+pub(crate) fn team_advance_upfield_space_qualifies(
+    forward_dribble_space_yards: f64,
+    nearest_opponent_distance_yards: f64,
+) -> bool {
+    forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS
+        || nearest_opponent_distance_yards >= UNCONTESTED_CARRIER_SPACE_YARDS
+}
+
 /// Whether the **team upfield advance in possession** strategy is active this process. When a team
 /// is in controlled possession through a carrier who has space to advance into, the whole team
 /// pushes forward as a unit: off-ball runners make forward supporting runs, the back four steps up
