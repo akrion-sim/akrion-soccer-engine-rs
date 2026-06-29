@@ -2705,6 +2705,7 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
     length: f64,
 ) -> Vec<PlanarObstacle> {
     let half_dt2 = 0.5 * dt * dt;
+    let sixth_dt3 = dt * dt * dt / 6.0; // 3rd-order (jerk) term, matching predicted_ball_position
     let mut obstacles = Vec::with_capacity(snapshot.players.len().saturating_add(1));
     for other in &snapshot.players {
         if other.id == player.id {
