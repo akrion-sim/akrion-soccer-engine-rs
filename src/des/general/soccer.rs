@@ -1598,6 +1598,23 @@ const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
 const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
 const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
 const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
+// Exponential backward-pass risk. A backward ball is not just LINEARLY worse the further it
+// goes (that is `long_backward_pass_penalty`): the danger COMPOUNDS — a deep retreat invites a
+// charge-down, concedes territory, and launches the counter, each worse than the last yard.
+// Calibrated so the demerit GROWS 5x for every `..._REF_YARDS` (10yd) played backward, i.e. a
+// 20yd backward pass is priced ~5x the risk of a 10yd one, a 30yd ~25x, etc. Short resets up to
+// the free allowance carry no exponential demerit (the linear/short-reset curves still apply).
+// Gated default-ON in prod (`DD_SOCCER_ENABLE_BACKWARD_EXP_RISK`), neutral (0) in tests.
+const BACKWARD_EXP_RISK_FREE_YARDS: f64 = 6.0;
+const BACKWARD_EXP_RISK_REF_YARDS: f64 = 10.0;
+const BACKWARD_EXP_RISK_GROWTH_PER_REF: f64 = 5.0;
+const BACKWARD_EXP_RISK_SCALE: f64 = 0.30;
+const BACKWARD_EXP_RISK_CAP: f64 = 22.0;
+// Minimum legal pass distance. A sub-3yd pass neither escapes pressure nor progresses and is
+// almost always a needless touch that invites a turnover — it is made ILLEGAL (filtered out of
+// the pass-target ranking entirely) rather than merely down-weighted. Gated default-ON in prod
+// (`DD_SOCCER_ENABLE_MIN_PASS_DISTANCE`), inert in tests.
+const MIN_LEGAL_PASS_YARDS: f64 = 3.0;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
