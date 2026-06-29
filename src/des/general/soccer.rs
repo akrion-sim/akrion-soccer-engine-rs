@@ -602,6 +602,20 @@ const HOLDER_PRESS_MAX_DISTANCE_YARDS: f64 = 16.0;
 /// Tight standoff the presser closes to: within tackle/contest range, a half-step off
 /// so it is a contain-press that forces a decision, not a committed lunge.
 const HOLDER_PRESS_STANDOFF_YARDS: f64 = 1.8;
+/// Press-or-contain standoff endpoints (yd, goal-side of the carrier) the
+/// [`WorldSnapshot::press_or_contain_aggression_for`] MDP blends between. At full aggression the
+/// defender presses tight (the `_PRESS_` value); at zero it sits off and contains (the `_CONTAIN_`
+/// value), giving the carrier space in front rather than diving in. Two pairs: one for the
+/// fast-carrier box contest (kept tighter — a box threat must still be met), one for the general
+/// holder-press / advancing-carrier jockey across the rest of the pitch. Gated default-ON.
+const PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS: f64 = 0.3;
+const PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS: f64 = 2.6;
+const PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS: f64 = 0.8;
+const PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS: f64 = 5.0;
+/// Multiplicative jockey-gap scaling applied to the advancing-carrier step-up standoff: at full
+/// aggression the gap tightens to `_PRESS_SCALE`, at zero it widens to `_CONTAIN_SCALE` (back off).
+const PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE: f64 = 0.7;
+const PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE: f64 = 2.1;
 /// Press-cover hardening (gated `DD_SOCCER_ENABLE_PRESS_COVER`): how far goal-side of
 /// the carrier the single COVER defender tucks in behind the lone presser, so a beaten
 /// press meets immediate second pressure instead of a clean break.
