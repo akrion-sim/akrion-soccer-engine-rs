@@ -21791,6 +21791,76 @@ pub(crate) fn far_offball_conservation_factor(ball_distance_yards: f64) -> f64 {
     let t = ((ball_distance_yards - FAR_OFFBALL_CONSERVE_START_YARDS) / span).clamp(0.0, 1.0);
     1.0 - FAR_OFFBALL_CONSERVE_MAX_REDUCTION * smoothstep_unit(t)
 }
+/// True when a receiver moving at `nominal_speed_yps` would reach the reception point
+/// meaningfully BEFORE the ball does — i.e. they would overrun the spot if they kept going, so
+/// the ball arrives behind their run. Pure / testable. Returns false for a stationary/near-static
+/// ball or degenerate inputs (nothing to sync to).
+pub(crate) fn receive_in_stride_would_overrun(
+    distance_to_target_yards: f64,
+    nominal_speed_yps: f64,
+    ball_distance_to_target_yards: f64,
+    ball_speed_yps: f64,
+) -> bool {
+    if !(distance_to_target_yards.is_finite()
+        && nominal_speed_yps.is_finite()
+        && ball_distance_to_target_yards.is_finite()
+        && ball_speed_yps.is_finite())
+    {
+        return false;
+    }
+    if nominal_speed_yps <= 1e-3 || ball_speed_yps <= RECEIVE_IN_STRIDE_MIN_BALL_SPEED_YPS {
+        return false;
+    }
+    let ball_time = ball_distance_to_target_yards / ball_speed_yps;
+    if ball_time <= 1e-3 {
+        return false;
+    }
+    let self_time = distance_to_target_yards / nominal_speed_yps;
+    self_time < ball_time * RECEIVE_IN_STRIDE_EARLY_MARGIN
+}
+
+/// Speed multiplier for a free receiver settling to take an incoming ball IN STRIDE rather than
+/// overrunning it. `1.0` when the receiver is not early (would arrive with/after the ball); when
+/// early, the pace that lands them ~as the ball arrives (`distance / ball_time`), as a fraction of
+/// nominal, floored at [`RECEIVE_IN_STRIDE_MIN_FACTOR`] so they keep drifting onto the ball. Pure.
+pub(crate) fn receive_in_stride_speed_factor(
+    distance_to_target_yards: f64,
+    nominal_speed_yps: f64,
+    ball_distance_to_target_yards: f64,
+    ball_speed_yps: f64,
+) -> f64 {
+    if !receive_in_stride_would_overrun(
+        distance_to_target_yards,
+        nominal_speed_yps,
+        ball_distance_to_target_yards,
+        ball_speed_yps,
+    ) {
+        return 1.0;
+    }
+    let ball_time = ball_distance_to_target_yards / ball_speed_yps;
+    let required_speed = distance_to_target_yards / ball_time;
+    (required_speed / nominal_speed_yps).clamp(RECEIVE_IN_STRIDE_MIN_FACTOR, 1.0)
+}
+
+/// Receive-in-stride / anti-overrun: a FREE receiver who would reach the reception point well
+/// before the ball eases off (settles to a controlled pace) so the ball arrives in stride rather
+/// than running on behind them. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE=0`); default-OFF in tests for byte-identical movement.
+pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
+    }
+}
+
 /// Per-fully-wasted-sprint-tick penalty points, overridable via
 /// `DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS` for A/B tuning. Falls back to
 /// [`WASTED_ENERGY_PENALTY_POINTS`]; a non-finite/negative override is ignored.
