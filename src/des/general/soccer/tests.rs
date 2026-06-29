@@ -86993,7 +86993,9 @@ fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
         score(&hold, "protect-ball"),
         0.50,
         "hold-up must not damp shielding while waiting for support"
-=======
+    );
+}
+
 #[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
