@@ -18047,6 +18047,36 @@ fn analytic_press_aggression_presses_when_winnable_contains_when_beaten() {
     assert!(press > 0.75, "should press a winnable duel (got {press})");
     assert!(contain < 0.25, "should contain when likely beaten (got {contain})");
     assert!(press > contain);
+
+    // Correctness guard: a lone carrier driving at our goal with NO runner in behind must STILL
+    // be engaged (backing off there just concedes a shot). Maximal `exposed_behind` with zero
+    // `runner_in_behind` must NOT collapse aggression — the space-behind risk is gated by a runner.
+    let lone_carrier_near_goal = PressOrContainInputs {
+        proximity: 0.8,
+        set: 0.8,
+        goal_side: 1.0,
+        cover_behind: 0.0,
+        tackling: 0.6,
+        carrier_slowness: 0.5,
+        pace_disadvantage: 0.1,
+        runner_in_behind: 0.0,
+        forward_lane_danger: 0.0,
+        exposed_behind: 1.0,
+    };
+    let engage = analytic_press_aggression(&lone_carrier_near_goal);
+    assert!(
+        engage > 0.6,
+        "a lone carrier at our goal with no runner behind must still be engaged (got {engage})"
+    );
+    // Adding a runner in behind (a real reason to hold off) must lower aggression.
+    let with_runner = PressOrContainInputs {
+        runner_in_behind: 1.0,
+        ..lone_carrier_near_goal
+    };
+    assert!(
+        analytic_press_aggression(&with_runner) < engage,
+        "a runner in the space behind should pull the decision toward contain"
+    );
 }
 
 #[test]
