@@ -14366,6 +14366,29 @@ impl SoccerMatch {
             * movement_decisiveness(self.players[player_id].decision_confidence)
             * far_offball_factor
             * side_glance_speed_factor;
+        // Receive in stride (anti-overrun): the named receiver of an incoming ground ball who is
+        // collecting it FREE (`!sprint` ⇒ the reception election deemed it uncontested/unpressured;
+        // a contested or pressured reception keeps `sprint` set and must still attack the ball)
+        // eases to a pace that lands them ~with the ball instead of sprinting through the spot so
+        // the ball runs on behind them. Gated default-ON; factor is 1.0 (byte-identical) when off,
+        // when sprinting, or when the receiver is not actually early. See
+        // `receive_in_stride_speed_factor`.
+        let speed = if dd_soccer_enable_receive_in_stride()
+            && incoming_pass
+            && !sprint
+            && self.ball.holder.is_none()
+            && self.players[player_id].controller_slot.is_none()
+        {
+            speed
+                * receive_in_stride_speed_factor(
+                    to_target_len,
+                    speed,
+                    self.ball.position.distance(target),
+                    self.ball.velocity.len(),
+                )
+        } else {
+            speed
+        };
         // MPC execution + MDP↔MPC reconciliation layer. For the active subset
         // (carrier + nearby contesters) a short-horizon point-mass MPC plans a
         // dynamically-feasible movement; depending on config it either refines the
