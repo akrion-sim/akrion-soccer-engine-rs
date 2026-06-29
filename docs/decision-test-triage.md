@@ -23,7 +23,7 @@ owning commit before editing.
 
 | Test | Delta | Why it smells like a bug |
 |---|---|---|
-| `fatigue_accumulates_from_repeated_sprints_and_recovers_at_rest` | `high_after_sprints > 0.0` is false (fatigue stayed `0`) | Fatigue **not accumulating at all** after repeated sprints is almost certainly broken plumbing, not an intended behavior change. Check whether a merge dropped the fatigue accumulation path. |
+| `fatigue_accumulates_from_repeated_sprints_and_recovers_at_rest` | `high_after_sprints > 0.0` is false (fatigue stayed `0`) | **Root-caused: NOT broken plumbing.** The fatigue math is correct (`MovementGait::fatigue_delta` → `Sprint = +0.0030·(1.55 − 0.80·cardio)·dt` ≈ +0.00225/s at elite stamina, applied via `add_fatigue` at `world.rs:14367`). The test sprints toward `(25, 220)` which **clamps to the pitch** (`y ≤ field_length = 120`); over its 48 × dt=1s steps the player arrives early and then `Stand`s, and standing recovery (`-0.020/s`) wipes the ~0.1 accumulated fatigue back to 0. **Fix is in the test fixture**: give a target inside the pitch / fewer steps so the player is still sprinting at the assert, or assert on peak fatigue rather than end-state. (Pre-existing even at the old `HEAD` 7fb6053 — a movement-calibration drift, not from any one recent merge.) |
 | `blocked_goal_pressure_preempts_recycling_with_single_killer_pass` | `got 0/120` — killer pass **never** chosen | The killer pass going from "chosen under blocked goal pressure" to "never" is a categorical loss of a finishing option. Likely the pass-risk-by-role work over-penalised it. Confirm it's intended; if not, it's a real attacking regression. |
 
 ---
