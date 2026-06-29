@@ -3703,7 +3703,7 @@ const SOCCER_FORMATION_LP_PRESS_DISTANCE_YARDS: f64 = 2.8;
 // Formation targets are tactical priors, not collision physics; refreshing them
 // every other tick keeps first-tick guidance immediate while avoiding needless
 // LP problem rebuilds at full 15Hz.
-const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 2;
+const SOCCER_FORMATION_LP_REFRESH_TICKS: u64 = 4; // dt=1/30 ×2 (was 2 @1/15)
 const SOCCER_FORMATION_LP_BALL_REFRESH_YARDS: f64 = 8.0;
 /// Iteration cap for the deterministic Bland's-rule simplex that solves the formation
 /// LP (see `SoccerFormationLpBrain::solve_exact_formation_lp`). Generous enough that the
