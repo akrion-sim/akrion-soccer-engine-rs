@@ -14582,6 +14582,7 @@ impl SoccerMatch {
             self.config.field_length_yards,
         );
         let half_dt2 = 0.5 * dt * dt;
+        let sixth_dt3 = dt * dt * dt / 6.0; // 3rd-order (jerk) term, matching predicted_ball_position
         let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
         let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
         let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
