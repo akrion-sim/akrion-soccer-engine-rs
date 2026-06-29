@@ -26257,18 +26257,15 @@ impl WorldSnapshot {
                 look_behind_scan_seconds: 0.0,
                 look_behind_confidence_bonus: 0.0,
                 look_behind_drift_risk: 0.0,
-<<<<<<< HEAD
                 blindside_steal_opportunity: 0.0,
                 blindside_steal_target: None,
                 blindside_threat_from_behind: 0.0,
                 blindside_scan_active: false,
                 blindside_scan_drift_risk: 0.0,
-=======
                 side_glance_scan_active: false,
                 side_glance_scan_rate_hz: 0.0,
                 side_glance_surprise_recognition: 0.0,
                 side_glance_control_cost: 0.0,
->>>>>>> origin/main
                 previous_tick_carryover: None,
                 scheduled_index: None,
                 ball_scheduled_index: None,
