@@ -3942,23 +3942,17 @@ const SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM: usize = 8;
 /// dribble runway, and speed edge. This gives MARL/MAPPO the same solo-goal vs hold-up
 /// evidence that the hand-authored action scorer uses.
 const SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM: usize = 4;
-const SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM: usize =
-<<<<<<< HEAD
     SOCCER_NEURAL_PRE_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM
         + SOCCER_NEURAL_SLIP_BREAK_OFFSIDE_TRAP_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
         + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM
-    + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
-=======
-    SOCCER_NEURAL_PRE_RECEPTION_APPROACH_FEATURE_DIM + SOCCER_NEURAL_RECEPTION_APPROACH_FEATURE_DIM;
+// Upstream's graph-temporal block is appended at the TAIL of akrion's chain (after the
+// solo-carrier block) so akrion's existing trained nets migrate by zero-padding the new tail.
 const SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM: usize =
-    SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
-        + SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM;
+    SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
->>>>>>> upstream/main
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
