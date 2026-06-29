@@ -55825,6 +55825,34 @@ const DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES: f64 = 10.0;
 const DISCRETIZED_KICK_CURVE_MIN_DISTANCE_YARDS: f64 = 10.0;
 const DISCRETIZED_KICK_CURVE_MIN_SPEED_MPH: f64 = 18.0;
 
+// Speed envelope (mph) the 10 discrete power buckets span for passes — bracketing all
+// pass speeds (ground floor 3 → aerial ceiling + overshoot) so a heuristic pass speed
+// always encodes to an in-range bucket. Used to quantize a continuous pass speed into a
+// `DiscretizedKickAction` (`discretized_kick_power_for_speed`) and lower it back. See
+// `docs/discretized-kick-action-plan.md`.
+const DISCRETIZED_KICK_PASS_MIN_SPEED_MPH: f64 = 3.0;
+const DISCRETIZED_KICK_PASS_MAX_SPEED_MPH: f64 =
+    AERIAL_PASS_CEILING_MPH + PASS_SPEED_CEILING_OVERSHOOT_MPH;
+
+/// Master gate for Phase 0 of the discretized kick action (roadmap Priority 1): route
+/// the heuristic pass release through the DISCRETE kick representation — quantize power +
+/// direction into buckets, then lower. Off (default) ⇒ the continuous heuristic release
+/// stands, byte-identical. On ⇒ a bounded (≤ ½-bucket) quantization; the plumbing later
+/// phases swap from heuristic-sourced buckets to learned-head buckets. Read once per
+/// process. See `docs/discretized-kick-action-plan.md`.
+pub fn dd_soccer_enable_discretized_kick() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_DISCRETIZED_KICK")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DISCRETIZED_KICK"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiscretizedKickCurve {
@@ -56002,6 +56030,17 @@ fn discretized_kick_power_for_bucket(speed_bucket: u8, dither: DiscretizedKickDi
     (center + dither.sanitized().speed_power_offset).clamp(0.0, 1.0)
 }
 
+/// Inverse of the lowering's `speed = min + (max-min)·power` mapping: the [0,1] power that
+/// encodes `speed_yps` within the `[min_yps, max_yps]` envelope, clamped so an
+/// out-of-envelope speed saturates to the end buckets rather than wrapping. Lets a
+/// continuous heuristic pass speed be quantized into a `DiscretizedKickAction`.
+fn discretized_kick_power_for_speed(speed_yps: f64, min_yps: f64, max_yps: f64) -> f64 {
+    if !speed_yps.is_finite() || !(max_yps > min_yps) {
+        return 0.0;
+    }
+    ((speed_yps - min_yps) / (max_yps - min_yps)).clamp(0.0, 1.0)
+}
+
 fn discretized_kick_direction_bucket_for_vector(direction: Vec2) -> u8 {
     let dir = direction.normalized();
     if dir.len() <= 1e-9 {
@@ -56135,6 +56174,56 @@ fn lower_discretized_kick_release(
     curve_bend_yards: f64,
     dither: DiscretizedKickDither,
 ) -> LoweredKickRelease {
+    lower_discretized_kick_release_bounded(
+        origin,
+        action,
+        min_speed_yps,
+        max_speed_yps,
+        reference_distance_yards,
+        curve_bend_yards,
+        dither,
+        None,
+    )
+}
+
+/// Pitch-clamped production lowering of a `DiscretizedKickAction` — the live analogue of
+/// `kick_release_clamped_to_pitch` for the discrete representation (the bare
+/// `lower_discretized_kick_release` does not clamp and is test/seed only).
+#[allow(clippy::too_many_arguments)]
+fn discretized_kick_release_clamped_to_pitch(
+    origin: Vec2,
+    action: DiscretizedKickAction,
+    min_speed_yps: f64,
+    max_speed_yps: f64,
+    reference_distance_yards: f64,
+    curve_bend_yards: f64,
+    dither: DiscretizedKickDither,
+    field_width_yards: f64,
+    field_length_yards: f64,
+) -> LoweredKickRelease {
+    lower_discretized_kick_release_bounded(
+        origin,
+        action,
+        min_speed_yps,
+        max_speed_yps,
+        reference_distance_yards,
+        curve_bend_yards,
+        dither,
+        Some((field_width_yards, field_length_yards)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_discretized_kick_release_bounded(
+    origin: Vec2,
+    action: DiscretizedKickAction,
+    min_speed_yps: f64,
+    max_speed_yps: f64,
+    reference_distance_yards: f64,
+    curve_bend_yards: f64,
+    dither: DiscretizedKickDither,
+    pitch_bounds: Option<(f64, f64)>,
+) -> LoweredKickRelease {
     let power = discretized_kick_power_for_bucket(action.speed_bucket, dither);
     let min_speed = if min_speed_yps.is_finite() {
         min_speed_yps.max(0.0)
@@ -56154,14 +56243,17 @@ fn lower_discretized_kick_release(
     };
     let direction = discretized_kick_direction_for_bucket(action.direction_bucket, dither);
     let curve = masked_discretized_kick_curve(action.curve, distance, speed_yps);
-    kick_release(KickReleaseSpec {
-        origin,
-        intended_target: origin + direction * distance,
-        speed_yps,
-        curve,
-        curve_bend_yards,
-        elevation: action.elevation,
-    })
+    kick_release_with_pitch_bounds(
+        KickReleaseSpec {
+            origin,
+            intended_target: origin + direction * distance,
+            speed_yps,
+            curve,
+            curve_bend_yards,
+            elevation: action.elevation,
+        },
+        pitch_bounds,
+    )
 }
 
 fn modulated_pass_speed_yps(
@@ -60462,6 +60554,60 @@ mod discretized_kick_scaffold_tests {
         assert!(release.launch_target.x < release.intended_target.x);
         assert_close(release.launch_target.y, origin.y + 30.0, 1e-9);
         assert_close(release.velocity.len(), release.speed_yps, 1e-9);
+    }
+
+    #[test]
+    fn discretized_pass_kick_round_trip_is_bounded() {
+        // Phase 0: a continuous heuristic (speed, direction) encoded into the discrete
+        // kick representation and lowered back is faithful to within HALF a bucket — the
+        // quantization the gated live path will introduce, before any learned head.
+        let min_yps = mph_to_yps(DISCRETIZED_KICK_PASS_MIN_SPEED_MPH);
+        let max_yps = mph_to_yps(DISCRETIZED_KICK_PASS_MAX_SPEED_MPH);
+        let origin = Vec2::new(20.0, 30.0);
+        let half_bucket_speed =
+            (max_yps - min_yps) / (2.0 * f64::from(DISCRETIZED_KICK_SPEED_BUCKETS));
+        let half_bucket_cos = (DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES * 0.5)
+            .to_radians()
+            .cos();
+        // (speed_yps, aim direction, pass distance) — all targets land well inside the pitch.
+        let cases = [
+            (mph_to_yps(22.0), Vec2::new(1.0, 0.3), 25.0),
+            (mph_to_yps(35.0), Vec2::new(-0.4, 1.0), 18.0),
+            (mph_to_yps(9.0), Vec2::new(0.2, -1.0), 12.0),
+        ];
+        for (speed, dir, distance) in cases {
+            let action = DiscretizedKickAction::from_power_direction(
+                discretized_kick_power_for_speed(speed, min_yps, max_yps),
+                dir,
+                DiscretizedKickCurve::None,
+                DiscretizedKickElevation::Floor,
+            );
+            let release = discretized_kick_release_clamped_to_pitch(
+                origin,
+                action,
+                min_yps,
+                max_yps,
+                distance,
+                0.0,
+                DiscretizedKickDither::none(),
+                DEFAULT_FIELD_WIDTH_YARDS,
+                DEFAULT_FIELD_LENGTH_YARDS,
+            );
+            assert!(
+                (release.speed_yps - speed).abs() <= half_bucket_speed + 1e-6,
+                "speed {speed} -> {} exceeds half a bucket ({half_bucket_speed})",
+                release.speed_yps
+            );
+            let cos = dir.normalized().dot(release.velocity.normalized());
+            assert!(
+                cos >= half_bucket_cos - 1e-9,
+                "direction off by more than half a bucket (cos {cos})"
+            );
+            assert!(
+                release.altitude_yards.abs() < 1e-9,
+                "floor elevation lowers to ground altitude"
+            );
+        }
     }
 
     #[test]
