@@ -7916,7 +7916,17 @@ impl SoccerMatch {
 
         let field_loop_started = Instant::now();
         let phase_started = Instant::now();
-        let field_schedule = self.agent_schedule_for_field_entities();
+        let mut field_schedule = self.agent_schedule_for_field_entities();
+        if dd_soccer_enable_fisher_yates_schedule() {
+            // Fisher-Yates: randomize the per-tick processing order of ALL field entities
+            // (22 players + officials + ball) so no agent has a systematic act-first advantage when
+            // contested events (possession, collisions, keep-out, shielding) resolve in schedule
+            // order. Uses the match RNG, so it stays deterministic for a fixed seed.
+            for i in (1..field_schedule.len()).rev() {
+                let j = ((self.rng.next_float() * ((i + 1) as f64)) as usize).min(i);
+                field_schedule.swap(i, j);
+            }
+        }
         self.last_agent_schedule = vec![AgentScheduleEntry {
             kind: AgentScheduleKind::CentralBrain,
             id: CENTRAL_BRAIN_AGENT_ID,
