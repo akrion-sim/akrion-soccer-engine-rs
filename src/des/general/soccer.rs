@@ -18350,6 +18350,26 @@ pub(crate) fn gate_default_on(name: &str) -> bool {
     }
 }
 
+/// Whether the **team upfield advance in possession** strategy is active this process. When a team
+/// is in controlled possession through a carrier who has space to advance into, the whole team
+/// pushes forward as a unit: off-ball runners make forward supporting runs, the back four steps up
+/// to stay compact behind the attack, and the MARL/MAPPO policy is rewarded for the coordinated
+/// territorial gain. Default-ON in production (env `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD=0/false`
+/// is the kill switch); default-OFF under test so the option-scoring parity suite stays
+/// byte-identical. See [`WorldSnapshot::team_advance_upfield_active`].
+pub(crate) fn team_advance_upfield_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD"))
+    }
+}
+
 /// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
 /// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
 /// carrier driving the flank in the opponent half. Unset (default) the strategy is never proposed,
