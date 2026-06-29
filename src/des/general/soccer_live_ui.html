@@ -4010,7 +4010,7 @@ function effectiveSimTicksPerPulse() {
 // wall-clock speed = ticksPerPulse * tempo. Clamped so we neither hammer the
 // server nor stall the loop.
 function currentStepIntervalMs() {
-  return clamp(LIVE_STEP_INTERVAL_MS / Math.max(0.05, playbackSpeed), MIN_STEP_GAP_MS, 4000);
+  return clamp(liveStepIntervalMs() / Math.max(0.05, playbackSpeed), MIN_STEP_GAP_MS, 4000);
 }
 function simSpeedLabel() {
   const configured = configuredSimTicksPerPulse();
