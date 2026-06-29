@@ -67870,7 +67870,6 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_RECEPTION_APPROACH_KINEMATIC_FIT + 1,
-<<<<<<< HEAD
         SOCCER_NEURAL_PRE_SURPRISE_BEHIND_STEAL_FEATURE_DIM
     );
     assert_eq!(
@@ -67883,16 +67882,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE + 1,
-=======
-        SOCCER_NEURAL_PRE_RELATIONAL_ATTENTION_FEATURE_DIM
-    );
-    assert_eq!(
-        SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY + 1,
         SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY + 1,
->>>>>>> upstream/main
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
