@@ -14643,13 +14643,15 @@ impl SoccerMatch {
             );
             let velocity = finite_vec2(self.ball.velocity, Vec2::zero());
             let acceleration = finite_vec2(self.ball.acceleration, Vec2::zero());
+            let jerk = finite_vec2(self.ball.jerk, Vec2::zero());
             let center = finite_pitch_point(
-                position + velocity * dt + acceleration * half_dt2,
+                position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
                 field_width,
                 field_length,
                 position,
             );
-            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 36.0);
+            let obstacle_velocity =
+                limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 36.0);
             let ball_weight = keepout_weight
                 * 0.15
                 * (1.0
