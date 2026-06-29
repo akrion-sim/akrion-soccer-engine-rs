@@ -21774,6 +21774,78 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
 }
+/// Exponentially-escalating risk demerit for a long backward pass (see
+/// [`backward_pass_exponential_risk_penalty`]). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_BACKWARD_EXP_RISK=0`); default-OFF in tests so the pass-ranking suite is
+/// byte-identical unless a test opts in.
+pub(crate) fn dd_soccer_enable_backward_exp_risk() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK"))
+    }
+}
+/// Make a sub-[`MIN_LEGAL_PASS_YARDS`] pass ILLEGAL — filtered out of the pass-target ranking
+/// entirely rather than merely down-weighted. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_MIN_PASS_DISTANCE=0`); default-OFF in tests for byte-identical ranking.
+pub(crate) fn dd_soccer_enable_min_pass_distance() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE"))
+    }
+}
+/// Receive-in-stride / anti-overrun: a FREE receiver who would reach the reception point well
+/// before the ball eases off (settles to a controlled pace) so the ball arrives in stride rather
+/// than running on behind them. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE=0`); default-OFF in tests for byte-identical movement.
+pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
+    }
+}
+/// Press-or-contain MDP: a defender (esp. a central defender) deciding whether to PRESS the
+/// ball-carrier to win it / cut a lane, or BACK OFF and contain (hold a goal-side gap, shepherd
+/// them away from danger) as a function of the likelihood of winning vs being beaten / a runner
+/// getting in behind. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_PRESS_OR_CONTAIN=0`);
+/// default-OFF in tests so the existing fixed-standoff behaviour is byte-identical.
+pub(crate) fn dd_soccer_enable_press_or_contain() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN"))
+    }
+}
 /// "Drive to the corner flag and cross" for a wide carrier. ON by default: a committed run at the
 /// byline corner (then a low cutback / high cross) instead of slowing 32-38yd out or cutting into
 /// central traffic. Set `DD_SOCCER_DISABLE_BYLINE_DRIVE_TO_CORNER=1` to restore the old
