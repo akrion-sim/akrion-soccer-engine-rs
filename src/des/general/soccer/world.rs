@@ -20868,11 +20868,15 @@ fn first_time_pass_field_feasibility_for_snapshot(
                 .clamp(0.0, 1.0)
         })
         .unwrap_or(0.0);
-    (target_fit * 0.58
+    let blocked_one_touch_lane = forward_support_context.visible_forward_pass_options == 0
+        && floor_pass_lane_score < 0.62;
+    let one_touch_lane_gate = if blocked_one_touch_lane { 0.58 } else { 1.0 };
+    ((target_fit * 0.58
         + forward_fit * 0.16
         + threaded_fit * 0.14
         + target_density * 0.04
         + first_touch_shape_prior.clamp(0.0, 1.0) * 0.12)
+        * one_touch_lane_gate)
         .clamp(0.0, 1.0)
 }
 
@@ -21773,6 +21777,15 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
+}
+
+/// Receiver check-run correction. ON by default: an unpressured named receiver who has already
+/// overrun the rolling pass path slows/checks toward the ball instead of sprinting farther past
+/// it. Set `DD_SOCCER_DISABLE_RECEIVER_CHECK_RUN=1` for A/B parity.
+fn dd_soccer_disable_receiver_check_run() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEIVER_CHECK_RUN").is_ok())
 }
 /// "Drive to the corner flag and cross" for a wide carrier. ON by default: a committed run at the
 /// byline corner (then a low cutback / high cross) instead of slowing 32-38yd out or cutting into
@@ -34791,9 +34804,35 @@ impl WorldSnapshot {
         // Attack the ball to WIN it: treat it as contested (and sprint) whenever a
         // defender is anywhere close to the reception, not just dead-level.
         let defender_can_contest = opponent_target_time <= receiver_target_time + 1.05;
-        let moving_pass_needs_attack =
-            self.ball.velocity.len() > 1.0 && receiver_target_time > 0.10;
-        let sprint = pass.receiver_urgency >= 0.30
+        let receiver_should_check_run = if dd_soccer_disable_receiver_check_run()
+            || aerial_plan.is_some()
+            || pressured_reception
+            || defender_can_contest
+            || bound_one_two_wall
+            || pass.off_target_yards > 1.25
+            || intended_target_confidence < 0.45
+        {
+            false
+        } else {
+            let ball_speed = self.ball.velocity.len();
+            if ball_speed <= 1.0 {
+                false
+            } else {
+                let ball_dir = self.ball.velocity * (1.0 / ball_speed);
+                let current_along = (current - self.ball.position).dot(ball_dir);
+                let target_along = (target - self.ball.position).dot(ball_dir);
+                let lane_end =
+                    self.ball.position + ball_dir * self.field_length.max(self.field_width);
+                let lane_lateral = segment_distance_to_point(self.ball.position, lane_end, current);
+                let receiver_velocity = self.player_velocity(me.id).unwrap_or(me.velocity);
+                let running_past_ball = receiver_velocity.dot(ball_dir) > 0.65;
+                current_along > target_along + 0.85 && lane_lateral <= 3.5 && running_past_ball
+            }
+        };
+        let moving_pass_needs_attack = self.ball.velocity.len() > 1.0
+            && receiver_target_time > 0.10
+            && !receiver_should_check_run;
+        let sprint = !receiver_should_check_run && (pass.receiver_urgency >= 0.30
             || intended_target_confidence >= 0.60
             || pass.off_target_yards > 0.75
             || distance_to_ball > 4.5
@@ -34802,7 +34841,7 @@ impl WorldSnapshot {
             || defender_can_contest
             || moving_pass_needs_attack
             || bound_one_two_wall
-            || aerial_plan.map(|p| p.sprint).unwrap_or(false);
+            || aerial_plan.map(|p| p.sprint).unwrap_or(false));
         Some((target, sprint))
     }
 

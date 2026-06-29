@@ -183,6 +183,10 @@ const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
 // contention. Deliberate threaded/killer balls (`require_reception_won == false`) are exempt —
 // their risk is priced in, not vetoed.
 const PASS_LANE_SAFE_PASS_OVERRISK_PENALTY: f64 = 14.0;
+const PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR: f64 = 0.34;
+const PASS_TURNOVER_SAFETY_RECEIPT_FLOOR: f64 = 0.50;
+const PASS_TURNOVER_SAFETY_DAMP: f64 = 0.74;
+const PASS_TURNOVER_SAFETY_FINAL_THIRD_FORWARD_DAMP: f64 = 0.56;
 // ---------------------------------------------------------------------------
 // Bayesian opponent-press belief (lightweight Beta-Bernoulli filter).
 // ---------------------------------------------------------------------------
@@ -54724,6 +54728,15 @@ fn dd_soccer_disable_learnable_pass_velocity() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_LEARNABLE_PASS_VELOCITY").is_ok())
 }
 
+/// Default-on POMDP pass-safety hardening: when the lane, endpoint, or MPC receipt model says a
+/// floor pass is likely a direct turnover, compress its policy-facing completion estimate so carry
+/// / hold / safer outlets can win. Set `DD_SOCCER_DISABLE_PASS_TURNOVER_SAFETY_HARDENING=1` for A/B.
+fn dd_soccer_disable_pass_turnover_safety_hardening() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PASS_TURNOVER_SAFETY_HARDENING").is_ok())
+}
+
 /// The power buckets the policy considers for a ground/driven pass, weakest→hardest. A
 /// weighted ball (low power) is easy to control but lingers in the lane (high interception
 /// risk); a driven ball (high power) threads a contested corridor but is harder to receive.
@@ -55056,6 +55069,17 @@ fn pass_target_quality_for_snapshot_inner(
         effective_pass_speed,
         anticipated_target,
     );
+    let direct_opponent_control_risk = if flight.is_aerial() {
+        0.0
+    } else {
+        snapshot.pass_point_direct_opponent_control_risk(
+            passer.team,
+            target_position,
+            passer_position,
+            anticipated_target,
+            effective_pass_speed,
+        )
+    };
     let position_confidence = snapshot
         .player_position_confidence_for_point(passer.id, target_position)
         .unwrap_or(0.0);
@@ -55224,6 +55248,39 @@ fn pass_target_quality_for_snapshot_inner(
                 }
             }
         }
+    }
+    if !dd_soccer_disable_pass_turnover_safety_hardening() && !flight.is_aerial() {
+        let yards_to_goal =
+            (passer.team.goal_y(snapshot.field_length) - anticipated_target.y).abs();
+        let forward_floor = target_forward > 1.25;
+        let final_third_forward = forward_floor && yards_to_goal <= snapshot.field_length / 3.0;
+        let lane_risk_floor = if final_third_forward {
+            0.74
+        } else if forward_floor {
+            0.64
+        } else {
+            0.54
+        };
+        let lane_gift_risk = ((lane_interception_risk - lane_risk_floor)
+            / (1.0 - lane_risk_floor).max(1e-6))
+        .clamp(0.0, 1.0);
+        let direct_gift_risk =
+            ((direct_opponent_control_risk - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR)
+                / (1.0 - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR).max(1e-6))
+            .clamp(0.0, 1.0);
+        let path_gift_risk = lane_gift_risk.max(direct_gift_risk);
+        let receipt_gift_risk = ((PASS_TURNOVER_SAFETY_RECEIPT_FLOOR - mpc_receipt.probability)
+            / PASS_TURNOVER_SAFETY_RECEIPT_FLOOR.max(1e-6))
+            .clamp(0.0, 1.0)
+            * path_gift_risk
+            * 0.72;
+        let gift_risk = path_gift_risk.max(receipt_gift_risk);
+        let damp = if final_third_forward {
+            PASS_TURNOVER_SAFETY_FINAL_THIRD_FORWARD_DAMP
+        } else {
+            PASS_TURNOVER_SAFETY_DAMP
+        };
+        expected_completion *= (1.0 - gift_risk * damp).clamp(0.20, 1.0);
     }
     PassTargetQuality {
         receiver_openness,
@@ -60002,6 +60059,12 @@ fn open_support_outlet_fit(observation: &SoccerPomdpObservation) -> f64 {
 /// Multiplier (<=1) that discourages dribbling straight into an opponent: 2yd is
 /// the open-play buffer and 3yd applies in the carrier's own half. The penalty is
 /// soft, lighter near goal, and relieved when the nearest opponent is moving away.
+fn dd_soccer_disable_dribble_turnover_safety_hardening() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_DRIBBLE_TURNOVER_SAFETY_HARDENING").is_ok())
+}
+
 fn dribble_into_opponent_penalty(
     forward_dribble_space_yards: f64,
     yards_to_goal: f64,
@@ -60025,7 +60088,19 @@ fn dribble_into_opponent_penalty(
     } else {
         0.70
     };
-    (1.0 - closeness * penalty_strength).clamp(0.30, 1.0)
+    let base = (1.0 - closeness * penalty_strength).clamp(0.30, 1.0);
+    if dd_soccer_disable_dribble_turnover_safety_hardening() {
+        return base;
+    }
+    let turnover_safety_strength = if yards_to_goal <= FINAL_THIRD_ATTACK_YARDS_TO_GOAL {
+        0.10
+    } else if own_half {
+        0.20
+    } else {
+        0.16
+    };
+    let safety_gate = (1.0 - closeness * turnover_safety_strength).clamp(0.76, 1.0);
+    (base * safety_gate).clamp(0.24, 1.0)
 }
 
 fn pressure_release_signal(observation: &SoccerPomdpObservation) -> f64 {
