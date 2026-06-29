@@ -32,6 +32,11 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
 const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.10;
 const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.65;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
+const DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE: f64 = 0.42;
+const DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN: f64 = 0.06;
+const DEFENSIVE_PRESS_CONTAIN_PASS_LANE_RADIUS_YARDS: f64 = 6.0;
+const DEFENSIVE_PRESS_CONTAIN_RUNNER_HORIZON_SECONDS: f64 = 2.0;
+const DEFENSIVE_PRESS_CONTAIN_RUNNER_THREAT_BAND_YARDS: f64 = 18.0;
 const OWN_HALF_TINY_PASS_MAX_YARDS: f64 = 3.0;
 const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
@@ -13109,6 +13114,22 @@ impl SoccerMatch {
                     };
                     let release_target = release.intended_target;
                     let release_distance = player_pos.distance(release_target);
+                    let target_current_distance = target_id
+                        .and_then(|target| snapshot.player_position(target))
+                        .map(|target_position| player_pos.distance(target_position))
+                        .unwrap_or(release_distance);
+                    if pass_distance_is_illegal_short(release_distance)
+                        || pass_distance_is_illegal_short(target_current_distance)
+                    {
+                        let look = release_target - player_pos;
+                        if look.len() > 1e-6 {
+                            let face = facing_bucket_from_vector(look);
+                            if face != FacingBucket::Unknown {
+                                self.players[player_id].action_facing = face;
+                            }
+                        }
+                        return;
+                    }
                     let launch_target = release.launch_target;
                     let resolved_facing = facing_bucket_from_vector(launch_target - player_pos);
                     if resolved_facing != FacingBucket::Unknown {
@@ -20472,6 +20493,14 @@ pub(crate) struct SupportSpecialTargets {
     pub(crate) flank_cross_arrival: Option<Vec2>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DefensivePressContainProfile {
+    pub(crate) press_score: f64,
+    pub(crate) contain_risk: f64,
+    pub(crate) target: Option<Vec2>,
+    pub(crate) primary_presser: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SupportActionContext {
     pub(crate) options: Vec<AgentActionOptionTrace>,
@@ -20899,11 +20928,15 @@ fn first_time_pass_field_feasibility_for_snapshot(
                 .clamp(0.0, 1.0)
         })
         .unwrap_or(0.0);
-    (target_fit * 0.58
+    let blocked_one_touch_lane = forward_support_context.visible_forward_pass_options == 0
+        && floor_pass_lane_score < 0.62;
+    let one_touch_lane_gate = if blocked_one_touch_lane { 0.58 } else { 1.0 };
+    ((target_fit * 0.58
         + forward_fit * 0.16
         + threaded_fit * 0.14
         + target_density * 0.04
         + first_touch_shape_prior.clamp(0.0, 1.0) * 0.12)
+        * one_touch_lane_gate)
         .clamp(0.0, 1.0)
 }
 
@@ -21832,6 +21865,25 @@ pub(crate) fn receive_in_stride_speed_factor(
     (required_speed / nominal_speed_yps).clamp(RECEIVE_IN_STRIDE_MIN_FACTOR, 1.0)
 }
 
+/// Receive-in-stride / anti-overrun: a FREE receiver who would reach the reception point well
+/// before the ball eases off (settles to a controlled pace) so the ball arrives in stride rather
+/// than running on behind them. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE=0`); default-OFF in tests for byte-identical movement.
+pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
+    }
+}
+
 /// Per-fully-wasted-sprint-tick penalty points, overridable via
 /// `DD_SOCCER_WASTED_ENERGY_PENALTY_POINTS` for A/B tuning. Falls back to
 /// [`WASTED_ENERGY_PENALTY_POINTS`]; a non-finite/negative override is ignored.
@@ -21856,77 +21908,14 @@ fn dd_soccer_disable_reception_urgency() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEPTION_URGENCY").is_ok())
 }
-/// Exponentially-escalating risk demerit for a long backward pass (see
-/// [`backward_pass_exponential_risk_penalty`]). Default-ON in prod (kill switch
-/// `DD_SOCCER_ENABLE_BACKWARD_EXP_RISK=0`); default-OFF in tests so the pass-ranking suite is
-/// byte-identical unless a test opts in.
-pub(crate) fn dd_soccer_enable_backward_exp_risk() -> bool {
-    #[cfg(test)]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK").is_ok())
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACKWARD_EXP_RISK"))
-    }
-}
-/// Make a sub-[`MIN_LEGAL_PASS_YARDS`] pass ILLEGAL — filtered out of the pass-target ranking
-/// entirely rather than merely down-weighted. Default-ON in prod (kill switch
-/// `DD_SOCCER_ENABLE_MIN_PASS_DISTANCE=0`); default-OFF in tests for byte-identical ranking.
-pub(crate) fn dd_soccer_enable_min_pass_distance() -> bool {
-    #[cfg(test)]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE").is_ok())
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MIN_PASS_DISTANCE"))
-    }
-}
-/// Receive-in-stride / anti-overrun: a FREE receiver who would reach the reception point well
-/// before the ball eases off (settles to a controlled pace) so the ball arrives in stride rather
-/// than running on behind them. Default-ON in prod (kill switch
-/// `DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE=0`); default-OFF in tests for byte-identical movement.
-pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
-    #[cfg(test)]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
-    }
-}
-/// Press-or-contain MDP: a defender (esp. a central defender) deciding whether to PRESS the
-/// ball-carrier to win it / cut a lane, or BACK OFF and contain (hold a goal-side gap, shepherd
-/// them away from danger) as a function of the likelihood of winning vs being beaten / a runner
-/// getting in behind. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_PRESS_OR_CONTAIN=0`);
-/// default-OFF in tests so the existing fixed-standoff behaviour is byte-identical.
-pub(crate) fn dd_soccer_enable_press_or_contain() -> bool {
-    #[cfg(test)]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN").is_ok())
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PRESS_OR_CONTAIN"))
-    }
+
+/// Receiver check-run correction. ON by default: an unpressured named receiver who has already
+/// overrun the rolling pass path slows/checks toward the ball instead of sprinting farther past
+/// it. Set `DD_SOCCER_DISABLE_RECEIVER_CHECK_RUN=1` for A/B parity.
+fn dd_soccer_disable_receiver_check_run() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_RECEIVER_CHECK_RUN").is_ok())
 }
 /// "Drive to the corner flag and cross" for a wide carrier. ON by default: a committed run at the
 /// byline corner (then a low cutback / high cross) instead of slowing 32-38yd out or cutting into
@@ -23930,13 +23919,29 @@ impl WorldSnapshot {
             return false;
         }
         // The ball to an opponent's FEET is always a concession (no perception gate). A marked
-        // man is only a vetoable concession if the passer actually perceives the marker.
-        let nearest = self.nearest_opponent_distance_at(passer.team, reception);
+        // man is only a vetoable concession if the passer actually perceives that marker, not just
+        // the receiver/reception point ahead of him.
+        let Some((_, opponent_position, nearest)) = self.nearest_opponent_at(passer.team, reception)
+        else {
+            return false;
+        };
         if nearest <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS {
             return true;
         }
+        if let Some(facing) = self.player_facing_direction(passer) {
+            let to_marker = opponent_position - passer_position;
+            if to_marker.len() > 1e-6 && facing.len() > 1e-6 {
+                let marker_angle = angle_between_vectors_degrees(facing, to_marker);
+                if marker_angle > ball_holder_shoulder_scan_limit_degrees()
+                    && ball_holder_head_scan_delay_seconds(marker_angle, passer.skills.vision)
+                        > self.ball_holder_possession_seconds.max(0.0)
+                {
+                    return false;
+                }
+            }
+        }
         let perceived = self
-            .player_position_confidence_for_point(passer_id, reception)
+            .player_position_confidence_for_point(passer_id, opponent_position)
             .unwrap_or(1.0);
         perceived >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE
     }
@@ -25417,92 +25422,264 @@ impl WorldSnapshot {
             return None;
         }
         // Meet the ball a touch on the goal side so we arrive at it rather than
-        // ball-watch, but step level enough to actually contest. The press-or-contain MDP shades
-        // the standoff: press tighter when we can win it, sit off (give space, jockey) when we'd
-        // likely be beaten or would release a runner in behind. Gated default-ON; the fixed
-        // standoff is used (byte-identical) when off.
+        // ball-watch, but step level enough to actually contest.
         let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
         let goal_side = (own_goal - carrier_position).normalized();
-        let standoff = match self.press_or_contain_aggression_for(me) {
-            Some(aggression) => press_or_contain_standoff_yards(
-                PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS,
-                PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS,
-                aggression,
-            ),
-            None => CONTAIN_ENGAGE_GOAL_SIDE_YARDS,
-        };
         Some(
-            (carrier_position + goal_side * standoff)
+            (carrier_position + goal_side * CONTAIN_ENGAGE_GOAL_SIDE_YARDS)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
     }
 
-    /// The single nearest defender steps up to PRESS an opponent ball-holder, closing to
-    /// a tight standoff rather than sitting off in containment. Unlike
-    /// [`Self::fast_carrier_engage_target_for`] (which contests a fast carrier bearing
-    /// down on our box), this applies real pressure on the ball anywhere on the pitch, so
-    /// a holder is never left to dwell unpressured — and a pressed holder is pushed to
-    /// release or drive sooner. Only the closest outfielder presses; the rest hold shape.
-    fn holder_press_target_for(&self, me: &PlayerSnapshot) -> Option<Vec2> {
-        if me.role == PlayerRole::Goalkeeper {
-            return None;
+    pub(crate) fn defensive_press_contain_profile_for(
+        &self,
+        player_id: usize,
+    ) -> DefensivePressContainProfile {
+        let Some(me) = self.players.iter().find(|player| player.id == player_id) else {
+            return DefensivePressContainProfile::default();
+        };
+        if me.role == PlayerRole::Goalkeeper || self.controlled_possession_team() == Some(me.team)
+        {
+            return DefensivePressContainProfile::default();
         }
-        let holder_id = self.ball.holder?;
-        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        let Some(holder_id) = self.ball.holder else {
+            return DefensivePressContainProfile::default();
+        };
+        let Some(holder) = self.players.iter().find(|player| player.id == holder_id) else {
+            return DefensivePressContainProfile::default();
+        };
         if holder.team == me.team {
-            return None;
+            return DefensivePressContainProfile::default();
         }
-        let holder_position = self.player_snapshot_position(holder);
-        // In our own defensive third, the retreat / containment / fast-carrier-contest
-        // logic governs (pressing out there risks being played through for a back-line
-        // break). This press fills the MIDFIELD / opponent-half gap, where a holder was
-        // previously left to dwell unpressured.
-        let own_goal_y = self.own_goal_y_for(me.team);
-        if (holder_position.y - own_goal_y).abs() <= self.field_length / 3.0 {
-            return None;
-        }
-        // Defer to the retreat logic whenever the carrier is genuinely threatening our
-        // back line (even just outside the third) — pressing out then invites a break.
-        if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
-            return None;
-        }
-        let my_position = self.player_snapshot_position(me);
-        // Press only when already within reach — don't drag a lone presser out of the
-        // block from distance (the line behind stays compact).
-        if my_position.distance(holder_position) > HOLDER_PRESS_MAX_DISTANCE_YARDS {
-            return None;
-        }
-        // Only the single closest outfielder presses; the rest keep their shape.
+
+        let carrier = self.player_snapshot_position(holder);
+        let me_pos = self.player_snapshot_position(me);
+        let distance = me_pos.distance(carrier);
         let closest = self
             .players
             .iter()
             .filter(|player| player.team == me.team && player.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                self.lane_biased_player_target_score(a, holder_position, 1.10)
-                    .total_cmp(&self.lane_biased_player_target_score(b, holder_position, 1.10))
+                let a_role_fit = if a.role == PlayerRole::Defender && !self.is_wide_defender(a) {
+                    0.86
+                } else if a.role == PlayerRole::Defender {
+                    0.95
+                } else if a.role == PlayerRole::Midfielder {
+                    1.02
+                } else {
+                    1.15
+                };
+                let b_role_fit = if b.role == PlayerRole::Defender && !self.is_wide_defender(b) {
+                    0.86
+                } else if b.role == PlayerRole::Defender {
+                    0.95
+                } else if b.role == PlayerRole::Midfielder {
+                    1.02
+                } else {
+                    1.15
+                };
+                (self.lane_biased_player_target_score(a, carrier, 1.10) * a_role_fit)
+                    .total_cmp(
+                        &(self.lane_biased_player_target_score(b, carrier, 1.10) * b_role_fit),
+                    )
                     .then(a.id.cmp(&b.id))
-            })?;
-        if closest.id != me.id {
-            return None;
-        }
-        // Close to a tight standoff on the goal side: within contest range, a half-step
-        // off so it forces the holder to act rather than committing to a lunge. The
-        // press-or-contain MDP shades the standoff (press tight to win / cut a lane, or sit off
-        // and contain when a press would likely be beaten). Gated default-ON; fixed standoff off.
-        let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
-        let goal_side = (own_goal - holder_position).normalized();
-        let standoff = match self.press_or_contain_aggression_for(me) {
-            Some(aggression) => press_or_contain_standoff_yards(
-                PRESS_OR_CONTAIN_HOLDER_PRESS_YARDS,
-                PRESS_OR_CONTAIN_HOLDER_CONTAIN_YARDS,
-                aggression,
-            ),
-            None => HOLDER_PRESS_STANDOFF_YARDS,
+            });
+        let primary_presser = closest.is_some_and(|player| player.id == me.id);
+
+        let holder_velocity = self.player_velocity(holder_id).unwrap_or(holder.velocity);
+        let carrier_goalward_speed = (holder_velocity.y * holder.team.attack_dir()).max(0.0);
+        let defender_speed = (player_top_speed_yps(me.role, &me.skills)
+            * (1.0 - me.fatigue.clamp(0.0, 1.0) * 0.18)
+            * (0.84 + ability01(me.skills.acceleration) * 0.16))
+        .max(0.85);
+        let own_goal_y = self.own_goal_y_for(me.team);
+        let own_goal = Vec2::new(self.field_width * 0.5, own_goal_y);
+        let own_half_depth = (self.field_length * 0.5).max(1.0);
+        let carrier_goal_distance = (carrier.y - own_goal_y).abs();
+        let goal_threat = (1.0 - carrier_goal_distance / own_half_depth).clamp(0.0, 1.0);
+        let distance_fit =
+            (1.0 - (distance - 1.2) / (HOLDER_PRESS_MAX_DISTANCE_YARDS - 1.2).max(1.0))
+                .clamp(0.0, 1.0);
+        let defending_skill = ability01(me.skills.defending) * 0.56
+            + ability01(me.skills.defensive_tracking) * 0.24
+            + ability01(me.skills.aggression) * 0.20;
+        let carrier_security = ability01(holder.skills.dribbling) * 0.48
+            + ability01(holder.skills.first_touch) * 0.22
+            + ability01(holder.skills.acceleration) * 0.18
+            + ability01(holder.skills.strength) * 0.12;
+        let fatigue_edge = (holder.fatigue.clamp(0.0, 1.0) - me.fatigue.clamp(0.0, 1.0))
+            .clamp(-1.0, 1.0);
+        let ball_win = (distance_fit * 0.46
+            + defending_skill * 0.34
+            + fatigue_edge.max(0.0) * 0.14
+            - carrier_security * 0.18)
+            .clamp(0.0, 1.0);
+        let delay_value =
+            ((carrier_goalward_speed / 7.0).clamp(0.0, 1.0) * 0.46 + goal_threat * 0.54)
+                .clamp(0.0, 1.0);
+        let central_lane = (1.0
+            - (carrier.x - self.field_width * 0.5).abs()
+                / (self.field_width * 0.24).max(1.0))
+        .clamp(0.0, 1.0);
+        let (channel_pressure, _, _) = self.defensive_carrier_channel_profile_for(me.team);
+        let redirect_value = (central_lane * 0.62 + channel_pressure * 0.38).clamp(0.0, 1.0);
+        let pass_lane_cut = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == holder.team
+                    && player.id != holder_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|receiver| {
+                let receiver_pos = self.player_snapshot_position(receiver);
+                let forward_yards = (receiver_pos.y - carrier.y) * holder.team.attack_dir();
+                if forward_yards <= 2.0 {
+                    return 0.0;
+                }
+                let lane_gap = segment_distance_to_point(carrier, receiver_pos, me_pos);
+                let lane_fit =
+                    (1.0 - lane_gap / DEFENSIVE_PRESS_CONTAIN_PASS_LANE_RADIUS_YARDS)
+                        .clamp(0.0, 1.0);
+                let goal_value = (1.0
+                    - (holder.team.goal_y(self.field_length) - receiver_pos.y).abs()
+                        / own_half_depth)
+                    .clamp(0.0, 1.0);
+                let forward_fit = (forward_yards / 28.0).clamp(0.0, 1.0);
+                lane_fit * (goal_value * 0.42 + forward_fit * 0.38 + 0.20)
+            })
+            .fold(0.0, f64::max);
+
+        let cover_count = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == me.team
+                    && player.id != me.id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .filter(|player| {
+                let position = self.player_snapshot_position(player);
+                (position.y - carrier.y) * me.team.attack_dir() < -0.5
+                    && position.distance(carrier) <= CARRIER_COVER_RADIUS_YARDS
+            })
+            .count();
+        let cover_fit = (cover_count as f64 / 2.0).clamp(0.0, 1.0);
+        let speed_edge = ((carrier_goalward_speed - defender_speed * 0.72) / 4.5).clamp(0.0, 1.0);
+        let dribble_past_risk = (speed_edge * 0.42
+            + (1.0 - distance_fit) * 0.22
+            + goal_threat * 0.20
+            + (1.0 - cover_fit) * 0.22)
+            .clamp(0.0, 1.0);
+        let in_behind_risk = self
+            .second_last_defender_line_for(holder.team)
+            .map(|line_y| {
+                self.players
+                    .iter()
+                    .filter(|player| {
+                        player.team == holder.team
+                            && player.id != holder_id
+                            && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    })
+                    .map(|runner| {
+                        let runner_pos = self.player_snapshot_position(runner);
+                        let runner_velocity = self.player_velocity(runner.id).unwrap_or(runner.velocity);
+                        let forward_speed = (runner_velocity.y * holder.team.attack_dir()).max(0.0);
+                        if forward_speed <= 1.2 {
+                            return 0.0;
+                        }
+                        let projected = runner_pos
+                            + runner_velocity * DEFENSIVE_PRESS_CONTAIN_RUNNER_HORIZON_SECONDS;
+                        let current_gap = (line_y - runner_pos.y) * holder.team.attack_dir();
+                        let projected_break = (projected.y - line_y) * holder.team.attack_dir();
+                        let timing_fit = (1.0
+                            - current_gap.abs() / DEFENSIVE_PRESS_CONTAIN_RUNNER_THREAT_BAND_YARDS)
+                            .clamp(0.0, 1.0);
+                        let break_fit = (projected_break / 9.0).clamp(0.0, 1.0);
+                        let lane_responsibility =
+                            (1.0 - (runner_pos.x - me_pos.x).abs() / 18.0).clamp(0.0, 1.0);
+                        let goal_value = (1.0
+                            - (holder.team.goal_y(self.field_length) - runner_pos.y).abs()
+                                / own_half_depth)
+                            .clamp(0.0, 1.0);
+                        (forward_speed / 7.0).clamp(0.0, 1.0)
+                            * (timing_fit * 0.32 + break_fit * 0.34 + goal_value * 0.22)
+                            * (0.45 + lane_responsibility * 0.55)
+                    })
+                    .fold(0.0, f64::max)
+            })
+            .unwrap_or(0.0);
+        let central_defender = me.role == PlayerRole::Defender && !self.is_wide_defender(me);
+        let role_press_weight = match me.role {
+            PlayerRole::Defender if central_defender => 1.18,
+            PlayerRole::Defender => 1.02,
+            PlayerRole::Midfielder => 0.95,
+            PlayerRole::Forward => 0.70,
+            PlayerRole::Goalkeeper => 0.0,
         };
-        Some(
-            (holder_position + goal_side * standoff)
-                .clamp_to_pitch(self.field_width, self.field_length),
-        )
+        let primary_weight = if primary_presser { 1.0 } else { 0.42 };
+        let press_score = ((ball_win * 0.34
+            + delay_value * 0.22
+            + redirect_value * 0.20
+            + pass_lane_cut * 0.24)
+            * role_press_weight
+            * primary_weight)
+            .clamp(0.0, 1.0);
+        let contain_risk = (dribble_past_risk * 0.52
+            + in_behind_risk * 0.36
+            + (1.0 - cover_fit) * goal_threat * 0.12
+            + if central_defender {
+                in_behind_risk * 0.08
+            } else {
+                0.0
+            })
+        .clamp(0.0, 1.0);
+        let press_decision = primary_presser
+            && distance <= HOLDER_PRESS_MAX_DISTANCE_YARDS
+            && press_score >= DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE
+            && press_score + self.own_goal_press_urgency(me.team, carrier) * 0.10
+                >= contain_risk + DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN;
+        let target = if press_decision {
+            let to_own_goal = own_goal - carrier;
+            let goal_side = if to_own_goal.len() > 1e-6 {
+                to_own_goal.normalized()
+            } else {
+                Vec2::new(0.0, -holder.team.attack_dir())
+            };
+            let lateral_sign = if carrier.x <= self.field_width * 0.5 {
+                -1.0
+            } else {
+                1.0
+            };
+            let redirect_block = Vec2::new(lateral_sign, 0.0) * redirect_value * 0.95;
+            let standoff = HOLDER_PRESS_STANDOFF_YARDS
+                + (CARRIER_ADVANCE_JOCKEY_YARDS - HOLDER_PRESS_STANDOFF_YARDS)
+                    * contain_risk
+                    * 0.55;
+            Some((carrier + goal_side * standoff + redirect_block).clamp_to_pitch(
+                self.field_width,
+                self.field_length,
+            ))
+        } else {
+            None
+        };
+        DefensivePressContainProfile {
+            press_score,
+            contain_risk,
+            target,
+            primary_presser,
+        }
+    }
+
+    /// The designated defender steps up to PRESS an opponent ball-holder only when
+    /// the POMDP press value beats the contain/back-off risk. Unlike
+    /// [`Self::fast_carrier_engage_target_for`] (which contests a fast carrier bearing
+    /// down on our box), this evaluates pressure anywhere on the pitch: win/slow,
+    /// redirect, and lane-cut value can trigger the close, while dribble-past or
+    /// runner-in-behind risk withholds it. Only the primary outfielder can receive a
+    /// press target; the rest hold shape or cover.
+    fn holder_press_target_for(&self, me: &PlayerSnapshot) -> Option<Vec2> {
+        self.defensive_press_contain_profile_for(me.id).target
     }
 
     /// Defensive mirror of the offside-trap-breaking run: when an opponent attacker is
@@ -26071,24 +26248,6 @@ impl WorldSnapshot {
             channel_stepup_fraction
         } else {
             close_stepup_fraction
-        };
-        // Press-or-contain MDP: when the duel favours winning the ball, tighten the jockey gap and
-        // step up further (press); when a press would likely be beaten or release a runner in
-        // behind, widen the gap and hold off (contain — give the carrier space in front rather
-        // than diving in). Gated default-ON; byte-identical (unscaled) when off.
-        let (standoff_yards, stepup_fraction) = match self.press_or_contain_aggression_for(me) {
-            Some(aggression) => {
-                let scale = press_or_contain_standoff_yards(
-                    PRESS_OR_CONTAIN_JOCKEY_PRESS_SCALE,
-                    PRESS_OR_CONTAIN_JOCKEY_CONTAIN_SCALE,
-                    aggression,
-                );
-                (
-                    standoff_yards * scale,
-                    stepup_fraction * (0.55 + 0.45 * aggression),
-                )
-            }
-            None => (standoff_yards, stepup_fraction),
         };
         // Press to jockeying distance (edge of tackle range), not onto the ball.
         let channel_block = if channel_stepup && channel_side.abs() > 0.0 {
@@ -27050,6 +27209,8 @@ impl WorldSnapshot {
                 defensive_cross_arrival_threat_fit: 0.0,
                 goalkeeper_ball_goal_line_alignment_score: 0.0,
                 defensive_line_break_threat: 0.0,
+                defensive_press_action_score: 0.0,
+                defensive_contain_risk_score: 0.0,
                 defensive_carrier_channel_pressure: 0.0,
                 defensive_carrier_channel_side: 0.0,
                 defensive_carrier_channel_cover_count: 0,
@@ -27719,6 +27880,7 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let defensive_press_contain = self.defensive_press_contain_profile_for(player_id);
         let (
             defensive_carrier_channel_pressure,
             defensive_carrier_channel_side,
@@ -28259,6 +28421,11 @@ impl WorldSnapshot {
         // must spark recovery urgency even off the ball, while staying bounded as a lift.
         let defensive_urgency = (base_defensive_urgency
             + field_numbers.defensive_numbers_urgency * defensive_role_urgency * 0.40)
+            .max(
+                (defensive_press_contain.press_score * 0.54
+                    + defensive_press_contain.contain_risk * 0.28)
+                    * defensive_role_urgency,
+            )
             .clamp(0.0, 1.0);
         let pressure_urgency = if has_ball {
             (perceived_pressure * 0.58
@@ -28560,6 +28727,8 @@ impl WorldSnapshot {
             defensive_cross_arrival_threat_fit,
             goalkeeper_ball_goal_line_alignment_score,
             defensive_line_break_threat,
+            defensive_press_action_score: defensive_press_contain.press_score,
+            defensive_contain_risk_score: defensive_press_contain.contain_risk,
             defensive_carrier_channel_pressure,
             defensive_carrier_channel_side,
             defensive_carrier_channel_cover_count,
@@ -29428,6 +29597,29 @@ impl WorldSnapshot {
         self.ranked_pass_targets_filtered(player_id, limit, true, false)
     }
 
+    fn pass_target_visible_for_decision(
+        &self,
+        passer: &PlayerSnapshot,
+        target: &PlayerSnapshot,
+        target_position: Vec2,
+        forward_yards: f64,
+        visible_only: bool,
+    ) -> bool {
+        if !visible_only || self.player_can_see_player(passer.id, target.id) {
+            return true;
+        }
+        if self.ball.holder != Some(passer.id) || forward_yards <= 1.25 {
+            return false;
+        }
+        let passer_position = self.player_snapshot_position(passer);
+        if passer_position.distance(target_position) > player_vision_range(passer) {
+            return false;
+        }
+        self.player_position_confidence_for_point(passer.id, target_position)
+            .unwrap_or(0.0)
+            >= PASS_CONCEDE_PERCEPTION_MIN_CONFIDENCE * 0.50
+    }
+
     pub fn ranked_visible_aerial_pass_targets(&self, player_id: usize, limit: usize) -> Vec<usize> {
         self.ranked_aerial_pass_targets_filtered(player_id, limit, true)
     }
@@ -30023,7 +30215,7 @@ impl WorldSnapshot {
                 }
                 let target_position = self.player_snapshot_position(target);
                 let slip_break = self.slip_break_offside_trap_profile_for(player_id, target_id);
-                let reception = self
+                let mut reception = self
                     .anticipated_pass_reception_point(
                         player_id,
                         target_id,
@@ -30031,6 +30223,21 @@ impl WorldSnapshot {
                         nominal_speed,
                     )
                     .unwrap_or(target_position);
+                let led_reception_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    target_position,
+                    reception,
+                ) || self.nearest_opponent_distance_at(me.team, reception)
+                    <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                let current_pocket_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    target_position,
+                    target_position,
+                ) || self.nearest_opponent_distance_at(me.team, target_position)
+                    <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                if led_reception_is_gift && !current_pocket_is_gift {
+                    reception = target_position;
+                }
                 let scoring_reception = if slip_break.available {
                     slip_break.aim_point
                 } else {
@@ -30089,8 +30296,36 @@ impl WorldSnapshot {
                 // breaking into clear space has no opponent within the mark radius of the
                 // reception, so genuine killer balls are untouched; only a pass landing on a
                 // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                let over_top_conceded = over_top_aim
+                    .map(|aim| {
+                        let over_top_speed = pass_speed_yps_from_power(
+                            0.82,
+                            PassFlight::OverTop,
+                            false,
+                            &me.skills,
+                        );
+                        self.pass_point_directly_favors_opponent(
+                            me.team,
+                            target_position,
+                            aim.aim_point,
+                        ) || self.pass_reception_conceded_to_opponent(
+                            me.team,
+                            target_position,
+                            me_position,
+                            aim.aim_point,
+                            over_top_speed,
+                            self.attacker_pressure_on_point(me.team, me_position),
+                        )
+                    })
+                    .unwrap_or(false);
                 if !slip_break.available
-                    && self.pass_target_concedes_to_perceived_opponent(player_id, target_id, flight)
+                    && if over_top_aim.is_some() {
+                        over_top_conceded
+                    } else {
+                        self.pass_target_concedes_to_perceived_opponent(
+                            player_id, target_id, flight,
+                        )
+                    }
                 {
                     return None;
                 }
@@ -30105,7 +30340,16 @@ impl WorldSnapshot {
                     target_position,
                     flight,
                 );
-                if (quality.expected_completion < KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                let near_goal_completion_floor_multiplier = if receiver_yards_to_goal <= 8.0 {
+                    0.55
+                } else if receiver_yards_to_goal <= 18.0 {
+                    0.75
+                } else {
+                    1.0
+                };
+                let min_threaded_completion = KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                    * near_goal_completion_floor_multiplier;
+                if (quality.expected_completion < min_threaded_completion
                     && !slip_break.available)
                     || lane_fit < KILLER_PASS_MIN_LANE_FIT
                 {
@@ -30480,19 +30724,6 @@ impl WorldSnapshot {
                     .unwrap_or(position);
                 let forward = (anticipated_position.y - me_position.y) * me.team.attack_dir();
                 let receiver_distance = me_position.distance(position);
-                // A sub-3yd pass is illegal: a needless touch that neither escapes pressure nor
-                // progresses, and a frequent source of turnovers. Filter it out entirely rather
-                // than relying on a soft down-weight. Gated default-ON (byte-identical when off).
-                // Judged on the ACTUAL ball travel: a tiny pass is one where BOTH the receiver's
-                // current feet AND the led/anticipated reception point are inside 3yd — so a ball
-                // genuinely led 3+yd onto a checking/breaking runner (who is momentarily close)
-                // is NOT wrongly outlawed.
-                if dd_soccer_enable_min_pass_distance()
-                    && receiver_distance < MIN_LEGAL_PASS_YARDS
-                    && me_position.distance(anticipated_position) < MIN_LEGAL_PASS_YARDS
-                {
-                    return None;
-                }
                 if own_half
                     && own_half_progressive_floor_outlet_available
                     && receiver_distance < OWN_HALF_TINY_PASS_MAX_YARDS
@@ -30586,6 +30817,22 @@ impl WorldSnapshot {
                         None
                     }
                 };
+                let aim_point_and_anticipation = aim_point_and_anticipation.or_else(|| {
+                    let low_pressure_priced_lane = forward > 1.25
+                        && passer_pressure <= POINTLESS_SHORT_PASS_LOW_PRESSURE
+                        && receiver_distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                        && !self.pass_point_directly_favors_opponent(
+                            me.team,
+                            position,
+                            anticipated_position,
+                        )
+                        && !self.pass_point_directly_favors_opponent(
+                            me.team,
+                            position,
+                            position,
+                        );
+                    low_pressure_priced_lane.then_some((position, false))
+                });
                 // Never recycle a BACKWARD ball into coverage: a backward pass is only safe
                 // to a clearly OPEN teammate. If it goes meaningfully backward AND an opponent
                 // is tight to the receiver, veto it — the holder keeps / shields / clears it
@@ -30709,20 +30956,41 @@ impl WorldSnapshot {
                                 2.5,
                                 threading_speed,
                             );
-                        // `race_won` already includes the qualified half-open forward exception:
-                        // skilled passers keep those options visible. Direct-opponent endpoints
-                        // are priced in the score/learned features below instead of hard-hidden.
-                        (!visible_only || self.player_can_see_player(me.id, p.id))
-                            && (!require_reception_won || race_won)
-                            && (!require_reception_won || !marked_under_pressure)
-                            && !committed_cutout
-                            && !backward_into_coverage
-                            && !self.pass_lane_has_unavoidable_set_interceptor_at_speed(
+                        let unavoidable_set_interceptor = self
+                            .pass_lane_has_unavoidable_set_interceptor_at_speed(
                                 me_position,
                                 *aim_point,
                                 me.team,
                                 threading_speed,
-                            )
+                            );
+                        let patient_carry_can_price_lane_risk = forward_pass
+                            && passer_pressure <= POINTLESS_SHORT_PASS_LOW_PRESSURE
+                            && receiver_distance >= PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS
+                            && !self.pass_point_directly_favors_opponent(
+                                me.team,
+                                position,
+                                *aim_point,
+                            );
+                        // `race_won` already includes the qualified half-open forward exception:
+                        // skilled passers keep those options visible. Direct-opponent endpoints
+                        // are priced in the score/learned features below instead of hard-hidden.
+                        self.pass_target_visible_for_decision(
+                            me,
+                            p,
+                            position,
+                            forward,
+                            visible_only,
+                        )
+                            && !pass_distance_is_illegal_short(me_position.distance(position))
+                            && !pass_distance_is_illegal_short(me_position.distance(*aim_point))
+                            && (!require_reception_won
+                                || race_won
+                                || patient_carry_can_price_lane_risk)
+                            && (!require_reception_won || !marked_under_pressure)
+                            && !committed_cutout
+                            && !backward_into_coverage
+                            && (!unavoidable_set_interceptor
+                                || patient_carry_can_price_lane_risk)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
                             && !self.final_third_forward_pass_to_nobody(
                                 me.team,
@@ -31080,15 +31348,6 @@ impl WorldSnapshot {
                     .score
                     * SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT;
                 let long_backward_penalty = long_backward_pass_penalty(forward);
-                // Exponentially-escalating backward-pass risk (on top of the linear penalty): the
-                // danger of a deep retreat compounds, so a 20yd backward ball is priced ~5x a
-                // 10yd one. Gated default-ON; 0 (inert) when off. See
-                // `backward_pass_exponential_risk_penalty`.
-                let backward_exponential_risk_penalty = if dd_soccer_enable_backward_exp_risk() {
-                    backward_pass_exponential_risk_penalty(forward)
-                } else {
-                    0.0
-                };
                 // A backward ball played through opponents is doubly dangerous. The path
                 // traffic is already counted in `pass_quality` and scaled by backward depth
                 // for both floor and aerial candidates, so use that single source of truth.
@@ -31138,7 +31397,6 @@ impl WorldSnapshot {
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
-                    - backward_exponential_risk_penalty
                     - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
@@ -31252,19 +31510,53 @@ impl WorldSnapshot {
                         nominal_speed,
                     )
                     .unwrap_or(position);
-                let pass_point = self
+                let mut pass_point = self
                     .projected_in_behind_pass_point(me.id, p.id)
                     .unwrap_or(anticipated_position);
-                let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
-                // Sub-3yd passes are illegal (see floor ranking): only when BOTH the receiver's
-                // feet AND the projected reception point are inside 3yd, so a ball lofted onto a
-                // breaking runner is not wrongly outlawed. Gated default-ON; inert off.
-                if dd_soccer_enable_min_pass_distance()
-                    && me_position.distance(position) < MIN_LEGAL_PASS_YARDS
-                    && me_position.distance(pass_point) < MIN_LEGAL_PASS_YARDS
-                {
+                if pass_distance_is_illegal_short(me_position.distance(position)) {
                     return None;
                 }
+                if pass_distance_is_illegal_short(me_position.distance(pass_point)) {
+                    if pass_distance_is_illegal_short(me_position.distance(anticipated_position)) {
+                        return None;
+                    }
+                    pass_point = anticipated_position;
+                }
+                let projected_point_is_gift = self.pass_point_directly_favors_opponent(
+                    me.team,
+                    position,
+                    pass_point,
+                ) || self.pass_reception_conceded_to_opponent(
+                    me.team,
+                    position,
+                    me_position,
+                    pass_point,
+                    nominal_speed,
+                    passer_pressure,
+                );
+                if projected_point_is_gift && pass_point.distance(anticipated_position) > 1e-6 {
+                    let anticipated_is_gift = self.pass_point_directly_favors_opponent(
+                        me.team,
+                        position,
+                        anticipated_position,
+                    ) || self.pass_reception_conceded_to_opponent(
+                        me.team,
+                        position,
+                        me_position,
+                        anticipated_position,
+                        nominal_speed,
+                        passer_pressure,
+                    );
+                    if anticipated_is_gift
+                        || pass_distance_is_illegal_short(
+                            me_position.distance(anticipated_position),
+                        )
+                    {
+                        return None;
+                    }
+                    pass_point = anticipated_position;
+                }
+                let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 if me.role == PlayerRole::Goalkeeper
                     && forward < -1.25
                     && !goalkeeper_backward_emergency_release_allowed(
@@ -31305,10 +31597,20 @@ impl WorldSnapshot {
                     passer_pressure,
                     forward,
                 );
+                let final_third_aerial_contest = forward > 1.25
+                    && (me.team.goal_y(self.field_length) - pass_point.y).abs()
+                        <= self.field_length / 3.0
+                    && !self.pass_point_directly_favors_opponent(me.team, position, pass_point);
                 (aerial_strikeable
                     && !backward_into_coverage
-                    && !marked_under_pressure
-                    && (!visible_only || self.player_can_see_player(me.id, p.id))
+                    && (!marked_under_pressure || final_third_aerial_contest)
+                    && self.pass_target_visible_for_decision(
+                        me,
+                        p,
+                        position,
+                        forward,
+                        visible_only,
+                    )
                     && self.pending_offside_for_pass(me.id, p.id).is_none()
                     && !self.final_third_forward_pass_to_nobody(
                         me.team,
@@ -31573,13 +31875,6 @@ impl WorldSnapshot {
                     + role_risk.forward_risk_bonus * pass_target_learning
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
-                    // Exponentially-escalating backward-pass risk (a deep backward loft compounds
-                    // the danger); gated default-ON, inert off. See the floor ranking.
-                    - if dd_soccer_enable_backward_exp_risk() {
-                        backward_pass_exponential_risk_penalty(forward)
-                    } else {
-                        0.0
-                    }
                     // A backward loft still has to clear opponents on the path; this
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
@@ -35023,9 +35318,35 @@ impl WorldSnapshot {
         // Attack the ball to WIN it: treat it as contested (and sprint) whenever a
         // defender is anywhere close to the reception, not just dead-level.
         let defender_can_contest = opponent_target_time <= receiver_target_time + 1.05;
-        let moving_pass_needs_attack =
-            self.ball.velocity.len() > 1.0 && receiver_target_time > 0.10;
-        let sprint = pass.receiver_urgency >= 0.30
+        let receiver_should_check_run = if dd_soccer_disable_receiver_check_run()
+            || aerial_plan.is_some()
+            || pressured_reception
+            || defender_can_contest
+            || bound_one_two_wall
+            || pass.off_target_yards > 1.25
+            || intended_target_confidence < 0.45
+        {
+            false
+        } else {
+            let ball_speed = self.ball.velocity.len();
+            if ball_speed <= 1.0 {
+                false
+            } else {
+                let ball_dir = self.ball.velocity * (1.0 / ball_speed);
+                let current_along = (current - self.ball.position).dot(ball_dir);
+                let target_along = (target - self.ball.position).dot(ball_dir);
+                let lane_end =
+                    self.ball.position + ball_dir * self.field_length.max(self.field_width);
+                let lane_lateral = segment_distance_to_point(self.ball.position, lane_end, current);
+                let receiver_velocity = self.player_velocity(me.id).unwrap_or(me.velocity);
+                let running_past_ball = receiver_velocity.dot(ball_dir) > 0.65;
+                current_along > target_along + 0.85 && lane_lateral <= 3.5 && running_past_ball
+            }
+        };
+        let moving_pass_needs_attack = self.ball.velocity.len() > 1.0
+            && receiver_target_time > 0.10
+            && !receiver_should_check_run;
+        let sprint = !receiver_should_check_run && (pass.receiver_urgency >= 0.30
             || intended_target_confidence >= 0.60
             || pass.off_target_yards > 0.75
             || distance_to_ball > 4.5
@@ -35034,13 +35355,14 @@ impl WorldSnapshot {
             || defender_can_contest
             || moving_pass_needs_attack
             || bound_one_two_wall
-            || aerial_plan.map(|p| p.sprint).unwrap_or(false);
-        // Receive in stride (anti-overrun): when the reception is genuinely FREE (no defender can
-        // contest it, no pressure, not a bound one-two return) and the receiver would otherwise
-        // sprint to the spot WELL ahead of the ball, drop the sprint so they settle and take it in
-        // stride instead of overrunning it (the ball then arriving behind their run). The fine
-        // pace-matching is applied in `move_player_towards`. Gated default-ON; byte-identical off.
-        // A contested/pressured reception keeps `sprint` and still attacks the ball.
+            || aerial_plan.map(|p| p.sprint).unwrap_or(false));
+        // Receive in stride (anti-overrun), PREDICTIVE complement to `receiver_should_check_run`
+        // above (which reacts once a receiver is already running past the lane): when the reception
+        // is genuinely FREE (no defender can contest, no pressure, not a bound one-two return, not
+        // an aerial descent) and the receiver would otherwise SPRINT to the spot WELL ahead of the
+        // ball, drop the sprint so they settle and take it in stride rather than overrunning it.
+        // The fine pace-matching is applied in `move_player_towards`. Gated default-ON;
+        // byte-identical off. A contested/pressured reception keeps `sprint` and attacks the ball.
         let sprint = if dd_soccer_enable_receive_in_stride()
             && sprint
             && !pressured_reception
@@ -45381,9 +45703,21 @@ impl WorldSnapshot {
         }
 
         let zone = self.defensive_shape_for(player_id, home);
+        if let Some(press) = self.holder_press_target_for(me) {
+            return press;
+        }
         let Some(mark_target) = soccer_defensive_mark_target(self, me.team, me.role, zone) else {
             return zone;
         };
+        if me.role == PlayerRole::Defender {
+            if let Some(holder_position) = self.opponent_holder_position_for(me.team) {
+                if mark_target.distance(holder_position)
+                    <= DEFENDER_PRESS_MIDFIELDER_IDEAL_YARDS + 1.0
+                {
+                    return mark_target;
+                }
+            }
+        }
         (mark_target * 0.5 + zone * 0.5).clamp_to_pitch(self.field_width, self.field_length)
     }
 
@@ -45394,6 +45728,9 @@ impl WorldSnapshot {
         // rule on the FINAL assignment for defenders too.
         match self.players.iter().find(|p| p.id == player_id) {
             Some(me) if me.role == PlayerRole::Defender => {
+                if self.defensive_press_contain_profile_for(me.id).target.is_some() {
+                    return target.clamp_to_pitch(self.field_width, self.field_length);
+                }
                 let mut final_target = Vec2::new(
                     target.x,
                     self.defender_line_band_average_adjusted_y(me, target.y),
@@ -45565,6 +45902,9 @@ impl WorldSnapshot {
         // The nearest defender steps up to press any opponent holder (not only a fast
         // carrier near our box), so a holder is never left to dwell on the ball.
         if let Some(press) = self.holder_press_target_for(me) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, press);
+            }
             return press;
         }
         if me.role == PlayerRole::Defender {
@@ -47204,14 +47544,50 @@ pub(crate) fn soccer_decision_cadence_max_window() -> (u64, u64) {
 const DECISION_CADENCE_NEAR_YARDS: f64 = 15.0;
 const DECISION_CADENCE_MID_YARDS: f64 = 35.0;
 
-/// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
-/// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
-/// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
-/// → deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's fixed-order
-/// outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
+// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
+// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
+// and stays deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's
+// fixed-order outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+#[cfg(test)]
+thread_local! {
+    static TEST_FISHER_YATES_SCHEDULE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        std::cell::Cell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) struct TestFisherYatesScheduleOverrideGuard {
+    prior: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for TestFisherYatesScheduleOverrideGuard {
+    fn drop(&mut self) {
+        TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| override_flag.set(self.prior));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_force_fisher_yates_schedule(
+    enabled: bool,
+) -> TestFisherYatesScheduleOverrideGuard {
+    let prior = TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| {
+        let prior = override_flag.get();
+        override_flag.set(Some(enabled));
+        prior
+    });
+    TestFisherYatesScheduleOverrideGuard { prior }
+}
+
+/// Resolve the Fisher-Yates field-entity schedule gate.
 pub(crate) fn dd_soccer_enable_fisher_yates_schedule() -> bool {
     #[cfg(test)]
     {
+        if let Some(enabled) =
+            TEST_FISHER_YATES_SCHEDULE_OVERRIDE.with(|override_flag| override_flag.get())
+        {
+            return enabled;
+        }
         std::env::var("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE").is_ok()
     }
     #[cfg(not(test))]
