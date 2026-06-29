@@ -14600,13 +14600,15 @@ impl SoccerMatch {
             );
             let velocity = finite_vec2(other.velocity, Vec2::zero());
             let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+            let jerk = finite_vec2(other.jerk, Vec2::zero());
             let center = finite_pitch_point(
-                position + velocity * dt + acceleration * half_dt2,
+                position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
                 field_width,
                 field_length,
                 position,
             );
-            let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 28.0);
+            let obstacle_velocity =
+                limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 28.0);
             let opponent = other.team != my_team;
             let holder_bonus = if self.ball.holder == Some(other.id) {
                 0.4
