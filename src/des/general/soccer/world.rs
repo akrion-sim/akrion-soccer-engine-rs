@@ -31442,6 +31442,13 @@ impl WorldSnapshot {
                     + role_risk.forward_risk_bonus * pass_target_learning
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
+                    // Exponentially-escalating backward-pass risk (a deep backward loft compounds
+                    // the danger); gated default-ON, inert off. See the floor ranking.
+                    - if dd_soccer_enable_backward_exp_risk() {
+                        backward_pass_exponential_risk_penalty(forward)
+                    } else {
+                        0.0
+                    }
                     // A backward loft still has to clear opponents on the path; this
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
