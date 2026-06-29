@@ -25417,11 +25417,22 @@ impl WorldSnapshot {
             return None;
         }
         // Meet the ball a touch on the goal side so we arrive at it rather than
-        // ball-watch, but step level enough to actually contest.
+        // ball-watch, but step level enough to actually contest. The press-or-contain MDP shades
+        // the standoff: press tighter when we can win it, sit off (give space, jockey) when we'd
+        // likely be beaten or would release a runner in behind. Gated default-ON; the fixed
+        // standoff is used (byte-identical) when off.
         let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
         let goal_side = (own_goal - carrier_position).normalized();
+        let standoff = match self.press_or_contain_aggression_for(me) {
+            Some(aggression) => press_or_contain_standoff_yards(
+                PRESS_OR_CONTAIN_ENGAGE_PRESS_YARDS,
+                PRESS_OR_CONTAIN_ENGAGE_CONTAIN_YARDS,
+                aggression,
+            ),
+            None => CONTAIN_ENGAGE_GOAL_SIDE_YARDS,
+        };
         Some(
-            (carrier_position + goal_side * CONTAIN_ENGAGE_GOAL_SIDE_YARDS)
+            (carrier_position + goal_side * standoff)
                 .clamp_to_pitch(self.field_width, self.field_length),
         )
     }
