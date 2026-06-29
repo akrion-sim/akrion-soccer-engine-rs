@@ -7940,20 +7940,33 @@ impl SoccerMatch {
                         continue;
                     }
                     // Decision-compute cadence (MPC receding-horizon decomposition): run the
-                    // expensive PLANNING pass (MDP/POMDP + MPC/QP) on at most `max` of every
-                    // `window` ticks per player, STAGGERED by id; on the other ticks the player
-                    // EXECUTES its existing optimal plan — it replays the held intent and the
-                    // movement model still does optimal approach to the planned target every tick
-                    // (movement + ball advance on ALL ticks). Plan slow, execute fast → control
-                    // stays optimal while per-tick CPU drops, so the loop holds real-time. Humans
-                    // are never gated, and a player whose held plan is a spent one-shot
+                    // expensive PLANNING pass (MDP/POMDP + MPC/QP) at most a few times per `window`
+                    // ticks per player, STAGGERED by id; on the other ticks the player EXECUTES its
+                    // existing optimal plan — it replays the held intent and the movement model still
+                    // does optimal approach to the planned target every tick (movement + ball advance
+                    // on ALL ticks). Plan slow, execute fast → control stays optimal while per-tick
+                    // CPU drops, so the loop holds real-time. The budget is ADAPTIVE by ball
+                    // proximity: at most 3 plans / `window` ON or near the ball (where reactions
+                    // matter), 2 at mid range, 1 when far off the ball — capped by `cadence_cap`
+                    // (default 3, window 7 ≈ ≤3 plans per 0.47s, back-to-back allowed). Humans are
+                    // never gated, and a player whose held plan is a spent one-shot
                     // (`continuation_intent()`==None, e.g. a played pass/shot/tackle) re-plans
-                    // regardless. Default 3-of-7 ticks (~150ms reaction floor, back-to-back allowed).
-                    let (cadence_max, cadence_window) = soccer_decision_cadence_max_window();
-                    let plan_this_tick = cadence_window <= cadence_max
+                    // regardless.
+                    let (cadence_cap, cadence_window) = soccer_decision_cadence_max_window();
+                    let ball_distance = self.players[actor].position.distance(self.ball.position);
+                    let proximity_budget = if self.ball.holder == Some(scheduled.id)
+                        || ball_distance <= DECISION_CADENCE_NEAR_YARDS
+                    {
+                        3
+                    } else if ball_distance <= DECISION_CADENCE_MID_YARDS {
+                        2
+                    } else {
+                        1
+                    };
+                    let plan_budget = proximity_budget.min(cadence_cap);
+                    let plan_this_tick = cadence_window <= plan_budget
                         || self.players[actor].controller_slot.is_some()
-                        || (self.tick.wrapping_add(scheduled.id as u64) % cadence_window)
-                            < cadence_max;
+                        || (self.tick.wrapping_add(scheduled.id as u64) % cadence_window) < plan_budget;
                     if !plan_this_tick {
                         if let Some(held_intent) = self.players[actor].continuation_intent() {
                             self.pending_human_control = None;
