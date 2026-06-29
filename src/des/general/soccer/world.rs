@@ -103,6 +103,14 @@ const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
 /// entirely for any genuine movement cue (see the exemptions at the call site).
 const OFFBALL_SETTLE_REFERENCE_YARDS: f64 = 6.5;
 const OFFBALL_SETTLE_STAND_YARDS: f64 = 2.0;
+/// Receive-in-stride / anti-overrun tuning. A FREE receiver who would reach the reception point
+/// more than `(1 - EARLY_MARGIN)` ahead of the ball is "early" — sprinting on would carry them
+/// past the spot so the ball arrives behind their run. Such a receiver eases to a pace that lands
+/// them ~with the ball (receive it in stride), floored at `MIN_FACTOR` of nominal so they keep
+/// drifting onto it. Only applies to a moving ball (≥ `MIN_BALL_SPEED_YPS`).
+const RECEIVE_IN_STRIDE_EARLY_MARGIN: f64 = 0.92;
+pub(crate) const RECEIVE_IN_STRIDE_MIN_FACTOR: f64 = 0.30;
+const RECEIVE_IN_STRIDE_MIN_BALL_SPEED_YPS: f64 = 1.0;
 const INTENDED_PASS_TARGET_AWARENESS_PROBABILITY: f64 = 0.80;
 const INTENDED_PASS_TARGET_BELIEF_CONFIDENCE: f64 = 0.80;
 const BALL_RECEIPT_SHAPE_TIE_WINDOW_SECONDS: f64 = 0.45;
