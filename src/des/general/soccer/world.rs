@@ -7939,6 +7939,34 @@ impl SoccerMatch {
                     if self.players[actor].slide_recovery_seconds > 0.0 {
                         continue;
                     }
+                    // Decision-compute cadence (MPC receding-horizon decomposition): run the
+                    // expensive PLANNING pass (MDP/POMDP + MPC/QP) on at most `max` of every
+                    // `window` ticks per player, STAGGERED by id; on the other ticks the player
+                    // EXECUTES its existing optimal plan — it replays the held intent and the
+                    // movement model still does optimal approach to the planned target every tick
+                    // (movement + ball advance on ALL ticks). Plan slow, execute fast → control
+                    // stays optimal while per-tick CPU drops, so the loop holds real-time. Humans
+                    // are never gated, and a player whose held plan is a spent one-shot
+                    // (`continuation_intent()`==None, e.g. a played pass/shot/tackle) re-plans
+                    // regardless. Default 3-of-7 ticks (~150ms reaction floor, back-to-back allowed).
+                    let (cadence_max, cadence_window) = soccer_decision_cadence_max_window();
+                    let plan_this_tick = cadence_window <= cadence_max
+                        || self.players[actor].controller_slot.is_some()
+                        || (self.tick.wrapping_add(scheduled.id as u64) % cadence_window)
+                            < cadence_max;
+                    if !plan_this_tick {
+                        if let Some(held_intent) = self.players[actor].continuation_intent() {
+                            self.pending_human_control = None;
+                            let intent_player_id = held_intent.player_id;
+                            self.apply_player_intent(held_intent);
+                            if self.ball.holder == Some(intent_player_id) {
+                                self.sync_held_ball_to_holder();
+                            }
+                            self.enforce_restart_keepout_for(intent_player_id);
+                            self.enforce_shield_body_barrier_for(intent_player_id);
+                            continue;
+                        }
+                    }
                     let decision_context =
                         self.player_decision_timing_context_for(actor, scheduled.id);
                     let phase_started = Instant::now();
