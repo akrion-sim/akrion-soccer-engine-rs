@@ -23672,6 +23672,21 @@ impl WorldSnapshot {
         player: &PlayerSnapshot,
         target: Vec2,
     ) -> f64 {
+        self.dynamic_lane_affinity_for_player_target_with(player, target, None, None)
+    }
+
+    /// Same as [`Self::dynamic_lane_affinity_for_player_target`], but a caller that has
+    /// ALREADY computed the positional-shape relief and candidate occupancy for this exact
+    /// `(player, target)` can pass them in to skip a duplicate recomputation (relief is
+    /// ~O(players^2), occupancy O(players); both are top leaves in the live CPU profile).
+    /// `None` recomputes them, so the public wrapper above stays identical.
+    pub(crate) fn dynamic_lane_affinity_for_player_target_with(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        precomputed_relief: Option<f64>,
+        precomputed_occupancy: Option<CandidateOccupancy>,
+    ) -> f64 {
         let lane_tunables = &tunables().lane_affinity;
         if player.role == PlayerRole::Goalkeeper {
             let (width, length) = sane_pitch_dimensions(self.field_width, self.field_length);
