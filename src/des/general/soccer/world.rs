@@ -23158,9 +23158,8 @@ impl WorldSnapshot {
         }
         let holder_pos = self.player_snapshot_position(holder);
         let forward_space = self.forward_dribble_space_yards(holder_id);
-        let unpressured =
-            self.nearest_opponent_distance_at(team, holder_pos) >= UNCONTESTED_CARRIER_SPACE_YARDS;
-        if forward_space >= TEAM_ADVANCE_FORWARD_SPACE_YARDS || unpressured {
+        let nearest_opponent = self.nearest_opponent_distance_at(team, holder_pos);
+        if team_advance_upfield_space_qualifies(forward_space, nearest_opponent) {
             Some((holder_id, holder_pos, forward_space))
         } else {
             None
