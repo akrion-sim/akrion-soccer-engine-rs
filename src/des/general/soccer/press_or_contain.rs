@@ -45,6 +45,9 @@ const PRESS_OR_CONTAIN_COVER_RADIUS_YARDS: f64 = 14.0;
 const PRESS_OR_CONTAIN_RUNNER_RADIUS_YARDS: f64 = 22.0;
 /// Minimum goalward speed (yd/s) for an opponent to count as an active in-behind runner.
 const PRESS_OR_CONTAIN_RUNNER_MIN_SPEED_YPS: f64 = 1.5;
+/// Min distance (yd) from the nearest marker for a forward-outlet attacker to count as "open"
+/// enough that the carrier could realistically pick them out (so pressing to deny the lane pays).
+const PRESS_OR_CONTAIN_FORWARD_OUTLET_OPEN_YARDS: f64 = 2.5;
 /// Baseline aggression before the win/risk terms are applied (a slight default lean to press, so
 /// an evenly-balanced duel still steps in rather than retreating forever).
 const PRESS_OR_CONTAIN_BASE_AGGRESSION: f64 = 0.45;
