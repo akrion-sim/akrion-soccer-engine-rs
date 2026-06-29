@@ -206,7 +206,7 @@ impl WorldSnapshot {
                 let pos = self.player_snapshot_position(p);
                 (pos.y - carrier.y) * attack_dir < -3.0
                     && self.nearest_opponent_distance_at(holder.team, pos)
-                        >= PRESS_OR_CONTAIN_RUNNER_MIN_SPEED_YPS
+                        >= PRESS_OR_CONTAIN_FORWARD_OUTLET_OPEN_YARDS
             }
         }) {
             (0.5 + carrier_slowness * 0.5).clamp(0.0, 1.0)
