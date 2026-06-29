@@ -13101,6 +13101,22 @@ impl SoccerMatch {
                     };
                     let release_target = release.intended_target;
                     let release_distance = player_pos.distance(release_target);
+                    let target_current_distance = target_id
+                        .and_then(|target| snapshot.player_position(target))
+                        .map(|target_position| player_pos.distance(target_position))
+                        .unwrap_or(release_distance);
+                    if pass_distance_is_illegal_short(release_distance)
+                        || pass_distance_is_illegal_short(target_current_distance)
+                    {
+                        let look = release_target - player_pos;
+                        if look.len() > 1e-6 {
+                            let face = facing_bucket_from_vector(look);
+                            if face != FacingBucket::Unknown {
+                                self.players[player_id].action_facing = face;
+                            }
+                        }
+                        return;
+                    }
                     let launch_target = release.launch_target;
                     let resolved_facing = facing_bucket_from_vector(launch_target - player_pos);
                     if resolved_facing != FacingBucket::Unknown {
@@ -30520,6 +30536,8 @@ impl WorldSnapshot {
                         // skilled passers keep those options visible. Direct-opponent endpoints
                         // are priced in the score/learned features below instead of hard-hidden.
                         (!visible_only || self.player_can_see_player(me.id, p.id))
+                            && !pass_distance_is_illegal_short(me_position.distance(position))
+                            && !pass_distance_is_illegal_short(me_position.distance(*aim_point))
                             && (!require_reception_won || race_won)
                             && (!require_reception_won || !marked_under_pressure)
                             && !committed_cutout
@@ -31049,9 +31067,18 @@ impl WorldSnapshot {
                         nominal_speed,
                     )
                     .unwrap_or(position);
-                let pass_point = self
+                let mut pass_point = self
                     .projected_in_behind_pass_point(me.id, p.id)
                     .unwrap_or(anticipated_position);
+                if pass_distance_is_illegal_short(me_position.distance(position)) {
+                    return None;
+                }
+                if pass_distance_is_illegal_short(me_position.distance(pass_point)) {
+                    if pass_distance_is_illegal_short(me_position.distance(anticipated_position)) {
+                        return None;
+                    }
+                    pass_point = anticipated_position;
+                }
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
                 if me.role == PlayerRole::Goalkeeper
                     && forward < -1.25

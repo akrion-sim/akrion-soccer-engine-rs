@@ -4999,8 +4999,8 @@ fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
         directional_pass_progress_score(-9.0, weight) + backward_pass_depth_adjustment(-9.0);
 
     assert!(
-        backward_pass_depth_adjustment(-4.0) > 0.0,
-        "3-5yd backward releases should get a reset bonus"
+        backward_pass_depth_adjustment(-4.0) < 0.0,
+        "3-5yd backward releases remain legal but must not get a positive reset bonus"
     );
     assert!(
         backward_pass_depth_adjustment(-6.0) < 0.0,
@@ -5013,18 +5013,18 @@ fn backward_recycle_prefers_three_to_five_yard_reset_over_long_retreat() {
 }
 
 #[test]
-fn long_backward_pass_penalty_grows_linearly_past_short_reset() {
+fn long_backward_pass_penalty_grows_exponentially_past_short_reset() {
     let ten_back = long_backward_pass_penalty(-10.0);
     let twenty_back = long_backward_pass_penalty(-20.0);
 
-    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
+    assert!(long_backward_pass_penalty(-5.0) > 0.0);
     assert!(
         ten_back > 7.0,
         "10yd backward must be a real penalty: {ten_back}"
     );
     assert!(
-        (twenty_back - ten_back * 3.0).abs() < 1e-12,
-        "penalty should be linear in yards beyond 5: 10yd={ten_back} 20yd={twenty_back}"
+        (twenty_back / ten_back - 5.0).abs() < 1e-9,
+        "20yd backward should carry about 5x the distance risk of 10yd: 10yd={ten_back} 20yd={twenty_back}"
     );
 }
 
@@ -5213,23 +5213,24 @@ fn backward_pass_path_traffic_prices_floor_and_aerial_retreats() {
         passer_pos,
         receiver_pos,
     );
+    let forward_yards = (receiver_pos.y - passer_pos.y) * Team::Home.attack_dir();
     let expected_scaled = opponents.len() as f64
-        * ((passer_pos.y - receiver_pos.y) - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS);
+        * (backward_pass_distance_risk_units(forward_yards)
+            - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+        .max(0.0);
     assert_eq!(traffic.opponent_count, 3);
+    let expected_risk =
+        (expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT).clamp(0.0, 0.95);
     assert!(
-        (traffic.risk
-            - expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
-            .abs()
-            < 1e-12,
-        "traffic risk should be count * backward depth"
+        (traffic.risk - expected_risk).abs() < 1e-12,
+        "traffic risk should be count * exponential backward-distance risk with cap"
     );
     assert!(
         (traffic.score_penalty
-            - expected_scaled
-                * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD)
+            - expected_scaled * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT)
             .abs()
             < 1e-12,
-        "traffic score penalty should be count * backward depth"
+        "traffic score penalty should be count * exponential backward-distance risk"
     );
 
     let crowded_floor = pass_target_quality_for_snapshot(
@@ -5893,7 +5894,7 @@ fn forward_pass_aggregate_without_goal_receiver_does_not_become_killer_pass() {
     sim.players[passer].skills.passing = 9.0;
     sim.players[passer].skills.vision = 9.4;
     sim.players[receiver].role = PlayerRole::Forward;
-    sim.players[receiver].position = Vec2::new(42.0, 76.8);
+    sim.players[receiver].position = Vec2::new(44.0, 76.0);
     sim.players[receiver].velocity = Vec2::zero();
     sim.ball.holder = Some(passer);
     sim.ball.position = sim.players[passer].position;
@@ -17990,30 +17991,27 @@ fn backward_pass_length_preference_favours_the_short_drop() {
 }
 
 #[test]
-fn long_backward_pass_penalty_grows_linearly_with_retreat() {
-    // Forward, square and short-backward (<=5yd) balls are untouched.
+fn long_backward_pass_penalty_grows_exponentially_with_retreat() {
+    // Forward and square balls are untouched; every backward ball carries some risk.
     assert_eq!(long_backward_pass_penalty(6.0), 0.0);
     assert_eq!(long_backward_pass_penalty(0.0), 0.0);
-    assert_eq!(long_backward_pass_penalty(-5.0), 0.0);
-    // Beyond the 5yd short cap the demerit rises LINEARLY (constant per-yard slope): the
-    // gap from 6->10yd back equals the gap from 10->14yd back.
+    assert!(long_backward_pass_penalty(-5.0) > 0.0);
     let p6 = long_backward_pass_penalty(-6.0);
     let p10 = long_backward_pass_penalty(-10.0);
     let p14 = long_backward_pass_penalty(-14.0);
     assert!(p6 > 0.0 && p10 > p6 && p14 > p10);
     assert!(
-        ((p10 - p6) - (p14 - p10)).abs() < 1e-9,
-        "penalty must be linear in backward distance"
+        p14 - p10 > p10 - p6,
+        "penalty must compound with backward distance"
     );
-    // A >10yd backward ball is heavily demoted, and the ramp keeps growing linearly.
+    // A >10yd backward ball is heavily demoted, and 20yd is tuned to roughly 5x 10yd.
     assert!(p10 >= 6.0);
-    assert!(long_backward_pass_penalty(-40.0) > p14);
+    let p20 = long_backward_pass_penalty(-20.0);
     assert!(
-        (long_backward_pass_penalty(-40.0)
-            - (40.0 - LONG_BACKWARD_PASS_YARDS) * LONG_BACKWARD_PASS_PENALTY_PER_YARD)
-            .abs()
-            < 1e-9
+        (p20 / p10 - 5.0).abs() < 1e-9,
+        "20yd backward pass should be ~5x 10yd: p10={p10} p20={p20}"
     );
+    assert!(long_backward_pass_penalty(-40.0) > p20);
 }
 
 #[test]
@@ -18027,11 +18025,13 @@ fn backward_pass_path_risk_scales_with_retreat_and_opponents() {
     assert!(backward_pass_path_risk_penalty(-20.0, 2) > backward_pass_path_risk_penalty(-8.0, 2));
     // The MORE opponents sit on the path, the higher the risk for the same distance.
     assert!(backward_pass_path_risk_penalty(-12.0, 3) > backward_pass_path_risk_penalty(-12.0, 1));
-    // A 20yd backward ball through 3 players follows the same uncapped linear traffic formula.
+    // A 20yd backward ball through 3 players follows the exponential distance-risk formula.
     let deep_traffic = backward_pass_path_risk_penalty(-20.0, 3);
-    let expected = (20.0 - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS)
+    let expected = (backward_pass_distance_risk_units(-20.0)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0)
         * 3.0
-        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD;
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT;
     assert!((deep_traffic - expected).abs() < 1e-9);
     assert!(
         backward_pass_path_risk_penalty(-40.0, 3) > deep_traffic,
@@ -68992,7 +68992,7 @@ fn a_backward_pass_into_coverage_is_vetoed_but_to_an_open_man_is_allowed() {
         .id;
     park_players_except(&mut sim, &[holder, mate, presserr, coverer]);
     // Home attacks +y. Holder pressured (so backward isn't auto-vetoed by "no pressure"),
-    // a teammate 3yd BEHIND, and a short backward ball that wins the arrival race.
+    // a teammate more than 3yd BEHIND, and a short backward ball that wins the arrival race.
     sim.players[holder].position = Vec2::new(40.0, 60.0);
     sim.players[holder].facing_yaw = std::f64::consts::FRAC_PI_2;
     sim.ball.holder = Some(holder);
@@ -69002,7 +69002,7 @@ fn a_backward_pass_into_coverage_is_vetoed_but_to_an_open_man_is_allowed() {
     // backward veto never fires) without being a set interceptor in the backward lane.
     sim.players[presserr].position = Vec2::new(46.0, 59.0);
     sim.players[presserr].velocity = Vec2::new(-3.0, 0.0);
-    sim.players[mate].position = Vec2::new(40.0, 57.0); // 3yd behind the holder
+    sim.players[mate].position = Vec2::new(40.0, 56.5); // 3.5yd behind the holder
 
     // Covered: an opponent 2.8yd off the backward man (within the covered radius).
     sim.players[coverer].position = Vec2::new(40.0, 54.2);
@@ -69229,7 +69229,7 @@ fn own_half_tiny_short_pass_yields_to_upfield_outlet() {
 }
 
 #[test]
-fn own_half_tiny_short_pass_remains_available_without_upfield_outlet() {
+fn own_half_tiny_short_pass_is_illegal_without_upfield_outlet() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let mids: Vec<usize> = sim
         .players
@@ -69252,8 +69252,27 @@ fn own_half_tiny_short_pass_remains_available_without_upfield_outlet() {
     let ranked = snapshot.ranked_visible_pass_targets(holder, 5);
 
     assert!(
-        ranked.contains(&tiny_tap),
-        "own-half sub-3yd safety valve should remain available when no upfield floor outlet exists: ranked={ranked:?} tiny={tiny_tap}"
+        !ranked.contains(&tiny_tap),
+        "sub-3yd passes are illegal even without an upfield outlet; carrier should hold/carry instead: ranked={ranked:?} tiny={tiny_tap}"
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: holder,
+        action: SoccerAction::Pass {
+            target_player: Some(tiny_tap),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+    assert_eq!(
+        sim.ball.holder,
+        Some(holder),
+        "execution guard should veto the explicit sub-3yd pass and keep possession"
+    );
+    assert!(
+        sim.pending_pass.is_none(),
+        "explicit sub-3yd pass must not create a pending pass"
     );
 }
 

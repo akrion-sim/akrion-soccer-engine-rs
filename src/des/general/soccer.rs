@@ -1575,33 +1575,32 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // anywhere on the pitch. Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
 const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.0;
-// A short backward reset (3–5yd back to a supporting player) is a normal, useful ball;
-// slinging it 6+ yards backward concedes real territory and should be distinctly worse.
-// Beyond this backward distance, an escalating per-yard demerit kicks in so a 3–5yd
-// backward pass is preferred over a long backward one whenever both are on offer.
-const LONG_BACKWARD_PASS_YARDS: f64 = 5.0;
-// Per-yard demerit for every yard a backward pass travels beyond LONG_BACKWARD_PASS_YARDS.
-// The risk is LINEAR in how far backward (toward our own goal) the ball is played: every
-// extra yard conceded is priced the same, so the ranking strongly prefers a short reset and
-// only tolerates a long retreat when there is genuinely nothing else.
-const LONG_BACKWARD_PASS_PENALTY_PER_YARD: f64 = 1.45;
+// Passes below this are removed from ordinary pass candidates and vetoed again at release time.
+// They are not "passes" for now; the carrier should keep/carry/dribble instead.
+const ILLEGAL_SHORT_PASS_MAX_YARDS: f64 = 3.0;
+// Any backward pass is a riskier possession choice than an equal-quality forward/square option.
+// Beyond the short reset band the risk compounds sharply: tuned so a 20yd backward ball carries
+// about 5x the distance-risk units of a 10yd backward ball.
+const BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS: f64 = 10.0;
+const BACKWARD_PASS_DISTANCE_RISK_EXPONENT: f64 = 2.321_928_094_887_362; // log2(5)
+const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 7.6;
+const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.13;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
-// This is intentionally linear in both backward depth and traffic count, and applies to both
-// floor and aerial candidates; short 3-5yd resets stay unpriced.
+// Traffic count stays linear, while backward distance uses the compounding risk curve; short
+// 3-5yd resets stay free from corridor-traffic pricing.
 const BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS: f64 = 4.0;
 const BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS: f64 = 5.0;
 const BACKWARD_PASS_PATH_TRAFFIC_ENDPOINT_FRACTION: f64 = 0.08;
-const BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.012;
-const BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD: f64 = 0.20;
+const BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT: f64 = 0.07;
+const BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT: f64 = 1.15;
 const BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH: f64 = 0.78;
 // Backward recycling should be a short support bounce, not a retreating outlet.
 // If a backward pass is needed, prefer a 3-5yd reset and increasingly demote
 // balls played more than 5yd back toward our own goal.
 const BACKWARD_PASS_SHORT_RESET_MIN_YARDS: f64 = 3.0;
 const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
-const BACKWARD_PASS_SHORT_RESET_BONUS: f64 = 1.25;
-const BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD: f64 = 0.38;
-const BACKWARD_PASS_LONG_RESET_PENALTY_CAP: f64 = 3.2;
+const BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD: f64 = 0.16;
+const BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT: f64 = 1.15;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -3367,9 +3366,9 @@ const WALL_PASS_GIVE_MIN_FORWARD_YARDS: f64 = -5.0;
 /// Soft risk demerit (in quality units, 0..1) for the BACKWARD component of a one-two leg.
 /// A short backpass is part of the combination, but the further back a leg is played — and
 /// the more opponents sit in its corridor — the riskier it is, so quality is reduced by
-/// `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This demotes (but
-/// never vetoes) a long backward give/return, especially through traffic.
-const WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY: f64 = 0.03;
+/// exponential backward-distance risk units, capped. This demotes (but never vetoes) a long
+/// backward give/return, especially through traffic.
+const WALL_PASS_BACKWARD_RISK_PER_UNIT_PER_BODY: f64 = 0.16;
 const WALL_PASS_BACKWARD_RISK_MAX: f64 = 0.6;
 /// Corridor half-width used to test the give and return lanes are clean.
 const WALL_PASS_LANE_RADIUS_YARDS: f64 = 1.6;
@@ -54215,8 +54214,10 @@ fn backward_pass_path_traffic_for_snapshot(
     if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
         return BackwardPassPathTraffic::default();
     }
-    let priced_backward_yards = (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
-    if priced_backward_yards <= 0.0 {
+    let priced_risk_units = (backward_pass_distance_risk_units(forward_yards)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0);
+    if priced_risk_units <= 0.0 {
         return BackwardPassPathTraffic::default();
     }
     if passer_position.distance(target_point) <= 1e-6 {
@@ -54241,13 +54242,12 @@ fn backward_pass_path_traffic_for_snapshot(
     if opponent_count == 0 {
         return BackwardPassPathTraffic::default();
     }
-    let scaled = opponent_count as f64 * priced_backward_yards;
+    let scaled = opponent_count as f64 * priced_risk_units;
     BackwardPassPathTraffic {
         opponent_count,
-        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_PER_BACKWARD_YARD)
+        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT)
             .clamp(0.0, 0.95),
-        score_penalty: scaled
-            * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD,
+        score_penalty: scaled * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT,
     }
 }
 
@@ -55282,6 +55282,7 @@ fn pass_target_quality_for_snapshot_inner(
         };
         expected_completion *= (1.0 - gift_risk * damp).clamp(0.20, 1.0);
     }
+    expected_completion *= backward_pass_completion_multiplier(target_forward);
     PassTargetQuality {
         receiver_openness,
         stride_fit,
@@ -58561,16 +58562,40 @@ fn directional_pass_progress_score(forward_yards: f64, weight: f64) -> f64 {
     }
 }
 
-/// Escalating demerit for a *long* backward pass. Returns 0 for forward, square, or
-/// short-backward (≤5yd) balls so a 3–5yd reset is untouched, then grows per-yard
-/// for every yard travelled backward beyond [`LONG_BACKWARD_PASS_YARDS`].
+fn dd_soccer_disable_illegal_short_pass_ban() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ILLEGAL_SHORT_PASS_BAN").is_ok())
+}
+
+fn pass_distance_is_illegal_short(distance_yards: f64) -> bool {
+    !dd_soccer_disable_illegal_short_pass_ban()
+        && distance_yards.is_finite()
+        && distance_yards < ILLEGAL_SHORT_PASS_MAX_YARDS
+}
+
+fn backward_pass_distance_risk_units(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= 0.0 {
+        return 0.0;
+    }
+    ((-forward_yards) / BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS.max(1e-6))
+        .max(0.0)
+        .powf(BACKWARD_PASS_DISTANCE_RISK_EXPONENT)
+}
+
+fn backward_pass_completion_multiplier(forward_yards: f64) -> f64 {
+    let risk = backward_pass_distance_risk_units(forward_yards);
+    (1.0 - risk * BACKWARD_PASS_COMPLETION_RISK_PER_UNIT).clamp(0.32, 1.0)
+}
+
+/// Escalating demerit for a backward pass. Returns 0 for forward/square balls, applies a small
+/// demotion even to short resets, then compounds with backward distance.
 /// `forward_yards` is signed attacking-direction progress (negative = backward).
 fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= 0.0 {
         return 0.0;
     }
-    let backward_yards = -forward_yards;
-    (backward_yards - LONG_BACKWARD_PASS_YARDS).max(0.0) * LONG_BACKWARD_PASS_PENALTY_PER_YARD
+    backward_pass_distance_risk_units(forward_yards) * LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT
 }
 
 /// Extra demerit for playing the ball BACKWARD past opponents standing in the pass
@@ -58589,24 +58614,27 @@ fn backward_pass_path_risk_penalty(forward_yards: f64, opponents_on_path: usize)
     {
         return 0.0;
     }
-    let priced_backward_yards = (-forward_yards - BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS).max(0.0);
-    priced_backward_yards
+    let priced_risk_units = (backward_pass_distance_risk_units(forward_yards)
+        - backward_pass_distance_risk_units(-BACKWARD_PASS_PATH_TRAFFIC_FREE_YARDS))
+    .max(0.0);
+    priced_risk_units
         * opponents_on_path as f64
-        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_PER_BACKWARD_YARD
+        * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT
 }
 
 /// Soft risk (in 0..1 quality units) for the BACKWARD component of a one-two leg. A short
 /// backpass is a normal part of a give-and-go, so a forward/square leg carries no risk; the
 /// further BACK the leg is played and the more opponents sit in its corridor, the higher the
-/// demerit — `backward_yards * (1 + opponents_on_path) * PER_YARD_PER_BODY`, capped. This
+/// demerit, using the same exponential distance-risk units as normal backward passes. This
 /// demotes (never vetoes) a long or through-traffic backward give/return. `forward_yards` is
 /// signed attacking-direction progress for the leg (negative = backward).
 fn wall_pass_leg_backward_risk(forward_yards: f64, opponents_on_path: usize) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= 0.0 {
         return 0.0;
     }
-    let backward_yards = -forward_yards;
-    (backward_yards * (1.0 + opponents_on_path as f64) * WALL_PASS_BACKWARD_RISK_PER_YARD_PER_BODY)
+    (backward_pass_distance_risk_units(forward_yards)
+        * (1.0 + opponents_on_path as f64)
+        * WALL_PASS_BACKWARD_RISK_PER_UNIT_PER_BODY)
         .min(WALL_PASS_BACKWARD_RISK_MAX)
 }
 
@@ -58618,18 +58646,11 @@ fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
     if (BACKWARD_PASS_SHORT_RESET_MIN_YARDS..=BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
         .contains(&backward_yards)
     {
-        let midpoint =
-            (BACKWARD_PASS_SHORT_RESET_MIN_YARDS + BACKWARD_PASS_SHORT_RESET_MAX_YARDS) * 0.5;
-        let half_band =
-            ((BACKWARD_PASS_SHORT_RESET_MAX_YARDS - BACKWARD_PASS_SHORT_RESET_MIN_YARDS) * 0.5)
-                .max(1e-6);
-        let center_fit = (1.0 - (backward_yards - midpoint).abs() / half_band).clamp(0.0, 1.0);
-        return BACKWARD_PASS_SHORT_RESET_BONUS * (0.80 + center_fit * 0.20);
+        return -(backward_yards * BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD);
     }
     if backward_yards > BACKWARD_PASS_SHORT_RESET_MAX_YARDS {
-        return -((backward_yards - BACKWARD_PASS_SHORT_RESET_MAX_YARDS)
-            * BACKWARD_PASS_LONG_RESET_PENALTY_PER_YARD)
-            .min(BACKWARD_PASS_LONG_RESET_PENALTY_CAP);
+        return -(backward_pass_distance_risk_units(forward_yards)
+            * BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT);
     }
     0.0
 }
