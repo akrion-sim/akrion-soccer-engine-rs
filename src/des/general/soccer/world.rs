@@ -38179,38 +38179,20 @@ impl WorldSnapshot {
                 _ => box_edge_x,
             }
         } else {
-<<<<<<< HEAD
             // Ball well ahead of the back four and we are not a live ground-pass outlet ⇒ hold
             // width: stay in our current lane and push up with the play rather than bombing out
-            // to the touchline from behind an advanced ball.
+            // to the touchline from behind an advanced ball. This advanced-ball suppression
+            // (gated) layers on top of the release-fit attacking-width model below.
             if self.wingback_advanced_ball_should_hold_width(me) {
                 return target;
             }
-            // Open OUT toward the touchline; bomb wide when there is cover behind the ball.
-            let attack = me.team.attack_dir();
-            let ball_fwd = self.ball.position.y * attack;
-            let cover_behind_ball = self
-                .players
-                .iter()
-                .filter(|p| {
-                    p.team == me.team
-                        && p.id != player_id
-                        && self.player_snapshot_position(p).y * attack < ball_fwd
-                })
-                .count();
-            let buffer = if cover_behind_ball > WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN {
-                WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS
-            } else {
-                WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS
-            };
-            center_x - side_inward * (center_x - buffer)
-=======
+            // Otherwise open OUT toward the touchline using the release-fit-scaled attacking
+            // width: only open when there is a live flank release and scale the width by its fit.
             let flank_release_fit = self.wingback_flank_release_fit(me);
             if flank_release_fit <= 0.0 {
                 return target;
             }
             self.wingback_attacking_flank_x(me, flank_release_fit)
->>>>>>> origin/main
         };
         // Directional, bounded pull: defending only pinches IN, possession only opens OUT.
         let delta_inward = (desired_x - target.x) * side_inward;
