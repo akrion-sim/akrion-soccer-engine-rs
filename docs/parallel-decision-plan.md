@@ -9,6 +9,16 @@ reaction that doesn't physically exist. A **simultaneous-move** model (everyone 
 model at this granularity. "State must be agreed upon" is preserved by keeping the **resolve**
 phase serial.
 
+## Where the time goes (why the per-player layer is the right target)
+| Layer | Share of step | |
+|---|---|---|
+| **Player decisions** | **~74%** | the 22 independent per-player calcs (`fieldPlayerDecisionMs` 39163/53081 ms) |
+| Team (formation LP / central brain) | negligible | LP refreshes every 2 ticks (`SOCCER_FORMATION_LP_REFRESH_TICKS=2`); per-tick `CentralBrain` loop arm is empty `{}` |
+| World (ball, officials) | negligible | `fieldBallMs` ≈ 11ms/2000 ticks |
+
+So the bottleneck is also the part that scales with the 22 agents → Amdahl-favorable (~74%
+parallelizable). Team/world stay in the cheap serial phases, untouched.
+
 ## Target tps
 Live tick ≈ 77 ms ≈ **~57 ms decision (parallelizable) + ~20 ms serial** (snapshot, intent apply,
 ball, learning, serialize). Across 8 worker threads: ~57/8 + overhead ≈ **~9 ms** → ~30 ms/tick →
