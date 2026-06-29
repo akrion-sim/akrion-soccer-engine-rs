@@ -85,6 +85,8 @@ mod shot_decision;
 pub use shot_decision::*;
 mod reward_shaping;
 pub use reward_shaping::*;
+mod crash_box;
+pub(crate) use crash_box::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod policy_select;
@@ -1891,6 +1893,12 @@ const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+/// Penalty (points, applied negative) for an isolated attacking carrier panicking a
+/// backward/square ball instead of driving at goal or holding it up — see
+/// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
+/// forward-pass-chain link so it meaningfully discourages the blunder without swamping the
+/// sparse match-outcome signal.
+const ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS: f64 = 6.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
@@ -2532,6 +2540,15 @@ const WINGBACK_WIDTH_CONSISTENCY_TARGET_SECONDS: f64 = 3.0;
 const WINGBACK_ATTACK_TOUCHLINE_BUFFER_YARDS: f64 = 4.0;
 const WINGBACK_ATTACK_NO_COVER_BUFFER_YARDS: f64 = 8.0;
 const WINGBACK_ATTACK_COVER_BEHIND_BALL_MIN: usize = 2;
+// When the ball is this many yards or more AHEAD of our back-four line average, a wide
+// DEFENDER pushes up with the play but stops bombing out to the touchline to "open up":
+// opening wide from behind an advanced ball only isolates him and vacates the flank he
+// covers. He keeps his width only while he is still a live ground-pass outlet (below).
+const WINGBACK_BALL_AHEAD_HOLD_WIDTH_YARDS: f64 = 10.0;
+// The "live outlet" exception to the hold-width rule: a wide defender keeps opening wide
+// even with the ball advanced when a ground pass could actually reach him — i.e. he is
+// within this range of the ball with a clear (un-intercepted) lane.
+const WINGBACK_GROUND_PASS_OUTLET_YARDS: f64 = 20.0;
 const ROLE_LINE_CONSISTENCY_URGENCY_DEADBAND_YARDS: f64 = 0.5;
 const ROLE_LINE_CONSISTENCY_URGENCY_FULL_ERROR_YARDS: f64 = 14.0;
 // Ball-proximity-scaled "get into shape" grace, in ALL directions (fore-aft layering
@@ -2667,6 +2684,54 @@ const BALL_PROTECTION_LEAD_REF_YARDS: f64 = 2.5;
 const BALL_PROTECTION_FAST_DRIBBLE_REF_YPS: f64 = 6.0;
 const CONTESTABLE_STEAL_RADIUS_YARDS: f64 = 1.0;
 const CONTESTABLE_PROTECTION_THRESHOLD: f64 = 0.5;
+// --- Blindside surprise-steal (gated `DD_SOCCER_ENABLE_BLINDSIDE_STEAL`) ---
+// A defender drifting into the carrier's blind arc considers a steal from behind while
+// still this far back; the catch-belief model decides whether closing is feasible.
+const BLINDSIDE_STEAL_APPROACH_RADIUS_YARDS: f64 = 4.25;
+// The carrier's bearing relative to its own facing/motion below which the defender is
+// "behind the eyes" (out of the look-forward cone): cos of ~100° back from dead-ahead.
+const BLINDSIDE_BEHIND_DOT: f64 = -0.17;
+// At/below this carrier speed the dribble is a walk/jog/skip — fully exploitable; the
+// opportunity fades to zero as the carrier accelerates toward the getaway speed (a
+// sprinting carrier simply runs away from the thief).
+const BLINDSIDE_CARRIER_JOG_SPEED_YPS: f64 = 4.0;
+const BLINDSIDE_CARRIER_GETAWAY_SPEED_YPS: f64 = 7.5;
+// The carrier must actually be going forward (toward its own attack goal) for this to be
+// a "dribbling forward, can't see behind" situation rather than a shielded turn.
+const BLINDSIDE_CARRIER_MIN_FORWARD_SPEED_YPS: f64 = 0.6;
+// Catch-belief: the defender must close the gap within this horizon, and needs at least
+// this much real chase-speed margin over the carrier's getaway pace to believe it.
+const BLINDSIDE_CATCH_HORIZON_SECONDS: f64 = 1.5;
+const BLINDSIDE_CHASE_SPEED_MARGIN_YPS: f64 = 0.4;
+// Contact band within which a believed blindside approach actually nicks the ball.
+const BLINDSIDE_STEAL_CONTACT_RADIUS_YARDS: f64 = PLAYER_CONTROL_RADIUS_YARDS + 0.55;
+// Minimum opportunity strength at which a blindside approach at contact range wins the ball.
+const BLINDSIDE_STEAL_COMMIT_THRESHOLD: f64 = 0.30;
+// The carrier's side-glance (head-scan) control-drift cost while dribbling forward,
+// scaled by carrier speed (a quicker carrier glancing loses more control). This is the
+// physical price of looking: it rides the same ball-control drift channel as the
+// existing look-behind scan.
+const BLINDSIDE_GLANCE_DRIFT_RISK_BASE: f64 = 0.12;
+const BLINDSIDE_GLANCE_DRIFT_RISK_SPEED_SPAN: f64 = 0.22;
+
+/// A defender's "surprise steal from behind" opportunity against the current opponent
+/// ball-carrier (see [`WorldSnapshot::blindside_steal_assessment`]). Every field is in
+/// `[0, 1]`; `opportunity` is the overall strength the decision/observation reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlindsideStealAssessment {
+    /// The opponent carrier being crept up on.
+    pub target: usize,
+    /// Overall blindside-steal strength (blends the parts below), `[0, 1]`.
+    pub opportunity: f64,
+    /// How far the defender sits behind the carrier's eyes (1 = dead behind).
+    pub carrier_unaware: f64,
+    /// How exploitable the carrier's pace is (1 = walk/jog/skip, 0 = sprinting clear).
+    pub carrier_slow: f64,
+    /// The defender's belief it can catch the carrier before it reacts, `[0, 1]`.
+    pub catch_belief: f64,
+    /// Straight-line gap to the carrier, yards (for the contact test).
+    pub gap_yards: f64,
+}
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
@@ -5964,6 +6029,32 @@ pub struct SoccerPomdpObservation {
     pub look_behind_confidence_bonus: f64,
     #[serde(default)]
     pub look_behind_drift_risk: f64,
+    /// Blindside surprise-steal opportunity this DEFENDER has against the opponent carrier
+    /// in `[0, 1]` — high when it has crept into the carrier's blind arc, the carrier is
+    /// dribbling forward slowly, and it believes it can catch them (see
+    /// [`WorldSnapshot::blindside_steal_assessment`]). `0.0` unless this player is an
+    /// off-ball defender with a live chance and `DD_SOCCER_ENABLE_BLINDSIDE_STEAL` is on.
+    /// Decision-only — NOT part of the neural feature vector (`FEATURE_DIM` unchanged).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_steal_opportunity: f64,
+    /// The opponent carrier id this defender's blindside opportunity targets, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blindside_steal_target: Option<usize>,
+    /// What this CARRIER (perceptually) believes about a defender sneaking up on its blind
+    /// side, `[0, 1]`. Built from rear opponents discounted by the carrier's perception
+    /// confidence on them — so it stays low until the carrier GLANCES (a head-scan that
+    /// raises rear confidence at a control-drift cost), then rises and drives the escape
+    /// (accelerate forward / release early). `0.0` off the ball or with the gate off.
+    /// Decision-only — NOT a neural feature.
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_threat_from_behind: f64,
+    /// Whether this carrier is actively side-glancing this tick to check its blind side.
+    #[serde(default)]
+    pub blindside_scan_active: bool,
+    /// Ball-control drift risk `[0, 1]` this carrier incurs for the side-glance — the
+    /// physical price of looking (the same drift channel as the look-behind scan).
+    #[serde(default, skip_serializing_if = "serde_f64_is_effectively_zero")]
+    pub blindside_scan_drift_risk: f64,
     /// Previous settled run-time-step decision/action summary for this player.
     /// This is the explicit cross-tick bridge for MDP/POMDP/MPC continuity: the
     /// current observation stays current-state-first, while this optional payload
@@ -17047,6 +17138,21 @@ pub(crate) enum SoccerRewardEventKind {
     /// learning signal, complementing the retrospective concede penalty.
     KeeperSave,
     Goal,
+    /// A headed goal finished from a situational flank crash-the-box aerial cross. Carries the
+    /// same learning weight as a [`Goal`](SoccerRewardEventKind::Goal) but lets the bonus that
+    /// rewards the whole wide-cross → bodies-in-the-box → header pattern be attributed
+    /// distinctly. See [`crash_box`].
+    HeaderGoalFromCross,
+    /// Bounded shaped credit for an attacker having crashed into the box as a flank aerial
+    /// cross is released — the off-ball "be there for the delivery" signal.
+    CrashBoxArrival,
+    /// PENALTY (negative): a Forward / winger isolated in the attacking half with no teammate
+    /// ahead played a panicked BACKWARD/square pass instead of driving at goal or holding the
+    /// ball up for support. The direct learning signal that trains the policy off the
+    /// "no outlet ⇒ pass backwards" blunder. Emitted only when
+    /// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` is on. See
+    /// `isolated_attacking_carrier_drive_mode` in the `player` module.
+    IsolatedCarrierPanicBackPass,
     MatchResult,
 }
 
@@ -17062,6 +17168,9 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::KeeperSave
                 | SoccerRewardEventKind::Goal
+                | SoccerRewardEventKind::HeaderGoalFromCross
+                | SoccerRewardEventKind::CrashBoxArrival
+                | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -17080,6 +17189,8 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::Goal
+                | SoccerRewardEventKind::HeaderGoalFromCross
+                | SoccerRewardEventKind::CrashBoxArrival
         )
     }
 }
@@ -50056,6 +50167,28 @@ fn dd_soccer_disable_slide_tackle() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SLIDE_TACKLE").is_ok())
 }
 
+/// Set `DD_SOCCER_ENABLE_BLINDSIDE_STEAL=1` to enable the "surprise steal from behind".
+/// A defender that has crept into the blind arc of an opponent dribbling *forward and
+/// slowly* (walk/jog/skip) — and that believes it can actually catch the carrier (a real
+/// closing-speed margin) — can nick the ball from behind before the carrier reacts; the
+/// carrier in turn glances to its blind side (a head-scan with a real control-drift cost)
+/// to RECOGNISE the threat and break away. Default off ⇒ the assessment short-circuits to
+/// `None`, every new observation field stays zero, the new action option is inert, and the
+/// carrier never side-glances, so an unconfigured process is byte-identical (clean A/B).
+fn dd_soccer_enable_blindside_steal() -> bool {
+    #[cfg(test)]
+    {
+        // Read fresh under test so a single process can A/B the gate per test.
+        std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
+    }
+}
+
 /// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
 /// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off ⇒
 /// the block stays all-zero and the actor sees only the broad role one-hot, so the policy
@@ -54616,6 +54749,28 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
     }
 }
 
+/// Role-aware pass risk/safety appetite. The MPC/POMDP lane-interception risk
+/// (`pass_lane_interception_risk`, a 2-second lookahead — see
+/// [`PASS_LANE_DECISION_LOOKAHEAD_SECONDS`]) already QUANTIFIES how dangerous a pass is; this
+/// gate changes how that quantity is VALUED by WHO is on the ball and WHERE. Defenders lean
+/// into safety (amplify the risk penalty), forwards lean into a slightly higher appetite for a
+/// FORWARD ball (mute the risk penalty for forward passes and lift forward-progress weight),
+/// especially in the opponent's final third. Sideways/backward balls keep ~full risk pricing so
+/// "brave" never means a loose square ball. Default-OFF and byte-identical when off; opt-in via
+/// env, then A/B before promoting to [`gate_default_on`].
+pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok())
+    }
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
@@ -57197,6 +57352,95 @@ fn backward_pass_length_preference(dist: f64) -> f64 {
     } else {
         (1.0 - (dist - BACKWARD_PASS_SHORT_MAX_YARDS) / BACKWARD_PASS_LENGTH_FADE_BAND_YARDS)
             .clamp(0.0, 1.0)
+    }
+}
+
+/// Per-passer risk/safety appetite used to shade the (already-quantified) MPC/POMDP pass-lane
+/// interception risk when ranking pass options. This does NOT recompute risk — it scales how a
+/// given risk value is PRICED for the player on the ball:
+///   * `forward_risk_penalty_mult` — multiplier on the interception-risk penalty for a FORWARD
+///     ball (`> 1` = more risk-averse, `< 1` = braver going forward).
+///   * `sideways_risk_penalty_mult` — same, but for a lateral/backward ball, so a higher forward
+///     appetite never loosens square/back balls.
+///   * `forward_preference_lift` — additive bump to the forward-progress weight, so a forward is
+///     nudged to prefer a forward ball over a lateral/backward one even when it is riskier.
+#[derive(Clone, Copy, Debug)]
+struct PassRiskAppetite {
+    forward_risk_penalty_mult: f64,
+    sideways_risk_penalty_mult: f64,
+    forward_preference_lift: f64,
+}
+
+impl PassRiskAppetite {
+    /// Identity appetite: prices risk exactly as the baseline does (gate OFF ⇒ byte-identical).
+    const NEUTRAL: PassRiskAppetite = PassRiskAppetite {
+        forward_risk_penalty_mult: 1.0,
+        sideways_risk_penalty_mult: 1.0,
+        forward_preference_lift: 0.0,
+    };
+}
+
+/// Resolve the [`PassRiskAppetite`] for the passer's role and field zone. Returns
+/// [`PassRiskAppetite::NEUTRAL`] (byte-identical) unless
+/// [`dd_soccer_enable_role_pass_risk_appetite`] is enabled. Defenders/keeper lean SAFE; forwards
+/// lean BRAVE on the FORWARD ball, escalating in the attacking third; midfielders are roughly
+/// neutral with a small final-third nudge.
+fn pass_risk_appetite_for_passer(role: PlayerRole, passer_in_attacking_third: bool) -> PassRiskAppetite {
+    if !dd_soccer_enable_role_pass_risk_appetite() {
+        return PassRiskAppetite::NEUTRAL;
+    }
+    pass_risk_appetite_table(role, passer_in_attacking_third)
+}
+
+/// Pure role/zone → appetite mapping (no gate read), so it is unit-testable without touching the
+/// process-global gate env var. See [`pass_risk_appetite_for_passer`] for the gated entry point.
+fn pass_risk_appetite_table(role: PlayerRole, passer_in_attacking_third: bool) -> PassRiskAppetite {
+    match role {
+        // The keeper must not gamble in build-up: amplify risk everywhere, prefer the safe ball.
+        PlayerRole::Goalkeeper => PassRiskAppetite {
+            forward_risk_penalty_mult: 1.50,
+            sideways_risk_penalty_mult: 1.55,
+            forward_preference_lift: -0.10,
+        },
+        // Defenders only make safer passes — lean into safety in every direction.
+        PlayerRole::Defender => PassRiskAppetite {
+            forward_risk_penalty_mult: 1.30,
+            sideways_risk_penalty_mult: 1.22,
+            forward_preference_lift: -0.05,
+        },
+        // Midfielders are the pivot: ~neutral, with a small forward nudge in the final third.
+        PlayerRole::Midfielder => {
+            if passer_in_attacking_third {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.90,
+                    sideways_risk_penalty_mult: 1.04,
+                    forward_preference_lift: 0.08,
+                }
+            } else {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 1.0,
+                    sideways_risk_penalty_mult: 1.0,
+                    forward_preference_lift: 0.02,
+                }
+            }
+        }
+        // Forwards may play slightly riskier — and in the opponent's final third should prefer a
+        // forward ball over a safe lateral/backward one even when it is high-risk.
+        PlayerRole::Forward => {
+            if passer_in_attacking_third {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.66,
+                    sideways_risk_penalty_mult: 1.12,
+                    forward_preference_lift: 0.22,
+                }
+            } else {
+                PassRiskAppetite {
+                    forward_risk_penalty_mult: 0.82,
+                    sideways_risk_penalty_mult: 1.06,
+                    forward_preference_lift: 0.10,
+                }
+            }
+        }
     }
 }
 
