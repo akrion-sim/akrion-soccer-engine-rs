@@ -44993,7 +44993,14 @@ impl WorldSnapshot {
         };
         let in_possession = possession == Some(player.team);
         let dynamic_lane_fit = if player.role != PlayerRole::Goalkeeper {
-            self.dynamic_lane_affinity_for_player_target(player, target)
+            // Reuse the relief + occupancy already computed above for this candidate instead
+            // of recomputing them inside (they are identical for this exact player/target).
+            self.dynamic_lane_affinity_for_player_target_with(
+                player,
+                target,
+                Some(relief),
+                Some(candidate_occupancy),
+            )
         } else {
             0.0
         };
