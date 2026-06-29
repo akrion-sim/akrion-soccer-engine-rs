@@ -2714,13 +2714,15 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
         let position = finite_pitch_point(other.position, width, length, player.position);
         let velocity = finite_vec2(other.velocity, Vec2::zero());
         let acceleration = finite_vec2(other.acceleration, Vec2::zero());
+        let jerk = finite_vec2(other.jerk, Vec2::zero());
         let center = finite_pitch_point(
-            position + velocity * dt + acceleration * half_dt2,
+            position + velocity * dt + acceleration * half_dt2 + jerk * sixth_dt3,
             width,
             length,
             position,
         );
-        let obstacle_velocity = limit_vec2_len(velocity + acceleration * dt, 24.0);
+        let obstacle_velocity =
+            limit_vec2_len(velocity + acceleration * dt + jerk * half_dt2, 24.0);
         let same_team = other.team == player.team;
         let holder_bonus = if snapshot.ball.holder == Some(other.id) {
             0.55
