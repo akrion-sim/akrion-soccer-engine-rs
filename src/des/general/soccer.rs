@@ -39408,7 +39408,6 @@ fn soccer_neural_transition_features_with_action(
         features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_CLOSING] = readout[6];
         features[SOCCER_NEURAL_FEATURE_RELATIONAL_OPPONENT_ENTROPY] = readout[7];
     }
-<<<<<<< HEAD
     let goal_side_defender_gap =
         1.0 - (obs.field_opponents_ahead.min(6) as f64 / 6.0).clamp(0.0, 1.0);
     features[SOCCER_NEURAL_FEATURE_SOLO_GOAL_SIDE_DEFENDER_GAP] = goal_side_defender_gap;
@@ -39421,7 +39420,6 @@ fn soccer_neural_transition_features_with_action(
         * obs.nearest_defender_fatigue_confidence.clamp(0.35, 1.0))
     .clamp(0.0, 1.0);
     features[SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE] = soccer_neural_unit(solo_speed_edge);
-=======
     let graph_temporal = &obs.neural_extended;
     features[SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE] =
         soccer_neural_unit(graph_temporal.graph_forward_support_edge_weight);
@@ -39439,7 +39437,6 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_signed_unit(graph_temporal.temporal_actor_run_memory_score);
     features[SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY] =
         soccer_neural_unit(graph_temporal.temporal_opponent_press_memory_score);
->>>>>>> upstream/main
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
