@@ -46834,6 +46834,21 @@ impl WorldSnapshot {
     }
 }
 
+/// How many ticks between a player's deliberative decision recomputes (cadence gate). The player
+/// replays its held intent on the in-between ticks. At dt = 1/30 the default 3 ≈ 100ms. `1` disables
+/// the gate (decide every tick). Tunable via `SOCCER_DECISION_CADENCE_INTERVAL_TICKS`.
+pub(crate) fn soccer_decision_cadence_interval_ticks() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_DECISION_CADENCE_INTERVAL_TICKS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3)
+    })
+}
+
 /// Result of one player's decision computed against a FIXED snapshot, on a clone of the player —
 /// so the computation is read-only on the `SoccerMatch` and safe to run in parallel across players.
 /// The serial apply phase swaps `player_after` back in (in canonical schedule order) and applies
