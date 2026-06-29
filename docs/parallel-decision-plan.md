@@ -53,24 +53,29 @@ snapshot) and a **per-player RNG**, returning a `DecisionOutput`. No `&mut self`
 - Per-player RNG: `SeededRandom::new(mix(base_seed, tick, player_id))` — independent stream per
   player, deterministic, scheduling-independent. Replaces the shared serial `self.rng` draw.
 - `learned_action_for_player_with_context(&snapshot, …)` — read-only net inference (must be `Sync`).
-- The crux: split `run_time_step_with_context` / `_inner` so the player-metadata writes
-  (`last_intent`, `last_decision`, `decision_commit_ticks`, learned `behavior_probability`, refractory
-  state) become **fields of `DecisionOutput`** instead of `self.* =`. Audit `_inner` to prove it
-  touches *no* positional/ball/other-player state (those stay in apply).
-- `apply_post_decision_movement_discipline(&snapshot, &self, intent)` → confirm it reads only
-  immutable tick-start state; if so it runs inside Phase B, else move it to Phase C.
+- **Crux is simpler than feared — compute on a player CLONE, no `_inner` surgery.** Confirmed:
+  `PlayerAgent: Clone`; `run_time_step_with_context` mutates only the *player's own* metadata
+  (`last_decision`/`last_intent`/`decision_commit_ticks`/`behavior_probability`) and needs only
+  `(snapshot, rng)` — not `&SoccerMatch`; the two match-reads (`learned_action_for_player_with_context`,
+  `apply_post_decision_movement_discipline`) are both `&self`/`&SoccerMatch` (read-only). So Phase B
+  per player = clone the player, run the EXISTING `run_time_step_with_context` on the clone (mutating
+  the clone) against the shared snapshot + per-player RNG, run the read-only discipline/learned-action
+  against shared `&SoccerMatch`, and return the mutated clone + intent. Nothing on the real `self` is
+  written in Phase B. Phase C swaps the clones back in (serial, canonical order). This means **zero
+  refactor of the 130-line `_inner`** — only the loop is restructured.
 
 ```
 struct DecisionOutput {
     player_id: usize,
+    player_after: PlayerAgent,   // the decided clone (carries all metadata mutations)
     intent: PlayerIntent,
-    last_intent: PlayerIntent,
-    last_decision: AgentDecisionTrace,
-    decision_commit_tick: u64,
-    behavior_probability: Option<f64>,
-    // human players: computed in Phase C instead (see below)
 }
 ```
+
+- Requires `SoccerMatch: Sync` for the shared `&self` read across threads — **audit the decide
+  read-path for interior mutability** (`Cell`/`RefCell`/non-atomic caches), especially in
+  `learned_action_for_player_with_context` (net inference). `self.rng` is *not* used in Phase B
+  (per-player RNG instead), and gate `OnceLock`s are read-only post-init.
 
 ### Canonical-order invariant (the Fisher-Yates point)
 Apply/resolve MUST follow the **scheduler's canonical order**, never the order parallel threads
