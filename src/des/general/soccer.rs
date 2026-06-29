@@ -1328,7 +1328,7 @@ const DRIBBLE_DWELL_RELEASE_LIFT: f64 = 0.22;
 // commitments (1st, 4th, 8th ticks). This keeps players from changing strategy
 // faster than reaction/mental processing speed while still allowing genuine
 // reflex branches elsewhere in the player logic.
-const PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS: u64 = 3;
+const PLAYER_DECISION_COMMITMENT_SHORT_WINDOW_TICKS: u64 = 6; // dt=1/30 ×2 (was 3 @1/15)
 const PLAYER_DECISION_COMMITMENT_MAX_IN_SHORT_WINDOW: usize = 1;
 const PLAYER_DECISION_COMMITMENT_LONG_WINDOW_TICKS: u64 = 7;
 const PLAYER_DECISION_COMMITMENT_MAX_IN_LONG_WINDOW: usize = 2;
