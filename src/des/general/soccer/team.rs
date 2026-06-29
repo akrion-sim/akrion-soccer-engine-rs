@@ -2756,13 +2756,15 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
     let ball_position = finite_pitch_point(snapshot.ball.position, width, length, player.position);
     let ball_velocity = finite_vec2(snapshot.ball.velocity, Vec2::zero());
     let ball_acceleration = finite_vec2(snapshot.ball.acceleration, Vec2::zero());
+    let ball_jerk = finite_vec2(snapshot.ball.jerk, Vec2::zero());
     let ball_center = finite_pitch_point(
-        ball_position + ball_velocity * dt + ball_acceleration * half_dt2,
+        ball_position + ball_velocity * dt + ball_acceleration * half_dt2 + ball_jerk * sixth_dt3,
         width,
         length,
         ball_position,
     );
-    let ball_obstacle_velocity = limit_vec2_len(ball_velocity + ball_acceleration * dt, 32.0);
+    let ball_obstacle_velocity =
+        limit_vec2_len(ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2, 32.0);
     let ball_weight = 4.5
         + ball_velocity.len().clamp(0.0, 28.0) / 7.0
         + ball_acceleration.len().clamp(0.0, 28.0) / 14.0;
