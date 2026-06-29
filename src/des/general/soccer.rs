@@ -3910,6 +3910,9 @@ const SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM: usize = 8;
 /// Append-only forward-option recognition block: exposes the lane-aware good
 /// forward-pass quality used by forward-pass-first decisions to the value head.
 const SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM: usize = 1;
+/// Append-only defender press/contain block: exposes the POMDP action value to
+/// step to the carrier and the risk that doing so opens a dribble/run behind.
+const SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize = 2;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -3960,8 +3963,11 @@ const SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+        + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4408,6 +4414,10 @@ const SOCCER_NEURAL_FEATURE_TEMPORAL_OPPONENT_PRESS_MEMORY: usize =
     SOCCER_NEURAL_FEATURE_TEMPORAL_ACTOR_RUN_MEMORY + 1;
 const SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY: usize =
     SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4536,6 +4546,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM,
     // Same schema with graph-temporal features, before forward-option-quality recognition.
     SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM,
+    // Same schema with forward-option quality, before defender press/contain channels.
+    SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6449,6 +6461,14 @@ pub struct SoccerPomdpObservation {
     pub goalkeeper_ball_goal_line_alignment_score: f64,
     #[serde(default)]
     pub defensive_line_break_threat: f64,
+    /// MDP/POMDP score [0,1] that this defender should step to the opponent carrier:
+    /// likelihood of winning/slowing/redirecting the ball or cutting the live pass lane.
+    #[serde(default)]
+    pub defensive_press_action_score: f64,
+    /// MDP/POMDP score [0,1] that pressing would be punished by a dribble past or a runner
+    /// entering valued space in behind, so contain/back-off/cover is safer.
+    #[serde(default)]
+    pub defensive_contain_risk_score: f64,
     #[serde(default)]
     pub defensive_carrier_channel_pressure: f64,
     #[serde(default)]
@@ -8855,6 +8875,10 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub defensive_line_break_threat_bin: u8,
     #[serde(default)]
+    pub defensive_press_action_bin: u8,
+    #[serde(default)]
+    pub defensive_contain_risk_bin: u8,
+    #[serde(default)]
     pub defensive_carrier_channel_pressure_bin: u8,
     #[serde(default)]
     pub defensive_carrier_channel_side_bin: i8,
@@ -9472,6 +9496,14 @@ impl SoccerQStateKey {
             ),
             defensive_line_break_threat_bin: distance_bucket(
                 observation.defensive_line_break_threat,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            defensive_press_action_bin: distance_bucket(
+                observation.defensive_press_action_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            defensive_contain_risk_bin: distance_bucket(
+                observation.defensive_contain_risk_score,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
             defensive_carrier_channel_pressure_bin: distance_bucket(
@@ -10232,6 +10264,8 @@ impl SoccerQStateKey {
             && self.goalkeeper_ball_goal_line_alignment_bin
                 == other.goalkeeper_ball_goal_line_alignment_bin
             && self.defensive_line_break_threat_bin == other.defensive_line_break_threat_bin
+            && self.defensive_press_action_bin == other.defensive_press_action_bin
+            && self.defensive_contain_risk_bin == other.defensive_contain_risk_bin
             && self.defensive_carrier_channel_pressure_bin
                 == other.defensive_carrier_channel_pressure_bin
             && self.defensive_carrier_channel_side_bin == other.defensive_carrier_channel_side_bin
@@ -39550,6 +39584,10 @@ fn soccer_neural_transition_features_with_action(
         obs.best_forward_pass_option_quality
             .max(obs.best_forward_pass_receiver_openness),
     );
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION] =
+        soccer_neural_unit(obs.defensive_press_action_score);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK] =
+        soccer_neural_unit(obs.defensive_contain_risk_score);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }

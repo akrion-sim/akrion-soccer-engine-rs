@@ -32,6 +32,11 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
 const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.10;
 const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.65;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
+const DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE: f64 = 0.42;
+const DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN: f64 = 0.06;
+const DEFENSIVE_PRESS_CONTAIN_PASS_LANE_RADIUS_YARDS: f64 = 6.0;
+const DEFENSIVE_PRESS_CONTAIN_RUNNER_HORIZON_SECONDS: f64 = 2.0;
+const DEFENSIVE_PRESS_CONTAIN_RUNNER_THREAT_BAND_YARDS: f64 = 18.0;
 const OWN_HALF_TINY_PASS_MAX_YARDS: f64 = 3.0;
 const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
@@ -20457,6 +20462,14 @@ pub(crate) struct SupportSpecialTargets {
     pub(crate) flank_cross_arrival: Option<Vec2>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DefensivePressContainProfile {
+    pub(crate) press_score: f64,
+    pub(crate) contain_risk: f64,
+    pub(crate) target: Option<Vec2>,
+    pub(crate) primary_presser: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SupportActionContext {
     pub(crate) options: Vec<AgentActionOptionTrace>,
@@ -25317,62 +25330,255 @@ impl WorldSnapshot {
         )
     }
 
-    /// The single nearest defender steps up to PRESS an opponent ball-holder, closing to
-    /// a tight standoff rather than sitting off in containment. Unlike
-    /// [`Self::fast_carrier_engage_target_for`] (which contests a fast carrier bearing
-    /// down on our box), this applies real pressure on the ball anywhere on the pitch, so
-    /// a holder is never left to dwell unpressured — and a pressed holder is pushed to
-    /// release or drive sooner. Only the closest outfielder presses; the rest hold shape.
-    fn holder_press_target_for(&self, me: &PlayerSnapshot) -> Option<Vec2> {
-        if me.role == PlayerRole::Goalkeeper {
-            return None;
+    pub(crate) fn defensive_press_contain_profile_for(
+        &self,
+        player_id: usize,
+    ) -> DefensivePressContainProfile {
+        let Some(me) = self.players.iter().find(|player| player.id == player_id) else {
+            return DefensivePressContainProfile::default();
+        };
+        if me.role == PlayerRole::Goalkeeper || self.controlled_possession_team() == Some(me.team)
+        {
+            return DefensivePressContainProfile::default();
         }
-        let holder_id = self.ball.holder?;
-        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        let Some(holder_id) = self.ball.holder else {
+            return DefensivePressContainProfile::default();
+        };
+        let Some(holder) = self.players.iter().find(|player| player.id == holder_id) else {
+            return DefensivePressContainProfile::default();
+        };
         if holder.team == me.team {
-            return None;
+            return DefensivePressContainProfile::default();
         }
-        let holder_position = self.player_snapshot_position(holder);
-        // In our own defensive third, the retreat / containment / fast-carrier-contest
-        // logic governs (pressing out there risks being played through for a back-line
-        // break). This press fills the MIDFIELD / opponent-half gap, where a holder was
-        // previously left to dwell unpressured.
-        let own_goal_y = self.own_goal_y_for(me.team);
-        if (holder_position.y - own_goal_y).abs() <= self.field_length / 3.0 {
-            return None;
-        }
-        // Defer to the retreat logic whenever the carrier is genuinely threatening our
-        // back line (even just outside the third) — pressing out then invites a break.
-        if self.opponent_breakthrough_ball_carrier(me.team).is_some() {
-            return None;
-        }
-        let my_position = self.player_snapshot_position(me);
-        // Press only when already within reach — don't drag a lone presser out of the
-        // block from distance (the line behind stays compact).
-        if my_position.distance(holder_position) > HOLDER_PRESS_MAX_DISTANCE_YARDS {
-            return None;
-        }
-        // Only the single closest outfielder presses; the rest keep their shape.
+
+        let carrier = self.player_snapshot_position(holder);
+        let me_pos = self.player_snapshot_position(me);
+        let distance = me_pos.distance(carrier);
         let closest = self
             .players
             .iter()
             .filter(|player| player.team == me.team && player.role != PlayerRole::Goalkeeper)
             .min_by(|a, b| {
-                self.lane_biased_player_target_score(a, holder_position, 1.10)
-                    .total_cmp(&self.lane_biased_player_target_score(b, holder_position, 1.10))
+                let a_role_fit = if a.role == PlayerRole::Defender && !self.is_wide_defender(a) {
+                    0.86
+                } else if a.role == PlayerRole::Defender {
+                    0.95
+                } else if a.role == PlayerRole::Midfielder {
+                    1.02
+                } else {
+                    1.15
+                };
+                let b_role_fit = if b.role == PlayerRole::Defender && !self.is_wide_defender(b) {
+                    0.86
+                } else if b.role == PlayerRole::Defender {
+                    0.95
+                } else if b.role == PlayerRole::Midfielder {
+                    1.02
+                } else {
+                    1.15
+                };
+                (self.lane_biased_player_target_score(a, carrier, 1.10) * a_role_fit)
+                    .total_cmp(
+                        &(self.lane_biased_player_target_score(b, carrier, 1.10) * b_role_fit),
+                    )
                     .then(a.id.cmp(&b.id))
-            })?;
-        if closest.id != me.id {
-            return None;
+            });
+        let primary_presser = closest.is_some_and(|player| player.id == me.id);
+
+        let holder_velocity = self.player_velocity(holder_id).unwrap_or(holder.velocity);
+        let carrier_goalward_speed = (holder_velocity.y * holder.team.attack_dir()).max(0.0);
+        let defender_speed = (player_top_speed_yps(me.role, &me.skills)
+            * (1.0 - me.fatigue.clamp(0.0, 1.0) * 0.18)
+            * (0.84 + ability01(me.skills.acceleration) * 0.16))
+        .max(0.85);
+        let own_goal_y = self.own_goal_y_for(me.team);
+        let own_goal = Vec2::new(self.field_width * 0.5, own_goal_y);
+        let own_half_depth = (self.field_length * 0.5).max(1.0);
+        let carrier_goal_distance = (carrier.y - own_goal_y).abs();
+        let goal_threat = (1.0 - carrier_goal_distance / own_half_depth).clamp(0.0, 1.0);
+        let distance_fit =
+            (1.0 - (distance - 1.2) / (HOLDER_PRESS_MAX_DISTANCE_YARDS - 1.2).max(1.0))
+                .clamp(0.0, 1.0);
+        let defending_skill = ability01(me.skills.defending) * 0.56
+            + ability01(me.skills.defensive_tracking) * 0.24
+            + ability01(me.skills.aggression) * 0.20;
+        let carrier_security = ability01(holder.skills.dribbling) * 0.48
+            + ability01(holder.skills.first_touch) * 0.22
+            + ability01(holder.skills.acceleration) * 0.18
+            + ability01(holder.skills.strength) * 0.12;
+        let fatigue_edge = (holder.fatigue.clamp(0.0, 1.0) - me.fatigue.clamp(0.0, 1.0))
+            .clamp(-1.0, 1.0);
+        let ball_win = (distance_fit * 0.46
+            + defending_skill * 0.34
+            + fatigue_edge.max(0.0) * 0.14
+            - carrier_security * 0.18)
+            .clamp(0.0, 1.0);
+        let delay_value =
+            ((carrier_goalward_speed / 7.0).clamp(0.0, 1.0) * 0.46 + goal_threat * 0.54)
+                .clamp(0.0, 1.0);
+        let central_lane = (1.0
+            - (carrier.x - self.field_width * 0.5).abs()
+                / (self.field_width * 0.24).max(1.0))
+        .clamp(0.0, 1.0);
+        let (channel_pressure, _, _) = self.defensive_carrier_channel_profile_for(me.team);
+        let redirect_value = (central_lane * 0.62 + channel_pressure * 0.38).clamp(0.0, 1.0);
+        let pass_lane_cut = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == holder.team
+                    && player.id != holder_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|receiver| {
+                let receiver_pos = self.player_snapshot_position(receiver);
+                let forward_yards = (receiver_pos.y - carrier.y) * holder.team.attack_dir();
+                if forward_yards <= 2.0 {
+                    return 0.0;
+                }
+                let lane_gap = segment_distance_to_point(carrier, receiver_pos, me_pos);
+                let lane_fit =
+                    (1.0 - lane_gap / DEFENSIVE_PRESS_CONTAIN_PASS_LANE_RADIUS_YARDS)
+                        .clamp(0.0, 1.0);
+                let goal_value = (1.0
+                    - (holder.team.goal_y(self.field_length) - receiver_pos.y).abs()
+                        / own_half_depth)
+                    .clamp(0.0, 1.0);
+                let forward_fit = (forward_yards / 28.0).clamp(0.0, 1.0);
+                lane_fit * (goal_value * 0.42 + forward_fit * 0.38 + 0.20)
+            })
+            .fold(0.0, f64::max);
+
+        let cover_count = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == me.team
+                    && player.id != me.id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .filter(|player| {
+                let position = self.player_snapshot_position(player);
+                (position.y - carrier.y) * me.team.attack_dir() < -0.5
+                    && position.distance(carrier) <= CARRIER_COVER_RADIUS_YARDS
+            })
+            .count();
+        let cover_fit = (cover_count as f64 / 2.0).clamp(0.0, 1.0);
+        let speed_edge = ((carrier_goalward_speed - defender_speed * 0.72) / 4.5).clamp(0.0, 1.0);
+        let dribble_past_risk = (speed_edge * 0.42
+            + (1.0 - distance_fit) * 0.22
+            + goal_threat * 0.20
+            + (1.0 - cover_fit) * 0.22)
+            .clamp(0.0, 1.0);
+        let in_behind_risk = self
+            .second_last_defender_line_for(holder.team)
+            .map(|line_y| {
+                self.players
+                    .iter()
+                    .filter(|player| {
+                        player.team == holder.team
+                            && player.id != holder_id
+                            && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    })
+                    .map(|runner| {
+                        let runner_pos = self.player_snapshot_position(runner);
+                        let runner_velocity = self.player_velocity(runner.id).unwrap_or(runner.velocity);
+                        let forward_speed = (runner_velocity.y * holder.team.attack_dir()).max(0.0);
+                        if forward_speed <= 1.2 {
+                            return 0.0;
+                        }
+                        let projected = runner_pos
+                            + runner_velocity * DEFENSIVE_PRESS_CONTAIN_RUNNER_HORIZON_SECONDS;
+                        let current_gap = (line_y - runner_pos.y) * holder.team.attack_dir();
+                        let projected_break = (projected.y - line_y) * holder.team.attack_dir();
+                        let timing_fit = (1.0
+                            - current_gap.abs() / DEFENSIVE_PRESS_CONTAIN_RUNNER_THREAT_BAND_YARDS)
+                            .clamp(0.0, 1.0);
+                        let break_fit = (projected_break / 9.0).clamp(0.0, 1.0);
+                        let lane_responsibility =
+                            (1.0 - (runner_pos.x - me_pos.x).abs() / 18.0).clamp(0.0, 1.0);
+                        let goal_value = (1.0
+                            - (holder.team.goal_y(self.field_length) - runner_pos.y).abs()
+                                / own_half_depth)
+                            .clamp(0.0, 1.0);
+                        (forward_speed / 7.0).clamp(0.0, 1.0)
+                            * (timing_fit * 0.32 + break_fit * 0.34 + goal_value * 0.22)
+                            * (0.45 + lane_responsibility * 0.55)
+                    })
+                    .fold(0.0, f64::max)
+            })
+            .unwrap_or(0.0);
+        let central_defender = me.role == PlayerRole::Defender && !self.is_wide_defender(me);
+        let role_press_weight = match me.role {
+            PlayerRole::Defender if central_defender => 1.18,
+            PlayerRole::Defender => 1.02,
+            PlayerRole::Midfielder => 0.95,
+            PlayerRole::Forward => 0.70,
+            PlayerRole::Goalkeeper => 0.0,
+        };
+        let primary_weight = if primary_presser { 1.0 } else { 0.42 };
+        let press_score = ((ball_win * 0.34
+            + delay_value * 0.22
+            + redirect_value * 0.20
+            + pass_lane_cut * 0.24)
+            * role_press_weight
+            * primary_weight)
+            .clamp(0.0, 1.0);
+        let contain_risk = (dribble_past_risk * 0.52
+            + in_behind_risk * 0.36
+            + (1.0 - cover_fit) * goal_threat * 0.12
+            + if central_defender {
+                in_behind_risk * 0.08
+            } else {
+                0.0
+            })
+        .clamp(0.0, 1.0);
+        let press_decision = primary_presser
+            && distance <= HOLDER_PRESS_MAX_DISTANCE_YARDS
+            && press_score >= DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE
+            && press_score + self.own_goal_press_urgency(me.team, carrier) * 0.10
+                >= contain_risk + DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN;
+        let target = if press_decision {
+            let to_own_goal = own_goal - carrier;
+            let goal_side = if to_own_goal.len() > 1e-6 {
+                to_own_goal.normalized()
+            } else {
+                Vec2::new(0.0, -holder.team.attack_dir())
+            };
+            let lateral_sign = if carrier.x <= self.field_width * 0.5 {
+                -1.0
+            } else {
+                1.0
+            };
+            let redirect_block = Vec2::new(lateral_sign, 0.0) * redirect_value * 0.95;
+            let standoff = HOLDER_PRESS_STANDOFF_YARDS
+                + (CARRIER_ADVANCE_JOCKEY_YARDS - HOLDER_PRESS_STANDOFF_YARDS)
+                    * contain_risk
+                    * 0.55;
+            Some((carrier + goal_side * standoff + redirect_block).clamp_to_pitch(
+                self.field_width,
+                self.field_length,
+            ))
+        } else {
+            None
+        };
+        DefensivePressContainProfile {
+            press_score,
+            contain_risk,
+            target,
+            primary_presser,
         }
-        // Close to a tight standoff on the goal side: within contest range, a half-step
-        // off so it forces the holder to act rather than committing to a lunge.
-        let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(me.team));
-        let goal_side = (own_goal - holder_position).normalized();
-        Some(
-            (holder_position + goal_side * HOLDER_PRESS_STANDOFF_YARDS)
-                .clamp_to_pitch(self.field_width, self.field_length),
-        )
+    }
+
+    /// The designated defender steps up to PRESS an opponent ball-holder only when
+    /// the POMDP press value beats the contain/back-off risk. Unlike
+    /// [`Self::fast_carrier_engage_target_for`] (which contests a fast carrier bearing
+    /// down on our box), this evaluates pressure anywhere on the pitch: win/slow,
+    /// redirect, and lane-cut value can trigger the close, while dribble-past or
+    /// runner-in-behind risk withholds it. Only the primary outfielder can receive a
+    /// press target; the rest hold shape or cover.
+    fn holder_press_target_for(&self, me: &PlayerSnapshot) -> Option<Vec2> {
+        self.defensive_press_contain_profile_for(me.id).target
     }
 
     /// Defensive mirror of the offside-trap-breaking run: when an opponent attacker is
@@ -26902,6 +27108,8 @@ impl WorldSnapshot {
                 defensive_cross_arrival_threat_fit: 0.0,
                 goalkeeper_ball_goal_line_alignment_score: 0.0,
                 defensive_line_break_threat: 0.0,
+                defensive_press_action_score: 0.0,
+                defensive_contain_risk_score: 0.0,
                 defensive_carrier_channel_pressure: 0.0,
                 defensive_carrier_channel_side: 0.0,
                 defensive_carrier_channel_cover_count: 0,
@@ -27571,6 +27779,7 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let defensive_press_contain = self.defensive_press_contain_profile_for(player_id);
         let (
             defensive_carrier_channel_pressure,
             defensive_carrier_channel_side,
@@ -28111,6 +28320,11 @@ impl WorldSnapshot {
         // must spark recovery urgency even off the ball, while staying bounded as a lift.
         let defensive_urgency = (base_defensive_urgency
             + field_numbers.defensive_numbers_urgency * defensive_role_urgency * 0.40)
+            .max(
+                (defensive_press_contain.press_score * 0.54
+                    + defensive_press_contain.contain_risk * 0.28)
+                    * defensive_role_urgency,
+            )
             .clamp(0.0, 1.0);
         let pressure_urgency = if has_ball {
             (perceived_pressure * 0.58
@@ -28412,6 +28626,8 @@ impl WorldSnapshot {
             defensive_cross_arrival_threat_fit,
             goalkeeper_ball_goal_line_alignment_score,
             defensive_line_break_threat,
+            defensive_press_action_score: defensive_press_contain.press_score,
+            defensive_contain_risk_score: defensive_press_contain.contain_risk,
             defensive_carrier_channel_pressure,
             defensive_carrier_channel_side,
             defensive_carrier_channel_cover_count,
@@ -45388,6 +45604,9 @@ impl WorldSnapshot {
         // rule on the FINAL assignment for defenders too.
         match self.players.iter().find(|p| p.id == player_id) {
             Some(me) if me.role == PlayerRole::Defender => {
+                if self.defensive_press_contain_profile_for(me.id).target.is_some() {
+                    return target.clamp_to_pitch(self.field_width, self.field_length);
+                }
                 let mut final_target = Vec2::new(
                     target.x,
                     self.defender_line_band_average_adjusted_y(me, target.y),
@@ -45559,6 +45778,9 @@ impl WorldSnapshot {
         // The nearest defender steps up to press any opponent holder (not only a fast
         // carrier near our box), so a holder is never left to dwell on the ball.
         if let Some(press) = self.holder_press_target_for(me) {
+            if let Some(carrier) = self.opponent_holder_position_for(me.team) {
+                return self.shepherd_show_wide_adjusted_target(me, carrier, press);
+            }
             return press;
         }
         if me.role == PlayerRole::Defender {

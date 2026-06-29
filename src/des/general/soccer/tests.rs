@@ -14306,7 +14306,8 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -49423,7 +49424,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
@@ -49605,7 +49607,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -67948,7 +67951,8 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+            + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
@@ -68053,8 +68057,19 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY + 1,
+        SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+            .contains(&SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM),
+        "the pre-defensive-press/contain total must be a recognised legacy dim so old nets migrate"
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
+    assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -69649,6 +69664,186 @@ fn force_wide_channel_pressure_steps_defender_to_inside_shoulder_and_reaches_lea
     assert!(
         features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CARRIER_CHANNEL_COVER] > 0.0,
         "neural learner should directly see cover count"
+    );
+}
+
+#[test]
+fn central_defender_press_profile_steps_when_pressure_value_beats_contain_risk() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let cover = 3;
+    let carrier = 17;
+    let lane_receiver = 18;
+    park_players_except(&mut sim, &[defender, cover, carrier, lane_receiver]);
+
+    sim.players[defender].position = Vec2::new(40.0, 30.0);
+    sim.players[defender].home_position = sim.players[defender].position;
+    sim.players[defender].skills.defending = 9.0;
+    sim.players[defender].skills.defensive_tracking = 9.0;
+    sim.players[defender].skills.aggression = 8.0;
+    sim.players[cover].position = Vec2::new(45.0, 22.0);
+    sim.players[cover].home_position = sim.players[cover].position;
+
+    sim.players[carrier].position = Vec2::new(40.0, 36.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -2.0);
+    sim.players[carrier].skills.dribbling = 4.5;
+    sim.players[carrier].skills.first_touch = 4.5;
+    sim.players[lane_receiver].position = Vec2::new(42.0, 24.0);
+    sim.players[lane_receiver].velocity = Vec2::zero();
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let profile = snapshot.defensive_press_contain_profile_for(defender);
+    assert!(
+        profile.primary_presser,
+        "central defender should be the designated presser"
+    );
+    assert!(
+        profile.target.is_some(),
+        "press value should produce an active press target: {profile:?}"
+    );
+
+    let carrier_pos = snapshot.player_position(carrier).unwrap();
+    let defender_pos = snapshot.player_position(defender).unwrap();
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.distance(carrier_pos) < defender_pos.distance(carrier_pos),
+        "assignment should close the carrier: defender={defender_pos:?} target={assignment:?} carrier={carrier_pos:?}"
+    );
+    assert!(
+        assignment.distance(carrier_pos) <= 4.2,
+        "press target should reach jockeying range: target={assignment:?} carrier={carrier_pos:?}"
+    );
+
+    let observation = snapshot.observation_for(defender);
+    assert!(
+        observation.defensive_press_action_score
+            > observation.defensive_contain_risk_score + 0.16,
+        "POMDP should prefer press over contain: press={} contain={}",
+        observation.defensive_press_action_score,
+        observation.defensive_contain_risk_score
+    );
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(defender),
+        &observation,
+        Team::Home,
+        sim.players[defender].role,
+    );
+    assert!(key.defensive_press_action_bin > key.defensive_contain_risk_bin);
+
+    let transition = SoccerLearningTransition {
+        tick: snapshot.tick,
+        player_id: defender,
+        team: Team::Home,
+        role: sim.players[defender].role,
+        state: snapshot.mdp_state_for_player(defender),
+        observation: observation.clone(),
+        belief: belief_from_observation(&observation),
+        action: "press-cover".to_string(),
+        action_target: None,
+        decision_context: SoccerDecisionContext::default(),
+        tactical_trace: SoccerTacticalLearningTrace::default(),
+        reward: 0.0,
+        next_state: snapshot.mdp_state_for_player(defender),
+        next_observation: observation.clone(),
+        done: false,
+    };
+    let features = soccer_neural_transition_features(&transition);
+    assert!(features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION] > 0.25);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION]
+            > features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK]
+    );
+}
+
+#[test]
+fn central_defender_contains_when_press_opens_dribble_or_runner_behind() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let defender = 2;
+    let carrier = 17;
+    let runner = 18;
+    for player in sim.players.iter_mut() {
+        player.velocity = Vec2::zero();
+        player.acceleration = Vec2::zero();
+        if player.team == Team::Home {
+            if player.role == PlayerRole::Goalkeeper {
+                player.position = Vec2::new(40.0, 6.0);
+            } else if player.id == defender {
+                player.position = Vec2::new(40.0, 34.0);
+            } else {
+                player.position = Vec2::new(8.0 + player.id as f64, 90.0);
+            }
+        } else if player.id != carrier && player.id != runner {
+            player.position = Vec2::new(70.0, 104.0);
+        }
+        player.home_position = player.position;
+    }
+    sim.players[defender].skills.defending = 3.0;
+    sim.players[defender].skills.defensive_tracking = 3.0;
+    sim.players[defender].skills.top_speed = 3.0;
+    sim.players[defender].skills.acceleration = 3.0;
+
+    sim.players[carrier].position = Vec2::new(40.0, 46.0);
+    sim.players[carrier].velocity = Vec2::new(0.0, -4.8);
+    sim.players[carrier].skills.dribbling = 9.5;
+    sim.players[carrier].skills.first_touch = 9.0;
+    sim.players[carrier].skills.acceleration = 9.0;
+    sim.players[runner].position = Vec2::new(42.0, 38.0);
+    sim.players[runner].velocity = Vec2::new(0.0, -5.6);
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = sim.players[carrier].position;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let me = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == defender)
+        .unwrap();
+    assert!(
+        snapshot.fast_carrier_engage_target_for(me).is_none(),
+        "sub-threshold carrier speed should leave the press/contain profile in charge"
+    );
+
+    let profile = snapshot.defensive_press_contain_profile_for(defender);
+    assert!(
+        profile.primary_presser,
+        "central defender should still own the decision"
+    );
+    assert!(
+        profile.target.is_none(),
+        "high dribble/run-behind risk should withhold the press target: {profile:?}"
+    );
+    assert!(
+        profile.contain_risk > profile.press_score + 0.08,
+        "contain risk should beat press score: {profile:?}"
+    );
+
+    let observation = snapshot.observation_for(defender);
+    assert!(
+        observation.defensive_contain_risk_score
+            > observation.defensive_press_action_score + 0.08,
+        "POMDP should prefer contain/back-off: press={} contain={}",
+        observation.defensive_press_action_score,
+        observation.defensive_contain_risk_score
+    );
+    let key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(defender),
+        &observation,
+        Team::Home,
+        sim.players[defender].role,
+    );
+    assert!(key.defensive_contain_risk_bin >= key.defensive_press_action_bin);
+
+    let carrier_pos = snapshot.player_position(carrier).unwrap();
+    let assignment =
+        snapshot.defensive_assignment_for(defender, sim.players[defender].home_position, false);
+    assert!(
+        assignment.distance(carrier_pos) > 5.0,
+        "contain decision should not step into tackle range: target={assignment:?} carrier={carrier_pos:?}"
     );
 }
 
