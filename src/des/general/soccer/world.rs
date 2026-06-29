@@ -46884,3 +46884,27 @@ pub(crate) fn soccer_decision_cadence_max_window() -> (u64, u64) {
         (max, window)
     })
 }
+
+/// Ball-distance (yd) tiers for the adaptive decision cadence: on-ball or within NEAR gets the full
+/// per-window planning budget (3), within MID gets 2, beyond gets 1 — so planning compute is spent
+/// where reactions matter (on/near the ball) and saved on distant off-ball positioning.
+const DECISION_CADENCE_NEAR_YARDS: f64 = 15.0;
+const DECISION_CADENCE_MID_YARDS: f64 = 35.0;
+
+/// Fisher-Yates schedule shuffle: randomize the per-tick processing order of the field entities
+/// (22 players + officials + ball) each tick so contested resolution (possession/collision/keep-out/
+/// shielding, which run in schedule order) carries no systematic act-first bias. Uses the match RNG
+/// → deterministic for a fixed seed. ON in production, OFF in tests (keeps the suite's fixed-order
+/// outcomes stable). Kill in prod with `DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE=0`.
+pub(crate) fn dd_soccer_enable_fisher_yates_schedule() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE"))
+    }
+}
