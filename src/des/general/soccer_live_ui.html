@@ -6251,10 +6251,10 @@ function stepLoopTick() {
       .finally(finish);
   } else {
     // Idle (paused or a step already in flight): re-check soon without bursting.
-    setTimeout(stepLoopTick, Math.min(interval, LIVE_STEP_INTERVAL_MS));
+    setTimeout(stepLoopTick, Math.min(interval, liveStepIntervalMs()));
   }
 }
-setTimeout(stepLoopTick, LIVE_STEP_INTERVAL_MS);
+setTimeout(stepLoopTick, liveStepIntervalMs());
 if (playbackSpeedSelect) {
   playbackSpeedSelect.addEventListener("change", () => {
     playbackSpeed = Number(playbackSpeedSelect.value) || 1;
