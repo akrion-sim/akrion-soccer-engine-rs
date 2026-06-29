@@ -4000,8 +4000,8 @@ function effectiveSimTicksPerPulse() {
   // (smoother) integration. Applies to human-controlled play too (base = 1), so the
   // default controller-assigned game is real-time. (wall-clock = ticksPerPulse * tempo.)
   const base = liveControllerAssigned() ? 1 : configuredSimTicksPerPulse();
-  const dt = Number(state?.config?.dtSeconds) || (LIVE_STEP_INTERVAL_MS / 1000);
-  const dtScale = (LIVE_STEP_INTERVAL_MS / 1000) / Math.max(1e-3, dt);
+  const dt = Number(state?.config?.dtSeconds) || (liveStepIntervalMs() / 1000);
+  const dtScale = (liveStepIntervalMs() / 1000) / Math.max(1e-3, dt);
   return clamp(Math.round(base * dtScale), 1, 1000);
 }
 // Target gap between step starts. The tempo selector scales the base pulse
