@@ -93,6 +93,8 @@ mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
 pub use pass_lane_yield::*;
+mod slip_break_offside;
+pub(crate) use slip_break_offside::*;
 
 pub const DEFAULT_DT_SECONDS: f64 = 1.0 / 15.0;
 /// Convert a real-world duration in seconds to a whole number of simulation ticks at the
@@ -6088,6 +6090,20 @@ pub struct SoccerPomdpObservation {
     /// encoder (FEATURE_DIM unchanged).
     #[serde(default)]
     pub best_forward_pass_option_quality: f64,
+    /// Slip-and-break-the-offside-trap recognition for the ball-carrier: quality `[0,1]` of the
+    /// best available slip — a firm forward ground ball through a two-defender seam to a teammate
+    /// who has started a timed break from an onside staging band (see [`defender_seam_quality`] /
+    /// [`slip_break_opportunity_quality`]). Consumed by the slip-break pass bias under
+    /// `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE`. Not part of the neural feature encoder
+    /// (FEATURE_DIM unchanged).
+    #[serde(default)]
+    pub slip_break_seam_quality: f64,
+    /// Release-timing strength `[0,1]` that a slip-break runner is at the trigger point (~2–3 yd
+    /// before the line, sprinting, still onside) so the firm ground ball should be slipped NOW —
+    /// the pass comes *after* the run has started. Drives the carrier's quick release under
+    /// `DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE`. Not in the neural encoder (FEATURE_DIM unchanged).
+    #[serde(default)]
+    pub slip_break_release_now: f64,
     #[serde(default)]
     pub nearest_forward_teammate_distance_yards: f64,
     #[serde(default)]
