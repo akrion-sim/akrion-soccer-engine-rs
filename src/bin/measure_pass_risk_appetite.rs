@@ -184,6 +184,16 @@ fn main() {
         "total goals: home {goals_home} / away {goals_away} (sum {})   unique pass decisions: {unique_pass_decisions}",
         goals_home + goals_away
     );
+    // Machine-readable raw sums for cross-process (sharded) aggregation. One line per bucket:
+    //   RAW\t<role|zone>\tpasses\tfwd\tlat\tback\tsum_fwd_yds\tsum_completion\tsum_openness
+    // Plus a totals line. A summing script can fold many shards' RAW lines into one A/B table.
+    println!("RAW\tGOALS\t{goals_home}\t{goals_away}\t{unique_pass_decisions}");
+    for (key, b) in &buckets {
+        println!(
+            "RAW\t{key}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            b.passes, b.fwd, b.lat, b.back, b.sum_fwd_yds, b.sum_completion, b.sum_openness
+        );
+    }
     println!(
         "\n{:<26}{:>7}{:>7}{:>7}{:>7}{:>11}{:>10}{:>10}",
         "role | zone", "passes", "fwd%", "lat%", "back%", "avgFwdYds", "avgComp", "avgOpen"
