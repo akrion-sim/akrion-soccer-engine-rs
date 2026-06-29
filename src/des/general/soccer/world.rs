@@ -44955,9 +44955,11 @@ impl WorldSnapshot {
         let candidate_occupancy = self.candidate_occupancy_at(player.team, target, Some(player.id));
         let spacing = candidate_occupancy.team_spacing_score(spacing_mode);
         let space = (self.space_score_at(target, player.team) / 18.0).clamp(0.0, 1.0);
+        // Parenthesised to match `teammate_occupied_space_penalty_at` exactly
+        // (MAX * (pressure * (1 - relief))) so the result is bit-for-bit unchanged.
         let teammate_penalty = TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY
-            * candidate_occupancy.teammate_occupied_space_pressure()
-            * (1.0 - relief.clamp(0.0, 0.78));
+            * (candidate_occupancy.teammate_occupied_space_pressure()
+                * (1.0 - relief.clamp(0.0, 0.78)));
         let lane_penalty = self.vertical_lane_penalty_for_player_target(player, target, relief);
         let line_penalty = self.role_line_penalty_for_player_target(player, target, relief);
         let offside_penalty = if possession == Some(player.team) {
