@@ -50796,7 +50796,10 @@ fn dd_soccer_enable_blindside_steal() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok())
+        // Default ON in production (kill with DD_SOCCER_ENABLE_BLINDSIDE_STEAL=0): defenders steal
+        // from behind a blind dribbler when they believe they can win it; the carrier glances to
+        // recognize the threat. Tests stay default-OFF (suite stable).
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BLINDSIDE_STEAL"))
     }
 }
 
