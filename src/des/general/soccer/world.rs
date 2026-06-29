@@ -30952,6 +30952,15 @@ impl WorldSnapshot {
                     .score
                     * SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT;
                 let long_backward_penalty = long_backward_pass_penalty(forward);
+                // Exponentially-escalating backward-pass risk (on top of the linear penalty): the
+                // danger of a deep retreat compounds, so a 20yd backward ball is priced ~5x a
+                // 10yd one. Gated default-ON; 0 (inert) when off. See
+                // `backward_pass_exponential_risk_penalty`.
+                let backward_exponential_risk_penalty = if dd_soccer_enable_backward_exp_risk() {
+                    backward_pass_exponential_risk_penalty(forward)
+                } else {
+                    0.0
+                };
                 // A backward ball played through opponents is doubly dangerous. The path
                 // traffic is already counted in `pass_quality` and scaled by backward depth
                 // for both floor and aerial candidates, so use that single source of truth.
