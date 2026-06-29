@@ -7939,6 +7939,30 @@ impl SoccerMatch {
                     if self.players[actor].slide_recovery_seconds > 0.0 {
                         continue;
                     }
+                    // Decision cadence (dt = 1/30): a player recomputes its deliberative decision at
+                    // most once every `cadence_interval` ticks, STAGGERED by id; on the in-between
+                    // ticks it REPLAYS its sustainable held intent and keeps moving/animating — no
+                    // expensive decision is computed. Human-controlled players are never gated (they
+                    // must stay responsive), and a player whose held intent is a spent one-shot
+                    // (`continuation_intent()` == None, e.g. a played pass/shot/tackle) decides
+                    // regardless, so carriers/finishers never go stale. See docs/parallel-decision-plan.md.
+                    let cadence_interval = soccer_decision_cadence_interval_ticks();
+                    let cadence_due = self.players[actor].controller_slot.is_some()
+                        || cadence_interval <= 1
+                        || self.tick.wrapping_add(scheduled.id as u64) % cadence_interval == 0;
+                    if !cadence_due {
+                        if let Some(held_intent) = self.players[actor].continuation_intent() {
+                            self.pending_human_control = None;
+                            let intent_player_id = held_intent.player_id;
+                            self.apply_player_intent(held_intent);
+                            if self.ball.holder == Some(intent_player_id) {
+                                self.sync_held_ball_to_holder();
+                            }
+                            self.enforce_restart_keepout_for(intent_player_id);
+                            self.enforce_shield_body_barrier_for(intent_player_id);
+                            continue;
+                        }
+                    }
                     let decision_context =
                         self.player_decision_timing_context_for(actor, scheduled.id);
                     let phase_started = Instant::now();
