@@ -55592,8 +55592,9 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
 /// into safety (amplify the risk penalty), forwards lean into a slightly higher appetite for a
 /// FORWARD ball (mute the risk penalty for forward passes and lift forward-progress weight),
 /// especially in the opponent's final third. Sideways/backward balls keep ~full risk pricing so
-/// "brave" never means a loose square ball. Default-OFF and byte-identical when off; opt-in via
-/// env, then A/B before promoting to [`gate_default_on`].
+/// "brave" never means a loose square ball. Default-ON in production now that the ranker and A/B
+/// harness share the same gate (`DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE=0/false/no/off` remains
+/// the kill switch); default-OFF under test so parity suites stay byte-identical unless opted in.
 pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     #[cfg(test)]
     {
@@ -55603,9 +55604,6 @@ pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        // Default ON in production (kill with DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE=0): defenders
-        // price interception risk higher (safer passes), forwards lower on forward balls + prefer a
-        // forward pass over square/back in the final third. Tests stay default-OFF (suite stable).
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE"))
     }
 }

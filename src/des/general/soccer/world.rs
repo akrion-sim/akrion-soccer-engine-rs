@@ -20757,6 +20757,31 @@ fn pass_role_risk_score_adjustment(
     }
 }
 
+fn active_pass_role_risk_score_adjustment(
+    role: PlayerRole,
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    field_length: f64,
+    forward_yards: f64,
+    quality: &PassTargetQuality,
+    directive_risk_tolerance: f64,
+) -> PassRoleRiskScoreAdjustment {
+    if !dd_soccer_enable_role_pass_risk_appetite() {
+        return PassRoleRiskScoreAdjustment::default();
+    }
+    pass_role_risk_score_adjustment(
+        role,
+        team,
+        origin,
+        target,
+        field_length,
+        forward_yards,
+        quality,
+        directive_risk_tolerance,
+    )
+}
+
 fn first_touch_shape_prior_for_snapshot(
     directive: &TeamTacticalDirective,
     team_shape: TeamShapeObservation,
@@ -30075,7 +30100,7 @@ impl WorldSnapshot {
         // Role-aware risk/safety appetite for the player on the ball (see
         // `pass_risk_appetite_for_passer`): defenders price interception risk harder, forwards in
         // the final third price a FORWARD ball softer and prefer it over a safe square/back ball.
-        // NEUTRAL (byte-identical) unless `DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE` is set.
+        // Production-on with a kill switch; neutral in tests unless the gate is set.
         let passer_in_attacking_third =
             (me.team.goal_y(self.field_length) - me_position.y).abs() <= self.field_length / 3.0;
         let pass_risk_appetite = pass_risk_appetite_for_passer(me.role, passer_in_attacking_third);
@@ -30872,7 +30897,7 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
-                let role_risk = pass_role_risk_score_adjustment(
+                let role_risk = active_pass_role_risk_score_adjustment(
                     me.role,
                     me.team,
                     me_position,
@@ -31291,7 +31316,7 @@ impl WorldSnapshot {
                         / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
                         .clamp(0.0, 1.0)
                         * 1.2;
-                let role_risk = pass_role_risk_score_adjustment(
+                let role_risk = active_pass_role_risk_score_adjustment(
                     me.role,
                     me.team,
                     me_position,
