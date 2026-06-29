@@ -5422,6 +5422,27 @@ impl PlayerAgent {
                 }
             }
         }
+        // Isolated attacking carrier (gated `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; OFF ⇒
+        // no-op, byte-identical). When a Forward / winger has the ball in the attacking half with
+        // NO teammate ahead and no open forward pass, he used to deliberate into a panicked
+        // BACKWARD pass. Instead: DRIVE at goal (sprint, then shoot in range) when few defenders
+        // are behind the ball or there's space + a speed advantage; otherwise HOLD the ball up,
+        // carrying it forward / on an angle at a controlled pace while teammates push up to join
+        // the attack (the `front_line_carrier_support_cue` does the calling-forward). A
+        // backward/square recycle is the very last resort in BOTH modes — damped hard, never
+        // made illegal so it survives when nothing else is on.
+        if isolated_carrier_drive_enabled() {
+            if let Some(mode) =
+                isolated_attacking_carrier_drive_mode(observation, self.role, outside_midfielder)
+            {
+                apply_isolated_carrier_drive_bias(
+                    &mut options,
+                    mode,
+                    observation.yards_to_goal <= ISOLATED_CARRIER_SHOOT_YARDS,
+                    shot_legal,
+                );
+            }
+        }
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
