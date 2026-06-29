@@ -106,6 +106,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let ticks: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9000);
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
+    // Optional seed-base (hex) so independent processes can shard disjoint seed ranges and run in
+    // parallel — each ~4min match is single-threaded, so sharding is the only way to scale the A/B.
+    let seed_base: u32 = args
+        .get(3)
+        .map(|s| s.trim_start_matches("0x"))
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .unwrap_or(0x5EED_0000);
 
     let gate_on = std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok();
 
