@@ -58462,6 +58462,27 @@ fn wall_pass_leg_backward_risk(forward_yards: f64, opponents_on_path: usize) -> 
         .min(WALL_PASS_BACKWARD_RISK_MAX)
 }
 
+/// Exponential risk demerit for a BACKWARD pass, layered ON TOP of the linear
+/// [`long_backward_pass_penalty`]. Returns 0 for forward/square balls and for short backward
+/// resets up to [`BACKWARD_EXP_RISK_FREE_YARDS`]; beyond that the demerit grows as
+/// `SCALE * GROWTH_PER_REF^(backward_yards / REF_YARDS)`, so the penalty multiplies by
+/// `GROWTH_PER_REF` (5x) for every `REF_YARDS` (10yd) of extra retreat — a 20yd backward pass is
+/// priced ~5x a 10yd one. Capped so it never overflows or fully dominates the score. `forward_yards`
+/// is signed attacking-direction progress (negative = backward). Pure / RNG-free.
+fn backward_pass_exponential_risk_penalty(forward_yards: f64) -> f64 {
+    if !forward_yards.is_finite() || forward_yards >= -BACKWARD_EXP_RISK_FREE_YARDS {
+        return 0.0;
+    }
+    let backward_yards = -forward_yards;
+    let exponent = backward_yards / BACKWARD_EXP_RISK_REF_YARDS.max(1e-6);
+    let penalty = BACKWARD_EXP_RISK_SCALE * BACKWARD_EXP_RISK_GROWTH_PER_REF.powf(exponent);
+    if penalty.is_finite() {
+        penalty.min(BACKWARD_EXP_RISK_CAP)
+    } else {
+        BACKWARD_EXP_RISK_CAP
+    }
+}
+
 fn backward_pass_depth_adjustment(forward_yards: f64) -> f64 {
     if !forward_yards.is_finite() || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS {
         return 0.0;
