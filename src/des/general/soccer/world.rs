@@ -12648,6 +12648,9 @@ impl SoccerMatch {
                     self.players[player_id].incoming_ball = None;
                     let offside = target_id
                         .and_then(|target| snapshot.pending_offside_for_pass(player_id, target));
+                    // Captured before `offside` is moved into the pending pass below; the
+                    // slip-break reward only fires when the runner was onside (trap beaten).
+                    let pass_is_onside = offside.is_none();
                     let offside_candidates = snapshot.offside_candidates_for_pass(player_id);
                     let receiver_position_at_launch = target_id.and_then(|target| {
                         snapshot.player_position(target).or_else(|| {
@@ -12692,6 +12695,56 @@ impl SoccerMatch {
                             flight,
                         ),
                     });
+                    // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
+                    // to an ONSIDE runner who timed his break into a two-defender seam. Detect the
+                    // opportunity once (the actual pass target IS the breaking runner) and use it
+                    // for two gated, independent effects. Both off ⇒ byte-identical.
+                    let slip_break_executed = if !flight.is_aerial() && !is_cross && pass_is_onside {
+                        target_id.and_then(|runner| {
+                            snapshot
+                                .slip_break_runner_opportunity(
+                                    player_team,
+                                    player_id,
+                                    player_pos,
+                                    runner,
+                                )
+                                .map(|opportunity| (runner, opportunity))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((runner, opportunity)) = slip_break_executed {
+                        // Decision side: firm the slip into the 25–35 mph band so it beats the
+                        // recovering defender into the space (a tentative ground ball gets cut
+                        // out). Only ever raises the speed; never softens it.
+                        if dd_soccer_enable_slip_break_offside() {
+                            let firm_yps = mph_to_yps(slip_break_pass_speed_mph(release_distance));
+                            let current_speed = self.ball.velocity.len();
+                            if current_speed.is_finite()
+                                && current_speed > 1e-6
+                                && current_speed < firm_yps
+                            {
+                                self.ball.velocity = self.ball.velocity * (firm_yps / current_speed);
+                                if let Some(pending) = self.pending_pass.as_mut() {
+                                    pending.launch_speed_yps = firm_yps;
+                                }
+                            }
+                        }
+                        // Shared (centralized MAPPO) reward: the passer AND the runner split the
+                        // credit (the cooperative team-reward path), reinforcing the coordinated
+                        // pattern — the runner starting first, the carrier slipping it through at
+                        // the right moment. A pass flagged offside never reaches here: the trap
+                        // was not beaten, so there is nothing to reward.
+                        if dd_soccer_enable_slip_break_offside_reward() {
+                            let amount = opportunity.opportunity * SLIP_BREAK_REWARD_POINTS;
+                            self.record_involved_team_reward_at(
+                                self.tick,
+                                player_team,
+                                amount,
+                                &[player_id, runner],
+                            );
+                        }
+                    }
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
@@ -19809,6 +19862,19 @@ struct ForwardSupportContext {
     best_quick_forward_target: Option<usize>,
 }
 
+/// A slip-and-break-the-offside-trap opportunity for one runner, as seen from a passer (see
+/// [`WorldSnapshot::slip_break_runner_opportunity`]). All scalar factors are `[0,1]`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlipBreakOpportunity {
+    /// How well the release moment fits the ~2–3-yd-before-the-line window given the runner's
+    /// sprint (0 if offside or not closing).
+    pub(crate) timing: f64,
+    /// Openness of the carrier→seam ground-pass lane.
+    pub(crate) lane_openness: f64,
+    /// Combined opportunity quality (seam × timing × lane × pace advantage) for ranking/reward.
+    pub(crate) opportunity: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FieldFrontBehindContext {
     field_players_ahead: usize,
@@ -25638,6 +25704,8 @@ impl WorldSnapshot {
                 threaded_goal_pass_over_top_goalkeeper_avoidance_yards: 0.0,
                 best_forward_pass_receiver_openness: 0.0,
                 best_forward_pass_option_quality: 0.0,
+                slip_break_seam_quality: 0.0,
+                slip_break_release_now: 0.0,
                 nearest_forward_teammate_distance_yards: 0.0,
                 floor_pass_lane_score: 0.0,
                 best_pass_receiver_openness: 0.0,
@@ -26922,6 +26990,13 @@ impl WorldSnapshot {
             .map(|guidance| finite_metric(guidance.speed_match_weight))
             .unwrap_or(0.0);
         let urgency_elapsed = phase_started.elapsed();
+        // Slip-and-break-the-offside-trap recognition for the carrier: the best seam to slip a
+        // firm forward ground ball through to a teammate who has STARTED a timed break, and how
+        // strongly the moment to release has arrived (the runner ~2–3 yd before the line). Both
+        // are 0 when the gate is off, so the observation stays byte-identical. See
+        // `slip_break_carrier_recognition`.
+        let (slip_break_seam_quality, slip_break_release_now) =
+            self.slip_break_carrier_recognition(me, me_position);
         let mut observation = SoccerPomdpObservation {
             player_id,
             player_grid,
@@ -27003,6 +27078,8 @@ impl WorldSnapshot {
                 .best_forward_pass_receiver_openness,
             best_forward_pass_option_quality: forward_support_context
                 .best_forward_pass_option_quality,
+            slip_break_seam_quality,
+            slip_break_release_now,
             nearest_forward_teammate_distance_yards: forward_support_context
                 .nearest_forward_teammate_distance_yards,
             floor_pass_lane_score,
@@ -30164,6 +30241,226 @@ impl WorldSnapshot {
         defender_ys.get(1).copied()
     }
 
+    /// Find the best **seam** to slip a firm ground ball through for a runner staged near
+    /// `runner_position`: a lateral gap between two adjacent opponent defenders on the line, with
+    /// open space behind to run into. Returns the in-behind target point (nudged laterally away
+    /// from the keeper, per the usual angled slip) and the seam quality `[0,1]`. The seam closest
+    /// to the runner's lane wins. Used by the runner's timed-break target, the carrier's
+    /// recognition, and the shared reward. Pure read; no gate (callers gate).
+    pub(crate) fn slip_break_seam_for(
+        &self,
+        attacking_team: Team,
+        runner_position: Vec2,
+    ) -> Option<(Vec2, f64)> {
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let mut line_defenders: Vec<Vec2> = self
+            .players
+            .iter()
+            .filter(|p| p.team == attacking_team.other() && p.role != PlayerRole::Goalkeeper)
+            .filter_map(|p| self.player_position(p.id))
+            .filter(|pos| (pos.y - line_y).abs() <= SLIP_BREAK_LINE_BAND_YARDS)
+            .collect();
+        if line_defenders.len() < 2 {
+            return None;
+        }
+        line_defenders.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        let behind_space = ((attacking_team.goal_y(self.field_length) - line_y) * attack_dir)
+            .max(0.0);
+        let keeper_x = self
+            .goalkeeper_for(attacking_team.other())
+            .and_then(|id| self.player_position(id))
+            .map(|p| p.x)
+            .unwrap_or(self.field_width * 0.5);
+        let mut best: Option<(Vec2, f64)> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for pair in line_defenders.windows(2) {
+            let gap = pair[1].x - pair[0].x;
+            let seam_quality = defender_seam_quality(gap, behind_space);
+            if seam_quality <= 0.0 {
+                continue;
+            }
+            let seam_center = (pair[0].x + pair[1].x) * 0.5;
+            // Angle the slip away from the keeper (usual through-ball line); for a central seam
+            // under a central keeper, break toward the nearer touchline's open side.
+            let away_dir = if (seam_center - keeper_x).abs() < 1e-3 {
+                if seam_center < self.field_width * 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            } else {
+                (seam_center - keeper_x).signum()
+            };
+            let target_x = (seam_center + away_dir * SLIP_BREAK_KEEPER_AVOID_NUDGE_YARDS)
+                .clamp(4.0, self.field_width - 4.0);
+            let target_y = line_y + attack_dir * SLIP_BREAK_BEHIND_TARGET_YARDS;
+            let target =
+                Vec2::new(target_x, target_y).clamp_to_pitch(self.field_width, self.field_length);
+            // Prefer the seam nearest the runner's lane (he has to be able to reach it).
+            let lane_penalty = (seam_center - runner_position.x).abs() * 0.02;
+            let score = seam_quality - lane_penalty;
+            if score > best_score {
+                best_score = score;
+                best = Some((target, seam_quality));
+            }
+        }
+        best
+    }
+
+    /// Evaluate a teammate `runner_id` as a slip-break receiver for a pass from `passer_pos`:
+    /// he must be staged 5–10 yd onside of the line (not yet across it) with a real seam to break
+    /// into. Bundles the seam target, seam quality, release timing (how well *now* fits the
+    /// ~2–3-yd-before-the-line window given his sprint), the carrier→seam lane openness, and his
+    /// pace advantage over the back line (the holder's core recognition cue). Returns `None` if
+    /// he is not a valid slip-break runner. Pure read; no gate (callers gate).
+    pub(crate) fn slip_break_runner_opportunity(
+        &self,
+        attacking_team: Team,
+        passer_id: usize,
+        passer_pos: Vec2,
+        runner_id: usize,
+    ) -> Option<SlipBreakOpportunity> {
+        if runner_id == passer_id {
+            return None;
+        }
+        let runner = self.players.iter().find(|p| p.id == runner_id)?;
+        if runner.team != attacking_team
+            || !matches!(runner.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let runner_pos = self.player_snapshot_position(runner);
+        let yards_to_line = (line_y - runner_pos.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let onside = yards_to_line > 0.0;
+        let runner_vel = self
+            .player_velocity(runner_id)
+            .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+        let runner_forward_yps = runner_vel.y * attack_dir;
+        let (seam_target, seam_quality) = self.slip_break_seam_for(attacking_team, runner_pos)?;
+        // The back line's forward velocity (attacking frame): a line stepping up to spring the
+        // trap moves AGAINST the attack, increasing the runner's effective speed advantage.
+        let line_forward_yps = self.slip_break_line_forward_velocity(attacking_team, line_y);
+        let speed_advantage = slip_break_speed_advantage(runner_forward_yps, line_forward_yps);
+        let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
+        let lane_openness = if lane_open { 1.0 } else { 0.35 };
+        let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
+        let opportunity = slip_break_opportunity_quality(
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+        );
+        Some(SlipBreakOpportunity {
+            timing,
+            lane_openness,
+            opportunity,
+        })
+    }
+
+    /// Mean forward velocity (yd/s, attacking frame) of the opponent defenders forming the line —
+    /// negative when the line is stepping up to spring the offside trap. Zero if the line cannot
+    /// be sampled.
+    fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
+        let attack_dir = attacking_team.attack_dir();
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == attacking_team.other() && p.role != PlayerRole::Goalkeeper)
+        {
+            let Some(pos) = self.player_position(p.id) else {
+                continue;
+            };
+            if (pos.y - line_y).abs() > SLIP_BREAK_LINE_BAND_YARDS {
+                continue;
+            }
+            let vel = self
+                .player_velocity(p.id)
+                .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+            total += vel.y * attack_dir;
+            count += 1.0;
+        }
+        if count > 0.0 {
+            total / count
+        } else {
+            0.0
+        }
+    }
+
+    /// Carrier-side recognition of a slip-break opportunity (only the ball-holder recognizes a
+    /// slip): the best seam-opportunity quality across teammates who have STARTED a timed break,
+    /// and how strongly the release moment has arrived (a runner ~2–3 yd before the line,
+    /// sprinting, onside). Returns `(seam_quality, release_now)`, both `0` when the gate is off or
+    /// this player is not on the ball — so the observation stays byte-identical with the gate off.
+    pub(crate) fn slip_break_carrier_recognition(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+    ) -> (f64, f64) {
+        if !dd_soccer_enable_slip_break_offside() || self.ball.holder != Some(me.id) {
+            return (0.0, 0.0);
+        }
+        let mut best_seam = 0.0f64;
+        let mut best_release = 0.0f64;
+        for p in self
+            .players
+            .iter()
+            .filter(|p| p.team == me.team && p.id != me.id)
+        {
+            if let Some(o) =
+                self.slip_break_runner_opportunity(me.team, me.id, me_position, p.id)
+            {
+                best_seam = best_seam.max(o.opportunity);
+                best_release = best_release.max(o.timing * o.lane_openness);
+            }
+        }
+        (best_seam, best_release)
+    }
+
+    /// Runner-initiated timed break to slip in behind through a defender seam (the heart of the
+    /// pattern): a forward/attacking-mid staged 5–10 yd onside of the line, in possession, with a
+    /// real seam, breaks toward that seam channel — staying onside (targeting the line) until the
+    /// ball is actually slipped, then breaking beyond into the space to run onto it. Gated; `None`
+    /// when off ⇒ byte-identical.
+    pub(crate) fn slip_break_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        if !dd_soccer_enable_slip_break_offside() {
+            return None;
+        }
+        let me = self.players.iter().find(|p| p.id == player_id)?;
+        if self.possession_team() != Some(me.team)
+            || self.ball.holder == Some(player_id)
+            || !matches!(me.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(me.team)?;
+        let attack_dir = me.team.attack_dir();
+        let current = self.player_snapshot_position(me);
+        let yards_to_line = (line_y - current.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let (seam_target, _quality) = self.slip_break_seam_for(me.team, current)?;
+        // Offside is judged when the ball is played: hold the run to the line (the shoulder, at
+        // the seam's lane) until our ball is actually in flight, THEN break beyond into the space.
+        let ball_released = self.pending_pass.is_some();
+        let run_y = if ball_released {
+            seam_target.y
+        } else {
+            line_y
+        };
+        let target_x = (current.x * 0.45 + seam_target.x * 0.55)
+            .clamp(4.0, self.field_width - 4.0);
+        Some(Vec2::new(target_x, run_y).clamp_to_pitch(self.field_width, self.field_length))
+    }
+
     fn neutral_in_behind_window(&self, team: Team) -> bool {
         let progress_from_midfield =
             (self.ball.position.y - self.field_length * 0.5) * team.attack_dir();
@@ -30702,6 +30999,13 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn in_behind_run_target_for(&self, player_id: usize) -> Option<Vec2> {
+        // Slip-and-break-the-offside-trap (gated): a runner staged onside who has a seam to break
+        // into takes priority over the generic in-behind cadence — he initiates the sprint into
+        // the seam channel and the carrier then slips the ball through. `None` (so the generic
+        // logic below runs) when off or no seam is on. See `slip_break_run_target_for`.
+        if let Some(target) = self.slip_break_run_target_for(player_id) {
+            return Some(target);
+        }
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let backfield_long_pass_invite = self.backfield_long_pass_run_invite_for(player_id);
         if self.possession_team() != Some(me.team)

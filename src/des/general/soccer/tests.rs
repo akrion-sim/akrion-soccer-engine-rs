@@ -85149,3 +85149,117 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     assert!(r[4] < 0.0, "opponent depth {} should be behind", r[4]);
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
 }
+
+#[test]
+fn slip_break_seam_and_runner_opportunity_are_recognised() {
+    // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
+    // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
+    // via the pure helpers to avoid process-global env races). Home attacks toward larger y.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_242,
+        ..Default::default()
+    });
+    let away_keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .expect("away keeper");
+    let away_defs: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .take(4)
+        .collect();
+    assert_eq!(away_defs.len(), 4, "expected a back four");
+    let passer = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
+        .map(|p| p.id)
+        .expect("home midfielder");
+    let runner = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("home forward");
+    let kept = {
+        let mut v = away_defs.clone();
+        v.extend_from_slice(&[away_keeper, passer, runner]);
+        v
+    };
+    // Push everyone else upfield (small y) so the back four are the deepest outfielders and
+    // define the offside line.
+    for p in &mut sim.players {
+        if kept.contains(&p.id) {
+            continue;
+        }
+        p.position = Vec2::new(8.0, 55.0);
+        p.velocity = Vec2::zero();
+    }
+    // Back four on a line at y=90 with a wide central seam (x 32..52) and tighter outer gaps.
+    let line_y = 90.0;
+    for (def, x) in away_defs.iter().zip([24.0, 32.0, 52.0, 60.0]) {
+        sim.players[*def].position = Vec2::new(x, line_y);
+        sim.players[*def].velocity = Vec2::zero();
+    }
+    sim.players[away_keeper].position = Vec2::new(40.0, 110.0);
+    sim.players[away_keeper].velocity = Vec2::zero();
+    // Carrier on the ball behind; runner staged ~2.5 yd onside of the line, sprinting forward.
+    sim.players[passer].position = Vec2::new(40.0, 70.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[runner].position = Vec2::new(42.0, line_y - 2.5);
+    sim.players[runner].velocity = Vec2::new(0.0, 5.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        snapshot.second_last_defender_line_for(Team::Home),
+        Some(line_y),
+        "back four should set the offside line"
+    );
+    let (seam_target, seam_quality) = snapshot
+        .slip_break_seam_for(Team::Home, sim.players[runner].position)
+        .expect("a seam through the back four");
+    assert!(seam_quality > 0.5, "wide central seam quality {seam_quality}");
+    // The slip is angled into the space behind the line.
+    assert!(
+        (seam_target.y - line_y) * Team::Home.attack_dir() > 0.0,
+        "seam target {seam_target:?} should be behind the line"
+    );
+
+    let opportunity = snapshot
+        .slip_break_runner_opportunity(
+            Team::Home,
+            passer,
+            sim.players[passer].position,
+            runner,
+        )
+        .expect("an onside, well-timed slip-break runner");
+    assert!(
+        opportunity.timing > 0.5,
+        "runner ~2.5 yd before the line, sprinting, should be at the release window: {}",
+        opportunity.timing
+    );
+    assert!(opportunity.opportunity > 0.0, "a real opportunity exists");
+
+    // A runner who has already crossed the line is offside-side ⇒ not a slip-break candidate.
+    sim.players[runner].position = Vec2::new(42.0, line_y + 5.0);
+    let snapshot_offside = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot_offside
+            .slip_break_runner_opportunity(
+                Team::Home,
+                passer,
+                sim.players[passer].position,
+                runner,
+            )
+            .is_none(),
+        "a runner already beyond the line is not a slip-break candidate"
+    );
+}

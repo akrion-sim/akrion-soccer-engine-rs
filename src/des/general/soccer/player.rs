@@ -4415,7 +4415,19 @@ impl PlayerAgent {
             low_pressure_pass_release_multiplier(observation, PassFlight::Floor);
         let aerial_pass_patience_multiplier =
             low_pressure_pass_release_multiplier(observation, PassFlight::Aerial);
-        let hold_release_score_cap = 1.22 * hold_release_multiplier.clamp(1.0, 1.38);
+        // Slip-and-break-the-offside-trap release: when a teammate has STARTED a timed break and
+        // is ~2–3 yd before the line (still onside, sprinting), the firm forward ground ball must
+        // be slipped NOW — the pass comes after the run. Lift the forward pass score and raise the
+        // release cap so the slip isn't clamped away into a hold/dribble. Gated; 0 (inert) when
+        // off ⇒ byte-identical. See `slip_break_release_now` / `dd_soccer_enable_slip_break_offside`.
+        let slip_break_release = if dd_soccer_enable_slip_break_offside() {
+            observation.slip_break_release_now.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let slip_break_pass_multiplier = 1.0 + slip_break_release * SLIP_BREAK_RELEASE_PASS_LIFT;
+        let hold_release_score_cap = (1.22 * hold_release_multiplier.clamp(1.0, 1.38))
+            * (1.0 + slip_break_release * SLIP_BREAK_RELEASE_CAP_LIFT);
         let aerial_forward_runner_multiplier = observation
             .aerial_forward_runner_pass_multiplier
             .clamp(1.0, 1.50);
@@ -4760,6 +4772,7 @@ impl PlayerAgent {
                 * crowded_pass_lift
                 * pressured_release_multiplier
                 * panic_pass_damp
+                * slip_break_pass_multiplier
                 * rank_weight)
                 .clamp(0.004, hold_release_score_cap);
             options.push(AgentActionOptionTrace::new(
