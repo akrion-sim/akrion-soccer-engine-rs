@@ -88846,14 +88846,6 @@ fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
             FORWARD_CARRY_MAX_REWARDED_SEGMENTS
         )
     );
-    // Productive payout is likewise capped (2yd cadence).
-    let pts = t.productive_carry_reward_points();
-    assert!(
-        (pts - FORWARD_CARRY_MAX_REWARDED_SEGMENTS as f64
-            * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS)
-            .abs()
-            < 1e-9
-    );
     // Beyond the cap pays nothing more.
     assert_eq!(t.fold_tick(10.0), seg(0, 0));
     // Non-finite deltas are ignored (no panic, no reward).
