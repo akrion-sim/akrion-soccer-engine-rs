@@ -1895,6 +1895,13 @@ static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHe
 static CARRIED_LONG_PASS_RUN_HEAD: std::sync::Mutex<Option<LongPassRunHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory give-and-go / wall-pass appetite head (which one-two to commit to and when),
+/// carried + trained across games WITHIN a learner process, mirroring
+/// `CARRIED_LONG_PASS_RUN_HEAD`. Resets on pod restart; untouched unless the model is enabled
+/// (DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO).
+static CARRIED_GIVE_AND_GO_HEAD: std::sync::Mutex<Option<GiveAndGoHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory receive-approach head (how far a receiver steps toward/away from an incoming
 /// ball), carried + trained across games WITHIN a learner process, mirroring
 /// `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart; untouched unless the model is
