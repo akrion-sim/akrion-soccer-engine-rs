@@ -5593,12 +5593,30 @@ impl PlayerAgent {
                 observation.perceived_time_on_ball_seconds,
             );
             if strength > 0.0 {
-                let floor = (0.42 + 0.50 * strength).clamp(0.40, 0.95);
+                // Floor the forward ball high enough to clearly beat a sideways carry / shield /
+                // hoof (those score ~0.7), so a recognised open man ahead is actually played.
+                let floor = (0.52 + 0.45 * strength).clamp(0.50, 0.98);
                 ensure_min_legal_option_probability(&mut options, "pass1", floor);
-                let dwell_damp = (1.0 - 0.50 * strength).clamp(0.45, 1.0);
-                for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
-                    scale_legal_option_score(&mut options, label, dwell_damp);
+                // Damp the STALL / sideways / hoof family hard (shielding and stopping with an open
+                // man ahead is the bug); leave forward DRIVING (carry-forward / vertical-attack)
+                // alone so taking the space on the dribble is still on when the pass isn't.
+                let stall_damp = (1.0 - 0.70 * strength).clamp(0.25, 1.0);
+                for label in [
+                    "protect-ball",
+                    "hold-up-flank",
+                    "side-step",
+                    "carry-out-left",
+                    "carry-out-right",
+                    "route-one",
+                    "recycle-reset",
+                    "switch-play",
+                ] {
+                    scale_legal_option_score(&mut options, label, stall_damp);
                 }
+                // The straight dribble is only mildly damped — a forward pass is preferred, but
+                // driving into space remains a valid alternative.
+                let dribble_damp = (1.0 - 0.30 * strength).clamp(0.55, 1.0);
+                scale_legal_option_score(&mut options, "dribble", dribble_damp);
             }
         }
         // Isolated attacking carrier (gated `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; OFF ⇒
