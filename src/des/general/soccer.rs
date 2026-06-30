@@ -89,6 +89,8 @@ mod crash_box;
 pub(crate) use crash_box::*;
 mod field_numbers;
 pub use field_numbers::*;
+mod goal_side;
+pub(crate) use goal_side::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
