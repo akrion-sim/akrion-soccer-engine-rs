@@ -17819,6 +17819,12 @@ pub(crate) enum SoccerRewardEventKind {
     /// escape, not a default outlet. Emitted only when `DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE`
     /// is on. See [`backward_pass_discipline_enabled`].
     UnpressuredBackwardPass,
+    /// Positive: BUILDUP credit — the last few teammates whose touches built the move that led to a
+    /// shot are rewarded, recency-discounted (the shooter/most-recent most, each earlier contributor
+    /// geometrically less). Scaled by outcome: any shot < shot on frame < goal. The MAPPO signal
+    /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
+    /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
+    BuildupChainCredit,
     MatchResult,
 }
 
