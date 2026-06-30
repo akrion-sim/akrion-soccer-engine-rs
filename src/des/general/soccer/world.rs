@@ -13369,14 +13369,14 @@ impl SoccerMatch {
                     self.stat_pass_attempt_half(attempt_own_half);
                     // PENALTY: an isolated attacking carrier who panicked a backward/square ball
                     // instead of driving at goal or holding it up. Trains the policy off the bug.
-                    if isolated_carrier_drive_enabled()
+                    let emitted_isolated_panic = isolated_carrier_drive_enabled()
                         && self.isolated_carrier_panic_back_pass(
                             player_id,
                             player_pos,
                             release_target,
                             attempt_own_half,
-                        )
-                    {
+                        );
+                    if emitted_isolated_panic {
                         self.record_reward_event_with_kind(
                             player_id,
                             -ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS,
@@ -13391,6 +13391,28 @@ impl SoccerMatch {
                         self.cash_out_productive_forward_carry(player_id);
                     } else {
                         self.clear_forward_carry_tracker(player_id);
+                    }
+                    // BACKWARD-PASS DISCIPLINE (penalty): a pass played backward (toward our own
+                    // goal) is only justified under genuine high pressure — an opponent within
+                    // BACKWARD_PASS_HIGH_PRESSURE_RADIUS of the passer (the case near the
+                    // touchlines/corners too, where options shrink). Played with no close opponent
+                    // it is penalized, scaled by how far back it goes. Skipped when the isolated
+                    // panic penalty already fired for this pass (no double counting).
+                    if backward_pass_discipline_enabled() && !emitted_isolated_panic {
+                        let backward_yards = -pass_forward_yards;
+                        if backward_yards >= BACKWARD_PASS_MIN_PENALIZED_YARDS
+                            && self.nearest_opponent_distance_at(player_team, player_pos)
+                                > BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS
+                        {
+                            let penalty = (BACKWARD_PASS_BASE_PENALTY_POINTS
+                                + backward_yards * BACKWARD_PASS_PENALTY_PER_YARD_POINTS)
+                                .min(BACKWARD_PASS_MAX_PENALTY_POINTS);
+                            self.record_reward_event_with_kind(
+                                player_id,
+                                -penalty,
+                                SoccerRewardEventKind::UnpressuredBackwardPass,
+                            );
+                        }
                     }
                     self.register_flank_crash_box_cross(
                         player_team,
