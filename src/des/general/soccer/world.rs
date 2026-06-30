@@ -41182,10 +41182,17 @@ impl WorldSnapshot {
         let mpc_slot_x = current_x + (slot_x - current_x) * consistency_gain;
         let lateral_gain = (BACK_FOUR_LATERAL_GAIN * consistency_gain).clamp(0.25, 1.0);
         let proposed_x = target_x + (mpc_slot_x - target_x) * lateral_gain;
-        let legal_slack = ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards)
-            .min(defensive_shape.back_four_horizontal_max_gap_yards - slot_step)
-            .max(0.0))
-            * 0.45;
+        let legal_slack = if adaptive_width {
+            // No narrow max-gap ceiling in adaptive mode (gaps are deliberately wider than the
+            // legacy 8yd cap); allow a lateral window proportional to the adaptive slot so a
+            // defender can still drift toward its man/zone instead of being pinned to an exact slot.
+            ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards).max(0.0)) * 0.45
+        } else {
+            ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards)
+                .min(defensive_shape.back_four_horizontal_max_gap_yards - slot_step)
+                .max(0.0))
+                * 0.45
+        };
         Some(
             proposed_x
                 .clamp(slot_x - legal_slack, slot_x + legal_slack)
