@@ -2700,9 +2700,13 @@ pub(crate) fn forward_pass_first_release_strength(
     let open_strength = ((fwd - FORWARD_PASS_FIRST_OPEN_THRESHOLD)
         / (1.0 - FORWARD_PASS_FIRST_OPEN_THRESHOLD))
         .clamp(0.0, 1.0);
+    // A clean forward option is played PROMPTLY — real players don't dwell a full second when a
+    // man is open ahead. The dwell still adds a little urgency, but a fresh carrier with an open
+    // forward man already strongly prefers the ball (high dwell FLOOR), so the early release wins
+    // over a sideways carry / shield / hoof instead of converting only after a long deliberation.
     let dwell =
         (time_on_ball_seconds.max(0.0) / FORWARD_PASS_FIRST_DWELL_FULL_SECONDS).clamp(0.0, 1.0);
-    ((0.45 + 0.55 * dwell) * (0.55 + 0.45 * open_strength)).clamp(0.0, 1.0)
+    ((0.74 + 0.26 * dwell) * (0.58 + 0.42 * open_strength)).clamp(0.0, 1.0)
 }
 
 /// True when the refractory forbids committing a changed decision at tick `now`, given the ticks
