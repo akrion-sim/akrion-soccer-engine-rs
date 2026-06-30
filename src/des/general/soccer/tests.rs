@@ -87684,6 +87684,37 @@ fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
 }
 
 #[test]
+fn unpressured_backward_pass_penalty_truth_table() {
+    let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
+    let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
+    // Under genuine high pressure a backward pass is NOT penalized, however deep.
+    assert_eq!(unpressured_backward_pass_penalty_points(20.0, pressed), 0.0);
+    // A forward / square ball (non-positive backward component) is never penalized.
+    assert_eq!(unpressured_backward_pass_penalty_points(-5.0, free), 0.0);
+    assert_eq!(unpressured_backward_pass_penalty_points(0.0, free), 0.0);
+    // A short backward nudge below the threshold is neutral even when unpressured.
+    assert_eq!(
+        unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS - 0.1, free),
+        0.0
+    );
+    // An unpressured backward pass at the threshold is penalized (base + per-yard).
+    let p_min = unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS, free);
+    assert!(p_min > 0.0);
+    // The DEEPER the backward pass, the BIGGER the penalty (monotonic) until the cap.
+    let p_short = unpressured_backward_pass_penalty_points(5.0, free);
+    let p_long = unpressured_backward_pass_penalty_points(10.0, free);
+    assert!(
+        p_long > p_short && p_short > p_min,
+        "penalty must grow with backward distance: {p_min} < {p_short} < {p_long}"
+    );
+    // Very deep recycles are capped.
+    assert_eq!(
+        unpressured_backward_pass_penalty_points(1000.0, free),
+        BACKWARD_PASS_MAX_PENALTY_POINTS
+    );
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
