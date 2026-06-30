@@ -11810,7 +11810,7 @@ impl SoccerMatch {
                 continue;
             }
             let lateral = (to_opp - dir * forward).len();
-            if lateral <= CARRIER_DRIVE_LANE_HALF_WIDTH_YARDS {
+            if lateral <= tunables().dribble.carry_lane_half_width_yards {
                 forward_space = forward_space.min((forward - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
             }
         }
