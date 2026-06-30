@@ -90035,6 +90035,8 @@ fn overdribble_penalty_fires_when_a_long_hold_is_dispossessed() {
             curl_acceleration: Vec2::zero(),
             altitude_yards: 0.0,
             resistance: BallResistanceFrame::default(),
+            holder: Some(attacker),
+            last_touch_team: Some(Team::Home),
         });
     }
     let before = sim.reward_events.len();
