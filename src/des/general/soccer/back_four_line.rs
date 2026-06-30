@@ -1591,6 +1591,34 @@ mod back_four_line_tests {
     }
 
     #[test]
+    fn sticky_anchor_holds_then_repicks_on_window_flip_or_deep_drop() {
+        let latch_ticks = 45; // ~3s at 15tps
+        // Held steady: small fluctuation, same possession, window not elapsed ⇒ HOLD.
+        assert!(!back_four_line_sticky_should_repick(20.0, 21.5, 10, latch_ticks, false));
+        // The ideal line stepping UP (larger depth-from-goal) is held, never re-picked early —
+        // this is the asymmetry that kills the sine-wave's up-and-back ratchet.
+        assert!(!back_four_line_sticky_should_repick(
+            20.0,
+            20.0 + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS + 5.0,
+            10,
+            latch_ticks,
+            false
+        ));
+        // Window elapsed ⇒ re-pick.
+        assert!(back_four_line_sticky_should_repick(20.0, 20.0, latch_ticks, latch_ticks, false));
+        // Possession flipped ⇒ re-pick immediately.
+        assert!(back_four_line_sticky_should_repick(20.0, 20.0, 1, latch_ticks, true));
+        // Fresh line dropped materially DEEPER (smaller depth) ⇒ re-pick promptly for safety.
+        assert!(back_four_line_sticky_should_repick(
+            20.0,
+            20.0 - BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS - 0.5,
+            1,
+            latch_ticks,
+            false
+        ));
+    }
+
+    #[test]
     fn reward_weighted_training_is_a_noop_on_empty_or_nonfinite() {
         let mut head = BackFourLineHead::new(5);
         assert_eq!(head.train_reward_weighted(&[], 0.05), 0.0);
