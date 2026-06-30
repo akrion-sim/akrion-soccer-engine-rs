@@ -46910,17 +46910,10 @@ impl WorldSnapshot {
                 f > approx_line_fwd + BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS && f < ball_fwd
             }
         });
-<<<<<<< HEAD
-        if space_occupied {
-            base_gap
-        } else {
-            // Compress toward the possession-aware floor (`gap_min`), so a dead zone in front
-            // collapses the gap to 5yd in possession / 20yd out of it rather than a fixed 20.
-            gap_min + (base_gap - gap_min) * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
-        }
-=======
-        back_four_dead_space_adjusted_gap_yards(base_gap, min_gap, space_occupied)
->>>>>>> 40b9d439e6e2d44947860d6f5fc1c22813740697
+        // Compress toward the possession-aware floor (`gap_min`: 5yd in possession / 20yd out), so
+        // a dead zone in front collapses the gap rather than holding a fixed 20. The shared pure
+        // helper carries the finite guards and is unit-tested directly.
+        back_four_dead_space_adjusted_gap_yards(base_gap, gap_min, space_occupied)
     }
 
     fn back_four_foremost_four_opponent_attack_fwd(&self, team: Team) -> Option<f64> {
