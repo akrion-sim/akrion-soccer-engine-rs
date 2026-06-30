@@ -29687,6 +29687,7 @@ impl WorldSnapshot {
             defensive_urgency,
             decision_urgency,
             field_numbers,
+            defensive_goal_side_quality,
             goal_attack_window_score,
             killer_pass_goal_pressure: 0.0,
             single_thread_goal_pressure: 0.0,
