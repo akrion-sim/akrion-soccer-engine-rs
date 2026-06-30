@@ -26407,6 +26407,21 @@ impl WorldSnapshot {
             .unwrap_or_default()
     }
 
+    /// True when `team` has a NUMBERS-UP overload behind the ball — at least
+    /// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT` of its players are goalside of the ball (between the
+    /// ball and their own goal). In that picture the defence can afford to commit a presser to the
+    /// carrier, because there is ample cover behind. See [`Self::advancing_carrier_steal_urgency`].
+    pub(crate) fn defensive_numbers_up_behind_ball(&self, team: Team) -> bool {
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let behind = self
+            .players
+            .iter()
+            .filter(|p| p.team == team && self.player_snapshot_position(p).y * attack < ball_fwd)
+            .count();
+        behind >= DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT
+    }
+
     pub(crate) fn advancing_carrier_steal_urgency(&self, defender_id: usize) -> f64 {
         let Some(me) = self.players.iter().find(|p| p.id == defender_id) else {
             return 1.0;
@@ -26439,6 +26454,19 @@ impl WorldSnapshot {
         if nearest.map(|p| p.id) != Some(me.id) {
             return 1.0;
         }
+        // Numbers-up press: when our defence has a clear overload BEHIND THE BALL (>= 7 outfielders
+        // goalside of it), the nearest defender can afford to commit and should PRESS the carrier
+        // hard — step onto him (urgency > 1 triggers the positional step-up) and tackle readily —
+        // rather than merely contain, even if the carrier isn't advancing. We have ample cover.
+        // 0.0 when not numbers-up so every `.max(numbers_up_floor)` below is a true no-op (the
+        // press values are all positive) — byte-identical with the gate off.
+        let numbers_up_floor = if defensive_numbers_up_press_enabled()
+            && self.defensive_numbers_up_behind_ball(me.team)
+        {
+            NUMBERS_UP_PRESS_URGENCY_FLOOR
+        } else {
+            0.0
+        };
         let surprise = self.surprise_behind_steal_profile_for(me.id);
         if surprise.available {
             return (1.0 + CARRIER_ADVANCE_STEAL_BOOST * (0.42 + surprise.score * 0.74))
@@ -26455,7 +26483,9 @@ impl WorldSnapshot {
         let advance_min_speed =
             CARRIER_ADVANCE_MIN_SPEED_YPS * (1.0 - press_urgency * OWN_GOAL_PRESS_SPEED_RELAX);
         if goalward < advance_min_speed {
-            return 1.0; // not advancing: contain as normal.
+            // Not advancing: contain as normal (1.0) — UNLESS we are numbers-up behind the ball, in
+            // which case we still press the carrier (we can afford to commit a presser).
+            return 1.0_f64.max(numbers_up_floor);
         }
         let advance01 = ((goalward - CARRIER_ADVANCE_MIN_SPEED_YPS)
             / (CARRIER_ADVANCE_FULL_SPEED_YPS - CARRIER_ADVANCE_MIN_SPEED_YPS).max(1e-6))
@@ -26471,11 +26501,12 @@ impl WorldSnapshot {
             }
         });
         if has_cover {
-            1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST
+            (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(numbers_up_floor)
         } else if press_urgency <= 0.0 {
             // Outside our third: a lone last defender contains rather than lunging —
-            // a failed steal with no cover lets the carrier clean through.
-            CARRIER_NO_COVER_CONTAIN_FACTOR
+            // a failed steal with no cover lets the carrier clean through. With a numbers-up
+            // overload behind the ball there IS cover, so press regardless.
+            CARRIER_NO_COVER_CONTAIN_FACTOR.max(numbers_up_floor)
         } else {
             // But the closer the carrier dribbles to our own goal, the less that
             // caution is affordable: ramp the lone defender from the timid contain
@@ -26484,8 +26515,9 @@ impl WorldSnapshot {
             // fires against a slow dribbler walking the ball in.
             let covered_commit =
                 (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(1.0 + OWN_GOAL_PRESS_MIN_BOOST);
-            CARRIER_NO_COVER_CONTAIN_FACTOR
-                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR)
+            (CARRIER_NO_COVER_CONTAIN_FACTOR
+                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR))
+            .max(numbers_up_floor)
         }
     }
 

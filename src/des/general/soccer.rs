@@ -18720,6 +18720,30 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
     }
 }
 
+/// Number of a team's players that must be goalside of the ball for a defensive NUMBERS-UP press.
+const DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT: usize = 7;
+/// Press-urgency floor applied to the nearest defender when the defence is numbers-up behind the
+/// ball: `> 1.0` both firms the tackle commitment AND triggers the positional step-up onto the
+/// carrier, so a covered defence presses the ball-holder instead of containing.
+const NUMBERS_UP_PRESS_URGENCY_FLOOR: f64 = 1.5;
+
+/// Whether **numbers-up defensive pressing** is active this process: when the defending team has
+/// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT`+ players behind the ball, the nearest defender presses
+/// the carrier harder. Default-ON in production (env `DD_SOCCER_ENABLE_NUMBERS_UP_PRESS=0/false` is
+/// the kill switch); default-OFF under test so the parity suite stays byte-identical.
+pub(crate) fn defensive_numbers_up_press_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS"))
+    }
+}
+
 /// Whether the **ground-pass speed floor** is active this process. A released ground pass is
 /// `intended_speed · power_factor · momentum_f` — when the body can't drive it (struck while
 /// sprinting against your own momentum, or twisted side-on) that product collapses the pass to a
@@ -32510,6 +32534,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE",
         "DD_SOCCER_ENABLE_MPC_PASS_WEIGHT",
         "DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT",
+        "DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR",
+        "DD_SOCCER_ENABLE_NUMBERS_UP_PRESS",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
