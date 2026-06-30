@@ -74,6 +74,11 @@ pub struct Tunables {
     pub defensive_shape: DefensiveShapeTunables,
     /// Ball-carrier anti-stutter / keep-rolling thresholds.
     pub carrier_keep_rolling: CarrierKeepRollingTunables,
+    /// Good-dribbling knobs: touch DIRECTION weighting, touch LENGTH (how far the ball rolls per
+    /// touch), and carry SPEED (the forward-drive gait floor). Read by both the deterministic/MPC
+    /// touch-decision path and tunable from the learning store's policy overlay (the POMDP tuning
+    /// row), so dribbling can be tuned via MPC and POMDP both. See [`DribbleTuning`].
+    pub dribble: DribbleTuning,
     /// Freshly-won possession escape burst thresholds.
     pub fresh_possession_escape: FreshPossessionEscapeTunables,
     /// Goalkeeper positioning shaping (resting line, alignment score, buildup
