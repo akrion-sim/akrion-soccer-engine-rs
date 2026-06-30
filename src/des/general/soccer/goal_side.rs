@@ -71,14 +71,16 @@ pub(crate) const GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS: f64 = 14.0;
 /// there is no extra credit for sitting much deeper than this.
 pub(crate) const GOAL_SIDE_DEPTH_SATURATION_YARDS: f64 = 12.0;
 
-/// Per-tick shaped reward (points) at full positive goal-side quality (`q == 1`). Small and
-/// budget-bounded so this dense positional signal can never rival the sparse match outcome.
-pub(crate) const GOAL_SIDE_REWARD_POINTS: f64 = 0.14;
+/// Learning reward at full positive goal-side quality (`q == +1`, on the line and well goal-side
+/// of the threat). Matches the magnitude of the legacy y-axis goal-side reward's best case
+/// (`+0.24`) so flipping the gate only changes the *definition* of goal-side (true line vs
+/// y-axis), not the weight it carries in the per-player defensive reward.
+pub(crate) const GOAL_SIDE_REWARD_BEST_POINTS: f64 = 0.24;
 
-/// Per-tick *mild* penalty (points) at the worst failure (`q == -1`, caught fully upfield of the
-/// ball). Deliberately a little under half the positive reward — "mildly penalized for failing
-/// to get goalside", per the design intent.
-pub(crate) const GOAL_SIDE_FAIL_PENALTY_POINTS: f64 = 0.06;
+/// Penalty at the worst failure (`q == -1`, caught fully upfield of the threat). Matches the
+/// legacy worst case (`-0.42`) — being ball-side is the same magnitude of mistake under either
+/// definition; only what counts as "goal-side" changes.
+pub(crate) const GOAL_SIDE_FAIL_WORST_POINTS: f64 = 0.42;
 
 /// Weight with which the goal-side recovery urgency lifts the off-ball `defensive_urgency` the
 /// policy consumes. Bounded so it nudges, never dominates, the existing defensive urgency.
