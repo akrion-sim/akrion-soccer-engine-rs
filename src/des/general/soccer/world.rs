@@ -46045,7 +46045,15 @@ impl WorldSnapshot {
             .clamp(0.0, 1.0);
         let base_gap = BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
             + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac;
-        if !back_four_push_into_dead_space_enabled() {
+        // Only step into dead space while WE CONTROL the ball. Pushing the line up off the ball
+        // (out of possession, or on a loose/contested ball) just vacates the space BEHIND it for an
+        // opponent runner to be sprung into over the top — the `space_occupied` check sees only
+        // CURRENT positions, so a late run arrives after the line has stepped up. That high line
+        // gets burned both ways and collapses matches into goal-fests; out of possession we hold the
+        // deeper analytic/learned line instead.
+        if !back_four_push_into_dead_space_enabled()
+            || self.controlled_possession_team() != Some(team)
+        {
             return base_gap;
         }
         // Push up to FILL DEAD SPACE: the line should not sit ~40yd off the ball when the zone in
