@@ -13399,8 +13399,12 @@ impl SoccerMatch {
                     // it is penalized, scaled by how far back it goes. Skipped when the isolated
                     // panic penalty already fired for this pass (no double counting).
                     if backward_pass_discipline_enabled() && !emitted_isolated_panic {
-                        let nearest_opp =
-                            self.nearest_opponent_distance_at(player_team, player_pos);
+                        let nearest_opp = self
+                            .players
+                            .iter()
+                            .filter(|other| other.team == player_team.other())
+                            .map(|other| other.position.distance(player_pos))
+                            .fold(f64::INFINITY, f64::min);
                         let penalty = unpressured_backward_pass_penalty_points(
                             -pass_forward_yards,
                             nearest_opp,
