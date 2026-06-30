@@ -13683,7 +13683,32 @@ impl SoccerMatch {
                         flight,
                     );
                 }
-                self.move_player_towards(player_id, self.players[player_id].home_position, false);
+                // After playing the pass, CONTINUE THE RUN / overlap — keep the momentum in stride
+                // (a give-and-go, an overlapping run, supporting the ball forward) instead of
+                // turning back toward home and killing the run on the release tick. Genuinely
+                // stationary ⇒ fall back to holding shape. Gate off ⇒ original (home) behaviour.
+                if continue_run_after_pass_enabled() {
+                    let me = &self.players[player_id];
+                    let vel = me.velocity;
+                    let was_running =
+                        matches!(me.movement_gait, MovementGait::Run | MovementGait::Sprint);
+                    let target = if vel.len() >= CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS {
+                        (me.position + vel.normalized() * CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS)
+                            .clamp_to_pitch(
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            )
+                    } else {
+                        me.home_position
+                    };
+                    self.move_player_towards(player_id, target, was_running);
+                } else {
+                    self.move_player_towards(
+                        player_id,
+                        self.players[player_id].home_position,
+                        false,
+                    );
+                }
                 if release_facing != FacingBucket::Unknown {
                     self.players[player_id].action_facing = release_facing;
                 }

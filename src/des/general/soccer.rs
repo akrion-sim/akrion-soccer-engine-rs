@@ -18801,6 +18801,47 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
     }
 }
 
+/// Min speed (yps) for the passer to "continue the run" after a pass rather than fall back to shape.
+const CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS: f64 = 2.0;
+/// How far ahead (yds, along the passer's current heading) to aim the continue-the-run move.
+const CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS: f64 = 8.0;
+
+/// Whether **strategy-persist-until-change** is active this process: the team's elected attack
+/// strategy CONTINUES until a turnover, a meaningful change of situation (possession phase / ball
+/// third / opponent press), or a strong interrupt cue — instead of being re-elected on a fixed tick
+/// cadence. Default-ON in production (env `DD_SOCCER_ENABLE_STRATEGY_PERSIST=0/false` is the kill
+/// switch); default-OFF under test so the strategy-commitment parity suite stays byte-identical.
+pub(crate) fn strategy_persist_until_change_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STRATEGY_PERSIST").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STRATEGY_PERSIST"))
+    }
+}
+
+/// Whether the **continue-the-run-after-pass** behaviour is active this process: after playing a
+/// pass the passer keeps its momentum (overlap / give-and-go / support the ball forward) instead of
+/// turning back toward its home position on the release tick. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical.
+pub(crate) fn continue_run_after_pass_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS"))
+    }
+}
+
 /// Whether the **in-stride pass margin** is active this process: kicking against your own momentum
 /// is softened from a near-veto (12% power at sprint-reverse) to a realistic MARGIN (≈50–62%), so a
 /// player can pass while running/sprinting instead of being forced to stop — the difficulty is a
@@ -32615,6 +32656,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS",
         "DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO",
         "DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN",
+        "DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS",
+        "DD_SOCCER_ENABLE_STRATEGY_PERSIST",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",

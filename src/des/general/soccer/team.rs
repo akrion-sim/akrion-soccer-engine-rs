@@ -5056,8 +5056,17 @@ impl CentralBrain {
             && commitment.set
             && commitment.attack != TeamAttackStrategy::AdvanceUpfield
             && advance_upfield_cue >= ADVANCE_UPFIELD_STRATEGY_INTERRUPT_CUE;
+        // The elected strategy CONTINUES until a new one is genuinely warranted — a turnover
+        // (`possession_flip`), a meaningful change of situation (`ctx` = possession phase + ball
+        // third + opponent press), or a strong interrupt cue — rather than re-electing on a fixed
+        // clock that can flip-flop a working plan. Gate off ⇒ the original time-windowed review.
+        let review_due = if strategy_persist_until_change_enabled() {
+            ctx != commitment.context
+        } else {
+            tick >= commitment.review_tick
+        };
         if !commitment.set
-            || tick >= commitment.review_tick
+            || review_due
             || possession_flip
             || defense_window_interrupt
             || advance_upfield_window_interrupt
