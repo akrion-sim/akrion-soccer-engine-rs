@@ -15369,7 +15369,13 @@ impl SoccerMatch {
             || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD;
         let previous_gait = self.players[player_id].movement_gait;
         let gait_held_seconds = self.players[player_id].locomotion.gait_held_seconds;
-        let gait = commit_gait(previous_gait, gait, gait_held_seconds, gait_emergency);
+        let gait = commit_gait(
+            previous_gait,
+            gait,
+            gait_held_seconds,
+            gait_emergency,
+            gait_step_limit_enabled(),
+        );
         // Cap the drop-back under a forward overhead ball to a walk: keep the back-pedal /
         // forward orientation but never exceed walking pace (effort tier 1).
         let gait = if forward_aerial_walk_back && gait.effort_tier() > 1 {
