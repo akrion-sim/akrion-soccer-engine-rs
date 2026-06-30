@@ -2678,7 +2678,7 @@ pub(crate) fn apply_isolated_carrier_drive_bias(
 /// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
 /// released early instead of dwelt on (the user's "if that option is forward and sufficiently
 /// open"). Below this the carrier keeps his normal patience.
-const FORWARD_PASS_FIRST_OPEN_THRESHOLD: f64 = 0.45;
+const FORWARD_PASS_FIRST_OPEN_THRESHOLD: f64 = 0.40;
 /// Seconds of dwell on the ball at which the forward-release urgency saturates: a carrier
 /// sitting this long on an open forward option is pushed fully toward releasing it ("passing
 /// sooner rather than later"). The bias already applies (weaker) the instant he has the ball.

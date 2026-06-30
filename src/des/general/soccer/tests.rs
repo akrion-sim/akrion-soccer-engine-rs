@@ -1540,6 +1540,147 @@ fn pass_velocity_plan_firms_moving_runner_above_weakest_bucket() {
 }
 
 #[test]
+fn executed_receiver_pass_respects_mpc_speed_floor_despite_bad_momentum() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_246,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[passer].velocity = Vec2::new(0.0, -1.0);
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].skills.passing_completion_rate = 8.0;
+    sim.players[passer].skills.passing = 8.0;
+    sim.players[passer].skills.vision = 8.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 70.0);
+    sim.players[receiver].velocity = Vec2::new(0.0, 7.2);
+    sim.players[receiver].skills.acceleration = 8.0;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let passer_snap = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == passer)
+        .expect("passer");
+    let receiver_snap = snapshot
+        .players
+        .iter()
+        .find(|p| p.id == receiver)
+        .expect("receiver");
+    let passer_pos = snapshot.player_position(passer).expect("passer position");
+    let receiver_pos = snapshot
+        .player_position(receiver)
+        .expect("receiver position");
+    let raw_speed = pass_speed_yps_from_power(
+        0.68,
+        PassFlight::Floor,
+        false,
+        &sim.players[passer].skills,
+    );
+    let mut rng = mulberry32(4_246);
+    let initial_speed = modulated_pass_speed_yps(
+        raw_speed,
+        passer_pos,
+        receiver_pos,
+        PassFlight::Floor,
+        false,
+        pass_execution_skill(&sim.players[passer].skills, PassFlight::Floor, false),
+        1.0,
+        &mut rng,
+    );
+    let mut aim = snapshot
+        .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, initial_speed)
+        .unwrap_or(receiver_pos);
+    if let Some((mpc_aim, _)) =
+        snapshot.mpc_pass_execution(passer, receiver, aim, initial_speed)
+    {
+        aim = mpc_aim;
+    }
+    let plan = pass_velocity_plan_for_snapshot(
+        &snapshot,
+        passer_snap,
+        passer_pos,
+        aim,
+        PassFlight::Floor,
+        false,
+        Some((receiver_snap, receiver_pos)),
+    );
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+
+    let pending = sim
+        .pending_pass
+        .as_ref()
+        .expect("receiver pass should release");
+    assert_eq!(pending.target, Some(receiver));
+    assert!(
+        pending.launch_speed_yps + 1e-6 >= plan.speed_yps * 0.88,
+        "final release must not undercut the MPC/receipt speed floor: pending={pending:?} plan={plan:?}"
+    );
+}
+
+#[test]
+fn severe_momentum_mismatch_holds_instead_of_releasing_underhit_receiver_pass() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_247,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[passer].velocity = Vec2::new(0.0, -7.0);
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].skills.passing_completion_rate = 8.0;
+    sim.players[passer].skills.passing = 8.0;
+    sim.players[passer].skills.vision = 8.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 70.0);
+    sim.players[receiver].velocity = Vec2::new(0.0, 7.2);
+    sim.players[receiver].skills.acceleration = 8.0;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+
+    assert!(
+        sim.pending_pass.is_none(),
+        "severe body/momentum mismatch should hold instead of releasing a slow pass"
+    );
+    assert_eq!(sim.ball.holder, Some(passer));
+    assert_eq!(sim.ball.position, sim.players[passer].position);
+}
+
+#[test]
 fn goalkeeper_mpc_distribution_avoids_a_marked_teammate_for_a_deliverable_one() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -46140,6 +46281,86 @@ fn poor_dribbler_can_take_heavy_touch_and_lose_ball() {
     assert!(sim.ball.velocity.len() > sim.players[dribbler].velocity.len());
     assert!(
         sim.ball.position.distance(sim.players[dribbler].position) > PLAYER_CONTROL_RADIUS_YARDS
+    );
+}
+
+#[test]
+fn stale_dribble_after_loose_touch_turns_back_to_recover_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 46_101,
+        ..Default::default()
+    });
+    let dribbler = 9;
+    park_players_except(&mut sim, &[dribbler]);
+    sim.players[dribbler].position = Vec2::new(40.0, 60.0);
+    sim.players[dribbler].velocity = Vec2::zero();
+    sim.players[dribbler].acceleration = Vec2::zero();
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = sim.players[dribbler].position.distance(sim.ball.position);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: dribbler,
+        action: SoccerAction::DribbleMove {
+            target: Vec2::new(40.0, 78.0),
+            kind: DribbleMoveKind::CarryForward,
+            touch: DribbleTouchDecision::default(),
+        },
+        sprint: true,
+    });
+
+    let after = sim.players[dribbler].position.distance(sim.ball.position);
+    assert!(
+        after < before,
+        "stale dribble continuation without possession must recover the loose ball, not run upfield: before={before} after={after} player={:?} ball={:?}",
+        sim.players[dribbler].position,
+        sim.ball.position
+    );
+    assert!(
+        sim.players[dribbler].position.y < 60.0,
+        "the old upfield carry target should be ignored after the ball is loose"
+    );
+}
+
+#[test]
+fn holder_with_unsettled_ball_steps_to_ball_before_carrying_away() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.1,
+        seed: 46_102,
+        ..Default::default()
+    });
+    let dribbler = 9;
+    park_players_except(&mut sim, &[dribbler]);
+    sim.players[dribbler].position = Vec2::new(40.0, 60.0);
+    sim.players[dribbler].velocity = Vec2::zero();
+    sim.players[dribbler].acceleration = Vec2::zero();
+    sim.ball.holder = Some(dribbler);
+    sim.ball.position = Vec2::new(40.0, 57.6);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = sim.players[dribbler].position.distance(sim.ball.position);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: dribbler,
+        action: SoccerAction::Dribble(Vec2::new(40.0, 78.0)),
+        sprint: true,
+    });
+
+    let after = sim.players[dribbler].position.distance(sim.ball.position);
+    assert_eq!(sim.ball.holder, Some(dribbler));
+    assert!(
+        after < before,
+        "holder must step onto an out-of-reach ball before carrying away: before={before} after={after} player={:?} ball={:?}",
+        sim.players[dribbler].position,
+        sim.ball.position
+    );
+    assert!(
+        sim.players[dribbler].position.y < 60.0,
+        "dribbler should not keep running forward while the credited ball is behind him"
     );
 }
 
