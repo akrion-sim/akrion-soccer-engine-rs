@@ -25138,10 +25138,13 @@ impl WorldSnapshot {
             return false;
         }
         let receiver_distance = receiver_position.distance(pass_point);
-        // The marker must beat the intended receiver to the reception point by a clear margin —
-        // a man level with his marker is a contestable ball, not a giveaway, and is left alone.
+        // Leave a genuinely open pass alone: only fire when the intended receiver does NOT clearly
+        // beat his marker to the reception point. If the receiver is materially nearer the point
+        // than the opponent (by the margin), he wins the ball — a brave pass to a half-open man,
+        // not a giveaway. The veto bites when the marker is level with, or nearer than, the
+        // receiver (including the ball-to-a-marked-man's-feet case, where receiver_distance ~ 0).
         if !receiver_distance.is_finite()
-            || opponent_distance + PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS >= receiver_distance
+            || receiver_distance + PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS <= opponent_distance
         {
             return false;
         }
