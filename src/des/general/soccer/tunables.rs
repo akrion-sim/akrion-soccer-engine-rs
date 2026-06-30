@@ -111,6 +111,7 @@ impl Default for Tunables {
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
             carrier_keep_rolling: CarrierKeepRollingTunables::default(),
+            dribble: DribbleTuning::default(),
             fresh_possession_escape: FreshPossessionEscapeTunables::default(),
             goalkeeper: GoalkeeperTunables::default(),
             killer_pass_over_top: KillerPassOverTopTunables::default(),
