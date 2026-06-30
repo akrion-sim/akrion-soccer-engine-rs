@@ -21540,6 +21540,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// Held back-four line-centre depth (yd from own goal) per team (Home=0, Away=1), copied from the
+    /// match's sticky latch so the live line chokepoint reads the LATCHED centre instead of
+    /// recomputing it every tick. `None` ⇒ compute fresh (sticky anchor off, or not yet set).
+    #[serde(skip)]
+    pub(crate) back_four_line_latch_centre_depth: [Option<f64>; 2],
     /// The trained pass-completion head, carried from the match for live consumption in
     /// `pass_target_quality_for_snapshot`. `None` ⇒ analytic completion estimate (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
