@@ -91603,8 +91603,9 @@ fn intercepted_pass_spreads_discounted_blame_over_prior_passers() {
         "ball-loser keeps the full penalty: {loser_penalty} vs -{base}"
     );
 
-    // Gate OFF ⇒ no blame events at all (byte-identical to the prior behaviour).
-    std::env::set_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME", "0");
+    // Gate OFF ⇒ no blame events at all (byte-identical to the prior behaviour). Under
+    // `cfg(test)` the gate is keyed on the var being SET (any value), so disabling = remove it.
+    std::env::remove_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME");
     for id in [3usize, 4, 5, 6] {
         sim.record_possession_touch(id);
     }
@@ -91616,7 +91617,6 @@ fn intercepted_pass_spreads_discounted_blame_over_prior_passers() {
             .all(|e| e.kind != SoccerRewardEventKind::TurnoverChainBlame),
         "gate off ⇒ no chain-blame events"
     );
-    std::env::remove_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME");
 }
 
 #[test]
