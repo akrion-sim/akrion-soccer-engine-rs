@@ -301,6 +301,60 @@ pub fn back_four_line_target_depth_v2(
     raw.clamp(lo, max_depth)
 }
 
+/// Pure trailing-gap **floor** (yd behind the ball) for the dynamic band: the in-possession floor
+/// (5) when WE control the ball, else the deeper out-of-possession floor (20) — which covers both
+/// the opponent controlling AND a loose/contested ball ("dispossession"). The band top is always
+/// [`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`] (40). Extracted pure so the possession band is unit-
+/// tested without toggling a process-global gate (which would race the parallel suite).
+pub fn back_four_desired_gap_min_yards(we_control: bool) -> f64 {
+    if we_control {
+        BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS
+    } else {
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+    }
+}
+
+/// Pure **press-to-attackers compaction** of the line-CENTRE depth (yd from own goal). Raises a
+/// too-deep `centre_depth` UP toward the foremost-attacker line so the four sit at most
+/// `optimal_gap` goal-side of `attacker_depth` — never AHEAD of the attackers (no playing runners
+/// onside), never below the incoming `centre_depth` (push up only), never past `max_depth` / below
+/// `six`. Monotonic non-decreasing in `attacker_depth`.
+pub fn back_four_attacker_pressed_depth(
+    centre_depth: f64,
+    attacker_depth: f64,
+    optimal_gap: f64,
+    six: f64,
+    max_depth: f64,
+) -> f64 {
+    let press_floor = (attacker_depth - optimal_gap)
+        .min(attacker_depth)
+        .clamp(six.min(max_depth), max_depth);
+    centre_depth.max(press_floor)
+}
+
+/// Pure **hold-deadband** decision (energy conservation). Returns the forward target the defender
+/// should actually aim at: `cur_fwd` (HOLD) when it is within `deadband` of `target_fwd` and not
+/// illegally ahead of `cap`; otherwise `target_fwd`. `cap = None` ⇒ no offside concern (trap
+/// lifted), so a within-deadband target always holds. Holding only ever leaves a defender DEEPER
+/// than ideal (it never steps it ahead of the cap), so it cannot play a runner onside.
+pub fn back_four_line_hold_target_fwd(
+    cur_fwd: f64,
+    target_fwd: f64,
+    cap: Option<f64>,
+    deadband: f64,
+) -> f64 {
+    if let Some(cap) = cap {
+        if cur_fwd > cap + 1e-6 {
+            return target_fwd;
+        }
+    }
+    if (target_fwd - cur_fwd).abs() < deadband {
+        cur_fwd
+    } else {
+        target_fwd
+    }
+}
+
 /// Raw (un-normalized) state the line model is a function of, captured in the
 /// defending team's **attacking frame** (`fwd` increases toward the opponent
 /// goal; `lat` is signed distance from the pitch spine). Kept as a plain struct
