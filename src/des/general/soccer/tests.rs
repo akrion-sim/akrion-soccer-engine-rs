@@ -87630,6 +87630,58 @@ fn team_advance_upfield_space_qualifies_truth_table() {
 }
 
 #[test]
+fn forward_carry_tracker_sustained_segments_and_productive_payout() {
+    let mut t = ForwardCarryTracker::new_at(7, Team::Home, 60.0);
+    // First 2yd forward segment earns nothing — it must be "followed by 2 more".
+    assert_eq!(t.fold_tick(2.0), 0);
+    // Reaching 4yd total ⇒ the 2nd segment is the first rewardable one.
+    assert_eq!(t.fold_tick(2.0), 1);
+    // Each further completed 2yd segment pays one more.
+    assert_eq!(t.fold_tick(2.0), 1);
+    // Sub-segment forward increments accumulate; only crossing the next 2yd boundary pays.
+    assert_eq!(t.fold_tick(1.0), 0);
+    assert_eq!(t.fold_tick(1.0), 1);
+    // Productive cash-out after 8yd carried ⇒ 4 whole segments × per-segment points.
+    let pts = t.productive_carry_reward_points();
+    assert!(
+        (pts - 4.0 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS).abs() < 1e-9,
+        "productive payout {pts} should be 4 segments"
+    );
+    // A meaningful backward move breaks the run: accumulation AND rewarded-segment count reset.
+    assert_eq!(t.fold_tick(-FORWARD_CARRY_BACKWARD_RESET_YARDS), 0);
+    assert_eq!(t.productive_carry_reward_points(), 0.0);
+    // Rebuild from zero: first new segment again unpaid, second paid.
+    assert_eq!(t.fold_tick(2.0), 0);
+    assert_eq!(t.fold_tick(2.0), 1);
+}
+
+#[test]
+fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
+    let mut t = ForwardCarryTracker::new_at(3, Team::Away, 50.0);
+    // One huge forward drive: rewardable sustained segments are capped.
+    assert_eq!(t.fold_tick(100.0), FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
+    // Productive payout is likewise capped.
+    let pts = t.productive_carry_reward_points();
+    assert!(
+        (pts - FORWARD_CARRY_MAX_REWARDED_SEGMENTS as f64
+            * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS)
+            .abs()
+            < 1e-9
+    );
+    // Beyond the cap pays nothing more.
+    assert_eq!(t.fold_tick(10.0), 0);
+    // Non-finite deltas are ignored (no panic, no reward).
+    assert_eq!(t.fold_tick(f64::NAN), 0);
+    // Tiny backward jitter below the reset threshold does NOT break the run.
+    let mut u = ForwardCarryTracker::new_at(5, Team::Home, 40.0);
+    assert_eq!(u.fold_tick(2.0), 0);
+    assert_eq!(u.fold_tick(2.0), 1);
+    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), 0);
+    // Still accumulated (not reset): a forward nudge past the next boundary pays again.
+    assert_eq!(u.fold_tick(1.5), 1);
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
