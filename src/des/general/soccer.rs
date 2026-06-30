@@ -25488,48 +25488,31 @@ fn defensive_goal_side_reward_for_role(
     player_position: Vec2,
     snapshot: &WorldSnapshot,
 ) -> f64 {
+    // CONCEPTUAL MERGE: both lines reward the SAME true-diagonal goal-side-line fit. The
+    // `goal side` branch wrapped it in `defensive_goal_side_enabled()` with a y-axis-only "legacy
+    // ladder" fallback when OFF, but that gate is default-ON in production (so prod already rewards
+    // the diagonal) and the other branch shipped the identical role-weighted reward unconditionally.
+    // The gate-OFF legacy fallback only ever applied under `#[cfg(test)]`, where it regressed below
+    // the shared baseline and broke `defensive_reward_prefers_goal_side_of_ball_and_attacker`
+    // ("prefer true diagonal ball-goal line over flat y-depth"). So the diagonal reward is the
+    // unconditional baseline here — identical to prod and to the other branch. The `goal_side` gate
+    // still governs the POSITIONING bias and the neural feature; only this reward is un-gated.
     let profile = defensive_goal_side_line_profile_for_role(team, role, player_position, snapshot);
     if role == PlayerRole::Forward || profile.fit == 0.0 && profile.recovery_pressure == 0.0 {
         return 0.0;
     }
-    // `profile` (above) is computed by theirs' richer goal-side-line machinery; use it when the
-    // gate is ON, and fall back to ours' legacy y-axis ladder when OFF.
-    if goal_side::defensive_goal_side_enabled() {
-        // TRUE goal-side: role-weighted reward off the goal-side-line fit profile (fit +
-        // recovery_pressure) — a defender is rewarded more for screening than a midfielder/keeper,
-        // and the miss penalty scales with how much recovery pressure they are under. Subsumes the
-        // raw single-magnitude geometry.
-        let (bonus, miss_penalty) = match role {
-            PlayerRole::Defender => (0.58, 0.24),
-            PlayerRole::Midfielder => (0.48, 0.20),
-            PlayerRole::Goalkeeper => (0.28, 0.12),
-            PlayerRole::Forward => (0.0, 0.0),
-        };
-        let reward = profile.fit * bonus
-            - (1.0 - profile.fit).powi(2) * miss_penalty * (0.70 + profile.recovery_pressure * 0.30);
-        return reward.clamp(-miss_penalty, bonus);
-    }
-    // Legacy y-axis-only ladder (gate off): engage only while the opponent has possession, then
-    // reward sitting goal-side of both the ball and the carrier on the y-axis.
-    if snapshot.possession_team() != Some(team.other()) {
-        return 0.0;
-    }
-    let threat = snapshot
-        .ball
-        .holder
-        .and_then(|holder| snapshot.players.iter().find(|p| p.id == holder))
-        .filter(|holder| holder.team == team.other())
-        .and_then(|holder| snapshot.player_position(holder.id))
-        .unwrap_or(snapshot.ball.position);
-    let own_goal_y = team.other().goal_y(snapshot.field_length);
-    let goal_side_of_ball =
-        goal_side_between_y(player_position.y, snapshot.ball.position.y, own_goal_y);
-    let goal_side_of_attacker = goal_side_between_y(player_position.y, threat.y, own_goal_y);
-    match (goal_side_of_ball, goal_side_of_attacker) {
-        (true, true) => 0.24,
-        (true, false) | (false, true) => -0.12,
-        (false, false) => -0.42,
-    }
+    // Role-weighted reward off the goal-side-line fit profile (fit + recovery_pressure): a defender
+    // is rewarded more for screening than a midfielder/keeper, and the miss penalty scales with how
+    // much recovery pressure they are under.
+    let (bonus, miss_penalty) = match role {
+        PlayerRole::Defender => (0.58, 0.24),
+        PlayerRole::Midfielder => (0.48, 0.20),
+        PlayerRole::Goalkeeper => (0.28, 0.12),
+        PlayerRole::Forward => (0.0, 0.0),
+    };
+    let reward = profile.fit * bonus
+        - (1.0 - profile.fit).powi(2) * miss_penalty * (0.70 + profile.recovery_pressure * 0.30);
+    reward.clamp(-miss_penalty, bonus)
 }
 
 fn defensive_goal_line_spacing_score(
