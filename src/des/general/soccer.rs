@@ -18896,6 +18896,31 @@ pub(crate) fn in_stride_pass_margin_enabled() -> bool {
     }
 }
 
+/// An opponent must be this far ahead of the back line (yds) to count as "occupying the space in
+/// front" — closer than this they are effectively part of the line, so the space is still dead.
+const BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS: f64 = 3.0;
+/// How strongly the back four compresses its trailing gap toward the minimum when the space in
+/// front of it is dead (no opponent in the band): 0 = no push-up, 1 = collapse fully to the min.
+const BACK_FOUR_DEAD_SPACE_PUSH_FRACTION: f64 = 0.7;
+
+/// Whether the **back-four push-up into dead space** is active this process: when no opponent
+/// occupies the band between the back line and the ball, the line compresses its trailing gap
+/// toward the minimum (steps up to fill the space) instead of holding a deep ~40yd line off nobody.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH=0/false` is the kill
+/// switch); default-OFF under test so the line-depth parity suite stays byte-identical.
+pub(crate) fn back_four_push_into_dead_space_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH"))
+    }
+}
+
 /// Whether the **release-long-inside-own-half** MARL/MAPPO strategy is active this process: when a
 /// teammate has broken beyond the opponent's last outfield defender but is ONSIDE in our own half
 /// (you cannot be offside in your own half), prefer + reward a long ball that springs them. Trains
