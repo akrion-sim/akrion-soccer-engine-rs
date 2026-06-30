@@ -20437,6 +20437,26 @@ fn pass_facing_outcome(facing_yaw: f64, kick_dir: Vec2, in_own_half: bool) -> Pa
     }
 }
 
+/// Minimum speed (mph) a released GROUND pass must leave the foot at, so the body-momentum/facing
+/// power penalty can soften a pass but never collapse it into a dead "ghost ball". ~12mph (≈5.9yps)
+/// is below any genuine pass pace (a crisp 5yd ball is already ~17mph) so this only lifts the
+/// collapsed ghosts, not normal play.
+const GROUND_PASS_MIN_RELEASE_MPH: f64 = 12.0;
+
+/// Floor a released GROUND pass's launch speed (yps) so the momentum/facing power penalty cannot
+/// collapse it into a near-stationary ball the passer runs away from. The floor is itself capped by
+/// any explicit weak-touch `speed_cap_yps` (a backheel / perpendicular prod still travels only at
+/// its cap, not faster) — so a deliberate soft touch is preserved while a true ghost pass is lifted
+/// to a real, travelling pace. Pure.
+pub(crate) fn floored_ground_pass_launch_speed(launch_speed: f64, speed_cap_yps: Option<f64>) -> f64 {
+    let viable_floor = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH);
+    let effective_floor = match speed_cap_yps {
+        Some(cap) => viable_floor.min(cap.max(0.0)),
+        None => viable_floor,
+    };
+    launch_speed.max(effective_floor)
+}
+
 /// Preference bonus for controlled forward passes. The ideal is 8yd exactly:
 /// 5yd support balls are only a ramp toward the ideal, and 12yd+ balls taper away.
 fn short_pass_preference_bonus(distance_yards: f64, holder_low_pressure: bool) -> f64 {
