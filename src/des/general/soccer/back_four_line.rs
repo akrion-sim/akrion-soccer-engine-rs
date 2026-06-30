@@ -186,7 +186,15 @@ pub fn midfield_line_model_enabled() -> bool {
 }
 
 /// Whether the v2 field-anchored back-four line depth is used at the live line
-/// chokepoint this process. Off ⇒ the existing ball-relative band stands (parity).
+/// chokepoint this process. The v2 centre is a function of **field geometry + the
+/// ball** (15yd anchor, dynamic possession-aware trailing gap, attacker compaction)
+/// rather than the AVERAGE of where the four currently are — so the four no longer
+/// chase a self-referential, jittering line average (the cosmetic "sine-wave"). It
+/// is the home of the 15yd non-linearity, the 5..40/20..40 possession band, the
+/// press-to-attackers compaction, and the hold deadband, so it is promoted to
+/// **default-ON** in production (env `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0`
+/// is the kill switch, reverting to the legacy ball-relative average band).
+/// Default-OFF under test so the line-depth parity suite stays byte-identical.
 pub fn back_four_line_depth_v2_enabled() -> bool {
     #[cfg(test)]
     {
@@ -196,7 +204,43 @@ pub fn back_four_line_depth_v2_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+    }
+}
+
+/// Whether the **press-to-attackers compaction** is applied to the v2 line centre this process:
+/// while in possession or dispossession (NOT while the opponent drives at our goal) the back four
+/// presses UP to sit at most [`BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS`] goal-side of the
+/// opponent's foremost-attacker line, filling the space rather than leaving a hole. MARL/MAPPO:
+/// the optimal distance is refined by the line-depth head via the attacker-compactness reward.
+/// Default-ON (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS=0`); default-OFF under test.
+pub fn back_four_press_to_attackers_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV))
+    }
+}
+
+/// Whether the **energy-conservation hold deadband** damps the v2 line target this process: a
+/// line-bound defender already within [`BACK_FOUR_LINE_HOLD_DEADBAND_YARDS`] of its legal target
+/// holds rather than re-chasing a jittering line (the "sine-wave"). Default-ON (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND=0`); default-OFF under test for parity.
+pub fn back_four_line_hold_deadband_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV))
     }
 }
 
